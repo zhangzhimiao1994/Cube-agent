@@ -1026,13 +1026,115 @@ export type WorkspaceDirectoryList = z.infer<typeof WorkspaceDirectoryListSchema
 export type WorkspaceFile = z.infer<typeof WorkspaceFileSchema>;
 export type WorkspaceFileList = z.infer<typeof WorkspaceFileListSchema>;
 
-const WebPreviewSchema = z.object({
+const PreviewUuid = z.string().regex(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+const PreviewLabel = z.string().regex(/^[a-z0-9][a-z0-9_-]{0,63}$/);
+const PreviewDisplayPath = z.string().min(1).max(512).regex(/^[A-Za-z0-9_./-]+$/)
+  .refine((value) => value.split("/").every((part) => part.length > 0 && !part.startsWith(".")));
+const PreviewTimestamp = z.string().max(40).datetime({ offset: true });
+
+export const PreviewIdentityV1Schema = z.object({
+  preview_id: PreviewUuid,
+  kind: z.enum(["static", "dynamic"]),
+  tenant_id: PreviewUuid,
+  user_id: PreviewUuid.nullable(),
+  project_id: PreviewLabel,
+  conversation_id: PreviewLabel,
+  workspace_session_id: PreviewLabel,
+  runtime_handle: z.string().regex(/^[0-9a-f]{32}$/).nullable(),
+  source: z.object({ scheme: z.enum(["preview-broker-tree-v2", "preview-static-tree-v1"]),
+    sha256: z.string().regex(/^[0-9a-f]{64}$/) }).strict(),
+  display_root: z.union([z.literal("."), PreviewDisplayPath]),
+  display_entrypoint: PreviewDisplayPath,
+}).strict().refine((value) => value.kind === "dynamic"
+  ? value.runtime_handle !== null && value.source.scheme === "preview-broker-tree-v2"
+  : value.runtime_handle === null && value.source.scheme === "preview-static-tree-v1");
+
+const previewBrokerResources = ["attachment", "unit_build", "unit_install", "unit_probe", "unit_start",
+  "cgroup_build", "cgroup_install", "cgroup_probe", "cgroup_start", "mount_unit", "work_path", "owned_directory"] as const;
+const previewStaticResources = ["serving_thread", "listener", "accepted_threads", "accepted_sockets",
+  "proxy_operations", "proxy_sockets"] as const;
+const previewManagerResources = ["capability", "snapshot"] as const;
+const previewUnobserved = ["private_network_namespace", "private_port", "other_mount_namespaces"];
+function previewSuccessfulResults(resource: string): string[] {
+  if (resource.startsWith("cgroup_")) return ["absent", "empty"];
+  if (resource.startsWith("unit_")) return ["inactive", "failed"];
+  if (resource === "mount_unit") return ["inactive"];
+  if (resource === "work_path") return ["absent", "not_mountpoint"];
+  if (resource === "capability") return ["revoked"];
+  if (["listener", "accepted_sockets", "proxy_sockets"].includes(resource)) return ["closed"];
+  if (["snapshot", "owned_directory"].includes(resource)) return ["absent"];
+  return ["attachment", "serving_thread"].includes(resource) ? ["exited"] : ["drained"];
+}
+
+export const PreviewResourceObservationSchema = z.object({
+  resource: z.enum([...previewBrokerResources, ...previewStaticResources, ...previewManagerResources]),
+  observer: z.enum(["broker", "manager"]),
+  observed_at: PreviewTimestamp,
+  result: z.enum(["absent", "empty", "inactive", "failed", "not_mountpoint", "revoked", "closed",
+    "exited", "drained", "present", "unknown"]),
+  reason_code: z.enum(["observed", "not_attempted", "observation_failed", "resource_present", "budget_exhausted",
+    "interrupted", "persistence_failed", "unbound_owner"]),
+  load_state: z.enum(["loaded", "not-found"]).nullable(),
+  active_state: z.enum(["inactive", "failed"]).nullable(),
+  main_pid: z.literal(0).nullable(),
+  identity_match: z.literal(true).nullable(),
+}).strict().refine((fact) => {
+  if (fact.observer !== (previewBrokerResources.some((r) => r === fact.resource) ? "broker" : "manager")) return false;
+  const success = previewSuccessfulResults(fact.resource);
+  if (![...success, "present", "unknown"].includes(fact.result)) return false;
+  if ((fact.resource.startsWith("unit_") || fact.resource === "mount_unit") && success.includes(fact.result)) {
+    return fact.identity_match === true && fact.load_state !== null && fact.active_state === fact.result
+      && (fact.load_state !== "not-found" || fact.result === "inactive")
+      && (fact.resource === "mount_unit" ? fact.main_pid === null : fact.main_pid === 0);
+  }
+  return [fact.load_state, fact.active_state, fact.main_pid, fact.identity_match].every((value) => value === null);
+});
+
+export const CleanupReceiptV1Schema = z.object({
+  schema_version: z.literal(1), identity: PreviewIdentityV1Schema, observation_id: PreviewUuid,
+  requested_at: PreviewTimestamp, observed_at: PreviewTimestamp,
+  reason: z.enum(["explicit", "expired", "replaced", "disconnect", "shutdown", "recovery"]),
+  status: z.enum(["pending", "confirmed", "unknown"]),
+  coverage: z.enum(["dynamic-systemd-tmpfs-v1", "static-loopback-v1"]),
+  observations: z.array(PreviewResourceObservationSchema).max(32),
+  unobserved: z.array(z.string()).max(3),
+}).strict().refine((receipt) => {
+  const dynamic = receipt.identity.kind === "dynamic";
+  const required = [...(dynamic ? previewBrokerResources : previewStaticResources), ...previewManagerResources];
+  const status = receipt.observations.some((fact) => fact.result === "unknown") ? "unknown"
+    : receipt.observations.some((fact) => fact.result === "present") ? "pending" : "confirmed";
+  return receipt.coverage === (dynamic ? "dynamic-systemd-tmpfs-v1" : "static-loopback-v1")
+    && JSON.stringify(receipt.unobserved) === JSON.stringify(dynamic ? previewUnobserved : [])
+    && JSON.stringify(receipt.observations.map((fact) => fact.resource)) === JSON.stringify(required)
+    && receipt.status === status && Date.parse(receipt.requested_at) <= Date.parse(receipt.observed_at)
+    && receipt.observations.every((fact) => Date.parse(fact.observed_at) <= Date.parse(receipt.observed_at));
+});
+
+function samePreviewIdentity(a: z.infer<typeof PreviewIdentityV1Schema>, b: z.infer<typeof PreviewIdentityV1Schema>): boolean {
+  return JSON.stringify(a) === JSON.stringify(b);
+}
+
+export const PreviewCleanupRecordSchema = z.object({
+  identity: PreviewIdentityV1Schema, cleanup_receipt: CleanupReceiptV1Schema.nullable(),
+  retention_expires_at: PreviewTimestamp.nullable(),
+}).strict().refine((record) => record.cleanup_receipt === null
+  || samePreviewIdentity(record.identity, record.cleanup_receipt.identity));
+export type PreviewIdentityV1 = z.infer<typeof PreviewIdentityV1Schema>;
+export type CleanupReceiptV1 = z.infer<typeof CleanupReceiptV1Schema>;
+export type PreviewCleanupRecord = z.infer<typeof PreviewCleanupRecordSchema>;
+
+export const WebPreviewSchema = z.object({
   id: z.string(),
   status: z.enum(["starting", "ready", "stopping", "stopped", "failed", "expired"]),
   preview_url: z.string().nullable(),
   lease_expires_at: z.string().nullable(),
   application_transport: z.boolean().optional(),
-});
+  identity: PreviewIdentityV1Schema,
+  cleanup_url: z.string(),
+  cleanup_receipt: CleanupReceiptV1Schema.nullable(),
+}).strict().refine((preview) => preview.id === preview.identity.preview_id
+  && preview.cleanup_url === `/api/v1/web-previews/${preview.id}/cleanup`
+  && (preview.cleanup_receipt === null || samePreviewIdentity(preview.identity, preview.cleanup_receipt.identity)));
 
 export type WebPreview = z.infer<typeof WebPreviewSchema>;
 export type WebPreviewStartRequest = {
@@ -2853,6 +2955,9 @@ export const api = {
       { method: "POST", body: JSON.stringify(payload) },
       WebPreviewSchema,
     );
+  },
+  getWebPreviewCleanup(id: string): Promise<PreviewCleanupRecord> {
+    return request(`/api/v1/web-previews/${encodeURIComponent(id)}/cleanup`, {}, PreviewCleanupRecordSchema);
   },
   async webPreviewForConversation(conversationId: string): Promise<WebPreview | null> {
     try {

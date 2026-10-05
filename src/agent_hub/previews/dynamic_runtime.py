@@ -11,6 +11,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
+from agent_hub.previews.cleanup import (
+    BrokerCleanupObservation,
+    PreviewIdentityV1,
+    PreviewOwnerScope,
+)
 from agent_hub.previews.dynamic_runner import (
     MAX_REQUEST_BODY,
     MAX_RESPONSE_BODY,
@@ -44,7 +49,10 @@ class DynamicPreviewStartupFailed(DynamicPreviewUnavailable):
 
 
 class DynamicPreviewCleanupError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, observation: BrokerCleanupObservation | None = None) -> None:
+        super().__init__(message)
+        self.observation = (BrokerCleanupObservation.from_wire(observation.to_wire())
+                            if observation is not None else None)
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,18 +92,29 @@ def _check_result(payload: dict[str, object]) -> None:
 
 
 class DynamicPreviewRuntime:
-    def __init__(self, connection: socket.socket, stream: FrameStream, handle: str,
-                 source_sha256: str, *, recovery_token: str | None = None,
+    def __init__(self, connection: socket.socket, stream: FrameStream, identity: PreviewIdentityV1,
+                 *, identity_binding: str, recovery_token: str | None = None,
                  reconnect: Callable[[], tuple[socket.socket, FrameStream]] | None = None) -> None:
         self._connection = connection
         self._stream = stream
-        self._handle = handle
-        self.source_sha256 = source_sha256
+        self._identity = PreviewIdentityV1.from_wire(identity.to_wire())
+        if self._identity.kind != "dynamic":
+            raise ValueError("dynamic runtime identity required")
+        self._handle = self._identity.runtime_handle
+        self.source_sha256 = self._identity.source_sha256
+        if re.fullmatch(r"[0-9a-f]{64}", identity_binding) is None:
+            raise ValueError("invalid private identity binding")
+        self._identity_binding = identity_binding
+        self._observation: BrokerCleanupObservation | None = None
         self._lock = threading.Lock()
         self._revoked = False
         self._closed = False
         self._recovery_token = recovery_token
         self._reconnect = reconnect
+
+    @property
+    def identity(self) -> PreviewIdentityV1:
+        return self._identity
 
     def request(self, method: str, target: str, headers: tuple[tuple[str, str], ...],
                 body: bytes) -> DynamicPreviewResponse:
@@ -104,7 +123,7 @@ class DynamicPreviewRuntime:
             if self._revoked:
                 raise DynamicPreviewUnavailable("preview runtime revoked")
             try:
-                write_frame(self._stream, {"version": 1, "action": "request",
+                write_frame(self._stream, {"version": 2, "action": "request",
                                           "handle": self._handle, "request": request})
                 result = read_frame(self._stream)
                 _check_result(result)
@@ -118,41 +137,53 @@ class DynamicPreviewRuntime:
                 self._revoked = True
                 raise DynamicPreviewUnavailable("preview transport failed; request not replayed")
 
-    def close(self) -> None:
+    def _cleanup_result(self, result: dict[str, object]) -> BrokerCleanupObservation:
+        if set(result) != {"ok", "state", "observation"} or type(result["ok"]) is not bool:
+            raise ValueError("invalid cleanup reply")
+        observation = BrokerCleanupObservation.from_wire(result["observation"])
+        if observation.identity != self.identity:
+            raise ValueError("cleanup identity mismatch")
+        confirmed = observation.status == "confirmed"
+        if result["ok"] != confirmed or result["state"] != ("stopped" if confirmed else "cleanup_pending"):
+            raise ValueError("inconsistent cleanup reply")
+        if not confirmed:
+            raise DynamicPreviewCleanupError("preview cleanup pending", observation=observation)
+        return observation
+
+    def close(self) -> BrokerCleanupObservation:
         with self._lock:
             self._revoked = True
             if self._closed:
-                return
+                assert self._observation is not None
+                return self._observation
             try:
-                write_frame(self._stream, {"version": 1, "action": "stop",
+                self._connection.settimeout(70)
+                write_frame(self._stream, {"version": 2, "action": "stop",
                                           "handle": self._handle})
-                result = read_frame(self._stream)
-                if result != {"ok": True, "state": "stopped"}:
-                    raise DynamicPreviewCleanupError("preview unit cleanup not confirmed")
+                observation = self._cleanup_result(read_frame(self._stream))
             except (OSError, EOFError, ValueError) as error:
                 if self._reconnect is None or self._recovery_token is None:
                     raise DynamicPreviewCleanupError("preview unit cleanup not confirmed") from error
-                self._recover_close()
-            except DynamicPreviewCleanupError:
-                if self._reconnect is None or self._recovery_token is None:
-                    raise
-                self._recover_close()
+                observation = self._recover_close()
+            self._observation = observation
             self._closed = True
             try:
                 self._stream.close()
             finally:
                 self._connection.close()
+            return observation
 
-    def _recover_close(self) -> None:
+    def _recover_close(self) -> BrokerCleanupObservation:
         assert self._reconnect is not None and self._recovery_token is not None
         try:
             connection, stream = self._reconnect()
             try:
-                connection.settimeout(60)
-                write_frame(stream, {"version": 1, "action": "recover_stop", "handle": self._handle,
-                                     "recovery_token": self._recovery_token})
-                if read_frame(stream) != {"ok": True, "state": "stopped"}:
-                    raise DynamicPreviewCleanupError("owned recovery cleanup not confirmed")
+                connection.settimeout(70)
+                write_frame(stream, {"version": 2, "action": "recover_stop", "handle": self._handle,
+                                     "recovery_token": self._recovery_token,
+                                     "identity": self.identity.to_wire(),
+                                     "identity_binding": self._identity_binding})
+                return self._cleanup_result(read_frame(stream))
             finally:
                 stream.close()
                 connection.close()
@@ -167,14 +198,14 @@ class DynamicPreviewBackend:
         self._socket_path = socket_path
         self._platform = platform
 
-    def _connect(self) -> tuple[socket.socket, FrameStream]:
+    def _connect(self, *, timeout: float = 300) -> tuple[socket.socket, FrameStream]:
         if self._platform != "linux":
             raise DynamicPreviewUnavailable("dynamic preview requires configured Linux isolation")
         family = getattr(socket, "AF_UNIX", None)
         if not isinstance(family, int):
             raise DynamicPreviewUnavailable("Linux Unix socket support unavailable")
         connection = socket.socket(family, socket.SOCK_STREAM)
-        connection.settimeout(300)
+        connection.settimeout(timeout)
         try:
             connection.connect(str(self._socket_path))
             return connection, connection.makefile("rwb", buffering=0)
@@ -183,7 +214,7 @@ class DynamicPreviewBackend:
             raise DynamicPreviewUnavailable("preview broker unavailable") from error
 
     def start(self, source_root: Path, preview_id: str,
-              lifetime_seconds: int) -> DynamicPreviewRuntime:
+              lifetime_seconds: int, *, scope: PreviewOwnerScope) -> DynamicPreviewRuntime:
         if self._platform != "linux":
             raise DynamicPreviewUnavailable("dynamic preview requires configured Linux isolation")
         staging = (self.workspace_root / ".preview-staging").resolve()
@@ -191,23 +222,26 @@ class DynamicPreviewBackend:
             raise ValueError("source_root must be a prepared preview staging snapshot")
         connection, stream = self._connect()
         try:
-            write_frame(stream, {"version": 1, "action": "start", "source_root": str(source_root),
-                                 "preview_id": preview_id, "lifetime_seconds": lifetime_seconds})
+            write_frame(stream, {"version": 2, "action": "start", "source_root": str(source_root),
+                                 "preview_id": preview_id, "lifetime_seconds": lifetime_seconds,
+                                 "scope": scope.to_wire()})
             result = read_frame(stream)
             _check_result(result)
-            if set(result) != {"ok", "state", "handle", "source_sha256", "recovery_token"} or result["state"] != "ready":
+            if set(result) != {"ok", "state", "identity", "identity_binding", "recovery_token"} or result["state"] != "ready":
                 raise ValueError("invalid preview start response")
-            handle, digest = result["handle"], result["source_sha256"]
-            if not isinstance(handle, str) or not re.fullmatch("[0-9a-f]{32}", handle):
-                raise ValueError("invalid runtime ownership handle")
-            if not isinstance(digest, str) or not re.fullmatch("[0-9a-f]{64}", digest):
-                raise ValueError("invalid runtime source identity")
+            identity = PreviewIdentityV1.from_wire(result["identity"])
+            if identity.preview_id != preview_id or identity.scope != scope or identity.kind != "dynamic":
+                raise ValueError("invalid runtime owner identity")
+            binding = result["identity_binding"]
+            if not isinstance(binding, str) or re.fullmatch("[0-9a-f]{64}", binding) is None:
+                raise ValueError("invalid runtime identity binding")
             recovery_token = result["recovery_token"]
             if not isinstance(recovery_token, str) or not re.fullmatch("[0-9a-f]{64}", recovery_token):
                 raise ValueError("invalid stop-only recovery proof")
             connection.settimeout(15)
-            return DynamicPreviewRuntime(connection, stream, handle, digest,
-                                         recovery_token=recovery_token, reconnect=self._connect)
+            return DynamicPreviewRuntime(connection, stream, identity, identity_binding=binding,
+                                         recovery_token=recovery_token,
+                                         reconnect=lambda: self._connect(timeout=70))
         except BaseException:
             stream.close()
             connection.close()
@@ -216,9 +250,12 @@ class DynamicPreviewBackend:
     def probe(self) -> None:
         connection, stream = self._connect()
         try:
-            write_frame(stream, {"version": 1, "action": "probe"})
+            write_frame(stream, {"version": 2, "action": "probe"})
             result = read_frame(stream)
-            if result != {"ok": True, "state": "probe"}:
+            if (result != {"ok": True, "state": "probe", "version": 2, "cleanup_schema_version": 1}
+                    or type(result.get("ok")) is not bool
+                    or type(result.get("version")) is not int
+                    or type(result.get("cleanup_schema_version")) is not int):
                 raise DynamicPreviewUnavailable("preview isolation probe failed")
         finally:
             stream.close()

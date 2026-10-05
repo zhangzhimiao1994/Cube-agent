@@ -3,8 +3,10 @@ from __future__ import annotations
 import json
 import os
 import threading
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from uuid import UUID
 
 import pytest
@@ -15,11 +17,17 @@ from agent_hub.previews import (
     PreviewManager,
     PreviewTokenRejected,
 )
+from agent_hub.previews.cleanup import (
+    BrokerCleanupObservation,
+    PreviewIdentityV1,
+    PreviewOwnerScope,
+)
 from agent_hub.previews.dynamic_runtime import (
     DynamicPreviewCleanupError,
     DynamicPreviewResponse,
     DynamicPreviewUnavailable,
 )
+from tests.unit.previews.test_cleanup import broker_observation, identity
 
 TENANT = UUID("10000000-0000-0000-0000-000000000001")
 
@@ -29,6 +37,7 @@ class FakeRuntime:
         self.calls: list[tuple[str, str, tuple[tuple[str, str], ...], bytes]] = []
         self.fail_close = False
         self.closed = False
+        self.identity: PreviewIdentityV1 = identity("dynamic")
         self.response = DynamicPreviewResponse(201, (("content-type", "application/json"),), b"{}")
 
     def request(
@@ -37,10 +46,11 @@ class FakeRuntime:
         self.calls.append((method, target, headers, body))
         return self.response
 
-    def close(self) -> None:
+    def close(self) -> BrokerCleanupObservation:
         if self.fail_close:
             raise DynamicPreviewCleanupError("not stopped")
         self.closed = True
+        return broker_observation(self.identity)
 
 
 class FakeBackend:
@@ -50,12 +60,13 @@ class FakeBackend:
         self.lifetimes: list[int] = []
         self.fail = False
 
-    def start(self, source_root: Path, preview_id: str, lifetime_seconds: int) -> FakeRuntime:
+    def start(self, source_root: Path, preview_id: str, lifetime_seconds: int, *, scope: PreviewOwnerScope) -> FakeRuntime:
         assert preview_id
         self.sources.append(source_root)
         self.lifetimes.append(lifetime_seconds)
         if self.fail:
             raise DynamicPreviewUnavailable("broker unavailable")
+        self.runtime.identity = PreviewIdentityV1.create(preview_id, scope, kind="dynamic", digest="b" * 64, handle="a" * 32)
         return self.runtime
 
 
@@ -118,6 +129,78 @@ def test_missing_dynamic_backend_never_becomes_static_ready(tmp_path: Path) -> N
         assert not backend.sources[0].exists()
 
 
+@pytest.mark.parametrize("returned_runtime", [False, True])
+def test_failed_start_retains_unpublished_cleanup_and_quota(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, returned_runtime: bool,
+) -> None:
+    project(tmp_path)
+
+    class WrongIdentityBackend(FakeBackend):
+        def start(self, source_root: Path, preview_id: str, lifetime_seconds: int,
+                  *, scope: PreviewOwnerScope) -> FakeRuntime:
+            return super().start(source_root, preview_id, lifetime_seconds,
+                                 scope=replace(scope, conversation_id="wrong-conversation"))
+
+    backend = WrongIdentityBackend() if returned_runtime else FakeBackend()
+    backend.fail = not returned_runtime
+    backend.runtime.fail_close = returned_runtime
+    manager = PreviewManager(tmp_path, dynamic_backend=backend, max_active_global=1,
+                             reaper_interval=timedelta(hours=1))
+    original_cleanup = TemporaryDirectory.cleanup
+
+    def fail_snapshot_cleanup(snapshot: TemporaryDirectory[str]) -> None:
+        if Path(snapshot.name).parent == tmp_path / ".preview-staging":
+            raise PermissionError("startup snapshot cleanup fixture")
+        original_cleanup(snapshot)
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(TemporaryDirectory, "cleanup", fail_snapshot_cleanup)
+            with pytest.raises((DynamicPreviewCleanupError, PermissionError)):
+                start(manager)
+            assert len(manager._runtimes) == 1
+            retained = next(iter(manager._runtimes.values()))
+            assert retained.state.identity is None
+            assert retained.state.status == "stopped"
+            assert manager.current(TENANT, "conversation-a") is None
+            assert manager.cleanup_record(retained.state.preview_id) is None
+            assert not manager._receipt_store._records
+            assert backend.sources[0].exists()
+            with pytest.raises(PreviewCapacityExceeded):
+                start(manager, "conversation-b")
+            with pytest.raises(DynamicPreviewCleanupError):
+                start(manager)
+            assert len(backend.sources) == 1
+            with pytest.raises(DynamicPreviewCleanupError):
+                manager.reap_expired()
+            backend.runtime.fail_close = False
+            with pytest.raises(DynamicPreviewCleanupError):
+                manager.reap_expired()
+            assert len(manager._runtimes) == 1
+            assert backend.sources[0].exists()
+        if returned_runtime:
+            rejected_identity = backend.runtime.identity
+            backend.runtime.identity = replace(rejected_identity, runtime_handle="c" * 32)
+            with pytest.raises(DynamicPreviewCleanupError):
+                manager.reap_expired()
+            assert backend.sources[0].exists()
+            assert len(manager._runtimes) == 1
+            backend.runtime.identity = rejected_identity
+        assert manager.reap_expired() == (retained.state.preview_id,)
+        assert not manager._runtimes
+        assert not backend.sources[0].exists()
+        assert not manager._receipt_store._records
+        assert manager.cleanup_record(retained.state.preview_id) is None
+        backend.fail = False
+        backend.runtime.fail_close = False
+        if returned_runtime:
+            manager._dynamic_backend = FakeBackend()
+        assert start(manager, "conversation-b").state.status == "ready"
+    finally:
+        backend.runtime.fail_close = False
+        manager.close()
+
+
 def test_stop_failure_revokes_retains_stage_and_quota_then_reaper_retries(tmp_path: Path) -> None:
     project(tmp_path)
     backend = FakeBackend()
@@ -141,6 +224,53 @@ def test_stop_failure_revokes_retains_stage_and_quota_then_reaper_retries(tmp_pa
     finally:
         backend.runtime.fail_close = False
         manager.close()
+
+
+def test_broker_clean_snapshot_failure_keeps_identity_slot_and_stopped_time(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    project(tmp_path)
+    backend = FakeBackend()
+    now = [datetime.now(UTC)]
+    with PreviewManager(tmp_path, dynamic_backend=backend, max_active_global=1, clock=lambda: now[0]) as manager:
+        launch = start(manager)
+        owned = manager._runtimes[launch.state.preview_id]
+        original = owned.snapshot.cleanup
+        monkeypatch.setattr(owned.snapshot, "cleanup", lambda: (_ for _ in ()).throw(OSError("snapshot fixture")))
+        with pytest.raises(DynamicPreviewCleanupError):
+            manager.stop(launch.state.preview_id)
+        assert backend.runtime.closed and backend.sources[0].exists()
+        stopped = owned.state.stopped_at
+        record = manager.cleanup_record(launch.state.preview_id)
+        assert record is not None and record.cleanup_receipt is not None
+        facts = {f.resource: f.result for f in record.cleanup_receipt.observations}
+        assert facts["owned_directory"] == "absent" and facts["snapshot"] == "unknown"
+        with pytest.raises(PreviewCapacityExceeded):
+            start(manager, "other")
+        now[0] += timedelta(seconds=2)
+        monkeypatch.setattr(owned.snapshot, "cleanup", original)
+        manager.stop(launch.state.preview_id)
+        assert owned.state.stopped_at == stopped
+        final = manager.cleanup_record(launch.state.preview_id)
+        assert final is not None and final.cleanup_receipt is not None
+        assert final.identity == record.identity and final.cleanup_receipt.status == "confirmed"
+        assert final.cleanup_receipt.requested_at > record.cleanup_receipt.requested_at
+
+
+def test_persistence_failure_does_not_defer_cleanup_or_confirm(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    project(tmp_path)
+    backend = FakeBackend()
+    with PreviewManager(tmp_path, dynamic_backend=backend) as manager:
+        launch = start(manager)
+        with monkeypatch.context() as patch:
+            patch.setattr(manager._receipt_store, "put", lambda r: (_ for _ in ()).throw(OSError("disk fixture")))
+            with pytest.raises(DynamicPreviewCleanupError):
+                manager.stop(launch.state.preview_id)
+            assert backend.runtime.closed and not backend.sources[0].exists()
+            record = manager.cleanup_record(launch.state.preview_id)
+            assert record is not None and record.cleanup_receipt is not None
+            assert record.cleanup_receipt.status == "unknown"
+            with pytest.raises(PreviewTokenRejected):
+                manager.app_request(launch.state.preview_id, launch.token, "POST", "/tasks", (), b"x")
+        manager.stop(launch.state.preview_id)
 
 
 @pytest.mark.parametrize(
@@ -394,10 +524,10 @@ def test_stop_conversation_during_preparation_cancels_startup(tmp_path: Path) ->
     release = threading.Event()
 
     class BlockingBackend(FakeBackend):
-        def start(self, source_root: Path, preview_id: str, lifetime_seconds: int) -> FakeRuntime:
+        def start(self, source_root: Path, preview_id: str, lifetime_seconds: int, *, scope: PreviewOwnerScope) -> FakeRuntime:
             entered.set()
             assert release.wait(3)
-            return super().start(source_root, preview_id, lifetime_seconds)
+            return super().start(source_root, preview_id, lifetime_seconds, scope=scope)
 
     backend = BlockingBackend()
     errors: list[BaseException] = []
@@ -430,9 +560,9 @@ def test_reaper_continues_other_tenant_after_cleanup_failure(tmp_path: Path) -> 
     shutil.copytree(session, tmp_path / str(other_tenant) / "projects/project-a/sessions/session-a")
 
     class SeparateBackend(FakeBackend):
-        def start(self, source_root: Path, preview_id: str, lifetime_seconds: int) -> FakeRuntime:
+        def start(self, source_root: Path, preview_id: str, lifetime_seconds: int, *, scope: PreviewOwnerScope) -> FakeRuntime:
             self.runtime = FakeRuntime()
-            return super().start(source_root, preview_id, lifetime_seconds)
+            return super().start(source_root, preview_id, lifetime_seconds, scope=scope)
 
     backend = SeparateBackend()
     now = [datetime(2026, 10, 3, tzinfo=UTC)]

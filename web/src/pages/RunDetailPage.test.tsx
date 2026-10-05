@@ -4,7 +4,7 @@ import { cleanup, render, screen, waitFor, within } from "@testing-library/react
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { api, type RunDetail } from "../api/client";
+import { api, WebPreviewSchema, type RunDetail } from "../api/client";
 import { TestApp } from "../app/router";
 
 const runId = "55555555-5555-4555-8555-555555555555";
@@ -957,12 +957,21 @@ describe("RunDetailPage", () => {
       ],
       artifacts: [htmlArtifact],
     };
-    const preview = {
-      id: "preview-detail",
+    const previewId = "10000000-0000-4000-8000-000000000006";
+    const preview = WebPreviewSchema.parse({
+      id: previewId,
       status: "ready" as const,
-      preview_url: "/api/v1/web-previews/preview-detail/content/",
+      preview_url: `/api/v1/web-previews/${previewId}/content/`,
       lease_expires_at: "2026-09-28T08:30:00Z",
-    };
+      identity: {
+        preview_id: previewId, kind: "static", tenant_id: "33333333-3333-4333-8333-333333333333",
+        user_id: "11111111-1111-4111-8111-111111111111", project_id: "project-detail-preview",
+        conversation_id: "conv-detail-preview", workspace_session_id: "session-detail-preview",
+        runtime_handle: null, source: { scheme: "preview-static-tree-v1", sha256: "b".repeat(64) },
+        display_root: "dist", display_entrypoint: "index.html",
+      },
+      cleanup_url: `/api/v1/web-previews/${previewId}/cleanup`, cleanup_receipt: null,
+    });
     vi.spyOn(api, "webPreviewForConversation").mockResolvedValue(null);
     const start = vi.spyOn(api, "startWebPreview").mockResolvedValue(preview);
     vi.spyOn(api, "renewWebPreview").mockResolvedValue(preview);

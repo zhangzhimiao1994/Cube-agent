@@ -4,7 +4,7 @@ import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { api, type RunDetail } from "../api/client";
+import { api, WebPreviewSchema, type RunDetail } from "../api/client";
 import {
   agentInlineSummary,
   ConversationCheckpointNav,
@@ -36,6 +36,21 @@ import {
   workbenchActionDescriptor,
   workspacePreviewPath,
 } from "./RunsPage";
+
+function websitePreviewFixture(id: string, scope: string, displayRoot = ".") {
+  return WebPreviewSchema.parse({
+    id, status: "ready", preview_url: `/api/v1/web-previews/${id}/content/`,
+    lease_expires_at: "2026-09-28T08:30:00Z",
+    identity: {
+      preview_id: id, kind: "static", tenant_id: "33333333-3333-4333-8333-333333333333",
+      user_id: "11111111-1111-4111-8111-111111111111", project_id: `project-${scope}`,
+      conversation_id: `conv-${scope}`, workspace_session_id: `session-${scope}`,
+      runtime_handle: null, source: { scheme: "preview-static-tree-v1", sha256: "b".repeat(64) },
+      display_root: displayRoot, display_entrypoint: "index.html",
+    },
+    cleanup_url: `/api/v1/web-previews/${id}/cleanup`, cleanup_receipt: null,
+  });
+}
 
 const baseRun: RunDetail = {
   id: "22222222-2222-4222-8222-222222222222",
@@ -969,12 +984,7 @@ describe("WorkbenchFilePreview", () => {
 
   it("starts and stops a website service preview from a workspace HTML file", async () => {
     const user = userEvent.setup();
-    const preview = {
-      id: "preview-1",
-      status: "ready" as const,
-      preview_url: "/api/v1/web-previews/preview-1/content/",
-      lease_expires_at: "2026-09-28T08:30:00Z",
-    };
+    const preview = websitePreviewFixture("10000000-0000-4000-8000-000000000001", "preview", "dist");
     vi.spyOn(api, "webPreviewForConversation").mockResolvedValue(null);
     const start = vi.spyOn(api, "startWebPreview").mockResolvedValue(preview);
     const renew = vi.spyOn(api, "renewWebPreview").mockResolvedValue(preview);
@@ -1020,21 +1030,16 @@ describe("WorkbenchFilePreview", () => {
     });
 
     await user.click(screen.getByRole("button", { name: "在新窗口打开" }));
-    expect(renew).toHaveBeenCalledWith("preview-1");
+    expect(renew).toHaveBeenCalledWith(preview.id);
     expect(open).toHaveBeenCalledWith(preview.preview_url, "_blank", "noopener,noreferrer");
 
     window.dispatchEvent(new PageTransitionEvent("pagehide"));
-    await waitFor(() => expect(stop).toHaveBeenCalledWith("preview-1", { keepalive: true }));
+    await waitFor(() => expect(stop).toHaveBeenCalledWith(preview.id, { keepalive: true }));
     unmount();
   });
 
   it("keeps an active website preview running when its drawer closes", async () => {
-    const preview = {
-      id: "preview-close",
-      status: "ready" as const,
-      preview_url: "/api/v1/web-previews/preview-close/content/",
-      lease_expires_at: "2026-09-28T08:30:00Z",
-    };
+    const preview = websitePreviewFixture("10000000-0000-4000-8000-000000000002", "close");
     vi.spyOn(api, "webPreviewForConversation").mockResolvedValue(preview);
     vi.spyOn(api, "renewWebPreview").mockResolvedValue(preview);
     const stop = vi.spyOn(api, "stopWebPreview").mockResolvedValue({ ...preview, status: "stopped" });
@@ -1069,12 +1074,7 @@ describe("WorkbenchFilePreview", () => {
   });
 
   it("stops the previous website preview when switching conversations", async () => {
-    const preview = {
-      id: "preview-old-conversation",
-      status: "ready" as const,
-      preview_url: "/api/v1/web-previews/preview-old-conversation/content/",
-      lease_expires_at: "2026-09-28T08:30:00Z",
-    };
+    const preview = websitePreviewFixture("10000000-0000-4000-8000-000000000003", "old");
     vi.spyOn(api, "webPreviewForConversation").mockImplementation(async (conversationId) => (
       conversationId === "conv-old" ? preview : null
     ));
@@ -1117,7 +1117,7 @@ describe("WorkbenchFilePreview", () => {
       />,
     );
 
-    await waitFor(() => expect(stop).toHaveBeenCalledWith("preview-old-conversation", { keepalive: false }));
+    await waitFor(() => expect(stop).toHaveBeenCalledWith(preview.id, { keepalive: false }));
     await waitFor(() => expect(api.webPreviewForConversation).toHaveBeenCalledWith("conv-new"));
   });
 
@@ -1127,12 +1127,7 @@ describe("WorkbenchFilePreview", () => {
     const startPromise = new Promise<Awaited<ReturnType<typeof api.startWebPreview>>>((resolve) => {
       resolveStart = resolve;
     });
-    const preview = {
-      id: "preview-late",
-      status: "ready" as const,
-      preview_url: "/api/v1/web-previews/preview-late/content/",
-      lease_expires_at: "2026-09-28T08:30:00Z",
-    };
+    const preview = websitePreviewFixture("10000000-0000-4000-8000-000000000004", "late");
     vi.spyOn(api, "webPreviewForConversation").mockResolvedValue(null);
     vi.spyOn(api, "startWebPreview").mockReturnValue(startPromise);
     const stop = vi.spyOn(api, "stopWebPreview").mockResolvedValue({ ...preview, status: "stopped" });
@@ -1164,16 +1159,11 @@ describe("WorkbenchFilePreview", () => {
     unmount();
     resolveStart(preview);
 
-    await waitFor(() => expect(stop).toHaveBeenCalledWith("preview-late", { keepalive: false }));
+    await waitFor(() => expect(stop).toHaveBeenCalledWith(preview.id, { keepalive: false }));
   });
 
   it("keeps an active website preview alive when pagehide enters the back-forward cache", async () => {
-    const preview = {
-      id: "preview-bfcache",
-      status: "ready" as const,
-      preview_url: "/api/v1/web-previews/preview-bfcache/content/",
-      lease_expires_at: "2026-09-28T08:30:00Z",
-    };
+    const preview = websitePreviewFixture("10000000-0000-4000-8000-000000000005", "bfcache");
     vi.spyOn(api, "webPreviewForConversation").mockResolvedValue(preview);
     const stop = vi.spyOn(api, "stopWebPreview").mockResolvedValue({ ...preview, status: "stopped" });
     const { unmount } = render(

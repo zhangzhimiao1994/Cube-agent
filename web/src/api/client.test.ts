@@ -1936,6 +1936,35 @@ describe("api client transport", () => {
 });
 
 describe("web preview transport", () => {
+  const identity = {
+    preview_id: "10000000-0000-4000-8000-000000000001", kind: "static",
+    tenant_id: "20000000-0000-4000-8000-000000000001",
+    user_id: "30000000-0000-4000-8000-000000000001", project_id: "project-a",
+    conversation_id: "conversation-a", workspace_session_id: "session-a",
+    runtime_handle: null, source: { scheme: "preview-static-tree-v1", sha256: "b".repeat(64) },
+    display_root: "dist", display_entrypoint: "index.html",
+  };
+
+  it("retains identity and nullable proof and does not hide missing cleanup records", async () => {
+    const record = { identity, cleanup_receipt: null, retention_expires_at: null };
+    const fetchMock = vi.fn().mockResolvedValueOnce(new Response(JSON.stringify(record)))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ error: { code: "preview_not_found", message: "not found" } }), { status: 404 }));
+    vi.stubGlobal("fetch", fetchMock);
+    await expect(api.getWebPreviewCleanup(identity.preview_id)).resolves.toEqual(record);
+    await expect(api.getWebPreviewCleanup(identity.preview_id)).rejects.toMatchObject({ status: 404 });
+    expect(String(fetchMock.mock.calls[0]?.[0])).toContain(`/web-previews/${identity.preview_id}/cleanup`);
+  });
+
+  it("rejects a fabricated confirmed summary, extra fields and incomplete coverage", async () => {
+    const { CleanupReceiptV1Schema, PreviewIdentityV1Schema } = await import("./client");
+    expect(PreviewIdentityV1Schema.safeParse({ ...identity, token: "private" }).success).toBe(false);
+    expect(PreviewIdentityV1Schema.safeParse({ ...identity, display_root: "../outside" }).success).toBe(false);
+    const receipt = { schema_version: 1, identity, observation_id: identity.preview_id,
+      requested_at: "2026-10-05T01:00:00Z", observed_at: "2026-10-05T01:00:01Z",
+      reason: "explicit", status: "confirmed", coverage: "static-loopback-v1", observations: [], unobserved: [] };
+    expect(CleanupReceiptV1Schema.safeParse(receipt).success).toBe(false);
+    expect(CleanupReceiptV1Schema.safeParse({ ...receipt, schema_version: true }).success).toBe(false);
+  });
   it.each([new TypeError("terminated"), new DOMException("aborted", "AbortError")])(
     "classifies an interrupted response body as a network error",
     async (error) => {
@@ -1955,10 +1984,13 @@ describe("web preview transport", () => {
 
   it("supports starting, reading, renewing, and stopping a conversation preview", async () => {
     const preview = {
-      id: "preview-1",
+      id: identity.preview_id,
       status: "ready",
       preview_url: "/api/v1/web-previews/preview-1/content/",
       lease_expires_at: "2026-09-28T08:30:00Z",
+      identity,
+      cleanup_url: `/api/v1/web-previews/${identity.preview_id}/cleanup`,
+      cleanup_receipt: null,
     };
     const response = () =>
       new Response(JSON.stringify(preview), {

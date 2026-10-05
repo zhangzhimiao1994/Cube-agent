@@ -14,6 +14,115 @@ from typing import Any
 
 import pytest
 
+from tests.unit.previews.test_cleanup import broker_observation, identity
+
+
+def test_v2_rejects_legacy_stopped_as_receipt() -> None:
+    mod = runtime()
+    client, server = socket.socketpair()
+
+    def serve() -> None:
+        with server, server.makefile("rwb", buffering=0) as stream:
+            mod.read_frame(stream)
+            mod.write_frame(stream, {"ok": True, "state": "stopped"})
+
+    worker = threading.Thread(target=serve, daemon=True)
+    worker.start()
+    app = mod.DynamicPreviewRuntime(client, client.makefile("rwb", buffering=0), identity("dynamic"),
+                                    identity_binding="d" * 64)
+    try:
+        with pytest.raises(mod.DynamicPreviewCleanupError):
+            app.close()
+        assert not app._closed
+    finally:
+        client.close()
+        worker.join(timeout=2)
+
+
+@pytest.mark.parametrize("reply", [
+    {"ok": True, "state": "probe"},
+    {"ok": True, "state": "probe", "version": 2, "cleanup_schema_version": True},
+    {"ok": True, "state": "probe", "version": 2.0, "cleanup_schema_version": 1},
+    {"ok": 1, "state": "probe", "version": 2, "cleanup_schema_version": 1},
+])
+def test_probe_requires_explicit_v2_receipt_capability(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reply: dict[str, object],
+) -> None:
+    mod = runtime()
+    client, server = socket.socketpair()
+    backend = mod.DynamicPreviewBackend(workspace_root=tmp_path, platform="linux")
+    monkeypatch.setattr(backend, "_connect", lambda: (client, client.makefile("rwb", buffering=0)))
+
+    def serve() -> None:
+        with server, server.makefile("rwb", buffering=0) as stream:
+            mod.read_frame(stream)
+            mod.write_frame(stream, reply)
+
+    worker = threading.Thread(target=serve, daemon=True)
+    worker.start()
+    try:
+        with pytest.raises(mod.DynamicPreviewUnavailable):
+            backend.probe()
+    finally:
+        client.close()
+        worker.join(timeout=2)
+
+
+@pytest.mark.parametrize("field,value", [
+    ("preview_id", "90000000-0000-0000-0000-000000000001"),
+    ("tenant_id", "90000000-0000-0000-0000-000000000001"),
+    ("user_id", None), ("project_id", "other"), ("conversation_id", "other"),
+    ("workspace_session_id", "other"), ("runtime_handle", "c" * 32),
+    ("source_sha256", "c" * 64), ("display_root", "other"), ("display_entrypoint", "other.html"),
+])
+def test_cleanup_compares_every_frozen_identity_field(field: str, value: object) -> None:
+    from dataclasses import replace
+    mod = runtime()
+    client, server = socket.socketpair()
+    stream = client.makefile("rwb", buffering=0)
+    app = mod.DynamicPreviewRuntime(client, stream, identity("dynamic"), identity_binding="d" * 64)
+    changed = replace(identity("dynamic"), **{field: value})
+    try:
+        with pytest.raises(ValueError, match="identity"):
+            app._cleanup_result({"ok": True, "state": "stopped", "observation": broker_observation(changed).to_wire()})
+        assert not app._closed
+    finally:
+        stream.close()
+        client.close()
+        server.close()
+
+
+def test_close_caches_exact_success_and_returns_validated_partial() -> None:
+    from datetime import UTC, datetime
+
+    from tests.unit.previews.test_cleanup import contract
+    mod = runtime()
+    client, server = socket.socketpair()
+    partial = contract().BrokerCleanupObservation.create(identity("dynamic"), (), requested_at=datetime.now(UTC))
+    final = broker_observation()
+    seen: list[dict[str, object]] = []
+
+    def serve() -> None:
+        with server, server.makefile("rwb", buffering=0) as stream:
+            seen.append(mod.read_frame(stream))
+            mod.write_frame(stream, {"ok": False, "state": "cleanup_pending", "observation": partial.to_wire()})
+            seen.append(mod.read_frame(stream))
+            mod.write_frame(stream, {"ok": True, "state": "stopped", "observation": final.to_wire()})
+
+    worker = threading.Thread(target=serve, daemon=True)
+    worker.start()
+    app = mod.DynamicPreviewRuntime(client, client.makefile("rwb", buffering=0), identity("dynamic"), identity_binding="d" * 64)
+    try:
+        with pytest.raises(mod.DynamicPreviewCleanupError) as error:
+            app.close()
+        assert error.value.observation == partial
+        assert app.close() == final
+        assert app.close() == final
+        assert len(seen) == 2
+    finally:
+        client.close()
+        worker.join(timeout=2)
+
 
 def runtime() -> Any:
     assert importlib.util.find_spec("agent_hub.previews.dynamic_runtime"), "Task1 runtime missing"
@@ -127,7 +236,7 @@ def test_windows_never_connects_or_executes_generated_code(tmp_path: Path) -> No
     mod = runtime()
     backend = mod.DynamicPreviewBackend(workspace_root=tmp_path, platform="win32")
     with pytest.raises(mod.DynamicPreviewUnavailable, match="Linux"):
-        backend.start(tmp_path, "fixture", 30)
+        backend.start(tmp_path, "fixture", 30, scope=identity("dynamic").scope)
 
 
 def test_response_rejects_malformed_wire_types_and_bounds() -> None:
@@ -155,11 +264,11 @@ def test_stop_failure_revokes_requests_and_retains_owned_retry() -> None:
             seen.append(mod.read_frame(stream))
             mod.write_frame(stream, {"ok": False, "error": "cleanup fixture"})
             seen.append(mod.read_frame(stream))
-            mod.write_frame(stream, {"ok": True, "state": "stopped"})
+            mod.write_frame(stream, {"ok": True, "state": "stopped", "observation": broker_observation().to_wire()})
 
     worker = threading.Thread(target=serve)
     worker.start()
-    app = mod.DynamicPreviewRuntime(client, client.makefile("rwb", buffering=0), "a" * 32, "b" * 64)
+    app = mod.DynamicPreviewRuntime(client, client.makefile("rwb", buffering=0), identity("dynamic"), identity_binding="d" * 64)
     try:
         with pytest.raises(mod.DynamicPreviewCleanupError):
             app.close()
@@ -186,11 +295,11 @@ def test_runtime_rejects_extra_wire_fields_and_never_replays_write() -> None:
                 "status_code": 200, "headers": [], "body": "",
             }})
             seen.append(mod.read_frame(stream))
-            mod.write_frame(stream, {"ok": True, "state": "stopped"})
+            mod.write_frame(stream, {"ok": True, "state": "stopped", "observation": broker_observation().to_wire()})
 
     worker = threading.Thread(target=serve)
     worker.start()
-    app = mod.DynamicPreviewRuntime(client, client.makefile("rwb", buffering=0), "a" * 32, "b" * 64)
+    app = mod.DynamicPreviewRuntime(client, client.makefile("rwb", buffering=0), identity("dynamic"), identity_binding="d" * 64)
     try:
         with pytest.raises(mod.DynamicPreviewUnavailable):
             app.request("POST", "/tasks", (), b"fixture")
@@ -210,13 +319,13 @@ def test_close_recovers_confirmed_stop_after_transport_disconnect() -> None:
     def serve() -> None:
         with server, server.makefile("rwb", buffering=0) as stream:
             seen.append(mod.read_frame(stream))
-            mod.write_frame(stream, {"ok": True, "state": "stopped"})
+            mod.write_frame(stream, {"ok": True, "state": "stopped", "observation": broker_observation().to_wire()})
 
     worker = threading.Thread(target=serve)
     worker.start()
     try:
         app = mod.DynamicPreviewRuntime(
-            client, client.makefile("rwb", buffering=0), "a" * 32, "b" * 64,
+            client, client.makefile("rwb", buffering=0), identity("dynamic"), identity_binding="d" * 64,
             recovery_token="c" * 64, reconnect=lambda: (fresh, fresh.makefile("rwb", buffering=0)),
         )
         app.close()
@@ -226,8 +335,9 @@ def test_close_recovers_confirmed_stop_after_transport_disconnect() -> None:
         fresh.close()
         server.close()
         worker.join(timeout=2)
-    assert seen == [{"version": 1, "action": "recover_stop", "handle": "a" * 32,
-                     "recovery_token": "c" * 64}]
+    assert seen == [{"version": 2, "action": "recover_stop", "handle": "a" * 32,
+                     "recovery_token": "c" * 64, "identity": identity("dynamic").to_wire(),
+                     "identity_binding": "d" * 64}]
 
 
 def test_failed_recovery_never_reports_closed() -> None:
@@ -239,7 +349,7 @@ def test_failed_recovery_never_reports_closed() -> None:
         raise mod.DynamicPreviewUnavailable("fixture unavailable")
 
     app = mod.DynamicPreviewRuntime(
-        client, client.makefile("rwb", buffering=0), "a" * 32, "b" * 64,
+        client, client.makefile("rwb", buffering=0), identity("dynamic"), identity_binding="d" * 64,
         recovery_token="c" * 64, reconnect=unavailable,
     )
     try:

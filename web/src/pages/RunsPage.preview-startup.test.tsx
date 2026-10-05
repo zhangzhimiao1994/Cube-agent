@@ -1,14 +1,23 @@
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { ApiError, api, type WebPreview } from "../api/client";
+import { ApiError, api, WebPreviewSchema, type WebPreview } from "../api/client";
 import { WebsiteServicePreview } from "./RunsPage";
 
 const scope = { conversationId: "conv-preview", projectId: "project", workspaceSessionId: "session" };
-const ready: WebPreview = {
-  id: "preview-1", status: "ready", preview_url: "/api/v1/web-previews/preview-1/content/",
+const previewId = "10000000-0000-4000-8000-000000000007";
+const ready: WebPreview = WebPreviewSchema.parse({
+  id: previewId, status: "ready", preview_url: `/api/v1/web-previews/${previewId}/content/`,
   lease_expires_at: "2026-10-04T12:00:00Z", application_transport: true,
-};
+  identity: {
+    preview_id: previewId, kind: "dynamic", tenant_id: "33333333-3333-4333-8333-333333333333",
+    user_id: "11111111-1111-4111-8111-111111111111", project_id: scope.projectId,
+    conversation_id: scope.conversationId, workspace_session_id: scope.workspaceSessionId,
+    runtime_handle: "a".repeat(32), source: { scheme: "preview-broker-tree-v2", sha256: "b".repeat(64) },
+    display_root: ".", display_entrypoint: "index.html",
+  },
+  cleanup_url: `/api/v1/web-previews/${previewId}/cleanup`, cleanup_receipt: null,
+});
 const networkError = () => new ApiError("network request failed", 0, "network_error");
 function deferred<T>() {
   let resolve!: (value: T) => void;

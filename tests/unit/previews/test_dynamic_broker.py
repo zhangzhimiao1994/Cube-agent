@@ -63,6 +63,195 @@ def test_uid_and_snapshot_identity_are_fixed(tmp_path: Path) -> None:
         mod.validate_broker_request(request, peer_uid=policy.allowed_uid, policy=policy)
 
 
+def test_source_identity_frames_embedded_nul_records(tmp_path: Path) -> None:
+    mod = broker()
+    root, policy = prepared(tmp_path)
+    (root / "a").write_bytes(b"X\0b\0file\0Y")
+    single = mod.inspect_source(root, policy)
+    (root / "a").write_bytes(b"X")
+    (root / "b").write_bytes(b"Y")
+    assert mod.inspect_source(root, policy) != single
+
+
+def receipt_session(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Any, Any, list[str]]:
+    from dataclasses import replace
+
+    from tests.unit.previews.test_cleanup import identity
+    mod = broker()
+    _, policy = prepared(tmp_path)
+    root = tmp_path / "owned"
+    root.mkdir()
+    service = mod.PreviewBroker(replace(policy, runtime_root=root))
+    session = service._reserve(identity("dynamic").preview_id, object(), 30)
+    session.identity = replace(identity("dynamic"), runtime_handle=session.handle)
+    session.mount_unit = "fixture.mount"
+    cgroups = tmp_path / "cgroups/system.slice"
+    cgroups.mkdir(parents=True)
+    metadata = dict.fromkeys((session.owned, root, cgroups, *cgroups.parents), (0, stat.S_IFDIR | 0o755))
+    linux_metadata(monkeypatch, metadata)
+    monkeypatch.setattr(mod, "_CGROUP_ROOT", cgroups)
+    seen: list[str] = []
+
+    def command(argv: tuple[str, ...]) -> subprocess.CompletedProcess[bytes]:
+        if argv[0] == "/usr/bin/systemd-escape":
+            return subprocess.CompletedProcess(argv, 0, b"fixture.mount\n")
+        seen.append(argv[2])
+        data = b""
+        if argv[1] == "show":
+            data = f"Id={argv[2]}\nLoadState=not-found\nActiveState=inactive\n".encode()
+            if argv[2].endswith(".service"):
+                data += b"MainPID=0\nControlGroup=\n"
+        return subprocess.CompletedProcess(argv, 0, data)
+
+    monkeypatch.setattr(service, "_command", command)
+    return service, session, seen
+
+
+def test_v2_stop_observes_four_stages_and_caches_same_attempt(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    service, session, seen = receipt_session(tmp_path, monkeypatch)
+    request = {"version": 2, "action": "stop", "handle": session.handle}
+    result = service.handle(request, peer_uid=service.policy.allowed_uid, owner=session.owner)
+    assert result["observation"]["status"] == "confirmed"
+    assert set(seen) == {"fixture.mount", *(f"agent-hub-preview-{session.handle}-{s}.service"
+                                          for s in ("build", "install", "probe", "start"))}
+    assert service.handle(request, peer_uid=service.policy.allowed_uid, owner=session.owner) == result
+    with pytest.raises(ValueError, match="ownership"):
+        service.handle(request, peer_uid=service.policy.allowed_uid, owner=object())
+
+
+def test_v2_recovery_requires_original_identity_binding(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    service, session, _ = receipt_session(tmp_path, monkeypatch)
+    request = {"version": 2, "action": "recover_stop", "handle": session.handle,
+               "recovery_token": service._recovery_token(session.handle),
+               "identity": session.identity.to_wire(), "identity_binding": "0" * 64}
+    with pytest.raises(ValueError, match="binding"):
+        service.handle(request, peer_uid=service.policy.allowed_uid, owner=object())
+    request["identity_binding"] = service._identity_binding(session.identity)
+    result = service.handle(request, peer_uid=service.policy.allowed_uid, owner=object())
+    assert result["observation"]["identity"] == session.identity.to_wire()
+    assert result["observation"]["status"] == "confirmed"
+
+
+def test_v2_partial_failure_retains_successful_facts_and_quota(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    service, session, _ = receipt_session(tmp_path, monkeypatch)
+    original = service._stop_storage
+    monkeypatch.setattr(service, "_stop_storage", lambda s: (_ for _ in ()).throw(OSError("fixture")))
+    request = {"version": 2, "action": "stop", "handle": session.handle}
+    failed = service.handle(request, peer_uid=service.policy.allowed_uid, owner=session.owner)
+    assert failed["ok"] is False
+    assert failed["observation"]["status"] == "unknown"
+    facts = {f["resource"]: f for f in failed["observation"]["observations"]}
+    assert facts["cgroup_start"]["result"] == "absent"
+    assert session.handle in service._sessions and session.owned.is_dir()
+    monkeypatch.setattr(service, "_stop_storage", original)
+    succeeded = service.handle(request, peer_uid=service.policy.allowed_uid, owner=session.owner)
+    assert succeeded["observation"]["status"] == "confirmed"
+    assert succeeded["observation"]["observation_id"] != failed["observation"]["observation_id"]
+
+
+def test_v2_directory_guard_failure_keeps_partial_observations(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    service, session, _ = receipt_session(tmp_path, monkeypatch)
+    monkeypatch.setattr(broker(), "_require_root_path", lambda p: (_ for _ in ()).throw(ValueError("owner fixture")))
+    result = service.handle({"version": 2, "action": "stop", "handle": session.handle},
+                            peer_uid=service.policy.allowed_uid, owner=session.owner)
+    assert result["ok"] is False
+    facts = {f["resource"]: f for f in result["observation"]["observations"]}
+    assert facts["work_path"]["result"] == "absent"
+    assert facts["owned_directory"]["result"] == "unknown"
+    assert facts["owned_directory"]["reason_code"] == "observation_failed"
+    assert session.handle in service._sessions
+
+
+def test_v2_cleanup_command_timeouts_share_sixty_second_budget(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from types import SimpleNamespace
+    mod = broker()
+    service, session, _ = receipt_session(tmp_path, monkeypatch)
+    clock = [0.0]
+    seen: list[float] = []
+    monkeypatch.setattr(mod, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+
+    def command(argv: tuple[str, ...], **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+        assert kwargs["timeout"] <= 60 - clock[0]
+        seen.append(kwargs["timeout"])
+        clock[0] += kwargs["timeout"]
+        output = b""
+        if argv[1] == "show":
+            output = f"Id={argv[2]}\nLoadState=not-found\nActiveState=inactive\nMainPID=0\nControlGroup=\n".encode()
+        return subprocess.CompletedProcess(argv, 0, output)
+
+    monkeypatch.setattr(service, "_command", mod.PreviewBroker._command)
+    monkeypatch.setattr(mod.subprocess, "run", command)
+    result = service.handle({"version": 2, "action": "stop", "handle": session.handle},
+                            peer_uid=service.policy.allowed_uid, owner=session.owner)
+    assert clock[0] <= 60 and len(seen) <= 6
+    assert result["observation"]["status"] == "unknown"
+    assert "budget_exhausted" in {f["reason_code"] for f in result["observation"]["observations"]}
+    assert session.handle in service._sessions
+
+
+def test_v2_restart_reobserves_legacy_tombstone_and_retains_failed_recovery(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    service, session, seen = receipt_session(tmp_path, monkeypatch)
+    request = {"version": 2, "action": "recover_stop", "handle": session.handle,
+               "recovery_token": service._recovery_token(session.handle),
+               "identity": session.identity.to_wire(), "identity_binding": service._identity_binding(session.identity)}
+    service._sessions.clear()
+    service._remember_stopped(session.handle, object())
+    original = service._stop_storage
+    monkeypatch.setattr(service, "_stop_storage", lambda s: (_ for _ in ()).throw(OSError("mount fixture")))
+    result = service.handle(request, peer_uid=service.policy.allowed_uid, owner=object())
+    assert result["ok"] is False
+    assert service._sessions[session.handle].identity == session.identity
+    assert any(name.endswith("-install.service") for name in seen)
+    monkeypatch.setattr(service, "_stop_storage", original)
+    assert service.handle(request, peer_uid=service.policy.allowed_uid, owner=object())["ok"] is True
+
+
+def test_v2_present_mount_is_reported_as_present_not_unknown(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    service, session, _ = receipt_session(tmp_path, monkeypatch)
+    monkeypatch.setattr(broker(), "_owned_storage_mounted", lambda p: True)
+    result = service.handle({"version": 2, "action": "stop", "handle": session.handle},
+                            peer_uid=service.policy.allowed_uid, owner=session.owner)
+    facts = {f["resource"]: f for f in result["observation"]["observations"]}
+    assert facts["mount_unit"]["result"] == "inactive"
+    assert facts["work_path"]["result"] == "present"
+    assert session.owned.is_dir()
+
+
+def test_v2_cleanup_lock_wait_is_bounded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    service, session, seen = receipt_session(tmp_path, monkeypatch)
+
+    class BusyLock:
+        def acquire(self, *, timeout: float) -> bool:
+            assert 0 < timeout <= 60
+            return False
+
+        def __enter__(self) -> None:
+            raise AssertionError("cleanup must not wait without a deadline")
+
+        def __exit__(self, *args: object) -> None:
+            pass
+
+    session.lock = BusyLock()
+    service._stop(session)
+    assert session.observation.status == "unknown"
+    assert not seen and session.handle in service._sessions
+
+
+def test_legacy_recovery_failure_also_reserves_retry_accounting(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    mod = broker()
+    _, policy = prepared(tmp_path)
+    service = mod.PreviewBroker(policy)
+    handle = "a" * 32
+    monkeypatch.setattr(service, "_stop_unit", lambda u: (_ for _ in ()).throw(RuntimeError("unit fixture")))
+    monkeypatch.setattr(service, "_stop_storage", lambda s: None)
+    with pytest.raises(RuntimeError):
+        service._recover_stop(handle, service._recovery_token(handle), object())
+    assert handle in service._sessions
+    assert service._sessions[handle].identity is None
+    monkeypatch.setattr(service, "_stop_unit", lambda u: None)
+    assert service._recover_stop(handle, service._recovery_token(handle), object()) == {"ok": True, "state": "stopped"}
+
+
 @pytest.mark.parametrize("name,content", [
     (".npmrc", "registry=evil"), ("node_modules/x", "evil"), (".env", "sentinel"),
     ("package.json", '{}'), ("package.json", '{"scripts":{"start":3}}'),

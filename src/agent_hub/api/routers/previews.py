@@ -10,12 +10,12 @@ import re
 import threading
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Annotated, Literal, Protocol, cast
+from typing import Annotated, Literal, Protocol, Self, cast
 from urllib.parse import quote
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Request, Response, status
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from agent_hub.api.dependencies import require_permission
 from agent_hub.api.errors import PublicAPIError, error_responses
@@ -29,6 +29,7 @@ from agent_hub.previews import (
     PreviewState,
     PreviewTokenRejected,
 )
+from agent_hub.previews.cleanup import CleanupReceiptV1, PreviewCleanupRecord, PreviewIdentityV1
 from agent_hub.previews.dynamic_runner import json_object
 from agent_hub.previews.dynamic_runtime import (
     DynamicPreviewCleanupError,
@@ -128,6 +129,33 @@ class WebPreviewResponse(BaseModel):
     preview_url: str | None
     lease_expires_at: datetime | None
     application_transport: bool = False
+    identity: dict[str, object]
+    cleanup_url: str
+    cleanup_receipt: dict[str, object] | None = None
+
+    @model_validator(mode="after")
+    def validate_cleanup(self) -> Self:
+        identity = PreviewIdentityV1.from_wire(self.identity)
+        if identity.preview_id != self.id or self.cleanup_url != _cleanup_url(self.id):
+            raise ValueError("preview response identity mismatch")
+        if self.cleanup_receipt is not None:
+            receipt = CleanupReceiptV1.from_wire(self.cleanup_receipt)
+            if receipt.identity != identity:
+                raise ValueError("preview receipt identity mismatch")
+        return self
+
+
+class WebPreviewCleanupResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    identity: dict[str, object]
+    cleanup_receipt: dict[str, object] | None
+    retention_expires_at: str | None
+
+    @model_validator(mode="after")
+    def validate_record(self) -> Self:
+        PreviewCleanupRecord.from_wire(self.model_dump())
+        return self
 
 
 class ApplicationRequest(BaseModel):
@@ -193,6 +221,7 @@ class WebPreviewService:
             project_id=project_id,
             session_id=session_id,
             root=root,
+            user_id=user_id,
         )
         with self._lock:
             current = self._manager.current(tenant_id, launch.state.conversation_id)
@@ -242,10 +271,36 @@ class WebPreviewService:
     def stop(
         self, tenant_id: UUID, preview_id: str, user_id: UUID | None = None
     ) -> WebPreviewResponse:
-        access = self._owned_access(tenant_id, preview_id, user_id)
-        state = self._manager.stop(preview_id)
-        self._forget(preview_id, access)
-        return _public_response(state)
+        try:
+            access = self._owned_access(tenant_id, preview_id, user_id)
+        except PreviewNotFound:
+            record = self.cleanup(tenant_id, preview_id, user_id)
+            receipt = record.cleanup_receipt
+            if receipt is not None and receipt.status == "confirmed":
+                return WebPreviewResponse(id=preview_id,
+                    status="expired" if receipt.reason == "expired" else "stopped",
+                    preview_url=None, lease_expires_at=None,
+                    application_transport=record.identity.kind == "dynamic",
+                    identity=record.identity.to_wire(), cleanup_url=_cleanup_url(preview_id),
+                    cleanup_receipt=receipt.to_wire())
+            access = None
+        try:
+            state = self._manager.stop(preview_id)
+        except PreviewNotFound:
+            raise DynamicPreviewCleanupError("historical preview cleanup remains unknown") from None
+        final_record = self._manager.cleanup_record(preview_id)
+        if final_record is None or final_record.cleanup_receipt is None or final_record.cleanup_receipt.status != "confirmed":
+            raise DynamicPreviewCleanupError("preview cleanup evidence unavailable")
+        if access is not None:
+            self._forget(preview_id, access)
+        return _public_response(state, final_record.cleanup_receipt)
+
+    def cleanup(self, tenant_id: UUID, preview_id: str, user_id: UUID | None) -> PreviewCleanupRecord:
+        record = self._manager.cleanup_record(preview_id)
+        if (record is None or user_id is None or record.identity.user_id != str(user_id)
+                or record.identity.tenant_id != str(tenant_id)):
+            raise PreviewNotFound("preview does not exist")
+        return record
 
     def app_request(
         self,
@@ -479,17 +534,26 @@ async def _authorize_preview_scope(
         )
 
 
-def _public_response(state: PreviewState) -> WebPreviewResponse:
+def _cleanup_url(preview_id: str) -> str:
+    return f"/api/v1/web-previews/{quote(preview_id, safe='')}/cleanup"
+
+
+def _public_response(state: PreviewState, receipt: CleanupReceiptV1 | None = None) -> WebPreviewResponse:
     preview_url = None
     if state.status == "ready":
         preview_id = quote(state.preview_id, safe="")
         preview_url = f"/api/v1/web-previews/{preview_id}/content/"
+    if state.identity is None:
+        raise DynamicPreviewCleanupError("preview identity missing")
     return WebPreviewResponse(
         id=state.preview_id,
         status=state.status,
         preview_url=preview_url,
         lease_expires_at=state.lease_expires_at,
         application_transport=state.application_transport,
+        identity=state.identity.to_wire(),
+        cleanup_url=_cleanup_url(state.preview_id),
+        cleanup_receipt=receipt.to_wire() if receipt else None,
     )
 
 
@@ -627,6 +691,22 @@ async def renew_web_preview(
         )
     except (PreviewNotFound, PreviewTokenRejected, DynamicPreviewCleanupError, ValueError) as error:
         raise _preview_error(error) from error
+
+
+@router.get("/{preview_id}/cleanup", response_model=WebPreviewCleanupResponse)
+async def get_web_preview_cleanup(
+    preview_id: str,
+    response: Response,
+    service: Annotated[WebPreviewService, Depends(_preview_service)],
+    principal: Annotated[AuthenticatedPrincipal, Depends(require_permission("run:read"))],
+) -> WebPreviewCleanupResponse:
+    headers = {"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"}
+    try:
+        record = await asyncio.to_thread(service.cleanup, principal.tenant_id, preview_id, principal.user_id)
+    except PreviewNotFound:
+        raise PublicAPIError(404, "preview_not_found", "preview was not found", headers=headers) from None
+    response.headers.update(headers)
+    return WebPreviewCleanupResponse.model_validate(record.to_wire())
 
 
 @router.delete(

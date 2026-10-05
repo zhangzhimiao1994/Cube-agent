@@ -19,7 +19,13 @@ from agent_hub.app import create_app
 from agent_hub.auth.models import AuthenticatedPrincipal, InvalidCredentials, Role
 from agent_hub.previews import PreviewLaunch, PreviewManager, PreviewNotFound
 from agent_hub.previews import bridge as preview_bridge
+from agent_hub.previews.cleanup import (
+    BrokerCleanupObservation,
+    PreviewIdentityV1,
+    PreviewOwnerScope,
+)
 from agent_hub.previews.dynamic_runtime import DynamicPreviewResponse
+from tests.unit.previews.test_cleanup import broker_observation, identity
 
 
 class StubAuthService:
@@ -62,6 +68,88 @@ class StubConversationService:
 
 def _bearer() -> dict[str, str]:
     return {"Authorization": "Bearer valid-token"}
+
+
+def test_owner_cleanup_get_and_repeated_delete_preserve_final_receipt(
+    preview_client: tuple[TestClient, AuthenticatedPrincipal, StubConversationService],
+) -> None:
+    client, principal, conversations = preview_client
+    started = client.post("/api/v1/web-previews/start", headers=_bearer(), json={
+        "conversation_id": "conv-preview", "project_id": "project-preview",
+        "workspace_session_id": "session-preview", "root": "dist",
+    })
+    assert started.status_code == 201
+    payload = started.json()
+    assert payload["identity"]["user_id"] == str(principal.user_id)
+    url = payload["cleanup_url"]
+    assert client.get(url, headers=_bearer()).json()["cleanup_receipt"] is None
+    deleted = client.delete(f'/api/v1/web-previews/{payload["id"]}', headers=_bearer())
+    assert deleted.status_code == 200
+    receipt = deleted.json()["cleanup_receipt"]
+    assert receipt["status"] == "confirmed"
+    conversations.archived_at = datetime.now(UTC)
+    fetched = client.get(url, headers=_bearer())
+    assert fetched.status_code == 200
+    assert fetched.headers["cache-control"] == "no-store"
+    assert fetched.headers["referrer-policy"] == "no-referrer"
+    assert fetched.json()["cleanup_receipt"] == receipt
+    assert client.delete(f'/api/v1/web-previews/{payload["id"]}', headers=_bearer()).json()[
+        "cleanup_receipt"
+    ] == receipt
+
+
+@pytest.mark.parametrize("foreign_tenant", [False, True])
+def test_cleanup_record_owner_is_exact_and_non_enumerating(
+    preview_client: tuple[TestClient, AuthenticatedPrincipal, StubConversationService], foreign_tenant: bool,
+) -> None:
+    client, principal, _ = preview_client
+    started = client.post("/api/v1/web-previews/start", headers=_bearer(), json={
+        "conversation_id": "conv-preview", "project_id": "project-preview",
+        "workspace_session_id": "session-preview", "root": "dist",
+    }).json()
+    app = cast(FastAPI, client.app)
+    app.state.auth_service.principal = AuthenticatedPrincipal(uuid4(), uuid4() if foreign_tenant else principal.tenant_id, Role.OPERATOR)
+    denied = client.get(started["cleanup_url"], headers=_bearer())
+    missing = client.get(f"/api/v1/web-previews/{uuid4()}/cleanup", headers=_bearer())
+    assert denied.status_code == missing.status_code == 404
+    assert denied.json() == missing.json()
+    assert denied.headers["cache-control"] == "no-store"
+    assert "set-cookie" not in denied.headers
+    app.state.auth_service.principal = principal
+
+
+def test_api_restart_preserves_final_receipt_without_live_access(
+    preview_client: tuple[TestClient, AuthenticatedPrincipal, StubConversationService], tmp_path: Path,
+) -> None:
+    client, _, _ = preview_client
+    payload = client.post("/api/v1/web-previews/start", headers=_bearer(), json={
+        "conversation_id": "conv-preview", "project_id": "project-preview",
+        "workspace_session_id": "session-preview", "root": "dist",
+    }).json()
+    deleted = client.delete(f'/api/v1/web-previews/{payload["id"]}', headers=_bearer()).json()
+    app = cast(FastAPI, client.app)
+    app.state.preview_manager.close()
+    app.state.preview_manager = WebPreviewService(PreviewManager(tmp_path))
+    assert client.get(payload["cleanup_url"], headers=_bearer()).json()["cleanup_receipt"] == deleted["cleanup_receipt"]
+    assert client.get(payload["preview_url"]).status_code == 404
+    assert client.post(f'/api/v1/web-previews/{payload["id"]}/renew', headers=_bearer()).status_code == 404
+
+
+def test_api_constructor_preserves_corrupt_receipt_as_missing_proof(
+    preview_client: tuple[TestClient, AuthenticatedPrincipal, StubConversationService], tmp_path: Path,
+) -> None:
+    client, _, _ = preview_client
+    payload = client.post("/api/v1/web-previews/start", headers=_bearer(), json={
+        "conversation_id": "conv-preview", "project_id": "project-preview",
+        "workspace_session_id": "session-preview", "root": "dist",
+    }).json()
+    app = cast(FastAPI, client.app)
+    app.state.preview_manager.close()
+    path = tmp_path / ".preview-receipts" / (payload["id"] + ".json")
+    path.write_bytes(b"corrupted fixture")
+    app.state.preview_manager = WebPreviewService(PreviewManager(tmp_path))
+    assert client.get(payload["cleanup_url"], headers=_bearer()).status_code == 404
+    assert path.read_bytes() == b"corrupted fixture"
 
 
 def _workspace(root: Path, principal: AuthenticatedPrincipal) -> Path:
@@ -143,6 +231,9 @@ def test_preview_uses_http_only_cookie_and_rewrites_root_relative_assets(
         "status": "ready",
         "preview_url": payload["preview_url"],
         "lease_expires_at": payload["lease_expires_at"],
+        "identity": payload["identity"],
+        "cleanup_url": payload["cleanup_url"],
+        "cleanup_receipt": None,
         "application_transport": False,
     }
     assert payload["preview_url"].endswith("/content/")
@@ -378,6 +469,7 @@ class AppRuntime:
         self.calls: list[tuple[str, str, tuple[tuple[str, str], ...], bytes]] = []
         self.closed = False
         self.fail_close = False
+        self.identity: PreviewIdentityV1 = identity("dynamic")
         from agent_hub.previews.dynamic_runtime import DynamicPreviewResponse
 
         self.response = DynamicPreviewResponse(
@@ -390,20 +482,22 @@ class AppRuntime:
         self.calls.append((method, target, headers, body))
         return self.response
 
-    def close(self) -> None:
+    def close(self) -> BrokerCleanupObservation:
         from agent_hub.previews.dynamic_runtime import DynamicPreviewCleanupError
 
         if self.fail_close:
             raise DynamicPreviewCleanupError("cleanup not confirmed")
         self.closed = True
+        return broker_observation(self.identity)
 
 
 class AppBackend:
     def __init__(self) -> None:
         self.runtime = AppRuntime()
 
-    def start(self, source_root: Path, preview_id: str, lifetime_seconds: int) -> AppRuntime:
+    def start(self, source_root: Path, preview_id: str, lifetime_seconds: int, *, scope: PreviewOwnerScope) -> AppRuntime:
         assert (source_root / "server.js").is_file()
+        self.runtime.identity = PreviewIdentityV1.create(preview_id, scope, kind="dynamic", digest="b" * 64, handle="a" * 32)
         return self.runtime
 
 
@@ -797,7 +891,7 @@ def test_start_failure_returns_safe_stage_not_missing_broker(
     client, _, _, backend, started = dynamic_client
     assert client.delete(f"/api/v1/web-previews/{started['id']}", headers=_bearer()).status_code == 200
 
-    def fail_start(source_root: Path, preview_id: str, lifetime_seconds: int) -> AppRuntime:
+    def fail_start(source_root: Path, preview_id: str, lifetime_seconds: int, *, scope: PreviewOwnerScope) -> AppRuntime:
         del source_root, preview_id, lifetime_seconds
         dynamic_runtime._check_result({"ok": False, "error": "preview startup failed",
                                        "phase": phase, "reason": reason})
@@ -835,9 +929,10 @@ def test_slow_dynamic_start_does_not_block_other_owned_preview(tmp_path: Path) -
     release = threading.Event()
 
     class BlockingBackend(AppBackend):
-        def start(self, source_root: Path, preview_id: str, lifetime_seconds: int) -> AppRuntime:
+        def start(self, source_root: Path, preview_id: str, lifetime_seconds: int, *, scope: PreviewOwnerScope) -> AppRuntime:
             entered.set()
             assert release.wait(5)
+            self.runtime.identity = PreviewIdentityV1.create(preview_id, scope, kind="dynamic", digest="b" * 64, handle="a" * 32)
             return self.runtime
 
     backend = BlockingBackend()
@@ -897,6 +992,7 @@ def test_service_does_not_register_launch_revoked_before_registration(tmp_path: 
             conversation_id: str,
             project_id: str,
             session_id: str,
+            user_id: UUID | None = None,
             root: str | None = None,
             lease: timedelta | None = None,
         ) -> PreviewLaunch:
@@ -905,6 +1001,7 @@ def test_service_does_not_register_launch_revoked_before_registration(tmp_path: 
                 conversation_id=conversation_id,
                 project_id=project_id,
                 session_id=session_id,
+                user_id=user_id,
                 root=root,
                 lease=lease,
             )

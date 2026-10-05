@@ -96,6 +96,215 @@ def test_preview_serves_immutable_snapshot_when_workspace_changes(tmp_path: Path
         assert response.body == b"window.version = 'original';"
 
 
+def test_static_cleanup_record_survives_restart_and_preserves_identity(tmp_path: Path) -> None:
+    _write(_session_root(tmp_path), "dist/index.html", "original")
+    with PreviewManager(tmp_path) as manager:
+        launch = _start(manager, user_id=UUID("30000000-0000-0000-0000-000000000001"))
+        record = manager.cleanup_record(launch.state.preview_id)
+        assert record is not None and record.cleanup_receipt is None
+        manager.stop(launch.state.preview_id)
+        final = manager.cleanup_record(launch.state.preview_id)
+        assert final is not None and final.identity == record.identity
+        assert final.cleanup_receipt is not None and final.cleanup_receipt.status == "confirmed"
+        assert {fact.resource for fact in final.cleanup_receipt.observations} >= {
+            "capability", "snapshot", "serving_thread", "listener", "accepted_threads",
+            "accepted_sockets", "proxy_operations", "proxy_sockets",
+        }
+    with PreviewManager(tmp_path) as restarted:
+        assert restarted.cleanup_record(launch.state.preview_id) == final
+        assert restarted.current(TENANT_ID, "conversation-a") is None
+
+
+@pytest.mark.parametrize("_attempt", range(20))
+def test_static_accepted_keepalive_is_closed_before_confirmation(tmp_path: Path, _attempt: int) -> None:
+    from agent_hub.previews.dynamic_runtime import DynamicPreviewCleanupError
+
+    _write(_session_root(tmp_path), "dist/index.html", "original")
+    with PreviewManager(tmp_path) as manager:
+        launch = _start(manager)
+        connection = http.client.HTTPConnection("127.0.0.1", launch.state.internal_port, timeout=2)
+        connection.request("GET", "/")
+        assert connection.getresponse().read() == b"original"
+        try:
+            try:
+                manager.stop(launch.state.preview_id)
+            except DynamicPreviewCleanupError:
+                failed = manager.cleanup_record(launch.state.preview_id)
+                pytest.fail(f"keepalive cleanup did not confirm: {failed}")
+            record = manager.cleanup_record(launch.state.preview_id)
+            assert record is not None and record.cleanup_receipt is not None
+            assert record.cleanup_receipt.status == "confirmed"
+            assert connection.sock is not None and connection.sock.recv(1) == b""
+        finally:
+            connection.close()
+
+
+def test_static_live_request_blocks_confirmation_then_drains(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from http.server import BaseHTTPRequestHandler
+
+    from agent_hub.previews.dynamic_runtime import DynamicPreviewCleanupError
+    _write(_session_root(tmp_path), "dist/index.html", "original")
+    entered, release = threading.Event(), threading.Event()
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            entered.set()
+            release.wait(30)
+
+    monkeypatch.setattr(preview_manager_module, "_handler_for", lambda *a, **kw: Handler)
+    manager = PreviewManager(tmp_path, reaper_interval=timedelta(hours=1))
+    connection: http.client.HTTPConnection | None = None
+    try:
+        launch = _start(manager)
+        connection = http.client.HTTPConnection("127.0.0.1", launch.state.internal_port, timeout=2)
+        connection.request("GET", "/")
+        assert entered.wait(2)
+        before = time.monotonic()
+        with pytest.raises(DynamicPreviewCleanupError):
+            manager.stop(launch.state.preview_id)
+        assert time.monotonic() - before < 6
+        record = manager.cleanup_record(launch.state.preview_id)
+        assert record is not None and record.cleanup_receipt is not None
+        assert record.cleanup_receipt.status != "confirmed"
+        assert next(f for f in record.cleanup_receipt.observations if f.resource == "accepted_threads").result == "present"
+        release.set()
+        manager.stop(launch.state.preview_id)
+    finally:
+        release.set()
+        if connection is not None:
+            connection.close()
+        manager.close()
+
+
+def test_static_inflight_proxy_finalizer_does_not_need_manager_lock(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from agent_hub.previews.dynamic_runtime import DynamicPreviewCleanupError
+    _write(_session_root(tmp_path), "dist/index.html", "original")
+    entered, release = threading.Event(), threading.Event()
+    original = http.client.HTTPConnection.request
+
+    def request(connection: http.client.HTTPConnection, *args: object, **kwargs: object) -> None:
+        entered.set()
+        release.wait(10)
+        original(connection, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(http.client.HTTPConnection, "request", request)
+    manager = PreviewManager(tmp_path, reaper_interval=timedelta(hours=1))
+    launch = _start(manager)
+    errors: list[Exception] = []
+
+    def read() -> None:
+        try:
+            manager.read(launch.state.preview_id, launch.token)
+        except PreviewNotFound as error:
+            errors.append(error)
+
+    worker = threading.Thread(target=read)
+    worker.start()
+    try:
+        assert entered.wait(2)
+        with pytest.raises(DynamicPreviewCleanupError):
+            manager.stop(launch.state.preview_id)
+        record = manager.cleanup_record(launch.state.preview_id)
+        assert record is not None and record.cleanup_receipt is not None
+        assert next(f for f in record.cleanup_receipt.observations if f.resource == "proxy_operations").result == "present"
+        release.set()
+        worker.join(3)
+        assert not worker.is_alive() and errors
+        manager.stop(launch.state.preview_id)
+    finally:
+        release.set()
+        worker.join(3)
+        manager.close()
+
+
+def test_snapshot_remaining_after_cleanup_is_present_and_retryable(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from agent_hub.previews.dynamic_runtime import DynamicPreviewCleanupError
+    _write(_session_root(tmp_path), "dist/index.html", "original")
+    with PreviewManager(tmp_path) as manager:
+        launch = _start(manager)
+        runtime = manager._runtimes[launch.state.preview_id]
+        original = runtime.snapshot.cleanup
+        monkeypatch.setattr(runtime.snapshot, "cleanup", lambda: None)
+        with pytest.raises(DynamicPreviewCleanupError):
+            manager.stop(launch.state.preview_id)
+        record = manager.cleanup_record(launch.state.preview_id)
+        assert record is not None and record.cleanup_receipt is not None
+        assert record.cleanup_receipt.status == "pending"
+        assert next(f for f in record.cleanup_receipt.observations if f.resource == "snapshot").result == "present"
+        monkeypatch.setattr(runtime.snapshot, "cleanup", original)
+
+
+def test_snapshot_finalizer_cannot_remove_replaced_directory(tmp_path: Path) -> None:
+    from agent_hub.previews.dynamic_runtime import DynamicPreviewCleanupError
+    _write(_session_root(tmp_path), "dist/index.html", "original")
+    manager = PreviewManager(tmp_path, reaper_interval=timedelta(hours=1))
+    launch = _start(manager)
+    runtime = manager._runtimes[launch.state.preview_id]
+    path = Path(runtime.snapshot.name)
+    reserved = path.with_name(path.name + "-reserved")
+    path.rename(reserved)
+    path.mkdir()
+    marker = path / "foreign.txt"
+    marker.write_text("preserve")
+    try:
+        with pytest.raises(DynamicPreviewCleanupError):
+            manager.stop(launch.state.preview_id)
+        runtime.snapshot._finalizer()  # type: ignore[attr-defined]
+        assert marker.read_text() == "preserve"
+    finally:
+        if marker.exists():
+            marker.unlink()
+        if path.exists():
+            path.rmdir()
+        reserved.rename(path)
+        manager.close()
+
+
+def test_static_read_finishes_drain_before_rechecking_revocation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _write(_session_root(tmp_path), "dist/index.html", "original")
+    read_body, release = threading.Event(), threading.Event()
+    original = http.client.HTTPResponse.read
+
+    def read(response: http.client.HTTPResponse, amt: int | None = None) -> bytes:
+        data = original(response, amt)
+        read_body.set()
+        assert release.wait(3)
+        return data
+
+    monkeypatch.setattr(http.client.HTTPResponse, "read", read)
+    with PreviewManager(tmp_path, reaper_interval=timedelta(hours=1)) as manager:
+        launch = _start(manager)
+        errors: list[Exception] = []
+
+        def fetch() -> None:
+            try:
+                manager.read(launch.state.preview_id, launch.token)
+            except (PreviewTokenRejected, PreviewNotFound) as error:
+                errors.append(error)
+
+        worker = threading.Thread(target=fetch)
+        stopper = threading.Thread(target=lambda: manager.stop(launch.state.preview_id))
+        worker.start()
+        try:
+            assert read_body.wait(2)
+            stopper.start()
+            runtime = manager._runtimes[launch.state.preview_id]
+            deadline = time.monotonic() + 2
+            while runtime.state.status == "ready" and time.monotonic() < deadline:
+                time.sleep(0.005)
+            assert runtime.state.status == "stopped"
+            release.set()
+            worker.join(2)
+            stopper.join(2)
+            assert not worker.is_alive() and not stopper.is_alive()
+            assert len(errors) == 1
+        finally:
+            release.set()
+            worker.join(3)
+            if stopper.ident is not None:
+                stopper.join(3)
+
+
 @pytest.mark.parametrize(
     ("files", "expected_root", "expected_body"),
     [

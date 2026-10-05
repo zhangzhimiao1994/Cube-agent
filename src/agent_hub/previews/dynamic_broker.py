@@ -27,8 +27,16 @@ import uuid
 from collections import OrderedDict
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import cast
+from typing import Literal, cast
 
+from agent_hub.previews.cleanup import (
+    BrokerCleanupObservation,
+    PreviewIdentityV1,
+    PreviewOwnerScope,
+    ResourceObservation,
+    tree_entry,
+    utc_now,
+)
 from agent_hub.previews.dynamic_runner import (
     MAX_FRAME,
     READY_TIMEOUT,
@@ -53,6 +61,43 @@ _PLATFORM = sys.platform
 _PRIVATE_DISK_MIB = 256
 _PROCESS_MEMORY_MIB = 384
 _CGROUP_ROOT = Path("/sys/fs/cgroup/system.slice")
+_CLEANUP_CONTEXT = threading.local()
+
+
+class _ResourcePresent(RuntimeError):
+    pass
+
+
+def _remaining(limit: float) -> float:
+    deadline = cast(float | None, getattr(_CLEANUP_CONTEXT, "deadline", None))
+    if deadline is None:
+        return limit
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("preview aggregate cleanup budget exhausted")
+    return min(limit, remaining)
+
+
+def _fact(resource: str, result: str, *, fields: dict[str, str] | None = None) -> ResourceObservation:
+    return ResourceObservation(resource, "broker", utc_now(), result, "observed",
+                               fields["LoadState"] if fields else None,
+                               fields["ActiveState"] if fields else None,
+                               int(fields["MainPID"]) if fields and "MainPID" in fields else None,
+                               True if fields else None)
+
+
+def _collect(fact: ResourceObservation) -> None:
+    facts = cast(list[ResourceObservation] | None, getattr(_CLEANUP_CONTEXT, "facts", None))
+    if facts is not None:
+        facts.append(fact)
+
+
+def _failed_facts(resources: tuple[str, ...], error: Exception) -> None:
+    facts = cast(list[ResourceObservation], _CLEANUP_CONTEXT.facts)
+    observed = {fact.resource for fact in facts}
+    code = "budget_exhausted" if isinstance(error, TimeoutError | subprocess.TimeoutExpired) else "observation_failed"
+    facts.extend(ResourceObservation(resource, "broker", utc_now(), "unknown", code)
+                 for resource in resources if resource not in observed)
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,7 +121,7 @@ def validate_broker_request(payload: dict[str, object], *, peer_uid: int,
                             policy: PreviewBrokerPolicy) -> dict[str, object]:
     if peer_uid != policy.allowed_uid:
         raise ValueError("preview caller uid is not authorized")
-    if type(payload.get("version")) is not int or payload["version"] != 1:
+    if type(payload.get("version")) is not int or payload["version"] not in {1, 2}:
         raise ValueError("invalid preview protocol version")
     action = payload.get("action")
     fields = {
@@ -86,6 +131,9 @@ def validate_broker_request(payload: dict[str, object], *, peer_uid: int,
         "stop": {"version", "action", "handle"},
         "recover_stop": {"version", "action", "handle", "recovery_token"},
     }
+    if payload["version"] == 2:
+        fields["start"] |= {"scope"}
+        fields["recover_stop"] |= {"identity", "identity_binding"}
     if not isinstance(action, str) or action not in fields or set(payload) != fields[action]:
         raise ValueError("invalid preview action fields")
     if action == "start":
@@ -97,6 +145,10 @@ def validate_broker_request(payload: dict[str, object], *, peer_uid: int,
         if type(lifetime) is not int or not 1 <= lifetime <= policy.max_lifetime_seconds:
             raise ValueError("invalid preview lifetime")
         _source_path(Path(source), policy)
+        if payload["version"] == 2:
+            if str(uuid.UUID(preview_id)) != preview_id:
+                raise ValueError("invalid preview UUID")
+            PreviewOwnerScope.from_wire(payload["scope"])
     elif action in {"request", "stop", "recover_stop"}:
         handle = payload["handle"]
         if not isinstance(handle, str) or not _HANDLE.fullmatch(handle):
@@ -105,6 +157,13 @@ def validate_broker_request(payload: dict[str, object], *, peer_uid: int,
             token = payload["recovery_token"]
             if not isinstance(token, str) or not re.fullmatch(r"[0-9a-f]{64}", token):
                 raise ValueError("invalid recovery ownership proof")
+            if payload["version"] == 2:
+                identity = PreviewIdentityV1.from_wire(payload["identity"])
+                binding = payload["identity_binding"]
+                if identity.kind != "dynamic" or identity.runtime_handle != handle:
+                    raise ValueError("invalid recovery identity binding")
+                if not isinstance(binding, str) or re.fullmatch(r"[0-9a-f]{64}", binding) is None:
+                    raise ValueError("invalid recovery identity binding")
         if action == "request":
             request = payload["request"]
             if not isinstance(request, dict):
@@ -155,7 +214,8 @@ def _manifest(data: bytes) -> None:
                 raise ValueError("unsupported dependency source")
 
 
-def _snapshot(root: Path, policy: PreviewBrokerPolicy, destination: Path | None = None) -> str:
+def _snapshot(root: Path, policy: PreviewBrokerPolicy, destination: Path | None = None,
+              *, legacy: bool = False) -> str:
     _source_path(root, policy)
     digest = hashlib.sha256()
     total = 0
@@ -174,9 +234,14 @@ def _snapshot(root: Path, policy: PreviewBrokerPolicy, destination: Path | None 
         if any(part in {"node_modules", ".npmrc", ".git", ".ssh", ".aws"}
                or part == ".env" or part.startswith(".env.") for part in relative.parts):
             raise ValueError("unprepared source or credential file")
-        digest.update(relative.as_posix().encode() + b"\0")
+        if legacy:
+            digest.update(relative.as_posix().encode() + b"\0")
+        else:
+            digest.update(tree_entry(relative.as_posix(), directory=data is None,
+                                     executable=bool(info.st_mode & 0o111), data=data or b""))
         if data is None:
-            digest.update(b"dir\0")
+            if legacy:
+                digest.update(b"dir\0")
             if destination is not None:
                 (destination / relative).mkdir(mode=0o755)
                 (destination / relative).chmod(0o755)
@@ -185,8 +250,9 @@ def _snapshot(root: Path, policy: PreviewBrokerPolicy, destination: Path | None 
             if total > policy.max_source_bytes:
                 raise ValueError("source size exceeded")
             executable = bool(info.st_mode & 0o111)
-            digest.update(b"exec\0" if executable else b"file\0")
-            digest.update(data + b"\0")
+            if legacy:
+                digest.update(b"exec\0" if executable else b"file\0")
+                digest.update(data + b"\0")
             if relative.as_posix() == "package.json":
                 manifest = data
             if destination is not None:
@@ -381,10 +447,10 @@ def _cleanup_cgroup_present(path: Path) -> bool:
     return True
 
 
-def _confirm_cgroup_empty(unit: str) -> None:
+def _confirm_cgroup_empty(unit: str) -> Literal["absent", "empty"]:
     path = _CGROUP_ROOT / unit
     if not _cleanup_cgroup_present(path):
-        return
+        return "absent"
     try:
         events = path / "cgroup.events"
         info = events.lstat()
@@ -410,13 +476,16 @@ def _confirm_cgroup_empty(unit: str) -> None:
                 raise RuntimeError("invalid preview cleanup cgroup events")
             values[match[1]] = match[2]
         if values.get("populated") != "0":
+            if values.get("populated") == "1":
+                raise _ResourcePresent("preview cgroup remains populated")
             raise RuntimeError("preview cgroup empty state not confirmed")
     except (OSError, RuntimeError):
         # cgroup removal can race the events read; re-observe the exact leaf
         # through trusted parents before treating unavailable evidence as absent.
         if not _cleanup_cgroup_present(path):
-            return
+            return "absent"
         raise
+    return "empty"
 
 
 def _owned_storage_mounted(owned: Path) -> bool:
@@ -457,6 +526,15 @@ class _Session:
     stopped: bool = False
     ready: bool = False
     lock: threading.RLock = field(default_factory=threading.RLock)
+    identity: PreviewIdentityV1 | None = None
+    observation: BrokerCleanupObservation | None = None
+    owned_identity: tuple[int, int] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _Completed:
+    owner: object
+    observation: BrokerCleanupObservation | None
 
 
 def _pipe_read(process: subprocess.Popen[bytes], timeout: float,
@@ -515,7 +593,7 @@ class PreviewBroker:
     def __init__(self, policy: PreviewBrokerPolicy) -> None:
         self.policy = policy
         self._sessions: dict[str, _Session] = {}
-        self._completed: OrderedDict[str, object] = OrderedDict()
+        self._completed: OrderedDict[str, _Completed] = OrderedDict()
         self._recovery_key = secrets.token_bytes(32)
         self._lock = threading.RLock()
 
@@ -546,9 +624,14 @@ class PreviewBroker:
         binding = f"preview-stop-v1\0{self.policy.allowed_uid}\0{self.policy.runtime_root}\0{handle}"
         return hmac.new(self._recovery_key, binding.encode(), hashlib.sha256).hexdigest()
 
-    def _remember_stopped(self, handle: str, owner: object) -> None:
+    def _identity_binding(self, identity: PreviewIdentityV1) -> str:
+        return hmac.new(self._recovery_key, identity.binding_bytes(
+            self.policy.allowed_uid, str(self.policy.runtime_root)), hashlib.sha256).hexdigest()
+
+    def _remember_stopped(self, handle: str, owner: object,
+                          observation: BrokerCleanupObservation | None = None) -> None:
         with self._lock:
-            self._completed[handle] = owner
+            self._completed[handle] = _Completed(owner, observation)
             self._completed.move_to_end(handle)
             while len(self._completed) > 128:
                 self._completed.popitem(last=False)
@@ -559,30 +642,60 @@ class PreviewBroker:
         with self._lock:
             session = self._sessions.get(handle)
             completed = handle in self._completed
+            if session is None and not completed:
+                if len(self._sessions) >= self.policy.max_sessions:
+                    raise RuntimeError("preview recovery capacity exceeded")
+                session = _Session(handle, "recovery-" + handle, owner,
+                                   self.policy.runtime_root / handle, 0, revoked=True, mounted=True)
+                session.units = {f"agent-hub-preview-{handle}-{stage}.service" for stage in _STAGES}
+                self._sessions[handle] = session
         if session is not None:
             self._stop(session)
-        elif not completed:
-            # A valid stop-only proof survives bounded tombstone eviction and a
-            # broker restart. Query/stop all fixed original units, never infer
-            # successful cleanup merely from an absent in-memory handle.
-            owned = self.policy.runtime_root / handle
-            recovery = _Session(handle, "recovery-" + handle, owner, owned, 0, revoked=True)
-            for stage in _STAGES:
-                self._stop_unit(f"agent-hub-preview-{handle}-{stage}.service")
-            self._stop_storage(recovery)
-            if owned.exists():
-                info = owned.lstat()
-                if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode) or info.st_uid != 0:
-                    raise RuntimeError("unsafe recovery directory")
-                shutil.rmtree(owned)
-            self._remember_stopped(handle, owner)
+            if not session.stopped:
+                raise RuntimeError("preview cleanup retained for retry")
         return {"ok": True, "state": "stopped"}
+
+    def _recover_observed(self, payload: dict[str, object], owner: object) -> dict[str, object]:
+        handle = cast(str, payload["handle"])
+        if not hmac.compare_digest(self._recovery_token(handle), cast(str, payload["recovery_token"])):
+            raise ValueError("preview recovery ownership rejected")
+        identity = PreviewIdentityV1.from_wire(payload["identity"])
+        if not hmac.compare_digest(self._identity_binding(identity), cast(str, payload["identity_binding"])):
+            raise ValueError("preview recovery identity binding rejected")
+        with self._lock:
+            completed = self._completed.get(handle)
+            if completed is not None and completed.observation is not None:
+                if completed.observation.identity != identity:
+                    raise ValueError("preview recovery identity mismatch")
+                return self._observation_reply(completed.observation)
+            session = self._sessions.get(handle)
+            if session is None:
+                if len(self._sessions) >= self.policy.max_sessions:
+                    raise RuntimeError("preview recovery capacity exceeded")
+                session = _Session(handle, identity.preview_id, owner,
+                                   self.policy.runtime_root / handle, 0, revoked=True, identity=identity)
+                self._sessions[handle] = session
+            elif session.identity is not None and session.identity != identity:
+                raise ValueError("preview recovery identity mismatch")
+            else:
+                session.identity = identity
+                session.preview_id = identity.preview_id
+            # Retained recovery is reserved before any observation can fail.
+        self._stop(session)
+        assert session.observation is not None
+        return self._observation_reply(session.observation)
+
+    @staticmethod
+    def _observation_reply(observation: BrokerCleanupObservation) -> dict[str, object]:
+        return {"ok": observation.status == "confirmed", "state": "stopped"
+                if observation.status == "confirmed" else "cleanup_pending",
+                "observation": observation.to_wire()}
 
     @staticmethod
     def _command(argv: tuple[str, ...]) -> subprocess.CompletedProcess[bytes]:
         return subprocess.run(argv, env=_ENV, stdin=subprocess.DEVNULL,
                               stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                              timeout=10, check=False)
+                              timeout=_remaining(10), check=False)
 
     def _reserve(self, preview_id: str, owner: object, lifetime: int) -> _Session:
         with self._lock:
@@ -594,6 +707,8 @@ class PreviewBroker:
             owned = self.policy.runtime_root / handle
             owned.mkdir(mode=0o755)
             session = _Session(handle, preview_id, owner, owned, time.monotonic() + lifetime)
+            info = owned.lstat()
+            session.owned_identity = (info.st_dev, info.st_ino)
             self._sessions[handle] = session
             return session
 
@@ -642,7 +757,7 @@ class PreviewBroker:
                 stream.write(content)
             target.chmod(0o444)
 
-    def _stop_storage(self, session: _Session) -> None:
+    def _stop_storage(self, session: _Session) -> tuple[ResourceObservation, ...]:
         unit = session.mount_unit or self._mount_unit_name(session.owned)
         self._observe_cleanup_unit(unit, service=False)
         stopped = self._command(("/usr/bin/systemctl", "stop", unit))
@@ -651,9 +766,21 @@ class PreviewBroker:
             fields["LoadState"] == "loaded" and stopped.returncode != 0
         ):
             raise RuntimeError("PID1 private disk cleanup not confirmed")
+        unit_fact = _fact("mount_unit", "inactive", fields=fields)
+        _collect(unit_fact)
         if _owned_storage_mounted(session.owned):
+            _collect(_fact("work_path", "present"))
             raise RuntimeError("private disk remains mounted")
+        try:
+            (session.owned / "work").lstat()
+        except FileNotFoundError:
+            result = "absent"
+        else:
+            result = "not_mountpoint"
+        path_fact = _fact("work_path", result)
+        _collect(path_fact)
         session.mounted = False
+        return (unit_fact, path_fact)
 
     def _launch(self, session: _Session, stage: str) -> dict[str, object]:
         unit = f"agent-hub-preview-{session.handle}-{stage}.service"
@@ -720,7 +847,7 @@ class PreviewBroker:
                 pipe.close()
         if process.poll() is None:
             process.kill()
-        process.wait(timeout=5)
+        process.wait(timeout=_remaining(5))
 
     def _observe_cleanup_unit(self, unit: str, *, service: bool) -> dict[str, str]:
         properties = "Id,LoadState,ActiveState"
@@ -740,7 +867,7 @@ class PreviewBroker:
             raise RuntimeError("contradictory missing preview unit observation")
         return fields
 
-    def _stop_unit(self, unit: str) -> None:
+    def _stop_unit(self, unit: str) -> tuple[ResourceObservation, ...]:
         identity = re.fullmatch(r"agent-hub-preview-([0-9a-f]{32})-([a-z]+)\.service", unit)
         if identity is None or identity[2] not in _STAGES:
             raise RuntimeError("invalid owned preview cleanup unit")
@@ -752,14 +879,123 @@ class PreviewBroker:
             self._command(("/usr/bin/systemctl", "kill", "--kill-whom=all", "--signal=KILL", unit))
         fields = self._observe_cleanup_unit(unit, service=True)
         if fields["ActiveState"] not in {"inactive", "failed"}:
+            _collect(_fact("unit_" + identity[2], "present"))
             raise RuntimeError("preview cgroup stop not confirmed")
         if fields["MainPID"] != "0":
+            _collect(_fact("unit_" + identity[2], "present"))
             raise RuntimeError("preview process remains alive")
         if fields["LoadState"] == "loaded" and stopped.returncode != 0:
             raise RuntimeError("preview stop failed; retained for retry")
-        _confirm_cgroup_empty(unit)
+        unit_fact = _fact("unit_" + identity[2], fields["ActiveState"], fields=fields)
+        _collect(unit_fact)
+        try:
+            group_fact = _fact("cgroup_" + identity[2], _confirm_cgroup_empty(unit))
+        except _ResourcePresent:
+            _collect(_fact("cgroup_" + identity[2], "present"))
+            raise
+        _collect(group_fact)
+        return (unit_fact, group_fact)
 
     def _stop(self, session: _Session) -> None:
+        session.revoked = True
+        if session.stopped:
+            return
+        previous = getattr(_CLEANUP_CONTEXT, "deadline", None)
+        _CLEANUP_CONTEXT.deadline = previous or time.monotonic() + 60
+        acquired = False
+        try:
+            acquired = session.lock.acquire(timeout=_remaining(60))
+            if not acquired:
+                if session.stopped:
+                    return
+                if session.identity is None:
+                    raise TimeoutError("preview cleanup lock budget exhausted")
+                session.observation = BrokerCleanupObservation.create(
+                    session.identity, (), requested_at=utc_now(), reason_code="budget_exhausted")
+                return
+            if session.identity is not None:
+                self._stop_observed(session)
+            else:
+                self._stop_legacy(session)
+        finally:
+            if acquired:
+                session.lock.release()
+            _CLEANUP_CONTEXT.deadline = previous
+
+    def _stop_observed(self, session: _Session) -> None:
+        with session.lock:
+            session.revoked = True
+            if session.stopped:
+                return
+            assert session.identity is not None
+            requested = utc_now()
+            facts: list[ResourceObservation] = []
+            failures: list[Exception] = []
+            _CLEANUP_CONTEXT.facts = facts
+            try:
+                try:
+                    _remaining(60)
+                    if session.process is not None:
+                        self._close_process(session.process)
+                        session.process = None
+                    facts.append(_fact("attachment", "exited"))
+                except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+                    failures.append(error)
+                    _failed_facts(("attachment",), error)
+                for stage in sorted(_STAGES):
+                    try:
+                        _remaining(60)
+                        self._stop_unit(f"agent-hub-preview-{session.handle}-{stage}.service")
+                    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+                        failures.append(error)
+                        _failed_facts(("unit_" + stage, "cgroup_" + stage), error)
+                try:
+                    _remaining(60)
+                    self._stop_storage(session)
+                except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+                    failures.append(error)
+                    _failed_facts(("mount_unit", "work_path"), error)
+                if not failures:
+                    try:
+                        _remaining(60)
+                        self._remove_owned(session)
+                        facts.append(_fact("owned_directory", "absent"))
+                    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+                        failures.append(error)
+                        _failed_facts(("owned_directory",), error)
+                session.observation = BrokerCleanupObservation.create(
+                    session.identity, tuple(facts), requested_at=requested,
+                )
+                if session.observation.status == "confirmed":
+                    with self._lock:
+                        session.stopped = True
+                        self._remember_stopped(session.handle, session.owner, session.observation)
+                        self._sessions.pop(session.handle, None)
+            finally:
+                _CLEANUP_CONTEXT.facts = None
+
+    def _remove_owned(self, session: _Session) -> None:
+        # Verify the fixed parent even when the leaf is already absent.
+        _require_root_path(self.policy.runtime_root)
+        try:
+            info = session.owned.lstat()
+        except FileNotFoundError:
+            return
+        if (not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022
+                or getattr(info, "st_file_attributes", 0) & 0x400
+                or (session.owned_identity is not None
+                    and (info.st_dev, info.st_ino) != session.owned_identity)):
+            raise RuntimeError("unsafe owned cleanup directory")
+        shutil.rmtree(session.owned)
+        _remaining(60)
+        try:
+            session.owned.lstat()
+        except FileNotFoundError:
+            return
+        _collect(_fact("owned_directory", "present"))
+        raise RuntimeError("owned cleanup directory remains")
+
+    def _stop_legacy(self, session: _Session) -> None:
         with session.lock:
             session.revoked = True
             if session.stopped:
@@ -774,7 +1010,23 @@ class PreviewBroker:
                 session.units.remove(unit)
             if session.mounted:
                 self._stop_storage(session)
-            shutil.rmtree(session.owned)
+            try:
+                info = session.owned.lstat()
+            except FileNotFoundError:
+                pass
+            else:
+                if (not stat.S_ISDIR(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400
+                        or (session.owned_identity is None and info.st_uid != 0)
+                        or (session.owned_identity is not None
+                            and session.owned_identity != (info.st_dev, info.st_ino))):
+                    raise RuntimeError("unsafe recovery directory")
+                shutil.rmtree(session.owned)
+                try:
+                    session.owned.lstat()
+                except FileNotFoundError:
+                    pass
+                else:
+                    raise RuntimeError("preview directory remains present")
             with self._lock:
                 session.stopped = True
                 self._remember_stopped(session.handle, session.owner)
@@ -787,8 +1039,9 @@ class PreviewBroker:
         try:
             with session.lock:
                 source = Path(cast(str, payload["source_root"]))
+                legacy = payload.get("version", 1) == 1
                 with preview_startup_phase("source_validate"):
-                    initial_digest = inspect_source(source, self.policy)
+                    initial_digest = _snapshot(source, self.policy, legacy=legacy)
                 with preview_startup_phase("storage_prepare"):
                     for name in ("root", "source", "work"):
                         (session.owned / name).mkdir(mode=0o755)
@@ -800,11 +1053,15 @@ class PreviewBroker:
                 with preview_startup_phase("storage_prepare"):
                     self._prepare_storage(session)
                 with preview_startup_phase("source_copy"):
-                    digest = _snapshot(source, self.policy, session.owned / "source")
+                    digest = _snapshot(source, self.policy, session.owned / "source", legacy=legacy)
                 with preview_startup_phase("source_validate"):
-                    if digest != initial_digest or inspect_source(source, self.policy) != digest:
+                    if digest != initial_digest or _snapshot(source, self.policy, legacy=legacy) != digest:
                         raise ValueError("source changed during preparation")
                 session.digest = digest
+                if not legacy:
+                    session.identity = PreviewIdentityV1.create(session.preview_id,
+                        PreviewOwnerScope.from_wire(payload["scope"]), kind="dynamic",
+                        digest=digest, handle=session.handle)
                 with preview_startup_phase("install"):
                     self._launch(session, "install")
                 with preview_startup_phase("install_validate"):
@@ -822,6 +1079,10 @@ class PreviewBroker:
                     if session.expires_at <= time.monotonic():
                         raise TimeoutError("preview lease expired during startup")
                 session.ready = True
+                if session.identity is not None:
+                    return {"ok": True, "state": "ready", "identity": session.identity.to_wire(),
+                            "recovery_token": self._recovery_token(session.handle),
+                            "identity_binding": self._identity_binding(session.identity)}
                 return {"ok": True, "state": "ready", "handle": session.handle,
                         "source_sha256": session.digest,
                         "recovery_token": self._recovery_token(session.handle)}
@@ -869,6 +1130,8 @@ class PreviewBroker:
         validate_broker_request(payload, peer_uid=peer_uid, policy=self.policy)
         action = payload["action"]
         if action == "recover_stop":
+            if payload["version"] == 2:
+                return self._recover_observed(payload, owner)
             return self._recover_stop(cast(str, payload["handle"]),
                                       cast(str, payload["recovery_token"]), owner)
         if action == "probe":
@@ -885,7 +1148,8 @@ class PreviewBroker:
                 with probe_phase("storage_roundtrip"):
                     if (probe_session.owned / "work/.runner-storage-probe").read_bytes() != b"preview-storage-v1":
                         raise ProbeFailure("storage_roundtrip", "invalid_result")
-                return {"ok": True, "state": "probe"}
+                return ({"ok": True, "state": "probe", "version": 2, "cleanup_schema_version": 1}
+                        if payload["version"] == 2 else {"ok": True, "state": "probe"})
             finally:
                 with probe_phase("cleanup"):
                     self._stop(probe_session)
@@ -896,14 +1160,26 @@ class PreviewBroker:
             return self._start(payload, owner)
         with self._lock:
             session = self._sessions.get(cast(str, payload["handle"]))
-            if action == "stop" and self._completed.get(cast(str, payload["handle"])) is owner:
+            completed = self._completed.get(cast(str, payload["handle"]))
+            if action == "stop" and completed is not None and completed.owner is owner:
+                if payload["version"] == 2:
+                    if completed.observation is None:
+                        raise ValueError("legacy cleanup has no identity evidence")
+                    return self._observation_reply(completed.observation)
                 return {"ok": True, "state": "stopped"}
         if session is None or session.owner is not owner:
             raise ValueError("preview ownership rejected")
+        if payload["version"] == 2 and session.identity is None:
+            raise ValueError("legacy session has no identity evidence")
+        if action == "stop":
+            self._stop(session)
+            if payload["version"] == 2:
+                assert session.observation is not None
+                return self._observation_reply(session.observation)
+            if not session.stopped:
+                raise RuntimeError("preview cleanup retained for retry")
+            return {"ok": True, "state": "stopped"}
         with session.lock:
-            if action == "stop":
-                self._stop(session)
-                return {"ok": True, "state": "stopped"}
             if session.revoked or time.monotonic() >= session.expires_at:
                 session.revoked = True
                 raise ValueError("preview lease revoked")
@@ -933,6 +1209,8 @@ class PreviewBroker:
             sessions = [session for session in self._sessions.values() if session.owner is owner]
         for session in sessions:
             self._stop(session)
+            if not session.stopped:
+                raise RuntimeError("preview disconnect cleanup retained for retry")
 
     def recover(self) -> None:
         """Reclaim root-owned state after broker death before accepting callers."""
@@ -962,6 +1240,8 @@ class PreviewBroker:
             if shutdown or session.revoked or crashed or time.monotonic() >= session.expires_at:
                 try:
                     self._stop(session)
+                    if not session.stopped:
+                        raise RuntimeError("preview cleanup retained for retry")
                 except (OSError, RuntimeError, subprocess.SubprocessError) as error:
                     failures.append(error)
         if failures:

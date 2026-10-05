@@ -10,9 +10,11 @@ import os
 import re
 import secrets
 import shutil
+import socket
 import stat
 import sys
 import threading
+import time
 from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
@@ -26,6 +28,17 @@ from typing import Literal, Protocol, Self
 from urllib.parse import quote, unquote, urlsplit
 from uuid import UUID, uuid4
 
+from agent_hub.previews.cleanup import (
+    BrokerCleanupObservation,
+    CleanupReceiptV1,
+    PreviewCleanupRecord,
+    PreviewIdentityV1,
+    PreviewOwnerScope,
+    ResourceObservation,
+    tree_entry,
+    utc_now,
+)
+from agent_hub.previews.cleanup_store import TERMINAL_TTL, PreviewReceiptStore
 from agent_hub.previews.dynamic_runner import json_object, validate_target
 from agent_hub.previews.dynamic_runtime import (
     DynamicPreviewBackend,
@@ -94,6 +107,7 @@ class PreviewState:
     created_at: datetime
     stopped_at: datetime | None = None
     application_transport: bool = False
+    identity: PreviewIdentityV1 | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -118,31 +132,136 @@ class _PreviewRuntime:
     state: PreviewState
     token_sha256: str
     entrypoint: str
-    server: ThreadingHTTPServer | None
+    server: _LoopbackPreviewServer | None
     thread: threading.Thread | None
     snapshot: TemporaryDirectory[str]
     application: ApplicationRuntime | None = None
     request_lock: threading.Lock = field(default_factory=threading.Lock)
     display_root: Path | None = None
+    snapshot_identity: tuple[int, int] = field(init=False)
+    snapshot_parent_identity: tuple[int, int] = field(init=False)
+    proxies: set[http.client.HTTPConnection] = field(default_factory=set)
+    proxy_condition: threading.Condition = field(default_factory=threading.Condition)
+    stop_reason: str | None = None
+    cleanup_identity: PreviewIdentityV1 | None = None
+
+    def __post_init__(self) -> None:
+        path = Path(self.snapshot.name)
+        info, parent = path.lstat(), path.parent.lstat()
+        self.snapshot_identity = (info.st_dev, info.st_ino)
+        self.snapshot_parent_identity = (parent.st_dev, parent.st_ino)
+        # Automatic TemporaryDirectory finalizers bypass the identity guard.
+        # All runtime-owned removals must go through _remove_snapshot instead.
+        self.snapshot._finalizer.detach()  # type: ignore[attr-defined]
 
 
 class ApplicationRuntime(Protocol):
+    @property
+    def identity(self) -> PreviewIdentityV1: ...
+
     def request(
         self, method: str, target: str, headers: tuple[tuple[str, str], ...], body: bytes
     ) -> DynamicPreviewResponse: ...
 
-    def close(self) -> None: ...
+    def close(self) -> BrokerCleanupObservation: ...
 
 
 class ApplicationBackend(Protocol):
     def start(
-        self, source_root: Path, preview_id: str, lifetime_seconds: int
+        self, source_root: Path, preview_id: str, lifetime_seconds: int, *, scope: PreviewOwnerScope
     ) -> ApplicationRuntime: ...
 
 
 class _LoopbackPreviewServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+
+    def __init__(self, address: tuple[str, int], handler: type[BaseHTTPRequestHandler]) -> None:
+        self.tracker = threading.Condition()
+        self.accepted: set[socket.socket] = set()
+        self.workers: set[threading.Thread] = set()
+        self.closing = False
+        self.shutdown_worker: threading.Thread | None = None
+        super().__init__(address, handler)
+
+    def serve_forever(self, poll_interval: float = 0.5) -> None:
+        try:
+            super().serve_forever(poll_interval)
+        except OSError:
+            if not self.closing:
+                raise
+
+    def process_request(self, request: socket.socket | tuple[bytes, socket.socket], client_address: tuple[str, int]) -> None:
+        if not isinstance(request, socket.socket):
+            raise TypeError("HTTP preview requires a TCP socket")
+        with self.tracker:
+            if self.closing:
+                self.shutdown_request(request)
+                return
+            # Bound keepalive reads even if cross-thread shutdown races recv.
+            request.settimeout(1.0)
+            self.accepted.add(request)
+            self.workers = {worker for worker in self.workers if worker.is_alive()}
+            worker = threading.Thread(target=self.process_request_thread,
+                                      args=(request, client_address), daemon=True)
+            self.workers.add(worker)
+            try:
+                worker.start()
+            except BaseException:
+                self.workers.discard(worker)
+                self.accepted.discard(request)
+                self.shutdown_request(request)
+                raise
+
+    def process_request_thread(self, request: socket.socket | tuple[bytes, socket.socket], client_address: tuple[str, int]) -> None:
+        if not isinstance(request, socket.socket):
+            raise TypeError("HTTP preview requires a TCP socket")
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            with self.tracker:
+                self.accepted.discard(request)
+                self.tracker.notify_all()
+
+    def drain(self, serving: threading.Thread | None, deadline: float) -> tuple[ResourceObservation, ...]:
+        with self.tracker:
+            self.closing = True
+            sockets = tuple(self.accepted)
+            workers = tuple(self.workers)
+        for connection in sockets:
+            _close_socket(connection)
+        if serving is not None and serving.is_alive():
+            if self.shutdown_worker is None:
+                self.shutdown_worker = threading.Thread(target=self.shutdown, daemon=True)
+                self.shutdown_worker.start()
+            serving.join(max(0, deadline - time.monotonic()))
+        if self.shutdown_worker is not None:
+            self.shutdown_worker.join(max(0, deadline - time.monotonic()))
+        self.server_close()
+        for worker in workers:
+            worker.join(max(0, deadline - time.monotonic()))
+        with self.tracker:
+            # Admission is closed before collecting workers; serving exit covers
+            # the accept/process_request race, and finalizers never take manager's lock.
+            return (
+                _manager_fact("serving_thread", "exited" if serving is None or not serving.is_alive() else "present"),
+                _manager_fact("listener", "closed" if self.socket.fileno() == -1 else "present"),
+                _manager_fact("accepted_threads", "drained" if not any(w.is_alive() for w in self.workers) else "present"),
+                _manager_fact("accepted_sockets", "closed" if not self.accepted and all(s.fileno() == -1 for s in sockets) else "present"),
+            )
+
+
+def _close_socket(connection: socket.socket) -> None:
+    try:
+        connection.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass
+    connection.close()
+
+
+def _manager_fact(resource: str, result: str, reason: str = "observed") -> ResourceObservation:
+    return ResourceObservation(resource, "manager", utc_now(), result,
+                               "resource_present" if result == "present" else reason)
 
 
 class PreviewManager:
@@ -188,6 +307,10 @@ class PreviewManager:
         self._max_active_per_tenant = max_active_per_tenant
         self._reaper_interval_seconds = reaper_interval.total_seconds()
         self._clock = clock or (lambda: datetime.now(UTC))
+        self._workspace_root.mkdir(parents=True, exist_ok=True)
+        self._receipt_store = PreviewReceiptStore(self._workspace_root, max_active=max_active_global,
+                                                  clock=self._clock)
+        self._unpersisted: dict[str, PreviewCleanupRecord] = {}
         self._lock = threading.RLock()
         self._runtimes: dict[str, _PreviewRuntime] = {}
         self._finished: OrderedDict[str, PreviewState] = OrderedDict()
@@ -216,6 +339,7 @@ class PreviewManager:
         conversation_id: str,
         project_id: str,
         session_id: str,
+        user_id: UUID | None = None,
         root: str | None = None,
         lease: timedelta | None = None,
     ) -> PreviewLaunch:
@@ -240,6 +364,9 @@ class PreviewManager:
                     preview_root, entrypoint = session_root, "index.html"
             else:
                 preview_root, entrypoint = _find_explicit_preview_root(session_root, root)
+            scope = PreviewOwnerScope(str(tenant_id), str(user_id) if user_id is not None else None,
+                                      project, conversation, session,
+                                      preview_root.relative_to(session_root).as_posix(), entrypoint)
             if application:
                 return self._start_application(
                     tenant_id,
@@ -250,6 +377,7 @@ class PreviewManager:
                     preview_root,
                     entrypoint,
                     requested_lease,
+                    scope,
                 )
             snapshot, served_root = _snapshot_preview_root(
                 preview_root,
@@ -262,6 +390,9 @@ class PreviewManager:
             token = secrets.token_urlsafe(32)
             token_sha256 = sha256(token.encode("utf-8")).hexdigest()
             preview_id = str(uuid4())
+            identity = PreviewIdentityV1.create(preview_id, scope, kind="static",
+                                                digest=_static_digest(served_root, self._max_snapshot_bytes,
+                                                                      self._max_snapshot_files))
             try:
                 handler = _handler_for(
                     served_root,
@@ -287,6 +418,7 @@ class PreviewManager:
                 lease_expires_at=lease_expires_at,
                 max_expires_at=max_expires_at,
                 created_at=now,
+                identity=identity,
             )
             thread = threading.Thread(
                 target=server.serve_forever,
@@ -314,7 +446,7 @@ class PreviewManager:
                 try:
                     current_id = self._active_by_conversation.get(reservation_key)
                     if current_id is not None:
-                        self._stop_locked(current_id, status="stopped", now=now)
+                        self._stop_locked(current_id, status="stopped", now=now, reason="replaced")
                 except BaseException:
                     server.server_close()
                     snapshot.cleanup()
@@ -323,11 +455,9 @@ class PreviewManager:
                 self._active_by_conversation[reservation_key] = preview_id
                 try:
                     thread.start()
+                    self._receipt_store.put(PreviewCleanupRecord(identity, None, None))
                 except BaseException:
-                    self._active_by_conversation.pop(reservation_key, None)
-                    self._runtimes.pop(preview_id, None)
-                    server.server_close()
-                    snapshot.cleanup()
+                    self._stop_locked(preview_id, status="stopped", now=now)
                     raise
             return PreviewLaunch(state=state, token=token)
         finally:
@@ -344,6 +474,7 @@ class PreviewManager:
         preview_root: Path,
         entrypoint: str,
         lease: timedelta,
+        scope: PreviewOwnerScope,
     ) -> PreviewLaunch:
         now = _aware_utc(self._clock())
         key = (tenant_id, conversation)
@@ -351,7 +482,7 @@ class PreviewManager:
         with self._lock:
             previous = self._active_by_conversation.get(key)
             if previous is not None:
-                self._stop_locked(previous, status="stopped", now=now)
+                self._stop_locked(previous, status="stopped", now=now, reason="replaced")
         staging = self._workspace_root / ".preview-staging"
         _reject_path_aliases(self._workspace_root, staging)
         staging.mkdir(exist_ok=True)
@@ -387,13 +518,28 @@ class PreviewManager:
                 source_root,
                 state.preview_id,
                 max(1, int(self._max_lifetime.total_seconds())),
+                scope=scope,
             )
+            identity = PreviewIdentityV1.from_wire(runtime.application.identity.to_wire())
+            runtime.cleanup_identity = identity
+            if identity.preview_id != state.preview_id or identity.scope != scope or identity.kind != "dynamic":
+                raise DynamicPreviewUnavailable("application identity mismatch")
+            runtime.state = state = replace(state, identity=identity)
         except BaseException:
-            snapshot.cleanup()
+            # Failed publication still owns cleanup and capacity, without an API identity.
+            with self._lock:
+                self._runtimes[state.preview_id] = runtime
+                self._active_by_conversation[key] = state.preview_id
+                self._stop_locked(state.preview_id, status="stopped", now=_aware_utc(self._clock()))
             raise
         with self._lock:
             self._runtimes[state.preview_id] = runtime
             self._active_by_conversation[key] = state.preview_id
+            try:
+                self._receipt_store.put(PreviewCleanupRecord(identity, None, None))
+            except (OSError, ValueError):
+                self._stop_locked(state.preview_id, status="stopped", now=now)
+                raise DynamicPreviewCleanupError("preview identity persistence failed") from None
             if key in self._cancelled_starts:
                 self._stop_locked(state.preview_id, status="stopped", now=now)
                 raise PreviewTokenRejected("preview startup was revoked")
@@ -442,6 +588,16 @@ class PreviewManager:
                 self._stop_locked(preview_id, status="expired", now=now)
                 return None
             return runtime.state
+
+    def cleanup_record(self, preview_id: str) -> PreviewCleanupRecord | None:
+        with self._lock:
+            if preview_id in self._unpersisted:
+                return self._unpersisted[preview_id]
+            try:
+                return self._receipt_store.get(preview_id)
+            except (OSError, ValueError, TypeError):
+                # A corrupt/missing file is missing evidence, never a cached success.
+                return None
 
     def renew(
         self,
@@ -551,12 +707,12 @@ class PreviewManager:
                 path,
             )
             state = runtime.state
+            connection = http.client.HTTPConnection(
+                state.internal_host, state.internal_port, timeout=_PROXY_TIMEOUT_SECONDS,
+            )
+            with runtime.proxy_condition:
+                runtime.proxies.add(connection)
         request_path = "/" if not relative_path else f"/{quote(relative_path, safe='/')}"
-        connection = http.client.HTTPConnection(
-            state.internal_host,
-            state.internal_port,
-            timeout=_PROXY_TIMEOUT_SECONDS,
-        )
         try:
             connection.request("GET", request_path, headers={"Accept-Encoding": "identity"})
             response = connection.getresponse()
@@ -571,11 +727,17 @@ class PreviewManager:
                 for name, value in response.getheaders()
                 if name.casefold() not in {"connection", "keep-alive", "transfer-encoding"}
             )
-            return PreviewResponse(status_code=response.status, headers=headers, body=body)
-        except OSError as exc:
+            result = PreviewResponse(status_code=response.status, headers=headers, body=body)
+        except (OSError, http.client.HTTPException, ValueError) as exc:
             raise PreviewNotFound("preview server is unavailable") from exc
         finally:
             connection.close()
+            with runtime.proxy_condition:
+                runtime.proxies.discard(connection)
+                runtime.proxy_condition.notify_all()
+        with self._lock:
+            self._authorized_runtime(preview_id, token, now=_aware_utc(self._clock()))
+        return result
 
     def app_request(
         self,
@@ -623,7 +785,7 @@ class PreviewManager:
             active_ids = tuple(preview_id for preview_id, runtime in self._runtimes.items())
             for preview_id in active_ids:
                 try:
-                    self._stop_locked(preview_id, status="stopped", now=now)
+                    self._stop_locked(preview_id, status="stopped", now=now, reason="shutdown")
                 except (PreviewError, DynamicPreviewCleanupError, OSError, RuntimeError) as exc:
                     if error is None:
                         error = exc
@@ -671,18 +833,67 @@ class PreviewManager:
         *,
         status: Literal["stopped", "expired"],
         now: datetime,
+        reason: str | None = None,
     ) -> PreviewState:
         runtime = self._runtimes[preview_id]
-        runtime.state = replace(runtime.state, status=status, stopped_at=now)
+        if runtime.state.stopped_at is None:
+            runtime.state = replace(runtime.state, status=status, stopped_at=now)
+            runtime.stop_reason = reason or ("expired" if status == "expired" else "explicit")
         key = (runtime.state.tenant_id, runtime.state.conversation_id)
-        if runtime.application is not None:
-            runtime.application.close()
-        if runtime.server is not None:
-            runtime.server.shutdown()
-            runtime.server.server_close()
-        if runtime.thread is not None and runtime.thread is not threading.current_thread():
-            runtime.thread.join(timeout=2)
-        runtime.snapshot.cleanup()
+        identity = runtime.state.identity
+        if identity is None:
+            self._stop_unpublished_locked(runtime)
+            if self._active_by_conversation.get(key) == preview_id:
+                self._active_by_conversation.pop(key, None)
+            self._runtimes.pop(preview_id, None)
+            return runtime.state
+        assert runtime.state.stopped_at is not None
+        facts = [_manager_fact("capability", "revoked")]
+        cleanup_error: Exception | None = None
+        try:
+            if runtime.application is not None:
+                observation = BrokerCleanupObservation.from_wire(runtime.application.close().to_wire())
+                if observation.identity != identity:
+                    raise ValueError("broker cleanup identity mismatch")
+                facts.extend(observation.observations)
+            if runtime.server is not None:
+                deadline = time.monotonic() + 5
+                facts.extend(runtime.server.drain(runtime.thread, deadline))
+                with runtime.proxy_condition:
+                    while runtime.proxies:
+                        for connection in tuple(runtime.proxies):
+                            if connection.sock is not None:
+                                _close_socket(connection.sock)
+                            connection.close()
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            break
+                        runtime.proxy_condition.wait(min(remaining, 0.02))
+                    drained = not runtime.proxies
+                facts.extend((_manager_fact("proxy_operations", "drained" if drained else "present"),
+                              _manager_fact("proxy_sockets", "closed" if drained else "present")))
+            if any(f.result in {"unknown", "present"} for f in facts):
+                raise DynamicPreviewCleanupError("preview drain remains pending")
+            facts.append(_manager_fact("snapshot", _remove_snapshot(runtime)))
+        except (OSError, RuntimeError, ValueError) as error:
+            cleanup_error = error
+            if (isinstance(error, DynamicPreviewCleanupError) and error.observation is not None
+                    and error.observation.identity == identity):
+                facts.extend(error.observation.observations)
+        receipt = CleanupReceiptV1.create(identity, tuple(facts), requested_at=now,
+                                           reason=runtime.stop_reason or "explicit")
+        record = PreviewCleanupRecord(identity, receipt,
+                                      now + TERMINAL_TTL if receipt.status == "confirmed" else None)
+        try:
+            self._receipt_store.put(record)
+            self._unpersisted.pop(preview_id, None)
+        except (OSError, ValueError) as error:
+            self._unpersisted[preview_id] = PreviewCleanupRecord(identity, CleanupReceiptV1.create(
+                identity, (), requested_at=now, reason=runtime.stop_reason or "explicit",
+                reason_code="persistence_failed"), None)
+            raise DynamicPreviewCleanupError("preview receipt persistence failed") from error
+        if receipt.status != "confirmed":
+            raise DynamicPreviewCleanupError("preview cleanup pending") from cleanup_error
         if self._active_by_conversation.get(key) == preview_id:
             self._active_by_conversation.pop(key, None)
         self._runtimes.pop(preview_id, None)
@@ -691,6 +902,19 @@ class PreviewManager:
         while len(self._finished) > _MAX_FINISHED_STATES:
             self._finished.popitem(last=False)
         return runtime.state
+
+    @staticmethod
+    def _stop_unpublished_locked(runtime: _PreviewRuntime) -> None:
+        try:
+            if runtime.application is not None:
+                observation = BrokerCleanupObservation.from_wire(runtime.application.close().to_wire())
+                if (runtime.cleanup_identity is None or observation.identity != runtime.cleanup_identity
+                        or observation.status != "confirmed"):
+                    raise DynamicPreviewCleanupError("unpublished application cleanup unconfirmed")
+            if _remove_snapshot(runtime) != "absent":
+                raise DynamicPreviewCleanupError("unpublished snapshot remains present")
+        except (OSError, RuntimeError, ValueError) as error:
+            raise DynamicPreviewCleanupError("unpublished preview cleanup pending") from error
 
     def _session_root(self, tenant_id: UUID, project_id: str, session_id: str) -> Path:
         candidate = (
@@ -709,6 +933,53 @@ class PreviewManager:
         if not resolved.is_relative_to(self._workspace_root) or not resolved.is_dir():
             raise InvalidPreviewPath("workspace session escapes the configured root")
         return resolved
+
+
+def _remove_snapshot(runtime: _PreviewRuntime) -> Literal["absent", "present"]:
+    path = Path(runtime.snapshot.name)
+    for parent in reversed(path.parents):
+        info = parent.lstat()
+        if not stat.S_ISDIR(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
+            raise InvalidPreviewPath("snapshot parent contains an alias")
+    parent_info = path.parent.lstat()
+    if (parent_info.st_dev, parent_info.st_ino) != runtime.snapshot_parent_identity:
+        raise InvalidPreviewPath("snapshot parent identity changed")
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return "absent"
+    if (not stat.S_ISDIR(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400
+            or (info.st_dev, info.st_ino) != runtime.snapshot_identity
+            or (sys.platform == "linux" and info.st_uid != os.getuid())):
+        raise InvalidPreviewPath("snapshot ownership identity changed")
+    runtime.snapshot.cleanup()
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return "absent"
+    return "present"
+
+
+def _static_digest(root: Path, max_bytes: int, max_files: int) -> str:
+    digest = sha256()
+    total = count = 0
+    for path in sorted(root.rglob("*")):
+        info = path.lstat()
+        directory = stat.S_ISDIR(info.st_mode)
+        if (getattr(info, "st_file_attributes", 0) & 0x400
+                or not (directory or stat.S_ISREG(info.st_mode))):
+            raise InvalidPreviewPath("unsafe snapshot identity")
+        data = b""
+        if not directory:
+            with path.open("rb") as stream:
+                data = stream.read(max_bytes - total + 1)
+            total += len(data)
+            count += 1
+            if total > max_bytes or count > max_files:
+                raise PreviewResponseTooLarge("snapshot identity exceeds limits")
+        digest.update(tree_entry(path.relative_to(root).as_posix(), directory=directory,
+                                 executable=bool(info.st_mode & 0o111), data=data))
+    return digest.hexdigest()
 
 
 def _handler_for(
@@ -849,7 +1120,7 @@ def _snapshot_preview_root(
                     if total_bytes > max_bytes:
                         raise PreviewResponseTooLarge("preview snapshot exceeds configured limits")
                     destination.write_bytes(data)
-                    destination.chmod(0o444)
+                    destination.chmod(0o555 if before.st_mode & 0o111 else 0o444)
         return snapshot, destination_root
     except BaseException:
         snapshot.cleanup()
@@ -930,7 +1201,7 @@ def _copy_application_files(
                     if total > max_bytes:
                         raise PreviewResponseTooLarge("preview snapshot exceeds configured limits")
                     path.write_bytes(data)
-                    path.chmod(0o444)
+                    path.chmod(0o555 if info.st_mode & 0o111 else 0o444)
                 else:
                     raise InvalidPreviewPath("preview source contains a link or special file")
             finally:
