@@ -14,6 +14,20 @@ def test_role_planning_request_accepts_extended_project_task_contract() -> None:
     RolePlanningRequest(task="x" * 6_000, mode=TaskMode.DIRECT)
 
 
+def test_fresh_software_implementer_declares_scoped_workspace_reader() -> None:
+    plan = RolePlanner().plan(
+        RolePlanningRequest(
+            task="Implement a TypeScript business project with tests and a workspace bundle.",
+            mode=TaskMode.DISPATCH,
+            profile=TaskProfile.SOFTWARE,
+        )
+    )
+
+    assert {
+        "workspace.write_text", "workspace.list", "workspace.bundle", "workspace.read",
+    }.issubset(plan.role("implementer").allowed_tools)
+
+
 def test_role_planning_request_rejects_task_beyond_extended_contract_limit() -> None:
     with pytest.raises(ValueError, match="task must be nonblank, unpadded, and bounded"):
         RolePlanningRequest(task="x" * 6_001, mode=TaskMode.DIRECT)

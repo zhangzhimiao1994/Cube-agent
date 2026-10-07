@@ -5,14 +5,19 @@ import hashlib
 import json
 from collections.abc import Mapping
 from decimal import Decimal
+from pathlib import Path
+from types import SimpleNamespace
 from typing import cast
 from uuid import UUID, uuid4
 
 import pytest
 
 from agent_hub.auth.models import Role
-from agent_hub.capabilities.runtime import RuntimeCapabilityError
+from agent_hub.capabilities.approvals import ApprovalService, InMemoryApprovalStore
+from agent_hub.capabilities.defaults import DefaultRuntimeCapabilityPolicyGateway
+from agent_hub.capabilities.runtime import RuntimeCapabilityError, RuntimeCapabilityGateway
 from agent_hub.domain.runs import TaskMode
+from agent_hub.harness.tool_gateway import HarnessToolGateway
 from agent_hub.harness.types import HarnessToolCallRequest, HarnessToolCallResult
 from agent_hub.models.capacity import CapacityUnavailable
 from agent_hub.models.gateway import GatewayCompletion, GatewayRejectedOutput, ModelGatewayError
@@ -3893,12 +3898,12 @@ def _workspace_delivery_sequence_runtime(
     harness: WorkspaceDeliverySequenceHarness,
     *,
     artifact_repository: InMemoryArtifactRepository | None = None,
+    tools: tuple[str, ...] = ("workspace.write_text", "workspace.list", "workspace.bundle"),
 ) -> CrewDispatchRuntime:
     class WorkspaceCapabilities(FakeCapabilities):
         def is_replay_safe(self, name: str) -> bool:
-            return name in {"workspace.write_text", "workspace.list", "workspace.bundle"}
+            return name in tools
 
-    tools = ("workspace.write_text", "workspace.list", "workspace.bundle")
     plan = DispatchPlan(
         agents=(AgentSpec(
             id="implementer",
@@ -4101,6 +4106,10 @@ async def test_workspace_delivery_repeated_early_stop_fails_bounded_without_fake
 
 async def _workspace_delivery_partial_checkpoint(
     *, legacy: bool = False, responses: tuple[ModelResponse, ...] | None = None,
+    harness: WorkspaceDeliverySequenceHarness | None = None,
+    context: TaskContext | None = None,
+    tools: tuple[str, ...] = ("workspace.write_text", "workspace.list", "workspace.bundle"),
+    expected_tools: int = 2,
 ) -> tuple[
     RuntimeCheckpoint, TaskContext, InMemoryArtifactRepository,
     WorkspaceDeliverySequenceHarness, WorkspaceDeliverySequenceGateway,
@@ -4124,9 +4133,11 @@ async def _workspace_delivery_partial_checkpoint(
 
     gateway = PausingGateway(responses)
     repository = InMemoryArtifactRepository()
-    harness = WorkspaceDeliverySequenceHarness()
-    context = _workspace_delivery_sequence_context()
-    runtime = _workspace_delivery_sequence_runtime(gateway, harness, artifact_repository=repository)
+    harness = harness or WorkspaceDeliverySequenceHarness()
+    context = context or _workspace_delivery_sequence_context()
+    runtime = _workspace_delivery_sequence_runtime(
+        gateway, harness, artifact_repository=repository, tools=tools,
+    )
     stream = runtime.run(context)
     assert isinstance(stream, CrewRunStream)
     # Build genuine legacy request hashes before stripping the new serialized marker.
@@ -4143,7 +4154,7 @@ async def _workspace_delivery_partial_checkpoint(
             tools = checkpoint.state.get("tools")
             if (
                 isinstance(models, Mapping) and len(models) == expected_models
-                and isinstance(tools, Mapping) and len(tools) == 2
+                and isinstance(tools, Mapping) and len(tools) == expected_tools
                 and all(isinstance(value, Mapping) and value.get("status") == "succeeded"
                         for value in (*models.values(), *tools.values()))
             ):
@@ -4161,6 +4172,247 @@ async def _workspace_delivery_partial_checkpoint(
             await consumer
     assert len(gateway.requests) == expected_models
     return checkpoints[-1], context, repository, harness, gateway
+
+
+class WorkspaceObservationHarness(WorkspaceDeliverySequenceHarness):
+    def __init__(self, root: Path, context: TaskContext) -> None:
+        super().__init__()
+        self.results: list[HarnessToolCallResult] = []
+        self.routing: dict[str, JsonValue] = {
+            **context.routing_decision,
+            "requested_permissions": ("workspace.read", "workspace.write"),
+        }
+
+        class ScopedRunRepository:
+            async def get(inner_self, tenant_id: UUID, run_id: UUID) -> object:
+                assert tenant_id == context.tenant_id and run_id == context.run_id
+                return SimpleNamespace(
+                    tenant_id=tenant_id, id=run_id, actor_id=context.actor_id,
+                    routing_decision=self.routing,
+                )
+
+        repository = ScopedRunRepository()
+        self.backend = RuntimeCapabilityGateway(
+            skill_store_dir=root / "skills", project_workspace_dir=root / "projects",
+            generated_artifact_dir=root / "artifacts", run_repository=repository,
+            skill_sandboxes={},
+        )
+        self.authorized = HarnessToolGateway(
+            self.backend,
+            policy_gateway=DefaultRuntimeCapabilityPolicyGateway(
+                ApprovalService(InMemoryApprovalStore()), repository,
+            ),
+            require_actor_identity=True,
+        )
+
+    async def invoke(
+        self, tenant_id: UUID, request: HarnessToolCallRequest, *,
+        user_id: UUID | None = None, role: Role | None = None,
+    ) -> HarnessToolCallResult:
+        self.calls.append(request)
+        result = await self.authorized.invoke(tenant_id, request, user_id=user_id, role=role)
+        self.results.append(result)
+        return result
+
+
+_WORKSPACE_OBSERVATION_TOOLS = (
+    "workspace.write_text", "workspace.read", "workspace.list", "workspace.bundle",
+)
+_WORKSPACE_OBSERVATION_BEFORE = "export type OwnTest = { before: boolean };\n"
+_WORKSPACE_OBSERVATION_AFTER = "export type OwnTest = { after: number };\n"
+
+
+def _workspace_observation_call(name: str, call_id: str) -> ToolCall:
+    return ToolCall(
+        id=call_id, name=name,
+        arguments={"path": "src/types.ts"} if name == "workspace.read" else {},
+    )
+
+
+def _workspace_observation_responses(name: str) -> tuple[ModelResponse, ...]:
+    changed_path = "src/types.ts" if name == "workspace.read" else "src/added.ts"
+    return (
+        _workspace_delivery_write_response("src/types.ts", _WORKSPACE_OBSERVATION_BEFORE, "write-before"),
+        ModelResponse(text=None, tool_calls=(_workspace_observation_call(name, "observe-before"),), usage=TokenUsage(1, 1, 2)),
+        _workspace_delivery_write_response(changed_path, _WORKSPACE_OBSERVATION_AFTER, "write-after"),
+        ModelResponse(text=None, tool_calls=(_workspace_observation_call(name, "observe-after"),), usage=TokenUsage(1, 1, 2)),
+        _workspace_delivery_bundle_response(),
+        ModelResponse(text="Workspace delivered.", usage=TokenUsage(1, 1, 2)),
+    )
+
+
+def _workspace_observation_value(result: Mapping[str, JsonValue], name: str) -> JsonValue:
+    if name == "workspace.read":
+        return result["text"]
+    rows = result["workspace_files"]
+    assert isinstance(rows, tuple)
+    paths = []
+    for row in rows:
+        assert isinstance(row, Mapping) and isinstance(row["path"], str)
+        paths.append(row["path"])
+    return tuple(sorted(paths))
+
+
+@pytest.mark.parametrize("legacy", (False, True))
+@pytest.mark.parametrize("name", ("workspace.read", "workspace.list"))
+async def test_workspace_delivery_observation_refreshes_after_changed_write(
+    tmp_path: Path, name: str, legacy: bool,
+) -> None:
+    context = _workspace_delivery_sequence_context()
+    harness = WorkspaceObservationHarness(tmp_path, context)
+    gateway = WorkspaceDeliverySequenceGateway(_workspace_observation_responses(name))
+    runtime = _workspace_delivery_sequence_runtime(gateway, harness, tools=_WORKSPACE_OBSERVATION_TOOLS)
+    stream = runtime.run(context)
+    assert isinstance(stream, CrewRunStream)
+    stream._state.workspace_delivery_continuation = not legacy
+
+    events: list[RunEvent] = []
+    if legacy:
+        with pytest.raises(RuntimeExecutionError, match="step repeated an identical capability after result synthesis"):
+            async for event in stream:
+                events.append(event)
+    else:
+        events = [event async for event in stream]
+        assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    observations = [result for result in harness.results if result.tool_name == name]
+    assert len(observations) == (1 if legacy else 2)
+    assert all(result.status == "succeeded" for result in harness.results)
+    before: JsonValue = _WORKSPACE_OBSERVATION_BEFORE if name == "workspace.read" else ("src/types.ts",)
+    after: JsonValue = _WORKSPACE_OBSERVATION_AFTER if name == "workspace.read" else ("src/added.ts", "src/types.ts")
+    assert _workspace_observation_value(observations[0].payload, name) == before
+    if not legacy:
+        assert _workspace_observation_value(observations[1].payload, name) == after
+    marker = "UNTRUSTED_CAPABILITY_RESULTS_JSON="
+    result_message = next(message for message in reversed(gateway.requests[4].messages) if isinstance(message.content, str) and message.content.startswith(marker))
+    assert isinstance(result_message.content, str)
+    packet = json.loads(result_message.content[len(marker):])
+    result = packet[0]["result"]
+    if name == "workspace.read":
+        assert result["text"] == (before if legacy else after)
+    else:
+        assert tuple(sorted(row["path"] for row in result["workspace_files"])) == (before if legacy else after)
+    assert bool(gateway.requests[4].tools) is (not legacy)
+
+
+@pytest.mark.parametrize("name", ("workspace.read", "workspace.list"))
+async def test_workspace_delivery_observation_refreshes_at_distinct_tool_index(
+    tmp_path: Path, name: str,
+) -> None:
+    context = _workspace_delivery_sequence_context()
+    harness = WorkspaceObservationHarness(tmp_path, context)
+    responses = _workspace_observation_responses(name)
+    changed_write = responses[2].tool_calls[0]
+    gateway = WorkspaceDeliverySequenceGateway((
+        responses[0],
+        ModelResponse(text=None, tool_calls=(
+            _workspace_observation_call(name, "observe-before"), changed_write,
+            _workspace_observation_call(name, "observe-after"),
+        ), usage=TokenUsage(1, 1, 2)),
+        responses[4], responses[5],
+    ))
+    runtime = _workspace_delivery_sequence_runtime(gateway, harness, tools=_WORKSPACE_OBSERVATION_TOOLS)
+
+    events = [event async for event in runtime.run(context)]
+
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    observations = [result for result in harness.results if result.tool_name == name]
+    assert len(observations) == 2
+    expected: list[JsonValue] = (
+        [_WORKSPACE_OBSERVATION_BEFORE, _WORKSPACE_OBSERVATION_AFTER]
+        if name == "workspace.read" else [("src/types.ts",), ("src/added.ts", "src/types.ts")]
+    )
+    assert [_workspace_observation_value(result.payload, name) for result in observations] == expected
+    checkpoint = await runtime.save_checkpoint()
+    tools = cast(Mapping[str, Mapping[str, JsonValue]], checkpoint.state["tools"])
+    observation_states = [state for state in tools.values() if state["name"] == name]
+    assert {state["tool_index"] for state in observation_states} == {0, 2}
+    assert len({state["trigger_model_artifact_id"] for state in observation_states}) == 1
+
+
+@pytest.mark.parametrize("name", ("workspace.read", "workspace.list"))
+@pytest.mark.parametrize("same_response", (False, True))
+async def test_workspace_delivery_observation_restore_preserves_same_model_snapshot(
+    tmp_path: Path, name: str, same_response: bool,
+) -> None:
+    context = _workspace_delivery_sequence_context()
+    harness = WorkspaceObservationHarness(tmp_path, context)
+    responses = _workspace_observation_responses(name)
+    seeded = responses[:2]
+    remainder = responses[2:]
+    if same_response:
+        seeded = (
+            responses[0],
+            ModelResponse(text=None, tool_calls=(
+                _workspace_observation_call(name, "observe-before"), responses[2].tool_calls[0],
+                _workspace_observation_call(name, "observe-after"),
+            ), usage=TokenUsage(1, 1, 2)),
+        )
+        remainder = responses[4:]
+    checkpoint, context, repository, _, first_gateway = await _workspace_delivery_partial_checkpoint(
+        responses=seeded, harness=harness, context=context,
+        tools=_WORKSPACE_OBSERVATION_TOOLS, expected_tools=4 if same_response else 2,
+    )
+    assert len(harness.calls) == (4 if same_response else 2)
+    original_ids = {str(state["artifact_id"]) for state in cast(Mapping[str, Mapping[str, JsonValue]], checkpoint.state["tools"]).values()}
+    gateway = WorkspaceDeliverySequenceGateway(remainder)
+    runtime = _workspace_delivery_sequence_runtime(
+        gateway, harness, artifact_repository=repository, tools=_WORKSPACE_OBSERVATION_TOOLS,
+    )
+    await runtime.restore_checkpoint(checkpoint)
+
+    events = [event async for event in runtime.run(context.model_copy(update={"checkpoint": checkpoint}))]
+
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert len(first_gateway.requests) == 2
+    assert len(gateway.requests) == (2 if same_response else 4)
+    assert [call.tool_name for call in harness.calls] == ["workspace.write_text", name, "workspace.write_text", name, "workspace.bundle"]
+    restored = await runtime.save_checkpoint()
+    assert restored.state["usage"] == {"tokens": 8 if same_response else 12, "cost_usd": "0"}
+    restored_ids = {str(state["artifact_id"]) for state in cast(Mapping[str, Mapping[str, JsonValue]], restored.state["tools"]).values()}
+    assert original_ids.issubset(restored_ids)
+    observations = [result for result in harness.results if result.tool_name == name]
+    expected_after: JsonValue = _WORKSPACE_OBSERVATION_AFTER if name == "workspace.read" else ("src/added.ts", "src/types.ts")
+    assert _workspace_observation_value(observations[-1].payload, name) == expected_after
+    next_request = gateway.requests[0 if same_response else 2]
+    assert next_request.tools
+    marker = "UNTRUSTED_CAPABILITY_RESULTS_JSON="
+    result_message = next(message for message in reversed(next_request.messages) if isinstance(message.content, str) and message.content.startswith(marker))
+    assert isinstance(result_message.content, str)
+    packet = json.loads(result_message.content[len(marker):])
+    observed = [item["result"] for item in packet if item["name"] == name]
+    if name == "workspace.read":
+        assert [item["text"] for item in observed] == (
+            [_WORKSPACE_OBSERVATION_BEFORE, _WORKSPACE_OBSERVATION_AFTER]
+            if same_response else [_WORKSPACE_OBSERVATION_AFTER]
+        )
+    else:
+        assert [tuple(sorted(row["path"] for row in item["workspace_files"])) for item in observed] == (
+            [("src/types.ts",), ("src/added.ts", "src/types.ts")]
+            if same_response else [("src/added.ts", "src/types.ts")]
+        )
+
+
+@pytest.mark.parametrize("name", ("workspace.read", "workspace.list"))
+async def test_workspace_delivery_observation_reauthorizes_after_permission_revoked(
+    tmp_path: Path, name: str,
+) -> None:
+    context = _workspace_delivery_sequence_context()
+    harness = WorkspaceObservationHarness(tmp_path, context)
+
+    class RevokingGateway(WorkspaceDeliverySequenceGateway):
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+            if len(self.requests) == 3:
+                harness.routing["requested_permissions"] = ("workspace.write",)
+            return await super().complete_with_context(request)
+
+    gateway = RevokingGateway(_workspace_observation_responses(name))
+    runtime = _workspace_delivery_sequence_runtime(gateway, harness, tools=_WORKSPACE_OBSERVATION_TOOLS)
+    with pytest.raises(RuntimeExecutionError, match="capability execution failed"):
+        _ = [event async for event in runtime.run(context)]
+    observations = [result for result in harness.results if result.tool_name == name]
+    assert len(observations) == 2
+    assert observations[0].status == "succeeded" and observations[1].status == "failed"
+    assert "workspace.bundle" not in [call.tool_name for call in harness.calls]
 
 
 async def test_workspace_delivery_checkpoint_keeps_new_history_without_replaying_success() -> None:

@@ -5,6 +5,7 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 from typing import ClassVar, cast
 from uuid import UUID, uuid4
 
@@ -14,6 +15,7 @@ import pytest
 from pydantic import ValidationError
 
 import agent_hub.runtime.defaults as defaults_module
+from agent_hub.capabilities.runtime import RuntimeCapabilityError, RuntimeCapabilityGateway
 from agent_hub.config.repository import ConfigRevision, ConfigStatus
 from agent_hub.config.schema import PlatformConfig
 from agent_hub.domain.runs import TaskMode
@@ -57,6 +59,7 @@ from agent_hub.runtime.defaults import (
 from agent_hub.runtime.direct import RuntimeExecutionError
 from agent_hub.runtime.role_planner import (
     RoleAssignment,
+    RolePlanner,
     RolePlanningRequest,
     RolePurpose,
     TaskProfile,
@@ -5371,10 +5374,16 @@ async def test_config_backed_discussion_runtime_prepares_tenant_before_inventory
 
     assert capability_gateway.prepared_tenants == [TENANT_ID]
     roles, steps = _role_step_plan_from_events(events)
+    assert tuple(role["id"] for role in roles) == ("scheduler", "reviewer")
+    assert all(role["purpose"] == "expertise" for role in roles)
     scheduler = next(role for role in roles if role["id"] == "scheduler")
-    assert scheduler["tools"] == ("read_context", "calendar.create_event")
+    assert scheduler["tools"] == ("read_context",)
     scheduler_step = next(step for step in steps if step["agent"] == "scheduler")
-    assert scheduler_step["tools"] == ("read_context", "calendar.create_event")
+    assert scheduler_step["tools"] == ("read_context",)
+    reviewer = next(role for role in roles if role["id"] == "reviewer")
+    assert reviewer["tools"] == ("calendar.create_event",)
+    reviewer_step = next(step for step in steps if step["agent"] == "reviewer")
+    assert reviewer_step["tools"] == ("calendar.create_event",)
 
 
 @pytest.mark.asyncio
@@ -6807,6 +6816,193 @@ def test_project_scale_capability_implementer_prioritizes_project_zip_tool() -> 
             "If read_context has no additional runtime context, continue with the requested files"
             in implementer_step.task
         )
+
+
+@pytest.mark.parametrize("reader_available", (False, True))
+def test_fresh_dispatch_plan_retains_only_available_workspace_reader(
+    reader_available: bool,
+) -> None:
+    roles = RolePlanner().plan(
+        RolePlanningRequest(
+            task="Implement a TypeScript business project with tests and a workspace bundle.",
+            mode=TaskMode.DISPATCH,
+            profile=TaskProfile.SOFTWARE,
+        )
+    ).roles
+    context = TaskContext(
+        run_id=uuid4(), tenant_id=TENANT_ID, mode=TaskMode.DISPATCH,
+        request="Build a real medium business project with sources and tests.",
+        routing_decision={
+            "project_scale": "medium", "project_delivery": "workspace",
+            "artifact_strategy": "workspace_bundle",
+        },
+    )
+    available = {"workspace.write_text", "workspace.list", "workspace.bundle"}
+    if reader_available:
+        available.add("workspace.read")
+    plan = _dispatch_plan(
+        roles, context, capability_gateway=FakeCapabilityAvailability(available),
+    )
+
+    agent = next(agent for agent in plan.agents if agent.id == "implementer")
+    step = next(step for step in plan.steps if step.agent == "implementer")
+    assert ("workspace.read" in step.tools) is reader_available
+    assert ("workspace.read" in agent.allowed_tools) is reader_available
+    assert ("workspace.read" in plan.allowed_tools) is reader_available
+    assert ("workspace.read" in step.task) is reader_available
+    assert {"workspace.write_text", "workspace.list", "workspace.bundle"}.issubset(step.tools)
+    assert "read_context" not in step.tools and "project.generate_zip" not in step.tools
+    assert step.tool_argument_budget_bytes == {"workspace.write_text": 512_000}
+
+
+def test_legacy_explicit_role_does_not_receive_workspace_reader_or_guidance() -> None:
+    role = RolePlanner().plan(
+        RolePlanningRequest(
+            task="Implement a TypeScript business project with tests and a workspace bundle.",
+            mode=TaskMode.DISPATCH,
+            profile=TaskProfile.SOFTWARE,
+        )
+    ).role("implementer")
+    legacy_tools = ("workspace.write_text", "workspace.list", "workspace.bundle")
+    role = replace(role, allowed_tools=legacy_tools, skills=())
+    context = TaskContext(
+        run_id=uuid4(), tenant_id=TENANT_ID, mode=TaskMode.DISPATCH,
+        request="Build a real medium business project with sources and tests.",
+        routing_decision={
+            "project_scale": "medium", "project_delivery": "workspace",
+            "artifact_strategy": "workspace_bundle",
+        },
+    )
+    plan = _dispatch_plan(
+        (role,), context,
+        capability_gateway=FakeCapabilityAvailability({*legacy_tools, "workspace.read"}),
+    )
+
+    assert plan.agents[0].allowed_tools == legacy_tools
+    step = next(step for step in plan.steps if step.agent == "implementer")
+    assert step.tools == legacy_tools
+    assert "workspace.read" not in plan.allowed_tools
+    assert "workspace.read" not in step.task
+    assert "Build the project incrementally" in step.task
+
+
+@pytest.mark.parametrize("reader_available", (False, True))
+def test_replay_safe_workspace_reader_requires_actual_gateway_availability(
+    tmp_path: Path, reader_available: bool,
+) -> None:
+    roles = RolePlanner().plan(
+        RolePlanningRequest(
+            task="Implement a TypeScript business project with tests and a workspace bundle.",
+            mode=TaskMode.DISPATCH,
+            profile=TaskProfile.SOFTWARE,
+        )
+    ).roles
+    context = TaskContext(
+        run_id=uuid4(), tenant_id=TENANT_ID, mode=TaskMode.DISPATCH,
+        request="Build a real medium business project with sources and tests.",
+        routing_decision={
+            "project_scale": "medium", "project_delivery": "workspace",
+            "artifact_strategy": "workspace_bundle",
+        },
+    )
+
+    class ScopedRunRepository:
+        async def get(self, tenant_id: UUID, run_id: UUID) -> object:
+            assert tenant_id == TENANT_ID and run_id == context.run_id
+            return SimpleNamespace(
+                tenant_id=tenant_id, id=run_id,
+                routing_decision={
+                    "project_id": "reader-test", "workspace_session_id": "reader-session",
+                    "sandbox_profile": "workspace_write",
+                    "requested_permissions": ("workspace.read", "workspace.write"),
+                },
+            )
+
+    gateway = RuntimeCapabilityGateway(
+        skill_store_dir=tmp_path / "skills", project_workspace_dir=tmp_path / "projects",
+        generated_artifact_dir=tmp_path / "artifacts", skill_sandboxes={},
+        run_repository=ScopedRunRepository() if reader_available else None,
+    )
+    assert gateway.is_replay_safe("workspace.read") is True
+    assert gateway.is_available(TENANT_ID, "workspace.read") is reader_available
+    plan = _dispatch_plan(roles, context, capability_gateway=gateway)
+    step = next(step for step in plan.steps if step.agent == "implementer")
+    agent = next(agent for agent in plan.agents if agent.id == "implementer")
+    assert ("workspace.read" in step.tools) is reader_available
+    assert ("workspace.read" in agent.allowed_tools) is reader_available
+    assert ("workspace.read" in plan.allowed_tools) is reader_available
+    assert ("workspace.read" in step.task) is reader_available
+    assert {"workspace.write_text", "workspace.list", "workspace.bundle"}.issubset(step.tools)
+
+
+@pytest.mark.parametrize("reader_available", (False, True))
+def test_incremental_reader_guidance_uses_returned_relative_paths_only_when_available(
+    reader_available: bool,
+) -> None:
+    tools: tuple[str, ...] = ("workspace.write_text", "workspace.list", "workspace.bundle")
+    if reader_available:
+        tools = (*tools, "workspace.read")
+    context = TaskContext(
+        run_id=uuid4(), tenant_id=TENANT_ID, mode=TaskMode.DISPATCH,
+        request="Build a TypeScript business project with tests.",
+    )
+    guidance = defaults_module._software_delivery_guidance(context, tools)
+
+    assert "Build the project incrementally" in guidance
+    assert ("workspace.read" in guidance) is reader_available
+    if reader_available:
+        assert "relative paths returned by workspace.write_text or workspace.list" in guidance
+        assert "workspace/current" in guidance
+        assert "Do not prepend" in guidance
+
+
+@pytest.mark.parametrize("read_authorized", (False, True))
+async def test_workspace_reader_requires_persisted_read_permission_after_write(
+    tmp_path: Path, read_authorized: bool,
+) -> None:
+    run_id = uuid4()
+    permissions = ["workspace.write"]
+    if read_authorized:
+        permissions.append("workspace.read")
+
+    class ScopedRunRepository:
+        async def get(self, tenant_id: UUID, requested_run_id: UUID) -> object:
+            assert tenant_id == TENANT_ID and requested_run_id == run_id
+            return SimpleNamespace(
+                tenant_id=tenant_id, id=requested_run_id,
+                routing_decision={
+                    "project_id": "reader-test", "workspace_session_id": "reader-session",
+                    "sandbox_profile": "workspace_write", "requested_permissions": permissions,
+                },
+            )
+
+    gateway = RuntimeCapabilityGateway(
+        skill_store_dir=tmp_path / "skills", project_workspace_dir=tmp_path / "projects",
+        run_repository=ScopedRunRepository(), skill_sandboxes={},
+    )
+    content = "export type OwnReaderTest = { own: boolean };\n"
+    written = await gateway.execute(
+        tenant_id=TENANT_ID, run_id=run_id, actor="implementer",
+        name="workspace.write_text", arguments={"path": "src/types.ts", "content": content},
+        idempotency_key="reader-test-write",
+    )
+    file = written["file"]
+    assert isinstance(file, Mapping) and file["path"] == "src/types.ts"
+    arguments: dict[str, JsonValue] = {
+        "path": "src/types.ts", "requested_permissions": ("workspace.read",),
+    }
+    if not read_authorized:
+        with pytest.raises(RuntimeCapabilityError, match="workspace read denied"):
+            await gateway.execute(
+                tenant_id=TENANT_ID, run_id=run_id, actor="implementer", name="workspace.read",
+                arguments=arguments, idempotency_key="reader-test-read",
+            )
+        return
+    result = await gateway.execute(
+        tenant_id=TENANT_ID, run_id=run_id, actor="implementer", name="workspace.read",
+        arguments=arguments, idempotency_key="reader-test-read",
+    )
+    assert result == {"path": "src/types.ts", "text": content, "truncated": False}
 
 
 def test_natural_large_website_uses_workspace_bundle_budget_and_preview_contract() -> None:

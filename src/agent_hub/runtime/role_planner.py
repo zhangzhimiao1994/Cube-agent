@@ -713,6 +713,7 @@ def _dispatch_specs(profile: TaskProfile) -> tuple[_RoleSpec, ...]:
                     "run_safe_command",
                     "workspace.write_text",
                     "workspace.list",
+                    "workspace.read",
                     "workspace.bundle",
                     "project.generate_zip",
                 ),

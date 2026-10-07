@@ -5931,9 +5931,13 @@ class CrewDispatchRuntime:
                     evidence,
                     arguments=tool_call.arguments,
                 )
+                # Mutable observations reuse only the exact causal tool slot below.
                 semantic_artifact = (
                     None
-                    if generated_file_result is not None
+                    if generated_file_result is not None or (
+                        workspace_continuation
+                        and tool_call.name in {"workspace.read", "workspace.list"}
+                    )
                     else _succeeded_semantic_tool_result(
                         tool_ledger,
                         step_id=step.id,
@@ -6023,11 +6027,18 @@ class CrewDispatchRuntime:
                     results.append(
                         {
                             "name": tool_call.name,
-                            "result": artifact.content["result"],
+                            "result": _mutable_json(artifact.content["result"]),
                         }
                     )
                     evidence.append(artifact)
-                    reused_semantic_results += 1
+                    if (
+                        workspace_continuation
+                        and tool_call.name in {"workspace.read", "workspace.list"}
+                        and artifact.source_ids == (str(trigger_model_artifact.id),)
+                    ):
+                        record_round_progress()
+                    else:
+                        reused_semantic_results += 1
                     continue
                 reusable_result = generated_file_result
                 if reusable_result is not None:

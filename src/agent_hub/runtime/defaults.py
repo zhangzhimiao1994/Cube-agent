@@ -1709,6 +1709,10 @@ def _software_delivery_guidance(context: TaskContext, tools: tuple[str, ...]) ->
                 "Do not claim delivery until workspace.bundle succeeds.",
             )
         )
+        if "workspace.read" in tools:
+            lines.append(
+                "Before extending existing code, use workspace.read to inspect interfaces and dependencies using the relative paths returned by workspace.write_text or workspace.list. Do not prepend workspace/current to those file paths."
+            )
         if context.routing_decision.get("website_preview_required") is True:
             lines.append(
                 "Write a self-contained preview.html with no external network dependencies so the UI can run the main flow in a sandboxed preview."
@@ -1861,11 +1865,13 @@ def _dispatch_plan(
         else ()
     )
     plan_allowed_tools = tuple(dict.fromkeys((*plan_allowed_tools, *preflight_tools)))
+    request_owner = _inventory_request_owner_id(selected_roles)
     role_tools_by_id = {
         role.id: _role_allowed_tools(
             role,
             context,
             capability_gateway=capability_gateway,
+            include_request=role.id == request_owner,
         )
         for role in selected_roles
     }
@@ -2453,11 +2459,20 @@ def _hybrid_role_payload(
     )
 
 
+def _inventory_request_owner_id(roles: tuple[RoleAssignment, ...]) -> str | None:
+    producers = tuple(role for role in roles if not _is_post_product_role(role))
+    return next(
+        (role.id for role in producers if role.purpose is RolePurpose.EXECUTE),
+        producers[-1].id if producers else None,
+    )
+
+
 def _role_allowed_tools(
     role: RoleAssignment,
     context: TaskContext | None,
     *,
     capability_gateway: RuntimeCapabilityGatewayProtocol | None,
+    include_request: bool = True,
 ) -> tuple[str, ...]:
     requested = tuple(dict.fromkeys((*role.allowed_tools, *role.skills)))
     if context is None or capability_gateway is None:
@@ -2471,6 +2486,7 @@ def _role_allowed_tools(
                     context,
                     requested=requested,
                     capability_gateway=capability_gateway,
+                    include_request=include_request,
                 ),
             )
         )
@@ -2480,6 +2496,10 @@ def _role_allowed_tools(
     is_available = getattr(capability_gateway, "is_available", None)
     filtered: list[str] = []
     for name in requested:
+        if name == "workspace.read":
+            if callable(is_available) and is_available(context.tenant_id, name) is True:
+                filtered.append(name)
+            continue
         if _is_replay_safe_capability(name, capability_gateway=capability_gateway):
             filtered.append(name)
             continue
@@ -2535,6 +2555,7 @@ def _available_inventory_tools_for_role(
     *,
     requested: tuple[str, ...],
     capability_gateway: RuntimeCapabilityGatewayProtocol,
+    include_request: bool = True,
 ) -> tuple[str, ...]:
     inventory = _capability_inventory_payload(
         context.tenant_id,
@@ -2546,7 +2567,7 @@ def _available_inventory_tools_for_role(
     if not isinstance(raw_items, tuple | list):
         return ()
     requested_tokens = {item.casefold() for item in requested}
-    match_text = _role_capability_match_text(role, context)
+    match_text = _role_capability_match_text(role, context, include_request=include_request)
     tools: list[str] = []
     for item in raw_items:
         if not isinstance(item, Mapping):
@@ -2567,11 +2588,13 @@ def _available_inventory_tools_for_role(
     return tuple(dict.fromkeys(tools))
 
 
-def _role_capability_match_text(role: RoleAssignment, context: TaskContext) -> str:
+def _role_capability_match_text(
+    role: RoleAssignment, context: TaskContext, *, include_request: bool = True,
+) -> str:
     return "\n".join(
         (
-            # Reviewers consume producer evidence unless their own assignment needs a tool.
-            "" if _is_post_product_role(role) else str(context.request),
+            # Shared requests are discovered by one owner; explicit assignments remain local.
+            str(context.request) if include_request and not _is_post_product_role(role) else "",
             role.id,
             role.role,
             role.mission,
@@ -2595,12 +2618,14 @@ def _plan_allowed_tools(
     capability_gateway: RuntimeCapabilityGatewayProtocol | None,
 ) -> tuple[str, ...]:
     tools: list[str] = []
+    request_owner = _inventory_request_owner_id(roles)
     for role in roles:
         tools.extend(
             _role_allowed_tools(
                 role,
                 context,
                 capability_gateway=capability_gateway,
+                include_request=role.id == request_owner,
             )
         )
     return tuple(dict.fromkeys(tools))
@@ -2614,11 +2639,13 @@ def _role_tools_by_id(
 ) -> dict[str, tuple[str, ...]]:
     if capability_gateway is None:
         return {role.id: role.allowed_tools for role in roles}
+    request_owner = _inventory_request_owner_id(roles)
     return {
         role.id: _role_allowed_tools(
             role,
             context,
             capability_gateway=capability_gateway,
+            include_request=role.id == request_owner,
         )
         for role in roles
     }
@@ -4570,6 +4597,7 @@ def _discussion_plan(
                 model=default_model,
             ),
         )
+    request_owner = _inventory_request_owner_id(selected_roles)
     participant_ids = _autogen_participant_ids(selected_roles)
     soft_turns = max(4, len(selected_roles) * 2)
     wall_time_seconds = context.timeout_seconds if context is not None else 300.0
@@ -4584,6 +4612,7 @@ def _discussion_plan(
                 role,
                 context,
                 capability_gateway=capability_gateway,
+                include_request=role.id == request_owner,
             ),
             max_output_tokens=1536,
         )

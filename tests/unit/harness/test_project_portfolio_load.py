@@ -8,10 +8,13 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from collections import Counter
+from contextlib import ExitStack
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 from urllib.parse import parse_qs, urlsplit
 
@@ -315,16 +318,100 @@ def test_portfolio_response_has_total_deadline_even_while_bytes_arrive(stage: st
     assert not worker.is_alive()
 
 
-def test_load_deadline_is_unknown_and_still_cleans_up(tmp_path: Path) -> None:
+@pytest.mark.parametrize('expiry', ['startup', 'request'])
+def test_load_deadline_is_unknown_and_still_cleans_up(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, expiry: str,
+) -> None:
     root = _application(tmp_path, 'slow_program')
-    result = _validate(root, timeout=2)
-    assert result['status'] == 'unknown', result
-    assert result['measurements']['elapsed_seconds'] < 6
-    assert result['measurements']['target_projects'] == 0
-    assert result['measurements']['request_errors'] == 1
-    assert result['cleanup_ok'] is True
-    _stopped(root)
-    _assert_counts(root, result)
+    npm = shutil.which('npm')
+    assert npm is not None
+    taskkill = shutil.which('taskkill') if requirements._PLATFORM == 'nt' else None
+    with ExitStack() as stack:
+        data = tempfile.TemporaryDirectory(dir=tmp_path, prefix='deadline-data-')
+        runtime = tempfile.TemporaryDirectory(dir=tmp_path, prefix='deadline-runtime-')
+        stack.enter_context(data)
+        stack.enter_context(runtime)
+        env = requirements._environment(data.name, runtime.name)
+        port = requirements._free_port()
+        env['PORT'] = str(port)
+        process = subprocess.Popen(
+            [npm, 'start'], cwd=root, env=env, stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=requirements._PLATFORM == 'posix',
+        )
+        try:
+            # Prepare the real fixture separately; validation retains its 2s budget.
+            ready_deadline = time.monotonic() + 25
+            while True:
+                assert process.poll() is None, 'trusted fixture exited before readiness'
+                assert time.monotonic() < ready_deadline, 'trusted fixture never became ready'
+                with socket.socket() as connection:
+                    connection.settimeout(0.1)
+                    if connection.connect_ex(('127.0.0.1', port)) == 0:
+                        break
+                time.sleep(0.05)
+            assert not (root / 'requests.jsonl').exists()
+            original_ready = requirements._ready_portfolio
+            clock_offset = 0.0
+            launches = 0
+            allocated: list[str] = []
+
+            def clock() -> float:
+                return time.monotonic() + clock_offset
+
+            def directory(*, prefix: str) -> tempfile.TemporaryDirectory[str]:
+                allocated.append(prefix)
+                return {'ultra-load-data-': data, 'ultra-load-runtime-': runtime}[prefix]
+
+            def launch(command: list[str], **kwargs: Any) -> subprocess.Popen[bytes]:
+                nonlocal launches
+                launches += 1
+                assert command == [npm, 'start'] and kwargs['cwd'] == root
+                assert kwargs['env']['DATA_DIR'] == data.name
+                assert kwargs['env']['HOME'] == runtime.name
+                assert kwargs['env']['PORT'] == str(port)
+                return process
+
+            def ready(api: Any, child: subprocess.Popen[bytes]) -> None:
+                nonlocal clock_offset
+                assert child is process
+                if expiry == 'startup':
+                    # Expire the shared deadline before the first HTTP request.
+                    clock_offset = api.deadline - time.monotonic()
+                original_ready(api, child)
+
+            with monkeypatch.context() as patch:
+                patch.setattr(requirements.tempfile, 'TemporaryDirectory', directory)
+                subprocess_shim = SimpleNamespace(**vars(subprocess))
+                subprocess_shim.Popen = launch
+                patch.setattr(requirements, 'subprocess', subprocess_shim)
+                patch.setattr(requirements, '_free_port', lambda: port)
+                patch.setattr(requirements, '_ready_portfolio', ready)
+                patch.setattr(requirements, 'time', SimpleNamespace(
+                    monotonic=clock, sleep=time.sleep,
+                ))
+                result = _validate(root, timeout=2)
+            assert launches == 1
+            assert allocated == ['ultra-load-data-', 'ultra-load-runtime-']
+            assert result['status'] == 'unknown', result
+            assert any('timeout' in reason.lower() for reason in result['reasons']), result
+            assert result['measurements']['elapsed_seconds'] < 6
+            expected = dict.fromkeys(_EXPECTED, 0)
+            if expiry == 'request':
+                expected.update(write_requests=1, request_errors=1)
+            assert {key: result['measurements'][key] for key in _EXPECTED} == expected
+            assert result['cleanup_ok'] is True
+            assert process.poll() is not None
+            _stopped(root)
+            if expiry == 'startup':
+                assert not (root / 'requests.jsonl').exists()
+            else:
+                assert [(entry['method'], entry['url']) for entry in _log(
+                    root, 'requests.jsonl',
+                )] == [('GET', '/programs'), ('POST', '/programs')]
+                _assert_counts(root, result)
+        finally:
+            requirements._stop_tree(process, taskkill)
 
 
 def test_environment_unavailable_is_unknown(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
