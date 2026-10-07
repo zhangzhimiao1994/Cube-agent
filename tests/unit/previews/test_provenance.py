@@ -132,17 +132,40 @@ def test_dynamic_selection_uses_component_exclusions() -> None:
     )
 
 
-def test_broker_and_provenance_import_without_harness_or_third_party() -> None:
+@pytest.mark.parametrize("missing_windows_native", [False, True])
+def test_broker_and_provenance_import_without_harness_or_third_party(
+    missing_windows_native: bool,
+) -> None:
     script = """
 import importlib.abc, sys
 sys.path.insert(0, sys.argv[1])
+if sys.argv[2] == 'missing':
+    sys.stdlib_module_names = sys.stdlib_module_names - {'_wmi'}
+    sys.modules.pop('_wmi', None)
 class Block(importlib.abc.MetaPathFinder):
     def find_spec(self, fullname, path=None, target=None):
         if fullname.startswith('agent_hub.harness'):
             raise RuntimeError('heavy harness import: ' + fullname)
+        if fullname == '_wmi' and fullname not in sys.stdlib_module_names:
+            raise ModuleNotFoundError('optional Windows native module missing', name=fullname)
         if fullname.split('.')[0] not in sys.stdlib_module_names | {'agent_hub'}:
             raise RuntimeError('third party import: ' + fullname)
 sys.meta_path.insert(0, Block())
+if sys.argv[2] == 'missing':
+    try:
+        __import__('_wmi')
+    except ModuleNotFoundError as error:
+        assert error.name == '_wmi'
+    else:
+        raise AssertionError('missing native module was imported')
+for name, message in [('requests', 'third party import:'),
+                      ('agent_hub.harness', 'heavy harness import:')]:
+    try:
+        __import__(name)
+    except RuntimeError as error:
+        assert str(error).startswith(message)
+    else:
+        raise AssertionError('forbidden import was accepted')
 from agent_hub.workspace_manifest import workspace_manifest_sha256
 from agent_hub.previews import provenance, dynamic_broker
 assert provenance.SnapshotManifestV1
@@ -151,7 +174,8 @@ assert workspace_manifest_sha256({'index.html': (0, 'a' * 64)})
 assert not any(n.startswith('agent_hub.harness') for n in sys.modules)
 """
     source = Path(__file__).resolve().parents[3] / "src"
-    result = subprocess.run([sys.executable, "-I", "-S", "-c", script, str(source)],
+    result = subprocess.run([sys.executable, "-I", "-S", "-c", script, str(source),
+                             "missing" if missing_windows_native else "native"],
                             capture_output=True, text=True, check=False)
     assert result.returncode == 0, result.stderr
 
