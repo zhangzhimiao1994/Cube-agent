@@ -5941,6 +5941,14 @@ class CrewDispatchRuntime:
                         arguments_sha256=arguments_sha256,
                     )
                 )
+                if (
+                    workspace_continuation
+                    and tool_call.name == "workspace.bundle"
+                    and semantic_artifact is not None
+                    and semantic_artifact.source_ids != (str(trigger_model_artifact.id),)
+                ):
+                    # Replay the original request, but freshly authorize each new bundle request.
+                    semantic_artifact = None
                 if semantic_artifact is not None:
                     semantic_result = _mutable_json(semantic_artifact.content["result"])
                     results.append(

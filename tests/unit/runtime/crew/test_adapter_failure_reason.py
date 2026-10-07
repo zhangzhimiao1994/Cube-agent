@@ -4300,6 +4300,111 @@ async def test_workspace_delivery_checkpoint_accepts_current_attempt_prior_bundl
 
 
 @pytest.mark.parametrize("legacy", [False, True])
+async def test_workspace_delivery_compact_retry_requests_fresh_bundle(legacy: bool) -> None:
+    gateway = WorkspaceDeliverySequenceGateway((
+        _workspace_delivery_write_response("src/business.ts", "export const ready = true;\n", "write-business"),
+        _workspace_delivery_bundle_response(),
+        ModelResponse(text="", usage=TokenUsage(1, 1, 2)),
+        _workspace_delivery_bundle_response(),
+        ModelResponse(text="Workspace delivered.", usage=TokenUsage(1, 1, 2)),
+    ))
+    harness = WorkspaceDeliverySequenceHarness()
+    runtime = _workspace_delivery_sequence_runtime(gateway, harness)
+    stream = runtime.run(_workspace_delivery_sequence_context())
+    assert isinstance(stream, CrewRunStream)
+    stream._state.workspace_delivery_continuation = not legacy
+
+    events = [event async for event in stream]
+
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert len(gateway.requests) == 5
+    retries = [event for event in events if event.kind is EventKind.STEP_RETRYING]
+    assert len(retries) == 1 and retries[0].reason == "model response text is empty"
+    assert [call.tool_name for call in harness.calls] == (
+        ["workspace.write_text", "workspace.bundle"] if legacy
+        else ["workspace.write_text", "workspace.bundle", "workspace.bundle"]
+    )
+    checkpoint = await runtime.save_checkpoint()
+    tools = cast(Mapping[str, Mapping[str, JsonValue]], checkpoint.state["tools"])
+    bundles = sorted(
+        (value for value in tools.values() if value["name"] == "workspace.bundle"),
+        key=lambda value: (cast(int, value["attempt"]), cast(int, value["round"])),
+    )
+    assert [value["attempt"] for value in bundles] == ([0] if legacy else [0, 1])
+    assert all(value["status"] == "succeeded" for value in bundles)
+    assert len({value["artifact_id"] for value in bundles}) == (1 if legacy else 2)
+    results = _workspace_delivery_request_packet(gateway.requests[-1], "UNTRUSTED_CAPABILITY_RESULTS_JSON=")
+    assert "workspace.bundle" in results and "incremental-progress.zip" in results
+    final_artifacts = [
+        event.artifact for event in events
+        if event.kind is EventKind.ARTIFACT_CREATED
+        and event.artifact is not None and event.artifact.type == "text"
+    ]
+    assert bundles[-1]["artifact_id"] in final_artifacts[-1].source_ids
+    assert checkpoint.state["usage"] == {"tokens": 8, "cost_usd": "0"}
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+async def test_workspace_delivery_changed_write_requests_fresh_bundle(legacy: bool) -> None:
+    class SnapshotHarness(WorkspaceDeliverySequenceHarness):
+        def __init__(self) -> None:
+            super().__init__()
+            self.bundle_snapshots: list[dict[str, str]] = []
+
+        async def invoke(
+            self, tenant_id: UUID, request: HarnessToolCallRequest, *,
+            user_id: UUID | None = None, role: Role | None = None,
+        ) -> HarnessToolCallResult:
+            result = await super().invoke(tenant_id, request, user_id=user_id, role=role)
+            if request.tool_name == "workspace.bundle":
+                self.bundle_snapshots.append(dict(self.files))
+            return result
+
+    before = "export const revision = 1;\n"
+    after = "export const revision = 2;\n"
+    gateway = WorkspaceDeliverySequenceGateway((
+        _workspace_delivery_write_response("src/business.ts", before, "write-before"),
+        _workspace_delivery_bundle_response(),
+        _workspace_delivery_write_response("src/business.ts", after, "write-after"),
+        _workspace_delivery_bundle_response(),
+        ModelResponse(text="Workspace delivered.", usage=TokenUsage(1, 1, 2)),
+    ))
+    harness = SnapshotHarness()
+    runtime = _workspace_delivery_sequence_runtime(gateway, harness)
+    stream = runtime.run(_workspace_delivery_sequence_context())
+    assert isinstance(stream, CrewRunStream)
+    stream._state.workspace_delivery_continuation = not legacy
+
+    events = [event async for event in stream]
+
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert len(gateway.requests) == 5
+    assert [call.tool_name for call in harness.calls] == (
+        ["workspace.write_text", "workspace.bundle", "workspace.write_text"] if legacy
+        else ["workspace.write_text", "workspace.bundle", "workspace.write_text", "workspace.bundle"]
+    )
+    assert harness.files == {"src/business.ts": after}
+    assert harness.bundle_snapshots == (
+        [{"src/business.ts": before}] if legacy
+        else [{"src/business.ts": before}, {"src/business.ts": after}]
+    )
+    assert (harness.bundle_snapshots[-1] == harness.files) is (not legacy)
+    checkpoint = await runtime.save_checkpoint()
+    tools = cast(Mapping[str, Mapping[str, JsonValue]], checkpoint.state["tools"])
+    bundles = sorted(
+        (value for value in tools.values() if value["name"] == "workspace.bundle"),
+        key=lambda value: (cast(int, value["attempt"]), cast(int, value["round"])),
+    )
+    assert [value["round"] for value in bundles] == ([1] if legacy else [1, 3])
+    assert all(value["attempt"] == 0 and value["status"] == "succeeded" for value in bundles)
+    assert len({value["artifact_id"] for value in bundles}) == (1 if legacy else 2)
+    attachments = _workspace_delivery_final_attachments(events)
+    assert len(attachments) == (1 if legacy else 2)
+    assert attachments[-1].artifact is not None
+    assert str(attachments[-1].artifact.id) == bundles[-1]["artifact_id"]
+
+
+@pytest.mark.parametrize("legacy", [False, True])
 @pytest.mark.parametrize(
     ("bundle_attempt", "bundle_round"),
     [(0, 1), (0, 2), (1, 0)],
