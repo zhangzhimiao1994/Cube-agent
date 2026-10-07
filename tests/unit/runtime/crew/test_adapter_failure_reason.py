@@ -35,6 +35,7 @@ from agent_hub.runtime.contracts import (
     RuntimeCheckpoint,
     TaskContext,
 )
+from agent_hub.runtime.crew import adapter as crew_adapter
 from agent_hub.runtime.crew.adapter import (
     CapabilityOutcomeUncertain,
     CrewAgentDefinition,
@@ -60,6 +61,8 @@ from agent_hub.runtime.crew.adapter import (
     _tool_round_budget,
     _tool_sandbox,
     _ToolLedger,
+    _workspace_assistant_tool_history,
+    _workspace_delivery_progress,
 )
 from agent_hub.runtime.crew.plan import AgentSpec, DispatchPlan, DispatchStep
 
@@ -3822,6 +3825,701 @@ async def test_natural_large_project_writes_workspace_incrementally_before_bundl
         "incremental_workspace_delivery"
     )
     assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+
+
+class WorkspaceDeliverySequenceGateway:
+    def __init__(self, responses: tuple[ModelResponse, ...]) -> None:
+        self.responses = responses
+        self.requests: list[ModelRequest] = []
+
+    async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+        self.requests.append(request)
+        assert len(self.requests) <= len(self.responses), "workspace continuation exceeded its bound"
+        return GatewayCompletion(
+            response=self.responses[len(self.requests) - 1],
+            deployment_id="primary",
+            logical_model=request.logical_model,
+            provider_id="deepseek",
+            provider_model="deepseek/chat",
+            cost_usd=Decimal(0),
+        )
+
+
+class WorkspaceDeliverySequenceHarness:
+    def __init__(self) -> None:
+        self.calls: list[HarnessToolCallRequest] = []
+        self.files: dict[str, str] = {}
+
+    async def invoke(
+        self,
+        tenant_id: UUID,
+        request: HarnessToolCallRequest,
+        *,
+        user_id: UUID | None = None,
+        role: Role | None = None,
+    ) -> HarnessToolCallResult:
+        assert tenant_id == TENANT_ID
+        assert user_id is not None and role is Role.OPERATOR
+        self.calls.append(request)
+        payload: Mapping[str, JsonValue]
+        if request.tool_name == "workspace.write_text":
+            path = request.arguments["path"]
+            content = request.arguments["content"]
+            assert isinstance(path, str) and isinstance(content, str)
+            self.files[path] = content
+            payload = {
+                "path": path,
+                "content_bytes": len(content.encode("utf-8")),
+                "content_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+                "summary": "Workspace file written.",
+            }
+        else:
+            assert request.tool_name == "workspace.bundle"
+            payload = {
+                "artifact_id": str(uuid4()),
+                "presentation": "final_attachment",
+                "file": {"filename": "incremental-progress.zip"},
+            }
+        return HarnessToolCallResult(
+            call_id=request.call_id,
+            tool_name=request.tool_name,
+            status="succeeded",
+            payload=payload,
+        )
+
+
+def _workspace_delivery_sequence_runtime(
+    gateway: WorkspaceDeliverySequenceGateway,
+    harness: WorkspaceDeliverySequenceHarness,
+    *,
+    artifact_repository: InMemoryArtifactRepository | None = None,
+) -> CrewDispatchRuntime:
+    class WorkspaceCapabilities(FakeCapabilities):
+        def is_replay_safe(self, name: str) -> bool:
+            return name in {"workspace.write_text", "workspace.list", "workspace.bundle"}
+
+    tools = ("workspace.write_text", "workspace.list", "workspace.bundle")
+    plan = DispatchPlan(
+        agents=(AgentSpec(
+            id="implementer",
+            role="Implementer",
+            goal="Complete the business sources and tests before bundling.",
+            logical_model="general",
+            allowed_tools=tools,
+        ),),
+        steps=(DispatchStep(
+            id="implementer_step",
+            agent="implementer",
+            task=(
+                "Build the project incrementally.\n"
+                "Project workspace delivery contract: produce complete workspace files "
+                "and a downloadable bundle."
+            ),
+            tools=tools,
+            final_synthesizer=True,
+            token_budget=10_000,
+            tool_argument_budget_bytes={"workspace.write_text": 512_000},
+        ),),
+        allowed_tools=tools,
+        total_token_budget=10_000,
+    )
+    return CrewDispatchRuntime(
+        gateway,
+        plan,
+        capability_gateway=WorkspaceCapabilities(),
+        harness_tool_gateway=harness,
+        crew_factory=FastFactory(),
+        artifact_repository=artifact_repository,
+    )
+
+
+def _workspace_delivery_sequence_context() -> TaskContext:
+    return _context(
+        actor_id=uuid4(),
+        actor_role=Role.OPERATOR,
+        routing_decision={
+            "project_id": "incremental-progress-project",
+            "workspace_session_id": "incremental-progress-session",
+            "sandbox_profile": "workspace_write",
+            "project_scale": "medium",
+            "project_delivery": "workspace",
+            "artifact_strategy": "workspace_bundle",
+        },
+        token_budget=10_000,
+    )
+
+
+def _workspace_delivery_write_response(path: str, content: str, call_id: str) -> ModelResponse:
+    return ModelResponse(
+        text=None,
+        tool_calls=(ToolCall(
+            id=call_id,
+            name="workspace.write_text",
+            arguments={"path": path, "content": content},
+        ),),
+        usage=TokenUsage(1, 1, 2),
+    )
+
+
+def _workspace_delivery_bundle_response() -> ModelResponse:
+    return ModelResponse(
+        text=None,
+        tool_calls=(ToolCall(
+            id="deliver-workspace",
+            name="workspace.bundle",
+            arguments={"title": "Incremental business project"},
+        ),),
+        usage=TokenUsage(1, 1, 2),
+    )
+
+
+def _workspace_delivery_request_packet(
+    request: ModelRequest, marker: str, *, role: str | None = None,
+) -> str:
+    packets = [
+        message.content.partition(marker)[2]
+        for message in request.messages
+        if isinstance(message.content, str)
+        and marker in message.content
+        and (role is None or message.role == role)
+    ]
+    assert packets, f"missing {marker} in the next model request"
+    payload, _end = json.JSONDecoder().raw_decode(packets[-1].lstrip())
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+
+def _workspace_delivery_final_attachments(events: list[RunEvent]) -> list[RunEvent]:
+    attachments: list[RunEvent] = []
+    for event in events:
+        if event.artifact is None:
+            continue
+        result = event.artifact.content.get("result")
+        if isinstance(result, Mapping) and result.get("presentation") == "final_attachment":
+            attachments.append(event)
+    return attachments
+
+
+async def test_workspace_delivery_rounds_keep_assistant_history_and_cumulative_progress() -> None:
+    business = "export const business = 'SOURCE_BODY_SENTINEL_A';\n" * 1000
+    tests = "const expected = 'SOURCE_BODY_SENTINEL_B';\n" * 1000
+    gateway = WorkspaceDeliverySequenceGateway((
+        _workspace_delivery_write_response("src/business.ts", business, "write-business"),
+        _workspace_delivery_write_response("tests/business.test.ts", tests, "write-tests"),
+        _workspace_delivery_bundle_response(),
+        ModelResponse(text="Workspace delivered.", usage=TokenUsage(1, 1, 2)),
+    ))
+    harness = WorkspaceDeliverySequenceHarness()
+    runtime = _workspace_delivery_sequence_runtime(gateway, harness)
+
+    events = [event async for event in runtime.run(_workspace_delivery_sequence_context())]
+
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    request = gateway.requests[2]
+    history = _workspace_delivery_request_packet(
+        request, "UNTRUSTED_ASSISTANT_TOOL_CALLS_JSON=", role="assistant",
+    )
+    progress = _workspace_delivery_request_packet(request, "WORKSPACE_DELIVERY_PROGRESS_JSON=")
+    latest_results = _workspace_delivery_request_packet(request, "UNTRUSTED_CAPABILITY_RESULTS_JSON=")
+    assert "workspace.write_text" in history
+    assert "tests/business.test.ts" in history
+    assert hashlib.sha256(tests.encode("utf-8")).hexdigest() in history
+    assert f'"content_bytes": {len(tests.encode("utf-8"))}' in history
+    assert "src/business.ts" in progress
+    assert "tests/business.test.ts" in progress
+    assert "tests/business.test.ts" in latest_results
+    serialized = json.dumps([message.content for message in request.messages], ensure_ascii=False)
+    assert "SOURCE_BODY_SENTINEL_A" not in serialized
+    assert "SOURCE_BODY_SENTINEL_B" not in serialized
+    assert len((history + progress).encode("utf-8")) <= 16_384
+    assert [call.tool_name for call in harness.calls] == [
+        "workspace.write_text", "workspace.write_text", "workspace.bundle",
+    ]
+    attachments = _workspace_delivery_final_attachments(events)
+    assert len(attachments) == 1
+    assert attachments[0].tool_name == "workspace.bundle"
+
+
+async def test_workspace_delivery_early_stop_continues_once_to_missing_files_and_bundle() -> None:
+    gateway = WorkspaceDeliverySequenceGateway((
+        _workspace_delivery_write_response("src/business.ts", "export const ready = true;\n", "write-business"),
+        ModelResponse(text="Implementation finished.", usage=TokenUsage(1, 1, 2)),
+        _workspace_delivery_write_response("tests/business.test.ts", "const testReady = true;\n", "write-tests"),
+        _workspace_delivery_bundle_response(),
+        ModelResponse(text="Workspace delivered.", usage=TokenUsage(1, 1, 2)),
+    ))
+    harness = WorkspaceDeliverySequenceHarness()
+    runtime = _workspace_delivery_sequence_runtime(gateway, harness)
+
+    events = [event async for event in runtime.run(_workspace_delivery_sequence_context())]
+
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert len(gateway.requests) == 5
+    assert set(harness.files) == {"src/business.ts", "tests/business.test.ts"}
+    assert [call.tool_name for call in harness.calls] == [
+        "workspace.write_text", "workspace.write_text", "workspace.bundle",
+    ]
+    assert all(call.approval_required for call in harness.calls)
+    assert len({call.idempotency_key for call in harness.calls}) == 3
+    progress = _workspace_delivery_request_packet(
+        gateway.requests[2], "WORKSPACE_DELIVERY_PROGRESS_JSON=",
+    )
+    assert "src/business.ts" in progress
+    assert "tests/business.test.ts" not in progress
+    attachments = _workspace_delivery_final_attachments(events)
+    assert len(attachments) == 1
+    assert attachments[0].tool_name == "workspace.bundle"
+    checkpoint = await runtime.save_checkpoint()
+    assert checkpoint.state["usage"] == {"tokens": 10, "cost_usd": "0"}
+
+
+async def test_workspace_delivery_repeated_early_stop_fails_bounded_without_fake_artifact() -> None:
+    gateway = WorkspaceDeliverySequenceGateway((
+        _workspace_delivery_write_response("src/business.ts", "export const ready = true;\n", "write-business"),
+        ModelResponse(text="Implementation finished.", usage=TokenUsage(1, 1, 2)),
+        ModelResponse(text="Everything is already done.", usage=TokenUsage(1, 1, 2)),
+    ))
+    harness = WorkspaceDeliverySequenceHarness()
+    runtime = _workspace_delivery_sequence_runtime(gateway, harness)
+    events: list[RunEvent] = []
+
+    with pytest.raises(RuntimeExecutionError, match="workspace (bundle|delivery)"):
+        async for event in runtime.run(_workspace_delivery_sequence_context()):
+            events.append(event)
+
+    assert len(gateway.requests) == 3
+    assert [call.tool_name for call in harness.calls] == ["workspace.write_text"]
+    assert set(harness.files) == {"src/business.ts"}
+    assert harness.calls[0].approval_required is True
+    assert not any(event.kind is EventKind.RUNTIME_COMPLETED for event in events)
+    assert _workspace_delivery_final_attachments(events) == []
+    checkpoint = await runtime.save_checkpoint()
+    assert checkpoint.state["usage"] == {"tokens": 6, "cost_usd": "0"}
+    tools = checkpoint.state["tools"]
+    assert isinstance(tools, Mapping) and len(tools) == 1
+    assert all(isinstance(state, Mapping) and state["status"] == "succeeded" for state in tools.values())
+
+
+async def _workspace_delivery_partial_checkpoint(
+    *, legacy: bool = False, responses: tuple[ModelResponse, ...] | None = None,
+) -> tuple[
+    RuntimeCheckpoint, TaskContext, InMemoryArtifactRepository,
+    WorkspaceDeliverySequenceHarness, WorkspaceDeliverySequenceGateway,
+]:
+    paused = asyncio.Event()
+    checkpoint_ready = asyncio.Event()
+    if responses is None:
+        responses = (
+            _workspace_delivery_write_response("src/business.ts", "export const ready = true;\n", "write-business"),
+            _workspace_delivery_write_response("tests/business.test.ts", "const testReady = true;\n", "write-tests"),
+        )
+    expected_models = len(responses)
+
+    class PausingGateway(WorkspaceDeliverySequenceGateway):
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+            if len(self.requests) == expected_models:
+                paused.set()
+                await asyncio.Event().wait()
+                raise AssertionError("cancelled unpaid request must not complete")
+            return await super().complete_with_context(request)
+
+    gateway = PausingGateway(responses)
+    repository = InMemoryArtifactRepository()
+    harness = WorkspaceDeliverySequenceHarness()
+    context = _workspace_delivery_sequence_context()
+    runtime = _workspace_delivery_sequence_runtime(gateway, harness, artifact_repository=repository)
+    stream = runtime.run(context)
+    assert isinstance(stream, CrewRunStream)
+    # Build genuine legacy request hashes before stripping the new serialized marker.
+    if legacy:
+        stream._state.workspace_delivery_continuation = False
+    checkpoints: list[RuntimeCheckpoint] = []
+
+    async def consume() -> None:
+        async for event in stream:
+            checkpoint = event.checkpoint
+            if checkpoint is None:
+                continue
+            models = checkpoint.state.get("models")
+            tools = checkpoint.state.get("tools")
+            if (
+                isinstance(models, Mapping) and len(models) == expected_models
+                and isinstance(tools, Mapping) and len(tools) == 2
+                and all(isinstance(value, Mapping) and value.get("status") == "succeeded"
+                        for value in (*models.values(), *tools.values()))
+            ):
+                checkpoints.append(checkpoint)
+                checkpoint_ready.set()
+
+    consumer = asyncio.create_task(consume())
+    try:
+        async with asyncio.timeout(5):
+            await paused.wait()
+            await checkpoint_ready.wait()
+    finally:
+        await runtime.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await consumer
+    assert len(gateway.requests) == expected_models
+    return checkpoints[-1], context, repository, harness, gateway
+
+
+async def test_workspace_delivery_checkpoint_keeps_new_history_without_replaying_success() -> None:
+    checkpoint, context, repository, harness, first_gateway = await _workspace_delivery_partial_checkpoint()
+    assert checkpoint.state.get("workspace_delivery_continuation") is True
+    gateway = WorkspaceDeliverySequenceGateway((
+        _workspace_delivery_bundle_response(),
+        ModelResponse(text="Workspace delivered.", usage=TokenUsage(1, 1, 2)),
+    ))
+    runtime = _workspace_delivery_sequence_runtime(gateway, harness, artifact_repository=repository)
+    await runtime.restore_checkpoint(checkpoint)
+
+    events = [event async for event in runtime.run(context.model_copy(update={"checkpoint": checkpoint}))]
+
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert len(first_gateway.requests) == 2 and len(gateway.requests) == 2
+    assert [call.tool_name for call in harness.calls] == [
+        "workspace.write_text", "workspace.write_text", "workspace.bundle",
+    ]
+    history = _workspace_delivery_request_packet(
+        gateway.requests[0], "UNTRUSTED_ASSISTANT_TOOL_CALLS_JSON=", role="assistant",
+    )
+    assert "tests/business.test.ts" in history
+    progress = _workspace_delivery_request_packet(gateway.requests[0], "WORKSPACE_DELIVERY_PROGRESS_JSON=")
+    assert "src/business.ts" in progress and "tests/business.test.ts" in progress
+    restored = await runtime.save_checkpoint()
+    assert restored.state["usage"] == {"tokens": 8, "cost_usd": "0"}
+
+
+async def test_workspace_delivery_legacy_checkpoint_keeps_old_request_hashes_without_replay() -> None:
+    checkpoint, context, repository, harness, first_gateway = await _workspace_delivery_partial_checkpoint(legacy=True)
+    payload = checkpoint.to_payload()
+    state = cast(dict[str, JsonValue], payload["state"])
+    state.pop("workspace_delivery_continuation", None)
+    payload["state_sha256"] = ""
+    legacy_checkpoint = RuntimeCheckpoint.from_payload(payload)
+    assert "workspace_delivery_continuation" not in legacy_checkpoint.state
+    assert legacy_checkpoint.state["models"] == checkpoint.state["models"]
+    assert legacy_checkpoint.runtime_version == checkpoint.runtime_version == "11"
+    gateway = WorkspaceDeliverySequenceGateway((
+        _workspace_delivery_bundle_response(),
+        ModelResponse(text="Workspace delivered.", usage=TokenUsage(1, 1, 2)),
+    ))
+    runtime = _workspace_delivery_sequence_runtime(gateway, harness, artifact_repository=repository)
+    await runtime.restore_checkpoint(legacy_checkpoint)
+
+    events = [event async for event in runtime.run(context.model_copy(update={"checkpoint": legacy_checkpoint}))]
+
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert len(first_gateway.requests) == 2 and len(gateway.requests) == 2
+    assert [call.tool_name for call in harness.calls] == [
+        "workspace.write_text", "workspace.write_text", "workspace.bundle",
+    ]
+    for request in gateway.requests:
+        serialized = json.dumps([message.content for message in request.messages])
+        assert "UNTRUSTED_ASSISTANT_TOOL_CALLS_JSON=" not in serialized
+        assert "WORKSPACE_DELIVERY_PROGRESS_JSON=" not in serialized
+    restored = await runtime.save_checkpoint()
+    assert restored.state.get("workspace_delivery_continuation") is False
+    assert restored.state["usage"] == {"tokens": 8, "cost_usd": "0"}
+
+
+@pytest.mark.parametrize("marker", [None, 0, 1, "true", [], {}])
+async def test_workspace_delivery_checkpoint_rejects_nonbool_marker(marker: JsonValue) -> None:
+    checkpoint, _context_value, repository, harness, _gateway = await _workspace_delivery_partial_checkpoint()
+    payload = checkpoint.to_payload()
+    state = cast(dict[str, JsonValue], payload["state"])
+    state["workspace_delivery_continuation"] = marker
+    payload["state_sha256"] = ""
+    invalid = RuntimeCheckpoint.from_payload(payload)
+    assert invalid.state_sha256 == invalid.recompute_state_sha256()
+    assert type(invalid.state["workspace_delivery_continuation"]) is not bool
+    gateway = WorkspaceDeliverySequenceGateway(())
+    runtime = _workspace_delivery_sequence_runtime(gateway, harness, artifact_repository=repository)
+    calls_before = len(harness.calls)
+
+    with pytest.raises(RuntimeExecutionError, match="checkpoint"):
+        await runtime.restore_checkpoint(invalid)
+
+    assert gateway.requests == []
+    assert len(harness.calls) == calls_before
+
+
+async def test_workspace_delivery_checkpoint_replays_early_stop_before_future_bundle() -> None:
+    checkpoint, context, repository, harness, first_gateway = await _workspace_delivery_partial_checkpoint(
+        responses=(
+            _workspace_delivery_write_response("src/business.ts", "export const ready = true;\n", "write-business"),
+            ModelResponse(text="Implementation finished.", usage=TokenUsage(1, 1, 2)),
+            _workspace_delivery_bundle_response(),
+        ),
+    )
+    gateway = WorkspaceDeliverySequenceGateway((
+        ModelResponse(text="Workspace delivered.", usage=TokenUsage(1, 1, 2)),
+    ))
+    runtime = _workspace_delivery_sequence_runtime(gateway, harness, artifact_repository=repository)
+    await runtime.restore_checkpoint(checkpoint)
+
+    events = [event async for event in runtime.run(context.model_copy(update={"checkpoint": checkpoint}))]
+
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert len(first_gateway.requests) == 3 and len(gateway.requests) == 1
+    results = _workspace_delivery_request_packet(gateway.requests[0], "UNTRUSTED_CAPABILITY_RESULTS_JSON=")
+    assert "workspace.bundle" in results and "incremental-progress.zip" in results
+    bundle_states = cast(Mapping[str, Mapping[str, JsonValue]], checkpoint.state["tools"])
+    bundle_id = next(value["artifact_id"] for value in bundle_states.values() if value["name"] == "workspace.bundle")
+    assert any(event.artifact is not None and bundle_id in event.artifact.source_ids for event in events)
+    assert [call.tool_name for call in harness.calls] == ["workspace.write_text", "workspace.bundle"]
+    restored = await runtime.save_checkpoint()
+    assert restored.state["usage"] == {"tokens": 8, "cost_usd": "0"}
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+async def test_workspace_delivery_checkpoint_accepts_current_attempt_prior_bundle(legacy: bool) -> None:
+    checkpoint, context, repository, harness, first_gateway = await _workspace_delivery_partial_checkpoint(
+        legacy=legacy,
+        responses=(
+            _workspace_delivery_write_response("src/business.ts", "export const ready = true;\n", "write-business"),
+            _workspace_delivery_bundle_response(),
+        ),
+    )
+    gateway = WorkspaceDeliverySequenceGateway((
+        ModelResponse(text="Workspace delivered.", usage=TokenUsage(1, 1, 2)),
+    ))
+    runtime = _workspace_delivery_sequence_runtime(gateway, harness, artifact_repository=repository)
+    await runtime.restore_checkpoint(checkpoint)
+
+    events = [event async for event in runtime.run(context.model_copy(update={"checkpoint": checkpoint}))]
+
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert len(first_gateway.requests) == 2 and len(gateway.requests) == 1
+    results = _workspace_delivery_request_packet(gateway.requests[0], "UNTRUSTED_CAPABILITY_RESULTS_JSON=")
+    assert "workspace.bundle" in results and "incremental-progress.zip" in results
+    assert [call.tool_name for call in harness.calls] == ["workspace.write_text", "workspace.bundle"]
+    serialized = json.dumps([message.content for message in gateway.requests[0].messages])
+    assert ("WORKSPACE_DELIVERY_PROGRESS_JSON=" in serialized) is (not legacy)
+    assert ("UNTRUSTED_ASSISTANT_TOOL_CALLS_JSON=" in serialized) is (not legacy)
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+@pytest.mark.parametrize(
+    ("bundle_attempt", "bundle_round"),
+    [(0, 1), (0, 2), (1, 0)],
+    ids=["current-round", "future-round", "other-attempt"],
+)
+async def test_workspace_delivery_bundle_causality_boundary(
+    monkeypatch: pytest.MonkeyPatch, legacy: bool, bundle_attempt: int, bundle_round: int,
+) -> None:
+    candidate = Artifact(
+        id=uuid4(), type="tool_result", producer="implementer",
+        content={"result": {
+            "artifact_id": str(uuid4()), "presentation": "final_attachment",
+            "file": {"filename": "out-of-scope.zip"},
+        }},
+        source_ids=(str(uuid4()),),
+    )
+    original_lookup = crew_adapter._succeeded_semantic_tool_result
+
+    def lookup_with_out_of_scope_bundle(
+        ledger: _ToolLedger, *, step_id: str, name: str, arguments_sha256: str,
+    ) -> Artifact | None:
+        # Inject at the ledger boundary; keep actual semantic lookup and delivery gates.
+        ledger.states["out-of-scope-bundle"] = {
+            "status": "succeeded", "step_id": step_id, "attempt": bundle_attempt,
+            "round": bundle_round, "tool_index": 0, "name": "workspace.bundle",
+            "arguments_sha256": "a" * 64,
+        }
+        ledger.artifacts["out-of-scope-bundle"] = candidate
+        return original_lookup(ledger, step_id=step_id, name=name, arguments_sha256=arguments_sha256)
+
+    monkeypatch.setattr(crew_adapter, "_succeeded_semantic_tool_result", lookup_with_out_of_scope_bundle)
+    gateway = WorkspaceDeliverySequenceGateway((
+        _workspace_delivery_write_response("src/business.ts", "export const ready = true;\n", "write-business"),
+        ModelResponse(text="Implementation finished.", usage=TokenUsage(1, 1, 2)),
+        _workspace_delivery_bundle_response(),
+        ModelResponse(text="Workspace delivered.", usage=TokenUsage(1, 1, 2)),
+    ))
+    harness = WorkspaceDeliverySequenceHarness()
+    runtime = _workspace_delivery_sequence_runtime(gateway, harness)
+    stream = runtime.run(_workspace_delivery_sequence_context())
+    assert isinstance(stream, CrewRunStream)
+    stream._state.workspace_delivery_continuation = not legacy
+
+    events = [event async for event in stream]
+
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert len(gateway.requests) == (2 if legacy else 4), "out-of-scope bundle must not satisfy new delivery contract"
+    assert [call.tool_name for call in harness.calls] == (
+        ["workspace.write_text"] if legacy
+        else ["workspace.write_text", "workspace.bundle"]
+    )
+    attachments = _workspace_delivery_final_attachments(events)
+    assert len(attachments) == (0 if legacy else 1)
+    assert all(event.artifact is not None and event.artifact.id != candidate.id for event in attachments)
+    serialized = json.dumps([message.content for request in gateway.requests for message in request.messages])
+    assert ("WORKSPACE_DELIVERY_PROGRESS_JSON=" in serialized) is (not legacy)
+    assert ("WORKSPACE_DELIVERY_CONTINUATION:" in serialized) is (not legacy)
+
+
+@pytest.mark.parametrize(("round_index", "expected_key"), [(1, "z-old"), (2, "a-latest")])
+def test_workspace_delivery_progress_uses_latest_coordinates_after_sorted_ledger_restore(
+    round_index: int, expected_key: str,
+) -> None:
+    writes = (
+        ("z-old", 0, 9, "export const revision = 'old';\n"),
+        ("b-middle", 1, 0, "export const revision = 'middle';\n"),
+        ("a-latest", 1, 1, "export const revision = 'latest';\n"),
+        ("c-current", 2, 0, "export const revision = 'current';\n"),
+        ("d-future", 3, 0, "export const revision = 'future';\n"),
+    )
+    ledger = _ToolLedger()
+    metadata: dict[str, dict[str, JsonValue]] = {}
+    for key, tool_round, tool_index, content in writes:
+        ledger.states[key] = {
+            "status": "succeeded",
+            "step_id": "implementer_step",
+            "attempt": 0,
+            "round": tool_round,
+            "tool_index": tool_index,
+            "name": "workspace.write_text",
+        }
+        metadata[key] = {
+            "path": "src/business.ts",
+            "size_bytes": len(content.encode("utf-8")),
+            "sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+        }
+        ledger.artifacts[key] = Artifact(
+            id=uuid4(),
+            type="tool_result",
+            producer="implementer",
+            content={"result": metadata[key]},
+        )
+    restored = _ToolLedger(
+        states=cast(dict[str, Mapping[str, JsonValue]], json.loads(json.dumps(ledger.states, sort_keys=True))),
+        artifacts=dict(ledger.artifacts),
+    )
+    expected = "WORKSPACE_DELIVERY_PROGRESS_JSON=" + json.dumps(
+        {"files": [metadata[expected_key]], "file_count": 1, "omitted_files": 0},
+        sort_keys=True, separators=(",", ":"),
+    )
+    original_message = _workspace_delivery_progress(
+        ledger, step_id="implementer_step", attempt=0, round_index=round_index, max_bytes=4096,
+    )
+    restored_message = _workspace_delivery_progress(
+        restored, step_id="implementer_step", attempt=0, round_index=round_index, max_bytes=4096,
+    )
+
+    assert original_message.content == expected
+    assert restored_message.content == expected
+    assert original_message.role == restored_message.role == "user"
+    assert original_message.content == restored_message.content
+
+
+@pytest.mark.parametrize("call_count", [1, 16])
+def test_workspace_delivery_assistant_history_512_budget_includes_prefix_without_source(
+    call_count: int,
+) -> None:
+    content = "export const privateBody = 'HISTORY_SOURCE_BODY_SENTINEL';\n" * 1000
+    calls = tuple(
+        ToolCall(
+            id=f"write-{index}",
+            name="workspace.write_text",
+            arguments={
+                "path": "src/" + "business_component/" * 8 + f"module_{index}.ts",
+                "content": content,
+            },
+        )
+        for index in range(call_count)
+    )
+
+    message = _workspace_assistant_tool_history(calls, max_bytes=512)
+
+    assert message.role == "assistant"
+    assert isinstance(message.content, str)
+    prefix = "UNTRUSTED_ASSISTANT_TOOL_CALLS_JSON="
+    assert message.content.startswith(prefix)
+    assert len(message.content.encode("utf-8")) <= 512
+    assert "HISTORY_SOURCE_BODY_SENTINEL" not in message.content
+    payload = json.loads(message.content.removeprefix(prefix))
+    if call_count == 16:
+        assert isinstance(payload, dict)
+        assert set(payload) == {"call_count", "details_omitted", "sha256"}
+        assert payload["call_count"] == 16 and payload["details_omitted"] is True
+        assert isinstance(payload["sha256"], str) and len(payload["sha256"]) == 64
+        assert set(payload["sha256"]) <= set("0123456789abcdef")
+    else:
+        assert isinstance(payload, list) and len(payload) == 1
+        assert payload[0]["name"] == "workspace.write_text"
+        assert payload[0]["arguments"] == {
+            "path": calls[0].arguments["path"],
+            "content_bytes": len(content.encode("utf-8")),
+            "content_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+        }
+
+
+def test_workspace_delivery_progress_512_budget_includes_prefix_and_omitted_count() -> None:
+    source = "export const privateBody = 'PROGRESS_SOURCE_BODY_SENTINEL';\n" * 1000
+    ledger = _ToolLedger()
+    for index in range(16):
+        key = f"write-{index:02d}"
+        ledger.states[key] = {
+            "status": "succeeded", "step_id": "implementer_step", "attempt": 0,
+            "round": 0, "tool_index": index, "name": "workspace.write_text",
+        }
+        ledger.artifacts[key] = Artifact(
+            id=uuid4(), type="tool_result", producer="implementer",
+            content={"result": {
+                "path": "src/" + "business_component/" * 8 + f"module_{index}.ts",
+                "size_bytes": len(source.encode("utf-8")),
+                "sha256": hashlib.sha256(source.encode("utf-8")).hexdigest(),
+                "content": source,
+            }},
+        )
+
+    message = _workspace_delivery_progress(
+        ledger, step_id="implementer_step", attempt=0, round_index=1, max_bytes=512,
+    )
+
+    assert message.role == "user"
+    assert isinstance(message.content, str)
+    prefix = "WORKSPACE_DELIVERY_PROGRESS_JSON="
+    assert message.content.startswith(prefix)
+    assert len(message.content.encode("utf-8")) <= 512
+    assert "PROGRESS_SOURCE_BODY_SENTINEL" not in message.content
+    payload = json.loads(message.content.removeprefix(prefix))
+    assert payload["file_count"] == 16
+    assert 0 < len(payload["files"]) < 16
+    assert payload["omitted_files"] == 16 - len(payload["files"])
+    assert payload["omitted_files"] >= 10
+    assert all(set(item) == {"path", "size_bytes", "sha256"} for item in payload["files"])
+
+
+def test_workspace_delivery_progress_filters_failed_other_step_and_other_attempt() -> None:
+    ledger = _ToolLedger()
+    for key, status, step_id, attempt in (
+        ("valid", "succeeded", "implementer_step", 0),
+        ("failed", "failed", "implementer_step", 0),
+        ("other-step", "succeeded", "reviewer_step", 0),
+        ("other-attempt", "succeeded", "implementer_step", 1),
+    ):
+        ledger.states[key] = {
+            "status": status, "step_id": step_id, "attempt": attempt,
+            "round": 0, "tool_index": 0, "name": "workspace.write_text",
+        }
+        ledger.artifacts[key] = Artifact(
+            id=uuid4(), type="tool_result", producer="implementer",
+            content={"result": {"path": f"src/{key}.ts", "size_bytes": 7, "sha256": "a" * 64}},
+        )
+
+    message = _workspace_delivery_progress(
+        ledger, step_id="implementer_step", attempt=0, round_index=1, max_bytes=512,
+    )
+
+    assert isinstance(message.content, str)
+    payload = json.loads(message.content.removeprefix("WORKSPACE_DELIVERY_PROGRESS_JSON="))
+    assert payload == {
+        "files": [{"path": "src/valid.ts", "size_bytes": 7, "sha256": "a" * 64}],
+        "file_count": 1,
+        "omitted_files": 0,
+    }
 
 
 async def test_workspace_repair_prunes_obsolete_files_before_bundle() -> None:
