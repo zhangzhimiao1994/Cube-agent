@@ -1386,6 +1386,34 @@ def verify_dynamic_web_preview(
     }
 
 
+def _deferred_preview() -> dict[str, object]:
+    return {
+        "status": "deferred",
+        "counted_as_passed": False,
+        "browser_interaction": "pending_preview",
+    }
+
+
+def _reject_deferred_report(report: Mapping[str, object]) -> None:
+    entries: list[Mapping[str, object]] = [report]
+    for key in ("cases", "attempt_history"):
+        value = report.get(key)
+        if isinstance(value, list):
+            entries.extend(item for item in value if isinstance(item, Mapping))
+    for entry in entries:
+        preview = entry.get("dynamic_web_preview")
+        deferred_preview = isinstance(preview, Mapping) and (
+            preview.get("status") in ("deferred", "pending_preview")
+            or preview.get("browser_interaction") == "pending_preview"
+        )
+        if (
+            entry.get("defer_preview") is True
+            or entry.get("status") in ("deferred", "pending_preview")
+            or deferred_preview
+        ):
+            raise ValueError("deferred preview reports cannot resume or finalize")
+
+
 def build_case_report(
     *,
     scale: str,
@@ -1396,6 +1424,7 @@ def build_case_report(
     dynamic_web_preview: Mapping[str, object],
     logical_model: str | None = None,
     model_scope_evidence: Mapping[str, object] | None = None,
+    defer_preview: bool = False,
 ) -> dict[str, object]:
     generated_project_ok = result.evidence.get("generated_project_validation") is True
     requirements_ok = result.evidence.get("requirements_validation") is True
@@ -1403,6 +1432,8 @@ def build_case_report(
     validated_bundle_matches = _public_bundle_matches_validation(
         result.validated_workspace_manifest, public_artifacts,
     )
+    if defer_preview:
+        dynamic_web_preview = _deferred_preview()
     preview_ok = dynamic_web_preview.get("counted_as_passed") is True
     route_intent = result.case_id.split(":", 1)[1]
     case_kind = "auto_scale" if route_intent == "auto" else "mode_capability"
@@ -1444,7 +1475,7 @@ def build_case_report(
         and required_multi_agent_ids <= set(result.participant_agent_ids)
         and result.participant_event_count >= 8
     )
-    core_ok = (
+    delivery_ok = (
         result.status == "completed"
         and bool(result.run_id)
         and result.ok
@@ -1452,13 +1483,13 @@ def build_case_report(
         and requirements_ok
         and public_artifacts_ok
         and validated_bundle_matches
-        and preview_ok
         and route_policy_ok
         and scale_fidelity_ok
         and result.scale_specific_evidence_ok
         and artifact_origin_ok
         and multi_agent_evidence_ok
     )
+    core_ok = delivery_ok and preview_ok
     report: dict[str, object] = {
         "case_id": result.case_id,
         "case_kind": case_kind,
@@ -1547,6 +1578,14 @@ def build_case_report(
         report.update(
             status="failed", core_acceptance_ok=False, automated_acceptance_complete=False
         )
+    if defer_preview:
+        report.update(
+            defer_preview=True,
+            delivery_acceptance_ok=delivery_ok and model_ok,
+            status="pending_preview" if delivery_ok and model_ok else "failed",
+            core_acceptance_ok=False,
+            automated_acceptance_complete=False,
+        )
     return report
 
 
@@ -1616,12 +1655,24 @@ def run_real_user_four_scale_acceptance(
     resume_report: Mapping[str, object] | None = None,
     logical_model: str | None = None,
     evidence_root: Path | None = None,
+    defer_preview: bool = False,
+    stop_on_failure: bool = False,
 ) -> dict[str, object]:
+    if type(defer_preview) is not bool:
+        raise TypeError("defer_preview must be a boolean")
+    if type(stop_on_failure) is not bool:
+        raise TypeError("stop_on_failure must be a boolean")
+    if resume_report is not None:
+        _reject_deferred_report(resume_report)
+        if defer_preview:
+            raise ValueError("deferred preview execution cannot resume existing reports")
     profile = _model_profile(logical_model)
     if resume_report is not None:
         _validate_report_model_profile(resume_report, profile)
     if not isinstance(output_path, str) or not output_path.strip():
         raise ValueError("paid acceptance requires a durable output_path")
+    if resume_report is None and os.path.lexists(output_path):
+        raise ValueError("fresh acceptance cannot overwrite an existing checkpoint")
     started_at = _utc_now()
     principal = client.request_json("GET", "/api/v1/auth/me")
     if not isinstance(principal, dict):
@@ -1656,6 +1707,7 @@ def run_real_user_four_scale_acceptance(
             started_at=started_at,
             authentication_method=authentication_method,
             finished=finished,
+            defer_preview=defer_preview,
         )
 
     client.configure_submission_journal(journal, lambda: _save_report(output_path, snapshot()))
@@ -1788,11 +1840,13 @@ def run_real_user_four_scale_acceptance(
                 workspace_session_id=workspace_session_id,
                 validated_workspace_manifest=result.validated_workspace_manifest,
             )
-            dynamic_web_preview = verify_dynamic_web_preview(
-                client,
-                project_id=project_id,
-                conversation_id=conversation_id,
-                workspace_session_id=workspace_session_id,
+            dynamic_web_preview = (
+                _deferred_preview() if defer_preview else verify_dynamic_web_preview(
+                    client,
+                    project_id=project_id,
+                    conversation_id=conversation_id,
+                    workspace_session_id=workspace_session_id,
+                )
             )
             completed_case = build_case_report(
                 scale=scale,
@@ -1803,6 +1857,7 @@ def run_real_user_four_scale_acceptance(
                 dynamic_web_preview=dynamic_web_preview,
                 logical_model=logical_model,
                 model_scope_evidence=model_scope_evidence,
+                defer_preview=defer_preview,
             )
         except Exception as error:  # noqa: BLE001 - every matrix case must be attempted.
             completed_case = {
@@ -1845,6 +1900,10 @@ def run_real_user_four_scale_acceptance(
         if logical_model is not None:
             completed_case["model_profile"] = copy.deepcopy(profile)
         completed_case["attempt"] = attempt
+        if defer_preview:
+            completed_case["defer_preview"] = True
+            completed_case.setdefault("delivery_acceptance_ok", False)
+            completed_case["dynamic_web_preview"] = _deferred_preview()
         if previous is not None:
             cases[cases.index(previous)] = completed_case
         else:
@@ -1852,6 +1911,8 @@ def run_real_user_four_scale_acceptance(
         # Saving is outside the case exception handler: a failed checkpoint must stop execution.
         if output_path:
             _save_report(output_path, snapshot())
+        if stop_on_failure and completed_case["status"] == "failed":
+            break
 
     payload = snapshot(finished=True)
     if output_path:
@@ -1938,6 +1999,7 @@ def _matrix_report(
     started_at: str,
     authentication_method: str,
     finished: bool,
+    defer_preview: bool = False,
 ) -> dict[str, object]:
 
     coverage = _matrix_mode_coverage(cases, execution_id=execution_id)
@@ -2010,6 +2072,38 @@ def _matrix_report(
     }
     if "model_profile" in identity:
         report["model_profile"] = copy.deepcopy(identity["model_profile"])
+    if defer_preview:
+        delivered = [case for case in cases if case.get("delivery_acceptance_ok") is True]
+        delivery_ok = (
+            finished and len(delivered) == len(_ACCEPTANCE_CASES)
+            and client.submission_journal is not None
+            and not client.submission_journal.has_unresolved
+        )
+        report.update(
+            defer_preview=True,
+            delivery_acceptance_ok=delivery_ok,
+            delivery_passed_case_count=len(delivered),
+            delivery_failed_case_count=sum(
+                case.get("delivery_acceptance_ok") is False for case in cases
+            ),
+            delivery_unsubmitted_case_count=len(_ACCEPTANCE_CASES) - len(cases),
+            delivery_auto_scale_passed_case_count=sum(
+                case["case_kind"] == "auto_scale" and case["exact_mode_coverage_ok"] is True
+                for case in delivered
+            ),
+            delivery_exact_mode_passed_case_count=sum(
+                case["case_kind"] == "mode_capability" and case["exact_mode_coverage_ok"] is True
+                for case in delivered
+            ),
+            delivery_safe_upgrade_case_count=sum(
+                case["coverage_credit"] == "safe_upgrade" for case in delivered
+            ),
+            status="pending_preview" if delivery_ok else "failed" if finished else "in_progress",
+            core_acceptance_ok=False,
+            automated_acceptance_complete=False,
+            pending_case_count=sum(case.get("status") == "pending_preview" for case in cases),
+            dynamic_web_preview=_deferred_preview(),
+        )
     return report
 
 
@@ -2710,6 +2804,7 @@ def finalize_real_device_acceptance(
 ) -> dict[str, object]:
     """Merge deployed desktop/mobile evidence into a completed acceptance report."""
 
+    _reject_deferred_report(automated_report)
     profile = _report_model_profile(automated_report)
     _validate_report_model_profile(automated_report, profile)
     if _report_model_profile(evidence) != profile:
@@ -2901,6 +2996,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--output",
         default=os.environ.get("AGENT_HUB_PROJECT_SCALE_REPORT_PATH"),
     )
+    parser.add_argument(
+        "--defer-preview", action="store_true",
+        help="Validate delivery only; do not start previews. Reports cannot resume or finalize.",
+    )
+    parser.add_argument(
+        "--stop-on-failure", action="store_true",
+        help="Stop after saving the first known failed case; unknown submissions always stop.",
+    )
     parser.add_argument("--finalize-report")
     parser.add_argument("--real-device-evidence")
     parser.add_argument("--evidence-root", type=Path, help="Trusted browser evidence directory.")
@@ -2918,12 +3021,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error(str(error))
 
     if args.finalize_report or args.real_device_evidence:
+        if args.defer_preview:
+            parser.error("--defer-preview cannot be combined with real-device finalization")
         if args.resume_report:
             parser.error("--resume-report cannot be combined with real-device finalization")
         if not args.finalize_report or not args.real_device_evidence:
             parser.error("--finalize-report and --real-device-evidence must be used together")
         try:
             automated = _read_json_mapping(args.finalize_report)
+            _reject_deferred_report(automated)
             device_evidence = _read_json_mapping(args.real_device_evidence)
             saved_profile = _report_model_profile(automated)
             _validate_report_model_profile(automated, saved_profile)
@@ -2960,8 +3066,11 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     resume_report = None
     if args.resume_report:
+        if args.defer_preview:
+            parser.error("deferred preview execution cannot resume existing reports")
         try:
             resume_report = _read_json_mapping(args.resume_report)
+            _reject_deferred_report(resume_report)
             _validate_report_model_profile(resume_report, profile)
         except (OSError, TypeError, ValueError) as error:
             parser.error(f"cannot read resume report: {error}")
@@ -2973,6 +3082,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.execution_id = saved_execution_id
         args.output = args.output or args.resume_report
     args.execution_id = args.execution_id or _default_execution_id()
+
+    if args.resume_report is None and args.output and os.path.lexists(args.output):
+        parser.error("fresh acceptance cannot overwrite an existing checkpoint")
 
     username, password, tenant_id = _acceptance_credentials_from_env()
     bearer_token = os.environ.get("AGENT_HUB_ACCEPTANCE_BEARER_TOKEN", "").strip()
@@ -3007,6 +3119,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             output_path=args.output,
             resume_report=resume_report,
             logical_model=args.logical_model,
+            defer_preview=args.defer_preview,
+            stop_on_failure=args.stop_on_failure,
             evidence_root=(
                 args.evidence_root.absolute() if args.evidence_root is not None else None
             ),

@@ -2742,6 +2742,476 @@ def run_matrix(module: Any, delegate: Any, **kwargs: Any) -> dict[str, Any]:
         return execute()
 
 
+def test_defer_preview_separates_twenty_deliveries_without_preview_requests(
+    matrix_harness: tuple[Any, Any, list[Any], list[str]], monkeypatch: Any,
+) -> None:
+    module, delegate, plans, _ = matrix_harness
+
+    def forbidden_preview(*args: Any, **kwargs: Any) -> None:
+        pytest.fail("deferred delivery must not start or inspect a preview")
+
+    monkeypatch.setattr(module, "verify_dynamic_web_preview", forbidden_preview)
+    payload = run_matrix(module, delegate, defer_preview=True)
+    assert len(plans) == len(delegate.submissions) == 20
+    assert payload["defer_preview"] is True
+    assert payload["status"] == "pending_preview"
+    assert payload["delivery_acceptance_ok"] is True
+    assert payload["delivery_passed_case_count"] == 20
+    assert payload["delivery_failed_case_count"] == 0
+    assert payload["delivery_exact_mode_passed_case_count"] == 16
+    assert payload["delivery_auto_scale_passed_case_count"] == 4
+    assert payload["core_passed_case_count"] == payload["exact_mode_passed_case_count"] == 0
+    assert payload["case_count"] == payload["pending_case_count"] == 20
+    for item in [payload, *payload["cases"]]:
+        assert item["status"] == "pending_preview"
+        assert item["delivery_acceptance_ok"] is True
+        assert item["dynamic_web_preview"]["status"] == "deferred"
+        assert item["dynamic_web_preview"]["counted_as_passed"] is False
+        for key in ("core_acceptance_ok", "automated_acceptance_complete",
+                    "real_device_acceptance_complete", "acceptance_complete"):
+            assert item[key] is False
+    assert all("web-previews" not in path for _, path in delegate.requests)
+    assert payload["success_policy"]["public_preview_lifecycle_required"] is True
+
+
+@pytest.mark.parametrize("failure", [
+    "status", "run_id", "ok", "build", "business", "public_artifacts", "bundle",
+    "mode", "scale", "scale_specific", "origin", "multi_agent", "model",
+])
+def test_defer_preview_stops_at_first_invalid_delivery(
+    matrix_harness: tuple[Any, Any, list[Any], list[str]], monkeypatch: Any,
+    tmp_path: Path, failure: str,
+) -> None:
+    module, delegate, plans, _ = matrix_harness
+    if failure == "multi_agent":
+        monkeypatch.setattr(module, "_ACCEPTANCE_CASES", tuple(
+            case for case in module._ACCEPTANCE_CASES if case[2] == "multi_agent"
+        ))
+    elif failure == "scale_specific":
+        monkeypatch.setattr(module, "_ACCEPTANCE_CASES", tuple(
+            case for case in module._ACCEPTANCE_CASES if case[1] == "large"
+        ))
+    execute = module.execute_project_scale_plan
+
+    def invalid_delivery(*args: Any, **kwargs: Any) -> ProjectScaleExecutionReport:
+        report = cast(ProjectScaleExecutionReport, execute(*args, **kwargs))
+        result = report.results[0]
+        changes: dict[str, Any] = {}
+        if failure == "status":
+            changes["status"] = "failed"
+        elif failure == "run_id":
+            changes["run_id"] = None
+        elif failure == "ok":
+            changes["errors"] = ("delivery failed",)
+        elif failure in {"build", "business"}:
+            key = "generated_project_validation" if failure == "build" else "requirements_validation"
+            changes["evidence"] = {**result.evidence, key: False}
+        elif failure == "mode":
+            changes.update(observed_mode="unknown", final_observed_mode="unknown")
+        elif failure == "scale":
+            changes["effective_scale"] = "ultra"
+        elif failure == "scale_specific":
+            changes["scale_validation"] = {}
+        elif failure == "origin":
+            changes["artifact_origin"] = "fixture"
+        elif failure == "multi_agent":
+            changes["participant_agent_ids"] = ()
+        elif failure == "model":
+            delegate.model_events[result.run_id] = []
+        return replace(report, results=(replace(result, **changes),))
+
+    monkeypatch.setattr(module, "execute_project_scale_plan", invalid_delivery)
+    if failure in {"public_artifacts", "bundle"}:
+        verify = module.verify_public_workspace_artifacts
+
+        def invalid_artifacts(*args: Any, **kwargs: Any) -> dict[str, Any]:
+            artifacts = cast(dict[str, Any], verify(*args, **kwargs))
+            if failure == "public_artifacts":
+                artifacts["ok"] = False
+            else:
+                artifacts["workspace_manifest"] = {}
+            return artifacts
+
+        monkeypatch.setattr(module, "verify_public_workspace_artifacts", invalid_artifacts)
+    output = tmp_path / "delivery.json"
+    payload = run_matrix(module, delegate, defer_preview=True, stop_on_failure=True,
+                         output_path=str(output))
+    assert len(plans) == len(delegate.submissions) == 1
+    assert payload["status"] == payload["cases"][0]["status"] == "failed"
+    assert payload["delivery_acceptance_ok"] is False
+    assert payload["cases"][0]["delivery_acceptance_ok"] is False
+    assert payload["delivery_failed_case_count"] == 1
+    assert payload["delivery_passed_case_count"] == 0
+    assert json.loads(output.read_text(encoding="utf-8")) == payload
+    assert payload["submission_journal"]["records"][0]["state"] == "confirmed"
+    assert all("web-previews" not in path for _, path in delegate.requests)
+
+
+def test_defer_preview_unknown_submission_keeps_intent_and_stops(
+    matrix_harness: tuple[Any, Any, list[Any], list[str]], monkeypatch: Any, tmp_path: Path,
+) -> None:
+    module, delegate, plans, _ = matrix_harness
+    request = delegate.request_json
+
+    def uncertain(method: str, path: str, **kwargs: Any) -> Any:
+        response = request(method, path, **kwargs)
+        if method == "POST" and path == "/api/v1/runs":
+            raise TimeoutError("response lost")
+        return response
+
+    monkeypatch.setattr(delegate, "request_json", uncertain)
+    output = tmp_path / "unknown.json"
+    with pytest.raises(ValueError, match="unresolved submission"):
+        run_matrix(module, delegate, defer_preview=True, output_path=str(output))
+    saved = json.loads(output.read_text(encoding="utf-8"))
+    assert len(plans) == len(delegate.submissions) == 1
+    assert saved["defer_preview"] is True
+    assert saved["cases"] == []
+    assert saved["submission_journal"]["records"][0]["state"] == "unresolved"
+    assert all("web-previews" not in path for _, path in delegate.requests)
+
+
+@pytest.mark.parametrize("defer_preview", [False, True])
+def test_deferred_reports_cannot_resume_or_finalize_even_with_forged_complete_flags(
+    matrix_harness: tuple[Any, Any, list[Any], list[str]], tmp_path: Path,
+    defer_preview: bool,
+) -> None:
+    module, delegate, plans, _ = matrix_harness
+    saved = _pending_automated_report()
+    saved["defer_preview"] = True
+    output = tmp_path / "deferred.json"
+    output.write_text(json.dumps(saved), encoding="utf-8")
+    original = output.read_bytes()
+    with pytest.raises(ValueError, match="deferred preview"):
+        run_matrix(module, delegate, defer_preview=defer_preview,
+                   resume_report=saved, output_path=str(output))
+    with pytest.raises(ValueError, match="deferred preview"):
+        module.finalize_real_device_acceptance(saved, _real_device_evidence("matrix-123"))
+    assert plans == delegate.requests == []
+    assert output.read_bytes() == original
+
+
+def test_defer_preview_refuses_any_resume_before_requests(
+    matrix_harness: tuple[Any, Any, list[Any], list[str]],
+) -> None:
+    module, delegate, _, _ = matrix_harness
+    with pytest.raises(ValueError, match="deferred preview"):
+        run_matrix(module, delegate, defer_preview=True, resume_report=_pending_automated_report())
+    assert delegate.requests == []
+
+
+def test_defer_preview_cli_runs_delivery_only_and_returns_pending(
+    matrix_harness: tuple[Any, Any, list[Any], list[str]], monkeypatch: Any, tmp_path: Path,
+) -> None:
+    module, delegate, plans, _ = matrix_harness
+    monkeypatch.setenv("AGENT_HUB_ACCEPTANCE_BEARER_TOKEN", "offline-test-token")
+    monkeypatch.setattr(module, "UrllibAcceptanceClient", lambda **kwargs: delegate)
+    output = tmp_path / "cli-delivery.json"
+    assert module.main(["--defer-preview", "--execution-id", "fresh-offline",
+                        "--output", str(output)]) == 2
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert payload["delivery_acceptance_ok"] is True
+    assert payload["status"] == "pending_preview"
+    assert len(plans) == 20
+    assert all("web-previews" not in path for _, path in delegate.requests)
+
+
+@pytest.mark.parametrize("defer_preview", [False, True])
+@pytest.mark.parametrize("state", ["deferred", "unresolved"])
+def test_defer_preview_does_not_overwrite_existing_checkpoint_or_replay(
+    matrix_harness: tuple[Any, Any, list[Any], list[str]], tmp_path: Path,
+    defer_preview: bool, state: str,
+) -> None:
+    module, delegate, plans, _ = matrix_harness
+    output = tmp_path / "existing.json"
+    saved = {"defer_preview": state == "deferred", "status": "in_progress",
+             "submission_journal": {"records": [{"state": "unresolved", "response": None}]}}
+    output.write_text(json.dumps(saved), encoding="utf-8")
+    original = output.read_bytes()
+    with pytest.raises(ValueError, match="existing checkpoint"):
+        run_matrix(module, delegate, defer_preview=defer_preview, output_path=str(output))
+    assert plans == delegate.requests == []
+    assert output.read_bytes() == original
+
+
+@pytest.mark.parametrize("action", ["resume", "finalize"])
+def test_deferred_report_cli_rejects_before_authentication_and_preserves_bytes(
+    matrix_harness: tuple[Any, Any, list[Any], list[str]], tmp_path: Path,
+    monkeypatch: Any, action: str,
+) -> None:
+    module, delegate, plans, _ = matrix_harness
+    saved = _pending_automated_report()
+    saved["defer_preview"] = True
+    source = tmp_path / "deferred.json"
+    device = tmp_path / "device.json"
+    source.write_text(json.dumps(saved), encoding="utf-8")
+    device.write_text(json.dumps(_real_device_evidence("matrix-123")), encoding="utf-8")
+    original = source.read_bytes()
+
+    def forbidden_client(**kwargs: Any) -> None:
+        pytest.fail("deferred report rejection must precede authentication")
+
+    monkeypatch.setattr(module, "UrllibAcceptanceClient", forbidden_client)
+    args = ["--output", str(source)]
+    if action == "resume":
+        args += ["--resume-report", str(source)]
+    else:
+        args += ["--finalize-report", str(source), "--real-device-evidence", str(device)]
+    with pytest.raises(SystemExit) as rejected:
+        module.main(args)
+    assert rejected.value.code == 2
+    assert source.read_bytes() == original
+    assert plans == delegate.requests == []
+
+
+@pytest.mark.parametrize("stop_on_failure", [None, False, True])
+def test_defer_preview_records_prior_success_before_later_delivery_failure(
+    matrix_harness: tuple[Any, Any, list[Any], list[str]], monkeypatch: Any,
+    stop_on_failure: bool | None,
+) -> None:
+    module, delegate, plans, _ = matrix_harness
+    execute = module.execute_project_scale_plan
+
+    def fail_second(*args: Any, **kwargs: Any) -> ProjectScaleExecutionReport:
+        report = cast(ProjectScaleExecutionReport, execute(*args, **kwargs))
+        if len(plans) == 2:
+            result = replace(report.results[0], errors=("business failure",))
+            return replace(report, results=(result,))
+        return report
+
+    monkeypatch.setattr(module, "execute_project_scale_plan", fail_second)
+    options = {} if stop_on_failure is None else {"stop_on_failure": stop_on_failure}
+    payload = run_matrix(module, delegate, defer_preview=True, **options)
+    assert len(plans) == len(delegate.submissions) == (2 if stop_on_failure else 20)
+    assert payload["status"] == "failed"
+    assert payload["delivery_acceptance_ok"] is False
+    assert payload["delivery_passed_case_count"] == (1 if stop_on_failure else 19)
+    assert payload["delivery_failed_case_count"] == 1
+    assert payload["delivery_unsubmitted_case_count"] == (18 if stop_on_failure else 0)
+    assert [case["status"] for case in payload["cases"][:2]] == ["pending_preview", "failed"]
+    assert all("web-previews" not in path for _, path in delegate.requests)
+
+
+@pytest.mark.parametrize("marker_path,value", [
+    pytest.param(("dynamic_web_preview", "status"), "deferred", id="root-preview-deferred"),
+    pytest.param(("dynamic_web_preview", "status"), "pending_preview", id="root-preview-pending"),
+    pytest.param(("cases", 0, "dynamic_web_preview", "status"), "deferred",
+                 id="case-preview-deferred"),
+    pytest.param(("cases", 0, "dynamic_web_preview", "status"), "pending_preview",
+                 id="case-preview-pending"),
+    pytest.param(("cases", 0, "dynamic_web_preview", "browser_interaction"), "pending_preview",
+                 id="case-browser-pending"),
+    pytest.param(("cases", 0, "status"), "pending_preview", id="case-status-pending"),
+    pytest.param(("attempt_history", 0, "defer_preview"), True, id="history-defer-flag"),
+    pytest.param(("attempt_history", 0, "status"), "pending_preview", id="history-status-pending"),
+    pytest.param(("attempt_history", 0, "dynamic_web_preview", "status"), "deferred",
+                 id="history-preview-deferred"),
+    pytest.param(("attempt_history", 0, "dynamic_web_preview", "status"), "pending_preview",
+                 id="history-preview-pending"),
+    pytest.param(("attempt_history", 0, "dynamic_web_preview", "browser_interaction"),
+                 "pending_preview", id="history-browser-pending"),
+])
+@pytest.mark.parametrize("consumer", ["resume_api", "finalize_api", "resume_cli", "finalize_cli"])
+def test_deferred_report_marker_rejects_before_auth_credentials_or_evidence(
+    matrix_harness: tuple[Any, Any, list[Any], list[str]], tmp_path: Path,
+    monkeypatch: Any, capsys: Any, marker_path: tuple[str | int, ...],
+    value: object, consumer: str,
+) -> None:
+    module, delegate, plans, _ = matrix_harness
+    saved = _pending_automated_report()
+    saved.pop("defer_preview", None)
+    saved["attempt_history"] = []
+    if marker_path[0] == "attempt_history":
+        saved["attempt_history"] = [copy.deepcopy(saved["cases"][0])]
+    # Keep complete-looking flags; only one surviving marker must trigger the early guard.
+    target: object = saved
+    for key in marker_path[:-1]:
+        if isinstance(key, int):
+            assert isinstance(target, list)
+            target = target[key]
+        else:
+            assert isinstance(target, dict)
+            target = target[key]
+    leaf = marker_path[-1]
+    assert isinstance(target, dict)
+    assert isinstance(leaf, str)
+    target[leaf] = value
+    source = tmp_path / "marker-checkpoint.json"
+    device = tmp_path / "unused-device.json"
+    source.write_text(json.dumps(saved), encoding="utf-8")
+    device.write_text("{}", encoding="utf-8")
+    original = source.read_bytes()
+
+    def forbidden_auth(*args: Any, **kwargs: Any) -> None:
+        pytest.fail("deferred marker must reject before auth or credential access")
+
+    def forbidden_write(*args: Any, **kwargs: Any) -> None:
+        pytest.fail("deferred marker must reject before checkpoint writes")
+
+    read = module._read_json_mapping
+
+    def guarded_read(path: str) -> Any:
+        if path == str(device):
+            pytest.fail("deferred marker must reject before reading device evidence")
+        return read(path)
+
+    monkeypatch.setattr(delegate, "request_json", forbidden_auth)
+    monkeypatch.setattr(module, "_acceptance_credentials_from_env", forbidden_auth)
+    monkeypatch.setattr(module, "UrllibAcceptanceClient", forbidden_auth)
+    monkeypatch.setattr(module, "_save_report", forbidden_write)
+    monkeypatch.setattr(module, "_write_report", forbidden_write)
+    monkeypatch.setattr(module, "_read_json_mapping", guarded_read)
+    try:
+        if consumer == "resume_api":
+            with pytest.raises(ValueError, match="deferred preview"):
+                run_matrix(module, delegate, resume_report=saved, output_path=str(source))
+        elif consumer == "finalize_api":
+            with pytest.raises(ValueError, match="deferred preview"):
+                module.finalize_real_device_acceptance(saved, {})
+        else:
+            args = ["--output", str(source)]
+            if consumer == "resume_cli":
+                args += ["--resume-report", str(source)]
+            else:
+                args += ["--finalize-report", str(source), "--real-device-evidence", str(device)]
+            with pytest.raises(SystemExit) as rejected:
+                module.main(args)
+            assert rejected.value.code == 2
+            assert "deferred preview" in capsys.readouterr().err
+    finally:
+        assert source.read_bytes() == original
+        assert plans == delegate.requests == []
+
+
+@pytest.mark.parametrize("defer_preview", [False, True])
+@pytest.mark.parametrize("state", ["deferred", "unresolved"])
+def test_fresh_cli_rejects_existing_checkpoint_before_credentials_or_http(
+    matrix_harness: tuple[Any, Any, list[Any], list[str]], tmp_path: Path,
+    monkeypatch: Any, defer_preview: bool, state: str,
+) -> None:
+    module, delegate, plans, _ = matrix_harness
+    output = tmp_path / "owned-checkpoint.json"
+    output.write_text(json.dumps({
+        "defer_preview": state == "deferred", "status": "in_progress",
+        "submission_journal": {"records": [{"state": "unresolved", "response": None}]},
+    }), encoding="utf-8")
+    original = output.read_bytes()
+
+    def forbidden_credentials() -> None:
+        pytest.fail("fresh checkpoint rejection must precede credential access")
+
+    monkeypatch.setattr(module, "_acceptance_credentials_from_env", forbidden_credentials)
+    args = ["--execution-id", "fresh-offline", "--output", str(output)]
+    if defer_preview:
+        args.append("--defer-preview")
+    with pytest.raises(SystemExit) as rejected:
+        module.main(args)
+    assert rejected.value.code == 2
+    assert output.read_bytes() == original
+    assert plans == delegate.requests == []
+
+
+@pytest.mark.parametrize("stop_on_failure", [False, True])
+def test_unknown_journal_cannot_be_replaced_by_default_fresh_execution(
+    matrix_harness: tuple[Any, Any, list[Any], list[str]], tmp_path: Path,
+    monkeypatch: Any, stop_on_failure: bool,
+) -> None:
+    module, delegate, plans, _ = matrix_harness
+    request = delegate.request_json
+
+    def lost_response(method: str, path: str, **kwargs: Any) -> Any:
+        response = request(method, path, **kwargs)
+        if method == "POST" and path == "/api/v1/runs":
+            raise TimeoutError("committed response lost")
+        return response
+
+    monkeypatch.setattr(delegate, "request_json", lost_response)
+    output = tmp_path / "actual-intent.json"
+    with pytest.raises(ValueError, match="unresolved submission"):
+        run_matrix(module, delegate, defer_preview=True, stop_on_failure=stop_on_failure,
+                   output_path=str(output))
+    original = output.read_bytes()
+    saved = json.loads(original)
+    assert saved["submission_journal"]["records"][0]["state"] == "unresolved"
+    assert len(plans) == len(delegate.submissions) == 1
+    delegate.requests.clear()
+    with pytest.raises(ValueError, match="existing checkpoint"):
+        run_matrix(module, delegate, output_path=str(output))
+    assert output.read_bytes() == original
+    assert delegate.requests == []
+    assert len(plans) == len(delegate.submissions) == 1
+
+
+@pytest.mark.parametrize("value", [None, 0, 1, "true"])
+def test_stop_on_failure_requires_explicit_boolean_before_any_request(
+    matrix_harness: tuple[Any, Any, list[Any], list[str]], value: object,
+) -> None:
+    module, delegate, plans, _ = matrix_harness
+    with pytest.raises(TypeError, match="^stop_on_failure must be a boolean$"):
+        run_matrix(module, delegate, stop_on_failure=value)
+    assert plans == delegate.requests == []
+
+
+@pytest.mark.parametrize("stop_on_failure", [False, True])
+def test_native_operator_stop_on_failure_cli_controls_known_delivery_failure(
+    matrix_harness: tuple[Any, Any, list[Any], list[str]], tmp_path: Path, monkeypatch: Any,
+    stop_on_failure: bool,
+) -> None:
+    module, delegate, plans, _ = matrix_harness
+    execute = module.execute_project_scale_plan
+
+    def failed_delivery(*args: Any, **kwargs: Any) -> ProjectScaleExecutionReport:
+        report = cast(ProjectScaleExecutionReport, execute(*args, **kwargs))
+        return replace(report, results=(replace(report.results[0], errors=("delivery failed",)),))
+
+    monkeypatch.setattr(module, "execute_project_scale_plan", failed_delivery)
+    monkeypatch.setattr(module, "UrllibAcceptanceClient", lambda **kwargs: delegate)
+    monkeypatch.setenv("AGENT_HUB_ACCEPTANCE_BEARER_TOKEN", "offline-test-token")
+    output = tmp_path / "operator.json"
+    args = ["--defer-preview", "--execution-id", "fresh-offline", "--output", str(output)]
+    if stop_on_failure:
+        args.append("--stop-on-failure")
+    assert module.main(args) == 1
+    saved = json.loads(output.read_text(encoding="utf-8"))
+    assert saved["delivery_acceptance_ok"] is False
+    assert saved["delivery_failed_case_count"] == (1 if stop_on_failure else 20)
+    assert saved["delivery_unsubmitted_case_count"] == (19 if stop_on_failure else 0)
+    assert saved["submission_journal"]["records"][0]["state"] == "confirmed"
+    assert len(plans) == len(delegate.submissions) == (1 if stop_on_failure else 20)
+    assert all("web-previews" not in path for _, path in delegate.requests)
+
+
+@pytest.mark.parametrize("stop_on_failure", [False, True])
+@pytest.mark.parametrize("failure_write", [2, 3])
+def test_checkpoint_write_failure_always_stops_independent_of_operator_control(
+    matrix_harness: tuple[Any, Any, list[Any], list[str]], tmp_path: Path,
+    monkeypatch: Any, stop_on_failure: bool, failure_write: int,
+) -> None:
+    module, delegate, plans, _ = matrix_harness
+    replace_file = module.os.replace
+    writes = 0
+
+    def failed_checkpoint(source: object, target: object) -> None:
+        nonlocal writes
+        writes += 1
+        if writes == failure_write:
+            raise OSError("checkpoint unavailable")
+        replace_file(source, target)
+
+    monkeypatch.setattr(module.os, "replace", failed_checkpoint)
+    output = tmp_path / "checkpoint.json"
+    with pytest.raises(ValueError, match="unresolved submission"):
+        run_matrix(module, delegate, defer_preview=True, stop_on_failure=stop_on_failure,
+                   output_path=str(output))
+    assert len(plans) == 1
+    assert len(delegate.submissions) == failure_write - 2
+    saved = json.loads(output.read_text(encoding="utf-8"))
+    assert saved["cases"] == []
+    records = saved["submission_journal"]["records"]
+    assert records == [] if failure_write == 2 else records[0]["state"] == "unresolved"
+    assert all("web-previews" not in path for _, path in delegate.requests)
+
+
 @pytest.mark.parametrize("failure", ["timeout", "json", "utf8", "disconnect", "list", "id", "scope"])
 def test_unknown_submissions_stop_matrix_and_restart_without_post_or_checkpoint_changes(
     matrix_harness: tuple[Any, Any, list[Any], list[str]], tmp_path: Path,
