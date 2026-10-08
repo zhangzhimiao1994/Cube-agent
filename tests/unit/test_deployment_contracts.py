@@ -1,3 +1,4 @@
+import configparser
 import hashlib
 import importlib.metadata
 import json
@@ -416,6 +417,15 @@ def test_compose_exposes_feishu_on_main_api_instead_of_second_app_process() -> N
     assert "\n  feishu:" not in compose
     assert "agent-hub-feishu.service" not in native_target
     assert "reverse_proxy api:8000" in read("deploy/compose/Caddyfile")
+
+
+def test_native_target_is_enabled_for_cold_boot() -> None:
+    target = configparser.ConfigParser(interpolation=None)
+    target.read_string(read("deploy/native/systemd/agent-hub.target"))
+
+    assert "multi-user.target" in target.get("Install", "WantedBy", fallback="").split(), (
+        "enabling agent-hub.target must persist its startup across reboots"
+    )
 
 
 def test_compose_and_native_litellm_use_config_file() -> None:

@@ -2,3 +2,6 @@
 Description=Agent Hub
 Wants=agent-hub-skill-broker.socket agent-hub-api.service agent-hub-worker.service agent-hub-litellm.service
 After=network-online.target
+
+[Install]
+WantedBy=multi-user.target
