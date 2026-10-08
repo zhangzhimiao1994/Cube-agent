@@ -30,7 +30,7 @@ from agent_hub.models.types import (
     TokenUsage,
     ToolCall,
 )
-from agent_hub.runtime.artifacts import InMemoryArtifactRepository
+from agent_hub.runtime.artifacts import ArtifactReference, InMemoryArtifactRepository
 from agent_hub.runtime.contracts import (
     Artifact,
     EventKind,
@@ -4554,12 +4554,35 @@ async def test_workspace_delivery_observation_reauthorizes_after_permission_revo
 
     gateway = RevokingGateway(_workspace_observation_responses(name))
     runtime = _workspace_delivery_sequence_runtime(gateway, harness, tools=_WORKSPACE_OBSERVATION_TOOLS)
-    with pytest.raises(RuntimeExecutionError, match="capability execution failed"):
-        _ = [event async for event in runtime.run(context)]
+    events: list[RunEvent] = []
+    if name == "workspace.read":
+        events = [event async for event in runtime.run(context)]
+        failed = next(event for event in events if event.kind is EventKind.TOOL_FAILED)
+        assert failed.reason == "workspace read denied or scoped file unavailable"
+        assert failed.payload["status"] == "rejected"
+        assert not any(
+            event.kind is EventKind.TOOL_COMPLETED and event.tool_call_id == failed.tool_call_id
+            for event in events
+        )
+        feedback = json.loads(_workspace_delivery_request_packet(
+            gateway.requests[4], "UNTRUSTED_CAPABILITY_REJECTIONS_JSON=",
+        ))
+        assert feedback[0]["result"] == {
+            "status": "rejected",
+            "error_code": "workspace_read_unavailable",
+            "message": "workspace read denied or scoped file unavailable",
+            "tool_name": "workspace.read",
+        }
+        assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    else:
+        with pytest.raises(RuntimeExecutionError, match="capability execution failed"):
+            _ = [event async for event in runtime.run(context)]
     observations = [result for result in harness.results if result.tool_name == name]
     assert len(observations) == 2
     assert observations[0].status == "succeeded" and observations[1].status == "failed"
-    assert "workspace.bundle" not in [call.tool_name for call in harness.calls]
+    assert observations[1].payload == {}
+    if name == "workspace.list":
+        assert "workspace.bundle" not in [call.tool_name for call in harness.calls]
 
 
 async def test_workspace_delivery_checkpoint_keeps_new_history_without_replaying_success() -> None:
@@ -5530,6 +5553,428 @@ async def test_replay_safe_harness_backend_error_records_failed_not_uncertain() 
     state = next(iter(tool_states.values()))
     assert isinstance(state, Mapping)
     assert state["status"] == "failed"
+
+
+_WORKSPACE_READ_UNAVAILABLE = "workspace read denied or scoped file unavailable"
+_SECRET_READ_PATH = "private/TOP-SECRET-READ-PATH/token-sensitive.txt"
+_SECRET_READ_CONTENT = "SYNTHETIC-SECRET-READ-CONTENT"
+_SECRET_READ_OUTPUT = "SYNTHETIC-SECRET-FAILED-READ-OUTPUT"
+
+
+class WorkspaceReadCorrectionGateway:
+    def __init__(
+        self,
+        paths: tuple[str, ...],
+        *,
+        name: str = "workspace.read",
+        correction_gate: asyncio.Event | None = None,
+        gate_after: int = 1,
+        cost_usd: Decimal = Decimal(0),
+    ) -> None:
+        self.paths = paths
+        self.name = name
+        self.correction_gate = correction_gate
+        self.gate_after = gate_after
+        self.cost_usd = cost_usd
+        self.requests: list[ModelRequest] = []
+
+    async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+        self.requests.append(request)
+        if len(self.requests) > self.gate_after and self.correction_gate is not None:
+            await self.correction_gate.wait()
+        index = len(self.requests) - 1
+        response = (
+            ModelResponse(
+                text=None,
+                tool_calls=(ToolCall(
+                    id=f"read-{index}",
+                    name=self.name.replace(".", "_"),
+                    arguments={
+                        "path": self.paths[index],
+                        **({"query": _SECRET_READ_CONTENT}
+                           if self.paths[index] == _SECRET_READ_PATH else {}),
+                    },
+                ),),
+                usage=TokenUsage(1, 1, 2),
+            )
+            if index < len(self.paths)
+            else ModelResponse(text="review complete", usage=TokenUsage(1, 1, 2))
+        )
+        return GatewayCompletion(
+            response=response,
+            deployment_id="primary",
+            logical_model=request.logical_model,
+            provider_id="deepseek",
+            provider_model="deepseek/chat",
+            cost_usd=self.cost_usd,
+        )
+
+
+class WorkspaceReadRejectionHarness:
+    def __init__(
+        self, backend: str, *, reason: str = _WORKSPACE_READ_UNAVAILABLE,
+    ) -> None:
+        self.backend = backend
+        self.reason = reason
+        self.calls: list[HarnessToolCallRequest] = []
+
+    async def invoke(
+        self,
+        tenant_id: UUID,
+        request: HarnessToolCallRequest,
+        *,
+        user_id: UUID | None = None,
+        role: Role | None = None,
+    ) -> HarnessToolCallResult:
+        del tenant_id, user_id, role
+        self.calls.append(request)
+        if request.arguments["path"] == "src/available.txt":
+            return HarnessToolCallResult(
+                call_id=request.call_id, tool_name=request.tool_name,
+                status="succeeded", payload={"items": ()},
+            )
+        if self.backend == "exception":
+            raise RuntimeCapabilityError(self.reason)
+        return HarnessToolCallResult(
+            call_id=request.call_id, tool_name=request.tool_name,
+            status="failed",
+            payload={"approval_id": str(RUN_ID)}
+            if self.reason == "capability requires approval" else {
+                "path": _SECRET_READ_PATH,
+                "text": _SECRET_READ_CONTENT,
+                "stderr": _SECRET_READ_OUTPUT,
+            },
+            failure_reason=self.reason,
+        )
+
+
+def _workspace_read_correction_plan(name: str = "workspace.read") -> DispatchPlan:
+    base = _read_context_tool_plan()
+    return base.model_copy(update={
+        "agents": (base.agents[0].model_copy(update={"allowed_tools": (name,)}),),
+        "steps": (base.steps[0].model_copy(update={"tools": (name,)}),),
+        "allowed_tools": (name,),
+    })
+
+
+@pytest.mark.parametrize("backend", ("exception", "failed_result"))
+@pytest.mark.parametrize("name", ("workspace.read", "workspace_read"))
+async def test_workspace_read_unavailable_is_honest_redacted_argument_rejection(
+    backend: str, name: str,
+) -> None:
+    gateway = WorkspaceReadCorrectionGateway((_SECRET_READ_PATH, "src/available.txt"), name=name)
+    harness = WorkspaceReadRejectionHarness(backend)
+    repository = InMemoryArtifactRepository()
+    runtime = CrewDispatchRuntime(
+        gateway, _workspace_read_correction_plan(name),
+        capability_gateway=FakeCapabilities(), harness_tool_gateway=harness,
+        artifact_repository=repository, crew_factory=FastFactory(),
+    )
+    events = [event async for event in runtime.run(_context())]
+
+    failed = [event for event in events if event.kind is EventKind.TOOL_FAILED]
+    assert len(failed) == 1
+    assert failed[0].payload["status"] == "rejected"
+    assert failed[0].payload["failure_kind"] == "invalid_arguments"
+    completed = [event for event in events if event.kind is EventKind.TOOL_COMPLETED]
+    assert len(completed) == 1
+    assert completed[0].tool_call_id != failed[0].tool_call_id
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert len(gateway.requests) == 3
+    assert len(harness.calls) == 2
+    assert all(call.sandbox == "read_only" for call in harness.calls)
+    assert len({call.idempotency_key for call in harness.calls}) == 2
+    feedback = next(
+        message.content for message in gateway.requests[1].messages
+        if isinstance(message.content, str)
+        and message.content.startswith("UNTRUSTED_CAPABILITY_REJECTIONS_JSON=")
+    )
+    result = json.loads(feedback.split("=", 1)[1])[0]["result"]
+    assert result == {
+        "status": "rejected",
+        "error_code": "workspace_read_unavailable",
+        "message": _WORKSPACE_READ_UNAVAILABLE,
+        "tool_name": name,
+    }
+    serialized_feedback = json.dumps([
+        {"role": message.role, "content": message.content}
+        for message in gateway.requests[1].messages
+    ])
+    checkpoint = await runtime.save_checkpoint()
+    assert checkpoint.state["usage"] == {"tokens": 6, "cost_usd": "0"}
+    tools = checkpoint.state["tools"]
+    assert isinstance(tools, Mapping)
+    rejected_state = next(
+        state for state in tools.values()
+        if isinstance(state, Mapping) and state["status"] == "rejected"
+    )
+    artifact_id = rejected_state["artifact_id"]
+    artifact_sha = rejected_state["sha256"]
+    assert isinstance(artifact_id, str) and isinstance(artifact_sha, str)
+    rejected_artifact, = await repository.get_many(TENANT_ID, RUN_ID, (
+        ArtifactReference(id=UUID(artifact_id), sha256=artifact_sha),
+    ))
+    assert rejected_artifact.type == "tool_result"
+    assert rejected_artifact.content["result"] == result
+    serialized_failure = json.dumps(failed[0].model_dump(mode="json"))
+    serialized_artifact = json.dumps(rejected_artifact.to_payload())
+    for secret in (_SECRET_READ_PATH, _SECRET_READ_CONTENT, _SECRET_READ_OUTPUT):
+        assert secret not in serialized_feedback
+        assert secret not in serialized_failure
+        assert secret not in serialized_artifact
+    original_model_artifact = next(
+        event.artifact for event in events
+        if event.artifact is not None and event.artifact.type == "model_response"
+    )
+    original_model_payload = json.dumps(original_model_artifact.to_payload())
+    assert _SECRET_READ_PATH in original_model_payload
+    assert _SECRET_READ_CONTENT in original_model_payload
+
+
+@pytest.mark.parametrize("backend", ("exception", "failed_result"))
+@pytest.mark.parametrize("name", ("workspace.read", "workspace_read"))
+async def test_workspace_read_repeated_rejection_does_not_invoke_again(
+    backend: str, name: str,
+) -> None:
+    gateway = WorkspaceReadCorrectionGateway((_SECRET_READ_PATH, _SECRET_READ_PATH), name=name)
+    harness = WorkspaceReadRejectionHarness(backend)
+    runtime = CrewDispatchRuntime(
+        gateway, _workspace_read_correction_plan(name),
+        capability_gateway=FakeCapabilities(), harness_tool_gateway=harness,
+        crew_factory=FastFactory(),
+    )
+    events: list[RunEvent] = []
+    with pytest.raises(RuntimeExecutionError, match="repeated rejected request"):
+        async for event in runtime.run(_context()):
+            events.append(event)
+    assert len(harness.calls) == 1
+    assert len(gateway.requests) == 2
+    assert not any(event.kind is EventKind.TOOL_COMPLETED for event in events)
+    checkpoint = await runtime.save_checkpoint()
+    assert checkpoint.state["usage"] == {"tokens": 4, "cost_usd": "0"}
+
+
+@pytest.mark.parametrize("backend", ("exception", "failed_result"))
+@pytest.mark.parametrize("name", ("workspace.read", "workspace_read"))
+async def test_workspace_read_corrections_stop_after_two_rejections(
+    backend: str, name: str,
+) -> None:
+    gateway = WorkspaceReadCorrectionGateway(("missing/a", "missing/b", "missing/c"), name=name)
+    harness = WorkspaceReadRejectionHarness(backend)
+    runtime = CrewDispatchRuntime(
+        gateway, _workspace_read_correction_plan(name),
+        capability_gateway=FakeCapabilities(), harness_tool_gateway=harness,
+        crew_factory=FastFactory(),
+    )
+    events: list[RunEvent] = []
+    with pytest.raises(RuntimeExecutionError, match="capability execution failed"):
+        async for event in runtime.run(_context()):
+            events.append(event)
+    assert len(gateway.requests) == len(harness.calls) == 3
+    failed = [event for event in events if event.kind is EventKind.TOOL_FAILED]
+    assert [event.payload["status"] for event in failed] == ["rejected", "rejected", "failed"]
+    assert not any(event.kind is EventKind.TOOL_COMPLETED for event in events)
+    checkpoint = await runtime.save_checkpoint()
+    assert checkpoint.state["usage"] == {"tokens": 6, "cost_usd": "0"}
+
+
+@pytest.mark.parametrize("backend", ("exception", "failed_result"))
+@pytest.mark.parametrize(("name", "reason"), (
+    ("workspace.read", "capability denied"),
+    ("workspace.read", "workspace access is not authorized"),
+    ("workspace_read", "workspace scope could not be resolved"),
+    ("workspace.read", "workspace read denied or scoped file unavailable: other error"),
+    ("workspace.read", "workspace path must be relative"),
+    ("workspace.list", _WORKSPACE_READ_UNAVAILABLE),
+))
+async def test_workspace_read_other_errors_and_tools_are_not_correctable(
+    backend: str, name: str, reason: str,
+) -> None:
+    gateway = WorkspaceReadCorrectionGateway((_SECRET_READ_PATH,), name=name)
+    harness = WorkspaceReadRejectionHarness(backend, reason=reason)
+    runtime = CrewDispatchRuntime(
+        gateway, _workspace_read_correction_plan(name),
+        capability_gateway=FakeCapabilities(), harness_tool_gateway=harness,
+        crew_factory=FastFactory(),
+    )
+    events: list[RunEvent] = []
+    with pytest.raises(RuntimeExecutionError, match="capability execution failed"):
+        async for event in runtime.run(_context()):
+            events.append(event)
+    assert len(gateway.requests) == len(harness.calls) == 1
+    assert [event.payload["status"] for event in events if event.kind is EventKind.TOOL_FAILED] == [
+        "failed",
+    ]
+    assert not any(event.kind is EventKind.TOOL_COMPLETED for event in events)
+
+
+async def test_workspace_read_approval_is_not_argument_correction() -> None:
+    gateway = WorkspaceReadCorrectionGateway((_SECRET_READ_PATH,))
+    harness = WorkspaceReadRejectionHarness("failed_result", reason="capability requires approval")
+    runtime = CrewDispatchRuntime(
+        gateway, _workspace_read_correction_plan(),
+        capability_gateway=FakeCapabilities(), harness_tool_gateway=harness,
+        crew_factory=FastFactory(),
+    )
+    events: list[RunEvent] = []
+    with pytest.raises(RuntimeExecutionError, match="capability execution failed"):
+        async for event in runtime.run(_context()):
+            events.append(event)
+    assert len(gateway.requests) == len(harness.calls) == 1
+    failed = next(event for event in events if event.kind is EventKind.TOOL_FAILED)
+    assert failed.payload["status"] == failed.payload["failure_kind"] == "waiting_approval"
+    checkpoint = await runtime.save_checkpoint()
+    tools = checkpoint.state["tools"]
+    assert isinstance(tools, Mapping)
+    assert any(
+        isinstance(state, Mapping) and state["status"] == "waiting_approval"
+        for state in tools.values()
+    )
+
+
+async def test_workspace_read_missing_identity_does_not_invoke_or_correct() -> None:
+    gateway = WorkspaceReadCorrectionGateway((_SECRET_READ_PATH,))
+    capabilities = FakeCapabilities()
+    runtime = CrewDispatchRuntime(
+        gateway, _workspace_read_correction_plan(),
+        capability_gateway=capabilities, crew_factory=FastFactory(),
+    )
+    events: list[RunEvent] = []
+    with pytest.raises(RuntimeExecutionError, match="capability execution failed"):
+        async for event in runtime.run(_context()):
+            events.append(event)
+    assert capabilities.calls == []
+    assert len(gateway.requests) == 1
+    failed = next(event for event in events if event.kind is EventKind.TOOL_FAILED)
+    assert failed.reason == "capability identity unavailable"
+    assert failed.payload["status"] == "failed"
+
+
+@pytest.mark.parametrize("backend", ("exception", "failed_result"))
+@pytest.mark.parametrize(("prior_rejections", "outcome", "expected_cost"), (
+    (1, "success", "0.375"), (1, "repeat", "0.250"),
+    (2, "success", "0.500"), (2, "repeat", "0.375"), (2, "exhausted", "0.375"),
+))
+async def test_workspace_read_rejection_checkpoint_keeps_feedback_and_replay_guard(
+    backend: str, prior_rejections: int, outcome: str, expected_cost: str,
+) -> None:
+    gate = asyncio.Event()
+    gateway = WorkspaceReadCorrectionGateway(
+        (_SECRET_READ_PATH, "missing/second")[:prior_rejections],
+        correction_gate=gate, gate_after=prior_rejections, cost_usd=Decimal("0.125"),
+    )
+    harness = WorkspaceReadRejectionHarness(backend)
+    repository = InMemoryArtifactRepository()
+    plan = _workspace_read_correction_plan()
+    plan = plan.model_copy(update={
+        "steps": (plan.steps[0].model_copy(update={"cost_budget_usd": Decimal(1)}),),
+        "total_cost_usd": Decimal(1),
+    })
+    runtime = CrewDispatchRuntime(
+        gateway, plan, capability_gateway=FakeCapabilities(), harness_tool_gateway=harness,
+        artifact_repository=repository, crew_factory=FastFactory(),
+    )
+    checkpoint: RuntimeCheckpoint | None = None
+    async for event in runtime.run(_context()):
+        if event.kind is not EventKind.CHECKPOINT_SAVED or event.checkpoint is None:
+            continue
+        tools = event.checkpoint.state["tools"]
+        assert isinstance(tools, Mapping)
+        if sum(
+            isinstance(state, Mapping) and state["status"] == "rejected"
+            for state in tools.values()
+        ) == prior_rejections:
+            checkpoint = event.checkpoint
+            break
+    await runtime.cancel()
+    assert checkpoint is not None
+    assert checkpoint.state["usage"] == {
+        "tokens": 2 * prior_rejections,
+        "cost_usd": "0.125" if prior_rejections == 1 else "0.250",
+    }
+
+    resumed_gateway = WorkspaceReadCorrectionGateway((
+        _SECRET_READ_PATH if outcome == "repeat"
+        else "missing/third" if outcome == "exhausted"
+        else "src/available.txt",
+    ), cost_usd=Decimal("0.125"))
+    resumed_harness = WorkspaceReadRejectionHarness(backend)
+    resumed = CrewDispatchRuntime(
+        resumed_gateway, plan, capability_gateway=FakeCapabilities(),
+        harness_tool_gateway=resumed_harness, artifact_repository=repository,
+        crew_factory=FastFactory(),
+    )
+    await resumed.restore_checkpoint(checkpoint)
+    events: list[RunEvent] = []
+    if outcome != "success":
+        reason = "repeated rejected request" if outcome == "repeat" else "capability execution failed"
+        with pytest.raises(RuntimeExecutionError, match=reason):
+            async for event in resumed.run(_context(checkpoint=checkpoint)):
+                events.append(event)
+        assert len(resumed_harness.calls) == (0 if outcome == "repeat" else 1)
+        assert len(resumed_gateway.requests) == 1
+        if outcome == "exhausted":
+            failed = next(event for event in events if event.kind is EventKind.TOOL_FAILED)
+            assert failed.payload["status"] == "failed"
+    else:
+        events = [event async for event in resumed.run(_context(checkpoint=checkpoint))]
+        assert len(resumed_harness.calls) == 1
+        assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+        assert len(resumed_gateway.requests) == 2
+    feedback = json.dumps([
+        {"role": message.role, "content": message.content}
+        for message in resumed_gateway.requests[0].messages
+    ])
+    assert "workspace_read_unavailable" in feedback
+    for secret in (_SECRET_READ_PATH, _SECRET_READ_CONTENT, _SECRET_READ_OUTPUT):
+        assert secret not in feedback
+    restored = await resumed.save_checkpoint()
+    assert restored.state["usage"] == {
+        "tokens": 2 * prior_rejections + (4 if outcome == "success" else 2),
+        "cost_usd": expected_cost,
+    }
+    assert len(harness.calls) == prior_rejections
+    if outcome == "success":
+        completed_gateway = WorkspaceReadCorrectionGateway((), cost_usd=Decimal("0.125"))
+        completed_harness = WorkspaceReadRejectionHarness(backend)
+        completed = CrewDispatchRuntime(
+            completed_gateway, plan, capability_gateway=FakeCapabilities(),
+            harness_tool_gateway=completed_harness, artifact_repository=repository,
+            crew_factory=FastFactory(),
+        )
+        await completed.restore_checkpoint(restored)
+        completed_events = [
+            event async for event in completed.run(_context(checkpoint=restored))
+        ]
+        assert [event.kind for event in completed_events] == [EventKind.RUNTIME_COMPLETED]
+        assert completed_gateway.requests == []
+        assert completed_harness.calls == []
+        assert restored.state["usage"] == {
+            "tokens": 2 * prior_rejections + 4, "cost_usd": expected_cost,
+        }
+
+
+@pytest.mark.parametrize("backend", ("exception", "failed_result"))
+async def test_workspace_read_argument_correction_does_not_extend_token_budget(backend: str) -> None:
+    gateway = WorkspaceReadCorrectionGateway((_SECRET_READ_PATH, "src/available.txt"))
+    harness = WorkspaceReadRejectionHarness(backend)
+    plan = _workspace_read_correction_plan()
+    plan = plan.model_copy(update={
+        "steps": (plan.steps[0].model_copy(update={"token_budget": 2}),),
+        "total_token_budget": 2,
+    })
+    runtime = CrewDispatchRuntime(
+        gateway, plan, capability_gateway=FakeCapabilities(), harness_tool_gateway=harness,
+        crew_factory=FastFactory(),
+    )
+    with pytest.raises(RuntimeExecutionError, match="dispatch budget exhausted"):
+        async for _event in runtime.run(_context(token_budget=2)):
+            pass
+    assert len(gateway.requests) == 2
+    assert len(harness.calls) == 1
+    checkpoint = await runtime.save_checkpoint()
+    assert checkpoint.state["usage"] == {"tokens": 4, "cost_usd": "0"}
+    assert checkpoint.state["phase"] == "budget_exhausted"
 
 
 async def test_read_context_scoped_unavailable_does_not_fail_dispatch_step() -> None:

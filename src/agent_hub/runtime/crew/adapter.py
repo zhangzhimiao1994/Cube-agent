@@ -636,13 +636,25 @@ _MAX_TOOL_ARGUMENT_CORRECTIONS_PER_STEP = 2
 
 
 def _is_correctable_tool_argument_failure(name: str, reason: str) -> bool:
-    return name == "workspace.write_text" and reason in _CORRECTABLE_WORKSPACE_PATH_FAILURES
+    return (
+        name == "workspace.write_text" and reason in _CORRECTABLE_WORKSPACE_PATH_FAILURES
+    ) or (
+        name in {"workspace.read", "workspace_read"}
+        and reason == "workspace read denied or scoped file unavailable"
+    )
 
 
 def _tool_argument_rejection_result(
     tool_call: ToolCall,
     reason: str,
 ) -> Mapping[str, JsonValue]:
+    if tool_call.name in {"workspace.read", "workspace_read"}:
+        return {
+            "status": "rejected",
+            "error_code": "workspace_read_unavailable",
+            "message": "workspace read denied or scoped file unavailable",
+            "tool_name": tool_call.name,
+        }
     return {
         "status": "rejected",
         "error_code": "invalid_workspace_path",
