@@ -25,6 +25,8 @@ from pydantic import (
 
 from agent_hub.auth.models import Role
 from agent_hub.domain.runs import TaskMode
+from agent_hub.models.failure_receipt import MAX_GATEWAY_FAILURE_ATTEMPTS
+from agent_hub.models.gateway import ScopeIncompletePhase, ScopeIncompleteReason
 from agent_hub.runtime.instruction_context import InstructionContext
 
 type JsonScalar = None | bool | int | float | str
@@ -103,6 +105,10 @@ _OPTIONAL_FAILURE_DIAGNOSTIC_KEYS = frozenset(
     {"status_code", "hybrid_child_mode", "orchestration_recovery_hint", "step_id", "actor"}
 )
 _FAILURE_DIAGNOSTIC_KEYS = _REQUIRED_FAILURE_DIAGNOSTIC_KEYS | _OPTIONAL_FAILURE_DIAGNOSTIC_KEYS
+_GATEWAY_SCOPE_DIAGNOSTIC_KEYS = frozenset({
+    "gateway_scope_phase", "gateway_scope_reason",
+    "gateway_scope_transport_entered_count", "gateway_scope_failure_attempt_count",
+})
 
 
 def _mutable_json(value: JsonValue) -> object:
@@ -220,7 +226,9 @@ def _safe_identifier(value: str, *, name: str) -> str:
 
 
 def _validate_failure_diagnostic(payload: Mapping[str, JsonValue]) -> None:
-    if not _REQUIRED_FAILURE_DIAGNOSTIC_KEYS <= set(payload) or set(payload) - _FAILURE_DIAGNOSTIC_KEYS:
+    if not _REQUIRED_FAILURE_DIAGNOSTIC_KEYS <= set(payload) or (
+        set(payload) - _FAILURE_DIAGNOSTIC_KEYS - _GATEWAY_SCOPE_DIAGNOSTIC_KEYS
+    ):
         raise ValueError("runtime failure diagnostic fields are invalid")
     for name in ("error_code", "error_stage", "error_category", "step_id", "actor"):
         if name in payload:
@@ -247,6 +255,25 @@ def _validate_failure_diagnostic(payload: Mapping[str, JsonValue]) -> None:
         payload["orchestration_recovery_hint"] != "retry_blocked_contract_chain"
     ):
         raise ValueError("runtime failure diagnostic recovery hint is invalid")
+
+
+def _validate_gateway_scope_diagnostic(payload: Mapping[str, JsonValue]) -> None:
+    fields = {key for key in payload if key.startswith("gateway_scope_")}
+    if not fields:
+        return
+    if fields != _GATEWAY_SCOPE_DIAGNOSTIC_KEYS:
+        raise ValueError("gateway scope diagnostic fields are invalid")
+    phase = payload["gateway_scope_phase"]
+    reason = payload["gateway_scope_reason"]
+    entered = payload["gateway_scope_transport_entered_count"]
+    attempts = payload["gateway_scope_failure_attempt_count"]
+    if (
+        type(phase) is not str or phase not in {item.value for item in ScopeIncompletePhase}
+        or type(reason) is not str or reason not in {item.value for item in ScopeIncompleteReason}
+        or type(entered) is not int or type(attempts) is not int
+        or not 0 <= attempts <= entered <= MAX_GATEWAY_FAILURE_ATTEMPTS
+    ):
+        raise ValueError("gateway scope diagnostic values are invalid")
 
 
 def _preflight_payload(
@@ -826,6 +853,10 @@ class RunEvent(_RuntimeContractModel):
         object.__setattr__(self, "payload", _freeze_object(self.payload, name="event payload"))
         if _contains_sensitive_key(self.payload):
             raise ValueError("event payload contains sensitive data")
+        if any(key.startswith("gateway_scope_") for key in self.payload):
+            if self.kind not in {EventKind.STEP_FAILED, EventKind.RUNTIME_FAILED}:
+                raise ValueError("gateway scope diagnostic event kind is invalid")
+            _validate_gateway_scope_diagnostic(self.payload)
         if self.kind is EventKind.ARTIFACT_CREATED:
             if self.artifact is None or self.checkpoint is not None or self.reason is not None:
                 raise ValueError("artifact.created requires only an artifact")

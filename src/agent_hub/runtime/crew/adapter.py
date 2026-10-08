@@ -42,10 +42,13 @@ from agent_hub.domain.runs import TaskMode
 from agent_hub.harness import HarnessToolGateway
 from agent_hub.harness.events import safe_tool_event_payload
 from agent_hub.harness.types import HarnessToolCallRequest, HarnessToolCallResult
+from agent_hub.models.failure_receipt import MAX_GATEWAY_FAILURE_ATTEMPTS
 from agent_hub.models.gateway import (
     GatewayCompletion,
     GatewayRejectedOutput,
     GatewayResponseCancelled,
+    GatewayScopeDiagnostic,
+    get_gateway_scope_diagnostic,
 )
 from agent_hub.models.registry import ModelRegistry, NoCapableDeployment
 from agent_hub.models.types import (
@@ -1393,6 +1396,71 @@ class _ReviewFailed(RuntimeExecutionError):
 
 class _ModelContractFailed(RuntimeExecutionError):
     """A contract failure cannot restart paid business or review work."""
+
+
+class _GatewayScopeFailure(RuntimeExecutionError):
+    """Carries only an issuer-verified immutable diagnostic, never its exception."""
+
+    def __init__(self, reason: str, diagnostic: GatewayScopeDiagnostic) -> None:
+        super().__init__(reason)
+        self.scope_diagnostic = diagnostic
+
+
+class _GatewayScopeContractFailure(_GatewayScopeFailure, _ModelContractFailed):
+    """Preserves the existing correction failure's non-retryable boundary."""
+
+
+class _GatewayScopeReviewFailure(_GatewayScopeFailure, _ReviewFailed):
+    """Preserves the existing review failure's outer recovery boundary."""
+
+
+_GATEWAY_SCOPE_CARRIERS: weakref.WeakKeyDictionary[
+    _GatewayScopeFailure, GatewayScopeDiagnostic
+] = weakref.WeakKeyDictionary()
+
+
+def _registered_gateway_scope_diagnostic(error: Exception) -> GatewayScopeDiagnostic | None:
+    # Exact carrier types retain object identity hashing; constructors and copied dicts confer no authority.
+    if type(error) not in {
+        _GatewayScopeFailure, _GatewayScopeContractFailure, _GatewayScopeReviewFailure,
+    }:
+        return None
+    return _GATEWAY_SCOPE_CARRIERS.get(cast(_GatewayScopeFailure, error))
+
+
+def _gateway_scope_failure(
+    reason: str, source: Exception, *, contract: bool = False,
+) -> RuntimeExecutionError:
+    diagnostic = get_gateway_scope_diagnostic(source)
+    if diagnostic is None:
+        diagnostic = _registered_gateway_scope_diagnostic(source)
+    if diagnostic is not None and diagnostic.transport_entered_count <= MAX_GATEWAY_FAILURE_ATTEMPTS:
+        failure_type = _GatewayScopeContractFailure if contract else _GatewayScopeFailure
+        failure = failure_type(reason, diagnostic)
+        _GATEWAY_SCOPE_CARRIERS[failure] = diagnostic
+        return failure
+    return _ModelContractFailed(reason) if contract else RuntimeExecutionError(reason)
+
+
+def _gateway_scope_review_failure(reason: str, source: Exception) -> _ReviewFailed:
+    diagnostic = _registered_gateway_scope_diagnostic(source)
+    if diagnostic is None:
+        return _ReviewFailed(reason)
+    failure = _GatewayScopeReviewFailure(reason, diagnostic)
+    _GATEWAY_SCOPE_CARRIERS[failure] = diagnostic
+    return failure
+
+
+def _gateway_scope_payload(error: Exception) -> dict[str, JsonValue]:
+    diagnostic = _registered_gateway_scope_diagnostic(error)
+    if diagnostic is None:
+        return {}
+    return {
+        "gateway_scope_phase": diagnostic.phase.value,
+        "gateway_scope_reason": diagnostic.reason.value,
+        "gateway_scope_transport_entered_count": diagnostic.transport_entered_count,
+        "gateway_scope_failure_attempt_count": diagnostic.failure_attempt_count,
+    }
 
 
 class _StableTerminalError(RuntimeExecutionError):
@@ -3303,6 +3371,7 @@ class _RunState:
     commit_tasks: set[asyncio.Task[None]] = field(default_factory=set)
     pending_artifact_writes: dict[UUID, ArtifactReference] = field(default_factory=dict)
     cleanup_error: RuntimeExecutionError | None = None
+    gateway_scope_failures: dict[str, RuntimeExecutionError] = field(default_factory=dict)
 
 
 class CrewRunStream:
@@ -4275,6 +4344,7 @@ class CrewDispatchRuntime:
                 del emit_error
         except RuntimeExecutionError as error:
             failure_reason = safe_runtime_failure_reason(error, fallback="dispatch execution failed")
+            scope_payload = _gateway_scope_payload(error)
             error.__traceback__ = None
             error.__context__ = None
             error.__cause__ = None
@@ -4282,7 +4352,13 @@ class CrewDispatchRuntime:
             if hydrating_restored and protected_checkpoint is not None:
                 self._publish_checkpoint(state, protected_checkpoint)
             try:
-                await emit(kind=EventKind.RUNTIME_FAILED, reason=failure_reason)
+                await emit(
+                    kind=EventKind.RUNTIME_FAILED, reason=failure_reason,
+                    payload=(
+                        {**runtime_failure_diagnostic_from_reason(failure_reason), **scope_payload}
+                        if scope_payload else {}
+                    ),
+                )
             except Exception as emit_error:  # noqa: BLE001
                 emit_error.__traceback__ = None
                 emit_error.__context__ = None
@@ -4307,6 +4383,7 @@ class CrewDispatchRuntime:
         finally:
             state.open = False
             state.artifact_writes_open = False
+            state.gateway_scope_failures.clear()
             frozen_writes = tuple(state.pending_artifact_writes.items())
             commit_tasks = tuple(state.commit_tasks)
             if commit_tasks:
@@ -4583,7 +4660,7 @@ class CrewDispatchRuntime:
                                     **review_diagnostic,
                                 },
                             )
-                            raise _ReviewFailed(review_failure) from None
+                            raise _gateway_scope_review_failure(review_failure, error) from None
                         else:
                             await event(
                                 kind=EventKind.REVIEW_COMPLETED,
@@ -4791,6 +4868,7 @@ class CrewDispatchRuntime:
                     reason=failure_reason,
                     payload={
                         **diagnostic,
+                        **_gateway_scope_payload(error),
                         **_step_orchestration_payload(
                             plan,
                             step,
@@ -5351,13 +5429,22 @@ class CrewDispatchRuntime:
                 raise ModelOutcomeUncertain("model outcome requires confirmation")
             if existing["status"] == "failed":
                 if repair is not None:
+                    cached_failure = run_state.gateway_scope_failures.get(key)
+                    if cached_failure is not None:
+                        raise _gateway_scope_failure(
+                            "structured correction failed", cached_failure, contract=True,
+                        ) from None
                     raise _ModelContractFailed("structured correction failed") from None
                 agent = next(item for item in self._plan.agents if item.id == actor)
                 if not _failed_model_state_can_compact_retry(
                     existing, recovery_limit=_subagent_recovery_attempt_limit(agent),
                 ):
                     raise ModelOutcomeUncertain("model outcome requires confirmation")
-                _fail(cast(str, existing.get("failure_reason") or "model gateway failed"))
+                failure_reason = cast(str, existing.get("failure_reason") or "model gateway failed")
+                cached_failure = run_state.gateway_scope_failures.get(key)
+                if cached_failure is not None:
+                    raise _gateway_scope_failure(failure_reason, cached_failure) from None
+                _fail(failure_reason)
             if existing["status"] == "rejected":
                 private = ledger.rejected_outputs.get(key)
                 if private is None:
@@ -5383,6 +5470,7 @@ class CrewDispatchRuntime:
                 raise asyncio.CancelledError
             await model_boundary(key, running)
             completion: GatewayCompletion | None = None
+            gateway_failure: RuntimeExecutionError | None = None
             try:
                 async with asyncio.timeout(self._remaining_timeout(run_state, step_deadline)):
                     completion = await self._complete_with_guidance(
@@ -5479,16 +5567,29 @@ class CrewDispatchRuntime:
                     else None
                 )
                 if completion is None:
+                    gateway_failure = _gateway_scope_failure(
+                        "structured correction failed" if repair is not None else reason,
+                        error, contract=repair is not None,
+                    )
+                    error.__traceback__ = None
+                    error.__context__ = None
+                    error.__cause__ = None
                     failed = dict(running)
                     failed.update(status="failed", failure_reason=reason)
                     await model_boundary(key, failed)
-                    if repair is not None:
-                        raise _ModelContractFailed("structured correction failed") from None
-                    _fail(reason)
-                completion = _completion_with_estimated_usage(completion, request)
-                rejected = self._reject_invalid_structured(request, completion)
-                if rejected is None:
-                    self._valid_response(completion, max_output_bytes=output_limit)
+                else:
+                    completion = _completion_with_estimated_usage(completion, request)
+                    rejected = self._reject_invalid_structured(request, completion)
+                    if rejected is None:
+                        self._valid_response(completion, max_output_bytes=output_limit)
+            # Raise outside the gateway exception handler so no private exception is chained.
+            if gateway_failure is not None:
+                if _registered_gateway_scope_diagnostic(gateway_failure) is not None:
+                    # Keep an unraised sanitized copy only within this run, never in the model ledger.
+                    run_state.gateway_scope_failures[key] = _gateway_scope_failure(
+                        str(gateway_failure), gateway_failure, contract=repair is not None,
+                    )
+                raise gateway_failure from None
             # Preserve paid receipts privately before rejecting any forbidden tool batch.
             if completion is not None and completion.response.tool_calls and (
                 repair is not None or purpose == "review" or (
