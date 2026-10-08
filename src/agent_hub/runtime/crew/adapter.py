@@ -1754,6 +1754,7 @@ def _should_check_framework_raw(step: DispatchStep, completion: GatewayCompletio
     return (
         not _is_project_scale_recovery_completion(completion)
         and not _is_project_scale_tool_contract_step(step)
+        and not _is_incremental_workspace_contract_step(step)
     )
 
 
@@ -1996,7 +1997,10 @@ def _project_scale_structured_role_completion(
     completion: GatewayCompletion,
 ) -> GatewayCompletion:
     if (
-        not _is_project_scale_tool_contract_step(step)
+        not (
+            _is_project_scale_tool_contract_step(step)
+            or _is_incremental_workspace_contract_step(step)
+        )
         or not agent.output_schema
         or completion.response.tool_calls
     ):
