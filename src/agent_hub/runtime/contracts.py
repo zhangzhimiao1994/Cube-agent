@@ -38,6 +38,17 @@ _MAX_JSON_DEPTH = 20
 _MAX_JSON_NODES = 4_096
 _MAX_JSON_STRING = 512_000
 _MAX_JSON_BYTES = 2_000_000
+_CHECKPOINT_LEDGER_FIELDS = frozenset(
+    {
+        "tools",
+        "models",
+        "rejected_outputs",
+        "structured_repairs",
+        "review_refs",
+        "artifact_registry",
+        "step_usage",
+    }
+)
 _MAX_TEXT_BYTES = _MAX_JSON_STRING
 _SENSITIVE_KEYS = frozenset(
     {
@@ -47,6 +58,8 @@ _SENSITIVE_KEYS = frozenset(
         "secret_ref",
         "password",
         "token",
+        "access_token",
+        "refresh_token",
         "authorization",
         "raw_prompt",
         "prompt",
@@ -119,13 +132,13 @@ def _canonical_json_bytes(value: Mapping[str, JsonValue]) -> bytes:
     ).encode("utf-8")
 
 
-def _freeze_json(value: object) -> JsonValue:
+def _freeze_json(value: object, *, max_nodes: int = _MAX_JSON_NODES) -> JsonValue:
     nodes = 0
 
     def visit(item: object, depth: int) -> JsonValue:
         nonlocal nodes
         nodes += 1
-        if nodes > _MAX_JSON_NODES or depth > _MAX_JSON_DEPTH:
+        if nodes > max_nodes or depth > _MAX_JSON_DEPTH:
             raise ValueError("JSON value exceeds structural limits")
         if item is None or type(item) is bool or type(item) is int:
             return cast(JsonScalar, item)
@@ -145,7 +158,7 @@ def _freeze_json(value: object) -> JsonValue:
                 if type(key) is not str:
                     raise TypeError("JSON object keys must be strings")
                 nodes += 1
-                if nodes > _MAX_JSON_NODES:
+                if nodes > max_nodes:
                     raise ValueError("JSON value exceeds structural limits")
                 if len(key.encode("utf-8")) > _MAX_JSON_STRING:
                     raise ValueError("JSON string exceeds size limit")
@@ -161,10 +174,12 @@ def _freeze_json(value: object) -> JsonValue:
     return frozen
 
 
-def _freeze_object(value: object, *, name: str) -> Mapping[str, JsonValue]:
+def _freeze_object(
+    value: object, *, name: str, max_nodes: int = _MAX_JSON_NODES
+) -> Mapping[str, JsonValue]:
     if not isinstance(value, Mapping):
         raise TypeError(f"{name} must be a JSON object")
-    frozen = _freeze_json(value)
+    frozen = _freeze_json(value, max_nodes=max_nodes)
     if not isinstance(frozen, Mapping):  # pragma: no cover - guarded above
         raise TypeError(f"{name} must be a JSON object")
     return frozen
@@ -234,7 +249,9 @@ def _validate_failure_diagnostic(payload: Mapping[str, JsonValue]) -> None:
         raise ValueError("runtime failure diagnostic recovery hint is invalid")
 
 
-def _preflight_payload(value: object) -> None:
+def _preflight_payload(
+    value: object, *, max_nodes: int = _MAX_JSON_NODES, max_bytes: int = _MAX_JSON_BYTES
+) -> None:
     nodes = 0
     estimated_bytes = 0
     active: set[int] = set()
@@ -242,7 +259,7 @@ def _preflight_payload(value: object) -> None:
     def visit(item: object, depth: int) -> None:
         nonlocal nodes, estimated_bytes
         nodes += 1
-        if nodes > _MAX_JSON_NODES or depth > _MAX_JSON_DEPTH:
+        if nodes > max_nodes or depth > _MAX_JSON_DEPTH:
             raise ValueError("payload exceeds structural limits")
         if item is None or type(item) is bool:
             estimated_bytes += 5
@@ -286,10 +303,83 @@ def _preflight_payload(value: object) -> None:
             for child in cast(list[object], item):
                 visit(child, depth + 1)
         active.remove(identity)
-        if estimated_bytes > _MAX_JSON_BYTES:
+        if estimated_bytes > max_bytes:
             raise ValueError("payload exceeds estimated size limit")
 
     visit(value, 0)
+    encoded = json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+    if len(encoded.encode("utf-8")) > max_bytes:
+        raise ValueError("payload exceeds serialized size limit")
+
+
+def _preflight_checkpoint_json(value: object) -> None:
+    # Cumulative records get individual node budgets; the complete snapshot still
+    # obeys the original byte/depth/width bounds, including all nested envelopes.
+    # One node per byte is a conservative ceiling, not a raised input allowance.
+    _preflight_payload(value, max_nodes=_MAX_JSON_BYTES)
+
+
+def _preflight_checkpoint_payload(value: object) -> None:
+    _preflight_checkpoint_json(value)
+    if type(value) is not dict:
+        raise TypeError("checkpoint must be a JSON object")
+    envelope = dict(cast(dict[str, object], value))
+    state = envelope.get("state")
+    if type(state) is not dict:
+        raise TypeError("checkpoint state must be a JSON object")
+    metadata = dict(cast(dict[str, object], state))
+    runtime_type = envelope.get("runtime_type")
+    fields = _CHECKPOINT_LEDGER_FIELDS if runtime_type == "crew" else frozenset()
+    if runtime_type == "hybrid":
+        fields = frozenset({"artifact_registry"})
+        child = metadata.get("child_checkpoint")
+        if child is not None:
+            _preflight_checkpoint_payload(child)
+            metadata["child_checkpoint"] = None
+    for name in fields:
+        records = metadata.get(name)
+        if records is None:
+            continue
+        if type(records) is not dict:
+            raise TypeError("checkpoint ledger must be a JSON object")
+        for key, record in cast(dict[str, object], records).items():
+            _preflight_payload({key: record})
+        metadata[name] = {}
+    _preflight_payload(metadata)
+    envelope["state"] = {}
+    _preflight_payload(envelope)
+
+
+def _preflight_checkpoint_carrier(
+    value: object, *, artifact_field: Literal["inputs", "artifacts"]
+) -> None:
+    if type(value) is not dict:
+        _preflight_payload(value)
+        return
+    envelope = dict(cast(dict[str, object], value))
+    artifacts = envelope.get(artifact_field, [])
+    if type(artifacts) is not list or len(cast(list[object], artifacts)) > 64:
+        raise ValueError("runtime artifacts must be a bounded JSON list")
+    records = cast(list[object], artifacts)
+    for record in records:
+        _preflight_payload(record)
+    # Validated typed artifacts are cumulative inputs, not arbitrary metadata.
+    # Reserve one bounded envelope per record without removing any source IDs;
+    # the runtime prompt builder can then compact them at its soft waterline.
+    checkpoint_nodes = _MAX_JSON_BYTES if envelope.get("checkpoint") is not None else _MAX_JSON_NODES
+    _preflight_payload(
+        value,
+        max_nodes=checkpoint_nodes + len(records) * _MAX_JSON_NODES,
+        max_bytes=_MAX_JSON_BYTES * (1 + len(records)) + max(0, len(records) - 1),
+    )
+    envelope[artifact_field] = []
+    if envelope.get("checkpoint") is None:
+        _preflight_payload(envelope)
+        return
+    _preflight_checkpoint_json(envelope)
+    _preflight_checkpoint_payload(envelope["checkpoint"])
+    envelope["checkpoint"] = None
+    _preflight_payload(envelope)
 
 
 class RuntimeContractError(ValueError):
@@ -310,12 +400,16 @@ class _RuntimeContractModel(BaseModel):
     )
 
     @classmethod
+    def _preflight_contract(cls, payload: object) -> None:
+        _preflight_payload(payload)
+
+    @classmethod
     def from_payload(cls, payload: object) -> Self:
         failed = False
         validated: Self | None = None
         encoded: str | None = None
         try:
-            _preflight_payload(payload)
+            cls._preflight_contract(payload)
             encoded = json.dumps(
                 payload,
                 ensure_ascii=False,
@@ -435,6 +529,7 @@ class Artifact(_RuntimeContractModel):
         if self.content_sha256 and self.content_sha256 != digest:
             raise ValueError("artifact content hash does not match content")
         object.__setattr__(self, "content_sha256", digest)
+        _preflight_payload(self.to_payload())
         return self
 
     def recompute_content_sha256(self) -> str:
@@ -488,6 +583,10 @@ class RuntimeCheckpoint(_RuntimeContractModel):
     state: Mapping[str, JsonValue] = Field(repr=False)
     state_sha256: str = Field(default="", pattern=r"^(?:|[0-9a-f]{64})$", repr=False)
 
+    @classmethod
+    def _preflight_contract(cls, payload: object) -> None:
+        _preflight_checkpoint_payload(payload)
+
     @field_validator("runtime_type")
     @classmethod
     def validate_runtime_type(cls, value: str) -> str:
@@ -510,18 +609,24 @@ class RuntimeCheckpoint(_RuntimeContractModel):
     @field_validator("state", mode="before")
     @classmethod
     def validate_state(cls, value: object) -> object:
-        return _strict_json_input(_freeze_object(value, name="checkpoint state"))
+        return _strict_json_input(
+            _freeze_object(value, name="checkpoint state", max_nodes=_MAX_JSON_BYTES)
+        )
 
     @model_validator(mode="after")
     def state_invariants(self) -> RuntimeCheckpoint:
-        object.__setattr__(self, "state", _freeze_object(self.state, name="checkpoint state"))
+        object.__setattr__(
+            self,
+            "state",
+            _freeze_object(self.state, name="checkpoint state", max_nodes=_MAX_JSON_BYTES),
+        )
         if _contains_sensitive_key(self.state):
             raise ValueError("checkpoint state contains sensitive data")
         digest = self.recompute_state_sha256()
         if self.state_sha256 and self.state_sha256 != digest:
             raise ValueError("checkpoint state hash does not match state")
         object.__setattr__(self, "state_sha256", digest)
-        _preflight_payload(
+        _preflight_checkpoint_payload(
             {
                 "id": str(self.id),
                 "runtime_type": self.runtime_type,
@@ -610,6 +715,10 @@ class RunEvent(_RuntimeContractModel):
         allow_inf_nan=False,
     )
     currency: Literal["USD"] | None = None
+
+    @classmethod
+    def _preflight_contract(cls, payload: object) -> None:
+        _preflight_checkpoint_carrier(payload, artifact_field="inputs")
 
     @field_validator("kind", mode="before")
     @classmethod
@@ -940,6 +1049,7 @@ class RunEvent(_RuntimeContractModel):
             )
         ):
             raise ValueError("extension events require payload and forbid direct objects")
+        _preflight_checkpoint_carrier(self.to_payload(), artifact_field="inputs")
         return self
 
     def to_payload(self) -> dict[str, object]:
@@ -988,6 +1098,10 @@ class TaskContext(_RuntimeContractModel):
     routing_decision: Mapping[str, JsonValue] = Field(default_factory=dict, repr=False)
     timeout_seconds: float = Field(default=60.0, gt=0, le=3600, allow_inf_nan=False)
     token_budget: int = Field(default=16_384, ge=1, le=10_000_000)
+
+    @classmethod
+    def _preflight_contract(cls, payload: object) -> None:
+        _preflight_checkpoint_carrier(payload, artifact_field="artifacts")
 
     @field_validator("instruction_context", mode="before")
     @classmethod
@@ -1050,6 +1164,7 @@ class TaskContext(_RuntimeContractModel):
             or self.checkpoint.mode is not self.mode
         ):
             raise ValueError("checkpoint run, tenant, or mode does not match task context")
+        _preflight_checkpoint_carrier(self.to_payload(), artifact_field="artifacts")
         return self
 
     def validated_internal_clone(self) -> TaskContext:
