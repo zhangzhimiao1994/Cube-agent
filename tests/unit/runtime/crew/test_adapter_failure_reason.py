@@ -4077,6 +4077,127 @@ async def test_workspace_delivery_early_stop_continues_once_to_missing_files_and
     assert checkpoint.state["usage"] == {"tokens": 10, "cost_usd": "0"}
 
 
+@pytest.mark.parametrize("path", ["tests/business.test.ts", "src/business.ts"])
+async def test_workspace_delivery_new_file_progress_allows_another_delivery_correction(
+    path: str,
+) -> None:
+    gateway = WorkspaceDeliverySequenceGateway((
+        _workspace_delivery_write_response("src/business.ts", "export const ready = 1;\n", "first-write"),
+        ModelResponse(text="Implementation finished.", usage=TokenUsage(1, 1, 2)),
+        _workspace_delivery_write_response(path, "export const ready = 2;\n", "progress-write"),
+        ModelResponse(text="The additional work is finished.", usage=TokenUsage(1, 1, 2)),
+        _workspace_delivery_bundle_response(),
+        ModelResponse(text="Workspace delivered.", usage=TokenUsage(1, 1, 2)),
+    ))
+    harness = WorkspaceDeliverySequenceHarness()
+    runtime = _workspace_delivery_sequence_runtime(gateway, harness)
+
+    events = [event async for event in runtime.run(_workspace_delivery_sequence_context())]
+
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert len(gateway.requests) == 6
+    assert [call.tool_name for call in harness.calls] == [
+        "workspace.write_text", "workspace.write_text", "workspace.bundle",
+    ]
+    assert harness.files[path] == "export const ready = 2;\n"
+    assert all(call.approval_required for call in harness.calls)
+    assert len({call.idempotency_key for call in harness.calls}) == 3
+    assert len(_workspace_delivery_final_attachments(events)) == 1
+    checkpoint = await runtime.save_checkpoint()
+    assert checkpoint.state["usage"] == {"tokens": 12, "cost_usd": "0"}
+
+
+async def test_workspace_delivery_same_content_rewrite_does_not_renew_delivery_correction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_lookup = crew_adapter._succeeded_semantic_tool_result
+
+    def lookup_without_write_reuse(
+        ledger: _ToolLedger, *, step_id: str, name: str, arguments_sha256: str,
+    ) -> Artifact | None:
+        # Both identical writes must execute successfully, rather than reuse a receipt.
+        if name == "workspace.write_text":
+            return None
+        return original_lookup(
+            ledger, step_id=step_id, name=name, arguments_sha256=arguments_sha256,
+        )
+
+    monkeypatch.setattr(crew_adapter, "_succeeded_semantic_tool_result", lookup_without_write_reuse)
+    path = "src/business.ts"
+    content = "export const ready = 1;\n"
+    gateway = WorkspaceDeliverySequenceGateway((
+        _workspace_delivery_write_response(path, content, "first-write"),
+        ModelResponse(text="Implementation finished.", usage=TokenUsage(1, 1, 2)),
+        _workspace_delivery_write_response(path, content, "same-content-rewrite"),
+        ModelResponse(text="The unchanged work is finished.", usage=TokenUsage(1, 1, 2)),
+        _workspace_delivery_bundle_response(),
+        ModelResponse(text="Workspace delivered.", usage=TokenUsage(1, 1, 2)),
+    ))
+    harness = WorkspaceDeliverySequenceHarness()
+    runtime = _workspace_delivery_sequence_runtime(gateway, harness)
+    events: list[RunEvent] = []
+
+    with pytest.raises(RuntimeExecutionError, match="project workspace bundle is missing"):
+        async for event in runtime.run(_workspace_delivery_sequence_context()):
+            events.append(event)
+
+    assert len(gateway.requests) == 4
+    assert [call.tool_name for call in harness.calls] == [
+        "workspace.write_text", "workspace.write_text",
+    ]
+    assert all(call.arguments["path"] == path and call.arguments["content"] == content
+               and call.approval_required for call in harness.calls)
+    assert len({call.idempotency_key for call in harness.calls}) == 2
+    assert harness.files == {path: content}
+    writes = [event for event in events
+              if event.kind is EventKind.TOOL_COMPLETED and event.tool_name == "workspace.write_text"]
+    assert len(writes) == 2
+    for event in writes:
+        assert event.artifact is not None
+        result = event.artifact.content["result"]
+        assert isinstance(result, Mapping)
+        assert result["path"] == path
+        assert result["content_bytes"] == len(content.encode("utf-8"))
+        assert result["content_sha256"] == hashlib.sha256(content.encode("utf-8")).hexdigest()
+    assert not any(event.kind is EventKind.RUNTIME_COMPLETED for event in events)
+    assert _workspace_delivery_final_attachments(events) == []
+    checkpoint = await runtime.save_checkpoint()
+    assert checkpoint.state["usage"] == {"tokens": 8, "cost_usd": "0"}
+    tools = checkpoint.state["tools"]
+    assert isinstance(tools, Mapping) and len(tools) == 2
+    assert all(isinstance(state, Mapping) and state["status"] == "succeeded"
+               and state["name"] == "workspace.write_text" for state in tools.values())
+
+
+async def test_workspace_delivery_progress_corrections_restore_without_rebilling() -> None:
+    initial = (
+        _workspace_delivery_write_response("src/business.ts", "export const ready = 1;\n", "first-write"),
+        ModelResponse(text="Implementation finished.", usage=TokenUsage(1, 1, 2)),
+        _workspace_delivery_write_response("tests/business.test.ts", "export const ready = 2;\n", "progress-write"),
+        ModelResponse(text="The additional work is finished.", usage=TokenUsage(1, 1, 2)),
+    )
+    checkpoint, context, repository, harness, first_gateway = await _workspace_delivery_partial_checkpoint(
+        responses=initial, expected_tools=2,
+    )
+    gateway = WorkspaceDeliverySequenceGateway((
+        _workspace_delivery_bundle_response(),
+        ModelResponse(text="Workspace delivered.", usage=TokenUsage(1, 1, 2)),
+    ))
+    runtime = _workspace_delivery_sequence_runtime(gateway, harness, artifact_repository=repository)
+    await runtime.restore_checkpoint(checkpoint)
+
+    events = [event async for event in runtime.run(context.model_copy(update={"checkpoint": checkpoint}))]
+
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert len(first_gateway.requests) == 4 and len(gateway.requests) == 2
+    assert [call.tool_name for call in harness.calls] == [
+        "workspace.write_text", "workspace.write_text", "workspace.bundle",
+    ]
+    restored = await runtime.save_checkpoint()
+    assert restored.state["usage"] == {"tokens": 12, "cost_usd": "0"}
+    assert len(_workspace_delivery_final_attachments(events)) == 1
+
+
 async def test_workspace_delivery_repeated_early_stop_fails_bounded_without_fake_artifact() -> None:
     gateway = WorkspaceDeliverySequenceGateway((
         _workspace_delivery_write_response("src/business.ts", "export const ready = true;\n", "write-business"),
@@ -4251,6 +4372,32 @@ def _workspace_observation_value(result: Mapping[str, JsonValue], name: str) -> 
         assert isinstance(row, Mapping) and isinstance(row["path"], str)
         paths.append(row["path"])
     return tuple(sorted(paths))
+
+
+@pytest.mark.parametrize("name", ("workspace.read", "workspace.list"))
+async def test_workspace_delivery_observation_does_not_renew_delivery_correction(
+    tmp_path: Path, name: str,
+) -> None:
+    context = _workspace_delivery_sequence_context()
+    harness = WorkspaceObservationHarness(tmp_path, context)
+    gateway = WorkspaceDeliverySequenceGateway((
+        _workspace_delivery_write_response("src/types.ts", _WORKSPACE_OBSERVATION_BEFORE, "write-before"),
+        ModelResponse(text="Implementation finished.", usage=TokenUsage(1, 1, 2)),
+        ModelResponse(text=None, tool_calls=(_workspace_observation_call(name, "observe-only"),), usage=TokenUsage(1, 1, 2)),
+        ModelResponse(text="Everything is already finished.", usage=TokenUsage(1, 1, 2)),
+    ))
+    runtime = _workspace_delivery_sequence_runtime(gateway, harness, tools=_WORKSPACE_OBSERVATION_TOOLS)
+    events: list[RunEvent] = []
+
+    with pytest.raises(RuntimeExecutionError, match="workspace (bundle|delivery)"):
+        async for event in runtime.run(context):
+            events.append(event)
+
+    assert len(gateway.requests) == 4
+    assert [call.tool_name for call in harness.calls] == ["workspace.write_text", name]
+    assert all(result.status == "succeeded" for result in harness.results)
+    assert not any(event.kind is EventKind.RUNTIME_COMPLETED for event in events)
+    assert _workspace_delivery_final_attachments(events) == []
 
 
 @pytest.mark.parametrize("legacy", (False, True))

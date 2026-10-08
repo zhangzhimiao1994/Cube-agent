@@ -2987,14 +2987,13 @@ def _succeeded_semantic_tool_result(
     return None
 
 
-def _workspace_delivery_progress(
+def _workspace_delivery_file_metadata(
     ledger: _ToolLedger,
     *,
     step_id: str,
     attempt: int,
     round_index: int,
-    max_bytes: int,
-) -> ModelMessage:
+) -> dict[str, dict[str, object]]:
     files: dict[str, dict[str, object]] = {}
     coordinates: dict[str, tuple[int, int, str]] = {}
     for key, state in ledger.states.items():
@@ -3033,6 +3032,20 @@ def _workspace_delivery_progress(
                     "size_bytes", "sha256", "content_bytes", "content_sha256",
                 ) if type(item.get(name)) in (str, int)},
             }
+    return files
+
+
+def _workspace_delivery_progress(
+    ledger: _ToolLedger,
+    *,
+    step_id: str,
+    attempt: int,
+    round_index: int,
+    max_bytes: int,
+) -> ModelMessage:
+    files = _workspace_delivery_file_metadata(
+        ledger, step_id=step_id, attempt=attempt, round_index=round_index,
+    )
     # Only earlier rounds of this attempt are visible, including during hydration.
     # Future ledger entries must not change a cached request's content/hash.
     prefix = "WORKSPACE_DELIVERY_PROGRESS_JSON="
@@ -5686,7 +5699,7 @@ class CrewDispatchRuntime:
             run_state.workspace_delivery_continuation
             and _is_incremental_workspace_contract_step(step)
         )
-        delivery_correction_requested = False
+        delivery_correction_progress: set[str] = set()
         workspace_metadata_budget = max(
             512, min(8_192, content_limits.interaction_prompt_bytes // 8),
         )
@@ -5785,13 +5798,20 @@ class CrewDispatchRuntime:
                     )
                     for state in tool_ledger.states.values()
                 ):
+                    delivery_progress = hashlib.sha256(json.dumps(
+                        _workspace_delivery_file_metadata(
+                            tool_ledger, step_id=step.id, attempt=model_attempt,
+                            round_index=_round,
+                        ),
+                        sort_keys=True, separators=(",", ":"),
+                    ).encode("utf-8")).hexdigest()
                     if (
                         workspace_continuation
-                        and not delivery_correction_requested
+                        and delivery_progress not in delivery_correction_progress
                         and not force_result_synthesis
                         and _round < active_round_limit
                     ):
-                        delivery_correction_requested = True
+                        delivery_correction_progress.add(delivery_progress)
                         messages.append(ModelMessage(
                             role="system",
                             content=(
