@@ -135,7 +135,8 @@ _SENSITIVE_PUBLIC_KEYS = frozenset(
     }
 )
 _SENSITIVE_PUBLIC_TEXT = re.compile(
-    r"(?:api[_ -]?key|(?<![a-z0-9])sk-[a-z0-9_-]{8,}|bearer\s+|authorization|password|secret|token)",
+    r"(?:api[_ -]?key|(?<![a-z0-9])sk-[a-z0-9_-]{8,}|bearer\s+|authorization|password|secret|token"
+    r"|\b(?:set[-_]cookie|cookie)\s*:|\b(?:sessionid|session_id)\s*=)",
     re.IGNORECASE,
 )
 _SAFE_MODEL_ID = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
@@ -1885,7 +1886,7 @@ class RunRepository:
         event: RunEvent,
     ) -> None:
         event = _event_with_failure_diagnostic(event)
-        if event.kind == EventKind.RUNTIME_FAILED:
+        if event.kind in {EventKind.RUNTIME_FAILED, EventKind.STEP_FAILED, EventKind.TOOL_FAILED}:
             event = RunEvent.model_validate(event)
         payload = event.to_payload()
         inserted_event_id = await session.scalar(

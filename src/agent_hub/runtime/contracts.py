@@ -83,6 +83,13 @@ _SAFE_TOOL_EVENT_PAYLOAD_KEYS = frozenset(
         "workspace_files",
     }
 )
+_REQUIRED_FAILURE_DIAGNOSTIC_KEYS = frozenset(
+    {"error_code", "error_stage", "error_category", "error_summary", "retryable", "suggested_action"}
+)
+_OPTIONAL_FAILURE_DIAGNOSTIC_KEYS = frozenset(
+    {"status_code", "hybrid_child_mode", "orchestration_recovery_hint", "step_id", "actor"}
+)
+_FAILURE_DIAGNOSTIC_KEYS = _REQUIRED_FAILURE_DIAGNOSTIC_KEYS | _OPTIONAL_FAILURE_DIAGNOSTIC_KEYS
 
 
 def _mutable_json(value: JsonValue) -> object:
@@ -198,11 +205,7 @@ def _safe_identifier(value: str, *, name: str) -> str:
 
 
 def _validate_failure_diagnostic(payload: Mapping[str, JsonValue]) -> None:
-    required = {
-        "error_code", "error_stage", "error_category", "error_summary", "retryable", "suggested_action",
-    }
-    optional = {"status_code", "hybrid_child_mode", "orchestration_recovery_hint", "step_id", "actor"}
-    if not required <= set(payload) or set(payload) - required - optional:
+    if not _REQUIRED_FAILURE_DIAGNOSTIC_KEYS <= set(payload) or set(payload) - _FAILURE_DIAGNOSTIC_KEYS:
         raise ValueError("runtime failure diagnostic fields are invalid")
     for name in ("error_code", "error_stage", "error_category", "step_id", "actor"):
         if name in payload:
@@ -779,8 +782,17 @@ class RunEvent(_RuntimeContractModel):
             self.actor is None or self.tool_call_id is None or self.tool_name is None
         ):
             raise ValueError("tool events require actor, call id, and tool name")
-        if self.kind in tool_kinds and set(self.payload) - _SAFE_TOOL_EVENT_PAYLOAD_KEYS:
-            raise ValueError("tool event payload contains unsafe keys")
+        if self.kind in tool_kinds:
+            allowed_tool_keys = _SAFE_TOOL_EVENT_PAYLOAD_KEYS
+            if self.kind is EventKind.TOOL_FAILED:
+                diagnostic = {
+                    key: value for key, value in self.payload.items() if key in _FAILURE_DIAGNOSTIC_KEYS
+                }
+                if diagnostic:
+                    _validate_failure_diagnostic(diagnostic)
+                allowed_tool_keys |= _FAILURE_DIAGNOSTIC_KEYS
+            if set(self.payload) - allowed_tool_keys:
+                raise ValueError("tool event payload contains unsafe keys")
         if self.kind is EventKind.TOOL_COMPLETED and self.artifact is None and not self.payload:
             raise ValueError("tool.completed requires an artifact or result payload")
         if self.kind is EventKind.APPROVAL_REQUESTED and (

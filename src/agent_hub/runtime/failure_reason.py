@@ -296,8 +296,10 @@ def runtime_failure_diagnostic_from_reason(
             retryable=True,
             suggested_action="CrewAI 子 Agent 步骤执行超时；可压缩该步骤输入、切换更快模型、提高审查/汇总步骤超时或降低并发等待。",
         )
-        diagnostic["step_id"] = crew_timeout.group("step")
-        diagnostic["actor"] = crew_timeout.group("actor")
+        for field, group in (("step_id", "step"), ("actor", "actor")):
+            identifier = crew_timeout.group(group)
+            if re.fullmatch(r"[a-z0-9][a-z0-9_.-]{0,127}", identifier) is not None:
+                diagnostic[field] = identifier
     elif "model gateway failed" in lowered:
         diagnostic = _model_gateway_diagnostic(normalized, status_code=status_code)
     elif normalized == "runtime_not_configured":
