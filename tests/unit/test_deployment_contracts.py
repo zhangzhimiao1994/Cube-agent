@@ -22,6 +22,47 @@ def read(relative: str) -> str:
     return (ROOT / relative).read_text(encoding="utf-8")
 
 
+@pytest.mark.parametrize(
+    ("name", "image", "unchanged"),
+    (
+        (
+            "postgres", "public.ecr.aws/docker/library/postgres:16.11",
+            {
+                "environment": {
+                    "POSTGRES_DB": "agent_hub_test",
+                    "POSTGRES_USER": "agent_hub_test",
+                    "POSTGRES_PASSWORD": "agent_hub_test",
+                },
+                "ports": ["127.0.0.1:${AGENT_HUB_TEST_POSTGRES_PORT:-54329}:5432"],
+                "tmpfs": ["/var/lib/postgresql/data"],
+                "healthcheck": {
+                    "test": ["CMD-SHELL", "pg_isready -U agent_hub_test -d agent_hub_test"],
+                    "interval": "2s", "timeout": "5s", "retries": 15,
+                },
+            },
+        ),
+        (
+            "redis", "public.ecr.aws/docker/library/redis:7.4",
+            {
+                "ports": ["127.0.0.1:${AGENT_HUB_TEST_REDIS_PORT:-56379}:6379"],
+                "tmpfs": ["/data"],
+                "healthcheck": {
+                    "test": ["CMD", "redis-cli", "ping"],
+                    "interval": "2s", "timeout": "5s", "retries": 15,
+                },
+            },
+        ),
+    ),
+)
+def test_test_compose_uses_official_ecr_images_without_boundary_changes(
+    name: str, image: str, unchanged: dict[str, object],
+) -> None:
+    compose = yaml.safe_load(read("tests/compose.yml"))
+    assert compose["name"] == "${AGENT_HUB_TEST_COMPOSE_PROJECT:-agent-hub-test}"
+    assert set(compose["services"]) == {"postgres", "redis"}
+    assert compose["services"][name] == {"image": image, **unchanged}
+
+
 def test_quality_checks_types_for_both_supported_platforms() -> None:
     workflow = yaml.safe_load(read(".github/workflows/quality.yml"))
     commands = {
