@@ -204,7 +204,7 @@ class DispatchStep(_PlanModel):
     reviewer: str | None = None
     reviewer_retries: int = Field(default=0, ge=0, le=8)
     final_synthesizer: bool = False
-    token_budget: int = Field(default=4096, ge=1, le=1_000_000)
+    token_budget: int = Field(default=4096, ge=1, le=10_000_000)
     timeout_seconds: float = Field(default=60.0, gt=0, le=3600, allow_inf_nan=False)
     cost_budget_usd: Decimal = Field(default=Decimal(0), ge=0, le=Decimal(1000000))
 

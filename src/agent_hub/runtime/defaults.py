@@ -1982,7 +1982,7 @@ def _dispatch_plan(
         if preflight_context
         else ""
     )
-    step_token_budget = min(context.token_budget, 1_000_000)
+    step_token_budget = context.token_budget
     role_token_budget = step_token_budget
     final_token_budget = step_token_budget
     step_cost_budget = _DEFAULT_DISPATCH_STEP_COST_BUDGET_USD
@@ -2095,7 +2095,7 @@ def _dispatch_plan(
         cost_budget_usd=step_cost_budget,
     )
     steps = (*preflight_steps, *role_steps, final_step)
-    return DispatchPlan(
+    plan = DispatchPlan(
         agents=tuple(agents),
         steps=steps,
         allowed_tools=plan_allowed_tools,
@@ -2109,6 +2109,44 @@ def _dispatch_plan(
         total_timeout_seconds=sum(step.timeout_seconds for step in steps),
         total_cost_usd=sum((step.cost_budget_usd for step in steps), Decimal(0)),
     )
+    return _checkpoint_compatible_generated_plan(plan, context)
+
+
+def _checkpoint_compatible_generated_plan(plan: DispatchPlan, context: TaskContext) -> DispatchPlan:
+    if context.checkpoint is None:
+        return plan
+    checkpoint = context.validated_internal_clone().checkpoint
+    if checkpoint is None or checkpoint.state.get("terminal") is not False:
+        return plan
+    if checkpoint.runtime_type == "hybrid":
+        state = cast(Mapping[str, object], checkpoint.to_payload()["state"])
+        child = state.get("child_checkpoint")
+        if not isinstance(child, Mapping):
+            return plan
+        checkpoint = RuntimeCheckpoint.from_payload(dict(child))
+    if (
+        checkpoint.runtime_type != "crew"
+        or checkpoint.runtime_version not in {"9", "10", "11"}
+        or checkpoint.mode is not TaskMode.DISPATCH
+        or checkpoint.run_id != context.run_id
+        or checkpoint.tenant_id != context.tenant_id
+        or checkpoint.state.get("terminal") is not False
+    ):
+        return plan
+    digest = checkpoint.state.get("plan_digest")
+    if digest == plan.digest:
+        return plan
+    # Only the known old generator's step cap may differ. The full digest
+    # still commits to every role, tool, task, total envelope and cost limit.
+    payload = plan.to_payload()
+    legacy = DispatchPlan.from_payload({
+        **payload,
+        "steps": [
+            {**step, "token_budget": min(context.token_budget, 1_000_000)}
+            for step in cast(list[dict[str, object]], payload["steps"])
+        ],
+    })
+    return legacy if digest == legacy.digest else plan
 
 
 def _project_preflight_model_route(

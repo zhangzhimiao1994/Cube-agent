@@ -43,7 +43,7 @@
 }
 
 @test "native upgrades restart every process bound to the active release" {
-  grep -q 'systemctl stop agent-hub-skill-broker.service' scripts/lib/install_native.sh
+  grep -q 'systemctl restart agent-hub-skill-broker.service' scripts/lib/install_native.sh
   grep -q 'systemctl restart agent-hub-litellm.service' scripts/lib/install_native.sh
   grep -q 'systemctl restart agent-hub-api.service' scripts/lib/install_native.sh
   grep -q 'systemctl restart agent-hub-worker.service' scripts/lib/install_native.sh
@@ -58,7 +58,7 @@ from pathlib import Path
 script = Path("scripts/lib/install_native.sh").read_text()
 tmpfiles = script.index("systemd-tmpfiles --create")
 migrations = script.index("alembic upgrade head")
-start = script.index("systemctl enable --now agent-hub.target")
+start = script.index("systemctl enable agent-hub.target")
 assert tmpfiles < start
 assert migrations < start
 PY

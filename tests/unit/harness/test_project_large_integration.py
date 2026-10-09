@@ -6,6 +6,7 @@ import json
 import subprocess
 import sys
 import zipfile
+from collections.abc import Mapping
 from dataclasses import replace
 from io import BytesIO
 from pathlib import Path
@@ -20,6 +21,20 @@ from agent_hub.harness import project_scale as scale
 from agent_hub.harness import project_scale_runner as runner
 from agent_hub.harness import project_validation_result as protocol
 from agent_hub.harness import project_validation_sandbox as sandbox
+
+
+@pytest.fixture
+def healthy_generated_test_proof(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Isolate four business-gate units; this is not real test-execution credit."""
+    def healthy(
+        root: Path, *, timeout_seconds: float, absolute_deadline: float,
+        config: Mapping[str, str],
+    ) -> tuple[str, ...]:
+        assert root.is_dir()
+        assert timeout_seconds > 0
+        return ()
+
+    monkeypatch.setattr(runner, "verify_project_test_execution", healthy)
 
 
 def synthetic_result(status: str = "passed") -> dict[str, Any]:
@@ -155,6 +170,7 @@ def test_large_gate_requires_bound_current_profile_and_identity() -> None:
     assert runner._bind_scale_validation(synthetic_result(), "small:direct", "run", manifest) is None
 
 
+@pytest.mark.usefixtures("healthy_generated_test_proof")
 @pytest.mark.parametrize("business_failure", [False, True])
 def test_large_module_check_keeps_npm_start_business_mandatory(
     monkeypatch: pytest.MonkeyPatch, business_failure: bool,
@@ -182,6 +198,7 @@ def test_large_module_check_keeps_npm_start_business_mandatory(
     assert checked.scale_validation == (None if business_failure else synthetic_result())
 
 
+@pytest.mark.usefixtures("healthy_generated_test_proof")
 @pytest.mark.parametrize("exhausted", [False, True])
 def test_large_modules_and_business_share_remaining_absolute_deadline(
     monkeypatch: pytest.MonkeyPatch, exhausted: bool,
@@ -213,6 +230,7 @@ def test_large_modules_and_business_share_remaining_absolute_deadline(
         assert checked.scale_validation is None
 
 
+@pytest.mark.usefixtures("healthy_generated_test_proof")
 @pytest.mark.parametrize("tier", ["small", "medium"])
 def test_small_medium_business_does_not_require_module_evidence(
     monkeypatch: pytest.MonkeyPatch, tier: str,
@@ -231,6 +249,7 @@ def test_small_medium_business_does_not_require_module_evidence(
     forbidden.assert_not_called()
 
 
+@pytest.mark.usefixtures("healthy_generated_test_proof")
 @pytest.mark.parametrize("status", ["failed", "unknown", "malformed", "wrong_profile"])
 def test_large_incomplete_module_check_blocks_credit_and_only_defects_are_repairable(
     monkeypatch: pytest.MonkeyPatch, status: str,

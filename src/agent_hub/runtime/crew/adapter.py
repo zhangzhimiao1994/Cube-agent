@@ -114,6 +114,12 @@ from agent_hub.runtime.self_repair_context import (
     self_repair_context_text,
     self_repair_recovery_plan_payload,
 )
+from agent_hub.runtime.token_budget import (
+    TokenBudgetSource,
+    current_token_budget,
+    rebind_token_budget,
+    token_budget_scope,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -267,7 +273,7 @@ def _crew_content_limits(
         "large": (3, 2),
         "ultra": (2, 1),
     }.get(scale if type(scale) is str else "small", (1, 1))
-    token_derived_prompt = max(_MAX_PROMPT_BYTES, context.token_budget * 8)
+    token_derived_prompt = max(_MAX_PROMPT_BYTES, current_token_budget(context) * 8)
     context_window_tokens = (
         deployment_context_window_tokens
         if type(deployment_context_window_tokens) is int
@@ -361,7 +367,7 @@ def _model_output_byte_budget(max_output_tokens: int) -> int:
 
 
 def _tool_round_budget(context: TaskContext, step: DispatchStep) -> _ToolRoundBudget:
-    available_tokens = min(context.token_budget, step.token_budget)
+    available_tokens = min(current_token_budget(context), step.token_budget)
     available_seconds = min(context.timeout_seconds, step.timeout_seconds)
     token_limit = max(
         _MAX_TOOL_ROUNDS,
@@ -3570,7 +3576,9 @@ class CrewDispatchRuntime:
         return _default_crewai_storage_dir()
 
     def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
+        source_context = context
         context = self._strict_context(context)
+        token_budget = TokenBudgetSource.from_context(source_context, validated=context)
         if context.mode is not self.mode:
             raise RuntimeExecutionError("runtime mode mismatch")
         routed_scale = context.routing_decision.get(
@@ -3587,17 +3595,20 @@ class CrewDispatchRuntime:
         token = _RunToken(self._generation)
         self._current_token = token
         state = _RunState(token=token)
-        generator = self._run(context, state)
+        generator = self._run(context, state, token_budget)
         stream = CrewRunStream(self, generator, state)
         self._active_stream = stream
         self._active_done = asyncio.Event()
         self._last_checkpoint = None
         return stream
 
-    async def _run(self, context: TaskContext, state: _RunState) -> AsyncIterator[RunEvent]:
+    async def _run(
+        self, context: TaskContext, state: _RunState, token_budget: TokenBudgetSource,
+    ) -> AsyncIterator[RunEvent]:
         queue: asyncio.Queue[RunEvent] = asyncio.Queue(maxsize=512)
         terminal_future: asyncio.Future[_Terminal] = asyncio.get_running_loop().create_future()
-        coordinator = asyncio.create_task(self._coordinate(context, queue, terminal_future, state))
+        with token_budget_scope(context, token_budget):
+            coordinator = asyncio.create_task(self._coordinate(context, queue, terminal_future, state))
         self._active_task = coordinator
         try:
             while True:
@@ -3727,7 +3738,7 @@ class CrewDispatchRuntime:
                 type(persisted_plan_budget) is int
                 and persisted_plan_budget == plan.total_token_budget
             )
-            if context.token_budget < plan.total_token_budget and not adaptive_plan_envelope:
+            if current_token_budget(context) < plan.total_token_budget and not adaptive_plan_envelope:
                 _fail("task token budget is below the dispatch plan budget")
             if restored is not None:
                 self._validate_checkpoint(restored, context, plan)
@@ -3788,9 +3799,11 @@ class CrewDispatchRuntime:
                 ) = await self._hydrate_checkpoint(restored, context, plan, state)
                 artifact_registry.update(restored_artifacts)
                 input_refs = cast(tuple[Mapping[str, str], ...], restored.state["input_refs"])
-                context = self._strict_context(context.model_copy(update={
+                hydrated_context = self._strict_context(context.model_copy(update={
                     "artifacts": tuple(restored_artifacts[reference["id"]] for reference in input_refs),
                 }))
+                rebind_token_budget(context, hydrated_context)
+                context = hydrated_context
                 input_snapshot_ready = True
                 restored_repair_contract_ids = restored.state.get("repair_reopened_contract_ids")
                 if isinstance(restored_repair_contract_ids, tuple) and all(
@@ -4045,7 +4058,7 @@ class CrewDispatchRuntime:
                     elif terminal_phase is None and response_usage is None:
                         terminal_phase = "unaccounted"
                     elif terminal_phase is None and (
-                        new_tokens > min(context.token_budget, plan.total_token_budget)
+                        new_tokens > min(current_token_budget(context), plan.total_token_budget)
                         or new_cost > plan.total_cost_usd
                         or new_step_tokens > steps[step_id].token_budget
                         or new_step_cost > steps[step_id].cost_budget_usd
@@ -5208,7 +5221,7 @@ class CrewDispatchRuntime:
     ) -> tuple[ModelMessage, ...]:
         active_limits = limits or _crew_content_limits(
             context,
-            max_output_tokens=min(context.token_budget, 8_192),
+            max_output_tokens=min(current_token_budget(context), 8_192),
             source_count=max(1, len(context.artifacts)),
         )
         messages = cls._normalize_crewai_messages(
@@ -5296,6 +5309,8 @@ class CrewDispatchRuntime:
     ) -> GatewayCompletion:
         instructions = context.instruction_context
         if instructions is None or not instructions.render():
+            if current_token_budget(context) <= 0:
+                _fail("dispatch budget exhausted")
             return await self._gateway.complete_with_context(request)
         if not self._accepts_artifact_writes(run_state):
             raise asyncio.CancelledError
@@ -5314,6 +5329,8 @@ class CrewDispatchRuntime:
             # Cancellation may close the run after task creation but before its first turn.
             if not self._is_current_run(run_state) or not self._accepts_artifact_writes(run_state):
                 raise asyncio.CancelledError
+            if current_token_budget(context) <= 0:
+                _fail("dispatch budget exhausted")
             submitted = True
             ready.set()
             try:
@@ -5542,6 +5559,8 @@ class CrewDispatchRuntime:
             elif existing["status"] != "prepared":
                 _fail("model ledger state is invalid")
         if rejected is None:
+            if current_token_budget(context) <= 0:
+                _fail("dispatch budget exhausted")
             prepared: Mapping[str, JsonValue] = existing or {
                 "status": "prepared", "step_id": step.id, "attempt": attempt,
                 "purpose": purpose, "actor": actor, "call_index": index,
@@ -5749,7 +5768,7 @@ class CrewDispatchRuntime:
         if usage is None or usage.terminal_phase is not None:
             _fail("structured correction accounting unavailable")
         remaining_tokens = min(
-            context.token_budget - usage.tokens,
+            current_token_budget(context) - usage.tokens,
             self._plan.total_token_budget - usage.tokens,
             step.token_budget - usage.step_tokens.get(step.id, 0),
         )
@@ -8518,7 +8537,7 @@ class CrewDispatchRuntime:
             and all(dependency in completed_set for dependency in step.depends_on)
         )
         budget_exceeded = (
-            usage["tokens"] > min(context.token_budget, plan.total_token_budget)
+            usage["tokens"] > min(current_token_budget(context), plan.total_token_budget)
             or checkpoint_cost > plan.total_cost_usd
             or any(
                 parsed_step_tokens.get(step_id, 0) > step.token_budget

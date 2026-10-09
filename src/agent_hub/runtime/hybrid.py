@@ -41,9 +41,15 @@ from agent_hub.runtime.generated_file_recovery import (
 )
 from agent_hub.runtime.model_scope import validate_model_scope_artifact, validate_model_scope_parts
 from agent_hub.runtime.streams import closing_runtime_events
+from agent_hub.runtime.token_budget import (
+    TokenBudgetExhausted,
+    TokenBudgetSource,
+    token_budget_events,
+)
 
 _RUNTIME_TYPE = "hybrid"
-_RUNTIME_VERSION = "2"
+_RUNTIME_VERSION = "3"
+_PREVIOUS_RUNTIME_VERSION = "2"
 _LEGACY_RUNTIME_VERSION = "1"
 _MAX_HANDOFF_ARTIFACTS = 64
 _MAX_HANDOFF_ANCHORS = 8
@@ -104,6 +110,7 @@ class _ModelScopeBoundary:
 class _StageBudget:
     token_limit: int
     timeout_limit: float
+    token_source: TokenBudgetSource | None = None
     checkpoint_tokens: int = 0
     checkpoint_token_baseline: int = 0
     artifact_tokens: int = 0
@@ -164,7 +171,9 @@ class HybridRuntime:
         sequence = 1
         artifacts = list(context.artifacts)
         known = {artifact.id for artifact in artifacts}
-        remaining_tokens = context.token_budget
+        token_source = TokenBudgetSource.from_context(context)
+        remaining_tokens = token_source.limit
+        spent_tokens = 0
         remaining_timeout_seconds = context.timeout_seconds
         deadline: float | None = None
         adaptive_deadline: AdaptiveDeadline | None = None
@@ -218,10 +227,37 @@ class HybridRuntime:
                 if type(restored_progress_fingerprint) is str:
                     last_child_progress_fingerprint = restored_progress_fingerprint
                 restored_child_checkpoint = _child_checkpoint_from_state(restored)
+                if restored.runtime_version == _RUNTIME_VERSION:
+                    restored_grant = cast(int, restored.state["token_budget_grant"])
+                    spent_tokens = cast(int, restored.state["token_budget_spent"])
+                elif (
+                    next_stage == 0 and type(restored_tokens) is int
+                    and restored_child_checkpoint is not None
+                    and isinstance(restored_child_checkpoint.state.get("usage"), Mapping)
+                    and any(
+                        type(value) is int and 0 <= value <= 10_000_000
+                        for key, value in cast(
+                            Mapping[str, object], restored_child_checkpoint.state["usage"],
+                        ).items() if key in {"tokens", "total_tokens"}
+                    )
+                ):
+                    spent_tokens = _reported_tokens(restored_child_checkpoint.state)
+                    restored_grant = restored_tokens + spent_tokens
+                    if restored_grant > 10_000_000:
+                        raise RuntimeExecutionError("runtime checkpoint is incompatible")
+                else:
+                    raise RuntimeExecutionError("runtime checkpoint token history is unavailable")
+                # A larger resume context is not a new grant. Preserve historical
+                # consumption, while subsequent live source changes still propagate.
+                token_source = token_source.remaining(
+                    spent=max(0, token_source.limit - restored_grant),
+                )
             elif context.checkpoint is not None:
                 raise RuntimeExecutionError("runtime checkpoint was not restored")
             else:
                 next_stage = 0
+
+            remaining_tokens = max(0, token_source.limit - spent_tokens)
 
             for artifact in artifacts:
                 await self._repository.put(context.tenant_id, context.run_id, artifact)
@@ -249,6 +285,7 @@ class HybridRuntime:
                     restored_child_checkpoint if stage_index == next_stage else None
                 )
                 stage_timeout = deadline - monotonic()
+                remaining_tokens = max(0, token_source.limit - spent_tokens)
                 if remaining_tokens < 1:
                     raise RuntimeExecutionError("hybrid token budget exhausted")
                 if stage_timeout <= 0:
@@ -278,6 +315,10 @@ class HybridRuntime:
                         else set()
                     ),
                 )
+                stage_budget.token_source = token_source.remaining(
+                    spent=spent_tokens,
+                    checkpoint_baseline=stage_budget.checkpoint_token_baseline,
+                )
                 child_events = (
                     self._run_discussion(
                         context,
@@ -304,6 +345,8 @@ class HybridRuntime:
                 )
                 async with closing_runtime_events(child_events) as events:
                     async for event in events:
+                        remaining_tokens = max(0, token_source.limit - spent_tokens)
+                        stage_budget.token_limit = remaining_tokens
                         sequence = event.sequence + 1
                         if event.kind is EventKind.CHECKPOINT_SAVED:
                             if event.checkpoint is None:
@@ -343,6 +386,8 @@ class HybridRuntime:
                                 remaining_tokens=(
                                     remaining_tokens - stage_budget.consumed_tokens
                                 ),
+                                token_budget_grant=token_source.limit,
+                                token_budget_spent=spent_tokens + stage_budget.consumed_tokens,
                                 remaining_timeout_seconds=max(0.0, deadline - monotonic()),
                                 remaining_absolute_timeout_seconds=(
                                     adaptive_deadline.absolute_remaining(now=monotonic())
@@ -365,9 +410,11 @@ class HybridRuntime:
                             artifacts.append(event.artifact)
                             known.add(event.artifact.id)
                         yield event
+                remaining_tokens = max(0, token_source.limit - spent_tokens)
                 if stage_budget.consumed_tokens > remaining_tokens:
                     raise RuntimeExecutionError("hybrid child exceeded token budget")
-                remaining_tokens -= stage_budget.consumed_tokens
+                spent_tokens += stage_budget.consumed_tokens
+                remaining_tokens = max(0, token_source.limit - spent_tokens)
                 timeout_progress_units += 1
                 adaptive_deadline.observe(
                     progress_units=timeout_progress_units,
@@ -383,6 +430,8 @@ class HybridRuntime:
                     terminal=False,
                     reason=None,
                     remaining_tokens=remaining_tokens,
+                    token_budget_grant=token_source.limit,
+                    token_budget_spent=spent_tokens,
                     remaining_timeout_seconds=remaining_timeout_seconds,
                     remaining_absolute_timeout_seconds=(
                         adaptive_deadline.absolute_remaining(now=monotonic())
@@ -407,6 +456,8 @@ class HybridRuntime:
                 terminal=True,
                 reason="explicit_completion",
                 remaining_tokens=remaining_tokens,
+                token_budget_grant=token_source.limit,
+                token_budget_spent=spent_tokens,
                 remaining_timeout_seconds=max(0.0, deadline - monotonic()),
                 remaining_absolute_timeout_seconds=(
                     adaptive_deadline.absolute_remaining(now=monotonic())
@@ -451,6 +502,8 @@ class HybridRuntime:
                     terminal=True,
                     reason=partial_reason,
                     remaining_tokens=remaining_tokens,
+                    token_budget_grant=token_source.limit,
+                    token_budget_spent=spent_tokens,
                     remaining_timeout_seconds=(
                         max(0.0, deadline - monotonic())
                         if deadline is not None
@@ -595,7 +648,14 @@ class HybridRuntime:
         try:
             if checkpoint is not None:
                 await child.restore_checkpoint(checkpoint)
-            async with closing_runtime_events(child.run(child_context)) as events:
+            child_stream = (
+                token_budget_events(
+                    lambda: child.run(child_context), child_context, stage_budget.token_source,
+                )
+                if stage_budget.token_source is not None
+                else child.run(child_context)
+            )
+            async with closing_runtime_events(child_stream) as events:
                 async for item in events:
                     scope_artifact = _validate_child_model_scope_event(
                         item, parent.tenant_id, model_starts, scope_artifacts,
@@ -640,6 +700,8 @@ class HybridRuntime:
                             scope_artifact=scope_artifact,
                         )
                         sequence += 1
+        except TokenBudgetExhausted:
+            raise RuntimeExecutionError("hybrid token budget exhausted") from None
         except RuntimeExecutionError:
             raise
         except Exception as error:  # noqa: BLE001 - child runtime boundary is normalized.
@@ -661,6 +723,8 @@ class HybridRuntime:
         terminal: bool,
         reason: str | None,
         remaining_tokens: int,
+        token_budget_grant: int,
+        token_budget_spent: int,
         remaining_timeout_seconds: float,
         remaining_absolute_timeout_seconds: float,
         timeout_progress_units: int,
@@ -686,6 +750,8 @@ class HybridRuntime:
                 "terminal": terminal,
                 "reason": reason,
                 "remaining_token_budget": remaining_tokens,
+                "token_budget_grant": token_budget_grant,
+                "token_budget_spent": token_budget_spent,
                 "remaining_timeout_seconds": remaining_timeout_seconds,
                 "remaining_absolute_timeout_seconds": remaining_absolute_timeout_seconds,
                 "timeout_progress_units": timeout_progress_units,
@@ -702,7 +768,7 @@ class HybridRuntime:
         if (
             checkpoint.runtime_type != _RUNTIME_TYPE
             or checkpoint.runtime_version
-            not in {_LEGACY_RUNTIME_VERSION, _RUNTIME_VERSION}
+            not in {_LEGACY_RUNTIME_VERSION, _PREVIOUS_RUNTIME_VERSION, _RUNTIME_VERSION}
             or checkpoint.mode is not self.mode
             or checkpoint.run_id != context.run_id
             or checkpoint.tenant_id != context.tenant_id
@@ -727,6 +793,7 @@ class HybridRuntime:
             "last_child_progress_fingerprint",
         }
         child_state = {"child_checkpoint"}
+        token_history_state = {"token_budget_grant", "token_budget_spent"}
         has_budget_state = budget_state.issubset(state)
         allowed_state = (
             {frozenset(required_state), frozenset(required_state | budget_state)}
@@ -741,6 +808,19 @@ class HybridRuntime:
                 )
             }
         )
+        if checkpoint.runtime_version == _RUNTIME_VERSION:
+            allowed_state = {
+                frozenset(required_state | budget_state | child_state
+                          | adaptive_budget_state | token_history_state),
+            }
+            grant = state.get("token_budget_grant")
+            spent = state.get("token_budget_spent")
+            if (
+                type(grant) is not int or not 0 <= grant <= 10_000_000
+                or type(spent) is not int or not 0 <= spent <= 10_000_000
+                or state.get("remaining_token_budget") != max(0, grant - spent)
+            ):
+                raise RuntimeExecutionError("runtime checkpoint is incompatible")
         if (
             frozenset(state) not in allowed_state
             or not isinstance(registry, Mapping)
@@ -761,7 +841,7 @@ class HybridRuntime:
                     or not math.isfinite(float(state["remaining_timeout_seconds"]))
                     or not 0.0 <= float(state["remaining_timeout_seconds"]) <= 3600.0
                     or (
-                        checkpoint.runtime_version == _RUNTIME_VERSION
+                        checkpoint.runtime_version != _LEGACY_RUNTIME_VERSION
                         and adaptive_budget_state.issubset(state)
                         and (
                             isinstance(
@@ -804,7 +884,7 @@ class HybridRuntime:
         child_checkpoint = _child_checkpoint_from_state(checkpoint)
         next_stage = cast(int, state["next_stage"])
         if child_checkpoint is not None and (
-            checkpoint.runtime_version != _RUNTIME_VERSION
+            checkpoint.runtime_version == _LEGACY_RUNTIME_VERSION
             or state["terminal"] is True
             or next_stage >= len(self._stages())
             or child_checkpoint.run_id != context.run_id
@@ -847,7 +927,7 @@ class HybridRuntime:
         if (
             validated.runtime_type != _RUNTIME_TYPE
             or validated.runtime_version
-            not in {_LEGACY_RUNTIME_VERSION, _RUNTIME_VERSION}
+            not in {_LEGACY_RUNTIME_VERSION, _PREVIOUS_RUNTIME_VERSION, _RUNTIME_VERSION}
             or validated.mode is not self.mode
         ):
             raise RuntimeExecutionError("runtime checkpoint is incompatible")

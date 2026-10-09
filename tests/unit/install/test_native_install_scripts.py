@@ -791,7 +791,7 @@ def test_native_installer_deploys_release_before_starting_services() -> None:
     assert "uv sync --frozen --no-dev" in script
 
     deploy = script.index("deploy_native_release")
-    start = script.index("systemctl enable --now agent-hub.target")
+    start = script.index("systemctl enable agent-hub.target")
     assert deploy < start
 
 
@@ -854,13 +854,13 @@ def test_skill_broker_can_prepare_probes_in_service_owned_runtime_without_broad_
 def test_native_upgrade_restarts_every_release_bound_process_after_switch() -> None:
     installer = read("scripts/lib/install_native.sh")
     switch = installer.index('ln -sfn "$release" "$INSTALL_ROOT/current"')
-    broker_stop = installer.index("systemctl stop agent-hub-skill-broker.service")
+    broker_restart = installer.index("systemctl restart agent-hub-skill-broker.service")
     litellm_restart = installer.index("systemctl restart agent-hub-litellm.service")
     api_restart = installer.index("systemctl restart agent-hub-api.service")
     worker_restart = installer.index("systemctl restart agent-hub-worker.service")
     readiness = installer.index("require_native_readiness", worker_restart)
 
-    assert switch < broker_stop < litellm_restart < api_restart < worker_restart < readiness
+    assert switch < broker_restart < litellm_restart < worker_restart < api_restart < readiness
 
 
 def test_native_install_keeps_root_broker_runtime_unwritable_by_service_user() -> None:
@@ -987,7 +987,7 @@ def test_native_installer_creates_runtime_dirs_and_migrates_before_services() ->
     tmpfiles = script.index("systemd-tmpfiles --create")
     database = script.index("configure_native_database")
     migrations = script.index("alembic upgrade head")
-    start = script.index("systemctl enable --now agent-hub.target")
+    start = script.index("systemctl enable agent-hub.target")
 
     assert tmpfiles < start
     assert database < migrations
@@ -1005,7 +1005,7 @@ def test_native_installer_fails_fast_when_core_services_do_not_become_active() -
     assert "require_native_service_active agent-hub-api.service" in script
     assert "require_native_service_active agent-hub-worker.service" in script
     assert "require_native_service_active agent-hub-litellm.service" in script
-    start = script.index("systemctl enable --now agent-hub.target")
+    start = script.index("systemctl enable agent-hub.target")
     litellm_check = script.index("require_native_service_active agent-hub-litellm.service")
     mark = script.index('mark_stage "native-up"')
     assert start < litellm_check < mark
@@ -1018,7 +1018,7 @@ def test_native_installer_waits_for_readiness_before_marking_native_up() -> None
     assert "AGENT_HUB_NATIVE_READY_TIMEOUT_SECONDS" in script
     assert "http://127.0.0.1:${AGENT_HUB_API_PORT:-8000}/health/ready" in script
     assert "native readiness did not reach 200" in script
-    start = script.index("systemctl enable --now agent-hub.target")
+    start = script.index("systemctl enable agent-hub.target")
     readiness = script.index("require_native_readiness", start)
     mark = script.index('mark_stage "native-up"')
     assert start < readiness < mark

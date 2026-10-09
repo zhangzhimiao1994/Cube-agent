@@ -77,6 +77,20 @@ def trusted_python_fixture_commands(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(project_scale_runner_module, "generated_command", fixture_command)
 
 
+@pytest.fixture
+def healthy_generated_test_execution(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Isolate eight load/business units; this prerequisite is not real execution credit."""
+    def healthy(
+        root: Path, *, timeout_seconds: float, absolute_deadline: float,
+        config: Mapping[str, str],
+    ) -> tuple[str, ...]:
+        assert root.is_dir()
+        assert timeout_seconds > 0
+        return ()
+
+    monkeypatch.setattr(project_scale_runner_module, "verify_project_test_execution", healthy)
+
+
 def test_default_generated_project_install_disables_dependency_lifecycle_scripts() -> None:
     assert project_scale_runner_module._DEFAULT_GENERATED_PROJECT_COMMANDS[0] == (
         "npm",
@@ -87,6 +101,7 @@ def test_default_generated_project_install_disables_dependency_lifecycle_scripts
     )
 
 
+@pytest.mark.usefixtures("healthy_generated_test_execution")
 def test_ultra_generated_bundle_requires_independent_load_check(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -134,6 +149,7 @@ def test_storage_gate_rejects_legacy_load_only_binding() -> None:
     ) is None
 
 
+@pytest.mark.usefixtures("healthy_generated_test_execution")
 def test_storage_freezes_before_legacy_business_probe_can_write(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -164,6 +180,7 @@ def test_storage_freezes_before_legacy_business_probe_can_write(
     assert calls == ["storage", "business"]
 
 
+@pytest.mark.usefixtures("healthy_generated_test_execution")
 def test_storage_unavailable_does_not_invoke_model_repair_or_bind_credit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -183,6 +200,7 @@ def test_storage_unavailable_does_not_invoke_model_repair_or_bind_credit(
     assert not project_scale_runner_module._generated_project_validation_is_repairable(checked)
 
 
+@pytest.mark.usefixtures("healthy_generated_test_execution")
 def test_ultra_generated_bundle_preserves_verified_load_result(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2566,6 +2584,7 @@ def test_non_preview_request_does_not_require_html_entrypoint() -> None:
 
 
 @pytest.mark.usefixtures("trusted_python_fixture_commands")
+@pytest.mark.usefixtures("healthy_generated_test_execution")
 def test_capability_build_success_cannot_replace_independent_requirements(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2585,6 +2604,7 @@ def test_capability_build_success_cannot_replace_independent_requirements(
 
 
 @pytest.mark.usefixtures("trusted_python_fixture_commands")
+@pytest.mark.usefixtures("healthy_generated_test_execution")
 def test_capability_medium_uses_independent_crm_requirements(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2605,6 +2625,7 @@ def test_capability_medium_uses_independent_crm_requirements(
 
 
 @pytest.mark.usefixtures("trusted_python_fixture_commands")
+@pytest.mark.usefixtures("healthy_generated_test_execution")
 def test_capability_large_uses_independent_order_requirements(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2632,6 +2653,7 @@ def test_capability_large_uses_independent_order_requirements(
 
 
 @pytest.mark.usefixtures("trusted_python_fixture_commands")
+@pytest.mark.usefixtures("healthy_generated_test_execution")
 def test_capability_ultra_uses_independent_portfolio_requirements(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

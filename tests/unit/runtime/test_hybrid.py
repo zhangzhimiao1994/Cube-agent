@@ -529,7 +529,7 @@ async def test_hybrid_wraps_and_resumes_child_checkpoint_with_remaining_budgets(
 
 
 @pytest.mark.asyncio
-async def test_hybrid_restores_legacy_v1_checkpoint_at_completed_stage() -> None:
+async def test_hybrid_unknown_legacy_token_history_fails_closed_at_completed_stage() -> None:
     run_id = uuid4()
     tenant_id = uuid4()
     dispatch = UnusedRuntime(TaskMode.DISPATCH, "completed legacy stage must not rerun")
@@ -579,9 +579,9 @@ async def test_hybrid_restores_legacy_v1_checkpoint_at_completed_stage() -> None
         )
     ]
 
-    assert discussion.contexts[0].token_budget == 70
-    assert discussion.contexts[0].timeout_seconds <= 45.0
-    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert discussion.contexts == []
+    assert synthesis.contexts == []
+    assert events[-1].kind is EventKind.RUNTIME_FAILED
 
 
 @pytest.mark.asyncio

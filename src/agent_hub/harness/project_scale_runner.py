@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import codecs
 import copy
 import hashlib
 import json
@@ -13,6 +14,7 @@ import sys
 import tempfile
 import time
 import zipfile
+import zlib
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from html.parser import HTMLParser
@@ -41,6 +43,7 @@ from agent_hub.harness.project_scale import (
     ProjectScaleRunPlan,
     build_project_scale_run_plan,
 )
+from agent_hub.harness.project_test_execution import verify_project_test_execution
 from agent_hub.harness.project_validation_result import (
     scale_validation_manifest_sha256,
     scale_validation_passed,
@@ -712,6 +715,9 @@ def execute_project_scale_plan(
     for index, run_request in enumerate(plan.requests):
         case_label = f"case {index + 1}/{plan.case_count} {run_request.case_id}"
         request_body = _scoped_execution_body(run_request.body, execution_id=execution_id)
+        request_body = _capability_test_execution_body(
+            request_body, case_id=run_request.case_id, benchmark_kind=plan.benchmark_kind,
+        )
         evidence = {
             "run_details": False,
             "run_events": False,
@@ -2530,6 +2536,12 @@ def _validate_generated_project_bundle(
                         passed=False,
                         reasons=("requirements: independent evaluator unavailable for this scale",),
                     )
+                test_failures = verify_project_test_execution(
+                    root, timeout_seconds=min(timeout_seconds, remaining_seconds),
+                    absolute_deadline=absolute_deadline, config=_generated_project_command_env(),
+                )
+                if test_failures:
+                    return _EvidenceCheck(passed=False, reasons=test_failures)
                 # Freeze the same built tree before a legacy business probe can
                 # leave working-directory state that would contaminate relocation.
                 profile = scale_validation_profile(scale)
@@ -3976,6 +3988,27 @@ def _idempotency_key(case_id: str, index: int, *, execution_id: str | None = Non
     if execution_id is not None:
         key = f"{key}-{_safe_idempotency_token(execution_id)}"
     return key[:90]
+
+
+def _capability_test_execution_body(
+    body: dict[str, object], *, case_id: str, benchmark_kind: str,
+) -> dict[str, object]:
+    if benchmark_kind != "capability" or case_id.split(":", 1)[0] not in {
+        "small", "medium", "large", "ultra",
+    }:
+        return body
+    message = _string_value(body.get("message"))
+    if message is None:
+        return body
+    return {
+        **body,
+        "message": message + "\nTest execution acceptance: use named node:test test bodies with "
+        "real assertions and package.json test script node --test (optionally compiled JS test "
+        "paths). Keep tests reproducible with the existing Node runtime and dependencies. "
+        "A no-op, module-load-only script, or an unsupported test runner receives no test "
+        "execution credit. Acceptance independently checks the structured test stream and a "
+        "failing registered test body in an isolated disposable copy.",
+    }
 
 
 def _scoped_execution_body(
@@ -5556,6 +5589,59 @@ def _workspace_bundle_has_project_quality(workspace_bundle: bytes | None) -> boo
     return not _workspace_bundle_project_quality_reasons(workspace_bundle)
 
 
+def _workspace_bundle_has_placeholder(
+    archive: zipfile.ZipFile, *, source_only: bool
+) -> bool:
+    infos = archive.infolist()
+    if len(infos) > _GENERATED_PROJECT_MAX_FILES:
+        raise RuntimeError("workspace bundle contains too many files")
+    declared_total = 0
+    for info in infos:
+        if info.is_dir():
+            continue
+        declared_total += info.file_size
+        if (
+            info.file_size > _GENERATED_PROJECT_MAX_FILE_BYTES
+            or declared_total > _GENERATED_PROJECT_MAX_TOTAL_BYTES
+        ):
+            raise RuntimeError("workspace bundle exceeds placeholder scan byte limits")
+
+    matched = False
+    actual_total = 0
+    overlap = max(map(len, _PLACEHOLDER_MARKERS)) - 1
+    for info in infos:
+        if info.is_dir():
+            continue
+        lowered = info.filename.lower()
+        selected = (
+            _is_project_source_file(lowered) or lowered in {"main.py", "index.html"}
+            if source_only else _is_text_candidate(info.filename)
+        )
+        decoder = codecs.getincrementaldecoder("utf-8")() if selected else None
+        tail = ""
+        file_bytes = 0
+        # Read every member through EOF for CRC and byte-limit checks, even after a match.
+        with archive.open(info) as source:
+            while chunk := source.read(65_536):
+                file_bytes += len(chunk)
+                actual_total += len(chunk)
+                if (
+                    file_bytes > _GENERATED_PROJECT_MAX_FILE_BYTES
+                    or actual_total > _GENERATED_PROJECT_MAX_TOTAL_BYTES
+                ):
+                    raise RuntimeError("workspace bundle exceeds placeholder scan byte limits")
+                if decoder is not None:
+                    window = tail + decoder.decode(chunk).lower()
+                    matched = matched or any(marker in window for marker in _PLACEHOLDER_MARKERS)
+                    tail = window[-overlap:]
+        if file_bytes != info.file_size:
+            raise RuntimeError("workspace bundle member is truncated")
+        if decoder is not None:
+            window = tail + decoder.decode(b"", final=True).lower()
+            matched = matched or any(marker in window for marker in _PLACEHOLDER_MARKERS)
+    return matched
+
+
 def _executed_capability_quality(
     workspace_bundle: bytes | None, validation: _EvidenceCheck
 ) -> _EvidenceCheck:
@@ -5574,11 +5660,11 @@ def _executed_capability_quality(
     if workspace_bundle is not None:
         try:
             with zipfile.ZipFile(BytesIO(workspace_bundle)) as archive:
-                source = _workspace_bundle_source_text(archive, archive.namelist()).lower()
-            if any(marker in source for marker in _PLACEHOLDER_MARKERS):
+                has_placeholder = _workspace_bundle_has_placeholder(archive, source_only=True)
+            if has_placeholder:
                 reasons.append("workspace_bundle: source contains placeholder or stub markers")
-        except (OSError, zipfile.BadZipFile):
-            pass  # The structural check above already reports invalid archives.
+        except (OSError, RuntimeError, EOFError, UnicodeError, zipfile.BadZipFile, zlib.error):
+            reasons.append("workspace_bundle: invalid or unreadable zip bundle")
     return _EvidenceCheck(passed=not reasons, reasons=tuple(reasons))
 
 
@@ -5591,11 +5677,11 @@ def _workspace_bundle_project_quality_reasons(workspace_bundle: bytes | None) ->
             lowered = tuple(name.lower() for name in names)
             if not lowered:
                 return ("workspace_bundle: empty project bundle",)
-            text = _workspace_bundle_text(archive, names)
+            has_placeholder = _workspace_bundle_has_placeholder(archive, source_only=False)
             verification_text = _workspace_bundle_verification_text(archive, names)
             test_text = _workspace_bundle_test_text(archive, names)
             source_text = _workspace_bundle_source_text(archive, names)
-    except (OSError, zipfile.BadZipFile):
+    except (OSError, RuntimeError, EOFError, UnicodeError, zipfile.BadZipFile, zlib.error):
         return ("workspace_bundle: invalid or unreadable zip bundle",)
 
     reasons: list[str] = []
@@ -5613,7 +5699,7 @@ def _workspace_bundle_project_quality_reasons(workspace_bundle: bytes | None) ->
         reasons.append("workspace_bundle: missing build/test execution evidence")
     if not _bundle_has_interaction_execution_evidence(verification_text):
         reasons.append("workspace_bundle: missing interaction execution evidence")
-    if any(marker in text.lower() for marker in _PLACEHOLDER_MARKERS):
+    if has_placeholder:
         reasons.append("workspace_bundle: contains placeholder or stub markers")
     return tuple(reasons)
 
