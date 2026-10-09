@@ -20,7 +20,7 @@ def checkpoint_waits_for_approval(
         checkpoint = RuntimeCheckpoint.from_payload(checkpoint.to_payload())
         if checkpoint.runtime_type == "hybrid":
             if (
-                checkpoint.runtime_version != "2"
+                checkpoint.runtime_version not in {"2", "3"}
                 or checkpoint.mode is not TaskMode.HYBRID
                 or checkpoint.state.get("terminal") is not False
                 or type(checkpoint.state.get("next_stage")) is not int

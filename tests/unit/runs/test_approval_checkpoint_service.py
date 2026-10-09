@@ -39,31 +39,32 @@ def crew_checkpoint(run_id: UUID, approval_id: str = APPROVAL_ID) -> RuntimeChec
     )
 
 
-def hybrid_checkpoint(child: RuntimeCheckpoint) -> RuntimeCheckpoint:
+def hybrid_checkpoint(child: RuntimeCheckpoint, *, version: str = "2") -> RuntimeCheckpoint:
     return RuntimeCheckpoint(
-        id=uuid4(), runtime_type="hybrid", runtime_version="2",
+        id=uuid4(), runtime_type="hybrid", runtime_version=version,
         run_id=child.run_id, tenant_id=child.tenant_id, mode=TaskMode.HYBRID,
         state={"terminal": False, "next_stage": 0,
                "child_checkpoint": cast(JsonValue, child.to_payload())},
     )
 
 
-@pytest.mark.parametrize("hybrid", [False, True])
-def test_matching_waiting_receipt(hybrid: bool) -> None:
+@pytest.mark.parametrize("version", [None, "2", "3"])
+def test_matching_waiting_receipt(version: str | None) -> None:
     checkpoint = crew_checkpoint(uuid4())
-    if hybrid:
-        checkpoint = hybrid_checkpoint(checkpoint)
+    if version is not None:
+        checkpoint = hybrid_checkpoint(checkpoint, version=version)
     assert checkpoint_waits_for_approval(checkpoint, APPROVAL_ID)
     assert not checkpoint_waits_for_approval(checkpoint, "approval-stale")
 
 
+@pytest.mark.parametrize("version", ["2", "3"])
 @pytest.mark.parametrize("mutation", [
     "run", "tenant", "child_hash", "missing_child_hash", "outer_hash", "runtime",
     "child_runtime", "recursive_hybrid", "child_mode", "outer_mode", "terminal",
     "stage", "version", "prepared", "nested_tools",
 ])
-def test_hybrid_receipt_rejects_unrelated_or_invalid_state(mutation: str) -> None:
-    payload = hybrid_checkpoint(crew_checkpoint(uuid4())).to_payload()
+def test_hybrid_receipt_rejects_unrelated_or_invalid_state(mutation: str, version: str) -> None:
+    payload = hybrid_checkpoint(crew_checkpoint(uuid4()), version=version).to_payload()
     state = cast(dict[str, Any], payload["state"])
     child = state["child_checkpoint"]
     if mutation in {"run", "tenant"}:
@@ -73,7 +74,7 @@ def test_hybrid_receipt_rejects_unrelated_or_invalid_state(mutation: str) -> Non
     elif mutation == "missing_child_hash":
         child.pop("state_sha256")
     elif mutation == "outer_hash":
-        checkpoint = hybrid_checkpoint(crew_checkpoint(uuid4()))
+        checkpoint = hybrid_checkpoint(crew_checkpoint(uuid4()), version=version)
         checkpoint = checkpoint.model_copy(update={"state_sha256": "0" * 64})
         assert not checkpoint_waits_for_approval(checkpoint, APPROVAL_ID)
         return
@@ -103,6 +104,12 @@ def test_hybrid_receipt_rejects_unrelated_or_invalid_state(mutation: str) -> Non
         state["child_checkpoint"] = RuntimeCheckpoint.from_payload(child).to_payload()
     payload["state_sha256"] = ""
     checkpoint = RuntimeCheckpoint.from_payload(payload)
+    assert not checkpoint_waits_for_approval(checkpoint, APPROVAL_ID)
+
+
+@pytest.mark.parametrize("version", ["1", "4", "99"])
+def test_hybrid_receipt_rejects_unknown_outer_version(version: str) -> None:
+    checkpoint = hybrid_checkpoint(crew_checkpoint(uuid4()), version=version)
     assert not checkpoint_waits_for_approval(checkpoint, APPROVAL_ID)
 
 
