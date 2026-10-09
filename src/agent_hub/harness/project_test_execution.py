@@ -115,6 +115,8 @@ def _node_command(root: Path) -> tuple[str, ...]:
     script = scripts.get("test") if isinstance(scripts, dict) else None
     if not isinstance(script, str):
         raise _ProofFailure(_Reason.UNSUPPORTED)
+    # Build already ran in outer validation; only replay tests in the disposable copy.
+    script = script.removeprefix("npm run build && ")
     command = shlex.split(script)
     if command[:2] != ["node", "--test"]:
         raise _ProofFailure(_Reason.UNSUPPORTED)

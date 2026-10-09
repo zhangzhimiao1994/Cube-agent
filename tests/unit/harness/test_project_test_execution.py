@@ -152,6 +152,44 @@ def _verify(root: Path, *, timeout: float = 10) -> tuple[str, ...]:
     )
 
 
+@pytest.mark.parametrize("tail", ("", " test/main.test.cjs", " test/*.test.cjs"))
+def test_fixed_build_prefix_returns_only_existing_node_test_argv(tmp_path: Path, tail: str) -> None:
+    root = _project(tmp_path, script="npm run build && node --test" + tail)
+    expected = ("node", "--test", "test/main.test.cjs") if tail else ("node", "--test")
+    assert proof._node_command(root) == expected
+
+
+@pytest.mark.parametrize("script", (
+    "npm run other && node --test test/main.test.cjs",
+    "npm run build --if-present && node --test test/main.test.cjs",
+    "npm run build; node --test test/main.test.cjs",
+    "npm run build || node --test test/main.test.cjs",
+    "npm run build & node --test test/main.test.cjs",
+    "npm run build&&node --test test/main.test.cjs",
+    '"npm" run build && node --test test/main.test.cjs',
+    'npm run build "&&" node --test test/main.test.cjs',
+    "env OWN=1 npm run build && node --test test/main.test.cjs",
+    "npm run build && npm run build && node --test test/main.test.cjs",
+    "npm run build && npm test",
+    "npm run build && vitest run",
+    "npm run build && node --test test/main.test.cjs && echo passed",
+    "npm run build && node --test test/main.test.cjs; echo passed",
+    "npm run build && node --test test/main.test.cjs || echo passed",
+    "npm run build && node --test test/main.test.cjs | cat",
+    "npm run build && node --test test/main.test.cjs > report.json",
+    "npm run build && node --test --test-reporter=spec test/main.test.cjs",
+    "npm run build && node --test test",
+    "npm run build && node --test ../outside.test.cjs",
+    "npm run build && node --test missing/*.test.cjs",
+))
+def test_fixed_build_prefix_does_not_expand_shell_runner_flag_or_path_policy(
+    tmp_path: Path, script: str,
+) -> None:
+    with pytest.raises(proof._ProofFailure) as failure:
+        proof._node_command(_project(tmp_path, script=script))
+    assert failure.value.reason is proof._Reason.UNSUPPORTED
+
+
 def test_trusted_reporter_emits_one_structured_report(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
@@ -166,6 +204,8 @@ def test_trusted_reporter_emits_one_structured_report(
 
 @pytest.mark.parametrize("script", (
     "node --test", "node --test test/main.test.cjs", "node --test test/*.test.cjs",
+    "npm run build && node --test", "npm run build && node --test test/main.test.cjs",
+    "npm run build && node --test test/*.test.cjs",
 ))
 def test_actual_named_body_and_failing_canary_use_existing_dependencies_only_in_clone(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, script: str
