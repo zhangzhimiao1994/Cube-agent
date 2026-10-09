@@ -289,9 +289,12 @@ def build_real_user_scale_plan(
     workspace_session_id: str,
     route_intent: str,
     logical_model: str | None = None,
+    defer_preview: bool = False,
 ) -> ProjectScaleRunPlan:
     """Build one natural AUTO scale case or one explicit mode capability case."""
 
+    if type(defer_preview) is not bool:
+        raise TypeError("defer_preview must be a boolean")
     profile = _model_profile(logical_model)
     if route_intent not in _ROUTE_INTENTS:
         raise ValueError(f"unknown real-user route intent: {route_intent}")
@@ -313,7 +316,7 @@ def build_real_user_scale_plan(
             "project_label": project_label,
             "conversation_id": conversation_id,
             "workspace_session_id": workspace_session_id,
-            "message": f"{body['message']}{_WEBSITE_DELIVERABLE_REQUIREMENT}",
+            "message": body["message"] if defer_preview else f"{body['message']}{_WEBSITE_DELIVERABLE_REQUIREMENT}",
         }
     )
     if profile is not None:
@@ -1791,6 +1794,7 @@ def run_real_user_four_scale_acceptance(
                 workspace_session_id=workspace_session_id,
                 route_intent=route_intent,
                 logical_model=logical_model,
+                defer_preview=defer_preview,
             )
             effective_wait = _effective_execute_wait_seconds(
                 plan,

@@ -2794,6 +2794,53 @@ def test_real_user_timeout_fidelity_default_wait_survives_absent_operator(
     assert all("runtime_timeout_seconds" not in body for body in delegate.run_bodies.values())
 
 
+@pytest.mark.parametrize("defer_preview", [True, False, None], ids=["deferred", "full", "default-full"])
+def test_preview_contract_scopes_all_twenty_submitted_messages(
+    matrix_harness: tuple[Any, Any, list[Any], list[str]], defer_preview: bool | None,
+) -> None:
+    module, delegate, plans, _ = matrix_harness
+    options = {} if defer_preview is None else {"defer_preview": defer_preview}
+    payload = run_matrix(module, delegate, **options)
+    expected_cases = [(scale, "auto") for scale in ("small", "medium", "large", "ultra")] + [
+        (scale, mode) for scale in ("small", "medium", "large", "ultra")
+        for mode in ("direct", "dispatch", "hybrid", "multi_agent")
+    ]
+    assert len(plans) == len(delegate.submissions) == len(delegate.run_bodies) == 20
+    assert [plan.requests[0].case_id for plan in plans] == [f"{scale}:{mode}" for scale, mode in expected_cases]
+    expected_messages = []
+    for plan, (scale, mode) in zip(plans, expected_cases, strict=True):
+        base = module.build_project_scale_run_plan(
+            scales=(scale,), flows=("artifact_production" if mode == "auto" else mode,),
+            execute=True, benchmark_kind="capability",
+        )
+        expected = base.requests[0].body["message"]
+        if defer_preview is not True:
+            expected += module._WEBSITE_DELIVERABLE_REQUIREMENT
+        assert plan.requests[0].body["message"] == expected
+        expected_messages.append(expected)
+    assert sorted(body["message"] for body in delegate.run_bodies.values()) == sorted(expected_messages)
+    assert payload["acceptance_complete"] is False
+    if defer_preview is True:
+        assert payload["status"] == "pending_preview"
+        assert payload["core_acceptance_ok"] is False
+        assert all("web-previews" not in path for _, path in delegate.requests)
+    else:
+        assert payload["status"] == "pending_real_device"
+        assert payload["core_acceptance_ok"] is True
+        assert any("web-previews" in path for _, path in delegate.requests)
+
+
+@pytest.mark.parametrize("defer_preview", [None, 0, 1, "false", []])
+def test_scale_plan_rejects_non_boolean_defer_preview(defer_preview: Any) -> None:
+    module = load_script()
+    with pytest.raises(TypeError, match="^defer_preview must be a boolean$"):
+        module.build_real_user_scale_plan(
+            scale="small", project_id="project", project_label="project",
+            conversation_id="conversation", workspace_session_id="workspace", route_intent="auto",
+            defer_preview=defer_preview,
+        )
+
+
 def test_defer_preview_separates_twenty_deliveries_without_preview_requests(
     matrix_harness: tuple[Any, Any, list[Any], list[str]], monkeypatch: Any,
 ) -> None:
