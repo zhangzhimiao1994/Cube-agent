@@ -16,6 +16,7 @@ from openai import (
     AsyncStream,
 )
 
+from agent_hub.models.failure_receipt import _valid_usage
 from agent_hub.models.responses import (
     ResponsesContractError,
     parse_response,
@@ -29,6 +30,8 @@ from agent_hub.models.types import (
     ModelRequest,
     ModelResponse,
     RejectedOutputEvidence,
+    RejectedOutputReason,
+    RejectedUsageStatus,
     TokenUsage,
     ToolCall,
     ToolDefinition,
@@ -444,22 +447,67 @@ def _parse_response(
     deployment_id: str,
     sensitive_values: Sequence[str],
 ) -> ModelResponse:
-    choices = _attribute(response, "choices")
-    if not isinstance(choices, Sequence) or isinstance(choices, str | bytes) or not choices:
-        raise ModelResponseError(f"malformed model response for deployment {deployment_id!r}")
-    choice = choices[0]
-    message = _attribute(choice, "message")
-    if message is None:
-        raise ModelResponseError(f"malformed model response for deployment {deployment_id!r}")
-    content = _attribute(message, "content")
-    if content is not None and not isinstance(content, str):
-        raise ModelResponseError(f"malformed model response for deployment {deployment_id!r}")
-    return ModelResponse(
-        text=content,
-        tool_calls=_parse_tool_calls(_attribute(message, "tool_calls"), deployment_id),
-        usage=_parse_usage(_attribute(response, "usage"), deployment_id),
-        provider_metadata=_metadata(response, choice, sensitive_values),
-    )
+    # Accounting evidence is independent of whether any output can be accepted.
+    raw_usage = _attribute(response, "usage")
+    usage: TokenUsage | None = None
+    usage_status: RejectedUsageStatus = "missing" if raw_usage is None else "invalid"
+    try:
+        usage = _parse_usage(raw_usage, deployment_id)
+        if usage is not None:
+            if not _valid_usage(usage):
+                usage = None
+            else:
+                usage_status = "known"
+    except (ModelResponseError, ValueError, OverflowError):
+        pass
+
+    def rejected(
+        reason: RejectedOutputReason, *, choice: object = None, content: object = None,
+    ) -> ModelResponseError:
+        final_text: str | None = None
+        if (
+            type(content) is str
+            and _attribute(choice, "finish_reason") in ("stop", "tool_calls")
+            and not _contains_sensitive(content, sensitive_values)
+        ):
+            try:
+                if len(content.encode("utf-8")) <= 65_536:
+                    final_text = content
+            except UnicodeError:
+                pass
+        return ModelResponseError(
+            "model response rejected",
+            evidence=RejectedOutputEvidence(
+                final_text=final_text, usage=usage, usage_status=usage_status,
+                status="completed" if final_text is not None else "unknown", reason=reason,
+            ),
+        )
+
+    if usage_status == "invalid":
+        raise rejected("usage_invalid") from None
+    choice: object = None
+    content: object = None
+    reason: RejectedOutputReason = "invalid_output"
+    try:
+        choices = _attribute(response, "choices")
+        if not isinstance(choices, Sequence) or isinstance(choices, str | bytes) or not choices:
+            raise rejected(reason)
+        choice = choices[0]
+        message = _attribute(choice, "message")
+        if message is None:
+            raise rejected(reason)
+        content = _attribute(message, "content")
+        if content is not None and not isinstance(content, str):
+            raise rejected(reason)
+        reason = "invalid_tool"
+        tool_calls = _parse_tool_calls(_attribute(message, "tool_calls"), deployment_id)
+        reason = "invalid_output"
+        return ModelResponse(
+            text=content, tool_calls=tool_calls, usage=usage,
+            provider_metadata=_metadata(response, choice, sensitive_values),
+        )
+    except (ModelResponseError, TypeError, ValueError, RecursionError, OverflowError):
+        raise rejected(reason, choice=choice, content=content) from None
 
 
 def safe_model_client_error(

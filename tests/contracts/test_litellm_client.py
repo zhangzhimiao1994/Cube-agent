@@ -386,7 +386,12 @@ async def test_rejects_malformed_usage_with_safe_contract_error() -> None:
 
     create.assert_awaited_once()
     close.assert_awaited_once_with()
-    assert caught.value.status_code is None and caught.value.evidence is None
+    assert caught.value.status_code is None
+    evidence = caught.value.evidence
+    assert evidence is not None
+    assert evidence.usage is None and evidence.usage_status == "invalid"
+    assert evidence.reason == "usage_invalid"
+    assert evidence.final_text is None and not evidence.correction_eligible
     assert API_KEY not in repr(caught.value)
     assert PROMPT not in repr(caught.value)
 
@@ -1245,13 +1250,15 @@ def test_content_bearing_contract_reprs_are_safe() -> None:
 
 
 @pytest.mark.parametrize(
-    "response",
+    ("response", "expected_usage", "expected_usage_status"),
     [
-        sdk_response(choices=[]),
-        SimpleNamespace(choices=[SimpleNamespace(message=None)]),
+        (sdk_response(choices=[]), TokenUsage(2, 3, 5), "known"),
+        (SimpleNamespace(choices=[SimpleNamespace(message=None)]), None, "missing"),
     ],
 )
-async def test_rejects_empty_or_malformed_responses_safely(response: object) -> None:
+async def test_rejects_empty_or_malformed_responses_safely(
+    response: object, expected_usage: TokenUsage | None, expected_usage_status: str,
+) -> None:
     transport, _, create, close = mock_transport(result=response)
 
     with pytest.raises(ModelResponseError, match="^model response rejected$") as caught:
@@ -1259,8 +1266,13 @@ async def test_rejects_empty_or_malformed_responses_safely(response: object) -> 
 
     create.assert_awaited_once()
     close.assert_awaited_once_with()
-    assert caught.value.status_code is None and caught.value.evidence is None
-    rendered = repr(caught.value)
+    assert caught.value.status_code is None
+    evidence = caught.value.evidence
+    assert evidence is not None
+    assert evidence.usage == expected_usage and evidence.usage_status == expected_usage_status
+    assert evidence.reason == "invalid_output" and evidence.status == "unknown"
+    assert evidence.final_text is None and not evidence.correction_eligible
+    rendered = repr(caught.value) + repr(evidence)
     assert API_KEY not in rendered
     assert PROMPT not in rendered
 
@@ -1278,13 +1290,19 @@ async def test_rejects_malformed_or_nonobject_tool_arguments_without_leaking_the
 
     create.assert_awaited_once()
     close.assert_awaited_once_with()
-    assert caught.value.status_code is None and caught.value.evidence is None
+    assert caught.value.status_code is None
+    evidence = caught.value.evidence
+    assert evidence is not None
+    assert evidence.usage == TokenUsage(2, 3, 5) and evidence.usage_status == "known"
+    assert evidence.reason == "invalid_tool" and not evidence.correction_eligible
+    assert not hasattr(evidence, "tool_calls")
     rendered = "".join(
         traceback.format_exception(type(caught.value), caught.value, caught.value.__traceback__)
     )
     for sensitive in (bad_arguments, API_KEY, PROMPT, RAW_ERROR):
         assert sensitive not in rendered
         assert sensitive not in repr(caught.value)
+        assert sensitive not in repr(evidence)
     assert caught.value.__cause__ is None
     assert caught.value.__context__ is None
 
@@ -1302,7 +1320,12 @@ async def test_rejects_nonfinite_tool_argument_json_constants(constant: str) -> 
 
     create.assert_awaited_once()
     close.assert_awaited_once_with()
-    assert caught.value.status_code is None and caught.value.evidence is None
+    assert caught.value.status_code is None
+    evidence = caught.value.evidence
+    assert evidence is not None
+    assert evidence.usage == TokenUsage(2, 3, 5) and evidence.usage_status == "known"
+    assert evidence.reason == "invalid_tool" and not evidence.correction_eligible
+    assert not hasattr(evidence, "tool_calls")
     assert caught.value.__cause__ is None
     assert caught.value.__context__ is None
 
@@ -1388,7 +1411,12 @@ async def test_parse_error_close_failure_keeps_parse_error() -> None:
 
     create.assert_awaited_once()
     close.assert_awaited_once_with()
-    assert caught.value.status_code is None and caught.value.evidence is None
+    assert caught.value.status_code is None
+    evidence = caught.value.evidence
+    assert evidence is not None
+    assert evidence.usage == TokenUsage(2, 3, 5) and evidence.usage_status == "known"
+    assert evidence.reason == "invalid_output" and evidence.final_text is None
+    assert not evidence.correction_eligible
     assert caught.value.__context__ is None
     assert RAW_ERROR not in captured_traceback(caught.value)
     assert API_KEY not in captured_traceback(caught.value)

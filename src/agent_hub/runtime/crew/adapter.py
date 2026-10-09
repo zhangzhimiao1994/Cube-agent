@@ -2044,7 +2044,7 @@ def _project_scale_rejected_zip_completion(
     rejected: GatewayRejectedOutput,
 ) -> GatewayCompletion | None:
     evidence = rejected.evidence
-    if evidence is None:
+    if evidence is None or not evidence.correction_eligible:
         return None
     completion = GatewayCompletion(
         response=ModelResponse(text=evidence.final_text, usage=evidence.usage),
@@ -2077,6 +2077,7 @@ def _project_scale_rejected_structured_completion(
         not _is_real_project_scale_handoff(step.task)
         or request.response_schema is None
         or evidence is None
+        or not evidence.correction_eligible
         or not isinstance(evidence.final_text, str)
         or not evidence.final_text.strip()
     ):
@@ -2400,26 +2401,6 @@ def _checkpoint_can_skip_rejected_tool_placeholders(
         return False
     last_state, last_artifact = round_tools[len(round_tools) - 1]
     return last_state.get("status") == "rejected" and last_artifact is not None
-
-
-def _project_scale_empty_rejected_structured_completion(
-    step: DispatchStep,
-    request: ModelRequest,
-    rejected: GatewayRejectedOutput,
-) -> GatewayCompletion | None:
-    evidence = rejected.evidence
-    if evidence is None:
-        return None
-    if isinstance(evidence.final_text, str) and evidence.final_text.strip():
-        return None
-    reason = evidence.reason.strip() if isinstance(evidence.reason, str) else ""
-    if "empty" not in reason.casefold():
-        reason = "empty_response"
-    return _project_scale_gateway_failure_structured_completion(
-        step,
-        request,
-        f"model gateway failed: {reason}",
-    )
 
 
 def _final_synthesis_fallback_text(
@@ -5602,45 +5583,33 @@ class CrewDispatchRuntime:
                 if rejected is None:
                     self._valid_response(completion, max_output_bytes=output_limit)
             except GatewayRejectedOutput as error:
-                completion = (
-                    _project_scale_rejected_zip_completion(context, step, error)
-                    if purpose == "step"
-                    else None
-                )
-                if completion is None and purpose == "step":
-                    completion = _project_scale_rejected_structured_completion(
-                        step,
-                        request,
-                        error,
-                    )
-                if completion is None and purpose == "step":
-                    completion = _project_scale_empty_rejected_structured_completion(
-                        step,
-                        request,
-                        error,
-                    )
-                if (
-                    completion is None
-                    and purpose == "step"
-                    and _is_project_scale_tool_contract_step(step)
-                    and (
-                        error.evidence is None
-                        or not isinstance(error.evidence.final_text, str)
-                        or not error.evidence.final_text.strip()
-                    )
+                evidence = error.evidence
+                # Received receipts must reach accounting before any recovery.
+                if evidence is not None and (
+                    not evidence.correction_eligible
+                    or not evidence.final_text
+                    or not evidence.final_text.strip()
                 ):
-                    reason = "model gateway failed: model response text is empty"
-                    failed = dict(running)
-                    failed.update(status="failed", failure_reason=reason)
-                    await model_boundary(key, failed)
-                    _fail(reason)
-                if completion is None:
                     rejected = error
                 else:
-                    completion = _completion_with_estimated_usage(completion, request)
-                    rejected = self._reject_invalid_structured(request, completion)
-                    if rejected is None:
-                        self._valid_response(completion, max_output_bytes=output_limit)
+                    completion = (
+                        _project_scale_rejected_zip_completion(context, step, error)
+                        if purpose == "step"
+                        else None
+                    )
+                    if completion is None and purpose == "step":
+                        completion = _project_scale_rejected_structured_completion(
+                            step,
+                            request,
+                            error,
+                        )
+                    if completion is None:
+                        rejected = error
+                    else:
+                        completion = _completion_with_estimated_usage(completion, request)
+                        rejected = self._reject_invalid_structured(request, completion)
+                        if rejected is None:
+                            self._valid_response(completion, max_output_bytes=output_limit)
             except GatewayResponseCancelled as error:
                 receipt = error.receipt
                 cancelled_private = dict(self._rejected_private_payload(receipt, sources))

@@ -7038,7 +7038,7 @@ async def test_missing_usage_after_capacity_retry_project_zip_tool_call_is_estim
     assert events[-1].kind is EventKind.RUNTIME_COMPLETED
 
 
-async def test_project_scale_tool_contract_rejected_without_text_retries_instead_of_unaccounted() -> None:
+async def test_project_scale_tool_contract_without_evidence_is_unaccounted_without_retry() -> None:
     task = (
         "Role mission: implement the project.\n"
         "User task: Build a real small business project for flow=dispatch. "
@@ -7055,18 +7055,12 @@ async def test_project_scale_tool_contract_rejected_without_text_retries_instead
             if not self._rejected:
                 self._rejected = True
                 raise GatewayRejectedOutput(
-                    evidence=RejectedOutputEvidence(
-                        final_text=None,
-                        usage=None,
-                        usage_status="missing",
-                        status="completed",
-                        reason="invalid_output",
-                    ),
+                    evidence=None,
                     deployment_id="primary",
                     logical_model=request.logical_model,
                     provider_id="deepseek",
                     provider_model="deepseek/deepseek-v4-flash",
-                    cost_usd=Decimal(0),
+                    cost_usd=None,
                 )
             return GatewayCompletion(
                 response=ModelResponse(
@@ -7095,6 +7089,9 @@ async def test_project_scale_tool_contract_rejected_without_text_retries_instead
             return name == "project.generate_zip"
 
     class ZipHarnessToolGateway:
+        def __init__(self) -> None:
+            self.calls: list[HarnessToolCallRequest] = []
+
         async def invoke(
             self,
             tenant_id: UUID,
@@ -7104,6 +7101,7 @@ async def test_project_scale_tool_contract_rejected_without_text_retries_instead
             role: Role | None = None,
         ) -> HarnessToolCallResult:
             del tenant_id, user_id, role
+            self.calls.append(request)
             artifact_id = str(uuid4())
             return HarnessToolCallResult(
                 call_id=request.call_id,
@@ -7159,43 +7157,68 @@ async def test_project_scale_tool_contract_rejected_without_text_retries_instead
         total_cost_usd=Decimal(100),
     )
     gateway = RejectedThenZipMissingUsageGateway()
+    capabilities = ZipCapabilities()
+    harness = ZipHarnessToolGateway()
     runtime = CrewDispatchRuntime(
         gateway,
         plan,
-        capability_gateway=ZipCapabilities(),
-        harness_tool_gateway=ZipHarnessToolGateway(),
+        capability_gateway=capabilities,
+        harness_tool_gateway=harness,
         crew_factory=FastFactory(),
     )
 
-    events = [event async for event in runtime.run(_context(token_budget=100_000))]
+    events: list[RunEvent] = []
+    with pytest.raises(RuntimeExecutionError, match="^dispatch usage unaccounted$"):
+        async for event in runtime.run(_context(token_budget=100_000)):
+            events.append(event)
     checkpoint = await runtime.save_checkpoint()
 
-    assert len(gateway.requests) >= 2
-    retrying = next(event for event in events if event.kind is EventKind.STEP_RETRYING)
-    assert retrying.payload["error_code"] == "model.empty_response"
+    assert len(gateway.requests) == 1
+    assert capabilities.calls == []
+    assert harness.calls == []
     assert not any(
+        event.kind in {EventKind.STEP_RETRYING, EventKind.RUNTIME_COMPLETED}
+        for event in events
+    )
+    assert any(
         event.payload.get("error_code") == "runtime.dispatch_usage_unaccounted"
         for event in events
     )
-    assert checkpoint.state["phase"] == "completed"
+    assert checkpoint.state["phase"] == "unaccounted"
+    rejected = cast(Mapping[str, Mapping[str, JsonValue]], checkpoint.state["rejected_outputs"])
+    assert len(rejected) == 1
+    receipt = next(iter(rejected.values()))
+    assert receipt["usage"] is None
+    assert receipt["cost_usd"] is None
+    assert receipt["usage_status"] == "missing"
+    assert checkpoint.state["tools"] == {}
     restored = CrewDispatchRuntime(
-        RejectedThenZipMissingUsageGateway(),
+        gateway,
         plan,
-        capability_gateway=ZipCapabilities(),
-        harness_tool_gateway=ZipHarnessToolGateway(),
+        capability_gateway=capabilities,
+        harness_tool_gateway=harness,
         crew_factory=FastFactory(),
     )
     await restored.restore_checkpoint(checkpoint)
     model_states = cast(Mapping[str, Mapping[str, JsonValue]], checkpoint.state["models"])
-    assert {state["status"] for state in model_states.values()} == {"failed", "succeeded"}
+    assert [state["status"] for state in model_states.values()] == ["rejected"]
     usage = checkpoint.state["usage"]
     assert isinstance(usage, Mapping)
     tokens = usage.get("tokens")
-    assert type(tokens) is int and tokens > 0
-    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert type(tokens) is int and tokens == 0
+    assert usage["cost_usd"] == "0"
+    with pytest.raises(RuntimeExecutionError, match="^dispatch usage unaccounted$"):
+        async for event in restored.run(_context(checkpoint=checkpoint, token_budget=100_000)):
+            assert event.kind is not EventKind.COST_RECORDED
+    retained = await restored.save_checkpoint()
+    for field in ("usage", "step_usage", "models", "rejected_outputs"):
+        assert retained.state[field] == checkpoint.state[field]
+    assert len(gateway.requests) == 1
+    assert capabilities.calls == []
+    assert harness.calls == []
 
 
-async def test_project_scale_rejected_structured_output_missing_usage_is_estimated() -> None:
+async def test_project_scale_rejected_structured_output_missing_usage_is_unaccounted() -> None:
     task = (
         "Role mission: implement the project.\n"
         "User task: Build a real small business project for flow=dispatch. "
@@ -7253,30 +7276,39 @@ async def test_project_scale_rejected_structured_output_missing_usage_is_estimat
         total_token_budget=100_000,
         total_cost_usd=Decimal(10),
     )
+    gateway = RejectedProjectScaleGateway()
     runtime = CrewDispatchRuntime(
-        RejectedProjectScaleGateway(),
+        gateway,
         plan,
         crew_factory=RecordingFactory(RecordingGeneration()),
     )
 
-    events = [
-        event async for event in runtime.run(_context(token_budget=100_000))
-    ]
+    events: list[RunEvent] = []
+    with pytest.raises(RuntimeExecutionError, match="dispatch usage unaccounted"):
+        async for event in runtime.run(_context(token_budget=100_000)):
+            events.append(event)
     checkpoint = await runtime.save_checkpoint()
 
-    assert not any(
+    assert any(
         event.payload.get("error_code") == "runtime.dispatch_usage_unaccounted"
         for event in events
     )
-    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
-    assert checkpoint.state["phase"] == "completed"
+    assert len(gateway.requests) == 1
+    assert not any(event.kind is EventKind.RUNTIME_COMPLETED for event in events)
+    assert checkpoint.state["phase"] == "unaccounted"
     usage = checkpoint.state["usage"]
     assert isinstance(usage, Mapping)
     tokens = usage.get("tokens")
-    assert type(tokens) is int and tokens > 0
+    assert type(tokens) is int and tokens == 0
+    rejected = checkpoint.state["rejected_outputs"]
+    assert isinstance(rejected, Mapping) and len(rejected) == 1
+    receipt = next(iter(rejected.values()))
+    assert isinstance(receipt, Mapping) and receipt["usage"] is None
+    assert receipt["usage_status"] == "missing"
+    assert checkpoint.state["structured_repairs"] == {}
 
 
-async def test_project_scale_empty_rejected_structured_output_uses_internal_fallback() -> None:
+async def test_project_scale_empty_rejected_structured_output_retains_unaccounted_receipt() -> None:
     task = (
         "Role mission: synthesize the project.\n"
         "User task: Build a real small business project for flow=dispatch. "
@@ -7338,16 +7370,22 @@ async def test_project_scale_empty_rejected_structured_output_uses_internal_fall
         crew_factory=RecordingFactory(RecordingGeneration()),
     )
 
-    events = [
-        event async for event in runtime.run(_context(token_budget=100_000))
-    ]
+    events: list[RunEvent] = []
+    with pytest.raises(RuntimeExecutionError, match="dispatch usage unaccounted"):
+        async for event in runtime.run(_context(token_budget=100_000)):
+            events.append(event)
     checkpoint = await runtime.save_checkpoint()
 
     assert len(gateway.requests) == 1
-    assert not any(event.kind is EventKind.RUNTIME_FAILED for event in events)
-    assert not any(event.kind is EventKind.STEP_FAILED for event in events)
-    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
-    assert checkpoint.state["phase"] == "completed"
+    assert any(event.kind is EventKind.RUNTIME_FAILED for event in events)
+    assert any(event.kind is EventKind.STEP_FAILED for event in events)
+    assert not any(event.kind is EventKind.RUNTIME_COMPLETED for event in events)
+    assert checkpoint.state["phase"] == "unaccounted"
+    rejected = checkpoint.state["rejected_outputs"]
+    assert isinstance(rejected, Mapping) and len(rejected) == 1
+    receipt = next(iter(rejected.values()))
+    assert isinstance(receipt, Mapping) and receipt["usage"] is None
+    assert receipt["final_text"] is None and receipt["reason"] == "invalid_output"
 
 
 async def test_project_scale_finalizer_gateway_empty_text_uses_internal_fallback() -> None:
