@@ -561,6 +561,102 @@ def test_repair_context_adds_vitest_global_api_hint() -> None:
     assert "globals" in hint
 
 
+def _assert_capability_node_test_guidance(message: str) -> None:
+    assert "named node:test" in message.casefold()
+    assert "build compiles all TS tests" in message
+    assert "node --test <test JS/globs>" in message
+    assert "node --test dist/*.js" not in message
+    assert "No Vitest/loader/reporter/filter/chains" in message
+
+
+@pytest.mark.parametrize("scale", ("small", "medium", "large", "ultra"))
+def test_capability_initial_guidance_compiles_tests_before_node_test(scale: str) -> None:
+    body: dict[str, object] = {
+        "message": "OWN_BUSINESS_REQUEST",
+        "mode": "auto",
+        "model_profile_id": "own-profile",
+        "workspace_session_id": "own-session",
+    }
+    original = copy.deepcopy(body)
+    result = project_scale_runner_module._capability_test_execution_body(
+        body, case_id=f"{scale}:auto", benchmark_kind="capability",
+    )
+
+    _assert_capability_node_test_guidance(str(result["message"]))
+    assert str(result["message"]).startswith("OWN_BUSINESS_REQUEST")
+    assert body == original
+    assert {key: value for key, value in result.items() if key != "message"} == {
+        key: value for key, value in body.items() if key != "message"
+    }
+
+
+@pytest.mark.parametrize("scale", ("small", "medium", "large", "ultra"))
+@pytest.mark.parametrize("incremental", (False, True))
+@pytest.mark.parametrize(
+    "failure",
+    (
+        "requirements: own business mismatch",
+        "requirements: test execution unsupported runner; use named node:test cases with node --test",
+        "ReferenceError: describe is not defined; ReferenceError: expect is not defined",
+        "sh: vitest: command not found; sh: tsx: command not found; sh: tsc: not found",
+    ),
+)
+def test_capability_repair_guidance_uses_compiled_node_tests(
+    scale: str, incremental: bool, failure: str,
+) -> None:
+    body: dict[str, object] = {
+        "message": "OWN_BUSINESS_REQUEST",
+        "mode": "direct",
+        "model_profile_id": "own-profile",
+        "workspace_session_id": "own-session",
+    }
+    original = copy.deepcopy(body)
+    bundle = _project_bundle({"tests/app.test.ts": "export const own = true;\n"})
+    result = _deliverable_repair_body(
+        body, f"{scale}:direct", benchmark_kind="capability",
+        failed_reasons=(failure,), source_workspace_bundle=bundle if incremental else None,
+    )
+
+    message = str(result["message"])
+    _assert_capability_node_test_guidance(message)
+    assert "Vitest test-runtime repair hint" not in message
+    assert "vitest -> vitest" not in message
+    assert "tsx -> tsx" not in message
+    if incremental and "is not defined" in failure:
+        assert "'node:test'" in message
+        assert "'node:assert/strict'" in message
+    if incremental and "tsc: not found" in failure:
+        assert "tsc -> typescript" in message
+    assert result["replace_workspace_files"] is not incremental
+    assert result["model_profile_id"] == body["model_profile_id"]
+    assert result["workspace_session_id"] == body["workspace_session_id"]
+    assert body == original
+    assert "Previous failed evidence" in message
+    if incremental:
+        assert "Current workspace context for precise repair" in message
+        assert "Return only complete changed files" in message
+
+
+@pytest.mark.parametrize("benchmark_kind,case_id", (("fixture", "small:direct"), ("capability", "own:direct")))
+def test_node_test_initial_guidance_does_not_change_noncapability_paths(
+    benchmark_kind: str, case_id: str,
+) -> None:
+    body: dict[str, object] = {"message": "OWN_REQUEST", "mode": "direct"}
+    assert project_scale_runner_module._capability_test_execution_body(
+        body, case_id=case_id, benchmark_kind=benchmark_kind,
+    ) is body
+
+
+def test_fixture_repair_keeps_existing_vitest_hint() -> None:
+    result = _deliverable_repair_body(
+        {"message": "OWN_REQUEST", "mode": "direct"}, "small:direct",
+        benchmark_kind="fixture", failed_reasons=("ReferenceError: describe is not defined",),
+        source_workspace_bundle=_project_bundle({"tests/app.test.ts": "describe('own', () => {});\n"}),
+    )
+    assert "Vitest test-runtime repair hint" in str(result["message"])
+    assert "build compiles all TS tests" not in str(result["message"])
+
+
 def test_repair_context_adds_missing_build_tool_dependency_hint() -> None:
     hint = project_scale_runner_module._repair_context_failure_hints(
         ("npm run build output_tail=\"sh: 1: tsc: not found\"",)
@@ -645,7 +741,7 @@ def test_capability_repair_keeps_workspace_context_after_long_failure_output() -
     assert "Current workspace context for precise repair" in message
     assert "vitest.config.ts" in message
     assert "tests/app.test.ts" in message
-    assert "Vitest test-runtime repair hint" in message
+    assert "Node test-runtime repair hint" in message
     assert len(message) <= 6_000
 
 

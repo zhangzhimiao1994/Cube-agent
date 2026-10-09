@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import shlex
 import stat
 import subprocess
@@ -116,7 +117,31 @@ def _node_command(root: Path) -> tuple[str, ...]:
     if not isinstance(script, str):
         raise _ProofFailure(_Reason.UNSUPPORTED)
     # Build already ran in outer validation; only replay tests in the disposable copy.
-    script = script.removeprefix("npm run build && ")
+    build_prefix = "npm run build && "
+    if script.startswith(build_prefix):
+        script = script.removeprefix(build_prefix)
+        if script.startswith("tsc -p "):
+            compile_prefix = re.fullmatch(
+                r'''tsc -p ("[^"\r\n]*"|'[^'\r\n]*'|[^\s'"]+) && (node --test(?: .*)?)''',
+                script,
+            )
+            if compile_prefix is None:
+                raise _ProofFailure(_Reason.UNSUPPORTED)
+            config = shlex.split(compile_prefix[1])[0]
+            relative = Path(config)
+            if (
+                not config or config.startswith("-") or relative.is_absolute()
+                or relative.as_posix() != config or ".." in relative.parts
+                or any(character in config for character in "\\:$`;|&<>*?[]#~\r\n")
+            ):
+                raise _ProofFailure(_Reason.UNSUPPORTED)
+            target = root.resolve(strict=True) / relative
+            try:
+                if target.resolve(strict=True) != target or not target.is_file():
+                    raise _ProofFailure(_Reason.UNSUPPORTED)
+            except (OSError, RuntimeError):
+                raise _ProofFailure(_Reason.UNSUPPORTED) from None
+            script = compile_prefix[2]
     command = shlex.split(script)
     if command[:2] != ["node", "--test"]:
         raise _ProofFailure(_Reason.UNSUPPORTED)

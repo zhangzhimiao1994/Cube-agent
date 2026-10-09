@@ -3990,6 +3990,12 @@ def _idempotency_key(case_id: str, index: int, *, execution_id: str | None = Non
     return key[:90]
 
 
+_CAPABILITY_NODE_TEST_GUIDANCE = (
+    "named node:test asserts; build compiles all TS tests; "
+    "test=node --test <test JS/globs>. No Vitest/loader/reporter/filter/chains. "
+)
+
+
 def _capability_test_execution_body(
     body: dict[str, object], *, case_id: str, benchmark_kind: str,
 ) -> dict[str, object]:
@@ -4002,9 +4008,8 @@ def _capability_test_execution_body(
         return body
     return {
         **body,
-        "message": message + "\nTest execution acceptance: use named node:test test bodies with "
-        "real assertions and package.json test script node --test (optionally compiled JS test "
-        "paths). Keep tests reproducible with the existing Node runtime and dependencies. "
+        "message": message + "\nTest execution acceptance: " + _CAPABILITY_NODE_TEST_GUIDANCE
+        + "Keep tests reproducible with the existing Node runtime and dependencies. "
         "A no-op, module-load-only script, or an unsupported test runner receives no test "
         "execution credit. Acceptance independently checks the structured test stream and a "
         "failing registered test body in an isolated disposable copy.",
@@ -4394,43 +4399,42 @@ def _deliverable_repair_body(
             "If only the report is missing, return only VERIFICATION.md; do not rewrite source. "
             if incremental_repair
             else (
-                "Replace the entire workspace with one coherent implementation. Return full "
-                "workspace_bundle.files or ### `path` fences and omit obsolete files: "
+                "Replace the entire workspace with one coherent implementation: full "
+                "workspace_bundle.files or ### `path` fences; omit obsolete; "
                 "source/tests/README/PROJECT_REQUIREMENTS.md/IMPLEMENTATION_PLAN.md. "
                 f"{authoritative_preview_guidance}"
             )
         )
         guidance = (
-            f"Repair same project for case_id={case_id} project_scale={scale} flow={flow}; "
+            f"Repair same project: case_id={case_id} project_scale={scale} flow={flow}; "
             f"{preview_api_guidance}"
-            f"preserve requirements. {delivery_guidance}"
-            "File keys: safe relative paths, not endpoints/URLs/methods. "
+            f"keep requirements. {delivery_guidance}"
+            "Safe relative paths only; no endpoints/URLs/methods. "
             "JSON files must use strict JSON syntax with double-quoted keys and strings; "
             "no object literals. "
             "constraints_reading_evidence.json: read_before_implementation:true; "
-            "constraints: AGENTS.md workspace rules, HANDOFF, PROJECT_REQUIREMENTS.md; "
-            "skills/rules: applicable SKILL.md or agent-standard rules. "
+            "AGENTS.md workspace rules, HANDOFF, PROJECT_REQUIREMENTS.md; "
+            "applicable SKILL.md or agent-standard rules. "
         )
         medium_guidance = (
-            "GET /tenants/:tenant_id/opportunities returns "
+            "GET /tenants/:tenant_id/opportunities: "
             "{items:[...]}; created/patched opportunities persist after restart. "
-            "POST/PATCH: object with top-level id, "
-            "never {item:...}, {data:...}, or any wrapper. Bodies: "
+            "POST/PATCH: top-level id; never {item:...}, {data:...}, or wrappers. "
             "accounts {name}; contacts {account_id,name,email}; opportunities "
             "{account_id,name,amount,stage}; PATCH opportunities {stage}; reminders "
             "{contact_id,due_at,note}; stages exactly open, won, lost. "
-            "Reference validation order is frozen: resolve tenant-scoped account_id/contact_id "
-            "before validating unrelated fields; a missing or foreign "
+            "Reference validation order is frozen: tenant-scoped account_id/contact_id "
+            "before validating unrelated fields; missing or foreign "
             "reference returns 404 NOT_FOUND even if email, due_at, note, amount, or stage "
             "is absent or invalid. "
-            "Route params: Request<{tenant_id:string,...}> or equivalent; not default {}. "
+            "Request<{tenant_id:string,...}>, not default {}. "
             "Tests: validator helpers that require a field argument need it or defaults. "
         )
         small_guidance = (
-            "For small file-backed task API repairs, use single-flight initialization and "
-            "serialized read-modify-write transactions so concurrent creates, "
-            "patches, deletes, and restores cannot overwrite each other. Atomic rename alone "
-            "does not prevent lost updates; rerun the concurrency and restart-persistence tests. "
+            "Small file-backed task API: single-flight initialization and "
+            "serialized read-modify-write transactions prevent lost concurrent "
+            "creates/patches/deletes/restores. Atomic rename alone does not prevent lost updates; "
+            "rerun concurrency and restart-persistence tests. "
         )
         ultra_guidance = (
             PROJECT_ULTRA_LOAD_GUIDANCE
@@ -4476,12 +4480,16 @@ def _deliverable_repair_body(
                 "-> independent test -> synthesis artifact dependencies, emit step.started and "
                 "step.completed per agent_id, and record discussion_trace plus explicit handoffs. "
             )
+        node_test_required = scale in {"small", "medium", "large", "ultra"}
+        if node_test_required:
+            guidance += _CAPABILITY_NODE_TEST_GUIDANCE
         context = _workspace_repair_context(
             source_workspace_bundle,
             failed_reasons=failed_reasons,
+            node_test_required=node_test_required,
         )
         guidance += (
-            "package.json scripts: build, test, start. No ellipses or summaries in files. "
+            "package.json scripts: build, test, start. No ellipses/summaries. "
             f"{PROJECT_SCALE_VERIFICATION_REPORT_GUIDANCE}\n"
         )
         reasons = _format_failed_reasons(failed_reasons)
@@ -4569,6 +4577,7 @@ def _workspace_repair_context(
     *,
     failed_reasons: Sequence[str],
     max_chars: int = _REPAIR_CONTEXT_TOTAL_CHARS,
+    node_test_required: bool = False,
 ) -> str:
     if workspace_bundle is None:
         return ""
@@ -4594,7 +4603,7 @@ def _workspace_repair_context(
     inventory = ", ".join(paths[:_REPAIR_CONTEXT_MAX_FILES])
     if len(paths) > _REPAIR_CONTEXT_MAX_FILES:
         inventory += f", ... (+{len(paths) - _REPAIR_CONTEXT_MAX_FILES} more)"
-    hints = _repair_context_failure_hints(failed_reasons)
+    hints = _repair_context_failure_hints(failed_reasons, node_test_required=node_test_required)
     parts = [
         "Current workspace context for precise repair:",
         f"Files: {inventory}",
@@ -4960,7 +4969,9 @@ def _compact_repair_snippet(
     return compact[: max_chars - 4].rstrip() + " ..."
 
 
-def _repair_context_failure_hints(failed_reasons: Sequence[str]) -> str:
+def _repair_context_failure_hints(
+    failed_reasons: Sequence[str], *, node_test_required: bool = False,
+) -> str:
     text = "\n".join(failed_reasons)
     hints: list[str] = []
     if "TS2305" in text or "has no exported member" in text:
@@ -4994,6 +5005,10 @@ def _repair_context_failure_hints(failed_reasons: Sequence[str]) -> str:
         )
     if re.search(r"\b(?:describe|it|test|expect|beforeEach|afterEach) is not defined\b", text):
         hints.append(
+            "Node test-runtime repair hint: explicitly import test APIs from 'node:test' and "
+            "assertions from 'node:assert/strict'; replace expect with real assertions, not "
+            "implicit globals."
+            if node_test_required else
             "Vitest test-runtime repair hint: explicitly import every used test API from "
             "'vitest', or enable and verify the matching runner globals configuration. Ensure "
             "the npm test script loads that configuration."
@@ -5005,6 +5020,9 @@ def _repair_context_failure_hints(failed_reasons: Sequence[str]) -> str:
         "tsx": "tsx",
         "eslint": "eslint",
     }
+    if node_test_required:
+        dependency_names.pop("vitest")
+        dependency_names.pop("tsx")
     supported_commands = "|".join(dependency_names)
     posix_missing = re.findall(
         rf"\b(?:sh|bash):\s*(?:\d+:\s*)?({supported_commands}):\s*"

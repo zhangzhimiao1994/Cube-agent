@@ -159,6 +159,156 @@ def test_fixed_build_prefix_returns_only_existing_node_test_argv(tmp_path: Path,
     assert proof._node_command(root) == expected
 
 
+@pytest.mark.parametrize("config", ("tsconfig.test.json", "config/tests.json", '"config/tests.json"'))
+@pytest.mark.parametrize("tail", ("", " test/main.test.cjs", " test/*.test.cjs"))
+def test_fixed_compile_prefix_returns_only_existing_node_test_argv(
+    tmp_path: Path, config: str, tail: str,
+) -> None:
+    root = _project(tmp_path, script=f"npm run build && tsc -p {config} && node --test{tail}")
+    target = root / config.strip('"')
+    target.parent.mkdir(exist_ok=True)
+    target.write_text("{}", encoding="utf-8")
+    expected = ("node", "--test", "test/main.test.cjs") if tail else ("node", "--test")
+    assert proof._node_command(root) == expected
+
+
+@pytest.mark.parametrize("middle", (
+    'tsc -p tsconfig.test.json "&&"', "tsc -p tsconfig.test.json '&&'",
+    "tsc -p tsconfig.test.json --incremental &&", "tsc --project tsconfig.test.json &&",
+    "npx tsc -p tsconfig.test.json &&", "tsc -p tsconfig.test.json;",
+    "tsc -p tsconfig.test.json ||", "tsc -p tsconfig.test.json && echo passed &&",
+    "tsc -p missing.json &&", "tsc -p config &&", "tsc -p ../outside.json &&",
+    "tsc -p /tmp/config.json &&", "tsc -p C:/config.json &&",
+    "tsc -p ./tsconfig.test.json &&", "tsc -p config//tests.json &&",
+    "tsc -p --version &&", 'tsc -p "$(echo config)" &&', "tsc -p `echo-config` &&",
+))
+def test_fixed_compile_prefix_rejects_operator_flag_and_config_variants(
+    tmp_path: Path, middle: str,
+) -> None:
+    root = _project(tmp_path, script=f"npm run build && {middle} node --test test/main.test.cjs")
+    (root / "tsconfig.test.json").write_text("{}", encoding="utf-8")
+    (root / "config").mkdir()
+    (root / "config/tests.json").write_text("{}", encoding="utf-8")
+    with pytest.raises(proof._ProofFailure) as failure:
+        proof._node_command(root)
+    assert failure.value.reason is proof._Reason.UNSUPPORTED
+
+
+@pytest.mark.parametrize("tail", (
+    "missing/*.test.cjs", "test", "../outside.test.cjs", "--test-reporter=spec test/main.test.cjs",
+    "test/main.test.cjs && echo passed", "test/main.test.cjs; echo passed",
+    "test/main.test.cjs | cat", "test/main.test.cjs > output.json",
+))
+def test_fixed_compile_prefix_preserves_node_tail_rejections(tmp_path: Path, tail: str) -> None:
+    root = _project(tmp_path, script=f"npm run build && tsc -p tsconfig.test.json && node --test {tail}")
+    (root / "tsconfig.test.json").write_text("{}", encoding="utf-8")
+    with pytest.raises(proof._ProofFailure) as failure:
+        proof._node_command(root)
+    assert failure.value.reason is proof._Reason.UNSUPPORTED
+
+
+@pytest.mark.parametrize("config", (
+    "#own.json", '"#own.json"', "'#own.json'",
+    "~/own.json", '"~/own.json"', "'~/own.json'", "~own.json",
+))
+def test_fixed_compile_prefix_rejects_comment_and_expansion_config(
+    tmp_path: Path, config: str,
+) -> None:
+    root = _project(tmp_path, script=f"npm run build && tsc -p {config} && node --test")
+    target = root / config.strip("\"'")
+    target.parent.mkdir(exist_ok=True)
+    target.write_text("{}", encoding="utf-8")
+    with pytest.raises(proof._ProofFailure) as failure:
+        proof._node_command(root)
+    assert failure.value.reason is proof._Reason.UNSUPPORTED
+
+
+@pytest.mark.parametrize("control", ("\r", "\n", "\r\n"))
+@pytest.mark.parametrize("quote", ('"', "'"))
+@pytest.mark.parametrize("position", ("config", "node_flag", "tail_flag"))
+def test_fixed_compile_prefix_rejects_quoted_crlf_config_and_flags(
+    tmp_path: Path, control: str, quote: str, position: str,
+) -> None:
+    config = f"{quote}tsconfig.test.json{control}{quote}" if position == "config" else "tsconfig.test.json"
+    node_flag = f"{quote}--test{control}{quote}" if position == "node_flag" else "--test"
+    tail = f" {quote}--test-reporter=spec{control}{quote}" if position == "tail_flag" else ""
+    root = _project(tmp_path, script=f"npm run build && tsc -p {config} && node {node_flag}{tail}")
+    (root / "tsconfig.test.json").write_text("{}", encoding="utf-8")
+    with pytest.raises(proof._ProofFailure) as failure:
+        proof._node_command(root)
+    assert failure.value.reason is proof._Reason.UNSUPPORTED
+
+
+def test_fixed_compile_prefix_rejects_parent_symlink_outside_owned_root(tmp_path: Path) -> None:
+    root = _project(tmp_path, script="npm run build && tsc -p config/own.json && node --test")
+    outside = tmp_path / "outside-own-fixture"
+    outside.mkdir()
+    (outside / "own.json").write_text("{}", encoding="utf-8")
+    try:
+        (root / "config").symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pytest.skip("own fixture directory symlink requires OS permission; native coverage required")
+    with pytest.raises(proof._ProofFailure) as failure:
+        proof._node_command(root)
+    assert failure.value.reason is proof._Reason.UNSUPPORTED
+    assert _verify(root) == (proof._Reason.COPY.value,)
+
+
+def test_fixed_compile_prefix_rejects_noncanonical_symlink_config(tmp_path: Path) -> None:
+    root = _project(tmp_path, script="npm run build && tsc -p alias.json && node --test")
+    (root / "actual.json").write_text("{}", encoding="utf-8")
+    try:
+        (root / "alias.json").symlink_to(root / "actual.json")
+    except OSError:
+        pytest.skip("own fixture symlink requires OS permission")
+    with pytest.raises(proof._ProofFailure) as failure:
+        proof._node_command(root)
+    assert failure.value.reason is proof._Reason.UNSUPPORTED
+
+
+@pytest.mark.parametrize("tail", ("dist/own.test.cjs", "dist/*.test.cjs"))
+def test_fixed_compile_prefix_uses_built_clone_without_replaying_prefixes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, tail: str,
+) -> None:
+    root = _project(tmp_path)
+    (root / "dist").mkdir()
+    (root / "test/main.test.cjs").rename(root / "dist/own.test.cjs")
+    (root / "tsconfig.test.json").write_text("{}", encoding="utf-8")
+    tripwire = "require('node:fs').writeFileSync('own-prefix-ran','bad');process.exit(93);"
+    (root / "own-prefix.cjs").write_text(tripwire, encoding="utf-8")
+    (root / "node_modules/.bin").mkdir()
+    (root / "node_modules/.bin/tsc").write_text(
+        "#!/usr/bin/env node\n" + tripwire, encoding="utf-8",
+    )
+    (root / "node_modules/.bin/tsc").chmod(0o755)
+    (root / "node_modules/.bin/tsc.cmd").write_text("@node own-prefix.cjs\r\n", encoding="utf-8")
+    (root / "package.json").write_text(json.dumps({"scripts": {
+        "build": "node own-prefix.cjs",
+        "test": f"npm run build && tsc -p tsconfig.test.json && node --test {tail}",
+    }}), encoding="utf-8")
+    before = {p.relative_to(root): p.read_bytes() for p in root.rglob("*") if p.is_file()}
+    copies: list[Path] = []
+
+    def own_command(
+        copied: Path, command: Sequence[str], reporter: Path, config: Mapping[str, str],
+    ) -> list[str]:
+        copies.append(copied)
+        assert copied != root and (copied / "dist/own.test.cjs").is_file()
+        assert not (copied / "own-prefix-ran").exists()
+        return _own_node_command(copied, command, reporter, config)
+
+    monkeypatch.setattr(proof, "_test_command", own_command)
+    assert _verify(root) == ()
+    assert len(copies) == 2 and all(not p.exists() for p in copies)
+    assert before == {p.relative_to(root): p.read_bytes() for p in root.rglob("*") if p.is_file()}
+
+
+def test_fixed_compile_prefix_missing_compiled_output_receives_no_credit(tmp_path: Path) -> None:
+    root = _project(tmp_path, script="npm run build && tsc -p tsconfig.test.json && node --test dist/*.test.cjs")
+    (root / "tsconfig.test.json").write_text("{}", encoding="utf-8")
+    assert _verify(root) == (proof._Reason.UNSUPPORTED.value,)
+
+
 @pytest.mark.parametrize("script", (
     "npm run other && node --test test/main.test.cjs",
     "npm run build --if-present && node --test test/main.test.cjs",
