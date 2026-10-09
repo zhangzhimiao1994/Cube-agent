@@ -3,7 +3,7 @@ name: ${AGENT_HUB_TEST_COMPOSE_PROJECT:-agent-hub-test}
 
 services:
   postgres:
-    image: public.ecr.aws/docker/library/postgres:16.11
+    image: postgres:16.11
     environment:
       POSTGRES_DB: agent_hub_test
       POSTGRES_USER: agent_hub_test
@@ -19,7 +19,7 @@ services:
       retries: 15
 
   redis:
-    image: public.ecr.aws/docker/library/redis:7.4
+    image: redis:7.4
     ports:
       - "127.0.0.1:${AGENT_HUB_TEST_REDIS_PORT:-56379}:6379"
     tmpfs:

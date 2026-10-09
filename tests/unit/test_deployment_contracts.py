@@ -11,6 +11,7 @@ import sys
 import tomllib
 import zipfile
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 import yaml
@@ -26,7 +27,7 @@ def read(relative: str) -> str:
     ("name", "image", "unchanged"),
     (
         (
-            "postgres", "public.ecr.aws/docker/library/postgres:16.11",
+            "postgres", "postgres:16.11",
             {
                 "environment": {
                     "POSTGRES_DB": "agent_hub_test",
@@ -42,7 +43,7 @@ def read(relative: str) -> str:
             },
         ),
         (
-            "redis", "public.ecr.aws/docker/library/redis:7.4",
+            "redis", "redis:7.4",
             {
                 "ports": ["127.0.0.1:${AGENT_HUB_TEST_REDIS_PORT:-56379}:6379"],
                 "tmpfs": ["/data"],
@@ -54,13 +55,133 @@ def read(relative: str) -> str:
         ),
     ),
 )
-def test_test_compose_uses_official_ecr_images_without_boundary_changes(
+def test_compose_uses_canonical_images_without_boundary_changes(
     name: str, image: str, unchanged: dict[str, object],
 ) -> None:
     compose = yaml.safe_load(read("tests/compose.yml"))
     assert compose["name"] == "${AGENT_HUB_TEST_COMPOSE_PROJECT:-agent-hub-test}"
     assert set(compose["services"]) == {"postgres", "redis"}
     assert compose["services"][name] == {"image": image, **unchanged}
+
+
+def _quality_docker_hub_mirror_setup() -> str:
+    workflow = yaml.safe_load(read(".github/workflows/quality.yml"))
+    steps = workflow["jobs"]["python-web-shell"]["steps"]
+    matches = [step for step in steps if step.get("name") == "Configure Docker Hub cache on hosted runner"]
+    assert len(matches) == 1, "the hosted-runner Docker Hub cache setup is required"
+    assert matches[0]["shell"] == "bash"
+    return str(matches[0]["run"])
+
+
+def _quality_docker_hub_mirror_merge_code() -> str:
+    match = re.search(r"(?ms)^sudo python3 - <<'PY'\n(?P<code>.*?)^PY$", _quality_docker_hub_mirror_setup())
+    assert match is not None, "the daemon configuration must use a structured Python JSON merge"
+    return match.group("code")
+
+
+def test_quality_docker_hub_mirror_setup_precedes_compose_and_preserves_readiness_cleanup() -> None:
+    workflow = yaml.safe_load(read(".github/workflows/quality.yml"))
+    job = workflow["jobs"]["python-web-shell"]
+    assert job["runs-on"] == "ubuntu-24.04"
+    steps = job["steps"]
+    setup_index = next(i for i, step in enumerate(steps) if step.get("run") == _quality_docker_hub_mirror_setup())
+    up_index = next(i for i, step in enumerate(steps) if step.get("run") == "docker compose -f tests/compose.yml up -d --wait")
+    cleanup = next(step for step in steps if step.get("run") == "docker compose -f tests/compose.yml down -v --remove-orphans")
+    assert setup_index < up_index
+    assert cleanup["if"] == "always()"
+    command = _quality_docker_hub_mirror_setup()
+    assert command.startswith("set -euo pipefail\n")
+    assert '${GITHUB_ACTIONS:-}' in command and '${RUNNER_ENVIRONMENT:-}' in command
+    assert '"true"' in command and '"github-hosted"' in command
+    assert command.index("GITHUB_ACTIONS") < command.index("sudo python3")
+    assert command.index("sudo python3") < command.index("sudo systemctl restart docker")
+    assert command.index("sudo systemctl restart docker") < command.index("docker info")
+    assert "{{json .RegistryConfig.Mirrors}}" in command
+    assert "docker login" not in command and "secrets." not in command
+
+
+@pytest.mark.parametrize(
+    ("actions", "runner", "allowed"),
+    (("true", "github-hosted", True), ("false", "github-hosted", False),
+     ("true", "self-hosted", False), (None, "github-hosted", False), ("true", None, False)),
+)
+def test_quality_docker_hub_mirror_guards_deny_non_hosted_execution(
+    actions: str | None, runner: str | None, allowed: bool,
+) -> None:
+    prefix = _quality_docker_hub_mirror_setup().split("sudo python3", 1)[0]
+    assert "sudo" not in prefix and "docker" not in prefix
+    env = {}
+    if actions is not None:
+        env["GITHUB_ACTIONS"] = actions
+    if runner is not None:
+        env["RUNNER_ENVIRONMENT"] = runner
+    result = subprocess.run(
+        (str(_posix_shell()), "-c", prefix + "\nprintf 'guard-passed\\n'\n"),
+        env=env, cwd=ROOT, capture_output=True, text=True, check=False, timeout=5,
+    )
+    assert (result.returncode == 0) is allowed
+    assert (result.stdout == "guard-passed\n") is allowed
+
+
+@pytest.mark.parametrize(
+    "original",
+    (None, {"debug": False, "features": {"buildkit": True},
+            "registry-mirrors": ["https://existing.example/mirror"]},
+     {"log-driver": "journald", "registry-mirrors": ["https://mirror.gcr.io/", "https://existing.example/mirror"]}),
+)
+def test_quality_docker_hub_mirror_actual_merge_preserves_daemon_keys_and_other_mirrors(
+    tmp_path: Path, original: dict[str, object] | None,
+) -> None:
+    path = tmp_path / "owned-daemon" / "daemon.json"
+    if original is not None:
+        path.parent.mkdir()
+        path.write_text(json.dumps(original), encoding="utf-8")
+    code = compile(_quality_docker_hub_mirror_merge_code(), "quality-mirror-merge", "exec")
+    # Redirect only the merger's fixed target to an owned fixture, never the host daemon.
+    with patch("pathlib.Path", return_value=path) as target:
+        exec(code, {})  # noqa: S102 - Trusted workflow code with its fixed target redirected to an owned fixture.
+        once = path.read_bytes()
+        exec(code, {})  # noqa: S102 - Trusted workflow code with its fixed target redirected to an owned fixture.
+        target.assert_called_with("/etc/docker/daemon.json")
+        assert target.call_count == 2
+    assert path.read_bytes() == once
+    merged = json.loads(once)
+    for key, value in (original or {}).items():
+        if key != "registry-mirrors":
+            assert merged[key] == value
+    previous = (original or {}).get("registry-mirrors", [])
+    assert isinstance(previous, list)
+    expected = previous if any(m.rstrip("/") == "https://mirror.gcr.io" for m in previous) else ["https://mirror.gcr.io", *previous]
+    assert merged["registry-mirrors"] == expected
+    assert set(merged) == set(original or {}) | {"registry-mirrors"}
+
+
+@pytest.mark.parametrize("original", ([], {"registry-mirrors": "not-a-list"}, {"registry-mirrors": [1]}))
+def test_quality_docker_hub_mirror_invalid_daemon_config_is_not_written(tmp_path: Path, original: object) -> None:
+    path = tmp_path / "daemon.json"
+    path.write_text(json.dumps(original), encoding="utf-8")
+    before = path.read_bytes()
+    code = compile(_quality_docker_hub_mirror_merge_code(), "quality-mirror-merge", "exec")
+    with patch("pathlib.Path", return_value=path), pytest.raises(ValueError):
+        exec(code, {})  # noqa: S102 - Trusted workflow code with its fixed target redirected to an owned fixture.
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    ("reported", "allowed"),
+    ((["https://mirror.gcr.io"], True), (["https://existing.example", "https://mirror.gcr.io/"], True),
+     (["https://existing.example"], False), ({"registry-mirrors": ["https://mirror.gcr.io"]}, False)),
+)
+def test_quality_docker_hub_mirror_actual_verification_requires_active_mirror(reported: object, allowed: bool) -> None:
+    line = next(line for line in _quality_docker_hub_mirror_setup().splitlines() if line.startswith("docker info "))
+    command = shlex.split(line.split("|", 1)[1])
+    assert command[:2] == ["python3", "-c"] and len(command) == 3
+    compile(command[2], "quality-mirror-verify", "exec")
+    result = subprocess.run(
+        (sys.executable, "-I", "-B", "-c", command[2]), input=json.dumps(reported),
+        capture_output=True, text=True, check=False, timeout=5,
+    )
+    assert (result.returncode == 0) is allowed
 
 
 def test_quality_checks_types_for_both_supported_platforms() -> None:

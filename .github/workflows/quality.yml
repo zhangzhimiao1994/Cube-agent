@@ -19,6 +19,33 @@ jobs:
       - run: uv run ruff check .
       - run: uv run mypy --strict --platform linux src tests
       - run: uv run mypy --strict --platform win32 src tests
+      - name: Configure Docker Hub cache on hosted runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_ACTIONS:-}" != "true" || "${RUNNER_ENVIRONMENT:-}" != "github-hosted" ]]; then
+            printf 'Docker Hub cache setup requires an ephemeral GitHub-hosted runner\n' >&2
+            exit 1
+          fi
+          sudo python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          path = Path("/etc/docker/daemon.json")
+          config = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+          if not isinstance(config, dict):
+              raise ValueError("invalid Docker daemon configuration")
+          mirrors = config.get("registry-mirrors", [])
+          if not isinstance(mirrors, list) or any(not isinstance(mirror, str) for mirror in mirrors):
+              raise ValueError("invalid Docker daemon mirrors")
+          if not any(mirror.rstrip("/") == "https://mirror.gcr.io" for mirror in mirrors):
+              mirrors = ["https://mirror.gcr.io", *mirrors]
+          config["registry-mirrors"] = mirrors
+          path.parent.mkdir(parents=True, exist_ok=True)
+          path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+          PY
+          sudo systemctl restart docker
+          docker info --format '{{json .RegistryConfig.Mirrors}}' | python3 -c 'import json, sys; mirrors = json.load(sys.stdin); sys.exit(0 if isinstance(mirrors, list) and all(isinstance(mirror, str) for mirror in mirrors) and any(mirror.rstrip("/") == "https://mirror.gcr.io" for mirror in mirrors) else "Docker Hub mirror not active")'
       - run: docker compose -f tests/compose.yml up -d --wait
       - name: Run uv run pytest -q
         shell: bash
