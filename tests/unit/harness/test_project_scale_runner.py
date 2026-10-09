@@ -6,6 +6,7 @@ import subprocess
 import sys
 import zipfile
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from email.message import Message
 from io import BytesIO
 from pathlib import Path
@@ -1046,6 +1047,76 @@ def test_effective_execute_wait_seconds_reserves_capability_repair_budget() -> N
         )
         == 3240
     )
+
+
+@pytest.mark.parametrize("operator_seconds, expected", [(None, 4980), (1200, 2580)])
+def test_runtime_observation_budget_keeps_explicit_operator_priority(
+    monkeypatch: pytest.MonkeyPatch, operator_seconds: int | None, expected: int,
+) -> None:
+    plan = build_project_scale_run_plan(
+        benchmark_kind="capability", scales=("medium",), flows=("hybrid",), execute=True,
+    )
+    request = plan.requests[0]
+    body = dict(request.body)
+    if operator_seconds is None:
+        body.pop("runtime_timeout_seconds")
+    else:
+        body["runtime_timeout_seconds"] = operator_seconds
+    plan = replace(plan, requests=(replace(request, body=body),))
+    before = copy.deepcopy(body)
+    assert project_scale_runner_module._effective_execute_wait_seconds(
+        plan, 0, generated_project_timeout_seconds=120, runtime_observation_budget_seconds=3600,
+    ) == expected
+    budget_args: dict[str, Any] = {
+        "configured_wait_seconds": 1, "request_body": body, "benchmark_kind": "capability",
+        "generated_project_timeout_seconds": 120, "generated_project_command_count": 3,
+        "runtime_observation_budget_seconds": 3600,
+    }
+    assert project_scale_runner_module._repair_wall_clock_budget_seconds(**budget_args) == expected
+    monkeypatch.setattr("agent_hub.harness.project_scale_runner.time.monotonic", lambda: 50.0)
+    assert project_scale_runner_module._extend_repair_deadline(
+        100, **budget_args, absolute_deadline=500,
+    ) == 500
+    assert project_scale_runner_module._repair_absolute_deadline_safety_limit(
+        100, **budget_args, additional_repair_attempts=2,
+    ) == 100 + expected * 2
+    assert project_scale_runner_module._extend_repair_absolute_deadline(
+        100, **budget_args, safety_limit=500,
+    ) == 500
+    assert body == before
+
+
+def test_runtime_observation_budget_waits_without_injecting_operator_or_reposting() -> None:
+    plan = build_project_scale_run_plan(
+        scales=("medium",), flows=("hybrid",), benchmark_kind="fixture", execute=True,
+    )
+    request = plan.requests[0]
+    body = dict(request.body)
+    body.pop("runtime_timeout_seconds")
+    plan = replace(plan, requests=(replace(request, body=body),))
+    client = FakeAcceptanceClient(
+        run_id="run-medium-observation", session_id="project-scale-medium-hybrid",
+        statuses=("running", "completed"),
+    )
+    result = execute_project_scale_plan(
+        plan, client, wait_seconds=0, poll_interval_seconds=0,
+        runtime_observation_budget_seconds=3600,
+    ).results[0]
+    assert result.status == "completed"
+    assert result.evidence["terminal_status"] is True
+    assert len(client.submitted_bodies) == 1
+    assert "runtime_timeout_seconds" not in client.submitted_bodies[0]
+    assert "runtime_observation_budget_seconds" not in client.submitted_bodies[0]
+    assert not any(method == "POST" and path.endswith("/cancel") for method, path, _ in client.calls)
+
+
+@pytest.mark.parametrize("budget", [True, False, 0, -1, 3601, float("inf"), float("nan"), "3600"])
+def test_runtime_observation_budget_rejects_invalid_values_before_submission(budget: object) -> None:
+    plan = build_project_scale_run_plan(scales=("small",), flows=("direct",), execute=True)
+    client = FakeAcceptanceClient()
+    with pytest.raises(ValueError, match="observation budget"):
+        execute_project_scale_plan(plan, client, runtime_observation_budget_seconds=cast(float, budget))
+    assert client.calls == []
 
 
 def test_repair_deadline_never_extends_past_case_absolute_deadline(

@@ -65,6 +65,8 @@ _ACCEPTANCE_CASES = (
 _SHA256_RE = re.compile(r"[a-f0-9]{64}\Z")
 _SAFE_ID_RE = re.compile(r"[^a-z0-9-]+")
 _SAFE_MODEL_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,127}")
+# Observe the existing service fuse without imposing an operator limit on the request.
+_REAL_USER_RUNTIME_OBSERVATION_BUDGET_SECONDS = 3600.0
 _ADMIN_RUN_PREFIX = "/api/v1/admin/runs"
 _MAX_PREVIEW_ASSETS = 24
 _MAX_MODEL_ARTIFACT_BYTES = 2_100_000
@@ -303,6 +305,7 @@ def build_real_user_scale_plan(
     )
     request = base.requests[0]
     body = dict(request.body)
+    body.pop("runtime_timeout_seconds", None)
     body.update(
         {
             "mode": "auto" if route_intent == "auto" else body["mode"],
@@ -1793,6 +1796,7 @@ def run_real_user_four_scale_acceptance(
                 plan,
                 wait_seconds,
                 generated_project_timeout_seconds=artifact_build_timeout_seconds,
+                runtime_observation_budget_seconds=_REAL_USER_RUNTIME_OBSERVATION_BUDGET_SECONDS,
             )
             if progress is not None:
                 progress(
@@ -1822,6 +1826,7 @@ def run_real_user_four_scale_acceptance(
                 generated_project_timeout_seconds=artifact_build_timeout_seconds,
                 progress=case_progress,
                 auto_approve_capability_requests=True,
+                runtime_observation_budget_seconds=_REAL_USER_RUNTIME_OBSERVATION_BUDGET_SECONDS,
             )
             result = runner_report.results[0]
             result_run_id = result.run_id

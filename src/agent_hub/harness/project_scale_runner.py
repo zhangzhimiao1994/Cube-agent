@@ -4,6 +4,7 @@ import argparse
 import copy
 import hashlib
 import json
+import math
 import os
 import posixpath
 import re
@@ -695,7 +696,17 @@ def execute_project_scale_plan(
     generated_project_timeout_seconds: float = 120,
     progress: Callable[[str], None] | None = None,
     auto_approve_capability_requests: bool = False,
+    runtime_observation_budget_seconds: float | None = None,
 ) -> ProjectScaleExecutionReport:
+    if runtime_observation_budget_seconds is not None:
+        wait_seconds = _effective_execute_wait_seconds(
+            plan, wait_seconds,
+            generated_project_timeout_seconds=generated_project_timeout_seconds,
+            generated_project_command_count=len(
+                generated_project_commands or _DEFAULT_GENERATED_PROJECT_COMMANDS
+            ),
+            runtime_observation_budget_seconds=runtime_observation_budget_seconds,
+        )
     validate_generated_project = validate_generated_project or plan.benchmark_kind == "capability"
     results: list[ProjectScaleCaseResult] = []
     for index, run_request in enumerate(plan.requests):
@@ -1100,6 +1111,7 @@ def execute_project_scale_plan(
                     deliverable_repair_safety_limit
                     - initial_deliverable_repair_attempt_limit,
                 ),
+                runtime_observation_budget_seconds=runtime_observation_budget_seconds,
             )
             seen_repair_progress_signatures = {repair_progress_state.signature}
             repair_progress_observed = True
@@ -1182,6 +1194,7 @@ def execute_project_scale_plan(
                         generated_project_commands or _DEFAULT_GENERATED_PROJECT_COMMANDS
                     ),
                     absolute_deadline=case_absolute_deadline,
+                    runtime_observation_budget_seconds=runtime_observation_budget_seconds,
                 )
                 if not _has_remaining_repair_wait_budget(case_deadline, wait_seconds):
                     _extend_unique(
@@ -1540,6 +1553,7 @@ def execute_project_scale_plan(
                             or _DEFAULT_GENERATED_PROJECT_COMMANDS
                         ),
                         safety_limit=case_absolute_deadline_safety_limit,
+                        runtime_observation_budget_seconds=runtime_observation_budget_seconds,
                     )
                 if evidence["workspace_bundle"]:
                     _drop_recovered_workspace_bundle_errors(errors)
@@ -1691,19 +1705,40 @@ def _acceptance_credentials_from_env() -> tuple[str | None, str | None, str | No
     return username, password, tenant_id
 
 
+def _runtime_observation_seconds(
+    request_body: Mapping[str, object], runtime_observation_budget_seconds: float | None,
+) -> float:
+    if runtime_observation_budget_seconds is not None and (
+        isinstance(runtime_observation_budget_seconds, bool)
+        or not isinstance(runtime_observation_budget_seconds, int | float)
+        or not math.isfinite(runtime_observation_budget_seconds)
+        or not 0 < runtime_observation_budget_seconds <= 3600
+    ):
+        raise ValueError("runtime observation budget must be finite and within (0, 3600]")
+    value = request_body.get("runtime_timeout_seconds")
+    if (
+        isinstance(value, int | float) and not isinstance(value, bool)
+        and math.isfinite(value) and value > 0
+    ):
+        return float(value)
+    return float(runtime_observation_budget_seconds or 0)
+
+
 def _effective_execute_wait_seconds(
     plan: ProjectScaleRunPlan,
     configured_wait_seconds: float,
     *,
     generated_project_timeout_seconds: float = 0.0,
     generated_project_command_count: int = len(_DEFAULT_GENERATED_PROJECT_COMMANDS),
+    runtime_observation_budget_seconds: float | None = None,
 ) -> float:
+    _runtime_observation_seconds({}, runtime_observation_budget_seconds)
     wait_seconds = max(configured_wait_seconds, 0.0)
     runtime_timeouts: list[float] = []
     for request in plan.requests:
-        value = request.body.get("runtime_timeout_seconds")
-        if isinstance(value, int | float) and not isinstance(value, bool) and value > 0:
-            runtime_timeouts.append(float(value))
+        value = _runtime_observation_seconds(request.body, runtime_observation_budget_seconds)
+        if value > 0:
+            runtime_timeouts.append(value)
     if runtime_timeouts:
         runtime_wait_seconds = max(runtime_timeouts)
         validation_command_count = max(generated_project_command_count, 0) + (
@@ -1731,6 +1766,7 @@ def _extend_repair_deadline(
     generated_project_timeout_seconds: float,
     generated_project_command_count: int,
     absolute_deadline: float,
+    runtime_observation_budget_seconds: float | None = None,
 ) -> float:
     repair_budget = _repair_wall_clock_budget_seconds(
         configured_wait_seconds=configured_wait_seconds,
@@ -1738,6 +1774,7 @@ def _extend_repair_deadline(
         benchmark_kind=benchmark_kind,
         generated_project_timeout_seconds=generated_project_timeout_seconds,
         generated_project_command_count=generated_project_command_count,
+        runtime_observation_budget_seconds=runtime_observation_budget_seconds,
     )
     if repair_budget <= 0:
         return deadline
@@ -1754,17 +1791,11 @@ def _repair_wall_clock_budget_seconds(
     benchmark_kind: ProjectScaleBenchmarkKind,
     generated_project_timeout_seconds: float,
     generated_project_command_count: int,
+    runtime_observation_budget_seconds: float | None = None,
 ) -> float:
+    runtime_budget = _runtime_observation_seconds(request_body, runtime_observation_budget_seconds)
     if configured_wait_seconds <= 0:
         return 0.0
-    runtime_timeout = request_body.get("runtime_timeout_seconds")
-    runtime_budget = (
-        float(runtime_timeout)
-        if isinstance(runtime_timeout, int | float)
-        and not isinstance(runtime_timeout, bool)
-        and runtime_timeout > 0
-        else 0.0
-    )
     validation_count = max(generated_project_command_count, 0) + (
         1 if benchmark_kind == "capability" else 0
     )
@@ -1785,6 +1816,7 @@ def _repair_absolute_deadline_safety_limit(
     generated_project_timeout_seconds: float,
     generated_project_command_count: int,
     additional_repair_attempts: int,
+    runtime_observation_budget_seconds: float | None = None,
 ) -> float:
     repair_budget = _repair_wall_clock_budget_seconds(
         configured_wait_seconds=configured_wait_seconds,
@@ -1792,6 +1824,7 @@ def _repair_absolute_deadline_safety_limit(
         benchmark_kind=benchmark_kind,
         generated_project_timeout_seconds=generated_project_timeout_seconds,
         generated_project_command_count=generated_project_command_count,
+        runtime_observation_budget_seconds=runtime_observation_budget_seconds,
     )
     return deadline + repair_budget * max(additional_repair_attempts, 0)
 
@@ -1805,6 +1838,7 @@ def _extend_repair_absolute_deadline(
     generated_project_timeout_seconds: float,
     generated_project_command_count: int,
     safety_limit: float,
+    runtime_observation_budget_seconds: float | None = None,
 ) -> float:
     repair_budget = _repair_wall_clock_budget_seconds(
         configured_wait_seconds=configured_wait_seconds,
@@ -1812,6 +1846,7 @@ def _extend_repair_absolute_deadline(
         benchmark_kind=benchmark_kind,
         generated_project_timeout_seconds=generated_project_timeout_seconds,
         generated_project_command_count=generated_project_command_count,
+        runtime_observation_budget_seconds=runtime_observation_budget_seconds,
     )
     return min(safety_limit, deadline + repair_budget)
 

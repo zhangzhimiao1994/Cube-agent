@@ -197,7 +197,7 @@ def test_auto_scale_plan_keeps_natural_user_request_in_auto_mode() -> None:
     assert request.body["project_label"] == "真实用户 large 验收"
     assert request.body["conversation_id"] == "conv-large-123"
     assert request.body["workspace_session_id"] == "conv-large-123"
-    assert request.body["runtime_timeout_seconds"] == 1800
+    assert "runtime_timeout_seconds" not in request.body
     assert "preview.html" in str(request.body["message"])
     assert "interactive website" in str(request.body["message"])
     assert "Use hybrid" not in str(request.body["message"])
@@ -229,6 +229,40 @@ def test_explicit_mode_capability_plans_use_the_requested_runtime_mode() -> None
         "small:hybrid",
         "small:multi_agent",
     }
+
+
+@pytest.mark.parametrize("scale", ("small", "medium", "large", "ultra"))
+@pytest.mark.parametrize("route", ("auto", "direct", "dispatch", "hybrid", "multi_agent"))
+def test_real_user_timeout_fidelity_keeps_server_default_and_request_scope(scale: str, route: str) -> None:
+    from agent_hub.harness.project_scale import build_project_scale_run_plan
+    from agent_hub.runs.service import _project_delivery_assessment
+
+    module = load_script()
+    plan = module.build_real_user_scale_plan(
+        scale=scale, route_intent=route, project_id="offline-project", project_label="offline",
+        conversation_id="offline-conversation", workspace_session_id="offline-session",
+        logical_model="deepseek",
+    )
+    body = plan.requests[0].body
+    assert "runtime_timeout_seconds" not in body
+    assert body["mode"] == ("dispatch" if route == "multi_agent" else route)
+    assert body["direct_model"] == "deepseek"
+    assert body["allowed_models"] == ("deepseek",)
+    assert body["project_id"] == "offline-project"
+    assert body["conversation_id"] == "offline-conversation"
+    assert body["workspace_session_id"] == "offline-session"
+    assessment = _project_delivery_assessment(str(body["message"]))
+    assert assessment is not None
+    assert assessment["project_scale"] == scale
+    assert assessment["runtime_timeout_source"] == "project_scale_soft_budget"
+    assert assessment["runtime_timeout_absolute_seconds"] == 3600
+    benchmark = build_project_scale_run_plan(
+        scales=(scale,), flows=("artifact_production" if route == "auto" else route,),
+        benchmark_kind="capability",
+    )
+    assert benchmark.requests[0].body["runtime_timeout_seconds"] == {
+        "small": 900, "medium": 1200, "large": 1800, "ultra": 3600,
+    }[scale]
 
 
 def test_dynamic_preview_verification_uses_public_lifecycle_and_revokes_content() -> None:
@@ -2562,6 +2596,7 @@ def matrix_harness(
 
     def execute(plan: Any, client: Any, **kwargs: object) -> ProjectScaleExecutionReport:
         assert kwargs["auto_approve_capability_requests"] is True
+        assert kwargs["runtime_observation_budget_seconds"] == 3600
         plans.append(plan)
         submitted = client.request_json(
             "POST",
@@ -2740,6 +2775,23 @@ def run_matrix(module: Any, delegate: Any, **kwargs: Any) -> dict[str, Any]:
     with TemporaryDirectory(prefix="matrix-checkpoint-") as temporary:
         options["output_path"] = str(Path(temporary) / "report.json")
         return execute()
+
+
+def test_real_user_timeout_fidelity_default_wait_survives_absent_operator(
+    matrix_harness: tuple[Any, Any, list[Any], list[str]],
+) -> None:
+    module, delegate, plans, _ = matrix_harness
+    progress: list[str] = []
+    result = run_matrix(
+        module, delegate, wait_seconds=0, artifact_build_timeout_seconds=120,
+        progress=progress.append,
+    )
+    assert result["core_acceptance_ok"] is True
+    assert len(plans) == 20
+    waits = [message for message in progress if "executing capability run" in message]
+    assert len(waits) == 20
+    assert all(message.endswith("wait budget 4980s") for message in waits)
+    assert all("runtime_timeout_seconds" not in body for body in delegate.run_bodies.values())
 
 
 def test_defer_preview_separates_twenty_deliveries_without_preview_requests(
