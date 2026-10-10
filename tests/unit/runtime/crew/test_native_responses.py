@@ -344,7 +344,11 @@ async def test_native_responses_mixed_output_cannot_execute_a_valid_tool(
         item = {"type": "web_search_call", "id": "builtin", "status": "completed"}
     case = NativeRun(tmp_path, [[tool_item(), item]])
     events: list[RunEvent] = []
-    with pytest.raises(RuntimeExecutionError, match="structured output invalid") as caught:
+    expected_failure = (
+        "model incomplete recovery budget exhausted" if boundary == "incomplete"
+        else "structured output invalid"
+    )
+    with pytest.raises(RuntimeExecutionError, match=expected_failure) as caught:
         await case.run(context, events)
     assert "PRIVATE-REFUSAL" not in str(caught.value)
     assert len(case.wire) == 1
@@ -354,6 +358,7 @@ async def test_native_responses_mixed_output_cannot_execute_a_valid_tool(
     assert case.harness.calls == []
     assert case.policy.requests == []
     assert case.executions() == []
+    assert not any(event.kind is EventKind.STEP_RETRYING for event in events)
     assert all(event.kind is not EventKind.RUNTIME_COMPLETED for event in events)
     assert not any(event.step_id == "final_response" for event in events)
     checkpoint = await case.runtime.save_checkpoint()

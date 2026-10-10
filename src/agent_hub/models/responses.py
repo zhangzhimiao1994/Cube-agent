@@ -326,7 +326,7 @@ def _parse_output(
         or _get(response, "error") is not None
         or _get(response, "incomplete_details") is not None
     ):
-        if _get(response, "status") == "incomplete":
+        if _get(response, "status") == "incomplete" and _get(response, "error") is None:
             raise rejected("incomplete", status="incomplete")
         raise rejected("invalid_output")
     output = _get(response, "output")
@@ -338,13 +338,19 @@ def _parse_output(
     permitted_names = {tool.name for tool in request.tools}
     message_count = 0
     for item in output:
+        kind = _get(item, "type")
+        if kind not in {"reasoning", "message", "function_call"}:
+            raise ResponsesContractError("Responses output item type is unsupported")
+        if kind == "message" and _get(item, "role") != "assistant":
+            raise rejected("invalid_output")
         if (
             _get(item, "error") is not None
             or _get(item, "incomplete_details") is not None
             or _get(item, "status") not in {None, "completed"}
         ):
-            raise rejected("incomplete", status="incomplete")
-        kind = _get(item, "type")
+            if _get(item, "status") == "incomplete" and _get(item, "error") is None:
+                raise rejected("incomplete", status="incomplete")
+            raise rejected("invalid_output")
         if kind == "reasoning":
             continue
         if kind == "message":
@@ -352,7 +358,7 @@ def _parse_output(
             if message_count > 1:
                 raise ResponsesContractError("Responses output has multiple final messages")
             if _get(item, "role") != "assistant" or _get(item, "status") != "completed":
-                raise rejected("incomplete", status="incomplete")
+                raise rejected("invalid_output")
             content = _get(item, "content")
             if not isinstance(content, list | tuple) or not 1 <= len(content) <= 128:
                 raise ResponsesContractError("Responses message content is invalid")

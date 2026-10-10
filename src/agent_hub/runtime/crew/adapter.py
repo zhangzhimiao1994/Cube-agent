@@ -1495,7 +1495,7 @@ class _ModelContractFailed(RuntimeExecutionError):
 
 
 class _KnownIncompleteResponse(RuntimeExecutionError):
-    """An accounted, tool-free receipt may use one bounded compact attempt."""
+    """A qualified, accounted receipt may use one bounded compact attempt."""
 
     def __init__(self, logical_model: str) -> None:
         super().__init__("model response incomplete")
@@ -2644,19 +2644,42 @@ def _known_incomplete_scope_unaccounted(receipt: GatewayCompletion | GatewayReje
     ))
 
 
+def _first_incomplete_recovery_succeeded(
+    step: DispatchStep, models: Mapping[str, Mapping[str, JsonValue]],
+) -> bool:
+    # Later tool states cannot authorize a missing first recovery request.
+    return any(
+        state.get("step_id") == step.id and state.get("actor") == step.agent
+        and state.get("purpose") == "step" and state.get("attempt") == 1
+        and state.get("call_index") == 0 and state.get("status") == "succeeded"
+        for state in models.values()
+    )
+
+
 def _known_incomplete_recovery_eligible(
     *, step: DispatchStep, request: ModelRequest, purpose: Literal["step", "review"],
     repair: Mapping[str, JsonValue] | None, evidence: RejectedOutputEvidence | None,
     tool_ledger: _ToolLedger | None,
+    attempt: int = 0, call_index: int = 0, allow_later_tools: bool = False,
 ) -> bool:
+    first_tool_call = (
+        bool(step.tools) and attempt == 0 and call_index == 0
+        and tuple(tool.name for tool in request.tools) == tuple(sorted(_tool_name_mapping(step.tools)))
+    )
     return (
         repair is None and purpose == "step" and request.response_schema is not None
-        and step.tools == () and request.tools == ()
+        and ((step.tools == () and request.tools == ()) or first_tool_call)
         and evidence is not None and evidence.status == "incomplete"
         and evidence.reason == "incomplete" and evidence.usage_status == "known"
         and evidence.usage is not None and evidence.final_text is None
         and tool_ledger is not None
-        and not any(state.get("step_id") == step.id for state in tool_ledger.states.values())
+        and not any(
+            state.get("step_id") == step.id and not (
+                first_tool_call and allow_later_tools
+                and type(state.get("attempt")) is int and cast(int, state["attempt"]) > attempt
+            )
+            for state in tool_ledger.states.values()
+        )
     )
 
 
@@ -5169,7 +5192,7 @@ class CrewDispatchRuntime:
                 or _MODEL_FALLBACK_UNAVAILABLE,
             }
             if incomplete_recovery_model is not None:
-                user["recovery"] = {
+                incomplete_recovery = {
                     "strategy": "compact_retry", "attempt": 1,
                     "compression_trigger": "incomplete_response",
                     "instruction": (
@@ -5183,6 +5206,15 @@ class CrewDispatchRuntime:
                         "Preserve required fields and facts; state blockers without inventing evidence."
                     ),
                 }
+                if step.tools:
+                    incomplete_recovery["instruction"] = (
+                        "Regenerate the first response using the unchanged role, schema and authorized tools. "
+                        "Do not continue or reconstruct the discarded incomplete response. "
+                        "Use only the original task and available source evidence. "
+                        "Use an authorized tool if needed, otherwise return complete compact JSON. "
+                        "Preserve mandatory fields and facts; never mechanically truncate or invent evidence."
+                    )
+                user["recovery"] = incomplete_recovery
         if feedback is not None:
             user["untrusted_reviewer_feedback"] = feedback
         user_text = json.dumps(user, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -5624,6 +5656,26 @@ class CrewDispatchRuntime:
         if receipt_usage is not None:
             # Rebuild the reserved request, not a smaller request after its own receipt.
             accounted_tokens = receipt_usage.total_tokens
+        if step.tools and cached is not None:
+            # Later receipts in this same recovery loop also followed the original reservation.
+            for later_key, later in ledger.states.items():
+                if (
+                    later["step_id"] != step.id or later["actor"] != cached["actor"]
+                    or later["purpose"] != cached["purpose"] or later["attempt"] != cached["attempt"]
+                    or cast(int, later["call_index"]) <= cast(int, cached["call_index"])
+                ):
+                    continue
+                later_usage = None
+                if later["status"] == "succeeded":
+                    later_artifact = ledger.artifacts.get(later_key)
+                    if later_artifact is None:
+                        _fail("model response artifact is unavailable")
+                    later_usage = self._completion_from_model_artifact(later_artifact).response.usage
+                elif later["status"] == "rejected":
+                    later_evidence = self._rejected_from_private(ledger.rejected_outputs[later_key]).evidence
+                    later_usage = later_evidence.usage if later_evidence is not None else None
+                if later_usage is not None:
+                    accounted_tokens += later_usage.total_tokens
         return min(
             current_token_budget(context) - usage.tokens,
             self._plan.total_token_budget - usage.tokens,
@@ -5873,6 +5925,7 @@ class CrewDispatchRuntime:
                 and _known_incomplete_recovery_eligible(
                     step=step, request=request, purpose=purpose, repair=repair,
                     evidence=rejected.evidence, tool_ledger=tool_ledger,
+                    attempt=attempt, call_index=index,
                 )
             )
             rejected_state = dict(running)
@@ -5892,6 +5945,9 @@ class CrewDispatchRuntime:
         if qualified_incomplete and actor == step.agent and _known_incomplete_recovery_eligible(
             step=step, request=request, purpose=purpose, repair=repair,
             evidence=evidence, tool_ledger=tool_ledger,
+            attempt=attempt, call_index=index, allow_later_tools=(
+                existing is not None and _first_incomplete_recovery_succeeded(step, ledger.states)
+            ),
         ):
             raise _KnownIncompleteResponse(rejected.logical_model)
         if (
@@ -6090,6 +6146,28 @@ class CrewDispatchRuntime:
             round_required_capabilities = set(required_capabilities)
             if force_result_synthesis:
                 round_required_capabilities.discard(ModelCapability.TOOL_CALLING)
+            round_output_tokens = max_output_tokens
+            if incomplete_recovery_model is not None and request_tools:
+                round_key = self._model_call_key(
+                    context.run_id, step.id, model_attempt, "step", agent.id, call_cursor.value,
+                )
+                round_output_tokens = min(
+                    max_output_tokens, self._incomplete_recovery_remaining_tokens(
+                        context, step, model_ledger, round_key,
+                    ),
+                )
+                if round_output_tokens <= 0:
+                    _fail("model incomplete recovery budget exhausted")
+                cached_round = model_ledger.states.get(round_key)
+                if cached_round is None or cached_round["status"] == "prepared":
+                    usage = model_ledger.usage
+                    if usage is None or usage.terminal_phase is not None:
+                        _fail("model incomplete recovery accounting unavailable")
+                    if (
+                        usage.cost_usd >= self._plan.total_cost_usd
+                        or usage.step_costs_usd.get(step.id, Decimal(0)) >= step.cost_budget_usd
+                    ):
+                        _fail("model incomplete recovery budget exhausted")
             await emit(
                 kind=EventKind.MODEL_STARTED,
                 actor=agent.id,
@@ -6124,10 +6202,10 @@ class CrewDispatchRuntime:
                 timeout_seconds=_model_call_timeout_seconds(
                     context,
                     remaining_seconds=remaining_timeout,
-                    max_output_tokens=max_output_tokens,
+                    max_output_tokens=round_output_tokens,
                     purpose="step",
                 ),
-                max_output_tokens=max_output_tokens,
+                max_output_tokens=round_output_tokens,
                 response_schema=response_schema,
                 tools=round_tools,
                 allow_fallback=incomplete_recovery_model is None,
@@ -8783,11 +8861,19 @@ class CrewDispatchRuntime:
                 if (
                     state["status"] != "rejected" or state["purpose"] != "step"
                     or state["actor"] != step.agent or state["call_index"] != 0
-                    or step.tools != () or _agent_response_schema(agent) is None
+                    or _agent_response_schema(agent) is None
+                    or (step.tools and (
+                        state["attempt"] != 0 or _is_project_scale_tool_contract_step(step)
+                        or _is_incremental_workspace_contract_step(step)
+                    ))
                     or evidence is None or evidence.reason != "incomplete"
                     or evidence.status != "incomplete" or evidence.usage_status != "known"
                     or evidence.usage is None or evidence.final_text is not None
-                    or any(tool["step_id"] == step.id for tool in tools.values())
+                    or (step.tools and any(tool["step_id"] == step.id for tool in tools.values())
+                        and not _first_incomplete_recovery_succeeded(step, models))
+                    or any(tool["step_id"] == step.id and (
+                        not step.tools or cast(int, tool["attempt"]) <= cast(int, state["attempt"])
+                    ) for tool in tools.values())
                 ):
                     _fail("runtime checkpoint incomplete qualification is invalid")
         step_ids = {step.id for step in plan.steps}
