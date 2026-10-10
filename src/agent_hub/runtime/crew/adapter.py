@@ -2629,6 +2629,23 @@ def _structured_correction_output_limit(
     return min(output_limit, remaining_tokens, 1_000_000)
 
 
+def _post_tool_finalization_output_limit(
+    request: ModelRequest,
+    evidence: RejectedOutputEvidence,
+    remaining_tokens: int,
+) -> int:
+    output_limit = request.max_output_tokens
+    if (
+        evidence.status == "incomplete" and evidence.reason == "incomplete"
+        and evidence.final_text is None and evidence.usage_status == "known"
+        and evidence.usage is not None
+        and evidence.usage.completion_tokens >= output_limit - max(1, output_limit // 100)
+    ):
+        # Expand only the existing finalization; saturation does not identify a provider stop cause.
+        output_limit *= 2
+    return min(output_limit, remaining_tokens, 1_000_000)
+
+
 def _known_incomplete_scope_unaccounted(receipt: GatewayCompletion | GatewayRejectedOutput) -> bool:
     if not isinstance(receipt, GatewayRejectedOutput):
         return False
@@ -3799,7 +3816,10 @@ class CrewDispatchRuntime:
                 state.workspace_delivery_continuation = cast(
                     bool, restored.state.get("workspace_delivery_continuation", False),
                 )
-                if context.checkpoint is None or context.checkpoint.id != restored.id:
+                if (
+                    context.checkpoint is None or context.checkpoint.id != restored.id
+                    or context.checkpoint.state_sha256 != restored.state_sha256
+                ):
                     _fail("runtime checkpoint mismatch")
                 if restored.runtime_version in _REMAINING_TIMEOUT_RUNTIME_VERSIONS:
                     saved_remaining = cast(
@@ -3842,6 +3862,16 @@ class CrewDispatchRuntime:
 
             if restored is not None:
                 hydrating_restored = True
+                saved_models = cast(Mapping[str, Mapping[str, JsonValue]], restored.state["models"])
+                saved_repairs = cast(
+                    Mapping[str, Mapping[str, JsonValue]], restored.state["structured_repairs"],
+                )
+                if any(
+                    reservation.get("mode") == "post_tool_finalization"
+                    and saved_models[cast(str, reservation["correction_key"])]["status"] == "prepared"
+                    for reservation in saved_repairs.values()
+                ):
+                    self._post_tool_finalization_remaining_timeout(context, state)
                 (
                     completed,
                     retry_counts,
@@ -5850,6 +5880,9 @@ class CrewDispatchRuntime:
             elif existing["status"] != "prepared":
                 _fail("model ledger state is invalid")
         if rejected is None:
+            post_tool_finalization = repair is not None and repair.get("mode") == "post_tool_finalization"
+            if post_tool_finalization:
+                self._post_tool_finalization_remaining_timeout(context, run_state, step_deadline)
             if current_token_budget(context) <= 0:
                 _fail("dispatch budget exhausted")
             prepared: Mapping[str, JsonValue] = existing or {
@@ -5863,6 +5896,8 @@ class CrewDispatchRuntime:
             running["status"] = "running"
             if not self._accepts_artifact_writes(run_state):
                 raise asyncio.CancelledError
+            if post_tool_finalization:
+                self._post_tool_finalization_remaining_timeout(context, run_state, step_deadline)
             await model_boundary(key, running)
             completion: GatewayCompletion | None = None
             gateway_failure: RuntimeExecutionError | None = None
@@ -6211,8 +6246,9 @@ class CrewDispatchRuntime:
             or usage.step_costs_usd.get(step.id, Decimal(0)) >= step.cost_budget_usd
         ):
             _fail("post-tool finalization budget exhausted")
-        output_tokens = min(request.max_output_tokens, remaining) if previous is None else cast(
-            int, previous["max_output_tokens"],
+        output_tokens = (
+            _post_tool_finalization_output_limit(request, evidence, remaining)
+            if previous is None else cast(int, previous["max_output_tokens"])
         )
         if cached is not None and cached["status"] == "prepared" and output_tokens > remaining:
             _fail("post-tool finalization request changed after checkpoint")
@@ -6228,8 +6264,10 @@ class CrewDispatchRuntime:
         correction = replace(
             request, messages=messages, tools=(),
             required_capabilities=request.required_capabilities - {ModelCapability.TOOL_CALLING},
-            allow_fallback=False, timeout_seconds=min(
-                request.timeout_seconds, self._remaining_timeout(run_state, step_deadline),
+            allow_fallback=False, timeout_seconds=(
+                min(request.timeout_seconds, self._post_tool_finalization_remaining_timeout(
+                    context, run_state, step_deadline,
+                )) if cached is None or cached["status"] == "prepared" else request.timeout_seconds
             ),
             max_output_tokens=output_tokens,
         )
@@ -6250,6 +6288,16 @@ class CrewDispatchRuntime:
             if any(previous.get(field) != value for field, value in reservation.items() if field != "status"):
                 _fail("post-tool finalization changed after checkpoint")
             reservation = previous
+        if cached is None or cached["status"] == "prepared":
+            limits = self._content_limits(
+                context, logical_model=correction.logical_model,
+                max_output_tokens=correction.max_output_tokens, source_count=len(sources),
+            )
+            self._normalize_crewai_messages(
+                [{"role": message.role, "content": message.content} for message in correction.messages],
+                max_prompt_bytes=limits.prompt_bytes,
+                message_limit=limits.interaction_message_limit,
+            )
         return await self._execute_model_request(
             context, step, actor, correction, purpose="step", attempt=attempt, cursor=cursor,
             ledger=ledger, sources=sources, emit=emit, model_boundary=model_boundary,
@@ -8152,6 +8200,24 @@ class CrewDispatchRuntime:
     def _finish_cleanup_task(self, task: asyncio.Task[Any]) -> None:
         self._cleanup_tasks.discard(task)
         self._retrieve_detached_task(task)
+
+    def _post_tool_finalization_remaining_timeout(
+        self, context: TaskContext, run_state: _RunState, step_deadline: float | None = None,
+    ) -> float:
+        checkpoint = context.checkpoint
+        if checkpoint is not None and checkpoint.state.get(
+            "remaining_absolute_timeout_seconds", checkpoint.state.get("remaining_timeout_seconds"),
+        ) == 0:
+            raise _ModelContractFailed("post-tool finalization deadline exhausted") from None
+        try:
+            return self._remaining_timeout(run_state, step_deadline)
+        except RuntimeExecutionError as error:
+            reason = (
+                "post-tool finalization deadline exhausted"
+                if str(error) == "dispatch deadline exhausted"
+                else "post-tool finalization deadline unavailable"
+            )
+            raise _ModelContractFailed(reason) from None
 
     @staticmethod
     def _remaining_timeout(run_state: _RunState, step_deadline: float | None = None) -> float:

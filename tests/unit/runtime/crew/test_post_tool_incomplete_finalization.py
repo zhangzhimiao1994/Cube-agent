@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import replace
 from decimal import Decimal
@@ -25,11 +26,15 @@ from agent_hub.models.gateway import (
 from agent_hub.models.litellm_client import LiteLLMClient, OpenAIClientFactory
 from agent_hub.models.registry import ModelRegistry
 from agent_hub.models.types import ModelCapability, ModelRequest, RejectedUsageStatus, ToolCall
-from agent_hub.runtime.artifacts import InMemoryArtifactRepository
+from agent_hub.runtime.artifacts import ArtifactReference, InMemoryArtifactRepository
 from agent_hub.runtime.contracts import Artifact, EventKind, RuntimeCheckpoint
+from agent_hub.runtime.crew import adapter
 from agent_hub.runtime.crew.adapter import CrewDispatchRuntime, RuntimeExecutionError
 from tests.unit.models.test_gateway import CapacityStub, SecretStub, deployment, lease
-from tests.unit.runtime.crew.test_adapter_failure_reason import RecordingHarnessToolGateway
+from tests.unit.runtime.crew.test_adapter_failure_reason import (
+    RecordingHarnessToolGateway,
+    _context,
+)
 from tests.unit.runtime.crew.test_known_incomplete_recovery import collect
 from tests.unit.runtime.crew.test_structured_repair_output_budget import mapping
 from tests.unit.runtime.crew.test_tool_incomplete_cost_boundary import cost_plan
@@ -73,7 +78,7 @@ async def test_completed_tool_then_known_incomplete_finalizes_once() -> None:
     assert finalization.response_schema == source.response_schema
     assert finalization.tools == () and not finalization.allow_fallback
     assert ModelCapability.TOOL_CALLING not in finalization.required_capabilities
-    assert finalization.max_output_tokens <= source.max_output_tokens
+    assert 0 < finalization.max_output_tokens <= 2 * source.max_output_tokens
     prompt = " ".join(str(message.content) for message in finalization.messages)
     assert "UNTRUSTED_CAPABILITY_RESULTS_JSON" in prompt
     assert "POST_TOOL_FINALIZATION" in prompt
@@ -597,7 +602,11 @@ async def test_prepared_review_candidate_mismatch_never_issues_model_or_tool(cha
     assert altered.to_payload() == before
 
 
-async def test_expired_prepared_finalization_checkpoint_never_issues_model_or_tool() -> None:
+@pytest.mark.parametrize("remaining", [0.0, 60.0])
+@pytest.mark.parametrize("slow_artifacts", [False, True])
+async def test_expired_prepared_finalization_checkpoint_never_issues_model_or_tool(
+    remaining: float, slow_artifacts: bool, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     repository = InMemoryArtifactRepository()
     dispatch = tool_plan()
     original = subject(PostToolGateway("tool", "incomplete", "success", "final"), dispatch,
@@ -607,14 +616,42 @@ async def test_expired_prepared_finalization_checkpoint_never_issues_model_or_to
                       and len(draft_models(event.checkpoint)) == 3
                       and draft_models(event.checkpoint)[-1]["status"] == "prepared")
     payload: dict[str, Any] = checkpoint.to_payload()
-    payload["state"]["remaining_timeout_seconds"] = 0.0
+    payload["state"]["remaining_timeout_seconds"] = remaining
     payload["state"]["remaining_absolute_timeout_seconds"] = 0.0
     payload["state_sha256"] = ""
     expired = RuntimeCheckpoint.from_payload(payload)
+    before = expired.to_payload()
+    artifacts_before = dict(repository._artifacts)
+    reads: list[tuple[ArtifactReference, ...]] = []
+    if slow_artifacts:
+        get_many = repository.get_many
+
+        async def slow_get_many(
+            tenant_id: UUID, run_id: UUID, references: tuple[ArtifactReference, ...],
+        ) -> tuple[Artifact, ...]:
+            reads.append(references)
+            await asyncio.sleep(0.01)
+            return await get_many(tenant_id, run_id, references)
+
+        monkeypatch.setattr(repository, "get_many", slow_get_many)
     gateway = PostToolGateway("success", "final")
     harness = RecordingHarnessToolGateway()
     restored = subject(gateway, dispatch, repository, harness)
-    with pytest.raises(RuntimeExecutionError, match="checkpoint|deadline|timeout"):
+    resumed_events = []
+    with pytest.raises(RuntimeExecutionError) as failure:
         await restored.restore_checkpoint(expired)
-        await collect(restored, checkpoint=expired)
+        async for event in restored.run(_context(token_budget=30000, checkpoint=expired)):
+            resumed_events.append(event)
     assert gateway.requests == [] and harness.calls == []
+    assert reads == []
+    assert all(event.kind is not EventKind.STEP_RETRYING for event in resumed_events)
+    saved = await restored.save_checkpoint()
+    for field in ("models", "rejected_outputs", "structured_repairs", "usage", "step_usage",
+                  "tools", "artifact_registry"):
+        assert saved.state[field] == expired.state[field], field
+    assert repository._artifacts == artifacts_before
+    assert expired.to_payload() == before
+    assert isinstance(failure.value, adapter._ModelContractFailed)
+    assert str(failure.value) == "post-tool finalization deadline exhausted"
+    assert get_gateway_scope_diagnostic(failure.value) is None
+    assert adapter._registered_gateway_scope_diagnostic(failure.value) is None
