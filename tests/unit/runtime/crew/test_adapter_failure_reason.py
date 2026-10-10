@@ -2584,20 +2584,27 @@ async def test_mixed_reused_results_do_not_extend_tool_round_budget() -> None:
 @pytest.mark.parametrize("reviewed", [False, True])
 async def test_tool_progress_crosses_initial_step_deadline_without_retry(
     reviewed: bool,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    loop = asyncio.get_running_loop()
+    now = loop.time()
+    elapsed = 0.0
+
     class TimedProgressGateway:
         def __init__(self) -> None:
             self.requests: list[ModelRequest] = []
             self.started_at: float | None = None
 
         async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
-            loop = asyncio.get_running_loop()
+            nonlocal elapsed
             if self.started_at is None:
                 self.started_at = loop.time()
             self.requests.append(request)
             index = len(self.requests)
             targets = (0.10, 0.25, 0.45, 0.60, 0.65)
-            await asyncio.sleep(max(0, self.started_at + targets[min(index, 5) - 1] - loop.time()))
+            elapsed = targets[min(index, 5) - 1]
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
             response = (
                 ModelResponse(
                     text=None,
@@ -2634,15 +2641,19 @@ async def test_tool_progress_crosses_initial_step_deadline_without_retry(
     )
     events: list[RunEvent] = []
     completions_at: list[float] = []
-    async for event in runtime.run(_context(
-        timeout_seconds=5, routing_decision={"project_scale": "medium"},
-    )):
-        events.append(event)
-        if event.kind is EventKind.TOOL_COMPLETED:
-            completions_at.append(asyncio.get_running_loop().time())
+    # Use the real scheduler and timeout handlers with a scoped, controlled clock.
+    with monkeypatch.context() as clock:
+        clock.setattr(loop, "time", lambda: now + elapsed)
+        async for event in runtime.run(_context(
+            timeout_seconds=5, routing_decision={"project_scale": "medium"},
+        )):
+            events.append(event)
+            if event.kind is EventKind.TOOL_COMPLETED:
+                completions_at.append(loop.time())
 
     assert gateway.started_at is not None
     assert completions_at[-1] > gateway.started_at + 0.4
+    assert elapsed < 5
     assert len(harness.calls) == 3
     assert len(gateway.requests) == (5 if reviewed else 4)
     assert not any(event.kind in {EventKind.STEP_RETRYING, EventKind.STEP_FAILED} for event in events)
