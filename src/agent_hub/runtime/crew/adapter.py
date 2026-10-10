@@ -42,12 +42,17 @@ from agent_hub.domain.runs import TaskMode
 from agent_hub.harness import HarnessToolGateway
 from agent_hub.harness.events import safe_tool_event_payload
 from agent_hub.harness.types import HarnessToolCallRequest, HarnessToolCallResult
-from agent_hub.models.failure_receipt import MAX_GATEWAY_FAILURE_ATTEMPTS
+from agent_hub.models.failure_receipt import (
+    MAX_GATEWAY_FAILURE_ATTEMPTS,
+    get_gateway_failure_receipt,
+)
 from agent_hub.models.gateway import (
     GatewayCompletion,
     GatewayRejectedOutput,
     GatewayResponseCancelled,
     GatewayScopeDiagnostic,
+    ScopeIncompletePhase,
+    ScopeIncompleteReason,
     get_gateway_scope_diagnostic,
 )
 from agent_hub.models.registry import ModelRegistry, NoCapableDeployment
@@ -1489,6 +1494,14 @@ class _ModelContractFailed(RuntimeExecutionError):
     """A contract failure cannot restart paid business or review work."""
 
 
+class _KnownIncompleteResponse(RuntimeExecutionError):
+    """An accounted, tool-free receipt may use one bounded compact attempt."""
+
+    def __init__(self, logical_model: str) -> None:
+        super().__init__("model response incomplete")
+        self.logical_model = logical_model
+
+
 class _GatewayScopeFailure(RuntimeExecutionError):
     """Carries only an issuer-verified immutable diagnostic, never its exception."""
 
@@ -2616,6 +2629,37 @@ def _structured_correction_output_limit(
     return min(output_limit, remaining_tokens, 1_000_000)
 
 
+def _known_incomplete_scope_unaccounted(receipt: GatewayCompletion | GatewayRejectedOutput) -> bool:
+    if not isinstance(receipt, GatewayRejectedOutput):
+        return False
+    evidence = receipt.evidence
+    if evidence is None or evidence.status != "incomplete" or evidence.reason != "incomplete":
+        return False
+    scope = get_gateway_scope_diagnostic(receipt)
+    history = get_gateway_failure_receipt(receipt)
+    return history is not None or (scope is not None and not (
+        scope.phase is ScopeIncompletePhase.TRANSPORT
+        and scope.reason is ScopeIncompleteReason.REJECTED_OUTPUT
+        and scope.transport_entered_count == 1 and scope.failure_attempt_count == 0
+    ))
+
+
+def _known_incomplete_recovery_eligible(
+    *, step: DispatchStep, request: ModelRequest, purpose: Literal["step", "review"],
+    repair: Mapping[str, JsonValue] | None, evidence: RejectedOutputEvidence | None,
+    tool_ledger: _ToolLedger | None,
+) -> bool:
+    return (
+        repair is None and purpose == "step" and request.response_schema is not None
+        and step.tools == () and request.tools == ()
+        and evidence is not None and evidence.status == "incomplete"
+        and evidence.reason == "incomplete" and evidence.usage_status == "known"
+        and evidence.usage is not None and evidence.final_text is None
+        and tool_ledger is not None
+        and not any(state.get("step_id") == step.id for state in tool_ledger.states.values())
+    )
+
+
 def _can_compact_retry_subagent(
     diagnostic: Mapping[str, object],
     *,
@@ -2624,6 +2668,8 @@ def _can_compact_retry_subagent(
     max_recovery_attempts: int = _STEP_TIMEOUT_RECOVERY_RETRIES,
 ) -> bool:
     error_code = diagnostic.get("error_code")
+    if error_code == "model.incomplete_response":
+        return False
     retryable_compact_error = (
         diagnostic.get("retryable") is True
         and (
@@ -2667,6 +2713,7 @@ def _recovery_status_after_attempts(
         in {
             "crew.step_timeout",
             "model.empty_response",
+            "model.incomplete_response",
             "model.capacity_unavailable",
             "model.provider_rate_limited",
             "model.provider_unavailable",
@@ -2678,7 +2725,10 @@ def _recovery_status_after_attempts(
             diagnostic.get("error_code") != "model.provider_transport_failed"
             or diagnostic.get("status_code") is None
         )
-        and recovery_attempts >= max_recovery_attempts
+        and recovery_attempts >= (
+            1 if diagnostic.get("error_code") == "model.incomplete_response"
+            else max_recovery_attempts
+        )
         else "failed_without_compact_retry"
     )
 
@@ -3786,6 +3836,14 @@ class CrewDispatchRuntime:
                 rebind_token_budget(context, hydrated_context)
                 context = hydrated_context
                 input_snapshot_ready = True
+                # Keep the validated receipt boundary saveable if compact replay fails early.
+                if any(
+                    private["disposition"] == "rejected" and private["reason"] == "incomplete"
+                    and private["output_status"] == "incomplete"
+                    and private["usage_status"] == "known"
+                    for private in model_ledger.rejected_outputs.values()
+                ):
+                    self._publish_checkpoint(state, restored)
                 restored_repair_contract_ids = restored.state.get("repair_reopened_contract_ids")
                 if isinstance(restored_repair_contract_ids, tuple) and all(
                     type(item) is str for item in restored_repair_contract_ids
@@ -4036,7 +4094,10 @@ class CrewDispatchRuntime:
                         or step_cost_overflow
                     ):
                         terminal_phase = "audit_overflow"
-                    elif terminal_phase is None and response_usage is None:
+                    elif terminal_phase is None and (
+                        response_usage is None
+                        or _known_incomplete_scope_unaccounted(completion)
+                    ):
                         terminal_phase = "unaccounted"
                     elif terminal_phase is None and (
                         new_tokens > min(current_token_budget(context), plan.total_token_budget)
@@ -4557,6 +4618,7 @@ class CrewDispatchRuntime:
             step_deadline = deadline
 
         recovery_attempt = 0
+        incomplete_recovery_model: str | None = None
         while True:
             attempt_sources = self._ordered_artifacts(
                 (*sources, *((feedback_artifact,) if feedback_artifact is not None else ())),
@@ -4596,6 +4658,7 @@ class CrewDispatchRuntime:
                     step_deadline,
                     use_repair_tool_keys=use_repair_tool_keys,
                     on_step_progress=advance_step_deadline,
+                    incomplete_recovery_model=incomplete_recovery_model,
                 )
                 completion = _project_scale_structured_role_completion(step, agent, completion)
                 _validate_structured_role_output(plan, step, agent, completion.response.text)
@@ -4831,14 +4894,52 @@ class CrewDispatchRuntime:
                 diagnostic: dict[str, object] = dict(
                     runtime_failure_diagnostic_from_reason(failure_reason)
                 )
-                if not isinstance(error, (_ReviewFailed, _ModelContractFailed)) and _can_compact_retry_subagent(
-                    diagnostic,
-                    recovery_attempt=recovery_attempt,
-                    remaining_seconds=self._remaining_timeout(run_state),
-                    max_recovery_attempts=_subagent_recovery_attempt_limit(agent),
+                is_incomplete = isinstance(error, _KnownIncompleteResponse)
+                if is_incomplete and recovery_attempt == 0:
+                    usage = model_ledger.usage
+                    if usage is None or usage.terminal_phase is not None:
+                        _fail("model incomplete recovery accounting unavailable")
+                    recovery_key = self._model_call_key(
+                        context.run_id, step.id, _subagent_model_attempt(
+                            retries, 1, _subagent_recovery_attempt_limit(agent),
+                        ), "step", agent.id, 0,
+                    )
+                    cached_recovery = model_ledger.states.get(recovery_key)
+                    received_recovery = (
+                        cached_recovery is not None
+                        and cached_recovery["status"] in {"succeeded", "rejected"}
+                    )
+                    if not received_recovery and (
+                        self._incomplete_recovery_remaining_tokens(
+                            context, step, model_ledger, recovery_key,
+                        ) <= 0
+                        or usage.cost_usd >= plan.total_cost_usd
+                        or usage.step_costs_usd.get(step.id, Decimal(0)) >= step.cost_budget_usd
+                    ):
+                        _fail("model incomplete recovery budget exhausted")
+                if (
+                    incomplete_recovery_model is None
+                    and not isinstance(error, (_ReviewFailed, _ModelContractFailed))
+                    and (
+                        (
+                            is_incomplete and recovery_attempt == 0
+                            and self._remaining_timeout(run_state, step_deadline)
+                            > _STEP_TIMEOUT_RETRY_MIN_REMAINING_SECONDS
+                        )
+                        or (
+                            not is_incomplete and _can_compact_retry_subagent(
+                                diagnostic, recovery_attempt=recovery_attempt,
+                                remaining_seconds=self._remaining_timeout(run_state),
+                                max_recovery_attempts=_subagent_recovery_attempt_limit(agent),
+                            )
+                        )
+                    )
                 ):
                     recovery_attempt += 1
-                    step_deadline = self._recovery_step_deadline(run_state, step_deadline, step)
+                    if isinstance(error, _KnownIncompleteResponse):
+                        incomplete_recovery_model = error.logical_model
+                    else:
+                        step_deadline = self._recovery_step_deadline(run_state, step_deadline, step)
                     await event(
                         kind=EventKind.STEP_RETRYING,
                         step_id=step.id,
@@ -4847,14 +4948,14 @@ class CrewDispatchRuntime:
                         payload={
                             "attempt": retries + recovery_attempt + 1,
                             "role": agent.role,
-                            "logical_model": _agent_logical_model_for_recovery(
+                            "logical_model": incomplete_recovery_model or _agent_logical_model_for_recovery(
                                 agent,
                                 recovery_attempt,
                             ),
                             **_subagent_recovery_payload(
                                 status="retrying_after_compact_trigger",
                                 recovery_attempt=recovery_attempt,
-                                model_fallback=_agent_model_fallback_label(
+                                model_fallback=None if is_incomplete else _agent_model_fallback_label(
                                     agent,
                                     recovery_attempt,
                                 ),
@@ -4867,8 +4968,13 @@ class CrewDispatchRuntime:
                 recovery_status = _recovery_status_after_attempts(
                     diagnostic,
                     recovery_attempts=recovery_attempt,
-                    max_recovery_attempts=_subagent_recovery_attempt_limit(agent),
+                    max_recovery_attempts=(
+                        1 if incomplete_recovery_model is not None
+                        else _subagent_recovery_attempt_limit(agent)
+                    ),
                 )
+                if incomplete_recovery_model is not None:
+                    recovery_status = "failed_after_compact_retry"
                 if recovery_status == "failed_after_compact_retry":
                     diagnostic = {
                         **diagnostic,
@@ -5002,10 +5108,11 @@ class CrewDispatchRuntime:
         *,
         use_repair_tool_keys: bool = False,
         on_step_progress: Callable[[float], None] | None = None,
+        incomplete_recovery_model: str | None = None,
     ) -> tuple[GatewayCompletion, tuple[Artifact, ...]]:
         content_limits = self._content_limits(
             context,
-            logical_model=_agent_logical_model_for_recovery(agent, recovery_attempt),
+            logical_model=incomplete_recovery_model or _agent_logical_model_for_recovery(agent, recovery_attempt),
             max_output_tokens=min(agent.max_output_tokens, step.token_budget),
             source_count=len(sources),
         )
@@ -5061,6 +5168,21 @@ class CrewDispatchRuntime:
                 "model_fallback": _agent_model_fallback_label(agent, recovery_attempt)
                 or _MODEL_FALLBACK_UNAVAILABLE,
             }
+            if incomplete_recovery_model is not None:
+                user["recovery"] = {
+                    "strategy": "compact_retry", "attempt": 1,
+                    "compression_trigger": "incomplete_response",
+                    "instruction": (
+                        "Return a complete compact JSON object satisfying the unchanged schema. "
+                        "Do not continue or reconstruct the discarded incomplete response. "
+                        "Use only the original task and available source evidence. "
+                        "Omit optional elaboration. Prefer concise strings (approximately 512 characters) "
+                        "and short arrays (approximately four items), only when compatible with the "
+                        "unchanged schema and required facts. "
+                        "Schema minima and mandatory entries take priority. Never mechanically truncate. "
+                        "Preserve required fields and facts; state blockers without inventing evidence."
+                    ),
+                }
         if feedback is not None:
             user["untrusted_reviewer_feedback"] = feedback
         user_text = json.dumps(user, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -5112,6 +5234,7 @@ class CrewDispatchRuntime:
                     step_deadline,
                     use_repair_tool_keys=use_repair_tool_keys,
                     on_step_progress=advance_step_deadline,
+                    incomplete_recovery_model=incomplete_recovery_model,
                 )
                 text = last_completion.response.text
                 if text is None:
@@ -5481,6 +5604,32 @@ class CrewDispatchRuntime:
             )
         return None
 
+    def _incomplete_recovery_remaining_tokens(
+        self, context: TaskContext, step: DispatchStep, ledger: _ModelLedger, key: str,
+    ) -> int:
+        usage = ledger.usage
+        if usage is None or usage.terminal_phase is not None:
+            _fail("model incomplete recovery accounting unavailable")
+        accounted_tokens = 0
+        cached = ledger.states.get(key)
+        receipt_usage: TokenUsage | None = None
+        if cached is not None and cached["status"] == "succeeded":
+            artifact = ledger.artifacts.get(key)
+            if artifact is None:
+                _fail("model response artifact is unavailable")
+            receipt_usage = self._completion_from_model_artifact(artifact).response.usage
+        elif cached is not None and cached["status"] == "rejected":
+            evidence = self._rejected_from_private(ledger.rejected_outputs[key]).evidence
+            receipt_usage = evidence.usage if evidence is not None else None
+        if receipt_usage is not None:
+            # Rebuild the reserved request, not a smaller request after its own receipt.
+            accounted_tokens = receipt_usage.total_tokens
+        return min(
+            current_token_budget(context) - usage.tokens,
+            self._plan.total_token_budget - usage.tokens,
+            step.token_budget - usage.step_tokens.get(step.id, 0),
+        ) + accounted_tokens
+
     async def _execute_model_request(
         self, context: TaskContext, step: DispatchStep, actor: str,
         request: ModelRequest, *, purpose: Literal["step", "review"], attempt: int,
@@ -5489,6 +5638,7 @@ class CrewDispatchRuntime:
         run_state: _RunState, step_deadline: float,
         repair: Mapping[str, JsonValue] | None = None,
         tool_ledger: _ToolLedger | None = None,
+        allow_structured_repair: bool = True,
     ) -> tuple[GatewayCompletion, Artifact]:
         if request.response_schema is not None:
             _structured_validator(request.response_schema)
@@ -5500,6 +5650,7 @@ class CrewDispatchRuntime:
         existing = ledger.states.get(key)
         rejected: GatewayRejectedOutput | None = None
         policy_failure: str | None = None
+        qualified_incomplete = False
         if existing is not None:
             if existing["request_sha256"] != request_sha:
                 _fail("model request changed after checkpoint")
@@ -5535,7 +5686,9 @@ class CrewDispatchRuntime:
                 if private["source_ids"] != tuple(str(source.id) for source in sources):
                     _fail("model sources changed after checkpoint")
                 rejected = self._rejected_from_private(private)
-                if existing["failure_reason"] != "structured output rejected":
+                if existing["failure_reason"] == "model response incomplete":
+                    qualified_incomplete = True
+                elif existing["failure_reason"] != "structured output rejected":
                     policy_failure = cast(str, existing["failure_reason"])
             elif existing["status"] != "prepared":
                 _fail("model ledger state is invalid")
@@ -5714,10 +5867,20 @@ class CrewDispatchRuntime:
                 )
                 return completion, artifact
             private = self._rejected_private_payload(rejected, sources)
+            qualified_incomplete = (
+                policy_failure is None and actor == step.agent
+                and not _known_incomplete_scope_unaccounted(rejected)
+                and _known_incomplete_recovery_eligible(
+                    step=step, request=request, purpose=purpose, repair=repair,
+                    evidence=rejected.evidence, tool_ledger=tool_ledger,
+                )
+            )
             rejected_state = dict(running)
             rejected_state.update(
                 status="rejected", sha256=private["text_sha256"], provenance=private["provenance"],
-                failure_reason=policy_failure or "structured output rejected",
+                failure_reason=policy_failure or (
+                    "model response incomplete" if qualified_incomplete else "structured output rejected"
+                ),
             )
             await self._run_commit(usage_boundary(
                 rejected, actor, step.id, key, rejected_state, None, private_output=private,
@@ -5725,9 +5888,15 @@ class CrewDispatchRuntime:
         evidence = rejected.evidence
         if policy_failure is not None:
             raise _ModelContractFailed(policy_failure)
+        # Legacy receipts lost gateway scope history; final known usage cannot qualify them.
+        if qualified_incomplete and actor == step.agent and _known_incomplete_recovery_eligible(
+            step=step, request=request, purpose=purpose, repair=repair,
+            evidence=evidence, tool_ledger=tool_ledger,
+        ):
+            raise _KnownIncompleteResponse(rejected.logical_model)
         if (
             repair is not None or evidence is None or not evidence.correction_eligible
-            or request.response_schema is None
+            or request.response_schema is None or not allow_structured_repair
         ):
             raise _ModelContractFailed("structured output invalid")
         previous_repair = ledger.structured_repairs.get(step.id)
@@ -5845,11 +6014,22 @@ class CrewDispatchRuntime:
         *,
         use_repair_tool_keys: bool = False,
         on_step_progress: Callable[[float], None] | None = None,
+        incomplete_recovery_model: str | None = None,
     ) -> GatewayCompletion:
         max_output_tokens = min(agent.max_output_tokens, step.token_budget)
+        if incomplete_recovery_model is not None:
+            max_output_tokens = min(
+                max_output_tokens, self._incomplete_recovery_remaining_tokens(
+                    context, step, model_ledger, self._model_call_key(
+                        context.run_id, step.id, model_attempt, "step", agent.id, call_cursor.value,
+                    ),
+                ),
+            )
+            if max_output_tokens <= 0:
+                _fail("model incomplete recovery budget exhausted")
         content_limits = self._content_limits(
             context,
-            logical_model=_agent_logical_model_for_recovery(agent, recovery_attempt),
+            logical_model=incomplete_recovery_model or _agent_logical_model_for_recovery(agent, recovery_attempt),
             max_output_tokens=max_output_tokens,
             source_count=len(input_sources),
         )
@@ -5880,7 +6060,7 @@ class CrewDispatchRuntime:
             required_capabilities.add(ModelCapability.TOOL_CALLING)
         if response_schema is not None:
             required_capabilities.add(ModelCapability.STRUCTURED_OUTPUT)
-        logical_model = _agent_logical_model_for_recovery(agent, recovery_attempt)
+        logical_model = incomplete_recovery_model or _agent_logical_model_for_recovery(agent, recovery_attempt)
         round_budget = _tool_round_budget(context, step)
         active_round_limit = round_budget.initial_limit
         last_round_progressed = True
@@ -5950,6 +6130,7 @@ class CrewDispatchRuntime:
                 max_output_tokens=max_output_tokens,
                 response_schema=response_schema,
                 tools=round_tools,
+                allow_fallback=incomplete_recovery_model is None,
             )
             model_attempt_index = _subagent_model_attempt(
                 retries,
@@ -5966,6 +6147,7 @@ class CrewDispatchRuntime:
                 emit=emit, model_boundary=model_state_boundary, usage_boundary=usage_boundary,
                 run_state=run_state, step_deadline=step_deadline,
                 tool_ledger=tool_ledger,
+                allow_structured_repair=incomplete_recovery_model is None,
             )
             evidence.append(model_artifact)
             response = self._valid_response(
@@ -8428,6 +8610,8 @@ class CrewDispatchRuntime:
                         else "step requested a forbidden capability",
                     }
                 )
+                if status == "rejected" and purpose == "step":
+                    allowed_reasons.add("model response incomplete")
                 if value["artifact_id"] is not None or failure_reason not in allowed_reasons:
                     _fail("runtime checkpoint is incompatible")
             elif status == "failed":
@@ -8579,7 +8763,9 @@ class CrewDispatchRuntime:
                 or type(value["fallback_used"]) is not bool
                 or not isinstance(value["attempted_logical_models"], tuple)
                 or (
-                    state["failure_reason"] not in {"structured output rejected", "model response cancelled"}
+                    state["failure_reason"] not in {
+                        "structured output rejected", "model response cancelled", "model response incomplete",
+                    }
                     and value["reason"] != "invalid_tool"
                 )
             ):
@@ -8588,7 +8774,22 @@ class CrewDispatchRuntime:
             if state["status"] == "received_cancelled" and check_value["reason"] == "cancelled_after_response":
                 # Validate receipt fields without relabeling the persisted cancellation outcome.
                 check_value["reason"] = "invalid_output"
-            self._rejected_from_private(check_value)
+            rejected = self._rejected_from_private(check_value)
+            if state["failure_reason"] == "model response incomplete":
+                step = next(item for item in plan.steps if item.id == state["step_id"])
+                agent = next(item for item in plan.agents if item.id == step.agent)
+                evidence = rejected.evidence
+                tools = cast(Mapping[str, Mapping[str, JsonValue]], checkpoint.state["tools"])
+                if (
+                    state["status"] != "rejected" or state["purpose"] != "step"
+                    or state["actor"] != step.agent or state["call_index"] != 0
+                    or step.tools != () or _agent_response_schema(agent) is None
+                    or evidence is None or evidence.reason != "incomplete"
+                    or evidence.status != "incomplete" or evidence.usage_status != "known"
+                    or evidence.usage is None or evidence.final_text is not None
+                    or any(tool["step_id"] == step.id for tool in tools.values())
+                ):
+                    _fail("runtime checkpoint incomplete qualification is invalid")
         step_ids = {step.id for step in plan.steps}
         repair_keys = {
             "version", "actor", "purpose", "source_key", "source_text_sha256", "correction_key",

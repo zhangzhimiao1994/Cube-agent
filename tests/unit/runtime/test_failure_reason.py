@@ -582,3 +582,26 @@ def test_runtime_failure_diagnostic_classifies_structured_output_invalid() -> No
     assert diagnostic["error_code"] == "model.structured_output_invalid"
     assert diagnostic["retryable"] is True
     assert "JSON" in str(diagnostic["suggested_action"])
+
+
+@pytest.mark.parametrize("prefix", ["", "hybrid dispatch failed: "])
+def test_known_incomplete_response_has_distinct_compact_recovery_diagnostic(prefix: str) -> None:
+    diagnostic = runtime_failure_diagnostic_from_reason(prefix + "model response incomplete")
+
+    assert diagnostic["error_summary"] == "model response incomplete"
+    assert diagnostic["error_stage"] == "model_response"
+    assert diagnostic["error_category"] == "incomplete_response"
+    assert diagnostic["error_code"] == "model.incomplete_response"
+    assert diagnostic["retryable"] is True
+    assert diagnostic["compression_trigger"] == "incomplete_response"
+    assert "\u672a\u5b8c\u6210" in str(diagnostic["suggested_action"])
+    assert "\u7528\u91cf" in str(diagnostic["suggested_action"])
+    assert "\u6709\u754c" in str(diagnostic["suggested_action"])
+
+
+def test_arbitrary_incomplete_response_text_does_not_authorize_recovery() -> None:
+    diagnostic = runtime_failure_diagnostic_from_reason("model response incomplete: arbitrary")
+
+    assert diagnostic["error_code"] == "runtime.failed"
+    assert diagnostic["retryable"] is False
+    assert "compression_trigger" not in diagnostic

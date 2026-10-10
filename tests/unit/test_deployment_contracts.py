@@ -23,6 +23,15 @@ def read(relative: str) -> str:
     return (ROOT / relative).read_text(encoding="utf-8")
 
 
+def test_quality_checkout_retains_baseline_objects_for_legacy_receipt_regressions() -> None:
+    workflow = yaml.safe_load(read(".github/workflows/quality.yml"))
+    steps = workflow["jobs"]["python-web-shell"]["steps"]
+    checkout = [step for step in steps if step.get("uses") == "actions/checkout@v4"]
+    assert len(checkout) == 1
+    depth = checkout[0].get("with", {}).get("fetch-depth")
+    assert type(depth) is int and depth == 0
+
+
 @pytest.mark.parametrize(
     ("name", "image", "unchanged"),
     (

@@ -356,6 +356,19 @@ def runtime_failure_diagnostic_from_reason(
             retryable=False,
             suggested_action="产物写入回滚失败；请检查文件存储/对象存储状态，确认残留产物后再重试。",
         )
+    elif normalized == "model response incomplete":
+        diagnostic = _base_diagnostic(
+            normalized,
+            error_stage="model_response",
+            error_category="incomplete_response",
+            error_code="model.incomplete_response",
+            retryable=True,
+            suggested_action=(
+                "模型响应未完成；已确认的用量仍会入账。仅在预算允许且没有工具副作用时，"
+                "使用原角色、模型和契约进行有界的紧凑重生成；不会执行残缺内容或重发结果未知的请求。"
+            ),
+        )
+        diagnostic["compression_trigger"] = "incomplete_response"
     elif normalized == "structured output invalid":
         diagnostic = _base_diagnostic(
             normalized,
