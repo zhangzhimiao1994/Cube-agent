@@ -5213,9 +5213,15 @@ class CrewDispatchRuntime:
                 if step.tools:
                     incomplete_recovery["instruction"] = (
                         "Regenerate the first response using the unchanged role, schema and authorized tools. "
+                        "Return a complete compact JSON object satisfying the unchanged schema. "
                         "Do not continue or reconstruct the discarded incomplete response. "
                         "Use only the original task and available source evidence. "
                         "Use an authorized tool if needed, otherwise return complete compact JSON. "
+                        "Omit optional elaboration. Prefer concise strings (approximately 512 characters) "
+                        "and short arrays (approximately four items), only when compatible with the "
+                        "unchanged schema and required facts. "
+                        "Schema minima and mandatory entries take priority. Never mechanically truncate. "
+                        "Preserve required fields and facts; state blockers without inventing evidence. "
                         "Preserve mandatory fields and facts; never mechanically truncate or invent evidence."
                     )
                 user["recovery"] = incomplete_recovery
