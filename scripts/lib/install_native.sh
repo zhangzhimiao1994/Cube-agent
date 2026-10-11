@@ -247,11 +247,21 @@ fix_native_uv_permissions() {
   [[ -d "$cache_dir" ]] && chmod 0755 "$cache_dir"
 }
 
-install_python_project_from_mirror() {
-  local mirror="$1"
-  warn "locked uv sync is skipped in China mirror mode or after official lock install fails"
-  python_mirror_env uv pip install --python .venv/bin/python --index-url "$mirror" .
-}
+install_python_project_from_mirror() (
+  local mirror="$1" requirements
+  requirements="$(mktemp)" || return
+  trap 'rm -f -- "$requirements"' EXIT
+  # Export registry pins and hashes, not the lock's official artifact URLs.
+  python_mirror_env uv export \
+    --frozen --offline --no-dev --no-emit-project \
+    --format requirements.txt --no-annotate --no-header \
+    --output-file "$requirements" >/dev/null || return
+  python_mirror_env uv pip sync \
+    --python .venv/bin/python --index-url "$mirror" \
+    --require-hashes "$requirements" || return
+  python_mirror_env uv pip install \
+    --python .venv/bin/python --index-url "$mirror" --no-deps .
+)
 
 sync_python_project_with_lock_or_mirror() {
   local mode mirror
@@ -268,7 +278,7 @@ sync_python_project_with_lock_or_mirror() {
   fi
 
   [[ "$mode" == "official" ]] && return 1
-  warn "official locked uv sync failed; installing project from China PyPI mirror without lock file URLs"
+  warn "official locked uv sync failed; retrying locked versions and hashes through China PyPI mirror"
   install_python_project_from_mirror "$mirror"
 }
 

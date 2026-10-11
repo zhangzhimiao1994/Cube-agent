@@ -1,5 +1,147 @@
 #!/usr/bin/env bats
 
+run_locked_python_fixture() {
+  run bash -c '
+    set -euo pipefail
+    source scripts/lib/install_native.sh
+    export FIXTURE_ROOT="$1"
+    export AGENT_HUB_MIRROR_MODE="$2"
+    export UV_FIXTURE_FAULT="$3"
+    export AGENT_HUB_PYPI_MIRROR=https://mirror.invalid/simple
+    export INSTALL_ROOT="$FIXTURE_ROOT/install"
+    export TMPDIR="$FIXTURE_ROOT/tmp"
+    mkdir -p "$FIXTURE_ROOT/bin" "$TMPDIR" "$FIXTURE_ROOT/project"
+    printf "lock sentinel\n" > "$FIXTURE_ROOT/project/uv.lock"
+    cp "$FIXTURE_ROOT/project/uv.lock" "$FIXTURE_ROOT/original-lock"
+    cat > "$FIXTURE_ROOT/bin/uv" <<"MOCK"
+#!/usr/bin/env bash
+set -euo pipefail
+printf "%s|%s\n" "${UV_DEFAULT_INDEX:-official}" "$*" >> "$FIXTURE_ROOT/calls"
+case "$1 $2" in
+  "sync --frozen")
+    [[ "$*" == "sync --frozen --no-dev" ]] || exit 91
+    [[ "$UV_FIXTURE_FAULT" != official_fail ]] || exit 20
+    printf "pycryptodome==3.23.0\n" > "$FIXTURE_ROOT/installed"
+    touch "$FIXTURE_ROOT/project-installed"
+    ;;
+  "export "*)
+    [[ "$UV_FIXTURE_FAULT" != export_fail ]] || exit 21
+    output=""
+    args=" $* "
+    [[ "$args" == *" --frozen "* && "$args" == *" --offline "* \
+      && "$args" == *" --no-dev "* && "$args" == *" --no-emit-project "* ]] || exit 92
+    [[ "$args" != *" --no-hashes "* && "$args" != *" --emit-index-url "* ]] || exit 93
+    while (($#)); do
+      if [[ "$1" == --output-file ]]; then output="$2"; shift; fi
+      shift
+    done
+    [[ -n "$output" ]] || exit 94
+    printf "pycryptodome==3.23.0 --hash=sha256:%064d\n" 1 > "$output"
+    printf "%s\n" "$output" > "$FIXTURE_ROOT/export-path"
+    ;;
+  "pip sync")
+    args=" $* "
+    [[ "$args" == *" --require-hashes "* && "$args" == *" --python .venv/bin/python "* \
+      && "${UV_DEFAULT_INDEX:-}" == https://mirror.invalid/simple ]] || exit 95
+    requirements="${@: -1}"
+    grep -qx "pycryptodome==3.23.0 --hash=sha256:$(printf "%064d" 1)" "$requirements" || exit 96
+    cp "$requirements" "$FIXTURE_ROOT/consumed-requirements"
+    [[ "$UV_FIXTURE_FAULT" != hash_fail && "$UV_FIXTURE_FAULT" != missing_locked ]] || exit 22
+    printf "pycryptodome==3.23.0\n" > "$FIXTURE_ROOT/installed"
+    ;;
+  "pip install")
+    args=" $* "
+    if [[ "$args" != *" --no-deps "* ]]; then
+      printf "pycryptodome==3.24.1\n" > "$FIXTURE_ROOT/installed"
+    else
+      [[ -f "$FIXTURE_ROOT/installed" && "${@: -1}" == . ]] || exit 97
+    fi
+    [[ "$UV_FIXTURE_FAULT" != project_fail ]] || exit 23
+    touch "$FIXTURE_ROOT/project-installed"
+    ;;
+  *) exit 98 ;;
+esac
+MOCK
+    chmod +x "$FIXTURE_ROOT/bin/uv"
+    export PATH="$FIXTURE_ROOT/bin:$PATH"
+    warn() { :; }
+    cd "$FIXTURE_ROOT/project"
+    # A caller testing the result disables errexit inside functions: failures must propagate.
+    if sync_python_project_with_lock_or_mirror; then exit 0; else exit "$?"; fi
+  ' _ "$BATS_TEST_TMPDIR" "$1" "$2"
+}
+
+assert_locked_python_fixture() {
+  [ "$status" -eq 0 ]
+  [ "$(cat "$BATS_TEST_TMPDIR/installed")" = 'pycryptodome==3.23.0' ]
+  [ -f "$BATS_TEST_TMPDIR/project-installed" ]
+  cmp "$BATS_TEST_TMPDIR/original-lock" "$BATS_TEST_TMPDIR/project/uv.lock"
+  [ -z "$(find "$BATS_TEST_TMPDIR/tmp" -type f -print -quit)" ]
+  ! grep -E 'pip install .*\.' "$BATS_TEST_TMPDIR/calls" | grep -v -- '--no-deps'
+}
+
+@test "China installs locked versions and hashes then installs project without dependencies" {
+  run_locked_python_fixture china none
+  assert_locked_python_fixture
+  [ -f "$BATS_TEST_TMPDIR/consumed-requirements" ]
+  ! grep -q '^official|' "$BATS_TEST_TMPDIR/calls"
+  [ ! -e "$(cat "$BATS_TEST_TMPDIR/export-path")" ]
+}
+
+@test "auto official failure falls back to hash-required locked mirror requirements" {
+  run_locked_python_fixture auto official_fail
+  assert_locked_python_fixture
+  [ -f "$BATS_TEST_TMPDIR/consumed-requirements" ]
+  grep -q '^official|sync --frozen --no-dev$' "$BATS_TEST_TMPDIR/calls"
+  [ ! -e "$(cat "$BATS_TEST_TMPDIR/export-path")" ]
+}
+
+@test "official mode retains locked sync without mirror fallback" {
+  run_locked_python_fixture official none
+  assert_locked_python_fixture
+  [ "$(cat "$BATS_TEST_TMPDIR/calls")" = 'official|sync --frozen --no-dev' ]
+}
+
+@test "official failure cannot silently drop the lock through a mirror" {
+  run_locked_python_fixture official official_fail
+  [ "$status" -ne 0 ]
+  [ "$(cat "$BATS_TEST_TMPDIR/calls")" = 'official|sync --frozen --no-dev' ]
+  [ ! -f "$BATS_TEST_TMPDIR/project-installed" ]
+}
+
+@test "failed lock export never installs or resolves the project" {
+  run_locked_python_fixture china export_fail
+  [ "$status" -ne 0 ]
+  ! grep -q '|pip ' "$BATS_TEST_TMPDIR/calls"
+  [ ! -f "$BATS_TEST_TMPDIR/project-installed" ]
+  [ -z "$(find "$BATS_TEST_TMPDIR/tmp" -type f -print -quit)" ]
+}
+
+@test "mirror hash mismatch stops before project install and removes owned requirements" {
+  run_locked_python_fixture china hash_fail
+  [ "$status" -ne 0 ]
+  [ -f "$BATS_TEST_TMPDIR/consumed-requirements" ]
+  ! grep -q '|pip install ' "$BATS_TEST_TMPDIR/calls"
+  [ ! -f "$BATS_TEST_TMPDIR/project-installed" ]
+  [ ! -e "$(cat "$BATS_TEST_TMPDIR/export-path")" ]
+}
+
+@test "missing locked mirror artifact fails rather than installing a newer version" {
+  run_locked_python_fixture china missing_locked
+  [ "$status" -ne 0 ]
+  [ ! -f "$BATS_TEST_TMPDIR/installed" ]
+  ! grep -q '|pip install ' "$BATS_TEST_TMPDIR/calls"
+  [ ! -e "$(cat "$BATS_TEST_TMPDIR/export-path")" ]
+}
+
+@test "project build failure preserves locked dependencies and cleans requirements" {
+  run_locked_python_fixture china project_fail
+  [ "$status" -ne 0 ]
+  [ "$(cat "$BATS_TEST_TMPDIR/installed")" = 'pycryptodome==3.23.0' ]
+  [ ! -f "$BATS_TEST_TMPDIR/project-installed" ]
+  [ ! -e "$(cat "$BATS_TEST_TMPDIR/export-path")" ]
+}
+
 @test "ubuntu debian rocky and alma map to supported package managers" {
   for fixture in ubuntu debian rocky almalinux; do
     run bash deploy/native/install-packages.sh --detect tests/install/fixtures/os-release-$fixture
