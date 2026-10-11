@@ -1064,7 +1064,7 @@ def _role_matches_task(spec: _RoleSpec, request: RolePlanningRequest) -> bool:
     # Custom catalog roles stay discoverable without hard-coding: if a role's
     # own short skill/role words appear in the task, it can participate.
     return any(
-        len(token) >= 2 and token.casefold() in task
+        len(token) >= 2 and _task_contains_keyword(task, token)
         for token in (*skills, role_id.replace("_", " "), role)
         if token.casefold() in haystack
     )
