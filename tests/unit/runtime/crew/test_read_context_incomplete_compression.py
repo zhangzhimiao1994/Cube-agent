@@ -79,7 +79,7 @@ async def test_compression_parity_keeps_model_tools_schema_and_cap(with_tool: bo
     assert recovered.tools == original.tools
     assert tuple(tool.name for tool in recovered.tools) == (("read_context",) if with_tool else ())
     assert original.max_output_tokens == 6144
-    assert recovered.max_output_tokens == (6144 if with_tool else 12288)
+    assert recovered.max_output_tokens == 12288
     assert not recovered.allow_fallback
     if with_tool:
         assert "authorized tool if needed" in _instruction(recovered)
@@ -138,7 +138,7 @@ async def test_schema_minima_override_compression_preferences(
     assert mapping(properties["summary"])["minLength"] == 600
     assert mapping(properties["items"])["minItems"] == 5
     assert original.max_output_tokens == 6144
-    assert recovered.max_output_tokens == (6144 if with_tool else 12288)
+    assert recovered.max_output_tokens == 12288
     assert not recovered.allow_fallback and recovered.tools == original.tools
     assert events[-1].kind is EventKind.RUNTIME_COMPLETED
     assert harness.calls == []

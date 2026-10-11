@@ -111,7 +111,8 @@ async def test_first_tool_call_incomplete_regenerates_before_one_approved_invoca
     assert fresh.response_schema == followup.response_schema == original.response_schema
     assert fresh.tools == followup.tools == original.tools
     assert not fresh.allow_fallback and not followup.allow_fallback
-    assert fresh.max_output_tokens == original.max_output_tokens == 6144
+    assert original.max_output_tokens == followup.max_output_tokens == 6144
+    assert fresh.max_output_tokens == 12288
     assert harness.calls[0][1].tool_name == "web.search"
     assert harness.calls[0][1].actor == "writer"
     prompt = " ".join(str(message.content) for message in fresh.messages)
@@ -138,7 +139,8 @@ async def test_natural_restore_distinguishes_recovery_from_normal_tool_loop(
     dispatch = tool_plan(tokens)
     repository = InMemoryArtifactRepository()
     source_harness = RecordingHarnessToolGateway()
-    source = subject(ToolIncompleteGateway(), dispatch, repository, source_harness)
+    source_gateway = ToolIncompleteGateway()
+    source = subject(source_gateway, dispatch, repository, source_harness)
     events = await collect(source, tokens=tokens)
 
     def matches(checkpoint: RuntimeCheckpoint) -> bool:
@@ -158,6 +160,14 @@ async def test_natural_restore_distinguishes_recovery_from_normal_tool_loop(
     checkpoint = next(event.checkpoint for event in events
                       if event.checkpoint is not None and matches(event.checkpoint))
     before = checkpoint.to_payload()
+    rows = draft_models(checkpoint)
+    assert "reserved_max_output_tokens" not in rows[0]
+    if len(rows) > 1:
+        assert rows[1]["reserved_max_output_tokens"] == (12288 if tokens == 30_000 else 622)
+        assert rows[1]["request_sha256"] == source._model_request_sha256(source_gateway.requests[1])
+    if len(rows) > 2:
+        assert "reserved_max_output_tokens" not in rows[2]
+        assert rows[2]["request_sha256"] == source._model_request_sha256(source_gateway.requests[2])
     uncertain = phase.endswith("running")
     outcomes = (("tool", "success", "final") if phase in {"source", "fresh_prepared"}
                 else ("final",) if phase == "followup_succeeded" else ("success", "final"))
@@ -321,7 +331,8 @@ async def test_real_gateway_sdk_mock_first_call_tools_or_unknown_scope(prior_unk
             assert fresh.response_schema == followup.response_schema == original.response_schema
             assert fresh.tools == followup.tools == original.tools
             assert not fresh.allow_fallback and not followup.allow_fallback
-            assert fresh.max_output_tokens == original.max_output_tokens == 6144
+            assert original.max_output_tokens == followup.max_output_tokens == 6144
+            assert fresh.max_output_tokens == 12288
             assert wire[0]["tools"] == wire[1]["tools"] == wire[2]["tools"]
             assert wire[0]["text"] == wire[1]["text"] == wire[2]["text"]
             assert harness.calls[0][1].arguments == {"q": "safe"}
@@ -426,8 +437,9 @@ async def test_natural_restore_tool_recovery_refuses_changed_or_unqualified_boun
 
         monkeypatch.setattr(replay, "_incomplete_recovery_remaining_tokens", lower_reserved_budget)
     expected = ("model request changed after checkpoint" if change in {
-        "source_hash", "fresh_hash", "budget",
-    } else "structured output invalid" if change == "legacy" else
+        "source_hash", "fresh_hash",
+    } else "model incomplete recovery budget exhausted" if change == "budget" else
+                "structured output invalid" if change == "legacy" else
                 "checkpoint.*(invalid|incompatible|unavailable)")
     with pytest.raises(RuntimeExecutionError, match=expected):
         await replay.restore_checkpoint(boundary)
