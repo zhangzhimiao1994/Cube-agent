@@ -6895,9 +6895,9 @@ class CrewDispatchRuntime:
                     evidence.append(artifact)
                     if (
                         workspace_continuation
-                        and tool_call.name in {"workspace.read", "workspace.list"}
                         and artifact.source_ids == (str(trigger_model_artifact.id),)
                     ):
+                        # Exact replay must preserve the original continuation's tool mode.
                         record_round_progress()
                     else:
                         reused_semantic_results += 1
