@@ -6,7 +6,11 @@ import httpx
 import pytest
 
 from agent_hub.models import gateway as gateway_module
-from agent_hub.models.capacity import CapacityBackendError, CapacityQueueFull
+from agent_hub.models.capacity import (
+    CapacityBackendError,
+    CapacityConfigurationError,
+    CapacityQueueFull,
+)
 from agent_hub.models.failure_receipt import get_gateway_failure_receipt
 from agent_hub.models.gateway import ModelGatewayError
 from agent_hub.models.litellm_client import ModelTransportError
@@ -19,6 +23,92 @@ def diagnostic(value: object) -> Any:
     getter = getattr(gateway_module, "get_gateway_scope_diagnostic", None)
     assert callable(getter), "trusted gateway scope diagnostic is missing"
     return getter(value)
+
+
+@pytest.mark.parametrize("failure,kind,reason", [
+    (CapacityConfigurationError("model capacity pool is not initialized"),
+     "configuration", "registration_not_ready"),
+    (CapacityConfigurationError("credential fingerprint quota scope conflicts"),
+     "configuration", "registration_conflict"),
+    (CapacityConfigurationError("credential fingerprint resolution failed"),
+     "configuration", "fingerprint_resolution_failed"),
+    (CapacityBackendError("model capacity initialization timed out"),
+     "backend", "initialization_timeout"),
+    (CapacityBackendError("model capacity backend unavailable"),
+     "backend", "backend_unavailable"),
+    (CapacityBackendError("model capacity backend returned invalid state"),
+     "backend", "invalid_backend_state"),
+    (CapacityBackendError("Authorization: private prompt https://private.invalid"),
+     "backend", "unclassified"),
+])
+async def test_capacity_failure_logs_only_fixed_categories(
+    failure: Exception, kind: str, reason: str, caplog: pytest.LogCaptureFixture,
+) -> None:
+    capacity = CapacityStub([failure])
+    with pytest.raises(type(failure)) as caught:
+        await make_gateway(OutcomesTransport([]), capacity).complete_with_context(request())
+    assert caught.value is failure
+    records = [r for r in caplog.records if r.name == gateway_module.__name__]
+    assert len(records) == 1
+    assert records[0].getMessage() == f"model_capacity_failure kind={kind} reason={reason}"
+    assert records[0].exc_info is None
+    result = diagnostic(caught.value)
+    assert result.reason.value == "capacity_backend_failure"
+    assert result.transport_entered_count == result.failure_attempt_count == 0
+
+
+async def test_capacity_failure_logging_cannot_replace_outcome(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    failure = CapacityBackendError("private body")
+
+    def fail_logging(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("private logger failure")
+
+    monkeypatch.setattr(gateway_module._LOGGER, "warning", fail_logging)
+    with pytest.raises(CapacityBackendError) as caught:
+        await make_gateway(OutcomesTransport([]), CapacityStub([failure])) \
+            .complete_with_context(request())
+    assert caught.value is failure
+    assert diagnostic(caught.value).reason.value == "capacity_backend_failure"
+
+
+def test_capacity_failure_logger_does_not_consult_adapter_properties(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class Hostile(CapacityBackendError):
+        def __getattribute__(self, name: str) -> Any:
+            raise AssertionError("adapter attributes must not be read")
+
+        def __str__(self) -> str:
+            raise AssertionError("adapter body must not be formatted")
+
+    gateway_module._log_capacity_failure(Hostile())
+    assert caplog.records[-1].getMessage() == \
+        "model_capacity_failure kind=unknown reason=unclassified"
+    assert caplog.records[-1].exc_info is None
+
+
+@pytest.mark.parametrize("operation", ["hash", "equality"])
+def test_capacity_failure_logger_does_not_consult_adapter_metaclass(
+    operation: str, caplog: pytest.LogCaptureFixture,
+) -> None:
+    class HostileType(type):
+        def __hash__(cls) -> int:
+            if operation == "hash":
+                raise AssertionError("adapter type must not be hashed")
+            return hash(CapacityBackendError)
+
+        def __eq__(cls, other: object) -> bool:
+            raise AssertionError("adapter type must not be compared")
+
+    class Hostile(CapacityBackendError, metaclass=HostileType):
+        def __getattribute__(self, name: str) -> Any:
+            raise AssertionError("adapter attributes must not be read")
+
+    gateway_module._log_capacity_failure(Hostile())
+    assert caplog.records[-1].getMessage() == \
+        "model_capacity_failure kind=unknown reason=unclassified"
 
 
 @pytest.mark.parametrize("stage,phase,reason,entered,attempts", [

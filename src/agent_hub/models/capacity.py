@@ -387,6 +387,7 @@ class CapacityPool:
         if (
             not force
             and self._initialized
+            and not self._refresh_in_progress
             and now < self._next_metadata_refresh
             and now < self._registration_valid_until
         ):
@@ -396,6 +397,7 @@ class CapacityPool:
             if (
                 not force
                 and self._initialized
+                and not self._refresh_in_progress
                 and now < self._next_metadata_refresh
                 and now < self._registration_valid_until
             ):
@@ -667,7 +669,9 @@ class CapacityPool:
             # Zero wait still permits one bounded, non-polling admission scan.
             rpc_deadline = deadline if wait_timeout else loop.time() + self._poll_interval
             while True:
+                self._require_initialized()
                 for deployment in self._ordered_candidates(ordered):
+                    self._require_initialized()
                     remaining = rpc_deadline - loop.time()
                     if remaining <= 0:
                         raise CapacityWaitTimeout("model capacity queue timeout")
@@ -676,6 +680,14 @@ class CapacityPool:
                         timeout=remaining,
                     )
                     if lease is not None:
+                        try:
+                            self._require_initialized()
+                        except CapacityConfigurationError:
+                            await self._release_id_ignoring_errors(
+                                self._keys(lease.quota_scope_id)["leases"], lease.id,
+                                timeout=max(0, rpc_deadline - loop.time()),
+                            )
+                            raise
                         return lease
                 await self._wait_for_next_poll(deadline)
         finally:
@@ -1039,6 +1051,7 @@ class _CapacityScopeView:
         if (
             not force
             and state.initialized
+            and not state.refresh_in_progress
             and now < state.next_metadata_refresh
             and now < state.valid_until
         ):
@@ -1048,6 +1061,7 @@ class _CapacityScopeView:
             if (
                 not force
                 and state.initialized
+                and not state.refresh_in_progress
                 and now < state.next_metadata_refresh
                 and now < state.valid_until
             ):
@@ -1122,7 +1136,9 @@ class _CapacityScopeView:
             deadline = loop.time() + float(wait_timeout)
             rpc_deadline = deadline if wait_timeout else loop.time() + root._poll_interval
             while True:
+                self._require_initialized()
                 for deployment in root._ordered_candidates(ordered):
+                    self._require_initialized()
                     remaining = rpc_deadline - loop.time()
                     if remaining <= 0:
                         raise CapacityWaitTimeout("model capacity queue timeout")
@@ -1131,6 +1147,14 @@ class _CapacityScopeView:
                         timeout=remaining,
                     )
                     if lease is not None:
+                        try:
+                            self._require_initialized()
+                        except CapacityConfigurationError:
+                            await root._release_id_ignoring_errors(
+                                root._keys(lease.quota_scope_id)["leases"], lease.id,
+                                timeout=max(0, rpc_deadline - loop.time()),
+                            )
+                            raise
                         return lease
                 await root._wait_for_next_poll(deadline)
         finally:

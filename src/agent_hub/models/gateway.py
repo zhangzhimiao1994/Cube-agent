@@ -54,8 +54,34 @@ from agent_hub.models.types import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+_CAPACITY_FAILURE_REASONS: dict[type[BaseException], dict[str, str]] = {
+    CapacityConfigurationError: {
+        "model capacity pool is not initialized": "registration_not_ready",
+        "credential fingerprint quota scope conflicts": "registration_conflict",
+        "credential fingerprint resolution failed": "fingerprint_resolution_failed",
+    },
+    CapacityBackendError: {
+        "model capacity initialization timed out": "initialization_timeout",
+        "model capacity backend unavailable": "backend_unavailable",
+        "model capacity backend returned invalid state": "invalid_backend_state",
+    },
+}
 _SCOPE_DIAGNOSTIC_ISSUER = object()
 _SCOPE_DIAGNOSTIC_ATTRIBUTE = "_gateway_scope_diagnostic"
+
+
+def _log_capacity_failure(error: BaseException) -> None:
+    # Only fixed native categories reach logs; adapters and raw errors stay opaque.
+    kind, reason = "unknown", "unclassified"
+    if type(error) is CapacityBackendError or type(error) is CapacityConfigurationError:
+        kind = "backend" if type(error) is CapacityBackendError else "configuration"
+        args = error.args
+        if len(args) == 1 and type(args[0]) is str:
+            reason = _CAPACITY_FAILURE_REASONS[type(error)].get(args[0], "unclassified")
+    try:
+        _LOGGER.warning("model_capacity_failure kind=%s reason=%s", kind, reason)
+    except BaseException:  # noqa: BLE001 - logging must not replace the original outcome.
+        return
 
 
 class ScopeIncompletePhase(StrEnum):
@@ -679,6 +705,7 @@ class ModelGateway:
                 failure_history.mark_incomplete(ScopeIncompletePhase.CANCELLATION,
                                                 ScopeIncompleteReason.CANCELLED)
             elif isinstance(error, (CapacityBackendError, CapacityConfigurationError)):
+                _log_capacity_failure(error)
                 failure_history.mark_incomplete(ScopeIncompletePhase.PRETRANSPORT_CAPACITY,
                                                 ScopeIncompleteReason.CAPACITY_BACKEND_FAILURE)
             elif not failure_history.attempts or not failure_history.history_complete:
