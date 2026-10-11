@@ -189,6 +189,7 @@ async def test_partial_checkpoint_records_ordered_exact_input_refs() -> None:
 async def test_v10_checkpoint_restores_only_saved_remaining_wall_time() -> None:
     checkpoint, repository = await capture_partial(())
     state = dict(checkpoint.state)
+    state.pop("incomplete_recovery_output_growth", None)
     state["remaining_timeout_seconds"] = 5.0
     bounded = RuntimeCheckpoint(
         id=uuid4(),
@@ -226,6 +227,7 @@ async def test_v10_checkpoint_restores_only_saved_remaining_wall_time() -> None:
 async def test_v9_checkpoint_without_remaining_wall_time_stays_compatible() -> None:
     checkpoint, repository = await capture_partial(())
     state = dict(checkpoint.state)
+    state.pop("incomplete_recovery_output_growth", None)
     state.pop("remaining_timeout_seconds", None)
     state.pop("remaining_absolute_timeout_seconds", None)
     state.pop("timeout_progress_units", None)

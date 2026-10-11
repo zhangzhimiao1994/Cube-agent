@@ -146,7 +146,7 @@ async def test_accounted_incomplete_uses_one_new_key_same_actor_schema_and_selec
     assert recovered.logical_model == "selected" and recovered.allow_fallback is False
     assert recovered.response_schema == original.response_schema
     assert recovered.tools == original.tools == ()
-    assert recovered.max_output_tokens == 6144
+    assert recovered.max_output_tokens == 12288
     prompt = " ".join(str(message.content) for message in recovered.messages)
     assert "incomplete_response" in prompt and "Do not continue" in prompt
     assert "UNTRUSTED_REJECTED_OUTPUT" not in prompt
@@ -623,7 +623,8 @@ async def test_compact_guidance_treats_sizes_as_preferences_subordinate_to_schem
     original, recovered, _ = gateway.requests
     prompt = " ".join(str(message.content) for message in recovered.messages)
     assert recovered.response_schema == original.response_schema
-    assert recovered.max_output_tokens == original.max_output_tokens
+    assert original.max_output_tokens == 6144
+    assert recovered.max_output_tokens == 12288
     assert "Prefer concise strings" in prompt and "short arrays" in prompt
     assert "only when compatible with the unchanged schema and required facts" in prompt
     assert "Schema minima and mandatory entries take priority" in prompt
@@ -741,7 +742,8 @@ async def test_sdk_mock_native_known_incomplete_preserves_primary_or_blocks_unkn
             assert recovered.logical_model == original.logical_model == "general"
             assert recovered.response_schema == original.response_schema
             assert recovered.allow_fallback is False and recovered.tools == ()
-            assert recovered.max_output_tokens == original.max_output_tokens == 6144
+            assert original.max_output_tokens == 6144
+            assert recovered.max_output_tokens == 12288
             assert wire[0]["text"] == wire[1]["text"]
             assert "PRIVATE_TRUNCATED" not in str(recovered.messages)
             assert mapping(checkpoint.state["usage"])["tokens"] == 8395

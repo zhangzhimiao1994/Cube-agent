@@ -102,7 +102,10 @@ _REQUIRED_FAILURE_DIAGNOSTIC_KEYS = frozenset(
     {"error_code", "error_stage", "error_category", "error_summary", "retryable", "suggested_action"}
 )
 _OPTIONAL_FAILURE_DIAGNOSTIC_KEYS = frozenset(
-    {"status_code", "hybrid_child_mode", "orchestration_recovery_hint", "step_id", "actor"}
+    {
+        "status_code", "hybrid_child_mode", "orchestration_recovery_hint", "step_id", "actor",
+        "compression_trigger",
+    }
 )
 _FAILURE_DIAGNOSTIC_KEYS = _REQUIRED_FAILURE_DIAGNOSTIC_KEYS | _OPTIONAL_FAILURE_DIAGNOSTIC_KEYS
 _GATEWAY_SCOPE_DIAGNOSTIC_KEYS = frozenset({
@@ -243,6 +246,14 @@ def _validate_failure_diagnostic(payload: Mapping[str, JsonValue]) -> None:
         _safe_free_text(value, name="runtime failure diagnostic text", max_bytes=limit * 4)
     if type(payload["retryable"]) is not bool:
         raise ValueError("runtime failure diagnostic retryable must be boolean")
+    if "compression_trigger" in payload and (
+        type(payload["compression_trigger"]) is not str
+        or payload["compression_trigger"] != "incomplete_response"
+        or payload["error_code"] != "model.incomplete_response"
+        or payload["error_stage"] != "model_response"
+        or payload["error_category"] != "incomplete_response"
+    ):
+        raise ValueError("runtime failure diagnostic compression trigger is invalid")
     if "status_code" in payload:
         status_code = payload["status_code"]
         if type(status_code) is not int or not 100 <= status_code <= 599:
