@@ -1253,25 +1253,75 @@ def test_native_installer_falls_back_to_china_mirrors_when_official_sources_fail
 
 
 def test_native_installer_uses_mirror_install_without_locked_wheel_urls_in_china_mode() -> None:
+    import shlex
+
     script = read("scripts/lib/install_native.sh")
+    mirror_install = re.search(
+        r"^install_python_project_from_mirror\(\) \(\n(.*?)^\)",
+        script,
+        re.MULTILINE | re.DOTALL,
+    )
+    assert mirror_install is not None
+    body = re.sub(r"\\\n[ \t]*", " ", mirror_install.group(1))
+    commands = [
+        shlex.split(line)
+        for line in body.splitlines()
+        if line.lstrip().startswith("python_mirror_env ")
+    ]
 
     assert "sync_python_project_with_lock_or_mirror" in script
     assert "install_litellm_proxy_venv" in script
     assert 'if [[ "$mode" == "china" ]]; then\n    install_python_project_from_mirror "$mirror"\n    return\n  fi' in script
-    assert "locked uv sync is skipped in China mirror mode" in script
-    assert "uv pip install --python .venv/bin/python" in script
+    assert 'requirements="$(mktemp)" || return' in body
+    assert "trap 'rm -f -- \"$requirements\"' EXIT" in body
+    assert commands == [
+        [
+            "python_mirror_env", "uv", "export", "--frozen", "--offline", "--no-dev",
+            "--no-emit-project", "--format", "requirements.txt", "--no-annotate", "--no-header",
+            "--output-file", "$requirements", ">/dev/null", "||", "return",
+        ],
+        [
+            "python_mirror_env", "uv", "pip", "sync", "--python", ".venv/bin/python",
+            "--index-url", "$mirror", "--require-hashes", "$requirements", "||", "return",
+        ],
+        [
+            "python_mirror_env", "uv", "pip", "install", "--python", ".venv/bin/python",
+            "--index-url", "$mirror", "--no-deps", ".",
+        ],
+    ]
+    assert len(re.findall(r"\buv (?:export|pip (?:sync|install))\b", body)) == 3
     assert "uv pip install \\\n    --python .litellm-venv/bin/python" in script
     assert "--index-url" in script
 
 
 def test_native_installer_falls_back_from_locked_uv_sync_to_mirror_pip_install() -> None:
     script = read("scripts/lib/install_native.sh")
+    project_sync = re.search(
+        r"^sync_python_project_with_lock_or_mirror\(\) \{\n(.*?)^\}",
+        script,
+        re.MULTILINE | re.DOTALL,
+    )
+    assert project_sync is not None
+    body = project_sync.group(1)
+    official_failure = '[[ "$mode" == "official" ]] && return 1'
+    mirror_call = 'install_python_project_from_mirror "$mirror"'
 
     assert "sync_python_project_with_lock_or_mirror" in script
     assert "run_with_timeout" in script
     assert "${AGENT_HUB_UV_SYNC_TIMEOUT_SECONDS:-900}" in script
     assert "uv sync --frozen --no-dev" in script
-    assert "uv pip install --python .venv/bin/python" in script
+    assert re.search(
+        r'if \[\[ "\$mode" == "china" \]\]; then\s+'
+        r'install_python_project_from_mirror "\$mirror"\s+return\s+fi',
+        body,
+    )
+    assert re.search(r"if native_uv_sync_locked; then\s+return 0\s+fi", body)
+    assert official_failure in body
+    assert body.count("native_uv_sync_locked") == 1
+    assert body.count(mirror_call) == 2
+    assert body.index("native_uv_sync_locked") < body.index(official_failure) < body.rindex(mirror_call)
+    assert "uv pip install" not in body
+    assert "uv pip sync" not in body
     assert "verify_litellm_proxy_venv" in script
     assert "litellm.proxy.proxy_server" in script
     assert "--index-url" in script
