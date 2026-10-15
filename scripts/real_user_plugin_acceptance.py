@@ -208,7 +208,9 @@ def build_acceptance_plugin(package_dir: Path, *, execution_id: str) -> Acceptan
                 "replay_safe": True,
                 "input_schema": {
                     "type": "object",
-                    "properties": {"text": {"type": "string", "maxLength": 4096}},
+                    "properties": {
+                        "text": {"type": "string", "maxLength": 4096, "const": input_text},
+                    },
                     "required": ["text"],
                     "additionalProperties": False,
                 },
@@ -216,7 +218,11 @@ def build_acceptance_plugin(package_dir: Path, *, execution_id: str) -> Acceptan
                     "type": "object",
                     "properties": {
                         "ok": {"type": "boolean", "const": True},
-                        "character_count": {"type": "integer", "minimum": 0},
+                        "character_count": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "const": len(input_text),
+                        },
                         "acceptance_nonce": {"type": "string", "const": nonce},
                     },
                     "required": ["ok", "character_count", "acceptance_nonce"],
@@ -660,10 +666,6 @@ def _resource_cleanup_recovery_steps(
         {"method": "POST", "path": f"{plugin_path}/stop", "body": {}},
         {"method": "POST", "path": f"{plugin_path}/uninstall", "body": {}},
         {
-            "method": "DELETE",
-            "path": (f"/api/v1/admin/plugins/signing-keys/{quote(package.key_id, safe='')}"),
-        },
-        {
             "method": "GET",
             "path": "/api/v1/admin/plugins",
             "require_absent": {"id": package.plugin_id},
@@ -672,6 +674,10 @@ def _resource_cleanup_recovery_steps(
             "method": "GET",
             "path": "/api/v1/admin/capabilities/manifest",
             "require_absent": {"capability_id": package.capability_id},
+        },
+        {
+            "method": "DELETE",
+            "path": (f"/api/v1/admin/plugins/signing-keys/{quote(package.key_id, safe='')}"),
         },
         {
             "method": "GET",
@@ -696,8 +702,23 @@ def _cleanup(
             try:
                 client.request_json("POST", f"{plugin_path}/{action}", body={})
                 completed.append(action)
-            except Exception as error:  # noqa: BLE001 - cleanup must continue through every phase.
+            except Exception as error:  # noqa: BLE001 - retain later resources on uncertain cleanup.
                 errors.append(f"{action}: {error}")
+                return completed, errors
+        try:
+            plugins = _list(client.request_json("GET", "/api/v1/admin/plugins"), "plugin list")
+            if any(
+                isinstance(item, Mapping) and item.get("id") == package.plugin_id
+                for item in plugins
+            ):
+                raise RuntimeError("temporary plugin remains installed")
+            manifest = client.request_json("GET", "/api/v1/admin/capabilities/manifest")
+            if _manifest_capability(manifest, package.capability_id) is not None:
+                raise RuntimeError("temporary plugin capability remains available")
+            completed.append("verify_removed")
+        except Exception as error:  # noqa: BLE001 - retain the signing key until removal is proven.
+            errors.append(f"verify_removed: {error}")
+            return completed, errors
     if key_registered:
         try:
             client.request_json(
@@ -707,6 +728,7 @@ def _cleanup(
             completed.append("delete_signing_key")
         except Exception as error:  # noqa: BLE001 - report cleanup failures without hiding the run.
             errors.append(f"delete_signing_key: {error}")
+            return completed, errors
         try:
             signing_keys = _list(
                 client.request_json("GET", "/api/v1/admin/plugins/signing-keys"),
@@ -720,20 +742,6 @@ def _cleanup(
             completed.append("verify_signing_key_removed")
         except Exception as error:  # noqa: BLE001 - cleanup verification is acceptance evidence.
             errors.append(f"verify_signing_key_removed: {error}")
-    if installed:
-        try:
-            plugins = _list(client.request_json("GET", "/api/v1/admin/plugins"), "plugin list")
-            if any(
-                isinstance(item, Mapping) and item.get("id") == package.plugin_id
-                for item in plugins
-            ):
-                raise RuntimeError("temporary plugin remains installed")
-            manifest = client.request_json("GET", "/api/v1/admin/capabilities/manifest")
-            if _manifest_capability(manifest, package.capability_id) is not None:
-                raise RuntimeError("temporary plugin capability remains available")
-            completed.append("verify_removed")
-        except Exception as error:  # noqa: BLE001 - cleanup verification is acceptance evidence.
-            errors.append(f"verify_removed: {error}")
     return completed, errors
 
 
@@ -1027,6 +1035,25 @@ def run_real_user_plugin_acceptance(
                 installed=installed,
                 key_registered=key_registered,
             )
+            if cleanup_errors:
+                recovery = {
+                    "required": True,
+                    "frozen": True,
+                    "resubmission_allowed": False,
+                    "reason": "resource_cleanup_unproven",
+                    "run_id": run_id or None,
+                    "plugin_id": package.plugin_id,
+                    "capability_id": package.capability_id,
+                    "key_id": package.key_id,
+                    "steps": [
+                        step
+                        for step in _resource_cleanup_recovery_steps(
+                            package,
+                            plugin_path=f"/api/v1/admin/plugins/{quote(package.plugin_id, safe='')}",
+                        )
+                        if step["method"] == "GET"
+                    ],
+                }
         cleanup_completed = [*run_cleanup_completed, *cleanup_completed]
         cleanup_errors = [*run_cleanup_errors, *cleanup_errors]
         errors.extend(cleanup_errors)
@@ -1421,6 +1448,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                             },
                         ]
                     )
+        elif operator_source == "temporary" and report.get("cleanup_state") == "failed":
+            cleanup_completed = []
+            cleanup_errors = [
+                "temporary operator cleanup deferred because plugin or signing key cleanup is unproven"
+            ]
         elif operator_source == "temporary" and temporary_operator_tenant is not None:
             cleanup_completed, cleanup_errors = _remove_temporary_operator(
                 admin_client,

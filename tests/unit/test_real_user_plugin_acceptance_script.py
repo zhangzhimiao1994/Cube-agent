@@ -10,6 +10,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
+from jsonschema import ValidationError, validate  # type: ignore[import-untyped]
 
 SCRIPT_PATH = Path("scripts/real_user_plugin_acceptance.py")
 ADMIN_USER_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
@@ -756,6 +757,7 @@ def test_build_acceptance_plugin_is_signed_executable_and_nonce_bound(tmp_path: 
         "type": "string",
         "const": package.nonce,
     }
+    validate({"text": package.input_text}, capability["input_schema"])
     completed = subprocess.run(
         [sys.executable, "-c", adapter.decode("utf-8")],
         input=json.dumps(
@@ -769,8 +771,34 @@ def test_build_acceptance_plugin_is_signed_executable_and_nonce_bound(tmp_path: 
         check=True,
     )
     result = json.loads(completed.stdout)
+    validate(result, capability["output_schema"])
     assert result["acceptance_nonce"] == package.nonce
     assert result["character_count"] == len(package.input_text)
+
+
+@pytest.mark.parametrize("changed_field", ["text", "character_count"])
+def test_acceptance_fixture_rejects_changed_text_or_character_count(
+    tmp_path: Path, changed_field: str
+) -> None:
+    module = _load_script()
+    package = module.build_acceptance_plugin(tmp_path, execution_id="schema-binding")
+    with zipfile.ZipFile(package.archive_path) as archive:
+        capability = json.loads(archive.read("plugin.json"))["capabilities"][0]
+    if changed_field == "text":
+        schema = capability["input_schema"]
+        valid = {"text": package.input_text}
+        invalid = {"text": package.input_text[:-1] + "!"}
+    else:
+        schema = capability["output_schema"]
+        valid = {
+            "ok": True,
+            "acceptance_nonce": package.nonce,
+            "character_count": len(package.input_text),
+        }
+        invalid = {**valid, "character_count": len(package.input_text) + 1}
+    validate(valid, schema)
+    with pytest.raises(ValidationError):
+        validate(invalid, schema)
 
 
 def test_build_acceptance_plugin_uses_fresh_runtime_nonce_for_same_execution_id(
@@ -1657,6 +1685,155 @@ def test_cli_creates_and_removes_temporary_operator_when_credentials_are_absent(
         "completed": ["delete_user", "verify_user_removed"],
         "errors": [],
     }
+    plugin_path = f"/api/v1/admin/plugins/{report['plugin_id']}"
+    cleanup_start = factory.admin.requests.index(("POST", f"{plugin_path}/disable"))
+    assert factory.admin.requests[cleanup_start:] == [
+        ("POST", f"{plugin_path}/disable"),
+        ("POST", f"{plugin_path}/stop"),
+        ("POST", f"{plugin_path}/uninstall"),
+        ("GET", "/api/v1/admin/plugins"),
+        ("GET", "/api/v1/admin/capabilities/manifest"),
+        ("DELETE", f"/api/v1/admin/plugins/signing-keys/plugin-uat-key-{report['plugin_id'][11:]}"),
+        ("GET", "/api/v1/admin/plugins/signing-keys"),
+        ("GET", "/api/v1/auth/me"),
+        ("GET", "/api/v1/users"),
+        ("DELETE", f"/api/v1/users/{USER_ID}"),
+        ("GET", "/api/v1/users"),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("stage", "outcome"),
+    [
+        (stage, outcome)
+        for stage in ("disable", "stop", "uninstall", "delete_signing_key")
+        for outcome in ("error", "response_lost")
+    ]
+    + [
+        (stage, outcome)
+        for stage in ("verify_plugin", "verify_capability", "verify_signing_key")
+        for outcome in ("error", "residual")
+    ],
+)
+def test_cli_cleanup_stops_after_unproven_stage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+    outcome: str,
+) -> None:
+    module = _load_script()
+    backend = FakePluginAcceptanceClient()
+    factory = CliClientFactory(backend=backend)
+    original_request = backend.request_json
+    cleanup_started = False
+
+    def request_json(
+        method: str,
+        path: str,
+        *,
+        body: dict[str, object] | None = None,
+        idempotency_key: str | None = None,
+    ) -> dict[str, object] | list[object]:
+        nonlocal cleanup_started
+        plugin_path = f"/api/v1/admin/plugins/{backend.plugin_id}"
+        if (method, path) == ("POST", f"{plugin_path}/disable"):
+            cleanup_started = True
+        targets = {
+            "disable": ("POST", f"{plugin_path}/disable"),
+            "stop": ("POST", f"{plugin_path}/stop"),
+            "uninstall": ("POST", f"{plugin_path}/uninstall"),
+            "verify_plugin": ("GET", "/api/v1/admin/plugins"),
+            "verify_capability": ("GET", "/api/v1/admin/capabilities/manifest"),
+            "delete_signing_key": (
+                "DELETE",
+                f"/api/v1/admin/plugins/signing-keys/plugin-uat-key-{backend.plugin_id[11:]}",
+            ),
+            "verify_signing_key": ("GET", "/api/v1/admin/plugins/signing-keys"),
+        }
+        fault = cleanup_started and (method, path) == targets[stage]
+        if fault and outcome == "error":
+            backend.requests.append((method, path))
+            raise ConnectionError(f"{stage} failed")
+        result = original_request(method, path, body=body, idempotency_key=idempotency_key)
+        if fault and outcome == "response_lost":
+            raise TimeoutError(f"{stage} response was lost")
+        if fault and outcome == "residual":
+            if stage == "verify_plugin":
+                return [{"id": backend.plugin_id}]
+            if stage == "verify_capability":
+                return {"capabilities": [{"id": backend.capability_id}]}
+            return [{"key_id": f"plugin-uat-key-{backend.plugin_id[11:]}"}]
+        return result
+
+    monkeypatch.setattr(backend, "request_json", request_json)
+    for name in ("USERNAME", "PASSWORD", "TENANT_ID"):
+        monkeypatch.delenv(f"AGENT_HUB_ACCEPTANCE_OPERATOR_{name}", raising=False)
+    monkeypatch.setattr(
+        module,
+        "_acceptance_credentials_from_env",
+        lambda: ("admin-user", "admin-password", "tenant-1"),
+    )
+    monkeypatch.setattr(module, "UrllibPluginAcceptanceClient", factory)
+    report_path = tmp_path / "report.json"
+
+    assert module.main(["--output", str(report_path), "--poll-interval", "0"]) == 1
+
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["status"] == "failed"
+    assert report["acceptance_complete"] is False
+    assert report["cleanup_state"] == "failed"
+    assert report["cleanup"]["errors"]
+    assert report["temporary_operator_cleanup"]["completed"] == []
+    assert report["temporary_operator_cleanup"]["errors"]
+    assert factory.admin.temporary_users
+    assert not any(path.startswith("/api/v1/users/") for _, path in factory.admin.requests)
+    cleanup_start = next(
+        i for i, (_, path) in enumerate(backend.requests) if path.endswith("/disable")
+    )
+    cleanup_requests = backend.requests[cleanup_start:]
+    assert (
+        len(cleanup_requests)
+        == {
+            "disable": 1,
+            "stop": 2,
+            "uninstall": 3,
+            "verify_plugin": 4,
+            "verify_capability": 5,
+            "delete_signing_key": 6,
+            "verify_signing_key": 7,
+        }[stage]
+    )
+    if stage not in {"delete_signing_key", "verify_signing_key"}:
+        assert backend.signing_keys
+    assert len(backend.run_idempotency_keys) == 1
+    assert report["recovery"]["required"] is True
+    assert report["recovery"]["frozen"] is True
+    assert report["recovery"]["resubmission_allowed"] is False
+    assert all(step["method"] == "GET" for step in report["recovery"]["steps"])
+
+
+def test_cleanup_recovery_preserves_plugin_verification_before_key_deletion(tmp_path: Path) -> None:
+    module = _load_script()
+    backend = FakePluginAcceptanceClient(terminal_quiescent=False)
+    report = module.run_real_user_plugin_acceptance(
+        backend,
+        operator_client=_operator(backend),
+        execution_id="cleanup-order",
+        package_dir=tmp_path,
+        wait_seconds=0,
+        poll_interval_seconds=0,
+    )
+    steps = report["recovery"]["steps"]
+    assert [(step["method"], step["path"]) for step in steps] == [
+        ("GET", f"/api/v1/runs/{RUN_ID}/details"),
+        ("POST", f"/api/v1/admin/plugins/{report['plugin_id']}/disable"),
+        ("POST", f"/api/v1/admin/plugins/{report['plugin_id']}/stop"),
+        ("POST", f"/api/v1/admin/plugins/{report['plugin_id']}/uninstall"),
+        ("GET", "/api/v1/admin/plugins"),
+        ("GET", "/api/v1/admin/capabilities/manifest"),
+        ("DELETE", f"/api/v1/admin/plugins/signing-keys/{report['recovery']['key_id']}"),
+        ("GET", "/api/v1/admin/plugins/signing-keys"),
+    ]
 
 
 def test_cli_defers_all_cleanup_when_run_submission_response_is_lost(
