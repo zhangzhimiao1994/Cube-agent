@@ -31,7 +31,7 @@ from sqlalchemy.engine import AdaptedConnection, Connection, make_url
 from sqlalchemy.engine.default import DefaultExecutionContext
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
-from sqlalchemy.sql.dml import Insert
+from sqlalchemy.sql.dml import Delete, Insert, Update
 from starlette.requests import Request
 from starlette.types import Message
 
@@ -45,7 +45,7 @@ from agent_hub.security.secrets import SecretCipher, SecretService
 
 PLUGIN_ID = "generated-tool"
 CONTENT_SHA256 = "1" * 64
-type Action = Literal["disable", "stop", "approve"]
+type Action = Literal["disable", "stop", "approve", "reject"]
 type AuditPhase = Literal["before", "after"]
 type Replacement = Literal["row_id", "marker", "payload"]
 type WriteAction = Action | Literal["upsert"]
@@ -157,16 +157,22 @@ async def saved_rows(context: AdminContext) -> dict[RowKey, SavedRow]:
 
 async def mutate(context: AdminContext, action: Action) -> admin.PluginResourceResponse:
     kwargs = {"tenant_id": context.principal.tenant_id, "actor_id": context.principal.user_id}
-    if action == "approve":
-        return await context.service.approve_plugin_package(
-            PLUGIN_ID, admin.PluginPackageApprovalRequest(), **kwargs
+    if action in {"approve", "reject"}:
+        approval = (
+            context.service.approve_plugin_package
+            if action == "approve"
+            else context.service.reject_plugin_package
         )
+        return await approval(PLUGIN_ID, admin.PluginPackageApprovalRequest(), **kwargs)
     if action == "disable":
         return await context.service.disable_plugin(PLUGIN_ID, **kwargs)
     return await context.service.stop_plugin(PLUGIN_ID, **kwargs)
 
 
 async def check_audit_rollback(context: AdminContext, action: Action, phase: AuditPhase) -> None:
+    if action == "approve":
+        # Legacy approval belongs to ordinary uploads; generated approval has its own transaction.
+        await make_ordinary_registration(context)
     before = await saved_rows(context)
     tenant_id = context.principal.tenant_id
     async with context.factory() as session:
@@ -264,15 +270,26 @@ async def check_audit_rollback(context: AdminContext, action: Action, phase: Aud
         after[(tenant_id, "plugin", PLUGIN_ID)].row_id
         == before[(tenant_id, "plugin", PLUGIN_ID)].row_id
     )
-    assert (
-        after[(tenant_id, "plugin", PLUGIN_ID)].payload["_generated_handover_id"]
-        == "gh-" + "2" * 64
-    )
+    original = before[(tenant_id, "plugin", PLUGIN_ID)].payload
+    stored = after[(tenant_id, "plugin", PLUGIN_ID)].payload
+    for marker in ("_generated_handover_id", "_generated_review_approval"):
+        if marker in original:
+            assert stored[marker] == original[marker]
+        else:
+            assert marker not in stored
+    for field in ("source_filename", "content_sha256", "resource_config"):
+        assert stored[field] == original[field]
+    if action in {"approve", "reject"}:
+        assert result.package_metadata is not None
+        assert result.package_metadata.approval_state == (
+            "approved" if action == "approve" else "rejected"
+        )
     audits = [row.payload for key, row in after.items() if key[1] == "audit"]
     assert len(audits) == 1
-    assert audits[0]["action"] == (
-        "plugin.package.approved" if action == "approve" else f"plugin.{action}"
-    )
+    assert audits[0]["action"] == {
+        "approve": "plugin.package.approved",
+        "reject": "plugin.package.rejected",
+    }.get(action, f"plugin.{action}")
     assert audits[0]["actor"] == str(context.principal.user_id)
     assert audits[0]["resource"] == f"plugin:{PLUGIN_ID}"
     assert len(after) == len(before) + 1
@@ -280,6 +297,67 @@ async def check_audit_rollback(context: AdminContext, action: Action, phase: Aud
         if key != (tenant_id, "plugin", PLUGIN_ID):
             assert after[key] == row
     assert "_generated_handover_id" not in result.model_dump()
+
+
+async def check_generated_legacy_approval_rejected(
+    context: AdminContext, *, referenced: bool = False, configured_review: bool = False
+) -> None:
+    before = await saved_rows(context)
+    plugin_key = (context.principal.tenant_id, "plugin", PLUGIN_ID)
+    assert "_generated_handover_id" in before[plugin_key].payload
+    async with context.factory() as session:
+        engine = session.get_bind()
+    writes: list[str] = []
+
+    def observe_write(
+        connection: Connection,
+        cursor: object,
+        statement: str,
+        parameters: object,
+        execution: DefaultExecutionContext,
+        executemany: bool,
+    ) -> None:
+        compiled = execution.compiled
+        if (
+            compiled is not None
+            and isinstance(compiled.statement, (Insert, Update, Delete))
+            and cast(Table, compiled.statement.table).name == AdminResourceRow.__tablename__
+        ):
+            writes.append(type(compiled.statement).__name__)
+
+    async def trusted_review(session: AsyncSession, *, plugin_row: AdminResourceRow) -> bool:
+        # Only a boundary stub; direct legacy approval must reject even with it configured.
+        assert session.in_transaction()
+        assert plugin_row.id == before[plugin_key].row_id
+        assert plugin_row.tenant_id == context.principal.tenant_id
+        return True
+
+    body = admin.PluginPackageApprovalRequest(
+        scan_report_id="gs-" + "3" * 64 if referenced else None,
+        scan_report_sha256="4" * 64 if referenced else None,
+    )
+    event.listen(engine, "before_cursor_execute", observe_write)
+    try:
+        with patch.object(
+            context.service, "_generated_plugin_approval_validator",
+            new=trusted_review if configured_review else None,
+        ):
+            try:
+                await asyncio.wait_for(
+                    context.service.approve_plugin_package(
+                        PLUGIN_ID, body, tenant_id=context.principal.tenant_id,
+                        actor_id=context.principal.user_id,
+                    ),
+                    timeout=15,
+                )
+            except PublicAPIError as error:
+                assert error.status_code == 409 and error.code == "plugin_generated_review_required"
+            else:
+                raise AssertionError("generated legacy approval bypassed source review")
+    finally:
+        event.remove(engine, "before_cursor_execute", observe_write)
+    assert writes == []
+    assert await saved_rows(context) == before
 
 
 async def wait_for_blocked_registration[T](
@@ -513,6 +591,10 @@ async def check_registration_write_aba(
     action: WriteAction,
     generated: bool,
 ) -> None:
+    if generated and action == "approve":
+        # Native callers retain this case, but a forbidden approval must never reach the CAS lock.
+        await check_generated_legacy_approval_rejected(context)
+        return
     tenant_id = context.principal.tenant_id
     plugin_key = (tenant_id, "plugin", PLUGIN_ID)
     if not generated:
@@ -1519,7 +1601,7 @@ if importlib.util.find_spec("pytest") is not None:
             finally:
                 await cleanup_context(context)
 
-    @pytest.mark.parametrize("action", ["disable", "stop", "approve"])
+    @pytest.mark.parametrize("action", ["disable", "stop", "approve", "reject"])
     @pytest.mark.parametrize("phase", ["before", "after"])
     async def test_postgres_admin_state_and_audit_roll_back_together(
         admin_context: AdminContext,
@@ -1546,7 +1628,7 @@ if importlib.util.find_spec("pytest") is not None:
         "action,generated",
         [
             (action, generated)
-            for action in ("disable", "stop", "approve", "upsert")
+            for action in ("disable", "stop", "approve", "reject", "upsert")
             for generated in (False, True)
             if not (action == "upsert" and generated)
         ],
@@ -1558,6 +1640,18 @@ if importlib.util.find_spec("pytest") is not None:
     ) -> None:
         async with safe_db_errors():
             await check_registration_write_aba(admin_context, action, generated)
+
+    @pytest.mark.parametrize("referenced", [False, True])
+    @pytest.mark.parametrize("configured_review", [False, True])
+    async def test_postgres_generated_legacy_approval_rejects_without_sql_writes(
+        admin_context: AdminContext,
+        referenced: bool,
+        configured_review: bool,
+    ) -> None:
+        async with safe_db_errors():
+            await check_generated_legacy_approval_rejected(
+                admin_context, referenced=referenced, configured_review=configured_review
+            )
 
     @pytest.mark.parametrize("active_replacement", [False, True])
     async def test_postgres_api_retry_preserves_old_pending(

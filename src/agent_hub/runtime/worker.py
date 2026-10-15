@@ -23,6 +23,7 @@ from agent_hub.hermes import PersistentHermesRunAdvisor
 from agent_hub.mcp.runtime import RuntimeMcpService
 from agent_hub.memory.persistent import PersistentRuntimeMemoryRecall
 from agent_hub.plugins.dependency_policy import plugin_package_dependency_policy_from_settings
+from agent_hub.plugins.handover_reviews import validate_generated_approval_in_session
 from agent_hub.plugins.runtime import (
     RuntimePluginService,
     build_plugin_package_subprocess_adapters,
@@ -279,6 +280,7 @@ def build_worker_service(
         session_factory=database.session_factory,
         skill_store_dir=settings.skill_store_dir,
         generated_artifact_dir=settings.generated_artifact_dir,
+        generated_plugin_approval_validator=validate_generated_approval_in_session,
     )
     runtime_mcp_service = RuntimeMcpService(
         tenant_id=settings.bootstrap_tenant_id,

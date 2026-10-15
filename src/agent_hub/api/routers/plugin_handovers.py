@@ -10,13 +10,14 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Header, Path, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.routing import APIRoute
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_validator
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, JsonValue, field_validator
 from starlette.requests import ClientDisconnect
 from starlette.responses import Response
 
 from agent_hub.api.dependencies import current_principal
 from agent_hub.api.errors import PublicAPIError, error_responses
 from agent_hub.auth.models import AuthenticatedPrincipal, PermissionDenied
+from agent_hub.plugins.handover_reviews import StoredPluginReviewReport
 from agent_hub.plugins.handover_snapshots import InvalidSnapshot, SnapshotUnavailable
 from agent_hub.plugins.handover_sources import SourceChanged, SourceLimits
 from agent_hub.plugins.handover_storage import (
@@ -27,6 +28,7 @@ from agent_hub.plugins.handover_storage import (
     StorageUnavailable,
     WorkspaceSource,
 )
+from agent_hub.runtime.contracts import _mutable_json
 
 _ID = r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$"
 _DIGEST = r"^[a-f0-9]{64}$"
@@ -54,6 +56,17 @@ class GeneratedPluginHandoverService(Protocol):
         expected_version: int, plan_hash: str, confirm: bool, idempotency_key: str,
         archive_bytes: bytes, key_id: str, request: Request,
     ) -> HandoverReceipt: ...
+
+
+class GeneratedPluginReviewService(Protocol):
+    async def scan_pending_package(
+        self, principal: AuthenticatedPrincipal, run_id: UUID, handover_id: str, *,
+        archive_bytes: bytes, key_id: str, idempotency_key: str,
+    ) -> StoredPluginReviewReport: ...
+
+    async def get_report(
+        self, principal: AuthenticatedPrincipal, run_id: UUID, handover_id: str, report_id: str,
+    ) -> StoredPluginReviewReport: ...
 
 
 class _SafeRoute(APIRoute):
@@ -126,11 +139,35 @@ class CancelPlanBody(_WireDTO):
     plan_hash: Annotated[str, Field(pattern=_DIGEST, min_length=64, max_length=64)]
 
 
+class PluginSourceReviewResponse(_WireDTO):
+    schema_version: Literal[1] = 1
+    report_id: Annotated[str, Field(pattern=r"^gs-[a-f0-9]{64}$")]
+    report_sha256: Annotated[str, Field(pattern=_DIGEST)]
+    created_at: AwareDatetime
+    coverage: Literal["complete", "incomplete"]
+    body: dict[str, JsonValue]
+
+
+def _review_response(stored: StoredPluginReviewReport) -> PluginSourceReviewResponse:
+    return PluginSourceReviewResponse(
+        report_id=stored.report_id, report_sha256=stored.report_sha256,
+        created_at=stored.created_at, coverage=stored.report.coverage,
+        body=cast(dict[str, JsonValue], _mutable_json(stored.report.body)),
+    )
+
+
 def get_plugin_handover_services(request: Request) -> GeneratedPluginHandoverService:
     services = getattr(request.app.state, "plugin_handover_services", None)
     if services is None:
         raise PublicAPIError(503, "service_unavailable", "service unavailable")
     return cast(GeneratedPluginHandoverService, services)
+
+
+def get_plugin_review_services(request: Request) -> GeneratedPluginReviewService:
+    services = getattr(request.app.state, "plugin_review_services", None)
+    if services is None:
+        raise PublicAPIError(503, "service_unavailable", "service unavailable")
+    return cast(GeneratedPluginReviewService, services)
 
 
 def _single_idempotency_key(request: Request) -> None:
@@ -152,6 +189,7 @@ async def _archive(request: Request) -> bytes:
 
 Principal = Annotated[AuthenticatedPrincipal, Depends(current_principal)]
 Services = Annotated[GeneratedPluginHandoverService, Depends(get_plugin_handover_services)]
+ReviewServices = Annotated[GeneratedPluginReviewService, Depends(get_plugin_review_services)]
 HandoverPath = Annotated[str, Path(pattern=r"^gh-[a-f0-9]{64}$", min_length=67, max_length=67)]
 IdempotencyKey = Annotated[
     str, Header(alias="Idempotency-Key", pattern=_ID, min_length=1, max_length=128),
@@ -215,3 +253,29 @@ async def confirm_plan(
         plan_hash=plan_hash, confirm=confirm == "true", idempotency_key=idempotency_key,
         archive_bytes=archive, key_id=key_id, request=request,
     )
+
+
+@router.post("/{handover_id}/scan-reports", response_model=PluginSourceReviewResponse)
+async def scan_source_package(
+    run_id: UUID, handover_id: HandoverPath, request: Request,
+    principal: Principal, services: ReviewServices, idempotency_key: IdempotencyKey,
+    key_id: Annotated[str, Query(pattern=_ID, min_length=1, max_length=128)],
+) -> PluginSourceReviewResponse:
+    _single_idempotency_key(request)
+    if set(request.query_params) != {"key_id"} or len(request.query_params.getlist("key_id")) != 1:
+        raise PublicAPIError(422, "request_validation", "request validation failed")
+    archive = await _archive(request)
+    stored = await services.scan_pending_package(
+        principal, run_id, handover_id, archive_bytes=archive, key_id=key_id,
+        idempotency_key=idempotency_key,
+    )
+    return _review_response(stored)
+
+
+@router.get("/{handover_id}/scan-reports/{report_id}", response_model=PluginSourceReviewResponse)
+async def get_source_package_report(
+    run_id: UUID, handover_id: HandoverPath,
+    report_id: Annotated[str, Path(pattern=r"^gs-[a-f0-9]{64}$", min_length=67, max_length=67)],
+    principal: Principal, services: ReviewServices,
+) -> PluginSourceReviewResponse:
+    return _review_response(await services.get_report(principal, run_id, handover_id, report_id))

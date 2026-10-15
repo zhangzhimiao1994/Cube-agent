@@ -48,6 +48,25 @@
   padding: 1rem 1.5rem max(2rem, env(safe-area-inset-bottom));
   overflow-wrap: anywhere;
 }
+.plugin-handover-modal [hidden] { display: none !important; }
+.plugin-handover-modal-full { width: 100%; }
+.plugin-handover-modal pre {
+  box-sizing: border-box;
+  min-width: 0;
+  max-width: 100%;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  overflow: auto;
+  border: 1px solid #a6afb8;
+  border-radius: 4px;
+  background: #f0f2f4;
+  color: #24282d;
+  padding: .75rem;
+}
+.plugin-handover-report { max-height: 22rem; }
+.plugin-handover-report-full { display: flex; flex-direction: column; gap: .75rem; }
+.plugin-handover-report-full pre { flex: 1; min-height: 0; margin: 0; }
+.plugin-handover-section h4 { font-size: .95rem; margin: 1rem 0 .25rem; }
 .plugin-handover-modal .plugin-handover-authority { color: #4a535b; }
 .plugin-handover-modal .plugin-handover-section {
   padding: 1.25rem 0;

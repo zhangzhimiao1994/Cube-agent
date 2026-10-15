@@ -1687,6 +1687,37 @@ export type PluginHandoverIdentityInput = z.infer<typeof PluginHandoverIdentityI
 export type PluginHandoverConfirmInput = z.infer<typeof PluginHandoverConfirmInputSchema>;
 export type PluginHandoverReceipt = z.infer<typeof PluginHandoverReceiptSchema>;
 
+const PluginScanReportIdSchema = z.string().regex(/^gs-[a-f0-9]{64}$/).length(67);
+const PluginScanCoverageSchema = z.enum(["complete", "incomplete"]);
+const PluginScanBodySchema = z.object({
+  schema_version: z.literal(1),
+  scanner_id: z.string().min(1), ruleset_id: z.string().min(1),
+  rules_sha256: PluginHandoverDigestSchema, parser_id: z.string().min(1),
+  limits: z.record(z.string(), z.json()),
+  subject: z.object({
+    run_id: PluginHandoverUUIDSchema, handover_id: PluginHandoverIdSchema,
+    plan_hash: PluginHandoverDigestSchema,
+    verified_package: z.object({
+      key_id: PluginHandoverIdentifierSchema, archive_sha256: PluginHandoverDigestSchema,
+    }).catchall(z.json()),
+  }).catchall(z.json()),
+  coverage: PluginScanCoverageSchema,
+  members: z.array(z.object({ path: z.string(), member_sha256: PluginHandoverDigestSchema,
+    size_bytes: z.number().int().nonnegative(), status: z.enum(["scanned", "nonexecuting", "unsupported", "incomplete"]),
+    reason: z.string().nullable() }).catchall(z.json())),
+  findings: z.array(z.object({ rule_id: z.string(), category: z.string(), path: z.string(),
+    member_sha256: PluginHandoverDigestSchema, line: z.number().int().positive(),
+    column: z.number().int().nonnegative(), explanation: z.string() }).catchall(z.json())),
+  incomplete_reasons: z.array(z.string()), limitations: z.string(),
+}).catchall(z.json());
+const PluginScanReportSchema = z.object({
+  schema_version: z.literal(1), report_id: PluginScanReportIdSchema,
+  report_sha256: PluginHandoverDigestSchema, created_at: PluginHandoverDateSchema,
+  coverage: PluginScanCoverageSchema, body: PluginScanBodySchema,
+}).refine((report) => report.coverage === report.body.coverage
+  && (report.coverage !== "complete" || report.body.incomplete_reasons.length === 0));
+export type PluginScanReport = z.infer<typeof PluginScanReportSchema>;
+
 const PluginSigningKeySchema = z.object({
   key_id: z.string(),
   algorithm: z.literal("ed25519"),
@@ -1708,6 +1739,8 @@ export type PluginSigningKeyPayload = {
 
 export type PluginPackageApprovalPayload = {
   reason?: string;
+  scan_report_id?: string;
+  scan_report_sha256?: string;
 };
 
 export type PluginResourcePayload = {
@@ -2291,6 +2324,34 @@ function pluginHandoverPath(runId: string, ...handoverIds: string[]): string {
 }
 
 export const api = {
+  async scanPluginHandover(runId: string, handoverId: string, keyId: string,
+    archive: Blob, idempotencyKey: string): Promise<PluginScanReport> {
+    const path = pluginHandoverPath(runId, handoverId);
+    const key_id = checkedPluginHandoverInput(PluginHandoverIdentifierSchema, keyId);
+    const key = checkedPluginHandoverInput(PluginHandoverIdentifierSchema, idempotencyKey);
+    if (!(archive instanceof Blob) || !archive.size) {
+      throw new ApiError("invalid scan archive", 422, "request_validation");
+    }
+    if (archive.size > 2_000_000) throw new ApiError("scan archive is too large", 413, "request_too_large");
+    const report = await requestBinary(`${path}/scan-reports?${new URLSearchParams({ key_id })}`, {
+      method: "POST", body: archive,
+      headers: { "Content-Type": "application/zip", "Idempotency-Key": key },
+    }, PluginScanReportSchema);
+    if (report.body.subject.run_id !== runId || report.body.subject.handover_id !== handoverId
+      || report.body.subject.verified_package.key_id !== keyId) {
+      throw new ApiError("scan report identity mismatch", 200, "invalid_response");
+    }
+    return report;
+  },
+  async pluginHandoverScanReport(runId: string, handoverId: string, reportId: string): Promise<PluginScanReport> {
+    const path = pluginHandoverPath(runId, handoverId);
+    const id = checkedPluginHandoverInput(PluginScanReportIdSchema, reportId);
+    const report = await request(`${path}/scan-reports/${encodeURIComponent(id)}`, { method: "GET" }, PluginScanReportSchema);
+    if (report.report_id !== id || report.body.subject.run_id !== runId || report.body.subject.handover_id !== handoverId) {
+      throw new ApiError("scan report identity mismatch", 200, "invalid_response");
+    }
+    return report;
+  },
   async createPluginHandover(
     runId: string, input: PluginHandoverCreateInput, idempotencyKey: string,
   ): Promise<PluginHandoverReceipt> {
@@ -3296,7 +3357,11 @@ export const api = {
       CapabilityInstallerPlanResponseSchema,
     );
   },
-  approvePluginPackage(id: string, payload: PluginPackageApprovalPayload): Promise<PluginResource> {
+  async approvePluginPackage(id: string, payload: PluginPackageApprovalPayload): Promise<PluginResource> {
+    if (payload.scan_report_id !== undefined || payload.scan_report_sha256 !== undefined) {
+      checkedPluginHandoverInput(PluginScanReportIdSchema, payload.scan_report_id);
+      checkedPluginHandoverInput(PluginHandoverDigestSchema, payload.scan_report_sha256);
+    }
     return request(
       `/api/v1/admin/plugins/${encodeURIComponent(id)}/package/approve`,
       { method: "POST", body: JSON.stringify(payload) },

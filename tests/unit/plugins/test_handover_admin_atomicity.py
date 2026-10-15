@@ -26,7 +26,9 @@ from tests.unit.plugins.test_handover_admin_writes import (
     Payload,
     RowKey,
     SQLBoundary,
+    configure_trusted_generated_review,
     plugin_payload,
+    reviewed_plugin_payload,
 )
 from tests.unit.plugins.test_handover_admin_writes import context as context  # noqa: PLC0414
 from tests.unit.plugins.test_handover_stage_journal import private_directory
@@ -115,9 +117,10 @@ def prepare(
     # Keep both the production audit writers and all SQL operations real.
     del service._record_audit
     tenant_id, actor_id = uuid4(), uuid4()
-    original = plugin_payload(generated=action != "upsert", enabled=True)
-    if action in {"start", "enable", "reload"}:
-        original["package_metadata"]["kind"] = "manifest_only"
+    original = plugin_payload(generated=action not in {"approve", "upsert"}, enabled=True)
+    if action in {"start", "enable", "reload", "failed_start"}:
+        original = reviewed_plugin_payload(enabled=action != "enable")
+        configure_trusted_generated_review(context, tenant_id=tenant_id)
     if action == "stop":
         original.update(status="running", health="healthy")
     db.put(original, tenant_id=tenant_id)
@@ -135,7 +138,8 @@ async def test_plugin_mutation_and_audit_roll_back_together(
 ) -> None:
     service, db, tenant_id, actor_id, before, before_ids = prepare(context, action)
     db.fail_audit = failure
-    with pytest.raises(RuntimeError, match="audit failed|commit failed"):
+    expected_error = "^commit failed$" if failure == "commit" else "^audit failed$"
+    with pytest.raises(RuntimeError, match=expected_error):
         await perform(service, action, tenant_id, actor_id)
     assert db.rows == before
     assert db.row_ids == before_ids
@@ -173,6 +177,32 @@ async def test_plugin_mutation_commits_one_scoped_audit(context: AdminContext, a
         assert (tenant_id, "plugin", "generated-tool") not in db.rows
     else:
         assert db.plugin(tenant_id=tenant_id) != before[(tenant_id, "plugin", "generated-tool")]
+        for marker in ("_generated_handover_id", "_generated_review_approval"):
+            if marker in before[(tenant_id, "plugin", "generated-tool")]:
+                assert db.plugin(tenant_id=tenant_id)[marker] == before[
+                    (tenant_id, "plugin", "generated-tool")
+                ][marker]
+
+
+@pytest.mark.parametrize("configured_review", [False, True])
+@pytest.mark.parametrize("approval_state", ["pending", "approved"])
+async def test_generated_legacy_approval_cannot_write_or_audit_across_tenants(
+    context: AdminContext, configured_review: bool, approval_state: str
+) -> None:
+    service, db, tenant_id, actor_id, _, _ = prepare(context, "approve")
+    original = plugin_payload(enabled=True)
+    original["package_metadata"]["approval_state"] = approval_state
+    db.put(original, tenant_id=tenant_id)
+    if configured_review:
+        configure_trusted_generated_review(context, tenant_id=tenant_id)
+    before, before_ids = deepcopy(db.rows), deepcopy(db.row_ids)
+    with pytest.raises(PublicAPIError) as error:
+        await perform(service, "approve", tenant_id, actor_id)
+    assert error.value.status_code == 409
+    assert error.value.code == "plugin_generated_review_required"
+    assert db.rows == before
+    assert db.row_ids == before_ids
+    assert not any(event[0] in {"write", "audit"} for event in db.events)
 
 
 @pytest.mark.parametrize("changed", ["marker", "row_id", "payload"])

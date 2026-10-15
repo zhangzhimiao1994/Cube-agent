@@ -1245,6 +1245,7 @@ def create_app(
         )
         try:
             application.state.plugin_handover_services = None
+            application.state.plugin_review_services = None
             application.state.settings = configured
             application.state.trusted_proxy_ips = configured.trusted_proxy_ips
             application.state.bootstrap_tenant_id = configured.bootstrap_tenant_id
@@ -1327,6 +1328,7 @@ def create_app(
                 from agent_hub.plugins.handover_grants import DurableSourceGrantService
                 from agent_hub.plugins.handover_plans import GeneratedPluginPlanService
                 from agent_hub.plugins.handover_public import GeneratedPluginHandoverService
+                from agent_hub.plugins.handover_reviews import GeneratedPluginReviewService
                 from agent_hub.plugins.handover_snapshots import (
                     FrozenSourceSnapshotStore,
                     InvalidSnapshot,
@@ -1357,6 +1359,14 @@ def create_app(
                         ),
                         generated_root=configured.generated_artifact_dir,
                     )
+                    handover_confirmation = GeneratedPluginConfirmationService(
+                        storage=handover_storage,
+                        snapshots=handover_snapshots,
+                        grants=handover_grants,
+                    )
+                    application.state.plugin_review_services = GeneratedPluginReviewService(
+                        confirmation=handover_confirmation,
+                    )
                     application.state.plugin_handover_services = GeneratedPluginHandoverService(
                         plans=GeneratedPluginPlanService(
                             sources=handover_sources,
@@ -1364,11 +1374,7 @@ def create_app(
                             grants=handover_grants,
                             storage=handover_storage,
                         ),
-                        confirmation=GeneratedPluginConfirmationService(
-                            storage=handover_storage,
-                            snapshots=handover_snapshots,
-                            grants=handover_grants,
-                        ),
+                        confirmation=handover_confirmation,
                         storage=handover_storage,
                         grants=handover_grants,
                     )
@@ -1383,6 +1389,10 @@ def create_app(
                     session_factory=active_sessions,
                     skill_store_dir=configured.skill_store_dir,
                     generated_artifact_dir=configured.generated_artifact_dir,
+                    generated_plugin_approval_validator=(
+                        None if application.state.plugin_review_services is None else
+                        application.state.plugin_review_services.validate_generated_approval_in_session
+                    ),
                 )
             if user_admin_service is None and active_sessions is not None:
                 application.state.user_admin_service = PersistentUserAdminService(active_sessions)
@@ -1853,6 +1863,7 @@ def create_app(
     application.state.multimedia_generation_executor = None
     application.state.project_workspace_store = None
     application.state.plugin_handover_services = None
+    application.state.plugin_review_services = None
     application.state.plugin_publication_reservations = plugin_publication_reservations
     application.state.preview_manager = (
         previews.WebPreviewService(preview_manager) if preview_manager is not None else None

@@ -13,6 +13,16 @@ const createInput = {
   expires_at: "2026-10-14T12:00:00+00:00",
 };
 const archive = new Blob([new Uint8Array([80, 75, 3, 4])], { type: "application/zip" });
+const scanReport = {
+  schema_version: 1, report_id: `gs-${"d".repeat(64)}`, report_sha256: "e".repeat(64),
+  created_at: "2026-10-15T00:00:00Z", coverage: "complete",
+  body: { schema_version: 1, scanner_id: "plugin-python-source-v1", ruleset_id: "plugin-python-signals-v1",
+    rules_sha256: "f".repeat(64), parser_id: "cpython-3.12-ast-exec", limits: { max_nodes: 100000 },
+    subject: { run_id: runId, handover_id: handoverId, plan_hash: planHash,
+      verified_package: { key_id: "existing:key.1", archive_sha256: "c".repeat(64) } },
+    coverage: "complete", members: [], findings: [], incomplete_reasons: [],
+    limitations: "Static signals only; not proof of malice or absence of vulnerabilities." },
+};
 const receipt = {
   schema_version: 1,
   handover_id: handoverId,
@@ -61,6 +71,60 @@ afterEach(async () => {
 });
 
 describe("public plugin handover transport", () => {
+  it("scans original ZIP bytes with the stored key and a unique idempotency key, then GETs the report", async () => {
+    const fetchMock = vi.fn().mockImplementation(async () => response(scanReport));
+    vi.stubGlobal("fetch", fetchMock);
+    expect(await api.scanPluginHandover(runId, handoverId, "existing:key.1", archive, "scan:1")).toEqual(scanReport);
+    const [path, init] = fetchMock.mock.calls[0];
+    expect(path).toBe(`/api/v1/runs/${runId}/plugin-handovers/${handoverId}/scan-reports?key_id=existing%3Akey.1`);
+    expect(init.body).toBe(archive);
+    expect(new Headers(init.headers).get("Content-Type")).toBe("application/zip");
+    expect(new Headers(init.headers).get("Idempotency-Key")).toBe("scan:1");
+    expect(await api.pluginHandoverScanReport(runId, handoverId, scanReport.report_id)).toEqual(scanReport);
+    expect(fetchMock.mock.calls[1][1].method).toBe("GET");
+  });
+
+  it.each([{ body: "<script>bad()</script>" }, { coverage: "safe" }, { report_sha256: "bad" },
+    { body: { ...scanReport.body, coverage: "incomplete" } },
+    { body: { ...scanReport.body, incomplete_reasons: ["parse_error"] } }])("rejects malformed scan reports %#", async (patch) => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(response({ ...scanReport, ...patch })));
+    await expect(api.scanPluginHandover(runId, handoverId, "existing:key.1", archive, "scan:1"))
+      .rejects.toMatchObject({ code: "invalid_response" });
+  });
+
+  it("rejects invalid scan identities and ZIP before fetch", async () => {
+    const fetchMock = vi.fn(); vi.stubGlobal("fetch", fetchMock);
+    await expect(api.scanPluginHandover(runId, handoverId, "key\n", archive, "scan:1")).rejects.toBeInstanceOf(ApiError);
+    await expect(api.scanPluginHandover(runId, handoverId, "key", new Blob(), "scan:1")).rejects.toBeInstanceOf(ApiError);
+    await expect(api.pluginHandoverScanReport(runId, handoverId, "../report")).rejects.toBeInstanceOf(ApiError);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it.each([401, 403, 404, 409, 413, 422, 503])("does not retry or approve a failed scan (HTTP %s)", async (status) => {
+    const fetchMock = vi.fn().mockResolvedValue(response({ error: { code: "scan_rejected", message: "rejected" } }, status));
+    vi.stubGlobal("fetch", fetchMock);
+    await expect(api.scanPluginHandover(runId, handoverId, "existing:key.1", archive, "scan:1"))
+      .rejects.toMatchObject({ status });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("sends exact report approval fields and preserves reason-only legacy requests", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(response({}));
+    vi.stubGlobal("fetch", fetchMock);
+    const payload = { reason: "reviewed", scan_report_id: scanReport.report_id, scan_report_sha256: scanReport.report_sha256 };
+    await api.approvePluginPackage("sample.plugin", payload).catch(() => undefined);
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual(payload);
+    await api.approvePluginPackage("legacy", { reason: "reviewed" }).catch(() => undefined);
+    expect(JSON.parse(fetchMock.mock.calls[1][1].body)).toEqual({ reason: "reviewed" });
+  });
+
+  it.each([{ scan_report_id: scanReport.report_id }, { scan_report_sha256: scanReport.report_sha256 },
+    { scan_report_id: "bad", scan_report_sha256: scanReport.report_sha256 }])("rejects incomplete report approval identity before fetch %#", async (payload) => {
+    const fetchMock = vi.fn(); vi.stubGlobal("fetch", fetchMock);
+    await expect(api.approvePluginPackage("sample.plugin", payload)).rejects.toMatchObject({ code: "request_validation" });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it("creates only a plan with the exact source, expiry and idempotency header", async () => {
     const fetchMock = vi.fn().mockResolvedValue(response(receipt));
     vi.stubGlobal("fetch", fetchMock);

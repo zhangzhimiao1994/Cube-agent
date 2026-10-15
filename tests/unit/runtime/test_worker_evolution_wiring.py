@@ -14,6 +14,7 @@ from agent_hub.api.routers import admin as admin_router
 from agent_hub.api.routers.admin import SystemSettingsResponse
 from agent_hub.config.service import ConfigService
 from agent_hub.evolution_hooks import EvolutionExecutionIngestHook
+from agent_hub.plugins import handover_reviews
 from agent_hub.runs.repository import RunRepository
 from agent_hub.runtime import worker
 from agent_hub.security.secrets import SecretService
@@ -23,7 +24,7 @@ TENANT_ID = UUID("00000000-0000-4000-8000-000000000001")
 OTHER_TENANT_ID = UUID("00000000-0000-4000-8000-000000000002")
 
 
-def test_worker_runtime_stack_uses_configured_generated_artifact_dir(
+def test_worker_runtime_stack_uses_configured_artifacts_and_sql_approval_validator(
     monkeypatch: MonkeyPatch, tmp_path: Path
 ) -> None:
     captured: dict[str, object] = {}
@@ -103,6 +104,14 @@ def test_worker_runtime_stack_uses_configured_generated_artifact_dir(
         captured["runtime_registry"] = kwargs
         return object()
 
+    def reject_review_service_construction(self: object, **kwargs: object) -> None:
+        pytest.fail("worker approval validation must not construct a source scan service")
+
+    monkeypatch.setattr(
+        handover_reviews.GeneratedPluginReviewService,
+        "__init__",
+        reject_review_service_construction,
+    )
     monkeypatch.setattr(worker, "build_database", lambda url: FakeDatabase())
     monkeypatch.setattr(worker, "Redis", FakeRedis)
     monkeypatch.setattr(worker, "ConfigService", lambda session_factory: object())
@@ -130,6 +139,16 @@ def test_worker_runtime_stack_uses_configured_generated_artifact_dir(
     assert resources.runtime_plugin_service is not None
     assert mcp_service["tenant_id"] == TENANT_ID
     assert plugin_service["tenant_id"] == TENANT_ID
+    runtime_admin = plugin_service["admin_service"]
+    assert isinstance(runtime_admin, admin_router.PersistentAdminResourceService)
+    assert mcp_service["admin_service"] is runtime_admin
+    assert runtime_admin._generated_plugin_approval_validator is (
+        handover_reviews.validate_generated_approval_in_session
+    )
+    scoped_admin = runtime_admin.for_principal(OTHER_TENANT_ID, OTHER_TENANT_ID)
+    assert scoped_admin._generated_plugin_approval_validator is (
+        handover_reviews.validate_generated_approval_in_session
+    )
     assert runtime_stack["generated_artifact_dir"] == tmp_path / "generated"
     assert runtime_stack["project_workspace_dir"] == tmp_path / "workspaces"
     assert runtime_stack["tool_registry"].manifests_for_tenant(TENANT_ID) == {

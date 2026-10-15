@@ -12,7 +12,10 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from starlette.types import Message, Receive, Scope, Send
 
 from agent_hub.api.middleware import RequestBodyLimitMiddleware, _body_limit
-from agent_hub.api.routers.admin import InMemoryAdminResourceService
+from agent_hub.api.routers.admin import (
+    InMemoryAdminResourceService,
+    PersistentAdminResourceService,
+)
 from agent_hub.app import create_app
 from agent_hub.plugins.handover_snapshots import InvalidSnapshot, SnapshotUnavailable
 from agent_hub.settings import Settings
@@ -46,6 +49,8 @@ def test_injected_run_service_still_gets_real_handover_dependencies(tmp_path: Pa
     with TestClient(application):
         service = getattr(application.state, "plugin_handover_services", None)
         assert service is not None
+        reviews = application.state.plugin_review_services
+        assert reviews is not None and reviews._confirmation is service._confirmation
         assert service._plans._storage is service._storage
         assert service._confirmation._storage is service._storage
         assert service._plans._grants is service._grants
@@ -56,6 +61,30 @@ def test_injected_run_service_still_gets_real_handover_dependencies(tmp_path: Pa
         assert service._plans._sources._workspaces is application.state.project_workspace_store
         assert service._plans._sources._generated_root == (tmp_path / "generated").absolute()
     assert not database.disposed and not redis.closed
+
+
+def test_default_persistent_admin_uses_the_current_review_validator(tmp_path: Path) -> None:
+    database = FakeDatabase()
+    application = create_app(
+        settings=Settings.model_validate({
+            "project_workspace_dir": tmp_path / "workspaces",
+            "plugin_package_store_dir": tmp_path / "packages",
+            "capability_environment_root_dir": tmp_path / "capabilities",
+            "scheduler_enabled": False,
+        }),
+        session_factory=cast(async_sessionmaker[AsyncSession], database.session_factory),
+        redis_client=FakeRedis(), auth_service=StubAuthService(), config_service=object(),
+        user_admin_service=object(), run_service=object(), rate_limiter=object(),
+        database_probe=Probe(), redis_probe=Probe(),
+    )
+    with TestClient(application):
+        service = application.state.admin_resource_service
+        assert isinstance(service, PersistentAdminResourceService)
+        reviews = application.state.plugin_review_services
+        assert reviews is not None
+        assert service._generated_plugin_approval_validator == reviews.validate_generated_approval_in_session
+        scoped = service.for_principal(uuid4(), uuid4())
+        assert scoped._generated_plugin_approval_validator == reviews.validate_generated_approval_in_session
 
 
 def test_missing_sessions_has_no_in_memory_handover_fallback(tmp_path: Path) -> None:
@@ -72,6 +101,7 @@ def test_missing_sessions_has_no_in_memory_handover_fallback(tmp_path: Path) -> 
     )
     with TestClient(application) as client:
         assert getattr(application.state, "plugin_handover_services", None) is None
+        assert application.state.plugin_review_services is None
         response = client.get(
             f"/api/v1/runs/{uuid4()}/plugin-handovers/gh-{'a' * 64}",
             headers={"Authorization": "Bearer valid-token"},
@@ -104,6 +134,7 @@ def test_restarted_lifespan_does_not_retain_previous_storage_authority(
     )
     with TestClient(application):
         assert application.state.plugin_handover_services is not None
+        assert application.state.plugin_review_services is not None
 
     def unavailable(*, package_root: Path) -> None:
         del package_root
@@ -114,6 +145,7 @@ def test_restarted_lifespan_does_not_retain_previous_storage_authority(
     )
     with TestClient(application):
         assert application.state.plugin_handover_services is None
+        assert application.state.plugin_review_services is None
 
 
 @pytest.mark.parametrize("error_type", [SnapshotUnavailable, InvalidSnapshot])

@@ -8,8 +8,8 @@ import stat
 import subprocess
 import sys
 import sysconfig
-from collections.abc import Awaitable, Callable, Mapping, Sequence
-from contextlib import suppress
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from contextlib import AbstractAsyncContextManager, asynccontextmanager, nullcontext, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import partial
@@ -28,6 +28,7 @@ from agent_hub.api.routers.admin import (
     SUPPORTED_PLUGIN_PACKAGE_SDK_API_VERSIONS,
     SUPPORTED_RUNTIME_REGISTERED_PACKAGE_ISOLATIONS,
     SUPPORTED_RUNTIME_REGISTERED_PACKAGE_RUNTIMES,
+    PersistentAdminResourceService,
     PluginCapabilityRequest,
     PluginPackageMetadata,
     PluginResourceResponse,
@@ -75,6 +76,14 @@ class PluginConfigService(Protocol):
         *,
         tenant_id: UUID | None = None,
     ) -> Sequence[Any]: ...
+
+
+class PluginInvocationScopeProvider(Protocol):
+    """Hold current registration and approval authority through the invocation body."""
+
+    def plugin_invocation_scope(
+        self, plugin: PluginResourceResponse, *, tenant_id: UUID,
+    ) -> AbstractAsyncContextManager[None]: ...
 
 
 class PluginAuditRecorder(Protocol):
@@ -1132,50 +1141,51 @@ class RuntimePluginService:
             idempotency_key=idempotency_key,
         )
         try:
-            adapter = self._adapters_for_plugin(tenant_id, plugin).get(capability.adapter)
-            if adapter is None:
-                raise RuntimeCapabilityError("Plugin backend unavailable")
-            descriptor = _adapter_descriptor(capability.adapter, adapter)
-            _ensure_supported_plugin_sandbox_profile(
-                capability.sandbox_profile,
-                descriptor=descriptor,
-            )
-            argument_validator = _plugin_schema_validator(
-                schema=_adapter_argument_schema(descriptor),
-                invalid_schema_message="Plugin adapter argument schema is invalid",
-            )
-            input_validator = _plugin_schema_validator(
-                schema=capability.input_schema,
-                invalid_schema_message="Plugin input schema is invalid",
-            )
-            output_validator = _plugin_schema_validator(
-                schema=capability.output_schema,
-                invalid_schema_message="Plugin output schema is invalid",
-            )
-            _validate_plugin_payload(
-                payload=arguments,
-                validator=argument_validator,
-                validation_message="Plugin arguments do not match adapter schema",
-                include_location=True,
-            )
-            _validate_plugin_payload(
-                payload=arguments,
-                validator=input_validator,
-                validation_message="Plugin arguments do not match input schema",
-                include_location=True,
-            )
-            result = await adapter.invoke(
-                plugin=plugin,
-                capability=capability,
-                arguments=arguments,
-                context=context,
-            )
-            _validate_plugin_payload(
-                payload=result,
-                validator=output_validator,
-                validation_message="Plugin result does not match output schema",
-                include_location=False,
-            )
+            async with self._plugin_invocation_scope(plugin, tenant_id=tenant_id):
+                adapter = self._adapters_for_plugin(tenant_id, plugin).get(capability.adapter)
+                if adapter is None:
+                    raise RuntimeCapabilityError("Plugin backend unavailable")
+                descriptor = _adapter_descriptor(capability.adapter, adapter)
+                _ensure_supported_plugin_sandbox_profile(
+                    capability.sandbox_profile,
+                    descriptor=descriptor,
+                )
+                argument_validator = _plugin_schema_validator(
+                    schema=_adapter_argument_schema(descriptor),
+                    invalid_schema_message="Plugin adapter argument schema is invalid",
+                )
+                input_validator = _plugin_schema_validator(
+                    schema=capability.input_schema,
+                    invalid_schema_message="Plugin input schema is invalid",
+                )
+                output_validator = _plugin_schema_validator(
+                    schema=capability.output_schema,
+                    invalid_schema_message="Plugin output schema is invalid",
+                )
+                _validate_plugin_payload(
+                    payload=arguments,
+                    validator=argument_validator,
+                    validation_message="Plugin arguments do not match adapter schema",
+                    include_location=True,
+                )
+                _validate_plugin_payload(
+                    payload=arguments,
+                    validator=input_validator,
+                    validation_message="Plugin arguments do not match input schema",
+                    include_location=True,
+                )
+                result = await adapter.invoke(
+                    plugin=plugin,
+                    capability=capability,
+                    arguments=arguments,
+                    context=context,
+                )
+                _validate_plugin_payload(
+                    payload=result,
+                    validator=output_validator,
+                    validation_message="Plugin result does not match output schema",
+                    include_location=False,
+                )
         except Exception:
             await self._record_invocation_audit(
                 plugin,
@@ -1191,6 +1201,38 @@ class RuntimePluginService:
             action="plugin.invoke.succeeded",
         )
         return result
+
+    @asynccontextmanager
+    async def _plugin_invocation_scope(
+        self, plugin: PluginResourceResponse, *, tenant_id: UUID,
+    ) -> AsyncIterator[None]:
+        body_error: BaseException | None = None
+        try:
+            scope_factory = getattr(self._admin_service, "plugin_invocation_scope", None)
+            scope: AbstractAsyncContextManager[None]
+            if scope_factory is None and not isinstance(
+                self._admin_service, PersistentAdminResourceService,
+            ):
+                scope = nullcontext()
+            else:
+                if not callable(scope_factory):
+                    raise RuntimeCapabilityError("Plugin invocation scope unavailable")
+                provider = cast(PluginInvocationScopeProvider, self._admin_service)
+                scope = provider.plugin_invocation_scope(plugin, tenant_id=tenant_id)
+            async with scope:
+                try:
+                    yield
+                except BaseException as error:
+                    body_error = error
+                    raise
+        except Exception:  # noqa: BLE001 - authority failures must not expose storage details.
+            if body_error is not None:
+                raise body_error
+            raise RuntimeCapabilityError(
+                "Plugin current registration or approval unavailable",
+            ) from None
+        if body_error is not None:
+            raise body_error
 
     def _plugins_for_tenant(self, tenant_id: UUID) -> tuple[PluginResourceResponse, ...] | None:
         return self._plugins_by_tenant.get(tenant_id)

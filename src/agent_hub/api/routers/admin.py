@@ -1475,6 +1475,22 @@ class PluginResourceResponse(PluginResourceRequest):
 type PluginActivationPreflight = Callable[[PluginResourceResponse], Awaitable[None]]
 
 
+class PluginGeneratedApprovalValidator(Protocol):
+    async def __call__(self, session: AsyncSession, *, plugin_row: AdminResourceRow) -> bool: ...
+
+
+class GeneratedPluginApprovalService(Protocol):
+    async def approve_generated(
+        self,
+        principal: AuthenticatedPrincipal,
+        plugin_id: str,
+        *,
+        report_id: str | None,
+        report_sha256: str | None,
+        reason: str,
+    ) -> PluginResourceResponse | None: ...
+
+
 @dataclass
 class _PluginAuditWrite:
     action: str
@@ -1563,7 +1579,8 @@ class _PluginWritePayload(dict[str, object]):
 
 def _plugin_response_from_payload(payload: Mapping[str, object]) -> PluginResourceResponse:
     return PluginResourceResponse.model_validate(
-        {key: value for key, value in payload.items() if key != "_generated_handover_id"}
+        {key: value for key, value in payload.items()
+         if key not in {"_generated_handover_id", "_generated_review_approval"}}
     )
 
 
@@ -1601,9 +1618,9 @@ def _checked_plugin_write_payload(
     state_snapshot: dict[str, object] | None = None,
     expected_payload: dict[str, object] | None = None,
 ) -> dict[str, object]:
-    marker = "_generated_handover_id"
+    markers = ("_generated_handover_id", "_generated_review_approval")
     if state_snapshot is None:
-        if marker in current or marker in payload:
+        if any(marker in current or marker in payload for marker in markers):
             raise _plugin_write_conflict()
         if expected_payload is not None and not _plugin_payloads_equal(current, expected_payload):
             raise _plugin_write_conflict()
@@ -1611,11 +1628,12 @@ def _checked_plugin_write_payload(
     # Compare the full row so a concurrent approval or lifecycle update is not lost.
     if not current or not _plugin_payloads_equal(current, state_snapshot):
         raise _plugin_write_conflict()
-    if marker in payload and (
-        marker not in current
-        or not _plugin_payloads_equal({marker: payload[marker]}, {marker: current[marker]})
-    ):
-        raise _plugin_write_conflict()
+    for marker in markers:
+        if marker in payload and (
+            marker not in current
+            or not _plugin_payloads_equal({marker: payload[marker]}, {marker: current[marker]})
+        ):
+            raise _plugin_write_conflict()
     try:
         if not _plugin_payloads_equal(
             _plugin_state_identity(current), _plugin_state_identity(payload)
@@ -1624,8 +1642,9 @@ def _checked_plugin_write_payload(
     except ValidationError:
         raise _plugin_write_conflict() from None
     updated = dict(payload)
-    if marker in current:
-        updated[marker] = current[marker]
+    for marker in markers:
+        if marker in current:
+            updated[marker] = current[marker]
     return updated
 
 
@@ -1666,6 +1685,14 @@ class PluginPackageApprovalRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     reason: str = Field(default="", max_length=256)
+    scan_report_id: str | None = Field(default=None, pattern=r"^gs-[a-f0-9]{64}$")
+    scan_report_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+
+    @model_validator(mode="after")
+    def validate_report_reference(self) -> Self:
+        if (self.scan_report_id is None) != (self.scan_report_sha256 is None):
+            raise ValueError("scan report id and digest must be provided together")
+        return self
 
 
 PluginActivationState = Literal[
@@ -9092,6 +9119,7 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         generated_artifact_dir: Path | None = None,
         conversation_repository: ConversationRepository | None = None,
         project_workspace_repository: ProjectWorkspaceRepository | None = None,
+        generated_plugin_approval_validator: PluginGeneratedApprovalValidator | None = None,
     ) -> None:
         super().__init__()
         self._config_service = config_service
@@ -9101,6 +9129,7 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         self._model_transport = model_transport or LiteLLMClient()
         self._run_repository = run_repository
         self._session_factory = session_factory
+        self._generated_plugin_approval_validator = generated_plugin_approval_validator
         self._conversation_repository = conversation_repository or (
             ConversationRepository(session_factory) if session_factory is not None else None
         )
@@ -9133,7 +9162,122 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             generated_artifact_dir=self._generated_artifact_dir,
             conversation_repository=self._conversation_repository,
             project_workspace_repository=self._project_workspace_repository,
+            generated_plugin_approval_validator=self._generated_plugin_approval_validator,
         )
+
+    async def _require_generated_plugin_approval(
+        self, session: AsyncSession, row: AdminResourceRow,
+    ) -> None:
+        from agent_hub.plugins.handover_storage import Conflict, StorageUnavailable
+
+        validator = self._generated_plugin_approval_validator
+        if validator is None:
+            raise PublicAPIError(
+                409, "plugin_generated_review_required", "generated plugin review is unavailable",
+            )
+        try:
+            valid = await validator(session, plugin_row=row)
+        except (Conflict, PermissionDenied):
+            raise PublicAPIError(
+                409, "plugin_generated_review_required", "generated plugin review is not current",
+            ) from None
+        except StorageUnavailable:
+            raise PublicAPIError(503, "service_unavailable", "service unavailable") from None
+        if valid is not True:
+            raise PublicAPIError(
+                409, "plugin_generated_review_required", "generated plugin review is not current",
+            )
+
+    @staticmethod
+    def _blocked_generated_review(plugin: PluginResourceResponse) -> PluginResourceResponse:
+        package = plugin.package_metadata
+        if package is not None and package.approval_state == "approved":
+            package = PluginPackageMetadata.model_validate({
+                **package.model_dump(mode="json"), "approval_state": "pending",
+                "approval_reason": "generated source review approval is not current",
+                "approved_by": None, "approved_at": None,
+            })
+        return plugin.model_copy(update={
+            "enabled": False, "status": "disabled", "health": "disabled",
+            "last_error_type": None, "package_metadata": package,
+        })
+
+    async def _plugin_with_current_review(
+        self, payload: dict[str, object], *, tenant_id: UUID | None = None,
+    ) -> PluginResourceResponse | None:
+        plugin = _plugin_response_from_payload(payload)
+        if not any(marker in payload for marker in (
+            "_generated_handover_id", "_generated_review_approval",
+        )):
+            return plugin
+        if (
+            self._session_factory is None or self._generated_plugin_approval_validator is None
+            or plugin.package_metadata is None
+            or plugin.package_metadata.approval_state != "approved"
+        ):
+            return self._blocked_generated_review(plugin)
+        target_tenant = self._tenant_id if tenant_id is None else tenant_id
+        async with self._session_factory() as session, session.begin():
+            await _acquire_plugin_registration_locks(session, target_tenant, (plugin.id,))
+            row = (await session.execute(
+                select(AdminResourceRow).where(
+                    AdminResourceRow.tenant_id == target_tenant,
+                    AdminResourceRow.kind == "plugin", AdminResourceRow.resource_id == plugin.id,
+                ).with_for_update().execution_options(populate_existing=True)
+            )).scalar_one_or_none()
+            if row is None:
+                return None
+            latest = _plugin_response_from_payload(row.payload)
+            try:
+                await self._require_generated_plugin_approval(session, row)
+            except PublicAPIError:
+                return self._blocked_generated_review(latest)
+            return latest
+
+    @contextlib.asynccontextmanager
+    async def plugin_invocation_scope(
+        self, plugin: PluginResourceResponse, *, tenant_id: UUID,
+    ) -> AsyncIterator[None]:
+        # Keep registration and proof locks until the already-admitted call ends.
+        if self._session_factory is None:
+            raise PublicAPIError(503, "service_unavailable", "plugin authority unavailable")
+        async with self._session_factory() as session, session.begin():
+            await _acquire_plugin_registration_locks(session, tenant_id, (plugin.id,))
+            row = (await session.execute(
+                select(AdminResourceRow).where(
+                    AdminResourceRow.tenant_id == tenant_id,
+                    AdminResourceRow.kind == "plugin", AdminResourceRow.resource_id == plugin.id,
+                ).with_for_update().execution_options(populate_existing=True)
+            )).scalar_one_or_none()
+            if row is None:
+                raise PublicAPIError(409, "plugin_unavailable", "plugin registration unavailable")
+            current = _plugin_response_from_payload(row.payload)
+            if any(marker in row.payload for marker in (
+                "_generated_handover_id", "_generated_review_approval",
+            )):
+                await self._require_generated_plugin_approval(session, row)
+            package = current.package_metadata
+            if package is not None and package.signature is not None:
+                key_row = (await session.execute(
+                    select(AdminResourceRow).where(
+                        AdminResourceRow.tenant_id == tenant_id,
+                        AdminResourceRow.kind == "plugin_signing_key",
+                        AdminResourceRow.resource_id == package.signature.key_id,
+                    ).with_for_update(read=True).execution_options(populate_existing=True)
+                )).scalar_one_or_none()
+                try:
+                    keys = () if key_row is None else (
+                        PluginSigningKeyResponse.model_validate(key_row.payload),
+                    )
+                    current = _plugin_with_effective_package_trust(current, keys, datetime.now(UTC))
+                except ValueError:
+                    raise PublicAPIError(409, "plugin_unavailable", "plugin signing trust unavailable") from None
+            _ensure_plugin_activation_snapshot_unchanged(
+                _plugin_activation_snapshot_sha256(plugin), current,
+            )
+            if not current.enabled or current.status != "running":
+                raise PublicAPIError(409, "plugin_unavailable", "plugin is not running")
+            yield
 
     async def list_runs(self) -> tuple[RunListItem, ...]:
         if self._run_repository is None:
@@ -12127,13 +12271,15 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             return await super().list_plugins()
         signing_keys = await self.list_plugin_signing_keys(tenant_id=tenant_id)
         now = datetime.now(UTC)
+        projected = [await self._plugin_with_current_review(payload, tenant_id=tenant_id)
+                     for payload in resources]
         return tuple(
             _plugin_with_effective_package_trust(
-                _plugin_response_from_payload(payload),
+                plugin,
                 signing_keys,
                 now,
             )
-            for payload in resources
+            for plugin in projected if plugin is not None
         )
 
     async def list_plugin_signing_keys(
@@ -12618,7 +12764,7 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             return None
         if not payload:
             return None
-        return _plugin_response_from_payload(payload)
+        return await self._plugin_with_current_review(payload, tenant_id=tenant_id)
 
     async def _set_plugin_lifecycle(
         self,
@@ -12655,6 +12801,15 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             raise KeyError(plugin_id)
         current = _plugin_response_from_payload(payload)
         if action in {"start", "enable", "reload"}:
+            if "_generated_handover_id" in payload or "_generated_review_approval" in payload:
+                reviewed = await self._plugin_with_current_review(payload, tenant_id=tenant_id)
+                if (
+                    reviewed is None or reviewed.package_metadata is None
+                    or reviewed.package_metadata.approval_state != "approved"
+                ):
+                    raise PublicAPIError(
+                        409, "plugin_generated_review_required", "matching source review required",
+                    )
             expected_sha256 = _plugin_activation_snapshot_sha256(current)
             try:
                 await _run_plugin_activation_preflight(current, activation_preflight)
@@ -12735,6 +12890,11 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             )
         if not payload:
             raise KeyError(plugin_id)
+        if approval_state == "approved" and "_generated_handover_id" in payload:
+            raise PublicAPIError(
+                409, "plugin_generated_review_required",
+                "generated plugin approval requires a matching source review",
+            )
         current = _plugin_response_from_payload(payload)
         updated = _plugin_with_package_approval(
             current,
@@ -13878,6 +14038,15 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
                     state_snapshot=state_snapshot,
                     expected_payload=expected_payload,
                 )
+                if (
+                    current is not None
+                    and any(marker in current.payload for marker in (
+                        "_generated_handover_id", "_generated_review_approval",
+                    ))
+                    and audit is not None
+                    and audit.action in {"plugin.enable", "plugin.start", "plugin.reload"}
+                ):
+                    await self._require_generated_plugin_approval(session, current)
                 if artifact_check is not None:
                     artifact_check()
                 await session.execute(
@@ -20262,6 +20431,8 @@ async def approve_plugin_package(
     principal: Annotated[AuthenticatedPrincipal, Depends(current_principal)],
     service: Annotated[AdminResourceService, Depends(_service)],
 ) -> PluginResourceResponse:
+    from agent_hub.plugins.handover_storage import Conflict, NotFound, StorageUnavailable
+
     _require(principal, "plugin:approve")
     try:
         current = await _current_plugin_for_activation_check(
@@ -20270,14 +20441,32 @@ async def approve_plugin_package(
             tenant_id=principal.tenant_id,
         )
         _ensure_runtime_registered_package_can_activate(request, current)
-        response = await service.approve_plugin_package(
-            plugin_id,
-            body,
-            tenant_id=principal.tenant_id,
-            actor_id=principal.user_id,
+        reviews = cast(
+            GeneratedPluginApprovalService | None,
+            getattr(request.app.state, "plugin_review_services", None),
         )
-    except KeyError:
+        response = None if reviews is None else await reviews.approve_generated(
+            principal,
+            plugin_id,
+            report_id=body.scan_report_id,
+            report_sha256=body.scan_report_sha256,
+            reason=body.reason,
+        )
+        if response is None:
+            response = await service.approve_plugin_package(
+                plugin_id,
+                body,
+                tenant_id=principal.tenant_id,
+                actor_id=principal.user_id,
+            )
+    except (KeyError, NotFound):
         raise PublicAPIError(404, "not_found", "not found") from None
+    except Conflict:
+        raise PublicAPIError(409, "plugin_source_review_conflict", "source review no longer matches") from None
+    except PermissionDenied:
+        raise PublicAPIError(403, "permission_denied", "permission denied") from None
+    except StorageUnavailable:
+        raise PublicAPIError(503, "plugin_source_review_unavailable", "source review unavailable") from None
     await _reload_plugin_runtime_config(request, principal.tenant_id)
     return response
 

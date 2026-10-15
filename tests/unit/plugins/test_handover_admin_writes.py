@@ -26,6 +26,7 @@ from agent_hub.api.routers.admin import (
     PluginResourceResponse,
     _PluginWritePayload,
 )
+from agent_hub.db.models import AdminResourceRow
 
 type Payload = dict[str, Any]
 type RowKey = tuple[UUID, str, str]
@@ -61,9 +62,13 @@ class SQLBoundary:
         self.rollback_rows = deepcopy(self.rows)
         self.rollback_ids = deepcopy(self.row_ids)
         self.active = True
+        event_start = len(self.events)
         try:
             yield
-            if self.fail_audit == "commit":
+            # Read-only review transactions must not consume mutation commit faults.
+            if self.fail_audit == "commit" and any(
+                event[0] in {"write", "delete", "audit"} for event in self.events[event_start:]
+            ):
                 raise RuntimeError("commit failed")
         except BaseException:
             self.rows = self.rollback_rows
@@ -200,6 +205,42 @@ def plugin_payload(*, generated: bool = True, enabled: bool = False) -> Payload:
     return payload
 
 
+def configure_trusted_generated_review(
+    context: AdminContext, *, tenant_id: UUID | None = None
+) -> None:
+    """Stub only the review boundary; this does not verify real approval proofs."""
+    service, db, own_tenant = context
+    target_tenant = own_tenant if tenant_id is None else tenant_id
+
+    async def validate(session: AsyncSession, *, plugin_row: AdminResourceRow) -> bool:
+        assert session is cast(AsyncSession, db) and db.active
+        key = (target_tenant, "plugin", "generated-tool")
+        assert plugin_row.id == db.row_ids[key]
+        assert plugin_row.payload == db.rows[key]
+        db.events.append(("review", target_tenant, plugin_row.id))
+        return True
+
+    service._generated_plugin_approval_validator = validate
+
+
+def reviewed_plugin_payload(*, enabled: bool = True) -> Payload:
+    """Synthetic prior approval/signature state, not real cryptographic review evidence."""
+    payload = plugin_payload(enabled=enabled)
+    payload["package_metadata"] = PluginPackageMetadata.model_validate(
+        {
+            **payload["package_metadata"],
+            "approval_state": "approved",
+            "signature": {"algorithm": "ed25519", "key_id": "test-key", "value": "A" * 86},
+            "signature_verification": "verified",
+            "verified_public_key_sha256": "a" * 64,
+            "sdk_api_version": "1.0",
+            "install_mode": "runtime_registered",
+        }
+    ).model_dump(mode="json")
+    payload["_generated_review_approval"] = "ga-review-" + "5" * 64
+    return payload
+
+
 @pytest.mark.parametrize("batch", [False, True])
 async def test_ordinary_upsert_rechecks_generated_owner_after_lock(
     context: AdminContext,
@@ -284,15 +325,30 @@ async def test_plugin_lock_uses_explicit_tenant(context: AdminContext) -> None:
     "action",
     ["disable", "stop", "preflight_failed", "approve", "reject", "start", "enable", "reload"],
 )
+@pytest.mark.parametrize("generated", [False, True])
 async def test_controlled_states_preserve_generated_identity_and_marker(
     context: AdminContext,
     action: str,
+    generated: bool,
 ) -> None:
     service, db, _ = context
-    original = plugin_payload(enabled=True)
+    original = plugin_payload(generated=generated, enabled=action != "enable")
     if action in {"start", "enable", "reload"}:
-        original["package_metadata"]["kind"] = "manifest_only"
+        if generated:
+            original = reviewed_plugin_payload(enabled=action != "enable")
+            configure_trusted_generated_review(context)
+        else:
+            original["package_metadata"]["kind"] = "manifest_only"
     db.put(original)
+    if generated and action == "approve":
+        before, before_ids = deepcopy(db.rows), deepcopy(db.row_ids)
+        with pytest.raises(PublicAPIError) as error:
+            await service.approve_plugin_package("generated-tool", PluginPackageApprovalRequest())
+        assert error.value.status_code == 409
+        assert error.value.code == "plugin_generated_review_required"
+        assert db.rows == before and db.row_ids == before_ids
+        assert not any(event[0] in {"write", "audit"} for event in db.events)
+        return
     if action == "approve":
         await service.approve_plugin_package("generated-tool", PluginPackageApprovalRequest())
     elif action == "reject":
@@ -307,8 +363,14 @@ async def test_controlled_states_preserve_generated_identity_and_marker(
     else:
         await getattr(service, action + "_plugin")("generated-tool")
     stored = db.plugin()
-    for key in ("source_filename", "content_sha256", "resource_config", "_generated_handover_id"):
+    for key in ("source_filename", "content_sha256", "resource_config"):
         assert stored[key] == original[key]
+    if generated:
+        assert stored["_generated_handover_id"] == original["_generated_handover_id"]
+        if "_generated_review_approval" in original:
+            assert stored["_generated_review_approval"] == original["_generated_review_approval"]
+    else:
+        assert "_generated_handover_id" not in stored
     for key in ("runtime", "entrypoint", "isolation", "package_version"):
         assert stored["package_metadata"][key] == original["package_metadata"][key]
     if action in {"approve", "reject"}:
@@ -327,8 +389,15 @@ async def test_controlled_states_preserve_generated_identity_and_marker(
     assert any(event[0] == "lock" for event in db.events)
 
 
-@pytest.mark.parametrize("generated", [False, True])
-@pytest.mark.parametrize("action", ["stop", "approve", "start"])
+@pytest.mark.parametrize(
+    "generated,action",
+    [
+        (generated, action)
+        for generated in (False, True)
+        for action in ("stop", "approve", "reject", "start")
+        if not (generated and action == "approve")
+    ],
+)
 @pytest.mark.parametrize("changed", ["content_sha256", "approval_state", "status"])
 async def test_old_state_snapshot_cannot_overwrite_concurrent_package_or_state(
     context: AdminContext,
@@ -339,8 +408,11 @@ async def test_old_state_snapshot_cannot_overwrite_concurrent_package_or_state(
     service, db, _ = context
     original = plugin_payload(generated=generated, enabled=True)
     original["package_metadata"]["kind"] = "manifest_only"
-    if action == "approve":
+    if action in {"approve", "reject"}:
         original["package_metadata"]["kind"] = "adapter_package"
+    if generated and action == "start":
+        original = reviewed_plugin_payload()
+        configure_trusted_generated_review(context)
     db.put(original)
     replacement = deepcopy(original)
     if changed == "content_sha256":
@@ -349,19 +421,28 @@ async def test_old_state_snapshot_cannot_overwrite_concurrent_package_or_state(
         replacement["package_metadata"][changed] = "rejected"
     else:
         replacement[changed] = "running"
-    db.on_lock = lambda: db.put(replacement)
+
+    def replace_on_write_lock(_plugin: PluginResourceResponse | None = None) -> None:
+        db.on_lock = lambda: db.put(replacement)
+
+    if action != "start":
+        replace_on_write_lock()
     with pytest.raises(PublicAPIError) as error:
-        if action == "approve":
-            await service.approve_plugin_package("generated-tool", PluginPackageApprovalRequest())
+        if action in {"approve", "reject"}:
+            await getattr(service, action + "_plugin_package")(
+                "generated-tool", PluginPackageApprovalRequest()
+            )
         elif action == "start":
             await service.start_plugin(
                 "generated-tool",
-                activation_preflight=AsyncMock(return_value=None),
+                activation_preflight=AsyncMock(side_effect=replace_on_write_lock),
             )
         else:
             await getattr(service, action + "_plugin")("generated-tool")
     assert error.value.status_code == 409
-    assert not any(event[0] == "write" for event in db.events)
+    assert error.value.code == "plugin_registration_conflict"
+    assert db.plugin() == replacement
+    assert not any(event[0] in {"write", "audit"} for event in db.events)
 
 
 @pytest.mark.parametrize(
@@ -444,18 +525,24 @@ async def test_failed_preflight_does_not_overwrite_package_changed_before_write_
     context: AdminContext,
 ) -> None:
     service, db, _ = context
-    original = plugin_payload(enabled=True)
+    original = reviewed_plugin_payload()
+    configure_trusted_generated_review(context)
     db.put(original)
     replacement = deepcopy(original)
     replacement["content_sha256"] = "3" * 64
-    db.on_lock = lambda: db.put(replacement)
+
+    async def failed_preflight(_plugin: PluginResourceResponse) -> None:
+        db.on_lock = lambda: db.put(replacement)
+        raise PublicAPIError(409, "preflight", "failed")
+
     with pytest.raises(PublicAPIError) as error:
         await service.start_plugin(
             "generated-tool",
-            activation_preflight=AsyncMock(side_effect=PublicAPIError(409, "preflight", "failed")),
+            activation_preflight=failed_preflight,
         )
     assert error.value.code == "plugin_registration_conflict"
-    assert not any(event[0] == "write" for event in db.events)
+    assert db.plugin() == replacement
+    assert not any(event[0] in {"write", "audit"} for event in db.events)
 
 
 @pytest.mark.parametrize("failed", [False, True])
@@ -464,8 +551,8 @@ async def test_preflight_cannot_write_replaced_generated_owner(
     failed: bool,
 ) -> None:
     service, db, _ = context
-    original = plugin_payload(enabled=True)
-    original["package_metadata"]["kind"] = "manifest_only"
+    original = reviewed_plugin_payload()
+    configure_trusted_generated_review(context)
     db.put(original)
 
     async def preflight(_plugin: PluginResourceResponse) -> None:
@@ -545,7 +632,7 @@ async def test_other_kinds_and_no_database_legacy_fallback_remain(context: Admin
             "reload",
             "upsert",
         )
-        if not (generated and action == "upsert")
+        if not (generated and action in {"upsert", "approve"})
     ],
 )
 async def test_identical_json_new_row_cannot_receive_old_write(
@@ -556,10 +643,19 @@ async def test_identical_json_new_row_cannot_receive_old_write(
     service, db, _ = context
     original = plugin_payload(generated=generated, enabled=True)
     if action in {"start", "enable", "reload"}:
-        original["package_metadata"]["kind"] = "manifest_only"
+        if generated:
+            original = reviewed_plugin_payload()
+            configure_trusted_generated_review(context)
+        else:
+            original["package_metadata"]["kind"] = "manifest_only"
     db.put(original)
     new_id = uuid4()
-    db.on_lock = lambda: db.put(deepcopy(original), row_id=new_id)
+
+    def replace_on_write_lock(_plugin: PluginResourceResponse | None = None) -> None:
+        db.on_lock = lambda: db.put(deepcopy(original), row_id=new_id)
+
+    if action not in {"start", "enable", "reload"}:
+        replace_on_write_lock()
     with pytest.raises(PublicAPIError) as error:
         if action in {"approve", "reject"}:
             await getattr(service, action + "_plugin_package")(
@@ -571,11 +667,39 @@ async def test_identical_json_new_row_cannot_receive_old_write(
             await service.upsert_plugin(PluginResourceRequest(id="generated-tool", name="Edited"))
         elif action in {"start", "enable", "reload"}:
             await getattr(service, action + "_plugin")(
-                "generated-tool", activation_preflight=AsyncMock(return_value=None)
+                "generated-tool", activation_preflight=AsyncMock(side_effect=replace_on_write_lock)
             )
         else:
             await getattr(service, action + "_plugin")("generated-tool")
     assert error.value.code == "plugin_registration_conflict"
     assert db.plugin() == original
     assert db.row_ids[(db.tenant_id, "plugin", "generated-tool")] == new_id
+    assert not any(event[0] in {"write", "audit"} for event in db.events)
+
+
+@pytest.mark.parametrize("action", ["start", "enable", "reload"])
+async def test_generated_activation_rechecks_review_at_write_lock(
+    context: AdminContext, action: str
+) -> None:
+    service, db, tenant_id = context
+    original = reviewed_plugin_payload()
+    db.put(original)
+    configure_trusted_generated_review(context)
+    before, before_ids = deepcopy(db.rows), deepcopy(db.row_ids)
+
+    async def revoked(session: AsyncSession, *, plugin_row: AdminResourceRow) -> bool:
+        assert session is cast(AsyncSession, db) and db.active
+        assert plugin_row.id == before_ids[(tenant_id, "plugin", "generated-tool")]
+        return False
+
+    async def preflight(_plugin: PluginResourceResponse) -> None:
+        service._generated_plugin_approval_validator = revoked
+
+    with pytest.raises(PublicAPIError) as error:
+        await getattr(service, action + "_plugin")(
+            "generated-tool", activation_preflight=preflight
+        )
+    assert error.value.status_code == 409
+    assert error.value.code == "plugin_generated_review_required"
+    assert db.rows == before and db.row_ids == before_ids
     assert not any(event[0] in {"write", "audit"} for event in db.events)

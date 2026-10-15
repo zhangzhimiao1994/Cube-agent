@@ -9,6 +9,7 @@ const mocks = vi.hoisted(() => ({
   me: vi.fn(), createPluginHandover: vi.fn(), pluginHandover: vi.fn(),
   cancelPluginHandover: vi.fn(), confirmPluginHandover: vi.fn(),
   workspaceFiles: vi.fn(),
+  scanPluginHandover: vi.fn(), pluginHandoverScanReport: vi.fn(), approvePluginPackage: vi.fn(),
   approvePlugin: vi.fn(), updatePlugin: vi.fn(), trustPluginSigningKey: vi.fn(),
 }));
 vi.mock("../api/client", async (original) => ({
@@ -32,6 +33,216 @@ const receipt = {
 };
 const admin = { user_id: creatorId, tenant_id: artifactId, username: "admin", role: "admin",
   permissions: ["run:create", "run:read", "plugin:read", "plugin:write"] };
+const pendingReceipt = { ...receipt, version: 2, status: "pending", key_id: "reviewed-key",
+  archive_sha256: "c".repeat(64) };
+const report = { schema_version: 1, report_id: `gs-${"d".repeat(64)}`, report_sha256: "e".repeat(64),
+  created_at: "2026-10-15T00:00:00Z", coverage: "complete",
+  body: { scanner_id: "plugin-python-source-v1", ruleset_id: "plugin-python-signals-v1",
+    parser_id: "cpython-3.12-ast-exec", limits: {}, coverage: "complete",
+    subject: { run_id: runId, handover_id: hid, plan_hash: receipt.plan_hash,
+      verified_package: { key_id: "reviewed-key", archive_sha256: "c".repeat(64) } },
+    members: [], findings: [{ rule_id: "PY003", category: "network", path: "main.py", line: 1,
+      explanation: "Network API signal." }], incomplete_reasons: [], limitations: "Static signals only." } };
+
+async function pendingScan() {
+  mocks.me.mockResolvedValue({ ...admin, permissions: [...admin.permissions, "plugin:approve"] });
+  mocks.confirmPluginHandover.mockResolvedValue(pendingReceipt);
+  mocks.scanPluginHandover.mockResolvedValue(report);
+  mocks.pluginHandoverScanReport.mockResolvedValue(report);
+  const user = await load();
+  const file = await prepareConfirm(user);
+  await user.click(screen.getByRole("button", { name: "提交待审批" }));
+  await screen.findByText("待审批，插件仍禁用，尚不可调用。");
+  return { user, file };
+}
+
+describe("bound source scan approval", () => {
+  it("scans the already selected ZIP and approves only the explicitly acknowledged report", async () => {
+    mount();
+    const { user, file } = await pendingScan();
+    await user.click(screen.getByRole("button", { name: "扫描签名归档" }));
+    await screen.findByText("覆盖完整");
+    expect(mocks.scanPluginHandover).toHaveBeenCalledWith(runId, hid, "reviewed-key", file, expect.any(String));
+    expect(mocks.approvePluginPackage).not.toHaveBeenCalled();
+    await user.click(screen.getByRole("checkbox", { name: "我已审阅此报告并接受风险" }));
+    await user.click(screen.getByRole("button", { name: "批准此报告对应插件" }));
+    expect(mocks.approvePluginPackage).toHaveBeenCalledWith(receipt.plugin_id, {
+      reason: "已审阅静态扫描报告并接受风险", scan_report_id: report.report_id, scan_report_sha256: report.report_sha256,
+    });
+    expect(mocks.updatePlugin).not.toHaveBeenCalled();
+    expect(mocks.confirmPluginHandover).toHaveBeenCalledTimes(1);
+  });
+
+  it("blocks incomplete reports and renders raw source as text in a reversible full screen", async () => {
+    mount(); const { user } = await pendingScan();
+    mocks.scanPluginHandover.mockResolvedValue({ ...report, coverage: "incomplete",
+      body: { ...report.body, coverage: "incomplete", incomplete_reasons: ["unsupported_format"],
+        limitations: "<script>window.BAD=true</script>" } });
+    await user.click(screen.getByRole("button", { name: "扫描签名归档" }));
+    await screen.findByText("覆盖不完整，不能批准");
+    expect(screen.getByRole("button", { name: "批准此报告对应插件" }).hasAttribute("disabled")).toBe(true);
+    await user.click(screen.getByRole("button", { name: "全屏查看报告" }));
+    expect(document.querySelector("script")).toBeNull();
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(screen.getByRole("dialog", { name: "插件安装计划" })).not.toBeNull();
+    expect(screen.queryByRole("button", { name: "返回报告" })).toBeNull();
+  });
+
+  it("clears the report on a new file and ignores a scan response after closing", async () => {
+    mount(); const { user } = await pendingScan();
+    await user.click(screen.getByRole("button", { name: "扫描签名归档" }));
+    await screen.findByText("覆盖完整");
+    fireEvent.change(screen.getByLabelText("扫描用已签名 ZIP"), { target: { files: [new File(["other"], "other.zip")] } });
+    expect(screen.queryByText("覆盖完整")).toBeNull();
+    let finish!: (value: unknown) => void;
+    mocks.scanPluginHandover.mockReturnValue(new Promise((resolve) => { finish = resolve; }));
+    await user.click(screen.getByRole("button", { name: "扫描签名归档" }));
+    await user.click(screen.getByRole("button", { name: "关闭安装计划" }));
+    await act(async () => finish(report));
+    await user.click(screen.getByRole("button", { name: "插件安装计划" }));
+    await screen.findByText("当前账号：admin");
+    expect(screen.queryByText("覆盖完整")).toBeNull();
+  });
+
+  it("clears a report immediately when the handover lookup changes", async () => {
+    mount(); const { user } = await pendingScan();
+    await user.click(screen.getByRole("button", { name: "扫描签名归档" }));
+    await screen.findByText("覆盖完整");
+    await user.clear(screen.getByLabelText("计划 ID"));
+    expect(screen.queryByText("覆盖完整")).toBeNull();
+  });
+
+  it("returns from full report via backdrop and restores report focus", async () => {
+    mount(); const { user } = await pendingScan();
+    await user.click(screen.getByRole("button", { name: "扫描签名归档" }));
+    await screen.findByText("覆盖完整");
+    await user.click(screen.getByRole("button", { name: "全屏查看报告" }));
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: "返回报告" }));
+    fireEvent.click(screen.getByTestId("plugin-handover-backdrop"));
+    expect(screen.getByRole("dialog")).not.toBeNull();
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("button", { name: "全屏查看报告" })));
+  });
+
+  it.each([401, 403, 422, 503])("shows safe scan failure without confirm retry or approval (%s)", async (status) => {
+    mount(); const { user } = await pendingScan();
+    mocks.scanPluginHandover.mockRejectedValue(new ApiError("PRIVATE SQL token", status, "scan_rejected"));
+    await user.click(screen.getByRole("button", { name: "扫描签名归档" }));
+    const error = await screen.findByRole("alert");
+    expect(error.textContent).not.toContain("PRIVATE");
+    expect(screen.queryByText("覆盖完整")).toBeNull();
+    expect(mocks.approvePluginPackage).not.toHaveBeenCalled();
+    expect(mocks.confirmPluginHandover).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects a report for another package", async () => {
+    mount(); const { user } = await pendingScan();
+    mocks.scanPluginHandover.mockResolvedValue({ ...report, body: { ...report.body, subject: {
+      ...report.body.subject, verified_package: { ...report.body.subject.verified_package, archive_sha256: "f".repeat(64) },
+    } } });
+    await user.click(screen.getByRole("button", { name: "扫描签名归档" }));
+    expect((await screen.findByRole("alert")).textContent).toContain("验证失败");
+    expect(screen.queryByText("覆盖完整")).toBeNull();
+  });
+
+  it.each(["role", "hash"])("rechecks authority and the exact report before approval (%s)", async (change) => {
+    mount(); const { user } = await pendingScan();
+    await user.click(screen.getByRole("button", { name: "扫描签名归档" }));
+    await screen.findByText("覆盖完整");
+    if (change === "role") mocks.me.mockResolvedValue(admin);
+    else mocks.pluginHandoverScanReport.mockResolvedValue({ ...report, report_sha256: "f".repeat(64) });
+    await user.click(screen.getByRole("checkbox", { name: "我已审阅此报告并接受风险" }));
+    await user.click(screen.getByRole("button", { name: "批准此报告对应插件" }));
+    await screen.findByRole("alert");
+    expect(mocks.approvePluginPackage).not.toHaveBeenCalled();
+    expect(screen.queryByText("覆盖完整")).toBeNull();
+  });
+
+  it("sends one scan and one approval despite repeated clicks", async () => {
+    mount(); const { user } = await pendingScan();
+    let finish!: (value: unknown) => void;
+    mocks.scanPluginHandover.mockReturnValue(new Promise((resolve) => { finish = resolve; }));
+    const scan = screen.getByRole("button", { name: "扫描签名归档" });
+    fireEvent.click(scan); fireEvent.click(scan);
+    expect(mocks.scanPluginHandover).toHaveBeenCalledTimes(1);
+    await act(async () => finish(report));
+    await screen.findByText("覆盖完整");
+    await user.click(screen.getByRole("checkbox", { name: "我已审阅此报告并接受风险" }));
+    mocks.approvePluginPackage.mockResolvedValue({});
+    const approve = screen.getByRole("button", { name: "批准此报告对应插件" });
+    fireEvent.click(approve); fireEvent.click(approve);
+    await screen.findByText("已批准此报告对应插件；尚未启用或启动。");
+    expect(mocks.approvePluginPackage).toHaveBeenCalledTimes(1);
+  });
+
+  it("ignores scan responses after a run change", async () => {
+    const view = render(<PluginHandoverPanel runId={runId} artifacts={[artifact]} />);
+    const { user } = await pendingScan();
+    let finish!: (value: unknown) => void;
+    mocks.scanPluginHandover.mockReturnValue(new Promise((resolve) => { finish = resolve; }));
+    await user.click(screen.getByRole("button", { name: "扫描签名归档" }));
+    view.rerender(<PluginHandoverPanel runId={artifactId} artifacts={[]} />);
+    await act(async () => finish(report));
+    expect(screen.queryByText("覆盖完整")).toBeNull();
+    expect(screen.queryByText("待审批，插件仍禁用，尚不可调用。")).toBeNull();
+  });
+
+  it("copies the unmodified raw report and reports clipboard failure", async () => {
+    mount(); const { user } = await pendingScan();
+    await user.click(screen.getByRole("button", { name: "扫描签名归档" }));
+    await screen.findByText("覆盖完整");
+    const write = vi.spyOn(navigator.clipboard, "writeText").mockResolvedValue(undefined);
+    await user.click(screen.getByRole("button", { name: "复制原始报告" }));
+    expect(write).toHaveBeenCalledWith(JSON.stringify(report, null, 2));
+    write.mockRejectedValue(new Error("denied"));
+    await user.click(screen.getByRole("button", { name: "复制原始报告" }));
+    await screen.findByText("复制失败，请选择报告文本复制。");
+  });
+
+  it("requires the same reviewing identity at approval time", async () => {
+    mount(); const { user } = await pendingScan();
+    await user.click(screen.getByRole("button", { name: "扫描签名归档" }));
+    await screen.findByText("覆盖完整");
+    mocks.me.mockResolvedValue({ ...admin, user_id: runId, permissions: ["*"] });
+    await user.click(screen.getByRole("checkbox", { name: "我已审阅此报告并接受风险" }));
+    await user.click(screen.getByRole("button", { name: "批准此报告对应插件" }));
+    await screen.findByRole("alert");
+    expect(mocks.approvePluginPackage).not.toHaveBeenCalled();
+  });
+
+  it("scans a pending receipt after reupload using its stored key without reconfirming", async () => {
+    mocks.pluginHandover.mockResolvedValue(pendingReceipt);
+    mocks.scanPluginHandover.mockResolvedValue(report);
+    mount(); const user = await open();
+    await user.type(screen.getByLabelText("计划 ID"), hid);
+    await user.click(screen.getByRole("button", { name: "载入回执" }));
+    await screen.findByText("待审批，插件仍禁用，尚不可调用。");
+    expect(screen.getByRole("button", { name: "扫描签名归档" }).hasAttribute("disabled")).toBe(true);
+    const file = new File(["signed zip bytes"], "reupload.zip");
+    fireEvent.change(screen.getByLabelText("扫描用已签名 ZIP"), { target: { files: [file] } });
+    await user.click(screen.getByRole("button", { name: "扫描签名归档" }));
+    await screen.findByText("覆盖完整");
+    const firstKey = mocks.scanPluginHandover.mock.calls[0][4];
+    await user.click(screen.getByRole("button", { name: "扫描签名归档" }));
+    await screen.findByText("覆盖完整");
+    expect(mocks.scanPluginHandover.mock.calls[1][4]).not.toBe(firstKey);
+    expect(mocks.scanPluginHandover).toHaveBeenCalledWith(runId, hid, "reviewed-key", file, expect.any(String));
+    expect(mocks.confirmPluginHandover).not.toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: "批准此报告对应插件" }).hasAttribute("disabled")).toBe(true);
+  });
+
+  it("freezes an uncertain approval and never automatically resubmits it", async () => {
+    mount(); const { user } = await pendingScan();
+    await user.click(screen.getByRole("button", { name: "扫描签名归档" }));
+    await screen.findByText("覆盖完整");
+    mocks.approvePluginPackage.mockRejectedValue(new ApiError("PRIVATE", 503, "unavailable"));
+    await user.click(screen.getByRole("checkbox", { name: "我已审阅此报告并接受风险" }));
+    await user.click(screen.getByRole("button", { name: "批准此报告对应插件" }));
+    await screen.findByText("批准结果未确认，请核实插件状态，勿重复提交。");
+    expect(mocks.approvePluginPackage).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole("button", { name: "批准此报告对应插件" })).toBeNull();
+    expect(screen.queryByText("覆盖完整")).toBeNull();
+  });
+});
 
 beforeEach(() => {
   vi.resetAllMocks();

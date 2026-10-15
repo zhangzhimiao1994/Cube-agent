@@ -1,8 +1,8 @@
-import { useCallback, useEffect, useId, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 
 import { api, ApiError, type CurrentUser, type PluginHandoverCreateInput, type PluginHandoverReceipt,
-  type RunDetail, type WorkspaceFileList } from "../api/client";
+  type RunDetail, type WorkspaceFileList, type PluginScanReport } from "../api/client";
 import "./PluginHandoverPanel.css";
 
 const UUID = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
@@ -13,6 +13,10 @@ type WorkspaceListing = { scope: string; status: "loading" | "ready" | "error"; 
 const STATUS_LABELS: Record<string, string> = {
   planned: "计划已创建", awaiting_signature: "等待签名归档", pending: "待审批",
   cancelled: "已取消", failed: "计划失败",
+};
+const SIGNAL_CATEGORIES: Record<string, string> = {
+  dynamic_execution: "动态执行", import: "模块导入", network: "网络访问",
+  process: "进程与命令", file_write: "文件修改", environment: "环境访问",
 };
 type CreateAttempt = {
   input: PluginHandoverCreateInput;
@@ -41,6 +45,8 @@ function permitted(user: CurrentUser | null, permission: string) {
 
 function safeError(error: unknown, action: string) {
   if (error instanceof ApiError) {
+    if (error.code === "invalid_response") return `${action}失败：报告或回执验证失败，请重新读取。`;
+    if (error.status === 401) return `${action}失败：登录已失效，请重新登录。`;
     if (error.status === 403) return `${action}失败：当前账号权限不足。`;
     if (error.status === 404) return `${action}失败：计划不存在或当前账号不可见。`;
     if (error.status === 409) return `${action}失败：计划状态已变化，请刷新回执。`;
@@ -112,8 +118,30 @@ export function PluginHandoverPanel({ runId, artifacts, workspaceScope }: {
   const [keyId, setKeyId] = useState("");
   const [archive, setArchive] = useState<File | null>(null);
   const [acknowledged, setAcknowledged] = useState(false);
+  const [report, setReport] = useState<PluginScanReport | null>(null);
+  const [reviewed, setReviewed] = useState(false);
+  const [approval, setApproval] = useState<"idle" | "approved" | "unknown">("idle");
+  const [fullReport, setFullReport] = useState(false);
+  const fullReportRef = useRef(false);
+  const reportButton = useRef<HTMLButtonElement>(null);
+  const reportClose = useRef<HTMLButtonElement>(null);
+  const [copyStatus, setCopyStatus] = useState("");
+  const operationEpoch = useRef(0);
+  const currentRun = useRef(runId);
+  currentRun.current = runId;
+  const invalidateReport = useCallback(() => {
+    operationEpoch.current += 1;
+    setReport(null); setReviewed(false); setApproval("idle"); setCopyStatus("");
+    fullReportRef.current = false; setFullReport(false);
+  }, []);
+  const returnToReport = useCallback(() => {
+    fullReportRef.current = false; setFullReport(false);
+    requestAnimationFrame(() => reportButton.current?.focus());
+  }, []);
+  useEffect(() => { if (fullReport) reportClose.current?.focus(); }, [fullReport]);
   const fileInput = useRef<HTMLInputElement>(null);
   const close = useCallback(() => {
+    invalidateReport();
     listingEpoch.current += 1;
     setOpen(false);
     setUser(null);
@@ -122,7 +150,14 @@ export function PluginHandoverPanel({ runId, artifacts, workspaceScope }: {
     setArchive(null);
     setKeyId("");
     setAcknowledged(false);
-  }, []);
+  }, [invalidateReport]);
+
+  useEffect(() => {
+    invalidateReport();
+    setReceipt(null); setLookup(""); setArchive(null); setKeyId(""); setAcknowledged(false);
+    createAttempt.current = null;
+    return () => { operationEpoch.current += 1; };
+  }, [runId, invalidateReport]);
 
   useEffect(() => {
     if (!open) return;
@@ -139,13 +174,14 @@ export function PluginHandoverPanel({ runId, artifacts, workspaceScope }: {
       if (event.key === "Escape") {
         event.preventDefault();
         event.stopPropagation();
-        close();
+        if (fullReportRef.current) returnToReport();
+        else close();
         return;
       }
       if (event.key !== "Tab") return;
       const elements = Array.from(dialog.current?.querySelectorAll<HTMLElement>(
-        'button:not(:disabled), input:not(:disabled), select:not(:disabled), a[href]',
-      ) ?? []);
+        'button:not(:disabled), input:not(:disabled), select:not(:disabled), a[href], pre[tabindex]',
+      ) ?? []).filter((element) => !element.closest("[hidden]"));
       const first = elements[0], last = elements[elements.length - 1];
       const outside = !dialog.current?.contains(document.activeElement) || document.activeElement === dialog.current;
       if (outside || (event.shiftKey ? document.activeElement === first : document.activeElement === last)) {
@@ -160,7 +196,7 @@ export function PluginHandoverPanel({ runId, artifacts, workspaceScope }: {
       document.body.style.overflow = previousOverflow;
       previousFocus?.focus();
     };
-  }, [open, close]);
+  }, [open, close, returnToReport]);
 
   const canRead = permitted(user, "run:read") && permitted(user, "plugin:read");
   const canCreate = canRead && permitted(user, "run:create");
@@ -215,27 +251,31 @@ export function PluginHandoverPanel({ runId, artifacts, workspaceScope }: {
     if (value.run_id !== runId || !HANDOVER_ID.test(value.handover_id)
       || (expectedId && value.handover_id !== expectedId)) throw new Error("receipt identity mismatch");
     if (value.handover_id !== receipt?.handover_id) {
+      invalidateReport();
       setKeyId("");
       setArchive(null);
       setAcknowledged(false);
       if (fileInput.current) fileInput.current.value = "";
     }
+    if (value.version !== receipt?.version || value.archive_sha256 !== receipt?.archive_sha256
+      || value.key_id !== receipt?.key_id || value.status !== receipt?.status) invalidateReport();
     setReceipt(value);
     setLookup(value.handover_id);
   }
 
-  async function perform(action: () => Promise<void>) {
+  async function perform(action: (isCurrent: () => boolean) => Promise<void>) {
     if (lock.current) return;
     lock.current = true;
     setBusy(true);
     setError("");
-    try { await action(); }
+    const epoch = operationEpoch.current, run = runId;
+    try { await action(() => epoch === operationEpoch.current && run === currentRun.current); }
     finally { lock.current = false; setBusy(false); }
   }
 
   async function create() {
     if (!canCreate || receipt || !UUID.test(runId) || (!createAttempt.current && !validSelection)) return;
-    await perform(async () => {
+    await perform(async (isCurrent) => {
       try {
         if (!createAttempt.current) {
           const expires = new Date(expiry);
@@ -251,30 +291,35 @@ export function PluginHandoverPanel({ runId, artifacts, workspaceScope }: {
           };
         }
         const attempt = createAttempt.current;
-        accept(await api.createPluginHandover(runId, attempt.input, attempt.key));
-      } catch (caught) { setError(safeError(caught, "创建计划")); }
+        const value = await api.createPluginHandover(runId, attempt.input, attempt.key);
+        if (isCurrent()) accept(value);
+      } catch (caught) { if (isCurrent()) setError(safeError(caught, "创建计划")); }
     });
   }
 
   async function get(handoverId: string) {
     if (!UUID.test(runId) || !HANDOVER_ID.test(handoverId)) return;
-    await perform(async () => {
+    await perform(async (isCurrent) => {
       try {
-        accept(await api.pluginHandover(runId, handoverId), handoverId);
+        const value = await api.pluginHandover(runId, handoverId);
+        if (!isCurrent()) return;
+        accept(value, handoverId);
         setUncertain((current) => { const next = new Set(current); next.delete(handoverId); return next; });
-      } catch (caught) { setError(safeError(caught, "载入回执")); }
+      } catch (caught) { if (isCurrent()) setError(safeError(caught, "载入回执")); }
     });
   }
 
   async function cancel() {
     if (!receipt || !canCancel) return;
     const current = receipt;
-    await perform(async () => {
+    await perform(async (isCurrent) => {
       try {
-        accept(await api.cancelPluginHandover(runId, current.handover_id, {
+        const value = await api.cancelPluginHandover(runId, current.handover_id, {
           expected_version: current.version, plan_hash: current.plan_hash,
-        }), current.handover_id);
+        });
+        if (isCurrent()) accept(value, current.handover_id);
       } catch (caught) {
+        if (!isCurrent()) return;
         setUncertain((ids) => new Set(ids).add(current.handover_id));
         setError(safeError(caught, "取消计划"));
       }
@@ -284,7 +329,7 @@ export function PluginHandoverPanel({ runId, artifacts, workspaceScope }: {
   async function confirm() {
     if (!receipt || !canConfirm) return;
     const current = receipt;
-    await perform(async () => {
+    await perform(async (isCurrent) => {
       try {
         let attempt = confirmAttempts.current.get(current.handover_id);
         if (!attempt) {
@@ -293,12 +338,95 @@ export function PluginHandoverPanel({ runId, artifacts, workspaceScope }: {
             archive, key: operationKey() };
           confirmAttempts.current.set(current.handover_id, attempt);
         }
-        accept(await api.confirmPluginHandover(runId, current.handover_id, attempt.input, attempt.archive, attempt.key), current.handover_id);
+        setUncertain((ids) => new Set(ids).add(current.handover_id));
+        const value = await api.confirmPluginHandover(runId, current.handover_id, attempt.input, attempt.archive, attempt.key);
+        if (isCurrent()) {
+          accept(value, current.handover_id);
+          setUncertain((ids) => { const next = new Set(ids); next.delete(current.handover_id); return next; });
+        }
       } catch (caught) {
+        if (!isCurrent()) return;
         setUncertain((ids) => new Set(ids).add(current.handover_id));
         setError(safeError(caught, "确认提交"));
       }
     });
+  }
+
+  function checkReport(value: PluginScanReport, current: PluginHandoverReceipt) {
+    const subject = value.body.subject;
+    if (subject.run_id !== runId || subject.handover_id !== current.handover_id
+      || subject.plan_hash !== current.plan_hash || !current.key_id || !current.archive_sha256
+      || subject.verified_package.key_id !== current.key_id
+      || subject.verified_package.archive_sha256 !== current.archive_sha256
+      || value.coverage !== value.body.coverage
+      || (value.coverage === "complete" && value.body.incomplete_reasons.length)) {
+      throw new ApiError("report binding mismatch", 200, "invalid_response");
+    }
+  }
+
+  function reviewFailure(caught: unknown, action: string) {
+    setReport(null); setReviewed(false);
+    if (caught instanceof ApiError && (caught.status === 401 || caught.status === 403)) setUser(null);
+    setError(safeError(caught, action));
+  }
+
+  async function scan() {
+    if (lock.current || !receipt || receipt.status !== "pending" || !canInstall || !validArchive || !archive
+      || !receipt.key_id || uncertain.has(receipt.handover_id)) return;
+    const current = receipt, file = archive;
+    invalidateReport();
+    await perform(async (isCurrent) => {
+      try {
+        const value = await api.scanPluginHandover(runId, current.handover_id, current.key_id!, file, operationKey());
+        if (!isCurrent()) return;
+        checkReport(value, current);
+        setReport(value);
+      } catch (caught) { if (isCurrent()) reviewFailure(caught, "扫描归档"); }
+    });
+  }
+
+  const canApprove = canRead && permitted(user, "plugin:approve");
+  async function approve() {
+    if (lock.current || !receipt || !report || !canApprove || !reviewed || report.coverage !== "complete"
+      || approval !== "idle" || receipt.status !== "pending") return;
+    const current = receipt, selectedReport = report;
+    await perform(async (isCurrent) => {
+      let submitted = false;
+      try {
+        const [principal, fresh] = await Promise.all([
+          api.me(), api.pluginHandoverScanReport(runId, current.handover_id, selectedReport.report_id),
+        ]);
+        if (!isCurrent()) return;
+        setUser(principal);
+        if (principal.user_id !== user?.user_id || principal.tenant_id !== user?.tenant_id
+          || !permitted(principal, "plugin:approve") || !permitted(principal, "plugin:read")
+          || !permitted(principal, "run:read")) throw new ApiError("permission revoked", 403, "forbidden");
+        checkReport(fresh, current);
+        if (fresh.report_id !== selectedReport.report_id || fresh.report_sha256 !== selectedReport.report_sha256
+          || JSON.stringify(fresh.body) !== JSON.stringify(selectedReport.body)) {
+          throw new ApiError("report changed", 200, "invalid_response");
+        }
+        submitted = true;
+        await api.approvePluginPackage(current.plugin_id, {
+          reason: "已审阅静态扫描报告并接受风险", scan_report_id: selectedReport.report_id,
+          scan_report_sha256: selectedReport.report_sha256,
+        });
+        if (isCurrent()) { setApproval("approved"); setReviewed(false); }
+      } catch (caught) {
+        if (!isCurrent()) return;
+        if (submitted) setApproval("unknown");
+        reviewFailure(caught, "批准插件");
+      }
+    });
+  }
+
+  const rawReport = useMemo(() => report ? JSON.stringify(report, null, 2) : "", [report]);
+  async function copyReport() {
+    const epoch = operationEpoch.current;
+    try {
+      await navigator.clipboard.writeText(rawReport);
+      if (epoch === operationEpoch.current) setCopyStatus("已复制");
+    } catch { if (epoch === operationEpoch.current) setCopyStatus("复制失败，请选择报告文本复制。"); }
   }
 
   const controlsDisabled = busy || !canInstall || !mutable || Boolean(frozenConfirm);
@@ -308,15 +436,24 @@ export function PluginHandoverPanel({ runId, artifacts, workspaceScope }: {
     </div>
     {open ? createPortal(
       <div className="plugin-handover-backdrop" data-testid="plugin-handover-backdrop"
-        onClick={(event) => { if (event.target === event.currentTarget) close(); }}>
-        <div className="plugin-handover-modal" role="dialog" aria-modal="true" aria-labelledby={titleId}
+        onClick={(event) => { if (event.target === event.currentTarget) {
+          if (fullReportRef.current) returnToReport(); else close();
+        } }}>
+        <div className={`plugin-handover-modal${fullReport ? " plugin-handover-modal-full" : ""}`} role="dialog" aria-modal="true" aria-labelledby={titleId}
           tabIndex={-1} ref={dialog}>
           <header className="plugin-handover-header">
             <h2 id={titleId}>插件安装计划</h2>
             <button type="button" className="plugin-handover-close" aria-label="关闭安装计划" title="关闭安装计划"
-              onClick={close}>×</button>
+              hidden={fullReport} onClick={close}>×</button>
+            {fullReport ? <button type="button" className="plugin-handover-close" ref={reportClose}
+              onClick={returnToReport} aria-label="返回报告" title="返回报告">×</button> : null}
           </header>
-          <div className="plugin-handover-content" aria-busy={busy}>
+          {fullReport ? <div className="plugin-handover-content plugin-handover-report-full">
+            <button type="button" onClick={() => void copyReport()}>复制原始报告</button>
+            {copyStatus ? <p role="status">{copyStatus}</p> : null}
+            <pre tabIndex={0} aria-label="原始扫描报告">{rawReport}</pre>
+          </div> : null}
+          <div className="plugin-handover-content" aria-busy={busy} hidden={fullReport}>
             <p className="plugin-handover-authority">{user ? `当前账号：${user.username || user.role}` : "正在读取账号权限…"}</p>
             {authError ? <p role="alert">{authError}</p> : null}
             {error ? <p role="alert">{error}</p> : null}
@@ -373,7 +510,7 @@ export function PluginHandoverPanel({ runId, artifacts, workspaceScope }: {
             <section className="plugin-handover-section" aria-label="查阅计划">
               <h3>查阅计划</h3>
               <label>计划 ID<input value={lookup} maxLength={67} placeholder="gh-…" disabled={busy}
-                onChange={(event) => setLookup(event.target.value)} autoComplete="off" spellCheck={false} /></label>
+                onChange={(event) => { invalidateReport(); setLookup(event.target.value); }} autoComplete="off" spellCheck={false} /></label>
               <div className="plugin-handover-actions">
                 <button type="button" disabled={busy || !UUID.test(runId) || !HANDOVER_ID.test(lookup)} onClick={() => void get(lookup)}>载入回执</button>
                 {receipt ? <button type="button" disabled={busy} onClick={() => void get(receipt.handover_id)}>刷新当前回执</button> : null}
@@ -417,6 +554,45 @@ export function PluginHandoverPanel({ runId, artifacts, workspaceScope }: {
                   {receipt.status === "pending" ? <a href="/mcp">前往插件审批</a> : null}
                 </div>
               </section>
+              {receipt.status === "pending" ? <section className="plugin-handover-section" aria-label="源码静态扫描">
+                <h3>源码静态扫描</h3>
+                <p>仅静态信号，不调用模型或执行源码。覆盖完整仍不代表无风险或无漏洞。</p>
+                <p>签名 key：{receipt.key_id || "回执缺少 key，无法扫描"}</p>
+                <label>扫描用已签名 ZIP<input type="file" accept=".zip,application/zip" disabled={busy || !canInstall}
+                  onChange={(event) => { invalidateReport(); setArchive(event.target.files?.[0] ?? null); }} /></label>
+                {archive ? <p>扫描归档：{archive.name}</p> : null}
+                <button type="button" disabled={busy || !canInstall || !validArchive || !receipt.key_id
+                  || uncertain.has(receipt.handover_id)} onClick={() => void scan()}>{busy ? "正在处理…" : "扫描签名归档"}</button>
+                {approval === "approved" ? <p role="status">已批准此报告对应插件；尚未启用或启动。</p> : null}
+                {approval === "unknown" ? <p role="status">批准结果未确认，请核实插件状态，勿重复提交。</p> : null}
+                {report ? <>
+                  <p role="status">{report.coverage === "complete" ? "覆盖完整" : "覆盖不完整，不能批准"}</p>
+                  <dl><dt>报告 ID</dt><dd>{report.report_id}</dd><dt>报告 SHA256</dt><dd>{report.report_sha256}</dd>
+                    <dt>扫描器</dt><dd>{report.body.scanner_id}</dd><dt>规则集</dt><dd>{report.body.ruleset_id}</dd>
+                    <dt>解析器</dt><dd>{report.body.parser_id}</dd></dl>
+                  {Object.entries(SIGNAL_CATEGORIES).map(([category, label]) => <div key={category}>
+                    <h4>{label}</h4>
+                    {report.body.findings.some((finding) => finding.category === category)
+                      ? <ul>{report.body.findings.filter((finding) => finding.category === category).map((finding, index) =>
+                        <li key={index}>{finding.path}:{finding.line} · {finding.rule_id} · {finding.explanation}</li>)}</ul>
+                      : <p>未记录信号</p>}
+                  </div>)}
+                  {report.body.incomplete_reasons.length ? <p>未完整原因：{report.body.incomplete_reasons.join("、")}</p> : null}
+                  <p>{report.body.limitations}</p>
+                  <div className="plugin-handover-actions">
+                    <button type="button" onClick={() => void copyReport()}>复制原始报告</button>
+                    <button type="button" ref={reportButton} onClick={() => { fullReportRef.current = true; setFullReport(true); }}>
+                      全屏查看报告</button>
+                  </div>
+                  {copyStatus ? <p role="status">{copyStatus}</p> : null}
+                  <pre className="plugin-handover-report" tabIndex={0} aria-label="原始扫描报告">{rawReport}</pre>
+                  <label className="plugin-handover-checkbox"><input type="checkbox" checked={reviewed}
+                    disabled={busy || !canApprove || report.coverage !== "complete" || approval !== "idle"}
+                    onChange={(event) => setReviewed(event.target.checked)} />我已审阅此报告并接受风险</label>
+                  <button type="button" disabled={busy || !canApprove || !reviewed || report.coverage !== "complete"
+                    || approval !== "idle"} onClick={() => void approve()}>批准此报告对应插件</button>
+                </> : null}
+              </section> : null}
             </> : null}
           </div>
         </div>
