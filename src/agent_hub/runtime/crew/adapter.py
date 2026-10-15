@@ -3663,6 +3663,7 @@ class _RunState:
     workspace_delivery_continuation: bool = True
     incomplete_recovery_output_growth: bool = True
     first_tool_incomplete_recovery_output_growth: bool = True
+    incomplete_continuation_output_growth: bool = True
     deadline: float | None = None
     adaptive_deadline: AdaptiveDeadline | None = None
     crew_generation: CrewStepGeneration | None = None
@@ -3960,6 +3961,9 @@ class CrewDispatchRuntime:
                 # Missing v11 flag preserves the original first-tool request fingerprint.
                 state.first_tool_incomplete_recovery_output_growth = cast(
                     bool, restored.state.get("first_tool_incomplete_recovery_output_growth", False),
+                )
+                state.incomplete_continuation_output_growth = cast(
+                    bool, restored.state.get("incomplete_continuation_output_growth", False),
                 )
                 if (
                     context.checkpoint is None or context.checkpoint.id != restored.id
@@ -6080,6 +6084,10 @@ class CrewDispatchRuntime:
                 self._post_tool_finalization_remaining_timeout(context, run_state, step_deadline)
             if current_token_budget(context) <= 0:
                 _fail("dispatch budget exhausted")
+            if reserved_max_output_tokens is not None:
+                self._validate_incomplete_recovery_budget(
+                    context, step, ledger, key, reserved_max_output_tokens, run_state, step_deadline,
+                )
             prepared: Mapping[str, JsonValue] = existing or {
                 "status": "prepared", "step_id": step.id, "attempt": attempt,
                 "purpose": purpose, "actor": actor, "call_index": index,
@@ -6610,6 +6618,12 @@ class CrewDispatchRuntime:
         if response_schema is not None:
             required_capabilities.add(ModelCapability.STRUCTURED_OUTPUT)
         logical_model = incomplete_recovery_model or _agent_logical_model_for_recovery(agent, recovery_attempt)
+        continuation_growth = (
+            run_state.incomplete_continuation_output_growth
+            and run_state.first_tool_incomplete_recovery_output_growth
+            and incomplete_recovery_model is not None and model_attempt == 1
+            and reserved_max_output_tokens is not None and bool(request_tools)
+        )
         round_budget = _tool_round_budget(context, step)
         active_round_limit = round_budget.initial_limit
         last_round_progressed = True
@@ -6640,7 +6654,6 @@ class CrewDispatchRuntime:
             if force_result_synthesis:
                 round_required_capabilities.discard(ModelCapability.TOOL_CALLING)
             round_output_tokens = max_output_tokens
-            # A first-tool reservation belongs only to recovery call zero.
             round_reservation = reserved_max_output_tokens if call_cursor.value == 0 else None
             if incomplete_recovery_model is not None and request_tools:
                 round_key = self._model_call_key(
@@ -6652,9 +6665,36 @@ class CrewDispatchRuntime:
                         self._incomplete_recovery_remaining_tokens(context, step, model_ledger, round_key),
                     )
                 )
+                cached_round = model_ledger.states.get(round_key)
+                if continuation_growth and call_cursor.value > 0:
+                    first_key = self._model_call_key(
+                        context.run_id, step.id, model_attempt, "step", agent.id, 0,
+                    )
+                    first = model_ledger.states.get(first_key)
+                    if first is None or first["status"] != "succeeded" or (
+                        first.get("reserved_max_output_tokens") != reserved_max_output_tokens
+                    ):
+                        _fail("runtime checkpoint incomplete reservation is invalid")
+                    if cached_round is None:
+                        round_reservation = min(
+                            cast(int, reserved_max_output_tokens),
+                            self._incomplete_recovery_remaining_tokens(
+                                context, step, model_ledger, round_key,
+                            ),
+                        )
+                    else:
+                        cap = cached_round.get("reserved_max_output_tokens")
+                        if type(cap) is not int or not 1 <= cap <= cast(int, reserved_max_output_tokens):
+                            _fail("runtime checkpoint incomplete reservation is invalid")
+                        round_reservation = cap
+                    round_output_tokens = round_reservation
+                    if cached_round is None or cached_round["status"] == "prepared":
+                        self._validate_incomplete_recovery_budget(
+                            context, step, model_ledger, round_key, round_reservation,
+                            run_state, step_deadline,
+                        )
                 if round_output_tokens <= 0:
                     _fail("model incomplete recovery budget exhausted")
-                cached_round = model_ledger.states.get(round_key)
                 if cached_round is None or cached_round["status"] == "prepared":
                     usage = model_ledger.usage
                     if usage is None or usage.terminal_phase is not None:
@@ -6664,6 +6704,11 @@ class CrewDispatchRuntime:
                         or usage.step_costs_usd.get(step.id, Decimal(0)) >= step.cost_budget_usd
                     ):
                         _fail("model incomplete recovery budget exhausted")
+            if continuation_growth:
+                content_limits = self._content_limits(
+                    context, logical_model=logical_model, max_output_tokens=round_output_tokens,
+                    source_count=len(input_sources),
+                )
             await emit(
                 kind=EventKind.MODEL_STARTED,
                 actor=agent.id,
@@ -8761,6 +8806,9 @@ class CrewDispatchRuntime:
                 **({"first_tool_incomplete_recovery_output_growth":
                     run_state.first_tool_incomplete_recovery_output_growth}
                    if any(step.tools for step in plan.steps) else {}),
+                **({"incomplete_continuation_output_growth":
+                    run_state.incomplete_continuation_output_growth}
+                   if any(step.tools for step in plan.steps) else {}),
                 "input_refs": tuple(
                     {"id": str(artifact.id), "sha256": artifact.content_sha256}
                     for artifact in context.artifacts
@@ -8859,6 +8907,7 @@ class CrewDispatchRuntime:
             "repair_reopened_contract_ids", "workspace_delivery_continuation",
             "incomplete_recovery_output_growth",
             "first_tool_incomplete_recovery_output_growth",
+            "incomplete_continuation_output_growth",
         }
         if checkpoint.runtime_version in _REMAINING_TIMEOUT_RUNTIME_VERSIONS:
             required_state_keys.add("remaining_timeout_seconds")
@@ -8888,6 +8937,12 @@ class CrewDispatchRuntime:
             type(state.get("workspace_delivery_continuation", False)) is not bool
             or type(state.get("incomplete_recovery_output_growth", False)) is not bool
             or type(state.get("first_tool_incomplete_recovery_output_growth", False)) is not bool
+            or type(state.get("incomplete_continuation_output_growth", False)) is not bool
+            or (
+                state.get("incomplete_continuation_output_growth", False)
+                and (checkpoint.runtime_version != _RUNTIME_VERSION
+                     or not state.get("first_tool_incomplete_recovery_output_growth", False))
+            )
             or (
                 state.get("first_tool_incomplete_recovery_output_growth", False)
                 and checkpoint.runtime_version != _RUNTIME_VERSION
@@ -9552,6 +9607,7 @@ class CrewDispatchRuntime:
         steps = {step.id: step for step in plan.steps}
         growth = checkpoint.state.get("incomplete_recovery_output_growth", False)
         first_tool_growth = checkpoint.state.get("first_tool_incomplete_recovery_output_growth", False)
+        continuation_growth = checkpoint.state.get("incomplete_continuation_output_growth", False)
         for key, row in models.items():
             step = steps[cast(str, row["step_id"])]
             agent = agents[step.agent]
@@ -9564,7 +9620,9 @@ class CrewDispatchRuntime:
             eligible = (
                 ((growth and not step.tools) or (first_tool_growth and step.tools and attempt == 1))
                 and row["actor"] == step.agent
-                and row["purpose"] == "step" and row["call_index"] == 0
+                and row["purpose"] == "step" and (
+                    row["call_index"] == 0 or (continuation_growth and step.tools)
+                )
                 and attempt % (limit + 1) == 1 and incomplete_source_state is not None
                 and incomplete_source_state.get("failure_reason") == "model response incomplete"
             )
@@ -9585,6 +9643,16 @@ class CrewDispatchRuntime:
                 ), step.token_budget, plan.total_token_budget,
             ):
                 _fail("runtime checkpoint incomplete reservation is invalid")
+            if row["call_index"] != 0:
+                first = models.get(self._model_call_key(
+                    checkpoint.run_id, step.id, attempt, "step", step.agent, 0,
+                ))
+                if (
+                    first is None or first["status"] != "succeeded"
+                    or type(first.get("reserved_max_output_tokens")) is not int
+                    or cap > cast(int, first["reserved_max_output_tokens"])
+                ):
+                    _fail("runtime checkpoint incomplete reservation is invalid")
         step_ids = {step.id for step in plan.steps}
         repair_keys = {
             "version", "actor", "purpose", "source_key", "source_text_sha256", "correction_key",

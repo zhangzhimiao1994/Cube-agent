@@ -1,4 +1,4 @@
-"""Offline first-tool growth, call-zero reservations, and v11 replay boundaries."""
+"""Offline first-tool growth, continuation reservations, and v11 replay boundaries."""
 
 from __future__ import annotations
 
@@ -68,8 +68,8 @@ async def test_first_tool_growth_only_on_known_saturation(completion: int, expec
     runtime = subject(gateway, tool_plan(), InMemoryArtifactRepository(), harness)
     events = await collect(runtime)
     original, fresh, followup, _ = gateway.requests
-    assert original.max_output_tokens == followup.max_output_tokens == 6144
-    assert fresh.max_output_tokens == expected
+    assert original.max_output_tokens == 6144
+    assert fresh.max_output_tokens == followup.max_output_tokens == expected
     assert fresh.logical_model == followup.logical_model == "selected"
     assert fresh.tools == followup.tools == original.tools
     assert fresh.response_schema == followup.response_schema == original.response_schema
@@ -77,10 +77,11 @@ async def test_first_tool_growth_only_on_known_saturation(completion: int, expec
     assert fresh.timeout_seconds <= original.timeout_seconds
     checkpoint = await runtime.save_checkpoint()
     assert checkpoint.runtime_version == "11" and checkpoint.state[FLAG] is True
+    assert checkpoint.state["incomplete_continuation_output_growth"] is True
     rows = draft_models(checkpoint)
     assert rows[1]["reserved_max_output_tokens"] == expected
     assert "reserved_max_output_tokens" not in rows[0]
-    assert "reserved_max_output_tokens" not in rows[2]
+    assert rows[2]["reserved_max_output_tokens"] == expected
     assert rows[1]["request_sha256"] == runtime._model_request_sha256(fresh)
     assert rows[2]["request_sha256"] == runtime._model_request_sha256(followup)
     assert len(harness.calls) == 1
@@ -116,23 +117,24 @@ async def test_first_tool_growth_clamps_each_budget_scope(scope: str, remaining:
                       fail="budget exhausted" if remaining == 0 else None)
     if remaining:
         assert gateway.requests[1].max_output_tokens == remaining
-        assert gateway.requests[2].max_output_tokens == min(6144, remaining - 17)
+        assert gateway.requests[2].max_output_tokens == remaining - 17
         assert len(harness.calls) == 1
     else:
         assert len(gateway.requests) == 1 and harness.calls == []
 
 
-async def test_multiple_followup_rounds_do_not_inherit_first_reservation() -> None:
+async def test_multiple_followup_rounds_reserve_within_first_reservation() -> None:
     gateway = SaturatedToolGateway("incomplete", "tool", "tool", "success", "final")
     harness = RecordingHarnessToolGateway()
     runtime = subject(gateway, tool_plan(), InMemoryArtifactRepository(), harness)
     await collect(runtime)
     assert [request.max_output_tokens for request in gateway.requests[:4]] == [
-        6144, 12288, 6144, 6144,
+        6144, 12288, 12288, 12288,
     ]
     rows = draft_models(await runtime.save_checkpoint())
     assert rows[1]["reserved_max_output_tokens"] == 12288
-    assert all("reserved_max_output_tokens" not in row for row in (rows[0], *rows[2:]))
+    assert "reserved_max_output_tokens" not in rows[0]
+    assert all(row["reserved_max_output_tokens"] == 12288 for row in rows[2:])
     assert len(harness.calls) == 2
 
 
@@ -148,11 +150,11 @@ async def test_other_steps_tool_history_does_not_block_first_tool_growth() -> No
     runtime = subject(gateway, dispatch, InMemoryArtifactRepository(), harness)
     await collect(runtime)
     assert gateway.requests[3].max_output_tokens == 12288
-    assert gateway.requests[4].max_output_tokens == 6144
+    assert gateway.requests[4].max_output_tokens == 12288
     assert [call.actor for _, call in harness.calls] == ["preflight", "writer"]
     rows = draft_models(await runtime.save_checkpoint())
     assert rows[1]["reserved_max_output_tokens"] == 12288
-    assert "reserved_max_output_tokens" not in rows[2]
+    assert rows[2]["reserved_max_output_tokens"] == 12288
 
 
 async def natural_boundary(phase: str = "fresh_prepared") -> tuple[

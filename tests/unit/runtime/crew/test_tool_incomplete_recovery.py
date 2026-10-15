@@ -111,8 +111,8 @@ async def test_first_tool_call_incomplete_regenerates_before_one_approved_invoca
     assert fresh.response_schema == followup.response_schema == original.response_schema
     assert fresh.tools == followup.tools == original.tools
     assert not fresh.allow_fallback and not followup.allow_fallback
-    assert original.max_output_tokens == followup.max_output_tokens == 6144
-    assert fresh.max_output_tokens == 12288
+    assert original.max_output_tokens == 6144
+    assert fresh.max_output_tokens == followup.max_output_tokens == 12288
     assert harness.calls[0][1].tool_name == "web.search"
     assert harness.calls[0][1].actor == "writer"
     prompt = " ".join(str(message.content) for message in fresh.messages)
@@ -166,7 +166,7 @@ async def test_natural_restore_distinguishes_recovery_from_normal_tool_loop(
         assert rows[1]["reserved_max_output_tokens"] == (12288 if tokens == 30_000 else 622)
         assert rows[1]["request_sha256"] == source._model_request_sha256(source_gateway.requests[1])
     if len(rows) > 2:
-        assert "reserved_max_output_tokens" not in rows[2]
+        assert rows[2]["reserved_max_output_tokens"] == (12288 if tokens == 30_000 else 605)
         assert rows[2]["request_sha256"] == source._model_request_sha256(source_gateway.requests[2])
     uncertain = phase.endswith("running")
     outcomes = (("tool", "success", "final") if phase in {"source", "fresh_prepared"}
@@ -331,8 +331,8 @@ async def test_real_gateway_sdk_mock_first_call_tools_or_unknown_scope(prior_unk
             assert fresh.response_schema == followup.response_schema == original.response_schema
             assert fresh.tools == followup.tools == original.tools
             assert not fresh.allow_fallback and not followup.allow_fallback
-            assert original.max_output_tokens == followup.max_output_tokens == 6144
-            assert fresh.max_output_tokens == 12288
+            assert original.max_output_tokens == 6144
+            assert fresh.max_output_tokens == followup.max_output_tokens == 12288
             assert wire[0]["tools"] == wire[1]["tools"] == wire[2]["tools"]
             assert wire[0]["text"] == wire[1]["text"] == wire[2]["text"]
             assert harness.calls[0][1].arguments == {"q": "safe"}
