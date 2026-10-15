@@ -1618,7 +1618,9 @@ const PluginHandoverUUIDSchema = z.string().length(36)
 const PluginHandoverIdSchema = z.string().length(67).regex(/^gh-[a-f0-9]{64}$/);
 const PluginHandoverDigestSchema = z.string().length(64).regex(/^[a-f0-9]{64}$/);
 const PluginHandoverDateSchema = z.iso.datetime({ offset: true }).max(64);
-const PluginHandoverPathsSchema = z.array(z.string().min(1).max(255).refine((path) => (
+// Match Python's code-point limit without relying on Zod's string-length semantics.
+const PluginHandoverPathsSchema = z.array(z.string().min(1)
+  .refine((path) => [...path].length <= 255).refine((path) => (
   !/[\\:%\x00-\x1f]/.test(path)
   && path.split("/").every((part) => part !== "" && part !== "." && part !== "..")
 ))).min(1).max(200).refine((paths) => new Set(paths).size === paths.length);
