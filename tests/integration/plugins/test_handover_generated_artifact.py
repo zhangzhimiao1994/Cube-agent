@@ -185,6 +185,7 @@ async def test_generated_publication_admin_confirmation_is_pending(
 ) -> None:
     case, c = generated_case, generated_case.http
     assert c.sql.creator.role is Role.OPERATOR and c.sql.installer.role is Role.ADMIN
+    before = await c.sql.rows()
     plan = await c.plan()
     assert plan["source"] == {"kind": "artifact", "artifact_id": str(case.published.id)}
     async with c.sql.factory() as session:
@@ -214,7 +215,8 @@ async def test_generated_publication_admin_confirmation_is_pending(
     assert pending["installer_id"] == str(c.sql.installer.user_id)
     assert pending["result"] == "blocked_pending_approval"
     rows = await c.sql.rows()
-    assert len(rows) == 4
+    assert len(rows) == len(before) + 4
+    assert all(row in rows for row in before)
     plugin = json.loads(next(row[3] for row in rows if row[1] == "plugin"))
     assert plugin["enabled"] is False and plugin["status"] == "disabled"
     assert plugin["package_metadata"]["approval_state"] == "pending"
