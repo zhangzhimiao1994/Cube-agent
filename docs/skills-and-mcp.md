@@ -40,3 +40,51 @@ Rollback restores the complete mapping captured before that revision was activat
 6. Keep rollback and audit data until no active run references the version.
 
 An Agent may discover a missing capability during conversation and propose this flow. It must still stop for required approval and must not invent a successful installation when the backend, credentials, or package material are unavailable.
+
+## Generating a local plugin package
+
+Plugin/capability creation requests receive the same package SDK guidance in the
+Direct and Crew runtimes, including when the session has no `AGENTS.md` or
+`SKILL.md`. Hybrid children reuse those prompt builders. This guidance supplies
+protocol knowledge; it does not choose a route, seed code, install a package, or
+grant tool permissions. Calling an existing capability does not require this
+generation guidance. Catalog installation proposals and generated-package
+handover plans are separate from source generation.
+
+For a Python adapter package using SDK API `"1.0"`, stdin contains one UTF-8 JSON
+object with these seven fields:
+
+```json
+{
+  "schema_version": 1,
+  "plugin_id": "text-statistics",
+  "capability_id": "text.statistics",
+  "arguments": {"text": "Cube Agent"},
+  "resource_config": {"zone": "utc"},
+  "capability_config": {"mode": "count"},
+  "context": {
+    "tenant_id": "00000000-0000-4000-8000-000000000001",
+    "user_id": "00000000-0000-4000-8000-000000000002",
+    "run_id": "00000000-0000-4000-8000-000000000003",
+    "actor": "tester",
+    "idempotency_key": "statistics-1"
+  }
+}
+```
+
+The runner closes stdin after the object. `schema_version` is the integer `1`,
+distinct from the manifest's SDK version string. Configuration objects may be
+nonempty. Dispatch on `capability_id` and validate the business `input_schema`
+against `arguments` only. Accept and ignore unused metadata and additional
+envelope/context fields; rejecting every top-level field except `capability_id`
+and `arguments` breaks real runner invocations.
+
+Stdout must contain exactly one business JSON object matching `output_schema`,
+without a `result` wrapper, logs, Markdown, or prose. Diagnostics belong on stderr.
+Stdin/stdout are local process pipes, not network traffic. This adapter I/O contract
+does not change the model's own response format. Package preflight compiles the
+entrypoint without executing it, so it does not establish protocol compatibility.
+
+The canonical schema and generation guidance live in
+`src/agent_hub/plugins/contracts.py`. See the working
+[text-statistics adapter and full protocol example](../examples/plugins/text-statistics/README.md).

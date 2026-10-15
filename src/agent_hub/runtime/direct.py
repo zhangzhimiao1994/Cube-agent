@@ -30,6 +30,7 @@ from agent_hub.models.types import (
     ModelResponse,
     TokenUsage,
 )
+from agent_hub.plugins.contracts import plugin_package_generation_guidance
 from agent_hub.runtime.adaptive_budget import deadline_from_routing
 from agent_hub.runtime.contracts import (
     Artifact,
@@ -2248,6 +2249,7 @@ class DirectRuntime:
             guidance_context = (
                 context.instruction_context.render() if context.instruction_context is not None else ""
             )
+            plugin_guidance = plugin_package_generation_guidance(context.request)
             project_delivery_context = ""
             if _is_workspace_project_delivery(context):
                 if self._capability_gateway is not None:
@@ -2277,6 +2279,7 @@ class DirectRuntime:
                 project_delivery_context += _WORKSPACE_PATH_POLICY
             payload = (
                 f"<USER_REQUEST_JSON>{task_payload}</USER_REQUEST_JSON>\n"
+                + (f"{plugin_guidance}\n" if plugin_guidance else "")
                 + (f"{guidance_context}\n" if guidance_context else "")
                 + (f"{project_delivery_context}\n" if project_delivery_context else "")
                 +
