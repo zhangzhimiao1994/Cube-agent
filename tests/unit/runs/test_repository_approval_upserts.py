@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import importlib.util
+import sys
 from copy import deepcopy
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any, Self
 from uuid import UUID, uuid4
 
@@ -21,9 +24,19 @@ from agent_hub.runs.repository import RunConflict, RunNotFound, RunRepository
 from agent_hub.runs.service import RunService
 from agent_hub.runtime.contracts import EventKind, RunEvent, RuntimeCheckpoint
 from agent_hub.runtime.registry import RuntimeRegistry
-from scripts.real_user_plugin_acceptance import FrozenPluginApproval, _verify_plugin_approval
 from tests.unit.plugins.test_runtime import FakeAdminService, plugin
 from tests.unit.runs.test_terminal_hooks import RuntimeCompletes
+
+_script_path = Path(__file__).resolve().parents[3] / "scripts/real_user_plugin_acceptance.py"
+_script_spec = importlib.util.spec_from_file_location(
+    "_repository_approval_plugin_acceptance", _script_path,
+)
+assert _script_spec is not None and _script_spec.loader is not None
+_script_module = importlib.util.module_from_spec(_script_spec)
+sys.modules[_script_spec.name] = _script_module
+_script_spec.loader.exec_module(_script_module)
+FrozenPluginApproval = _script_module.FrozenPluginApproval
+_verify_plugin_approval = _script_module._verify_plugin_approval
 
 
 class RecordingSession:
