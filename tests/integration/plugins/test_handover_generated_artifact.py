@@ -238,6 +238,23 @@ async def test_nested_file_id_is_not_publication(generated_case: GeneratedCase) 
     assert not c.sql.canonical.exists()
 
 
+async def test_ordinary_creator_downloads_the_published_source_zip(
+    generated_case: GeneratedCase,
+) -> None:
+    case, c = generated_case, generated_case.http
+    response = await c.client.get(
+        f"/api/v1/runs/{c.sql.run_id}/artifacts/{case.published.id}/download",
+        headers=c.creator_headers,
+    )
+    assert response.status_code == 200
+    assert response.headers["content-type"] == ZIP_MIME_TYPE
+    with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+        assert {name: archive.read(name) for name in archive.namelist()} == {
+            **sql_tests.MEMBERS,
+            "plugin.json": json.dumps(sql_tests._manifest()).encode(),
+        }
+
+
 async def test_cross_run_storage_key_is_rejected(generated_case: GeneratedCase) -> None:
     case, c = generated_case, generated_case.http
     other_run = uuid4()

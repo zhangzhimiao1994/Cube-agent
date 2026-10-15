@@ -9393,7 +9393,7 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             path = self._generated_file_store.resolve_for(
                 self._tenant_id,
                 run_id,
-                artifact_id,
+                UUID(metadata.get("artifact_id", str(artifact_id))),
                 metadata["storage_key"],
             )
         except (FileNotFoundError, ValueError):
@@ -17650,7 +17650,36 @@ def _find_generated_file_metadata(
         storage_key = metadata_payload.get("storage_key")
         if type(filename) is not str or type(mime_type) is not str or type(storage_key) is not str:
             continue
+        identities = [
+            item[name]
+            for item, names in (
+                (result, ("artifact_id",)),
+                (file_payload, ("artifact_id", "id")),
+                (metadata_payload, ("artifact_id", "id")),
+            )
+            for name in names
+            if name in item
+        ]
+        file_id = identities[0] if identities else artifact.get("id")
+        if type(file_id) is not str or any(
+            type(value) is not str or value != file_id for value in identities
+        ):
+            continue
+        try:
+            if str(UUID(file_id)) != file_id:
+                continue
+        except ValueError:
+            continue
+        if any(
+            name in item and item[name] != expected
+            for item in (file_payload, metadata_payload)
+            for name, expected in (
+                ("filename", filename), ("mime_type", mime_type), ("storage_key", storage_key)
+            )
+        ):
+            continue
         return {
+            "artifact_id": file_id,
             "filename": validate_generated_filename(filename, mime_type),
             "mime_type": mime_type,
             "storage_key": storage_key,
@@ -17740,9 +17769,15 @@ def _generated_file_artifact_ids(
 def _artifact_result_content(content: object) -> Mapping[str, object] | None:
     if not isinstance(content, Mapping):
         return None
-    result = content.get("result")
-    if isinstance(result, Mapping):
-        return result
+    envelopes = [content[name] for name in ("result", "workspace_delivery") if name in content]
+    if envelopes:
+        if (
+            len(envelopes) != 1
+            or not isinstance(envelopes[0], Mapping)
+            or any(name in content for name in ("workspace_bundle", "file", "metadata"))
+        ):
+            return None
+        return envelopes[0]
     return content
 
 
