@@ -47,6 +47,7 @@ from agent_hub.models.failure_receipt import (
     get_gateway_failure_receipt,
 )
 from agent_hub.models.gateway import (
+    ConservativeTokenEstimator,
     GatewayCompletion,
     GatewayRejectedOutput,
     GatewayResponseCancelled,
@@ -1625,6 +1626,14 @@ class _ModelContractFailed(RuntimeExecutionError):
     """A contract failure cannot restart paid business or review work."""
 
 
+class _InitialIncompleteResponse(_ModelContractFailed):
+    """An accounted initial rejection, consumed inside the same model attempt."""
+
+    def __init__(self, key: str) -> None:
+        super().__init__("model response incomplete")
+        self.key = key
+
+
 class _KnownIncompleteResponse(RuntimeExecutionError):
     """A qualified, accounted receipt may use one bounded compact attempt."""
 
@@ -2800,11 +2809,12 @@ def _known_incomplete_scope_unaccounted(receipt: GatewayCompletion | GatewayReje
 def _first_incomplete_recovery_succeeded(
     step: DispatchStep, models: Mapping[str, Mapping[str, JsonValue]],
 ) -> bool:
-    # Later tool states cannot authorize a missing first recovery request.
+    # A later success needs its validated initial-chain reservation.
     return any(
         state.get("step_id") == step.id and state.get("actor") == step.agent
         and state.get("purpose") == "step" and state.get("attempt") == 1
-        and state.get("call_index") == 0 and state.get("status") == "succeeded"
+        and (state.get("call_index") == 0 or "initial_incomplete_chain" in state)
+        and state.get("status") == "succeeded"
         for state in models.values()
     )
 
@@ -3664,6 +3674,7 @@ class _RunState:
     incomplete_recovery_output_growth: bool = True
     first_tool_incomplete_recovery_output_growth: bool = True
     incomplete_continuation_output_growth: bool = True
+    initial_incomplete_chain_growth: bool = True
     deadline: float | None = None
     adaptive_deadline: AdaptiveDeadline | None = None
     crew_generation: CrewStepGeneration | None = None
@@ -3964,6 +3975,9 @@ class CrewDispatchRuntime:
                 )
                 state.incomplete_continuation_output_growth = cast(
                     bool, restored.state.get("incomplete_continuation_output_growth", False),
+                )
+                state.initial_incomplete_chain_growth = cast(
+                    bool, restored.state.get("initial_incomplete_chain_growth", False),
                 )
                 if (
                     context.checkpoint is None or context.checkpoint.id != restored.id
@@ -5844,6 +5858,88 @@ class CrewDispatchRuntime:
             )
         return None
 
+    @staticmethod
+    def _initial_chain_eligible(
+        step: DispatchStep, actor: str, attempt: int, index: int,
+        receipt: GatewayRejectedOutput, cap: int | None,
+        models: Mapping[str, Mapping[str, JsonValue]], tools: _ToolLedger | None,
+    ) -> bool:
+        evidence = receipt.evidence
+        prior = [row for row in models.values() if row["step_id"] == step.id
+                 and row["actor"] == actor and row["purpose"] == "step"
+                 and row["attempt"] == 1 and cast(int, row["call_index"]) < index]
+        return (
+            actor == step.agent and attempt == 1 and type(cap) is int and cap > 0
+            and not receipt.fallback_used and evidence is not None
+            and evidence.status == "incomplete" and evidence.reason == "incomplete"
+            and evidence.final_text is None and evidence.usage_status == "known"
+            and evidence.usage is not None
+            and evidence.usage.completion_tokens >= cap - max(1, cap // 100)
+            and tools is not None and not any(row["step_id"] == step.id for row in tools.states.values())
+            and {row["call_index"] for row in prior} == set(range(index))
+            and all(row["status"] == "rejected" and row.get("failure_reason") in {
+                        "model initial-chain incomplete", "model response incomplete",
+                    }
+                    for row in prior)
+        )
+
+    @staticmethod
+    def _initial_chain_link(key: str, ledger: _ModelLedger) -> Mapping[str, JsonValue]:
+        source = ledger.states[key]
+        return {
+            "source_key": key, "source_request_sha256": source["request_sha256"],
+            "source_receipt_sha256": hashlib.sha256(json.dumps(
+                _mutable_json(ledger.rejected_outputs[key]), sort_keys=True, separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode()).hexdigest(),
+            "source_cap": source["reserved_max_output_tokens"],
+        }
+
+    def _initial_chain_output_limit(self, request: ModelRequest, remaining: int) -> int:
+        cap = min(request.max_output_tokens * 2, remaining, 1_000_000)
+        registry = getattr(self._gateway, "_registry", None)
+        if isinstance(registry, ModelRegistry):
+            candidates = registry.candidates(request.logical_model, request.required_capabilities)
+            input_tokens = ConservativeTokenEstimator().estimate_input(request)
+            for candidate in candidates:
+                if candidate.max_output_tokens is not None:
+                    cap = min(cap, candidate.max_output_tokens)
+                if candidate.context_window_tokens is not None:
+                    cap = min(cap, max(0, candidate.context_window_tokens - input_tokens))
+        return cap
+
+    @staticmethod
+    def _initial_chain_anchor(
+        step: DispatchStep, models: Mapping[str, Mapping[str, JsonValue]],
+    ) -> Mapping[str, JsonValue] | None:
+        rows = sorted((row for row in models.values() if row["step_id"] == step.id
+                       and row["actor"] == step.agent and row["purpose"] == "step" and row["attempt"] == 1),
+                      key=lambda row: cast(int, row["call_index"]))
+        for row in rows:
+            if row["status"] == "succeeded":
+                return row
+            if row["status"] != "rejected" or row.get("failure_reason") not in {
+                "model initial-chain incomplete", "model response incomplete",
+            }:
+                return None
+        return None
+
+    def _initial_chain_prior_tools(
+        self, step: DispatchStep, index: int,
+        models: Mapping[str, Mapping[str, JsonValue]], tools: _ToolLedger | None,
+    ) -> _ToolLedger | None:
+        if tools is None:
+            return None
+        closed = self._initial_chain_anchor(step, models) is not None and step.reviewer is not None and any(
+            row["step_id"] == step.id and row["actor"] == step.reviewer
+            and row["purpose"] == "review" and row["status"] == "succeeded"
+            for row in models.values()
+        )
+        # Restore separately validates reviewer feedback and every later business attempt's artifact graph.
+        return _ToolLedger(states={key: row for key, row in tools.states.items()
+            if row["step_id"] == step.id and not (closed and cast(int, row["attempt"]) > 1)
+            and (row["attempt"] != 1 or cast(int, row["round"]) <= index)})
+
     def _incomplete_recovery_source(
         self, run_id: UUID, step: DispatchStep, agent: AgentSpec,
         models: Mapping[str, Mapping[str, JsonValue]],
@@ -6022,6 +6118,7 @@ class CrewDispatchRuntime:
         tool_ledger: _ToolLedger | None = None,
         allow_structured_repair: bool = True,
         reserved_max_output_tokens: int | None = None,
+        initial_incomplete_chain: Mapping[str, JsonValue] | None = None,
     ) -> tuple[GatewayCompletion, Artifact]:
         if request.response_schema is not None:
             _structured_validator(request.response_schema)
@@ -6035,6 +6132,7 @@ class CrewDispatchRuntime:
         policy_failure: str | None = None
         qualified_incomplete = False
         qualified_post_tool = False
+        qualified_initial_chain = False
         if existing is not None:
             if existing["request_sha256"] != request_sha:
                 _fail("model request changed after checkpoint")
@@ -6074,6 +6172,8 @@ class CrewDispatchRuntime:
                     qualified_incomplete = True
                 elif existing["failure_reason"] == "model post-tool incomplete":
                     qualified_post_tool = True
+                elif existing["failure_reason"] == "model initial-chain incomplete":
+                    qualified_initial_chain = True
                 elif existing["failure_reason"] != "structured output rejected":
                     policy_failure = cast(str, existing["failure_reason"])
             elif existing["status"] != "prepared":
@@ -6095,6 +6195,8 @@ class CrewDispatchRuntime:
                 "provenance": None, "failure_reason": None,
                 **({"reserved_max_output_tokens": reserved_max_output_tokens}
                    if reserved_max_output_tokens is not None else {}),
+                **({"initial_incomplete_chain": initial_incomplete_chain}
+                   if initial_incomplete_chain is not None else {}),
             }
             await model_boundary(key, prepared, repair=repair)
             if reserved_max_output_tokens is not None:
@@ -6272,6 +6374,16 @@ class CrewDispatchRuntime:
                 )
                 return completion, artifact
             private = self._rejected_private_payload(rejected, sources)
+            qualified_initial_chain = (
+                run_state.initial_incomplete_chain_growth and run_state.incomplete_recovery_output_growth
+                and (not step.tools or run_state.first_tool_incomplete_recovery_output_growth)
+                and policy_failure is None and repair is None
+                and purpose == "step" and request.response_schema is not None
+                and not _known_incomplete_scope_unaccounted(rejected)
+                and rejected.logical_model == request.logical_model
+                and self._initial_chain_eligible(step, actor, attempt, index, rejected,
+                                                reserved_max_output_tokens, ledger.states, tool_ledger)
+            )
             qualified_incomplete = (
                 policy_failure is None and actor == step.agent
                 and not _known_incomplete_scope_unaccounted(rejected)
@@ -6300,6 +6412,7 @@ class CrewDispatchRuntime:
             rejected_state.update(
                 status="rejected", sha256=private["text_sha256"], provenance=private["provenance"],
                 failure_reason=policy_failure or (
+                    "model initial-chain incomplete" if qualified_initial_chain and step.tools else
                     "model response incomplete" if qualified_incomplete else (
                         "model post-tool incomplete" if qualified_post_tool else "structured output rejected"
                     )
@@ -6311,6 +6424,16 @@ class CrewDispatchRuntime:
         evidence = rejected.evidence
         if policy_failure is not None:
             raise _ModelContractFailed(policy_failure)
+        if (
+            existing is not None and run_state.initial_incomplete_chain_growth
+            and repair is None and purpose == "step" and request.response_schema is not None
+        ):
+            earlier_tools = self._initial_chain_prior_tools(step, index, ledger.states, tool_ledger)
+            qualified_initial_chain = self._initial_chain_eligible(
+                step, actor, attempt, index, rejected, reserved_max_output_tokens, ledger.states, earlier_tools,
+            )
+        if qualified_initial_chain:
+            raise _InitialIncompleteResponse(key)
         if qualified_post_tool:
             return await self._finalize_post_tool_incomplete(
                 context, step, actor, request, rejected, key=key, index=index, attempt=attempt,
@@ -6670,21 +6793,25 @@ class CrewDispatchRuntime:
                     first_key = self._model_call_key(
                         context.run_id, step.id, model_attempt, "step", agent.id, 0,
                     )
-                    first = model_ledger.states.get(first_key)
-                    if first is None or first["status"] != "succeeded" or (
-                        first.get("reserved_max_output_tokens") != reserved_max_output_tokens
+                    first = (self._initial_chain_anchor(step, model_ledger.states)
+                             if run_state.initial_incomplete_chain_growth else model_ledger.states.get(first_key))
+                    anchor_cap = None if first is None else first.get("reserved_max_output_tokens")
+                    if first is None or first["status"] != "succeeded" or type(anchor_cap) is not int:
+                        _fail("runtime checkpoint incomplete reservation is invalid")
+                    if (not run_state.initial_incomplete_chain_growth or "initial_incomplete_chain" not in first) and (
+                        anchor_cap != reserved_max_output_tokens
                     ):
                         _fail("runtime checkpoint incomplete reservation is invalid")
                     if cached_round is None:
                         round_reservation = min(
-                            cast(int, reserved_max_output_tokens),
+                            anchor_cap,
                             self._incomplete_recovery_remaining_tokens(
                                 context, step, model_ledger, round_key,
                             ),
                         )
                     else:
                         cap = cached_round.get("reserved_max_output_tokens")
-                        if type(cap) is not int or not 1 <= cap <= cast(int, reserved_max_output_tokens):
+                        if type(cap) is not int or not 1 <= cap <= anchor_cap:
                             _fail("runtime checkpoint incomplete reservation is invalid")
                         round_reservation = cap
                     round_output_tokens = round_reservation
@@ -6756,19 +6883,60 @@ class CrewDispatchRuntime:
                 recovery_attempt,
                 _subagent_recovery_attempt_limit(agent),
             )
-            completion, model_artifact = await self._execute_model_request(
-                context, step, agent.id, request, purpose="step", attempt=model_attempt_index,
-                cursor=call_cursor, ledger=model_ledger,
-                sources=self._ordered_artifacts(
-                    (*input_sources, *evidence),
-                    anchor_count=len(input_sources),
-                ),
-                emit=emit, model_boundary=model_state_boundary, usage_boundary=usage_boundary,
-                run_state=run_state, step_deadline=step_deadline,
-                tool_ledger=tool_ledger,
-                allow_structured_repair=incomplete_recovery_model is None,
-                reserved_max_output_tokens=round_reservation,
-            )
+            chain_link: Mapping[str, JsonValue] | None = None
+            while True:
+                try:
+                    completion, model_artifact = await self._execute_model_request(
+                        context, step, agent.id, request, purpose="step", attempt=model_attempt_index,
+                        cursor=call_cursor, ledger=model_ledger,
+                        sources=self._ordered_artifacts(
+                            (*input_sources, *evidence), anchor_count=len(input_sources),
+                        ),
+                        emit=emit, model_boundary=model_state_boundary, usage_boundary=usage_boundary,
+                        run_state=run_state, step_deadline=step_deadline, tool_ledger=tool_ledger,
+                        allow_structured_repair=incomplete_recovery_model is None,
+                        reserved_max_output_tokens=round_reservation,
+                        initial_incomplete_chain=chain_link,
+                    )
+                    break
+                except _InitialIncompleteResponse as error:
+                    next_key = self._model_call_key(
+                        context.run_id, step.id, model_attempt_index, "step", agent.id, call_cursor.value,
+                    )
+                    chain_link = self._initial_chain_link(error.key, model_ledger)
+                    cached_chain = model_ledger.states.get(next_key)
+                    if cached_chain is not None:
+                        if cached_chain.get("initial_incomplete_chain") != chain_link:
+                            _fail("runtime checkpoint incomplete chain is invalid")
+                        cap = cached_chain.get("reserved_max_output_tokens")
+                        if type(cap) is not int:
+                            _fail("runtime checkpoint incomplete chain is invalid")
+                    else:
+                        cap = self._initial_chain_output_limit(request, self._incomplete_recovery_remaining_tokens(
+                            context, step, model_ledger, next_key,
+                        ))
+                    if cap <= request.max_output_tokens:
+                        raise _ModelContractFailed("model incomplete recovery budget exhausted") from None
+                    if call_cursor.value > round_budget.hard_limit or len(model_ledger.states) >= _MAX_CHECKPOINT_MODEL_LEDGER_ENTRIES:
+                        _fail("dispatch model ledger capacity exhausted")
+                    if cached_chain is None or cached_chain["status"] == "prepared":
+                        self._validate_incomplete_recovery_budget(
+                            context, step, model_ledger, next_key, cap, run_state, step_deadline,
+                        )
+                        if cap > self._initial_chain_output_limit(request, cap):
+                            _fail("model incomplete recovery budget exhausted")
+                    round_reservation = cap
+                    round_output_tokens = cap
+                    content_limits = self._content_limits(
+                        context, logical_model=logical_model, max_output_tokens=cap,
+                        source_count=len(input_sources),
+                    )
+                    request = replace(request, max_output_tokens=cap, timeout_seconds=min(
+                        request.timeout_seconds, self._remaining_timeout(run_state, step_deadline),
+                    ))
+            if run_state.initial_incomplete_chain_growth and model_attempt_index == 1:
+                # Provisional tools are already keyed by the successful model call_index.
+                _round = call_cursor.value - 1
             evidence.append(model_artifact)
             response = self._valid_response(
                 completion,
@@ -8803,6 +8971,7 @@ class CrewDispatchRuntime:
                 "plan_digest": plan.digest,
                 "workspace_delivery_continuation": run_state.workspace_delivery_continuation,
                 "incomplete_recovery_output_growth": run_state.incomplete_recovery_output_growth,
+                "initial_incomplete_chain_growth": run_state.initial_incomplete_chain_growth,
                 **({"first_tool_incomplete_recovery_output_growth":
                     run_state.first_tool_incomplete_recovery_output_growth}
                    if any(step.tools for step in plan.steps) else {}),
@@ -8908,6 +9077,7 @@ class CrewDispatchRuntime:
             "incomplete_recovery_output_growth",
             "first_tool_incomplete_recovery_output_growth",
             "incomplete_continuation_output_growth",
+            "initial_incomplete_chain_growth",
         }
         if checkpoint.runtime_version in _REMAINING_TIMEOUT_RUNTIME_VERSIONS:
             required_state_keys.add("remaining_timeout_seconds")
@@ -8938,6 +9108,9 @@ class CrewDispatchRuntime:
             or type(state.get("incomplete_recovery_output_growth", False)) is not bool
             or type(state.get("first_tool_incomplete_recovery_output_growth", False)) is not bool
             or type(state.get("incomplete_continuation_output_growth", False)) is not bool
+            or type(state.get("initial_incomplete_chain_growth", False)) is not bool
+            or (state.get("initial_incomplete_chain_growth", False)
+                and checkpoint.runtime_version != _RUNTIME_VERSION)
             or (
                 state.get("incomplete_continuation_output_growth", False)
                 and (checkpoint.runtime_version != _RUNTIME_VERSION
@@ -9305,7 +9478,7 @@ class CrewDispatchRuntime:
                 or not isinstance(value, Mapping)
                 or (
                     not model_state_keys <= set(value)
-                    or set(value) - model_state_keys - {"failure_reason", "reserved_max_output_tokens"}
+                    or set(value) - model_state_keys - {"failure_reason", "reserved_max_output_tokens", "initial_incomplete_chain"}
                 )
             ):
                 _fail("runtime checkpoint is incompatible")
@@ -9400,6 +9573,7 @@ class CrewDispatchRuntime:
                 if status == "rejected" and purpose == "step":
                     allowed_reasons.add("model response incomplete")
                     allowed_reasons.add("model post-tool incomplete")
+                    allowed_reasons.add("model initial-chain incomplete")
                 if value["artifact_id"] is not None or failure_reason not in allowed_reasons:
                     _fail("runtime checkpoint is incompatible")
             elif status == "failed":
@@ -9553,7 +9727,7 @@ class CrewDispatchRuntime:
                 or (
                     state["failure_reason"] not in {
                         "structured output rejected", "model response cancelled", "model response incomplete",
-                        "model post-tool incomplete",
+                        "model post-tool incomplete", "model initial-chain incomplete",
                     }
                     and value["reason"] != "invalid_tool"
                 )
@@ -9580,7 +9754,7 @@ class CrewDispatchRuntime:
                     or evidence.usage is None or evidence.final_text is not None
                 ):
                     _fail("runtime checkpoint post-tool qualification is invalid")
-            if state["failure_reason"] == "model response incomplete":
+            if state["failure_reason"] == "model response incomplete" and "initial_incomplete_chain" not in state:
                 step = next(item for item in plan.steps if item.id == state["step_id"])
                 agent = next(item for item in plan.agents if item.id == step.agent)
                 evidence = rejected.evidence
@@ -9608,11 +9782,87 @@ class CrewDispatchRuntime:
         growth = checkpoint.state.get("incomplete_recovery_output_growth", False)
         first_tool_growth = checkpoint.state.get("first_tool_incomplete_recovery_output_growth", False)
         continuation_growth = checkpoint.state.get("incomplete_continuation_output_growth", False)
+        chain_growth = checkpoint.state.get("initial_incomplete_chain_growth", False)
+        chain_private = cast(Mapping[str, Mapping[str, JsonValue]], private)
+        tools = cast(Mapping[str, Mapping[str, JsonValue]], checkpoint.state["tools"])
+        chain_ledger = _ModelLedger(states=dict(models), rejected_outputs=dict(chain_private))
+        for key, row in models.items():
+            step = steps[cast(str, row["step_id"])]
+            link = row.get("initial_incomplete_chain")
+            if row.get("failure_reason") == "model initial-chain incomplete":
+                receipt = chain_private.get(key)
+                earlier_tools = self._initial_chain_prior_tools(
+                    step, cast(int, row["call_index"]), models, _ToolLedger(states=dict(tools)),
+                )
+                if (
+                    not chain_growth or not growth or (step.tools and not first_tool_growth)
+                    or row["status"] != "rejected" or receipt is None
+                    or not self._initial_chain_eligible(
+                        step, cast(str, row["actor"]), cast(int, row["attempt"]), cast(int, row["call_index"]),
+                        self._rejected_from_private(receipt),
+                        cast(int | None, row.get("reserved_max_output_tokens")), models, earlier_tools,
+                    )
+                ):
+                    _fail("runtime checkpoint incomplete chain is invalid")
+            if link is None:
+                continue
+            if (
+                not chain_growth or not growth or (step.tools and not first_tool_growth)
+                or not isinstance(link, Mapping) or row["attempt"] != 1 or row["purpose"] != "step"
+                or row["actor"] != step.agent or cast(int, row["call_index"]) < 1
+                or type(link.get("source_cap")) is not int
+                or _agent_response_schema(agents[step.agent]) is None
+            ):
+                _fail("runtime checkpoint incomplete chain is invalid")
+            chain_source_key = self._model_call_key(checkpoint.run_id, step.id, 1, "step", step.agent,
+                                              cast(int, row["call_index"]) - 1)
+            source = models.get(chain_source_key)
+            cap = row.get("reserved_max_output_tokens")
+            source_cap = None if source is None else source.get("reserved_max_output_tokens")
+            if (
+                source is None or source["status"] != "rejected"
+                or source.get("failure_reason") not in {"model initial-chain incomplete", "model response incomplete"}
+                or chain_source_key not in chain_private or type(source_cap) is not int or type(cap) is not int
+                or not source_cap < cap <= min(2 * source_cap, step.token_budget, plan.total_token_budget, 1_000_000)
+                or dict(link) != self._initial_chain_link(chain_source_key, chain_ledger)
+            ):
+                _fail("runtime checkpoint incomplete chain is invalid")
+            earlier_tools = self._initial_chain_prior_tools(
+                step, cast(int, source["call_index"]), models, _ToolLedger(states=dict(tools)),
+            )
+            if not self._initial_chain_eligible(
+                step, step.agent, 1, cast(int, source["call_index"]), self._rejected_from_private(chain_private[chain_source_key]),
+                source_cap, models, earlier_tools,
+            ):
+                _fail("runtime checkpoint incomplete chain is invalid")
+            initial_key = self._model_call_key(checkpoint.run_id, step.id, 0, "step", step.agent, 0)
+            initial_receipt = chain_private.get(initial_key)
+            source_receipt = chain_private[chain_source_key]
+            if (
+                initial_receipt is None
+                or self._rejected_from_private(initial_receipt).logical_model
+                != self._rejected_from_private(source_receipt).logical_model
+                or initial_receipt["source_ids"] != source_receipt["source_ids"]
+            ):
+                _fail("runtime checkpoint incomplete chain is invalid")
         for key, row in models.items():
             step = steps[cast(str, row["step_id"])]
             agent = agents[step.agent]
             attempt = cast(int, row["attempt"])
             limit = _checkpoint_recovery_attempt_limit(agent, checkpoint.runtime_version)
+            if "initial_incomplete_chain" in row:
+                continue
+            anchor = self._initial_chain_anchor(step, models) if chain_growth else None
+            if (
+                anchor is not None and "initial_incomplete_chain" in anchor
+                and continuation_growth and step.tools and row["attempt"] == 1
+                and row["purpose"] == "step" and row["actor"] == step.agent
+                and cast(int, row["call_index"]) > cast(int, anchor["call_index"])
+            ):
+                cap = row.get("reserved_max_output_tokens")
+                if type(cap) is not int or not 1 <= cap <= cast(int, anchor["reserved_max_output_tokens"]):
+                    _fail("runtime checkpoint incomplete reservation is invalid")
+                continue
             incomplete_source_key = self._model_call_key(
                 checkpoint.run_id, step.id, attempt - 1, "step", step.agent, 0,
             )
@@ -9723,6 +9973,9 @@ class CrewDispatchRuntime:
                 cast(str, model["purpose"]), cast(str, model["actor"]), cast(int, model["call_index"]) + 1,
             )
             if next_key in models:
+                next_link = models[next_key].get("initial_incomplete_chain")
+                if chain_growth and isinstance(next_link, Mapping) and next_link.get("source_key") == key:
+                    continue
                 link = repairs.get(cast(str, model["step_id"]))
                 if not isinstance(link, Mapping) or link["source_key"] != key or link["correction_key"] != next_key:
                     _fail("runtime checkpoint correction linkage is missing")

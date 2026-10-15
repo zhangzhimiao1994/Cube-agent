@@ -169,6 +169,7 @@ async def test_v9_network_checkpoint_continues_remaining_final_candidate() -> No
     checkpoint = failed_checkpoint(events, model_count=2)
     state = dict(checkpoint.state)
     state.pop("incomplete_recovery_output_growth", None)
+    state.pop("initial_incomplete_chain_growth", None)
     # V9 checkpoints omit the later persisted timeout fields and use a stride of two.
     for key in (
         "remaining_timeout_seconds", "remaining_absolute_timeout_seconds", "timeout_progress_units",
