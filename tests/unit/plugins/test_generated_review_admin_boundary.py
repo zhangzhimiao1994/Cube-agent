@@ -219,7 +219,7 @@ async def test_legacy_read_projection_preserves_its_existing_approval(context: A
     assert observed.package_metadata.approval_state == "approved"
 
 
-async def test_invocation_scope_holds_the_current_generated_proof_until_exit(context: AdminContext) -> None:
+async def test_invocation_scope_bool_stub_cannot_replace_the_generated_proof(context: AdminContext) -> None:
     service, db, tenant = context
     current = plugin_payload(enabled=True)
     current.update(status="running", health="healthy")
@@ -235,9 +235,10 @@ async def test_invocation_scope_holds_the_current_generated_proof_until_exit(con
 
     service._generated_plugin_approval_validator = validate
     cached = _plugin_response_from_payload(current)
-    async with service.plugin_invocation_scope(cached, tenant_id=tenant):
-        assert db.active
-        assert len(calls) == 1
+    with pytest.raises(PublicAPIError):
+        async with service.plugin_invocation_scope(cached, tenant_id=tenant):
+            pytest.fail("A bool stub cannot supply generated execution authority")
+    assert len(calls) == 1
     assert not db.active
     assert db.plugin() == current
     assert not any(event[0] in {"write", "audit"} for event in db.events)
@@ -307,8 +308,9 @@ async def test_invocation_scope_rechecks_signing_trust_for_legacy_packages(
         }, kind="plugin_signing_key", resource_id="test-key")
     cached = _plugin_response_from_payload(current)
     if key_state == "live":
-        async with service.plugin_invocation_scope(cached, tenant_id=tenant):
+        async with service.plugin_invocation_scope(cached, tenant_id=tenant) as authority:
             assert db.active
+            assert authority is None
     else:
         with pytest.raises(PublicAPIError):
             async with service.plugin_invocation_scope(cached, tenant_id=tenant):

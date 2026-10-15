@@ -128,6 +128,7 @@ from agent_hub.plugins.dependency_policy import (
     plugin_package_dependency_lock,
     plugin_package_dependency_policy_from_settings,
 )
+from agent_hub.plugins.execution_authority import GeneratedExecutionAuthority
 from agent_hub.plugins.schemas import PluginSchemaError, plugin_schema_validator
 from agent_hub.recovery_metadata import (
     ORCHESTRATION_CONTRACT_RECOVERY_HINT,
@@ -9237,7 +9238,12 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
     @contextlib.asynccontextmanager
     async def plugin_invocation_scope(
         self, plugin: PluginResourceResponse, *, tenant_id: UUID,
-    ) -> AsyncIterator[None]:
+    ) -> AsyncIterator[GeneratedExecutionAuthority | None]:
+        from agent_hub.plugins.handover_reviews import (
+            load_generated_execution_authority_in_session,
+        )
+        from agent_hub.plugins.handover_storage import Conflict, StorageUnavailable
+
         # Keep registration and proof locks until the already-admitted call ends.
         if self._session_factory is None:
             raise PublicAPIError(503, "service_unavailable", "plugin authority unavailable")
@@ -9252,10 +9258,21 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             if row is None:
                 raise PublicAPIError(409, "plugin_unavailable", "plugin registration unavailable")
             current = _plugin_response_from_payload(row.payload)
+            authority: GeneratedExecutionAuthority | None = None
             if any(marker in row.payload for marker in (
                 "_generated_handover_id", "_generated_review_approval",
             )):
                 await self._require_generated_plugin_approval(session, row)
+                try:
+                    authority = await load_generated_execution_authority_in_session(
+                        session, plugin_row=row,
+                    )
+                except (Conflict, PermissionDenied):
+                    raise PublicAPIError(
+                        409, "plugin_generated_review_required", "generated plugin review is not current",
+                    ) from None
+                except StorageUnavailable:
+                    raise PublicAPIError(503, "service_unavailable", "service unavailable") from None
             package = current.package_metadata
             if package is not None and package.signature is not None:
                 key_row = (await session.execute(
@@ -9277,7 +9294,7 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             )
             if not current.enabled or current.status != "running":
                 raise PublicAPIError(409, "plugin_unavailable", "plugin is not running")
-            yield
+            yield authority
 
     async def list_runs(self) -> tuple[RunListItem, ...]:
         if self._run_repository is None:

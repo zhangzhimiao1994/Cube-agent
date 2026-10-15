@@ -17,6 +17,7 @@ from agent_hub.api.routers.admin import (
 )
 from agent_hub.config.service import ConfigService
 from agent_hub.db.models import AdminResourceRow
+from agent_hub.plugins.execution_authority import GeneratedExecutionAuthority
 from agent_hub.security.secrets import SecretService
 from tests.integration.plugins import test_handover_reviews as review_tests
 
@@ -53,7 +54,12 @@ async def test_actual_invocation_keeps_source_grant_locked_through_execution_sco
         AdminResourceRow.tenant_id == c.sql.creator.tenant_id,
         AdminResourceRow.kind == "plugin_handover", AdminResourceRow.resource_id == grant.grant_id,
     ).with_for_update(nowait=True)
-    async with service.plugin_invocation_scope(cached, tenant_id=c.sql.creator.tenant_id), c.sql.factory() as competing:
+    async with service.plugin_invocation_scope(cached, tenant_id=c.sql.creator.tenant_id) as authority, c.sql.factory() as competing:
+        assert isinstance(authority, GeneratedExecutionAuthority)
+        assert authority.tenant_id == c.sql.creator.tenant_id
+        assert authority.plugin_id == cached.id
+        assert authority.archive_sha256 == c.pending.archive_sha256
+        assert authority.members and all(member.path != "plugin.json" for member in authority.members)
         with pytest.raises(DBAPIError):
             await competing.scalar(query)
         await competing.rollback()

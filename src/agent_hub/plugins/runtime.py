@@ -10,12 +10,12 @@ import sys
 import sysconfig
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager, asynccontextmanager, nullcontext, suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path, PurePosixPath
 from time import monotonic as default_monotonic
-from typing import Any, Literal, Protocol, cast
+from typing import Any, Literal, Protocol, TypedDict, cast
 from urllib.parse import urlsplit
 from uuid import UUID
 
@@ -51,6 +51,8 @@ from agent_hub.plugins.dependency_policy import (
     PluginPackageDependencyPolicy,
     plugin_package_dependency_lock,
 )
+from agent_hub.plugins.execution_authority import GeneratedExecutionAuthority
+from agent_hub.plugins.execution_view import SealedPackageView, capture_sealed_package
 from agent_hub.plugins.schemas import PluginSchemaError, plugin_schema_validator
 from agent_hub.runtime.contracts import JsonValue, _freeze_object, _mutable_json
 
@@ -83,7 +85,7 @@ class PluginInvocationScopeProvider(Protocol):
 
     def plugin_invocation_scope(
         self, plugin: PluginResourceResponse, *, tenant_id: UUID,
-    ) -> AbstractAsyncContextManager[None]: ...
+    ) -> AbstractAsyncContextManager[GeneratedExecutionAuthority | None]: ...
 
 
 class PluginAuditRecorder(Protocol):
@@ -105,6 +107,7 @@ class PluginInvocationContext:
     run_id: UUID
     actor: str
     idempotency_key: str
+    execution_authority: GeneratedExecutionAuthority | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,6 +115,12 @@ class PluginPackageExecutionTarget:
     root: Path
     entrypoint: Path
     dependency_root: Path | None = None
+    execution_authority: GeneratedExecutionAuthority | None = None
+    sealed_view: SealedPackageView | None = None
+
+
+class _PluginPackageSpawnOptions(TypedDict, total=False):
+    pass_fds: tuple[int, ...]
 
 
 class PluginAdapter(Protocol):
@@ -438,6 +447,7 @@ class PluginPackageAdapter:
             tenant_id=context.tenant_id,
             package_store_dir=self._package_store_dir,
             dependency_policy=self._dependency_policy,
+            execution_authority=context.execution_authority,
         )
         try:
             result = await self._runner.invoke(
@@ -529,9 +539,12 @@ class BubblewrapPluginPackageProcessLauncher:
             else _default_python_runtime_readonly_bind_paths(python_executable)
         )
         protected_paths = (
+            *self._protected_paths,
             *self._protected_identities,
+            root,
             root.resolve(),
-            *((target.dependency_root.resolve(),) if target.dependency_root is not None else ()),
+            *((target.dependency_root, target.dependency_root.resolve())
+              if target.dependency_root is not None else ()),
         )
         for source, destination in readonly_bind_mounts:
             _validate_runtime_readonly_mount(source, destination, protected_paths)
@@ -540,6 +553,25 @@ class BubblewrapPluginPackageProcessLauncher:
             for source, destination in readonly_bind_mounts
             for argument in ("--ro-bind", str(source), str(destination))
         )
+        package_bind_args: tuple[str, ...] = ("--ro-bind", str(root), str(root))
+        if target.sealed_view is not None:
+            if target.execution_authority is None or target.dependency_root is not None:
+                raise RuntimeCapabilityError("Plugin immutable execution authority unavailable")
+            directories = {
+                str(parent)
+                for item in target.sealed_view.files
+                for parent in PurePosixPath(item.path).parents
+                if parent != PurePosixPath(".")
+            }
+            package_bind_args = (
+                "--tmpfs", str(root),
+                *(argument for directory in sorted(directories, key=lambda p: (len(PurePosixPath(p).parts), p))
+                  for argument in ("--dir", str(root.joinpath(*PurePosixPath(directory).parts)))),
+                *(argument for item in target.sealed_view.files
+                  for argument in ("--ro-bind-data", str(item.fd),
+                                   str(root.joinpath(*PurePosixPath(item.path).parts)))),
+                "--remount-ro", str(root),
+            )
         return (
             str(self._bubblewrap_executable),
             "--die-with-parent",
@@ -550,9 +582,7 @@ class BubblewrapPluginPackageProcessLauncher:
             "--unshare-uts",
             "--tmpfs",
             "/tmp",
-            "--ro-bind",
-            str(root),
-            str(root),
+            *package_bind_args,
             *dependency_bind_args,
             *readonly_bind_args,
             "--dev",
@@ -591,9 +621,13 @@ def _validate_runtime_readonly_mount(
 ) -> None:
     for path in (source, destination):
         _validate_runtime_mount_path(path)
+        lexical = Path(os.path.abspath(path))
         canonical = path.resolve()
         if any(
-            canonical.is_relative_to(protected) or protected.is_relative_to(canonical)
+            canonical.is_relative_to(protected)
+            or protected.is_relative_to(canonical)
+            or lexical.is_relative_to(Path(os.path.abspath(protected)))
+            or Path(os.path.abspath(protected)).is_relative_to(lexical)
             for protected in protected_paths
         ):
             raise RuntimeCapabilityError("Plugin runtime mount overlaps protected storage")
@@ -707,6 +741,35 @@ class PythonSubprocessPluginPackageRunner:
         ).encode("utf-8")
         if len(payload) > self._max_stdin_bytes:
             raise RuntimeCapabilityError("Plugin request is too large")
+        authority = target.execution_authority
+        if authority is None:
+            if context.execution_authority is not None or target.sealed_view is not None:
+                raise RuntimeCapabilityError("Plugin immutable execution authority unavailable")
+            return await self._invoke_payload(target=target, payload=payload)
+        if (
+            not isinstance(self._process_launcher, BubblewrapPluginPackageProcessLauncher)
+            or authority != context.execution_authority
+            or authority.tenant_id != context.tenant_id
+            or authority.plugin_id != plugin.id
+            or authority.archive_sha256 != plugin.content_sha256
+            or target.dependency_root is not None
+            or target.sealed_view is not None
+        ):
+            raise RuntimeCapabilityError("Plugin immutable execution unavailable")
+        with capture_sealed_package(
+            target.root, authority.members, timeout_seconds=self._timeout_seconds,
+        ) as view:
+            private_root = Path(target.root.anchor) / "agent-hub-plugin"
+            sealed_target = replace(
+                target, root=private_root,
+                entrypoint=private_root / target.entrypoint.relative_to(target.root),
+                sealed_view=view,
+            )
+            return await self._invoke_payload(target=sealed_target, payload=payload)
+
+    async def _invoke_payload(
+        self, *, target: PluginPackageExecutionTarget, payload: bytes,
+    ) -> Mapping[str, JsonValue]:
         argv = (
             self._process_launcher.argv(
                 python_executable=self._python_executable,
@@ -715,14 +778,18 @@ class PythonSubprocessPluginPackageRunner:
             if self._process_launcher is not None
             else (self._python_executable, *_plugin_package_python_args(target))
         )
+        spawn_options: _PluginPackageSpawnOptions = {}
+        if target.sealed_view is not None:
+            spawn_options["pass_fds"] = target.sealed_view.pass_fds
         try:
             process = await asyncio.create_subprocess_exec(
                 *argv,
-                cwd=target.root,
+                cwd=target.root if target.sealed_view is None else target.root.anchor,
                 env=self._environment,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,
+                **spawn_options,
             )
         except Exception as error:
             raise RuntimeCapabilityError("Plugin tool failed") from error
@@ -1141,7 +1208,8 @@ class RuntimePluginService:
             idempotency_key=idempotency_key,
         )
         try:
-            async with self._plugin_invocation_scope(plugin, tenant_id=tenant_id):
+            async with self._plugin_invocation_scope(plugin, tenant_id=tenant_id) as authority:
+                context = replace(context, execution_authority=authority)
                 adapter = self._adapters_for_plugin(tenant_id, plugin).get(capability.adapter)
                 if adapter is None:
                     raise RuntimeCapabilityError("Plugin backend unavailable")
@@ -1205,11 +1273,11 @@ class RuntimePluginService:
     @asynccontextmanager
     async def _plugin_invocation_scope(
         self, plugin: PluginResourceResponse, *, tenant_id: UUID,
-    ) -> AsyncIterator[None]:
+    ) -> AsyncIterator[GeneratedExecutionAuthority | None]:
         body_error: BaseException | None = None
         try:
             scope_factory = getattr(self._admin_service, "plugin_invocation_scope", None)
-            scope: AbstractAsyncContextManager[None]
+            scope: AbstractAsyncContextManager[GeneratedExecutionAuthority | None]
             if scope_factory is None and not isinstance(
                 self._admin_service, PersistentAdminResourceService,
             ):
@@ -1219,9 +1287,9 @@ class RuntimePluginService:
                     raise RuntimeCapabilityError("Plugin invocation scope unavailable")
                 provider = cast(PluginInvocationScopeProvider, self._admin_service)
                 scope = provider.plugin_invocation_scope(plugin, tenant_id=tenant_id)
-            async with scope:
+            async with scope as authority:
                 try:
-                    yield
+                    yield authority
                 except BaseException as error:
                     body_error = error
                     raise
@@ -1534,6 +1602,7 @@ def _plugin_package_execution_target(
     tenant_id: UUID,
     package_store_dir: Path,
     dependency_policy: PluginPackageDependencyPolicy | None = None,
+    execution_authority: GeneratedExecutionAuthority | None = None,
 ) -> PluginPackageExecutionTarget:
     package = plugin.package_metadata
     if package is None or package.kind != "adapter_package":
@@ -1557,6 +1626,13 @@ def _plugin_package_execution_target(
         raise RuntimeCapabilityError("Plugin package artifact is unavailable")
     if plugin.content_sha256 is None or artifact.content_sha256 != plugin.content_sha256:
         raise RuntimeCapabilityError("Plugin package artifact digest does not match plugin content")
+    if execution_authority is not None and (
+        execution_authority.tenant_id != tenant_id
+        or execution_authority.plugin_id != plugin.id
+        or execution_authority.archive_sha256 != plugin.content_sha256
+        or package.dependencies
+    ):
+        raise RuntimeCapabilityError("Plugin immutable execution authority unavailable")
     expected_storage_key = f"{tenant_id}/{plugin.id}/{artifact.content_sha256}"
     if artifact.storage_key != expected_storage_key:
         raise RuntimeCapabilityError("Plugin package artifact storage key is invalid")
@@ -1582,6 +1658,7 @@ def _plugin_package_execution_target(
         root=root,
         entrypoint=entrypoint,
         dependency_root=dependency_root,
+        execution_authority=execution_authority,
     )
 
 

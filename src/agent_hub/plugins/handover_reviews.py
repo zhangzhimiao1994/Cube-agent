@@ -14,6 +14,7 @@ import re
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, Any, cast
 from uuid import UUID, uuid4
 
@@ -24,6 +25,10 @@ from sqlalchemy.orm.attributes import set_committed_value
 
 from agent_hub.auth.models import AuthenticatedPrincipal, PermissionDenied
 from agent_hub.db.models import AdminResourceRow
+from agent_hub.plugins.execution_authority import (
+    GeneratedExecutionAuthority,
+    PackageExecutionMember,
+)
 from agent_hub.plugins.handover_confirmation import GeneratedPluginConfirmationService, _pair
 from agent_hub.plugins.handover_grants import (
     DurableSourceGrantService,
@@ -820,11 +825,36 @@ async def _validate_generated_approval_in_session(
     plugin_row: AdminResourceRow,
     clock: Callable[[], datetime],
 ) -> bool:
+    return await _load_generated_execution_authority_in_session(
+        session, plugin_row=plugin_row, clock=clock,
+    ) is not None
+
+
+async def load_generated_execution_authority_in_session(
+    session: AsyncSession,
+    *,
+    plugin_row: AdminResourceRow,
+) -> GeneratedExecutionAuthority:
+    """Borrow the caller's locks and return only fully validated report authority."""
+    authority = await _load_generated_execution_authority_in_session(
+        session, plugin_row=plugin_row, clock=lambda: datetime.now(UTC),
+    )
+    if authority is None:
+        raise Conflict("generated plugin execution authority required")
+    return authority
+
+
+async def _load_generated_execution_authority_in_session(
+    session: AsyncSession,
+    *,
+    plugin_row: AdminResourceRow,
+    clock: Callable[[], datetime],
+) -> GeneratedExecutionAuthority | None:
     """Caller holds registration/plugin locks; never acquire handover FOR UPDATE.
 
     A committed approver decision survives account departure. Current grant,
     source association/artifact and tenant signing trust still gate use.
-    Pending/rejected generated rows raise Conflict; ordinary plugins return False.
+    Pending/rejected generated rows raise Conflict; ordinary plugins return None.
     """
     _require_caller_begin(session)
     service = GeneratedPluginReviewService
@@ -837,7 +867,7 @@ async def _validate_generated_approval_in_session(
     ):
         raise Conflict("plugin review registration required")
     if GENERATED_HANDOVER_MARKER not in row.payload:
-        return False
+        return None
     try:
         tenant = row.tenant_id
         if not isinstance(tenant, UUID):
@@ -969,6 +999,20 @@ async def _validate_generated_approval_in_session(
             != proof["reason_sha256"]
         ):
             raise ValueError
-        return True
+        return GeneratedExecutionAuthority(
+            tenant_id=tenant,
+            plugin_id=receipt.plugin_id,
+            registration_id=UUID(str(row.id)),
+            archive_sha256=report.subject.verified_package.archive_sha256,
+            report_id=report.report_id,
+            report_sha256=report.report_sha256,
+            members=tuple(
+                PackageExecutionMember(member.path, member.size_bytes, member.sha256)
+                for member in sorted(
+                    report.subject.verified_package.members, key=lambda member: member.path,
+                )
+                if PurePosixPath(member.path).name != "plugin.json"
+            ),
+        )
     except (ValueError, TypeError, KeyError, AttributeError, RecursionError):
         raise Conflict("valid generated plugin review approval required") from None
