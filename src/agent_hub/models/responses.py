@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 from collections.abc import Mapping
+from enum import Enum
 from typing import Any, Protocol, cast
 
 from jsonschema import Draft202012Validator, SchemaError  # type: ignore[import-untyped]
@@ -36,19 +38,57 @@ _PROJECT_ZIP_TOOL_NAMES = frozenset({"project.generate_zip", "project_generate_z
 _MAX_DEPTH = 64
 _MAX_NODES = 16_384
 
+logger = logging.getLogger(__name__)
+
+
+class _RejectSite(Enum):
+    GENERIC = "generic"
+    TOP_STATUS = "top_status"
+    TOP_ERROR = "top_error"
+    TOP_INCOMPLETE = "top_incomplete"
+    TOP_INCOMPLETE_DETAILS = "top_incomplete_details"
+    OUTPUT_CONTAINER = "output_container"
+    ITEM_TYPE = "item_type"
+    MESSAGE_ROLE = "message_role"
+    ITEM_ERROR = "item_error"
+    ITEM_INCOMPLETE = "item_incomplete"
+    ITEM_INCOMPLETE_DETAILS = "item_incomplete_details"
+    ITEM_STATUS = "item_status"
+    MESSAGE_STATUS = "message_status"
+    MESSAGE_PHASE = "message_phase"
+    MULTIPLE_FINAL = "multiple_final"
+    MESSAGE_CONTENT_CONTAINER = "message_content_container"
+    MESSAGE_CONTENT_TYPE = "message_content_type"
+    REFUSAL = "refusal"
+    MIXED_FINAL_TOOL = "mixed_final_tool"
+    NO_FINAL = "no_final"
+    INVALID_TOOL = "invalid_tool"
+    TOOL_JSON = "tool_json"
+    FINAL_JSON = "final_json"
+    OUTPUT_LIMIT = "output_limit"
+    USAGE_MISSING = "usage_missing"
+    USAGE_INVALID = "usage_invalid"
+
 
 class ResponsesContractError(ValueError):
     """Safe diagnostic without provider text, schema contents, or credentials."""
 
-    def __init__(self, message: str, *, evidence: RejectedOutputEvidence | None = None) -> None:
+    def __init__(
+        self, message: str, *, evidence: RejectedOutputEvidence | None = None,
+        reject_site: _RejectSite = _RejectSite.GENERIC,
+    ) -> None:
+        if type(reject_site) is not _RejectSite:
+            raise ValueError("Responses reject site is invalid")
         super().__init__(message)
         self.evidence = evidence
+        self.reject_site = reject_site
 
 
 class _RejectOutput(Protocol):
     def __call__(
         self, reason: RejectedOutputReason, *, status: RejectedOutputStatus = "unknown",
         final_text: str | None = None,
+        reject_site: _RejectSite = _RejectSite.GENERIC,
     ) -> ResponsesContractError: ...
 
 
@@ -293,14 +333,18 @@ def parse_response(response: object, request: ModelRequest) -> ModelResponse:
     def rejected(
         reason: RejectedOutputReason, *, status: RejectedOutputStatus = "unknown",
         final_text: str | None = None,
+        reject_site: _RejectSite = _RejectSite.GENERIC,
     ) -> ResponsesContractError:
-        return ResponsesContractError(
+        error = ResponsesContractError(
             "Responses output rejected",
             evidence=RejectedOutputEvidence(
                 final_text=final_text, usage=usage, usage_status=usage_status,
                 status=status, reason=reason,
             ),
+            reject_site=reject_site,
         )
+        logger.warning("Responses output rejected reject_site=%s", error.reject_site.value)
+        return error
 
     try:
         schema = _schema(request)
@@ -311,7 +355,7 @@ def parse_response(response: object, request: ModelRequest) -> ModelResponse:
     except ResponsesContractError as error:
         if error.evidence is not None:
             raise
-        raise rejected("invalid_output") from None
+        raise rejected("invalid_output", reject_site=error.reject_site) from None
     except (TypeError, ValueError, RecursionError, OverflowError):
         raise rejected("invalid_output") from None
 
@@ -327,48 +371,88 @@ def _parse_output(
         or _get(response, "incomplete_details") is not None
     ):
         if _get(response, "status") == "incomplete" and _get(response, "error") is None:
-            raise rejected("incomplete", status="incomplete")
-        raise rejected("invalid_output")
+            raise rejected(
+                "incomplete", status="incomplete", reject_site=_RejectSite.TOP_INCOMPLETE,
+            )
+        if _get(response, "error") is not None:
+            site = _RejectSite.TOP_ERROR
+        elif _get(response, "status") != "completed":
+            site = _RejectSite.TOP_STATUS
+        else:
+            site = _RejectSite.TOP_INCOMPLETE_DETAILS
+        raise rejected("invalid_output", reject_site=site)
     output = _get(response, "output")
     if not isinstance(output, list | tuple) or not 1 <= len(output) <= 128:
-        raise ResponsesContractError("Responses output items are invalid")
+        raise ResponsesContractError(
+            "Responses output items are invalid", reject_site=_RejectSite.OUTPUT_CONTAINER,
+        )
     texts: list[str] = []
     calls: list[ToolCall] = []
     call_ids: set[str] = set()
     permitted_names = {tool.name for tool in request.tools}
     message_count = 0
+    output_text_bytes = 0
     for item in output:
         kind = _get(item, "type")
         if kind not in {"reasoning", "message", "function_call"}:
-            raise ResponsesContractError("Responses output item type is unsupported")
+            raise ResponsesContractError(
+                "Responses output item type is unsupported", reject_site=_RejectSite.ITEM_TYPE,
+            )
         if kind == "message" and _get(item, "role") != "assistant":
-            raise rejected("invalid_output")
+            raise rejected("invalid_output", reject_site=_RejectSite.MESSAGE_ROLE)
         if (
             _get(item, "error") is not None
             or _get(item, "incomplete_details") is not None
             or _get(item, "status") not in {None, "completed"}
         ):
             if _get(item, "status") == "incomplete" and _get(item, "error") is None:
-                raise rejected("incomplete", status="incomplete")
-            raise rejected("invalid_output")
+                raise rejected(
+                    "incomplete", status="incomplete", reject_site=_RejectSite.ITEM_INCOMPLETE,
+                )
+            if _get(item, "error") is not None:
+                site = _RejectSite.ITEM_ERROR
+            elif _get(item, "incomplete_details") is not None:
+                site = _RejectSite.ITEM_INCOMPLETE_DETAILS
+            else:
+                site = _RejectSite.ITEM_STATUS
+            raise rejected("invalid_output", reject_site=site)
         if kind == "reasoning":
             continue
         if kind == "message":
-            message_count += 1
-            if message_count > 1:
-                raise ResponsesContractError("Responses output has multiple final messages")
             if _get(item, "role") != "assistant" or _get(item, "status") != "completed":
-                raise rejected("invalid_output")
+                raise rejected("invalid_output", reject_site=_RejectSite.MESSAGE_STATUS)
+            phase = _get(item, "phase")
+            if phase is not None and (
+                type(phase) is not str or phase not in {"commentary", "final_answer"}
+            ):
+                raise rejected("invalid_output", reject_site=_RejectSite.MESSAGE_PHASE)
+            if phase != "commentary":
+                message_count += 1
+                if message_count > 1:
+                    raise ResponsesContractError(
+                        "Responses output has multiple final messages",
+                        reject_site=_RejectSite.MULTIPLE_FINAL,
+                    )
             content = _get(item, "content")
             if not isinstance(content, list | tuple) or not 1 <= len(content) <= 128:
-                raise ResponsesContractError("Responses message content is invalid")
+                raise ResponsesContractError(
+                    "Responses message content is invalid",
+                    reject_site=_RejectSite.MESSAGE_CONTENT_CONTAINER,
+                )
             for part in content:
                 text = _get(part, "text")
                 if _get(part, "type") == "refusal":
-                    raise rejected("refusal", status="refused")
+                    raise rejected(
+                        "refusal", status="refused", reject_site=_RejectSite.REFUSAL,
+                    )
                 if _get(part, "type") != "output_text" or type(text) is not str:
-                    raise ResponsesContractError("Responses output is refused or unsupported")
-                texts.append(text)
+                    raise ResponsesContractError(
+                        "Responses output is refused or unsupported",
+                        reject_site=_RejectSite.MESSAGE_CONTENT_TYPE,
+                    )
+                output_text_bytes += len(text.encode())
+                if phase != "commentary":
+                    texts.append(text)
         elif kind == "function_call":
             call_id, name, arguments = (_get(item, key) for key in ("call_id", "name", "arguments"))
             argument_limit = (
@@ -386,36 +470,53 @@ def _parse_output(
                 or _get(item, "status") not in {None, "completed"}
                 or len(calls) >= 16
             ):
-                raise rejected("invalid_tool")
+                raise rejected("invalid_tool", reject_site=_RejectSite.INVALID_TOOL)
             try:
                 parsed = _loads(arguments, max_bytes=argument_limit)
                 if not isinstance(parsed, dict):
-                    raise rejected("invalid_tool")
+                    raise ResponsesContractError("Responses tool arguments must be an object")
                 calls.append(ToolCall(id=call_id, name=name, arguments=parsed))
             except (ValueError, TypeError):
-                raise rejected("invalid_tool") from None
+                raise rejected("invalid_tool", reject_site=_RejectSite.TOOL_JSON) from None
             call_ids.add(call_id)
         else:
-            raise ResponsesContractError("Responses output item type is unsupported")
-    if sum(len(text.encode()) for text in texts) > output_byte_limit:
-        raise rejected("output_limit", status="completed")
+            raise ResponsesContractError(
+                "Responses output item type is unsupported", reject_site=_RejectSite.ITEM_TYPE,
+            )
+    if output_text_bytes > output_byte_limit:
+        raise rejected(
+            "output_limit", status="completed", reject_site=_RejectSite.OUTPUT_LIMIT,
+        )
     text = "".join(texts) if texts else None
     if calls and texts:
-        raise ResponsesContractError("Responses output mixes final text and function calls")
+        raise ResponsesContractError(
+            "Responses output mixes final text and function calls",
+            reject_site=_RejectSite.MIXED_FINAL_TOOL,
+        )
     if not calls:
         if text is None:
-            raise ResponsesContractError("Responses output has no final result")
+            raise ResponsesContractError(
+                "Responses output has no final result", reject_site=_RejectSite.NO_FINAL,
+            )
         try:
             instance = _loads(text, max_bytes=output_byte_limit)
         except ResponsesContractError:
-            raise rejected("invalid_json", status="completed", final_text=text) from None
+            raise rejected(
+                "invalid_json", status="completed", final_text=text,
+                reject_site=_RejectSite.FINAL_JSON,
+            ) from None
         if not Draft202012Validator(schema).is_valid(instance):
             raise rejected("schema_mismatch", status="completed", final_text=text)
     if usage is None:
         reason: RejectedOutputReason = (
             "usage_missing" if _get(response, "usage") is None else "usage_invalid"
         )
-        raise rejected(reason, status="completed", final_text=text)
+        raise rejected(
+            reason, status="completed", final_text=text,
+            reject_site=(
+                _RejectSite.USAGE_MISSING if reason == "usage_missing" else _RejectSite.USAGE_INVALID
+            ),
+        )
     return ModelResponse(
         text=text,
         tool_calls=tuple(calls),
