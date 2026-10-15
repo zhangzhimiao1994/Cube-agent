@@ -4,6 +4,17 @@ import re
 from collections.abc import Mapping
 from typing import cast
 
+from jsonschema import (  # type: ignore[import-untyped]
+    Draft3Validator,
+    Draft4Validator,
+    Draft6Validator,
+    Draft7Validator,
+    Draft201909Validator,
+    Draft202012Validator,
+)
+from jsonschema.protocols import Validator  # type: ignore[import-untyped]
+from jsonschema.validators import validator_for  # type: ignore[import-untyped]
+
 from agent_hub.runtime.contracts import JsonValue
 
 _SAFE_MANIFEST_NAME = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,127}$")
@@ -30,6 +41,14 @@ _MAX_SCHEMA_DEPTH = 8
 _MAX_SCHEMA_PROPERTIES = 64
 _MAX_SCHEMA_REQUIRED = 64
 _MAX_SCHEMA_ENUM = 64
+_SCHEMA_DIALECTS: Mapping[str, type[Validator]] = {
+    "http://json-schema.org/draft-03/schema": Draft3Validator,
+    "http://json-schema.org/draft-04/schema": Draft4Validator,
+    "http://json-schema.org/draft-06/schema": Draft6Validator,
+    "http://json-schema.org/draft-07/schema": Draft7Validator,
+    "https://json-schema.org/draft/2019-09/schema": Draft201909Validator,
+    "https://json-schema.org/draft/2020-12/schema": Draft202012Validator,
+}
 
 
 def project_capability_manifest_item(
@@ -132,6 +151,7 @@ def _policy_effect(value: object) -> str:
 
 
 def _project_schema(schema: Mapping[str, JsonValue]) -> Mapping[str, JsonValue] | None:
+    # Public hints may weaken the source contract; plugin execution still validates the original.
     return _project_schema_at_depth(schema, depth=0)
 
 
@@ -139,19 +159,38 @@ def _project_schema_at_depth(
     schema: Mapping[str, JsonValue],
     *,
     depth: int,
+    dialect: type[Validator] = Draft202012Validator,
 ) -> Mapping[str, JsonValue] | None:
     if depth > _MAX_SCHEMA_DEPTH:
         return None
+    if "$schema" in schema:
+        dialect_uri = schema["$schema"]
+        if not isinstance(dialect_uri, str):
+            return None
+        expected = _SCHEMA_DIALECTS.get(dialect_uri.removesuffix("#"))
+        if expected is None:
+            return None
+        selected: type[Validator] | None = validator_for(schema, default=None)
+        if selected is not expected:
+            return None
+        dialect = expected
+    # Older dialects ignore $ref siblings. Never turn those siblings into new constraints.
+    if {"$ref", "$dynamicRef", "$recursiveRef"}.intersection(schema):
+        return None
     projected: dict[str, JsonValue] = {}
+    if "$schema" in schema:
+        projected["$schema"] = schema["$schema"]
     schema_type = _schema_type(schema.get("type"))
     if schema_type is not None:
         projected["type"] = schema_type
-    properties = _schema_properties(schema.get("properties"), depth=depth)
+    raw_properties = schema.get("properties", {})
+    properties = _schema_properties(raw_properties, depth=depth, dialect=dialect)
     if properties:
         projected["properties"] = properties
     items = schema.get("items")
-    if isinstance(items, Mapping):
-        projected_items = _project_schema_at_depth(items, depth=depth + 1)
+    # Omitting positional schemas must not make a tail-only rule apply to every array item.
+    if isinstance(items, Mapping) and not schema.get("prefixItems"):
+        projected_items = _project_schema_at_depth(items, depth=depth + 1, dialect=dialect)
         if projected_items is not None:
             projected["items"] = projected_items
     required = _schema_string_tuple(schema.get("required"), max_items=_MAX_SCHEMA_REQUIRED)
@@ -164,15 +203,20 @@ def _project_schema_at_depth(
     if const is not None:
         projected["const"] = const
     additional_properties = schema.get("additionalProperties")
-    if isinstance(additional_properties, bool):
-        projected["additionalProperties"] = additional_properties
-    elif isinstance(additional_properties, Mapping):
-        projected_additional = _project_schema_at_depth(
-            additional_properties,
-            depth=depth + 1,
-        )
-        if projected_additional is not None:
-            projected["additionalProperties"] = projected_additional
+    # Dropped declared/pattern keys must not be reclassified as restricted additional keys.
+    if (
+        isinstance(raw_properties, Mapping)
+        and len(properties or {}) == len(raw_properties)
+        and not schema.get("patternProperties")
+    ):
+        if isinstance(additional_properties, bool):
+            projected["additionalProperties"] = additional_properties
+        elif isinstance(additional_properties, Mapping):
+            projected_additional = _project_schema_at_depth(
+                additional_properties, depth=depth + 1, dialect=dialect,
+            )
+            if projected_additional is not None:
+                projected["additionalProperties"] = projected_additional
     for key in _SCHEMA_STRING_KEYS:
         value = _safe_schema_string(schema.get(key))
         if value is not None:
@@ -181,7 +225,11 @@ def _project_schema_at_depth(
         number_value = schema.get(key)
         if isinstance(number_value, int | float) and not isinstance(number_value, bool):
             projected[key] = number_value
-    return projected or None
+    # A keyword ignored by the source dialect must not gain force in the default dialect.
+    return {
+        key: value for key, value in projected.items()
+        if key == "$schema" or key in dialect.VALIDATORS
+    }
 
 
 def _schema_type(value: JsonValue | None) -> str | tuple[str, ...] | None:
@@ -189,12 +237,14 @@ def _schema_type(value: JsonValue | None) -> str | tuple[str, ...] | None:
         return value if value in _SCHEMA_TYPE_VALUES else None
     if isinstance(value, tuple | list):
         result = tuple(item for item in value if isinstance(item, str) and item in _SCHEMA_TYPE_VALUES)
-        if result and len(result) == len(set(result)):
+        if result and len(result) == len(value) and len(result) == len(set(result)):
             return result
     return None
 
 
-def _schema_properties(value: JsonValue | None, *, depth: int) -> Mapping[str, JsonValue] | None:
+def _schema_properties(
+    value: JsonValue | None, *, depth: int, dialect: type[Validator],
+) -> Mapping[str, JsonValue] | None:
     if not isinstance(value, Mapping):
         return None
     projected: dict[str, JsonValue] = {}
@@ -205,7 +255,7 @@ def _schema_properties(value: JsonValue | None, *, depth: int) -> Mapping[str, J
             continue
         if not isinstance(raw_schema, Mapping):
             continue
-        nested = _project_schema_at_depth(raw_schema, depth=depth + 1)
+        nested = _project_schema_at_depth(raw_schema, depth=depth + 1, dialect=dialect)
         if nested is not None:
             projected[raw_name] = nested
     return projected or None
@@ -225,15 +275,14 @@ def _schema_string_tuple(value: JsonValue | None, *, max_items: int) -> tuple[st
 
 
 def _schema_enum(value: JsonValue | None) -> tuple[JsonValue, ...]:
-    if not isinstance(value, tuple | list):
+    if not isinstance(value, tuple | list) or len(value) > _MAX_SCHEMA_ENUM:
         return ()
     result: list[JsonValue] = []
     for item in value:
-        if len(result) >= _MAX_SCHEMA_ENUM:
-            break
         safe = _schema_const(item)
-        if safe is not None:
-            result.append(safe)
+        if safe is None:
+            return ()
+        result.append(safe)
     return tuple(result)
 
 

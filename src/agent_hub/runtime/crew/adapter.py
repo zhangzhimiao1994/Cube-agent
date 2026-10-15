@@ -69,6 +69,7 @@ from agent_hub.models.types import (
     ToolDefinition,
     _require_safe_identifier,
 )
+from agent_hub.plugins.schemas import PluginSchemaError, plugin_schema_validator
 from agent_hub.project_preflight import scoped_project_preflight_arguments
 from agent_hub.recovery_metadata import ORCHESTRATION_CONTRACT_RECOVERY_HINT
 from agent_hub.runtime.adaptive_budget import AdaptiveDeadline, deadline_from_routing
@@ -793,9 +794,10 @@ def _correctable_tool_argument_rejection(
     source_id: str,
     arguments_sha256: str,
     incremental_reads: bool = False,
+    plugin: bool = False,
 ) -> tuple[Mapping[str, JsonValue], Artifact] | None:
     if (
-        not _is_correctable_tool_argument_failure(tool_call.name, reason)
+        plugin or not _is_correctable_tool_argument_failure(tool_call.name, reason)
         or _tool_argument_rejection_count(
             ledger, step_id=step_id, incremental_reads=incremental_reads,
         )
@@ -815,6 +817,132 @@ def _correctable_tool_argument_rejection(
         },
         source_ids=(source_id,),
     )
+
+
+_PLUGIN_ARGUMENT_REJECTION_MESSAGE = "Plugin arguments do not match input schema."
+_PLUGIN_VALIDATION_KEYWORDS = frozenset({
+    "type", "required", "additionalProperties", "unevaluatedProperties", "propertyNames",
+    "minProperties", "maxProperties", "dependentRequired", "dependencies",
+    "enum", "const", "allOf", "anyOf", "oneOf", "not", "if", "false schema",
+    "minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum", "multipleOf",
+    "minLength", "maxLength", "pattern", "minItems", "maxItems", "uniqueItems",
+    "items", "additionalItems", "unevaluatedItems", "contains", "minContains", "maxContains",
+})
+
+
+def _safe_schema_field(value: object) -> bool:
+    return isinstance(value, str) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", value) is not None
+
+
+def _plugin_argument_prevalidation(
+    tool_call: ToolCall, metadata: Mapping[str, JsonValue],
+) -> Mapping[str, JsonValue] | None:
+    if metadata.get("kind") != "plugin" or metadata.get("input_schema") is None:
+        return None
+    raw_schema = metadata.get("input_schema")
+    if isinstance(raw_schema, Mapping):
+        try:
+            encoded = json.dumps(_mutable_json(raw_schema), ensure_ascii=False, allow_nan=False)
+        except (TypeError, ValueError, RecursionError):
+            _fail("plugin input schema is invalid")
+        # The model hint budget is not a validity limit; the gateway remains authoritative.
+        if len(encoded.encode("utf-8")) > 8_192:
+            return None
+    schema = _manifest_input_schema(metadata, allow_implicit_object=True)
+    if schema is None:
+        _fail("plugin input schema is invalid")
+    try:
+        if "$schema" in schema and validator_for(schema, default=None) is None:
+            _fail("plugin input schema is invalid")
+        validator = plugin_schema_validator(
+            schema=schema, invalid_schema_message="plugin input schema is invalid",
+            require_object_schema=True,
+        )
+        if validator is None:
+            _fail("plugin input schema is invalid")
+        error = next(validator.iter_errors(_mutable_json(tool_call.arguments)), None)
+    except (PluginSchemaError, TypeError, ValueError, RecursionError, re.error):
+        _fail("plugin input schema is invalid")
+    if error is None:
+        return None
+    # Never render ValidationError: its message/path/schema may contain argument or const secrets.
+    keyword = error.validator if error.validator in _PLUGIN_VALIDATION_KEYWORDS else "schema"
+    missing: tuple[str, ...] = ()
+    if error.validator == "required" and isinstance(error.schema, Mapping):
+        required = error.schema.get("required", ())
+        properties = error.schema.get("properties", {})
+        if isinstance(required, list) and isinstance(properties, Mapping) and isinstance(error.instance, Mapping):
+            missing = tuple(name for name in required if _safe_schema_field(name)
+                            and name in properties and name not in error.instance)[:16]
+    encoded_schema = json.dumps(schema, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return {
+        "status": "rejected", "error_code": "plugin.invalid_arguments",
+        "message": _PLUGIN_ARGUMENT_REJECTION_MESSAGE,
+        "phase": "pre_invocation", "execution_started": False,
+        "tool_name": tool_call.name,
+        "arguments_sha256": hashlib.sha256(json.dumps(
+            _mutable_json(tool_call.arguments), ensure_ascii=False, allow_nan=False,
+            sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")).hexdigest(),
+        "schema_sha256": hashlib.sha256(encoded_schema.encode("utf-8")).hexdigest(),
+        "validation_keyword": keyword, "missing_fields": missing,
+    }
+
+
+def _plugin_argument_rejection_binding(
+    context: TaskContext, key: str, state: Mapping[str, JsonValue], schema_sha256: JsonValue,
+) -> Mapping[str, JsonValue]:
+    return {
+        "tenant_id": str(context.tenant_id), "run_id": str(context.run_id),
+        "idempotency_key": key, "schema_sha256": schema_sha256,
+        **{field: state[field] for field in (
+            "step_id", "attempt", "round", "tool_index", "name", "arguments_sha256",
+            "trigger_model_artifact_id",
+        )},
+    }
+
+
+def _verify_plugin_argument_rejection(
+    context: TaskContext, step: DispatchStep, key: str, state: Mapping[str, JsonValue],
+    artifact: Artifact, metadata: Mapping[str, JsonValue],
+) -> None:
+    result = artifact.content.get("result")
+    if not isinstance(result, Mapping):
+        _fail("plugin argument rejection evidence is invalid")
+    schema_sha = result.get("schema_sha256")
+    missing = result.get("missing_fields")
+    schema = _manifest_input_schema(metadata, allow_implicit_object=True)
+    if metadata.get("kind") != "plugin" or schema is None:
+        _fail("plugin argument rejection evidence is invalid")
+    current_schema_sha = hashlib.sha256(json.dumps(
+        schema, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+    if (
+        set(result) != {"status", "error_code", "message", "phase", "execution_started",
+                       "tool_name", "arguments_sha256", "schema_sha256",
+                       "validation_keyword", "missing_fields"}
+        or result.get("status") != "rejected"
+        or result.get("error_code") != "plugin.invalid_arguments"
+        or result.get("message") != _PLUGIN_ARGUMENT_REJECTION_MESSAGE
+        or result.get("phase") != "pre_invocation" or result.get("execution_started") is not False
+        or result.get("tool_name") != state["name"]
+        or result.get("arguments_sha256") != state["arguments_sha256"]
+        or not isinstance(schema_sha, str) or _SHA256.fullmatch(schema_sha) is None
+        or schema_sha != current_schema_sha
+        or result.get("validation_keyword") not in (*_PLUGIN_VALIDATION_KEYWORDS, "schema")
+        or not isinstance(missing, tuple) or len(missing) > 16
+        or not all(_safe_schema_field(name) for name in missing)
+        or artifact.content.get("prevalidation") != _plugin_argument_rejection_binding(
+            context, key, state, schema_sha,
+        )
+        or artifact.type != "tool_result" or artifact.producer != step.agent
+        or artifact.content.get("agent_id") != step.agent
+        or artifact.content.get("tool_name") != state["name"]
+        or artifact.content.get("arguments_sha256") != state["arguments_sha256"]
+        or artifact.source_ids != (state["trigger_model_artifact_id"],)
+        or str(artifact.id) != state["artifact_id"] or artifact.content_sha256 != state["sha256"]
+    ):
+        _fail("plugin argument rejection evidence is invalid")
 
 
 def _read_context_unavailable_result(
@@ -1094,12 +1222,14 @@ def _description_with_failure_codes(description: str, failure_codes: Sequence[st
     return description + suffix
 
 
-def _manifest_input_schema(metadata: Mapping[str, JsonValue]) -> Mapping[str, JsonValue] | None:
+def _manifest_input_schema(
+    metadata: Mapping[str, JsonValue], *, allow_implicit_object: bool = False,
+) -> Mapping[str, JsonValue] | None:
     value = metadata.get("input_schema")
     if not isinstance(value, Mapping):
         return None
     schema = cast(Mapping[str, JsonValue], _mutable_json(value))
-    if schema.get("type") != "object":
+    if schema.get("type") != "object" and not (allow_implicit_object and "type" not in schema):
         return None
     try:
         encoded = json.dumps(schema, ensure_ascii=False, allow_nan=False)
@@ -6744,6 +6874,23 @@ class CrewDispatchRuntime:
                 ):
                     _fail("capability arguments exceed limit")
                 arguments_sha256 = hashlib.sha256(canonical_arguments.encode("utf-8")).hexdigest()
+                idempotency_key = self._tool_call_key(
+                    context.run_id, step.id, model_attempt, _round, tool_index,
+                    tool_call.name, arguments_sha256,
+                    trigger_model_artifact_id=(
+                        str(trigger_model_artifact.id) if use_repair_tool_keys else None
+                    ),
+                )
+                existing = tool_ledger.states.get(idempotency_key)
+                plugin = tool_metadata_by_name.get(tool_call.name, {}).get("kind") == "plugin"
+                replay_safe_method = getattr(self._capabilities, "is_replay_safe", None)
+                replay_safe = bool(callable(replay_safe_method) and replay_safe_method(tool_call.name))
+                # Resolve unknown executions before any schema decision or semantic result reuse.
+                if existing is not None and (
+                    existing.get("status") == "uncertain"
+                    or (existing.get("status") == "running" and (plugin or not replay_safe))
+                ):
+                    raise CapabilityOutcomeUncertain("capability outcome requires confirmation")
                 event_arguments = (
                     project_zip_evidence_arguments(tool_call.arguments)
                     if tool_call.name == PROJECT_ZIP_TOOL_NAME
@@ -6791,24 +6938,16 @@ class CrewDispatchRuntime:
                     else:
                         reused_semantic_results += 1
                     continue
-                idempotency_key = self._tool_call_key(
-                    context.run_id,
-                    step.id,
-                    model_attempt,
-                    _round,
-                    tool_index,
-                    tool_call.name,
-                    arguments_sha256,
-                    trigger_model_artifact_id=(
-                        str(trigger_model_artifact.id) if use_repair_tool_keys else None
-                    ),
-                )
                 call_id = f"call-{idempotency_key[:32]}"
-                existing = tool_ledger.states.get(idempotency_key)
                 if existing is not None and existing.get("status") == "rejected":
                     artifact = tool_ledger.artifacts.get(idempotency_key)
                     if artifact is None:
                         _fail("capability rejection artifact is unavailable")
+                    if plugin or "prevalidation" in artifact.content:
+                        _verify_plugin_argument_rejection(
+                            context, step, idempotency_key, existing, artifact,
+                            tool_metadata_by_name.get(tool_call.name, {}),
+                        )
                     rejection_result = artifact.content.get("result")
                     if not isinstance(rejection_result, Mapping):
                         _fail("capability rejection artifact is invalid")
@@ -6949,16 +7088,6 @@ class CrewDispatchRuntime:
                     results.append({"name": tool_call.name, "result": reusable_result})
                     reused_generated_file_results += 1
                     continue
-                replay_safe_method = getattr(self._capabilities, "is_replay_safe", None)
-                replay_safe = bool(
-                    callable(replay_safe_method) and replay_safe_method(tool_call.name)
-                )
-                if (
-                    existing is not None
-                    and existing.get("status") in {"running", "uncertain"}
-                    and not (existing.get("status") == "running" and replay_safe)
-                ):
-                    raise CapabilityOutcomeUncertain("capability outcome requires confirmation")
                 tool_prepared: Mapping[str, JsonValue] = {
                     "status": "prepared",
                     "step_id": step.id,
@@ -6972,6 +7101,35 @@ class CrewDispatchRuntime:
                     "artifact_id": None,
                     "sha256": None,
                 }
+                # Existing execution/approval slots retain their original gateway semantics.
+                rejection_result = (
+                    _plugin_argument_prevalidation(tool_call, tool_metadata_by_name.get(tool_call.name, {}))
+                    if existing is None or existing.get("status") == "prepared" else None
+                )
+                if rejection_result is not None:
+                    if _tool_argument_rejection_count(
+                        tool_ledger, step_id=step.id, incremental_reads=workspace_continuation,
+                    ) >= _MAX_TOOL_ARGUMENT_CORRECTIONS_PER_STEP:
+                        _fail("capability argument correction allowance exhausted")
+                    artifact = Artifact(
+                        id=uuid4(), type="tool_result", producer=step.agent,
+                        content={
+                            "agent_id": step.agent, "result": rejection_result,
+                            "tool_name": tool_call.name, "arguments_sha256": arguments_sha256,
+                            "prevalidation": _plugin_argument_rejection_binding(
+                                context, idempotency_key, tool_prepared, rejection_result["schema_sha256"],
+                            ),
+                        },
+                        source_ids=(str(trigger_model_artifact.id),),
+                    )
+                    rejected = dict(tool_prepared)
+                    rejected.update(status="rejected", artifact_id=str(artifact.id), sha256=artifact.content_sha256)
+                    # tool_boundary stores the artifact and checkpoint before feedback can reach the model.
+                    await tool_boundary(idempotency_key, rejected, artifact)
+                    evidence.append(artifact)
+                    results.append({"name": tool_call.name, "result": _mutable_json(rejection_result)})
+                    argument_correction_requested = True
+                    break
                 await tool_boundary(idempotency_key, tool_prepared, None)
                 tool_sandbox = _tool_sandbox(
                     tool_call.name,
@@ -7113,6 +7271,7 @@ class CrewDispatchRuntime:
                         source_id=str(trigger_model_artifact.id),
                         arguments_sha256=arguments_sha256,
                         incremental_reads=workspace_continuation,
+                        plugin=plugin,
                     )
                     await emit(
                         kind=EventKind.TOOL_FAILED,
@@ -7309,6 +7468,7 @@ class CrewDispatchRuntime:
                         source_id=str(trigger_model_artifact.id),
                         arguments_sha256=arguments_sha256,
                         incremental_reads=workspace_continuation,
+                        plugin=plugin,
                     )
                     await emit(
                         kind=EventKind.TOOL_FAILED,
@@ -10143,6 +10303,17 @@ class CrewDispatchRuntime:
                     )
                 ):
                     _fail("runtime checkpoint capability artifacts are unavailable")
+                result = artifact.content.get("result")
+                if state["status"] == "rejected" and (
+                    "prevalidation" in artifact.content
+                    or (isinstance(result, Mapping) and result.get("error_code") == "plugin.invalid_arguments")
+                ):
+                    _verify_plugin_argument_rejection(
+                        context, steps[cast(str, state["step_id"])], key, state, artifact,
+                        _capability_manifest_tool_metadata(
+                            self._capabilities, tenant_id=context.tenant_id, name=cast(str, state["name"]),
+                        ),
+                    )
                 tool_ledger.artifacts[key] = artifact
             elif state["status"] == "uncertain" or (
                 state["status"] == "running" and state["replay_safe"] is False

@@ -407,17 +407,35 @@ class FrozenPluginApproval(RuntimeError):
     """An unproven or ambiguous approval must not trigger further writes."""
 
 
+class FrozenSeparateRunApproval(FrozenPluginApproval):
+    """A distinct approval workflow is never authorized by this plugin probe."""
+
+    def __init__(self, kind: object) -> None:
+        known = {
+            "self_repair", "temporary_agent_creation", "evolution_creation",
+            "schedule_creation", "openclaw_operation", "project_preflight",
+        }
+        self.approval_kind = kind if isinstance(kind, str) and kind in known else "unknown"
+        super().__init__(
+            f"public run requires separate {self.approval_kind} approval; "
+            "no capability approval was submitted"
+        )
+
+
 def _approval_identity(details: Mapping[str, object], run_id: str) -> tuple[str, int]:
     approval_id = details.get("approval_id")
     version = details.get("version")
     if (
         details.get("id") != run_id
         or details.get("status") != "waiting_approval"
-        or not isinstance(approval_id, str)
-        or not approval_id.strip()
         or type(version) is not int
         or version <= 0
     ):
+        raise FrozenPluginApproval("public plugin approval identity is not proven")
+    kind = details.get("approval_kind")
+    if kind != "capability_tool":
+        raise FrozenSeparateRunApproval(kind)
+    if not isinstance(approval_id, str) or not approval_id.strip():
         raise FrozenPluginApproval("public plugin approval identity is not proven")
     return approval_id, version
 
@@ -770,6 +788,7 @@ def run_real_user_plugin_acceptance(
     run_terminal = False
     run_cleanup_blocked = False
     approval_binding_frozen = False
+    separate_approval_kind: str | None = None
     run_submission_attempted = False
     run_submission_rejected = False
     run_submission_unknown = False
@@ -959,12 +978,18 @@ def run_real_user_plugin_acceptance(
         phases.append("unique_result_validated")
     except FrozenPluginApproval as error:
         errors.append(str(error))
+        if isinstance(error, FrozenSeparateRunApproval):
+            separate_approval_kind = error.approval_kind
         approval_binding_frozen = True
         run_cleanup_blocked = True
         recovery = {
             "required": True,
             "frozen": True,
-            "reason": "approval_binding_or_result_unproven",
+            "reason": (
+                "non_capability_approval_requires_review" if separate_approval_kind is not None
+                else "approval_binding_or_result_unproven"
+            ),
+            "resubmission_allowed": False,
             "run_id": run_id,
             "plugin_id": package.plugin_id,
             "capability_id": package.capability_id,
@@ -974,6 +999,8 @@ def run_real_user_plugin_acceptance(
                 {"method": "GET", "path": f"/api/v1/runs/{quote(run_id, safe='')}/events"},
             ],
         }
+        if separate_approval_kind is not None:
+            recovery["approval_kind"] = separate_approval_kind
     except Exception as error:  # noqa: BLE001 - always clean up and return machine-readable evidence.
         errors.append(str(error))
     finally:
@@ -1063,7 +1090,9 @@ def run_real_user_plugin_acceptance(
         and "verify_signing_key_removed" in cleanup_completed
     )
     cleanup_state = (
-        "frozen_waiting_for_approval_binding"
+        "frozen_waiting_for_separate_approval"
+        if separate_approval_kind is not None
+        else "frozen_waiting_for_approval_binding"
         if approval_binding_frozen
         else "deferred_waiting_for_run_identity"
         if run_submission_unknown

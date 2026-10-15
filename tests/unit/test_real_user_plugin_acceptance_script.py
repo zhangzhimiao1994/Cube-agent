@@ -383,6 +383,7 @@ class ApprovalPluginAcceptanceClient(FakePluginAcceptanceClient):
             details: dict[str, object] = {
                 "id": RUN_ID,
                 "status": "waiting_approval",
+                "approval_kind": "capability_tool",
                 "approval_id": "approval-1",
                 "version": 2,
                 **self.detail_changes,
@@ -544,6 +545,93 @@ def test_public_plugin_approval_requires_exact_binding(tmp_path: Path) -> None:
     assert backend.details_reads >= 2
     assert report["source_basis"] == "controlled_fixture"
     assert report["generated_source_acceptance"] is False
+
+
+@pytest.mark.parametrize(
+    "kind",
+    ["self_repair", "temporary_agent_creation", "evolution_creation", "schedule_creation",
+     "openclaw_operation", "project_preflight", None,
+     "secret://do-not-export", {"private": "value"}],
+)
+def test_separate_run_approval_freezes_without_any_approval_or_cleanup(
+    tmp_path: Path, kind: object,
+) -> None:
+    module = _load_script()
+    backend = ApprovalPluginAcceptanceClient(detail_changes={"approval_kind": kind})
+    report = module.run_real_user_plugin_acceptance(
+        backend, operator_client=_operator(backend), execution_id="separate-approval",
+        package_dir=tmp_path, wait_seconds=0, poll_interval_seconds=0,
+    )
+    expected_kind = kind if isinstance(kind, str) and not kind.startswith("secret:") else "unknown"
+    assert report["acceptance_complete"] is False
+    assert report["run_cleanup_blocked"] is True
+    assert report["cleanup_state"] == "frozen_waiting_for_separate_approval"
+    assert report["recovery"]["reason"] == "non_capability_approval_requires_review"
+    assert report["recovery"]["approval_kind"] == expected_kind
+    assert report["recovery"]["frozen"] is True
+    assert report["recovery"]["resubmission_allowed"] is False
+    assert all(step["method"] == "GET" for step in report["recovery"]["steps"])
+    assert backend.approval_bodies == []
+    assert backend.approval_reads == 0
+    assert not any(path.endswith(("/cancel", "/disable", "/stop", "/uninstall"))
+                   or method == "DELETE" for method, path in backend.requests)
+    serialized = json.dumps(report)
+    assert "secret://do-not-export" not in serialized
+    assert '"private"' not in serialized
+
+
+def test_approval_kind_rechecked_before_capability_approval(tmp_path: Path) -> None:
+    module = _load_script()
+    backend = ApprovalPluginAcceptanceClient(
+        detail_changes={"approval_kind": "capability_tool"},
+        recheck_changes={"approval_kind": "self_repair", "approval_id": None},
+    )
+    report = module.run_real_user_plugin_acceptance(
+        backend, operator_client=_operator(backend), execution_id="changed-kind",
+        package_dir=tmp_path, wait_seconds=0, poll_interval_seconds=0,
+    )
+    assert report["cleanup_state"] == "frozen_waiting_for_separate_approval"
+    assert report["recovery"]["approval_kind"] == "self_repair"
+    assert backend.approval_reads == 1
+    assert backend.approval_bodies == []
+
+
+def test_explicit_capability_approval_kind_preserves_bound_approval(tmp_path: Path) -> None:
+    module = _load_script()
+    backend = ApprovalPluginAcceptanceClient(detail_changes={"approval_kind": "capability_tool"})
+    report = module.run_real_user_plugin_acceptance(
+        backend, operator_client=_operator(backend), execution_id="explicit-kind",
+        package_dir=tmp_path, wait_seconds=0, poll_interval_seconds=0,
+    )
+    assert report["acceptance_complete"] is True
+    assert backend.approval_bodies == [{"approval_id": "approval-1", "version": 2}]
+
+
+def test_missing_approval_kind_is_not_automatic_approval_authority(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_script()
+    backend = ApprovalPluginAcceptanceClient()
+    original = backend.request_json
+
+    def request_json(method: str, path: str, **kwargs: Any) -> dict[str, object] | list[object]:
+        value = original(method, path, **kwargs)
+        if path.endswith("/details") and isinstance(value, dict):
+            value.pop("approval_kind", None)
+        return value
+
+    monkeypatch.setattr(backend, "request_json", request_json)
+    report = module.run_real_user_plugin_acceptance(
+        backend, operator_client=_operator(backend), execution_id="missing-kind",
+        package_dir=tmp_path, wait_seconds=0, poll_interval_seconds=0,
+    )
+    assert report["acceptance_complete"] is False
+    assert report["cleanup_state"] == "frozen_waiting_for_separate_approval"
+    assert report["recovery"]["approval_kind"] == "unknown"
+    assert backend.approval_reads == 0
+    assert backend.approval_bodies == []
+    assert not any(path.endswith(("/cancel", "/disable", "/stop", "/uninstall"))
+                   or method == "DELETE" for method, path in backend.requests)
 
 
 @pytest.mark.parametrize(

@@ -212,6 +212,7 @@ class RunSummary:
     mode_source: str | None = None
     execution_quiescent: bool = False
     execution_lease_expires_at: datetime | None = None
+    approval_kind: str | None = None
 
 
 class VibeCodingUnavailable(RuntimeError):
@@ -2818,6 +2819,7 @@ class RunService:
             and routing_decision.get("approval_kind") == "capability_tool"
             else None
         )
+        approval_kind = routing_decision.get("approval_kind")
         return RunSummary(
             id=record.id,
             tenant_id=record.tenant_id,
@@ -2849,6 +2851,21 @@ class RunService:
             mode_source=_string_or_none(routing_decision.get("mode_source")),
             execution_quiescent=execution_quiescent,
             execution_lease_expires_at=lease_expires_at,
+            approval_kind=(
+                approval_kind
+                if record.status is RunStatus.WAITING_APPROVAL
+                and isinstance(approval_kind, str)
+                and approval_kind in {
+                    "capability_tool",
+                    "self_repair",
+                    "temporary_agent_creation",
+                    "evolution_creation",
+                    "schedule_creation",
+                    "openclaw_operation",
+                    "project_preflight",
+                }
+                else None
+            ),
         )
 
     async def _safe_notify_terminal_hooks(

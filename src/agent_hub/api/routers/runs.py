@@ -525,6 +525,7 @@ class RunSummaryResponse(BaseModel):
     mode_source: str | None = None
     execution_quiescent: bool = False
     execution_lease_expires_at: datetime | None = None
+    approval_kind: str | None = None
 
     @classmethod
     def from_summary(cls, run: RunSummary) -> RunSummaryResponse:
@@ -548,6 +549,7 @@ class RunSummaryResponse(BaseModel):
             mode_source=run.mode_source,
             execution_quiescent=run.execution_quiescent,
             execution_lease_expires_at=run.execution_lease_expires_at,
+            approval_kind=run.approval_kind,
         )
 
 
