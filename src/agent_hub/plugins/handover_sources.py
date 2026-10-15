@@ -317,9 +317,15 @@ class HandoverSourceService:
         content = payload.get("content")
         if not isinstance(content, Mapping):
             raise InvalidSource("artifact has no source content")
-        result = content.get("result")
-        if isinstance(result, Mapping):
-            content = result
+        envelopes = [content[name] for name in ("result", "workspace_delivery") if name in content]
+        if envelopes:
+            if (
+                len(envelopes) != 1
+                or not isinstance(envelopes[0], Mapping)
+                or any(name in content for name in ("workspace_bundle", "file", "metadata"))
+            ):
+                raise InvalidSource("artifact has ambiguous source content")
+            content = envelopes[0]
         bundle = content.get("workspace_bundle")
         if isinstance(bundle, Mapping):
             members = bundle.get("files")
@@ -359,15 +365,18 @@ class HandoverSourceService:
         ):
             raise InvalidSource("invalid generated archive metadata")
         safe_generated_filename(filename)
-        expected_key = f"{principal.tenant_id}/{run_id}/{source.artifact_id}/{filename}"
+        file_id = _generated_file_id(content, file, metadata, fallback=source.artifact_id)
+        expected_key = f"{principal.tenant_id}/{run_id}/{file_id}/{filename}"
         if key != expected_key:
             raise InvalidSource("generated archive scope mismatch")
+        download_url = f"/api/v1/runs/{run_id}/artifacts/{file_id}/download"
         for name, expected in (
             ("filename", filename),
             ("mime_type", mime),
             ("storage_key", key),
             ("size_bytes", size),
             ("sha256", digest),
+            ("download_url", download_url),
         ):
             if any(name in item and item[name] != expected for item in (file, metadata)):
                 raise InvalidSource("generated archive metadata disagrees")
@@ -378,7 +387,7 @@ class HandoverSourceService:
         resolved = self._generated_store.resolve_for(
             principal.tenant_id,
             run_id,
-            UUID(source.artifact_id),
+            UUID(file_id),
             key,
         )
         if resolved != path:
@@ -388,6 +397,29 @@ class HandoverSourceService:
         if len(data) != size or hashlib.sha256(data).hexdigest() != digest:
             raise SourceChanged("generated archive changed")
         return _zip_files(data, self._limits)
+
+
+def _generated_file_id(
+    content: Mapping[str, object],
+    file: Mapping[str, object],
+    metadata: Mapping[str, object],
+    *,
+    fallback: str,
+) -> str:
+    # The selected outer artifact remains publication authority. Its generated
+    # file result has a separate, consistent UUID used only for scoped storage.
+    ids = [item["artifact_id"] for item in (content, file, metadata) if "artifact_id" in item]
+    if not ids:
+        return fallback
+    file_id = ids[0]
+    if (
+        len(ids) != 3
+        or type(file_id) is not str
+        or str(UUID(file_id)) != file_id
+        or any(type(value) is not str or value != file_id for value in ids)
+    ):
+        raise InvalidSource("generated archive identity disagrees")
+    return file_id
 
 
 def _association(record: RunRecord) -> tuple[object, object]:
