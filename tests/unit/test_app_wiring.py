@@ -763,6 +763,9 @@ def test_create_app_registers_enabled_plugin_package_subprocess_adapters(
             plugin_package_dependency_install_policy="offline_cache",
             plugin_package_dependency_allowlist=["python:pypi:requests==2.32.0"],
             plugin_package_dependency_cache_dir=tmp_path / "dependency-cache",
+            skill_store_dir=tmp_path / "skills",
+            generated_artifact_dir=tmp_path / "generated",
+            capability_environment_root_dir=tmp_path / "environments",
         ),
         database=FakeDatabase(),
         redis_client=FakeRedis(),
@@ -793,6 +796,15 @@ def test_create_app_registers_enabled_plugin_package_subprocess_adapters(
     assert adapter_kwargs["max_stdin_bytes"] == 2048
     assert adapter_kwargs["max_stdout_bytes"] == 1024
     assert adapter_kwargs["dependency_policy"] is dependency_policy
+    assert set(cast(tuple[Path, ...], adapter_kwargs["protected_paths"])) >= {
+        tmp_path,
+        tmp_path / "workspaces",
+        tmp_path / "dependency-cache",
+        tmp_path / "skills",
+        tmp_path / "generated",
+        tmp_path / "environments",
+        Path(app_module.__file__).resolve().parent,
+    }
     assert (
         application.state.plugin_package_subprocess_registration_status
         == "launcher_not_found"

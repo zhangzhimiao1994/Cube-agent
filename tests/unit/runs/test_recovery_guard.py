@@ -93,8 +93,11 @@ class _CapabilityApprovalSession(_FakeTransaction):
             return self._row
         return uuid4() if self._approved or self._rejected else None
 
-    async def execute(self, statement: object) -> None:
+    async def execute(self, statement: object) -> object:
+        from types import SimpleNamespace
+
         self.statements.append(statement)
+        return SimpleNamespace(scalar_one_or_none=uuid4)
 
     def add(self, item: object) -> None:
         self.added.append(item)

@@ -7,17 +7,19 @@ import binascii
 import hashlib
 import json
 import re
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
+from typing import cast
 from uuid import UUID, uuid4
 
-from sqlalchemy import Select, and_, delete, func, or_, select
+from sqlalchemy import Select, and_, delete, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from agent_hub.auth.models import Role
+from agent_hub.capabilities.approvals import PluginApprovalIdentity
 from agent_hub.db.models import (
     ConversationQueueItemRow,
     ConversationRow,
@@ -288,10 +290,14 @@ class RunRepository:
             await session.flush()
             return self._record(row)
 
-    async def get(self, tenant_id: UUID, run_id: UUID) -> RunRecord:
+    async def get(
+        self, tenant_id: UUID, run_id: UUID, *, actor_id: UUID | None = None,
+    ) -> RunRecord:
         async with self._session_factory() as session:
             row = await session.scalar(self._run_select(tenant_id, run_id))
             if row is None:
+                raise RunNotFound("run was not found")
+            if actor_id is not None and row.actor_id != actor_id:
                 raise RunNotFound("run was not found")
             return self._record(row)
 
@@ -1198,10 +1204,16 @@ class RunRepository:
         approval_id: str,
         approval_fingerprint: str,
         approval_scope: str | None = None,
+        actor_id: UUID | None = None,
+        plugin_identity: PluginApprovalIdentity | None = None,
     ) -> RunRecord:
         async with self._session_factory() as session, session.begin():
             row = await session.scalar(self._run_select(tenant_id, run_id).with_for_update())
             if row is None:
+                raise RunNotFound("run was not found")
+            if (actor_id is not None and row.actor_id != actor_id) or (
+                plugin_identity is not None and actor_id is None
+            ):
                 raise RunNotFound("run was not found")
             routing_decision = {} if row.routing_decision is None else dict(row.routing_decision)
             if (
@@ -1235,6 +1247,13 @@ class RunRepository:
                 approval_fingerprint=approval_fingerprint,
                 approval_scope=approval_scope,
                 status="pending",
+                request_version=row.version,
+                public_binding=(
+                    {"plugin_id": plugin_identity.plugin_id,
+                     "capability_id": plugin_identity.capability_id,
+                     "run_id": str(row.id), "version": row.version}
+                    if plugin_identity is not None else None
+                ),
             )
             await session.flush()
             return self._record(row)
@@ -1289,6 +1308,7 @@ class RunRepository:
                     "approval_checkpoint_required", "approval_checkpoint_worker_token",
                 }
             }
+            row.version += 1
             await self._upsert_capability_approval(
                 session,
                 tenant_id,
@@ -1297,8 +1317,8 @@ class RunRepository:
                 approval_fingerprint=approval_fingerprint,
                 approval_scope=_optional_string(routing_decision.get("approval_scope")),
                 status="approved" if status is RunStatus.RUNNING else "rejected",
+                resolution_version=row.version,
             )
-            row.version += 1
             await session.flush()
             return self._record(row)
 
@@ -1434,10 +1454,13 @@ class RunRepository:
         run_id: UUID,
         approval_id: str,
         version: int,
+        actor_id: UUID | None = None,
     ) -> RunRecord:
         async with self._session_factory() as session, session.begin():
             row = await session.scalar(self._run_select(tenant_id, run_id).with_for_update())
             if row is None:
+                raise RunNotFound("run was not found")
+            if actor_id is not None and row.actor_id != actor_id:
                 raise RunNotFound("run was not found")
             if RunStatus(row.status) is not RunStatus.WAITING_APPROVAL:
                 if await self._capability_approval_id_is_approved(
@@ -1481,6 +1504,7 @@ class RunRepository:
                 approval_fingerprint=approval_fingerprint,
                 approval_scope=approval_scope,
                 status="approved",
+                resolution_version=row.version,
             )
             await session.flush()
             session.add(
@@ -1503,10 +1527,13 @@ class RunRepository:
         run_id: UUID,
         approval_id: str,
         version: int,
+        actor_id: UUID | None = None,
     ) -> RunRecord:
         async with self._session_factory() as session, session.begin():
             row = await session.scalar(self._run_select(tenant_id, run_id).with_for_update())
             if row is None:
+                raise RunNotFound("run was not found")
+            if actor_id is not None and row.actor_id != actor_id:
                 raise RunNotFound("run was not found")
             if RunStatus(row.status) is not RunStatus.WAITING_APPROVAL:
                 if await self._capability_approval_id_has_status(
@@ -1549,6 +1576,7 @@ class RunRepository:
                 approval_fingerprint=approval_fingerprint,
                 approval_scope=approval_scope,
                 status="rejected",
+                resolution_version=row.version,
             )
             await session.flush()
             return self._record(row)
@@ -1637,9 +1665,13 @@ class RunRepository:
             await session.flush()
             return True
 
-    async def events(self, tenant_id: UUID, run_id: UUID) -> tuple[dict[str, object], ...]:
+    async def events(
+        self, tenant_id: UUID, run_id: UUID, *, actor_id: UUID | None = None,
+    ) -> tuple[dict[str, object], ...]:
         async with self._session_factory() as session:
-            await self._assert_run(session, tenant_id, run_id)
+            run = await session.scalar(self._run_select(tenant_id, run_id))
+            if run is None or (actor_id is not None and run.actor_id != actor_id):
+                raise RunNotFound("run was not found")
             rows = (
                 await session.scalars(
                     select(RunEventRow)
@@ -1653,6 +1685,47 @@ class RunRepository:
                 payload["created_at"] = row.created_at
                 events.append(payload)
             return tuple(events)
+
+    async def capability_approval_events(
+        self, tenant_id: UUID, run_id: UUID, *, actor_id: UUID | None = None,
+    ) -> tuple[dict[str, object], ...]:
+        """Independent durable approval sequence; never a worker event/SSE cursor."""
+        async with self._session_factory() as session:
+            run = await session.scalar(self._run_select(tenant_id, run_id))
+            if run is None or (actor_id is not None and run.actor_id != actor_id):
+                raise RunNotFound("run was not found")
+            approvals = (await session.scalars(
+                select(RunApprovalRow)
+                .where(RunApprovalRow.tenant_id == tenant_id, RunApprovalRow.run_id == run_id)
+                .order_by(RunApprovalRow.created_at, RunApprovalRow.approval_id)
+            )).all()
+            return _public_plugin_approval_events(approvals, run)
+
+    async def capability_approval_ready(
+        self, tenant_id: UUID, run_id: UUID, *, actor_id: UUID,
+    ) -> bool:
+        """Read the same recovery gate enforced by approval without changing its receipt."""
+        async with self._session_factory() as session:
+            run = await session.scalar(self._run_select(tenant_id, run_id))
+            if run is None or run.actor_id != actor_id:
+                raise RunNotFound("run was not found")
+            routing = dict(run.routing_decision or {})
+            approval_id = routing.get("approval_id")
+            fingerprint = routing.get("approval_fingerprint")
+            if (
+                run.status != RunStatus.WAITING_APPROVAL.value
+                or routing.get("approval_kind") != "capability_tool"
+                or not isinstance(approval_id, str) or not approval_id
+                or not isinstance(fingerprint, str) or not fingerprint
+            ):
+                return False
+            try:
+                await self._require_capability_approval_checkpoint(
+                    session, run, routing, approval_id=approval_id,
+                )
+            except RunConflict:
+                return False
+            return True
 
     async def raw_events(self, tenant_id: UUID, run_id: UUID) -> tuple[RunEvent, ...]:
         """Internal reconstruction only; public consumers must use events()."""
@@ -2115,6 +2188,9 @@ class RunRepository:
         approval_fingerprint: str,
         approval_scope: str | None = None,
         status: str,
+        public_binding: dict[str, object] | None = None,
+        request_version: int | None = None,
+        resolution_version: int | None = None,
     ) -> None:
         payload: dict[str, object] = {
             "approval_id": approval_id,
@@ -2122,23 +2198,46 @@ class RunRepository:
             "approval_kind": "capability_tool",
             "status": status,
             **({"approval_scope": approval_scope} if approval_scope else {}),
+            **({"public_binding": public_binding} if public_binding is not None else {}),
         }
-        await session.execute(
-            insert(RunApprovalRow)
-            .values(
-                id=uuid4(),
-                tenant_id=tenant_id,
-                run_id=run_id,
-                approval_id=approval_id,
-                action="capability_tool",
-                status=status,
-                payload=payload,
-            )
-            .on_conflict_do_update(
+        if request_version is not None:
+            payload["public_request"] = {
+                "kind": "approval.requested", "sequence": request_version,
+                "run_id": str(run_id), "approval_id": approval_id,
+                "actor": "capability_gateway", "action": "capability_tool",
+                "reason": "capability requires approval",
+                "payload": public_binding or {"run_id": str(run_id), "version": request_version},
+            }
+        if resolution_version is not None:
+            payload["public_resolution"] = {
+                "kind": "approval.resolved", "sequence": resolution_version,
+                "run_id": str(run_id), "approval_id": approval_id,
+                "actor": "capability_gateway", "decision": status, "payload": {},
+            }
+        if status == "pending":
+            statement = insert(RunApprovalRow).values(
+                id=uuid4(), tenant_id=tenant_id, run_id=run_id, approval_id=approval_id,
+                action="capability_tool", status=status, payload=payload,
+            ).on_conflict_do_nothing(
                 index_elements=[RunApprovalRow.run_id, RunApprovalRow.approval_id],
-                set_={"action": "capability_tool", "status": status, "payload": payload},
             )
-        )
+            result = await session.execute(statement.returning(RunApprovalRow.id))
+        else:
+            resolution = {key: value for key, value in payload.items()
+                          if key in {"status", "public_resolution"}}
+            result = await session.execute(
+                update(RunApprovalRow).where(
+                    RunApprovalRow.tenant_id == tenant_id,
+                    RunApprovalRow.run_id == run_id,
+                    RunApprovalRow.approval_id == approval_id,
+                    RunApprovalRow.status == "pending",
+                    RunApprovalRow.payload["approval_fingerprint"].astext == approval_fingerprint,
+                ).values(action="capability_tool", status=status,
+                         payload=RunApprovalRow.payload.op("||")(resolution))
+                .returning(RunApprovalRow.id)
+            )
+        if result.scalar_one_or_none() is None:
+            raise RunConflict("capability approval identity collision or stale resolution")
 
     @staticmethod
     async def _upsert_capability_approval_review(
@@ -2160,7 +2259,7 @@ class RunRepository:
             "reason": reason,
             "status": status,
         }
-        await session.execute(
+        result = await session.execute(
             insert(RunApprovalRow)
             .values(
                 id=uuid4(),
@@ -2178,8 +2277,12 @@ class RunRepository:
                     "status": status,
                     "payload": payload,
                 },
+                where=~RunApprovalRow.payload.has_key("public_request"),
             )
+            .returning(RunApprovalRow.id)
         )
+        if result.scalar_one_or_none() is None:
+            raise RunConflict("approval review cannot replace a persisted request")
 
     @staticmethod
     async def _persist_approval(
@@ -2206,6 +2309,7 @@ class RunRepository:
             .on_conflict_do_update(
                 index_elements=[RunApprovalRow.run_id, RunApprovalRow.approval_id],
                 set_={"action": action, "status": status, "payload": payload},
+                where=~RunApprovalRow.payload.has_key("public_request"),
             )
         )
 
@@ -2317,6 +2421,85 @@ def _self_repair_recovery_baseline_sequence(
         return 0
     value = routing_decision.get("self_repair_recovery_baseline_sequence")
     return value if type(value) is int and value >= 0 else 0
+
+
+def _public_plugin_approval_events(
+    approvals: Sequence[RunApprovalRow], run: RunRow,
+) -> tuple[dict[str, object], ...]:
+    # Run versions serialize this independent stream under the existing run row lock.
+    routing = run.routing_decision or {}
+    public: list[dict[str, object]] = []
+    for approval in approvals:
+        if approval.tenant_id != run.tenant_id or approval.run_id != run.id:
+            raise RunConflict("capability approval evidence scope is invalid")
+        requested = approval.payload.get("public_request")
+        if requested is None:
+            if approval.status == "pending":
+                raise RunConflict("pending capability approval evidence is unavailable")
+            continue
+        if (
+            approval.action != "capability_tool" or not isinstance(requested, dict)
+            or requested.get("kind") != "approval.requested"
+            or requested.get("run_id") != str(run.id)
+            or requested.get("approval_id") != approval.approval_id
+            or type(requested.get("sequence")) is not int or requested["sequence"] <= 0
+            or approval.status not in {"pending", "approved", "rejected"}
+        ):
+            raise RunConflict("capability approval evidence is invalid")
+        binding = requested.get("payload")
+        if not isinstance(binding, dict) or binding.get("run_id") != str(run.id) or (
+            type(binding.get("version")) is not int
+            or binding["version"] != requested["sequence"]
+        ):
+            raise RunConflict("capability approval evidence is invalid")
+        if "public_binding" in approval.payload:
+            if set(binding) != {"plugin_id", "capability_id", "run_id", "version"} or (
+                binding != approval.payload["public_binding"]
+            ):
+                raise RunConflict("capability approval identity is invalid")
+            try:
+                PluginApprovalIdentity(binding["plugin_id"], binding["capability_id"])
+            except (TypeError, ValueError):
+                raise RunConflict("capability approval identity is invalid") from None
+        elif set(binding) != {"run_id", "version"}:
+            raise RunConflict("capability approval identity is unproven")
+        if approval.status == "pending" and (
+            run.status != RunStatus.WAITING_APPROVAL.value
+            or routing.get("approval_kind") != "capability_tool"
+            or routing.get("approval_id") != approval.approval_id
+            or not isinstance(approval.payload.get("approval_fingerprint"), str)
+            or routing.get("approval_fingerprint") != approval.payload.get("approval_fingerprint")
+            or binding["version"] != run.version
+            or "public_resolution" in approval.payload
+        ):
+            raise RunConflict("pending capability approval evidence is stale")
+        # Construct a whitelist view; even stored envelope extensions cannot leak arguments/source.
+        public.append({
+            "kind": "approval.requested", "sequence": requested["sequence"], "run_id": str(run.id),
+            "approval_id": approval.approval_id, "actor": "capability_gateway",
+            "action": "capability_tool", "reason": "capability requires approval",
+            "payload": dict(binding), "created_at": approval.created_at,
+        })
+        if approval.status != "pending":
+            resolved = approval.payload.get("public_resolution")
+            if (
+                not isinstance(resolved, dict) or resolved.get("kind") != "approval.resolved"
+                or resolved.get("run_id") != str(run.id)
+                or resolved.get("approval_id") != approval.approval_id
+                or resolved.get("decision") != approval.status
+                or type(resolved.get("sequence")) is not int
+                or resolved["sequence"] <= requested["sequence"]
+            ):
+                raise RunConflict("capability approval resolution evidence is invalid")
+            public.append({
+                "kind": "approval.resolved", "sequence": resolved["sequence"], "run_id": str(run.id),
+                "approval_id": approval.approval_id, "actor": "capability_gateway",
+                "decision": approval.status, "payload": {}, "created_at": approval.created_at,
+            })
+    public.sort(key=lambda event: cast(int, event["sequence"]))
+    if len({event["sequence"] for event in public}) != len(public):
+        raise RunConflict("capability approval evidence sequence is duplicated")
+    return tuple(public)
 
 
 def _public_event_payload(payload: dict[str, object]) -> dict[str, object]:

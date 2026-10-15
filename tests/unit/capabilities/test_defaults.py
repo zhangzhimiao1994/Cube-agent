@@ -228,6 +228,7 @@ class ScopeApprovedRepository:
         approval_id: str,
         approval_fingerprint: str,
         approval_scope: str | None = None,
+        actor_id: UUID | None = None,
     ) -> object:
         del approval_id, approval_fingerprint, approval_scope
         self.pending_approvals += 1
@@ -248,6 +249,7 @@ class RecordingApprovalRepository(ScopeApprovedRepository):
         approval_id: str,
         approval_fingerprint: str,
         approval_scope: str | None = None,
+        actor_id: UUID | None = None,
     ) -> object:
         self.pending_approvals += 1
         self.approvals.append(

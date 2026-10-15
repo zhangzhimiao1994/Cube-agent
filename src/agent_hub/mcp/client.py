@@ -17,6 +17,7 @@ from agent_hub.mcp.types import (
     McpToolSchema,
     McpTransportKind,
 )
+from agent_hub.subprocess_cleanup import ProcessCleanupIncomplete, drain_and_reap_process
 
 
 class McpClient(Protocol):
@@ -30,6 +31,12 @@ class McpClient(Protocol):
     ) -> McpInvocationResult: ...
 
     async def health(self, server: McpServerDefinition) -> str: ...
+
+
+class StdioProcessFactory(Protocol):
+    async def __call__(
+        self, program: str, *args: str, stdin: int, stdout: int, stderr: int
+    ) -> asyncio.subprocess.Process: ...
 
 
 class McpProtocolError(TypeError):
@@ -293,8 +300,20 @@ class _DelegatingMcpClient:
 
 
 class StdioMcpClient(_DelegatingMcpClient):
-    def __init__(self, transport: McpClient | None = None) -> None:
-        super().__init__(transport or _StdioJsonRpcMcpClient(), expected=McpTransportKind.STDIO)
+    def __init__(
+        self,
+        transport: McpClient | None = None,
+        *,
+        process_factory: StdioProcessFactory | None = None,
+    ) -> None:
+        if transport is not None and process_factory is not None:
+            raise ValueError("transport and process_factory are mutually exclusive")
+        super().__init__(
+            transport
+            if transport is not None
+            else _StdioJsonRpcMcpClient(process_factory=process_factory),
+            expected=McpTransportKind.STDIO,
+        )
 
 
 class SseMcpClient(_DelegatingMcpClient):
@@ -313,6 +332,9 @@ def _ensure_transport(server: McpServerDefinition, expected: McpTransportKind) -
 
 
 class _StdioJsonRpcMcpClient:
+    def __init__(self, *, process_factory: StdioProcessFactory | None = None) -> None:
+        self._process_factory = process_factory
+
     async def discover_tools(self, server: McpServerDefinition) -> tuple[McpToolSchema, ...]:
         result = await self._request(server, "tools/list", {})
         return _tools_from_result(result)
@@ -344,12 +366,18 @@ class _StdioJsonRpcMcpClient:
     ) -> Mapping[str, object]:
         if server.command is None:
             raise RuntimeError("stdio MCP server command is not configured")
-        process = await asyncio.create_subprocess_exec(
+        process_factory = (
+            asyncio.create_subprocess_exec
+            if self._process_factory is None
+            else self._process_factory
+        )
+        process = await process_factory(
             server.command,
             *server.args,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+            # Only stdout carries JSON-RPC; an unread stderr pipe can block the peer.
+            stderr=asyncio.subprocess.DEVNULL,
         )
         try:
             if process.stdin is None or process.stdout is None:
@@ -373,13 +401,29 @@ class _StdioJsonRpcMcpClient:
             await _write_framed_json(process.stdin, _jsonrpc(next_id, method, params))
             return await _read_jsonrpc_result(process.stdout)
         finally:
-            if process.stdin is not None:
-                process.stdin.close()
-            try:
-                await asyncio.wait_for(process.wait(), timeout=1)
-            except TimeoutError:
-                process.kill()
-                await process.wait()
+            await _cleanup_stdio_process(process)
+
+
+async def _cleanup_stdio_process(process: asyncio.subprocess.Process) -> None:
+    async def cleanup() -> None:
+        if process.stdin is not None:
+            process.stdin.close()
+        try:
+            await drain_and_reap_process(process)
+        except ProcessCleanupIncomplete as error:
+            raise RuntimeError("MCP process cleanup incomplete") from error
+
+    # Repeated cancellation must not leave the owned direct child or pipe reader alive.
+    task = asyncio.create_task(cleanup())
+    cancelled = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancelled = True
+    task.result()
+    if cancelled:
+        raise asyncio.CancelledError
 
 
 class _HttpJsonRpcMcpClient:

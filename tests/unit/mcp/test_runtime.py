@@ -5,6 +5,9 @@ from types import SimpleNamespace
 from typing import Any
 from uuid import UUID
 
+import pytest
+
+from agent_hub.capabilities.runtime import RuntimeCapabilityError
 from agent_hub.mcp.client import InMemoryMcpClient
 from agent_hub.mcp.runtime import RuntimeMcpService, build_runtime_mcp_service
 from agent_hub.mcp.types import McpInvocationResult, McpToolSchema, McpTransportKind
@@ -481,7 +484,7 @@ async def test_runtime_mcp_reload_failure_preserves_loaded_tenant_service() -> N
     assert result == {"answer": "cached"}
 
 
-async def test_runtime_mcp_build_failure_preserves_loaded_tenant_service() -> None:
+async def test_runtime_mcp_build_failure_revokes_loaded_tenant_service() -> None:
     admin_service = TenantMappedAdminService(
         {
             OTHER_TENANT_ID: (server_config("search", allowed_tools=["web_search"]),),
@@ -510,19 +513,19 @@ async def test_runtime_mcp_build_failure_preserves_loaded_tenant_service() -> No
 
     duplicate_tools = True
     await service.reload(OTHER_TENANT_ID)
-    result = await service.invoke(
-        tenant_id=OTHER_TENANT_ID,
-        user_id=OTHER_TENANT_ID,
-        run_id=OTHER_TENANT_ID,
-        actor="runtime_planning",
-        name="search.web_search",
-        arguments={"query": "still available after build failure"},
-        idempotency_key="mcp_preserved_after_build_failure",
-    )
+    with pytest.raises(RuntimeCapabilityError, match="unavailable"):
+        await service.invoke(
+            tenant_id=OTHER_TENANT_ID,
+            user_id=OTHER_TENANT_ID,
+            run_id=OTHER_TENANT_ID,
+            actor="runtime_planning",
+            name="search.web_search",
+            arguments={"query": "refuse previous executor after build failure"},
+            idempotency_key="mcp_revoked_after_build_failure",
+        )
 
     assert admin_service.tenants == [OTHER_TENANT_ID, OTHER_TENANT_ID]
-    assert service.is_available(OTHER_TENANT_ID, "search.web_search") is True
-    assert result == {"answer": "cached"}
+    assert service.is_available(OTHER_TENANT_ID, "search.web_search") is False
 
 
 async def test_runtime_mcp_invocation_retries_after_initial_reload_failure() -> None:

@@ -1,6 +1,7 @@
 """Small security-focused ASGI middleware."""
 
 import logging
+import re
 from uuid import uuid4
 
 from starlette.responses import JSONResponse
@@ -10,6 +11,11 @@ from agent_hub.api.errors import error_payload
 
 _AUTH_BODY_LIMIT = 16 * 1024
 _CONFIG_BODY_LIMIT = 1024 * 1024
+_HANDOVER_PLAN_BODY_LIMIT = 1024 * 1024
+_HANDOVER_CANCEL_BODY_LIMIT = 4096
+_HANDOVER_JSON_PATH = re.compile(
+    r"/api/v1/runs/[^/]+/plugin-handovers(?:/[^/]+/cancel)?\Z"
+)
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -90,10 +96,11 @@ class RequestBodyLimitMiddleware:
             if message["type"] == "http.disconnect":
                 await self.app(scope, _single_message_receive(message), send)
                 return
-            body.extend(message.get("body", b""))
-            if len(body) > limit:
+            chunk = message.get("body", b"")
+            if len(chunk) > limit - len(body):
                 await _too_large(scope, receive, send)
                 return
+            body.extend(chunk)
             if not message.get("more_body", False):
                 break
         buffered: Message = {
@@ -112,6 +119,12 @@ def _body_limit(scope: Scope) -> int | None:
         return _AUTH_BODY_LIMIT
     if path.startswith("/api/v1/config/"):
         return _CONFIG_BODY_LIMIT
+    if scope.get("method") == "POST" and _HANDOVER_JSON_PATH.fullmatch(path):
+        return (
+            _HANDOVER_CANCEL_BODY_LIMIT
+            if path.endswith("/cancel")
+            else _HANDOVER_PLAN_BODY_LIMIT
+        )
     return None
 
 

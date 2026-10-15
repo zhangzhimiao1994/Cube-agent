@@ -296,7 +296,7 @@ async def test_replayed_approval_request_returns_existing_pending_approval(
     assert replayed.approval_id == first.approval_id
 
 
-async def test_capability_approval_upserts_refresh_row_action_for_review_and_resolution(
+async def test_capability_approval_review_cannot_replace_request_before_resolution(
     run_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     repository = RunRepository(run_session_factory)
@@ -323,30 +323,41 @@ async def test_capability_approval_upserts_refresh_row_action_for_review_and_res
     pending = await approval_row()
     assert pending.action == "capability_tool"
     assert pending.status == "pending"
+    waiting = await repository.get(TENANT_ID, run_id)
 
-    await repository.record_capability_approval_review(
-        TENANT_ID,
-        run_id,
-        approval_id=approval_id,
-        approval_fingerprint=fingerprint_capability_request(external_message_request(run_id)),
-        reviewer="auto_policy",
-        reason="safe replay",
-        status="approved",
-    )
-    reviewed = await approval_row()
-    assert reviewed.action == "capability_tool.auto_review"
-    assert reviewed.status == "approved"
+    for review_status in ("approved", "denied"):
+        with pytest.raises(RunConflict, match="review cannot replace a persisted request"):
+            await repository.record_capability_approval_review(
+                TENANT_ID,
+                run_id,
+                approval_id=approval_id,
+                approval_fingerprint=fingerprint_capability_request(external_message_request(run_id)),
+                reviewer="auto_policy",
+                reason="safe replay",
+                status=review_status,
+            )
+        reviewed = await approval_row()
+        assert reviewed.id == pending.id
+        assert reviewed.action == "capability_tool"
+        assert reviewed.status == "pending"
+        assert reviewed.payload == pending.payload
+        run = await repository.get(TENANT_ID, run_id)
+        assert run.status is RunStatus.WAITING_APPROVAL
+        assert run.version == waiting.version
+        assert run.routing_decision == waiting.routing_decision
 
-    run = await repository.get(TENANT_ID, run_id)
     await repository.approve_capability_and_enqueue(
         tenant_id=TENANT_ID,
         run_id=run_id,
         approval_id=approval_id,
-        version=run.version,
+        version=waiting.version,
     )
     resolved = await approval_row()
     assert resolved.action == "capability_tool"
     assert resolved.status == "approved"
+    assert resolved.id == pending.id
+    assert resolved.payload["public_request"] == pending.payload["public_request"]
+    assert resolved.payload["approval_fingerprint"] == pending.payload["approval_fingerprint"]
 
 
 async def test_runtime_approval_event_upsert_refreshes_row_action_on_resolution(

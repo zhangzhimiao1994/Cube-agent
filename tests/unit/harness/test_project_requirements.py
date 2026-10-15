@@ -30,19 +30,10 @@ let tasks = fault === 'volatile' || !fs.existsSync(file)
   ? [] : JSON.parse(fs.readFileSync(file, 'utf8'));
 if (fault === 'lost_status') tasks.forEach(t => { t.status = 'todo'; });
 const write = () => fs.writeFileSync(file, JSON.stringify(tasks));
-const child = spawn(process.execPath, ['-e',
-  "require('node:http').createServer(()=>{}).listen(0,'127.0.0.1',function(){" +
-  "console.log(this.address().port)});process.on('SIGTERM',()=>{});"],
-  {stdio: ['ignore', 'pipe', 'ignore']});
-child.stdout.once('data', value => {
-  fs.appendFileSync('launches.jsonl', JSON.stringify({
-    pid: process.pid, port: Number(process.env.PORT), childPort: Number(value.toString()), data,
-    leakedSecret: process.env.API_SECRET_SENTINEL || null
-  }) + '\n');
-  if (fault === 'no_listen') { setInterval(() => {}, 1000); }
-  else server.listen(Number(process.env.PORT), '127.0.0.1');
-});
+let markStartupReady;
+const startupReady = new Promise(resolve => { markStartupReady = resolve; });
 const server = http.createServer(async (req, res) => {
+  await startupReady;
   fs.appendFileSync('requests.jsonl', JSON.stringify({method: req.method, url: req.url}) + '\n');
   const send = (status, body) => {
     res.writeHead(status, {'Content-Type': 'application/json'});
@@ -85,6 +76,25 @@ const server = http.createServer(async (req, res) => {
   }
   send(404, {error: {code: 'NOT_FOUND', message: 'Unknown endpoint'}});
 });
+function launchChild() {
+  const child = spawn(process.execPath, ['-e',
+    "require('node:http').createServer(()=>{}).listen(0,'127.0.0.1',function(){" +
+    "console.log(this.address().port)});process.on('SIGTERM',()=>{});"],
+    {stdio: ['ignore', 'pipe', 'ignore']});
+  child.stdout.once('data', value => {
+    fs.appendFileSync('launches.jsonl', JSON.stringify({
+      pid: process.pid, port: Number(process.env.PORT), childPort: Number(value.toString()), data,
+      leakedSecret: process.env.API_SECRET_SENTINEL || null
+    }) + '\n');
+    markStartupReady();
+  });
+}
+if (fault === 'no_listen') {
+  launchChild();
+  setInterval(() => {}, 1000);
+} else {
+  server.listen(Number(process.env.PORT), '127.0.0.1', launchChild);
+}
 """
 
 

@@ -500,7 +500,9 @@ class StubRunService:
             clarification_reason=None,
         )
 
-    async def get(self, tenant_id: UUID, run_id: UUID) -> RunSummary:
+    async def get(
+        self, tenant_id: UUID, run_id: UUID, *, actor_id: UUID | None = None,
+    ) -> RunSummary:
         return RunSummary(
             id=run_id,
             tenant_id=tenant_id,
@@ -524,7 +526,9 @@ class StubRunService:
             execution_lease_expires_at=self.summary_execution_lease_expires_at,
         )
 
-    async def events(self, tenant_id: UUID, run_id: UUID) -> tuple[dict[str, object], ...]:
+    async def events(
+        self, tenant_id: UUID, run_id: UUID, *, actor_id: UUID | None = None,
+    ) -> tuple[dict[str, object], ...]:
         del tenant_id
         return (
             {"sequence": 1, "run_id": str(run_id), "kind": "step.started", "payload": {"ok": True}},
@@ -732,6 +736,40 @@ def _client(
 
 def bearer() -> dict[str, str]:
     return {"Authorization": "Bearer valid-token"}
+
+
+@pytest.mark.parametrize("ready", [False, True])
+def test_capability_approval_readiness_is_actor_scoped(
+    monkeypatch: pytest.MonkeyPatch, ready: bool,
+) -> None:
+    client, _service, principal = _client()
+    run_id = uuid4()
+    calls: list[str] = []
+
+    async def events(
+        self: StubRunService, tenant_id: UUID, requested_run: UUID, *, actor_id: UUID,
+    ) -> tuple[dict[str, object], ...]:
+        assert (tenant_id, requested_run, actor_id) == (
+            principal.tenant_id, run_id, principal.user_id,
+        )
+        calls.append("events")
+        return ()
+
+    async def readiness(
+        self: StubRunService, tenant_id: UUID, requested_run: UUID, *, actor_id: UUID,
+    ) -> bool:
+        assert (tenant_id, requested_run, actor_id) == (
+            principal.tenant_id, run_id, principal.user_id,
+        )
+        calls.append("ready")
+        return ready
+
+    monkeypatch.setattr(StubRunService, "capability_approval_events", events, raising=False)
+    monkeypatch.setattr(StubRunService, "capability_approval_ready", readiness, raising=False)
+    response = client.get(f"/api/v1/runs/{run_id}/capability-approvals", headers=bearer())
+    assert response.status_code == 200
+    assert response.json() == {"items": [], "ready": ready}
+    assert calls == ["events", "ready"]
 
 
 def test_conversation_queue_supports_list_edit_redirect_and_cancel() -> None:
@@ -1930,6 +1968,24 @@ def test_approve_capability_queues_waiting_run_safely() -> None:
     assert response.status_code == 202
     assert response.json()["status"] == "queued"
     assert response.json()["mode"] == "dispatch"
+
+
+def test_capability_approval_does_not_enqueue_when_preview_stop_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, service, _ = _client(preview_manager=StubPreviewManager(fail=True))
+    calls: list[object] = []
+
+    async def approve(**kwargs: object) -> None:
+        calls.append(kwargs)
+
+    monkeypatch.setattr(type(service), "approve_capability", lambda self, **kwargs: approve(**kwargs))
+    response = client.post(
+        f"/api/v1/runs/{uuid4()}/approve-capability", headers=bearer(),
+        json={"approval_id": "capability_approval_1", "version": 3},
+    )
+    assert response.status_code == 503
+    assert calls == []
 
 
 def test_reject_capability_cancels_waiting_run_safely() -> None:

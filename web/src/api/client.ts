@@ -1610,6 +1610,81 @@ export type CapabilityInstallerInstallPayload = CapabilityInstallerPlanPayload &
   confirm: boolean;
 };
 
+const PluginHandoverIdentifierSchema = z.string().min(1).max(128)
+  .regex(/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/)
+  .refine((value) => value === value.trim());
+const PluginHandoverUUIDSchema = z.string().length(36)
+  .regex(/^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}$/);
+const PluginHandoverIdSchema = z.string().length(67).regex(/^gh-[a-f0-9]{64}$/);
+const PluginHandoverDigestSchema = z.string().length(64).regex(/^[a-f0-9]{64}$/);
+const PluginHandoverDateSchema = z.iso.datetime({ offset: true }).max(64);
+const PluginHandoverPathsSchema = z.array(z.string().min(1).max(255).refine((path) => (
+  !/[\\:%\x00-\x1f]/.test(path)
+  && path.split("/").every((part) => part !== "" && part !== "." && part !== "..")
+))).min(1).max(200).refine((paths) => new Set(paths).size === paths.length);
+const PluginHandoverWorkspaceSourceSchema = z.object({
+  kind: z.literal("workspace"),
+  project_id: PluginHandoverIdentifierSchema,
+  session_id: PluginHandoverIdentifierSchema,
+  paths: PluginHandoverPathsSchema,
+}).strict();
+const PluginHandoverSourceSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("artifact"), artifact_id: PluginHandoverUUIDSchema }).strict(),
+  PluginHandoverWorkspaceSourceSchema,
+]);
+const PluginHandoverCreateInputSchema = z.object({
+  source: PluginHandoverSourceSchema,
+  expires_at: PluginHandoverDateSchema,
+}).strict();
+const PluginHandoverIdentityInputSchema = z.object({
+  expected_version: z.number().int().positive(),
+  plan_hash: PluginHandoverDigestSchema,
+}).strict();
+const PluginHandoverConfirmInputSchema = PluginHandoverIdentityInputSchema.extend({
+  key_id: PluginHandoverIdentifierSchema,
+});
+
+// Storage receipts can reference historical string artifact IDs, unlike new HTTP plans.
+const PluginHandoverReceiptSchema = z.object({
+  schema_version: z.literal(1),
+  handover_id: PluginHandoverIdSchema,
+  run_id: PluginHandoverUUIDSchema,
+  creator_id: PluginHandoverUUIDSchema,
+  installer_id: PluginHandoverUUIDSchema.nullable(),
+  version: z.number().int().positive(),
+  status: z.enum(["planned", "awaiting_signature", "pending", "cancelled", "failed"]),
+  created_at: PluginHandoverDateSchema,
+  updated_at: PluginHandoverDateSchema,
+  expires_at: PluginHandoverDateSchema,
+  source: z.discriminatedUnion("kind", [
+    z.object({ kind: z.literal("artifact"), artifact_id: PluginHandoverIdentifierSchema }).strict(),
+    PluginHandoverWorkspaceSourceSchema,
+  ]),
+  source_manifest_sha256: PluginHandoverDigestSchema,
+  plan_hash: PluginHandoverDigestSchema,
+  plugin_id: PluginHandoverIdentifierSchema,
+  plugin_version: z.string().min(1).max(128),
+  permissions: z.array(PluginHandoverIdentifierSchema).max(256),
+  risk_summary: z.array(PluginHandoverIdentifierSchema).max(64),
+  signature_payload_sha256: PluginHandoverDigestSchema.nullable(),
+  archive_sha256: PluginHandoverDigestSchema.nullable(),
+  key_id: PluginHandoverIdentifierSchema.nullable(),
+  receipt_id: PluginHandoverIdentifierSchema.nullable(),
+  audit_id: PluginHandoverIdentifierSchema.nullable(),
+  committed_at: PluginHandoverDateSchema.nullable(),
+  result: z.literal("blocked_pending_approval").nullable(),
+  source_grant_id: z.string().length(67).regex(/^sg-[a-f0-9]{64}$/).nullable(),
+  source_grant_binding_sha256: PluginHandoverDigestSchema.nullable(),
+}).strict().refine((receipt) => (
+  (receipt.source_grant_id === null) === (receipt.source_grant_binding_sha256 === null)
+));
+
+export type PluginHandoverSource = z.infer<typeof PluginHandoverSourceSchema>;
+export type PluginHandoverCreateInput = z.infer<typeof PluginHandoverCreateInputSchema>;
+export type PluginHandoverIdentityInput = z.infer<typeof PluginHandoverIdentityInputSchema>;
+export type PluginHandoverConfirmInput = z.infer<typeof PluginHandoverConfirmInputSchema>;
+export type PluginHandoverReceipt = z.infer<typeof PluginHandoverReceiptSchema>;
+
 const PluginSigningKeySchema = z.object({
   key_id: z.string(),
   algorithm: z.literal("ed25519"),
@@ -1693,6 +1768,7 @@ const CapabilityManifestItemSchema = z.object({
   id: z.string(),
   kind: z.string(),
   adapter: z.string(),
+  plugin_id: z.string().optional(),
   permission_class: z.string(),
   sandbox_profile: z.string(),
   policy_effect: z.enum(["inherit", "allow", "require_approval", "deny"]).default("inherit"),
@@ -2107,7 +2183,15 @@ async function requestBinary<T>(
   if (!response.ok) {
     throw await errorFromResponse(response);
   }
-  const payload = await response.json();
+  let payload: unknown;
+  try {
+    payload = await response.json();
+  } catch (error) {
+    if (error instanceof TypeError || (error instanceof DOMException && error.name === "AbortError")) {
+      throw new ApiError("network response interrupted", 0, "network_error");
+    }
+    throw error;
+  }
   const parsed = schema.safeParse(payload);
   if (!parsed.success) {
     throw new ApiError(
@@ -2188,7 +2272,67 @@ async function requestDownload(path: string): Promise<Blob> {
   return response.blob();
 }
 
+function checkedPluginHandoverInput<T>(schema: z.ZodType<T>, value: unknown): T {
+  const parsed = schema.safeParse(value);
+  if (!parsed.success) {
+    throw new ApiError("invalid handover request", 422, "request_validation");
+  }
+  return parsed.data;
+}
+
+function pluginHandoverPath(runId: string, ...handoverIds: string[]): string {
+  const run = checkedPluginHandoverInput(PluginHandoverUUIDSchema, runId);
+  const base = `/api/v1/runs/${encodeURIComponent(run)}/plugin-handovers`;
+  return [base, ...handoverIds.map((id) => (
+    encodeURIComponent(checkedPluginHandoverInput(PluginHandoverIdSchema, id))
+  ))].join("/");
+}
+
 export const api = {
+  async createPluginHandover(
+    runId: string, input: PluginHandoverCreateInput, idempotencyKey: string,
+  ): Promise<PluginHandoverReceipt> {
+    const path = pluginHandoverPath(runId);
+    const body = checkedPluginHandoverInput(PluginHandoverCreateInputSchema, input);
+    const key = checkedPluginHandoverInput(PluginHandoverIdentifierSchema, idempotencyKey);
+    return request(path, {
+      method: "POST", body: JSON.stringify(body), headers: { "Idempotency-Key": key },
+    }, PluginHandoverReceiptSchema);
+  },
+  async pluginHandover(runId: string, handoverId: string): Promise<PluginHandoverReceipt> {
+    return request(pluginHandoverPath(runId, handoverId), { method: "GET" }, PluginHandoverReceiptSchema);
+  },
+  async cancelPluginHandover(
+    runId: string, handoverId: string, input: PluginHandoverIdentityInput,
+  ): Promise<PluginHandoverReceipt> {
+    const path = pluginHandoverPath(runId, handoverId);
+    const body = checkedPluginHandoverInput(PluginHandoverIdentityInputSchema, input);
+    return request(`${path}/cancel`, {
+      method: "POST", body: JSON.stringify(body),
+    }, PluginHandoverReceiptSchema);
+  },
+  async confirmPluginHandover(
+    runId: string, handoverId: string, input: PluginHandoverConfirmInput,
+    archive: Blob, idempotencyKey: string,
+  ): Promise<PluginHandoverReceipt> {
+    const path = pluginHandoverPath(runId, handoverId);
+    const fields = checkedPluginHandoverInput(PluginHandoverConfirmInputSchema, input);
+    const key = checkedPluginHandoverInput(PluginHandoverIdentifierSchema, idempotencyKey);
+    if (!(archive instanceof Blob) || archive.size === 0) {
+      throw new ApiError("invalid handover archive", 422, "request_validation");
+    }
+    if (archive.size > 2_000_000) {
+      throw new ApiError("handover archive is too large", 413, "request_too_large");
+    }
+    const query = new URLSearchParams({
+      expected_version: String(fields.expected_version), plan_hash: fields.plan_hash,
+      confirm: "true", key_id: fields.key_id,
+    });
+    return requestBinary(`${path}/confirm?${query.toString()}`, {
+      method: "POST", body: archive,
+      headers: { "Content-Type": "application/zip", "Idempotency-Key": key },
+    }, PluginHandoverReceiptSchema);
+  },
   me(): Promise<CurrentUser> {
     return request("/api/v1/auth/me", { method: "GET" }, PrincipalSchema).then((principal) =>
       principalToCurrentUser(principal),

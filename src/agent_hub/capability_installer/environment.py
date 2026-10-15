@@ -9,12 +9,26 @@ import stat
 import subprocess
 import sys
 import time
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, cast
-from uuid import uuid4
+from uuid import UUID, uuid4
+
+from agent_hub.capability_installer.python_attestation import (
+    MANIFEST_NAME,
+    MAX_CONTROL_BYTES,
+    PythonAttestationError,
+    PythonAttestationLimitError,
+    ScanLimits,
+    bounded_tree_size,
+    canonical_json,
+    read_control,
+    scan_tree,
+    verify_tree,
+)
+from agent_hub.capability_installer.python_relocation import relocate_python_environment
 
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _SAFE_MODULE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]{0,255}$")
@@ -35,6 +49,14 @@ class EnvironmentQuotaExceeded(EnvironmentBuildError):
 
 class EnvironmentInUseError(EnvironmentBuildError):
     """A referenced or active environment cannot be removed."""
+
+
+def tenant_environment_id(tenant_id: UUID, capability_id: str) -> str:
+    if type(tenant_id) is not UUID:
+        raise ValueError("environment tenant must be an identifier")
+    capability_id = _safe_component(capability_id, "capability id")
+    digest = hashlib.sha256((tenant_id.hex + ":" + capability_id).encode("utf-8")).hexdigest()
+    return "tenant-" + digest
 
 
 class CommandRunner(Protocol):
@@ -68,6 +90,7 @@ class EnvironmentRecord:
     path: Path
     executable: str
     content_sha256: str
+    attestation_sha256: str | None = None
 
 
 class CapabilityEnvironmentManager:
@@ -79,6 +102,7 @@ class CapabilityEnvironmentManager:
         *,
         quota_bytes: int = 5 * 1024 * 1024 * 1024,
         runner: CommandRunner | None = None,
+        cli_probe: Callable[[Path, Path], None] | None = None,
         python_executable: str = sys.executable,
         lock_timeout_seconds: float = 30.0,
     ) -> None:
@@ -87,10 +111,15 @@ class CapabilityEnvironmentManager:
         self._root = root.resolve()
         self._quota_bytes = quota_bytes
         self._runner = cast(CommandRunner, subprocess.run) if runner is None else runner
+        self._cli_probe = cli_probe
         self._python_executable = python_executable
         self._lock_timeout_seconds = lock_timeout_seconds
         self._staging.mkdir(parents=True, exist_ok=True)
         self._locks.mkdir(parents=True, exist_ok=True)
+
+    @property
+    def root(self) -> Path:
+        return self._root
 
     @property
     def _staging(self) -> Path:
@@ -124,7 +153,12 @@ class CapabilityEnvironmentManager:
             staging = self._new_staging(capability_id, version)
             try:
                 self._run(
-                    [self._python_executable, "-m", "venv", str(staging)],
+                    [
+                        str(Path(self._python_executable).resolve(strict=True)),
+                        "-m",
+                        "venv",
+                        str(staging),
+                    ],
                     cwd=staging,
                     env=_isolated_environment(staging),
                 )
@@ -138,6 +172,7 @@ class CapabilityEnvironmentManager:
                         "--no-index",
                         "--require-hashes",
                         "--no-deps",
+                        "--only-binary=:all:",
                         "--find-links",
                         str(wheel_cache),
                         "-r",
@@ -149,12 +184,9 @@ class CapabilityEnvironmentManager:
                 executable = staging / metadata["executable"]
                 if not executable.is_file():
                     raise EnvironmentBuildError("Python environment executable is missing")
-                smoke = (
-                    "import importlib.util; "
-                    f"raise SystemExit(0 if importlib.util.find_spec({spec.smoke_module!r}) else 1)"
-                )
+                smoke = _module_presence_probe(staging, spec.smoke_module)
                 self._run(
-                    [str(python), "-I", "-c", smoke],
+                    [str(python), "-I", "-S", "-c", smoke],
                     cwd=staging,
                     env=_isolated_environment(staging),
                     smoke=True,
@@ -196,12 +228,18 @@ class CapabilityEnvironmentManager:
                     target.chmod(target.stat().st_mode | stat.S_IXUSR)
                 if _sha256_file(target) != expected:
                     raise EnvironmentBuildError("deployed CLI SHA256 mismatch")
-                self._run(
-                    [str(target), "--version"],
-                    cwd=staging,
-                    env=_isolated_environment(staging),
-                    smoke=True,
-                )
+                if self._cli_probe is None:
+                    self._run(
+                        [str(target), "--version"],
+                        cwd=staging,
+                        env=_isolated_environment(staging),
+                        smoke=True,
+                    )
+                else:
+                    try:
+                        self._cli_probe(target, staging)
+                    except Exception as error:
+                        raise EnvironmentBuildError("CLI namespace smoke test failed") from error
                 return self._publish(staging, metadata)
             except Exception:
                 _remove_tree(staging)
@@ -230,9 +268,7 @@ class CapabilityEnvironmentManager:
             )
             return record
 
-    def restore_active(
-        self, capability_id: str, version: str | None
-    ) -> EnvironmentRecord | None:
+    def restore_active(self, capability_id: str, version: str | None) -> EnvironmentRecord | None:
         capability_id = _safe_component(capability_id, "capability id")
         with self._build_lock(capability_id):
             state = self._read_state(capability_id)
@@ -307,9 +343,7 @@ class CapabilityEnvironmentManager:
                 raise KeyError("environment version not found")
             _remove_tree(path)
 
-    def _change_reference(
-        self, capability_id: str, version: str, owner: str, *, add: bool
-    ) -> None:
+    def _change_reference(self, capability_id: str, version: str, owner: str, *, add: bool) -> None:
         capability_id, version = self._validate_identity(capability_id, version)
         if not owner or len(owner) > 256:
             raise ValueError("reference owner must be non-empty and at most 256 characters")
@@ -317,11 +351,15 @@ class CapabilityEnvironmentManager:
             self._record(capability_id, version)
             state = self._read_state(capability_id)
             raw_references = state.get("references", {})
-            references: dict[str, list[str]] = {
-                key: [item for item in value if isinstance(item, str)]
-                for key, value in raw_references.items()
-                if isinstance(key, str) and isinstance(value, list)
-            } if isinstance(raw_references, dict) else {}
+            references: dict[str, list[str]] = (
+                {
+                    key: [item for item in value if isinstance(item, str)]
+                    for key, value in raw_references.items()
+                    if isinstance(key, str) and isinstance(value, list)
+                }
+                if isinstance(raw_references, dict)
+                else {}
+            )
             owners = set(references.get(version, []))
             if add:
                 owners.add(owner)
@@ -334,17 +372,115 @@ class CapabilityEnvironmentManager:
             self._write_state(capability_id, {**state, "references": references})
 
     def _publish(self, staging: Path, metadata: Mapping[str, str]) -> EnvironmentRecord:
-        _write_json_atomic(staging / "environment.json", dict(metadata))
-        if _tree_size(self._root) > self._quota_bytes:
-            _remove_tree(staging)
-            raise EnvironmentQuotaExceeded("capability environment disk quota exceeded")
         capability_id = metadata["capability_id"]
         version = metadata["version"]
         final = self._version(capability_id, version)
+        published_metadata: dict[str, Any] = dict(metadata)
+        pending_anchor: dict[str, Any] | None = None
+        pending_state: dict[str, Any] | None = None
+        state_growth = 0
+        if metadata["kind"] == "python":
+            try:
+                bounded_tree_size(staging, limits=ScanLimits(self._quota_bytes))
+                relocate_python_environment(staging, final)
+                manifest = scan_tree(
+                    staging,
+                    interpreter=Path(self._python_executable).resolve(strict=True),
+                    limits=ScanLimits(self._quota_bytes),
+                )
+                manifest_bytes = canonical_json(manifest)
+                if len(manifest_bytes) > min(MAX_CONTROL_BYTES, self._quota_bytes):
+                    raise PythonAttestationLimitError("Python attestation manifest quota exceeded")
+                _write_json_atomic(staging / MANIFEST_NAME, manifest, ascii_only=True)
+                published_metadata["python_attestation"] = {
+                    "schema_version": 1,
+                    "manifest": MANIFEST_NAME,
+                    "sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+                }
+            except PythonAttestationLimitError as error:
+                raise EnvironmentQuotaExceeded("Python attestation quota exceeded") from error
+            except PythonAttestationError as error:
+                raise EnvironmentBuildError("Python tree attestation failed") from error
+            except (OSError, ValueError) as error:
+                raise EnvironmentBuildError(
+                    "Python environment entry point relocation failed"
+                ) from error
+        _write_json_atomic(
+            staging / "environment.json",
+            published_metadata,
+            ascii_only=metadata["kind"] == "python",
+        )
+        if metadata["kind"] == "python":
+            try:
+                _, metadata_receipt = read_control(staging / "environment.json", max_bytes=65536)
+                _, manifest_receipt = read_control(staging / MANIFEST_NAME)
+                if (
+                    metadata_receipt["sha256"]
+                    != hashlib.sha256(canonical_json(published_metadata)).hexdigest()
+                    or manifest_receipt["sha256"]
+                    != published_metadata["python_attestation"]["sha256"]
+                ):
+                    raise PythonAttestationError("Python attestation changed before publication")
+                pending_anchor = {"metadata": metadata_receipt, "manifest": manifest_receipt}
+                state = self._read_state(capability_id)
+                anchors = state.get("python_attestations", {})
+                if not isinstance(anchors, dict):
+                    raise EnvironmentBuildError("Python attestation state is invalid")
+                pending_state = {
+                    **state,
+                    "python_attestations": {**anchors, version: pending_anchor},
+                }
+                activated_state = {**pending_state, "schema_version": 1, "active_version": version}
+                current = state.get("active_version")
+                if isinstance(current, str) and current != version:
+                    activated_state["previous_version"] = current
+                activated_size = len(canonical_json(activated_state))
+                if activated_size > 1024 * 1024:
+                    raise EnvironmentQuotaExceeded(
+                        "Python attestation state reference quota exceeded"
+                    )
+                state_path = self._root / capability_id / "state.json"
+                old_size = (
+                    read_control(state_path, max_bytes=1024 * 1024)[1]["identity"][4]
+                    if (state_path.exists())
+                    else 0
+                )
+                # Reserve both the receipt reference and subsequent activation write.
+                state_growth = max(0, activated_size - old_size)
+            except PythonAttestationError as error:
+                raise EnvironmentBuildError(
+                    "Python attestation publication identity changed"
+                ) from error
+        try:
+            used_bytes = (
+                bounded_tree_size(self._root, limits=ScanLimits(self._quota_bytes))
+                if metadata["kind"] == "python"
+                else _tree_size(self._root)
+            )
+        except PythonAttestationLimitError as error:
+            raise EnvironmentQuotaExceeded("Python attestation storage quota exceeded") from error
+        except PythonAttestationError as error:
+            raise EnvironmentBuildError("Python attestation storage identity changed") from error
+        if used_bytes + state_growth > self._quota_bytes:
+            _remove_tree(staging)
+            raise EnvironmentQuotaExceeded("capability environment disk quota exceeded")
         final.parent.mkdir(parents=True, exist_ok=True)
         if final.exists():
             raise EnvironmentBuildError("environment version already exists")
         staging.replace(final)
+        if metadata["kind"] == "python":
+            try:
+                _, metadata_receipt = read_control(final / "environment.json", max_bytes=65536)
+                _, manifest_receipt = read_control(final / MANIFEST_NAME)
+                if pending_anchor != {"metadata": metadata_receipt, "manifest": manifest_receipt}:
+                    raise PythonAttestationError("Python attestation replaced during publication")
+                if pending_state is None:
+                    raise PythonAttestationError("Python attestation publication state is missing")
+                self._write_state(capability_id, pending_state)
+            except PythonAttestationError as error:
+                raise EnvironmentBuildError(
+                    "Python attestation publication identity changed"
+                ) from error
         record = self._record(capability_id, version)
         self._activate(record)
         return record
@@ -356,8 +492,12 @@ class CapabilityEnvironmentManager:
         if not path.exists():
             return None
         record = self._record(capability_id, version)
-        if any(getattr(record, key) != value for key, value in metadata.items() if key != "executable"):
-            raise EnvironmentBuildError("immutable environment version already exists with other content")
+        if any(
+            getattr(record, key) != value for key, value in metadata.items() if key != "executable"
+        ):
+            raise EnvironmentBuildError(
+                "immutable environment version already exists with other content"
+            )
         if record.executable != metadata["executable"]:
             raise EnvironmentBuildError("immutable environment version has another executable")
         executable = record.path / record.executable
@@ -380,22 +520,90 @@ class CapabilityEnvironmentManager:
         self._write_state(record.capability_id, next_state)
 
     def _record(self, capability_id: str, version: str) -> EnvironmentRecord:
+        try:
+            capability_id, version = self._validate_identity(capability_id, version)
+        except ValueError:
+            raise EnvironmentBuildError("environment record identity is invalid") from None
         path = self._version(capability_id, version)
         try:
-            payload = json.loads((path / "environment.json").read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
+            for directory in (self._root, path.parent.parent, path.parent, path):
+                if directory.resolve(strict=True) != directory or not stat.S_ISDIR(
+                    directory.lstat().st_mode
+                ):
+                    raise EnvironmentBuildError("environment directory identity changed")
+            data, metadata_receipt = read_control(path / "environment.json", max_bytes=65536)
+            payload = json.loads(data)
+        except (OSError, ValueError) as exc:
             raise EnvironmentBuildError("environment metadata is missing or invalid") from exc
+        fields = ("capability_id", "version", "kind", "executable", "content_sha256")
+        if (
+            not isinstance(payload, dict)
+            or any(type(payload.get(key)) is not str for key in fields)
+            or payload["capability_id"] != capability_id
+            or payload["version"] != version
+            or payload["kind"] not in ("cli", "python")
+            or re.fullmatch(r"[0-9a-f]{64}", payload["content_sha256"]) is None
+        ):
+            raise EnvironmentBuildError("environment metadata identity is invalid")
+        executable: str = payload["executable"]
+        attestation_sha256: str | None = None
+        anchors = self._read_state(capability_id).get("python_attestations", {})
+        anchor = anchors.get(version) if isinstance(anchors, dict) else None
+        if payload["kind"] == "python" or anchor is not None:
+            if not isinstance(anchor, dict) or "python_attestation" not in payload:
+                raise EnvironmentBuildError(
+                    "Python record lacks complete tree attestation; rebuild required"
+                )
+            if payload["kind"] != "python":
+                raise EnvironmentBuildError("Python attestation record kind changed")
+            try:
+                attestation_sha256 = verify_tree(
+                    path,
+                    metadata=payload,
+                    metadata_receipt=metadata_receipt,
+                    anchor=anchor,
+                    limits=ScanLimits(self._quota_bytes),
+                )
+            except PythonAttestationError as error:
+                raise EnvironmentBuildError(
+                    "installed Python tree attestation is invalid"
+                ) from error
         try:
+            if payload["kind"] == "cli":
+                _safe_component(executable, "stored executable")
+            else:
+                parts = executable.split("/")
+                if len(parts) != 2 or parts[0] not in ("bin", "Scripts"):
+                    raise ValueError("invalid Python executable path")
+                name = parts[1]
+                if parts[0] == "Scripts" and name.lower().endswith(".exe"):
+                    name = name[:-4]
+                _safe_component(name, "stored executable")
+        except ValueError:
+            raise EnvironmentBuildError("environment executable path is invalid") from None
+        try:
+            target = path / executable
+            if payload["kind"] == "cli":
+                info = target.lstat()
+                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                    raise EnvironmentBuildError("immutable CLI executable identity changed")
+                if _sha256_file(target) != payload["content_sha256"]:
+                    raise EnvironmentBuildError("immutable CLI environment content SHA256 changed")
+            elif target.parent.resolve(strict=True) != target.parent or not target.is_file():
+                raise EnvironmentBuildError("immutable Python executable is missing or invalid")
             return EnvironmentRecord(
-                capability_id=str(payload["capability_id"]),
-                version=str(payload["version"]),
-                kind=str(payload["kind"]),
+                capability_id=capability_id,
+                version=version,
+                kind=payload["kind"],
                 path=path,
-                executable=str(payload["executable"]),
-                content_sha256=str(payload["content_sha256"]),
+                executable=executable,
+                content_sha256=payload["content_sha256"],
+                attestation_sha256=attestation_sha256,
             )
-        except KeyError as exc:
-            raise EnvironmentBuildError("environment metadata is incomplete") from exc
+        except OSError as exc:
+            raise EnvironmentBuildError(
+                "immutable environment executable is missing or invalid"
+            ) from exc
 
     def _run(
         self,
@@ -421,7 +629,7 @@ class CapabilityEnvironmentManager:
             raise EnvironmentBuildError(f"{label} failed") from exc
 
     def _new_staging(self, capability_id: str, version: str) -> Path:
-        path = self._staging / f"{capability_id}-{version}-{uuid4().hex}"
+        path = self._staging / uuid4().hex
         path.mkdir(parents=False, exist_ok=False)
         return path
 
@@ -436,8 +644,9 @@ class CapabilityEnvironmentManager:
         if not path.exists():
             return {"schema_version": 1, "references": {}}
         try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
+            data, _ = read_control(path, max_bytes=1024 * 1024)
+            payload = json.loads(data)
+        except (OSError, ValueError) as exc:
             raise EnvironmentBuildError("capability environment state is invalid") from exc
         if not isinstance(payload, dict):
             raise EnvironmentBuildError("capability environment state is invalid")
@@ -462,7 +671,9 @@ class CapabilityEnvironmentManager:
                 break
             except FileExistsError:
                 if time.monotonic() >= deadline:
-                    raise EnvironmentBuildError("timed out waiting for capability build lock") from None
+                    raise EnvironmentBuildError(
+                        "timed out waiting for capability build lock"
+                    ) from None
                 time.sleep(0.05)
         try:
             yield
@@ -477,10 +688,14 @@ def _validate_hashed_lock(path: Path) -> str:
     if not path.is_file():
         raise EnvironmentBuildError("Python lock file must be a local file")
     content = path.read_text(encoding="utf-8")
-    if "://" in content or re.search(r"(^|\s)(?:--index-url|--extra-index-url|-e|--editable|@)(?:\s|$)", content):
+    if "://" in content or re.search(
+        r"(^|\s)(?:--index-url|--extra-index-url|-e|--editable|@)(?:\s|$)", content
+    ):
         raise EnvironmentBuildError("remote or editable requirements are forbidden")
     logical = content.replace("\\\n", " ").splitlines()
-    requirements = [line.strip() for line in logical if line.strip() and not line.lstrip().startswith("#")]
+    requirements = [
+        line.strip() for line in logical if line.strip() and not line.lstrip().startswith("#")
+    ]
     if not requirements:
         raise EnvironmentBuildError("Python lock file is empty")
     for requirement in requirements:
@@ -489,7 +704,9 @@ def _validate_hashed_lock(path: Path) -> str:
         if _PINNED_REQUIREMENT.fullmatch(package) is None:
             raise EnvironmentBuildError("Python requirements must use fixed versions")
         if len(tokens) < 2 or not all(_HASH.fullmatch(token) for token in tokens[1:]):
-            if any(token.startswith("--") and not token.startswith("--hash=") for token in tokens[1:]):
+            if any(
+                token.startswith("--") and not token.startswith("--hash=") for token in tokens[1:]
+            ):
                 raise EnvironmentBuildError("extra pip directives are forbidden in lock files")
             raise EnvironmentBuildError("every Python requirement must include a SHA256 hash")
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
@@ -499,6 +716,25 @@ def _safe_component(value: str, label: str) -> str:
     if not _SAFE_NAME.fullmatch(value) or value in {".", ".."}:
         raise ValueError(f"invalid {label}")
     return value
+
+
+def _module_presence_probe(staging: Path, module: str) -> str:
+    # -S avoids installed .pth code; PathFinder never imports a parent package.
+    return (
+        "import os, sys\n"
+        "from pathlib import Path\n"
+        "from importlib.machinery import PathFinder\n"
+        f"root = Path({str(staging)!r})\n"
+        "site = (root / 'Lib' / 'site-packages' if os.name == 'nt' else "
+        "root / 'lib' / f'python{sys.version_info.major}.{sys.version_info.minor}' / 'site-packages')\n"
+        "paths = [str(site), *sys.path]\n"
+        f"for part in {module!r}.split('.'):\n"
+        "    spec = PathFinder.find_spec(part, paths)\n"
+        "    if spec is None:\n"
+        "        raise SystemExit(1)\n"
+        "    paths = list(spec.submodule_search_locations or ())\n"
+        "raise SystemExit(0)\n"
+    )
 
 
 def _venv_python_relative() -> str:
@@ -536,12 +772,17 @@ def _isolated_environment(staging: Path) -> dict[str, str]:
     return environment
 
 
-def _write_json_atomic(path: Path, payload: Mapping[str, Any]) -> None:
+def _write_json_atomic(
+    path: Path,
+    payload: Mapping[str, Any],
+    *,
+    ascii_only: bool = False,
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
     try:
         temporary.write_text(
-            json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+            json.dumps(payload, ensure_ascii=ascii_only, sort_keys=True, separators=(",", ":")),
             encoding="utf-8",
         )
         os.replace(temporary, path)

@@ -352,6 +352,7 @@ def test_plugin_manifest_source_marks_stopped_plugins_unavailable() -> None:
             {
                 "id": "search.web",
                 "kind": "plugin",
+                "plugin_id": "search",
                 "adapter": "plugin_runtime",
                 "permission_class": "network.read",
                 "sandbox_profile": "remote_connector",
@@ -374,6 +375,7 @@ def test_plugin_manifest_source_marks_stopped_plugins_unavailable() -> None:
             {
                 "id": "calendar.create_event",
                 "kind": "plugin",
+                "plugin_id": "calendar",
                 "adapter": "plugin_runtime",
                 "permission_class": "calendar.write",
                 "sandbox_profile": "remote_connector",

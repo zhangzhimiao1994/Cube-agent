@@ -79,6 +79,7 @@ def test_build_python_environment_uses_only_offline_hash_locked_wheels(tmp_path:
         "--no-index",
         "--require-hashes",
         "--no-deps",
+        "--only-binary=:all:",
         "--find-links",
         str(cache.resolve()),
         "-r",
@@ -86,8 +87,8 @@ def test_build_python_environment_uses_only_offline_hash_locked_wheels(tmp_path:
     )
     assert install_options["shell"] is False
     smoke_argv, smoke_options = runner.calls[2]
-    assert smoke_argv[1:3] == ("-I", "-c")
-    assert "demo_package" in smoke_argv[3]
+    assert smoke_argv[1:4] == ("-I", "-S", "-c")
+    assert "demo_package" in smoke_argv[4]
     assert smoke_options["shell"] is False
     smoke_cwd = Path(str(smoke_options["cwd"]))
     assert smoke_cwd.parent == tmp_path / "envs" / ".staging"

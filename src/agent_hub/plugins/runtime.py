@@ -4,12 +4,15 @@ import asyncio
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
+import sysconfig
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from functools import partial
 from pathlib import Path, PurePosixPath
 from time import monotonic as default_monotonic
 from typing import Any, Literal, Protocol, cast
@@ -120,6 +123,9 @@ type HttpJsonPost = Callable[
 type HttpJsonProbe = Callable[[str, float, Mapping[str, str]], Awaitable[int]]
 type PluginSecretResolver = Callable[[str], Awaitable[str]]
 type LocalRuntimeProbe = Callable[[str, float, Mapping[str, str]], Awaitable[bool]]
+type ScopedPluginAdapterFactory = Callable[
+    [UUID, PluginResourceResponse], Mapping[str, PluginAdapter]
+]
 
 
 class LocalCommandRunner(Protocol):
@@ -131,6 +137,13 @@ class LocalCommandRunner(Protocol):
         environment: Mapping[str, str],
         max_output_bytes: int,
     ) -> tuple[int, str, str]: ...
+
+
+class LocalProcessFactory(Protocol):
+    async def __call__(
+        self, program: str, *args: str, env: Mapping[str, str], stdin: int,
+        stdout: int, stderr: int,
+    ) -> asyncio.subprocess.Process: ...
 
 
 class PluginPackageRunner(Protocol):
@@ -262,12 +275,21 @@ class LocalCommandPluginAdapter:
         self,
         *,
         command_runner: LocalCommandRunner | None = None,
+        process_factory: LocalProcessFactory | None = None,
         command_resolver: Callable[[str], str | None] | None = None,
         runtime_probe: LocalRuntimeProbe | None = None,
     ) -> None:
-        self._command_runner = _run_local_command if command_runner is None else command_runner
+        if command_runner is not None and process_factory is not None:
+            raise ValueError("Command runner and process factory are mutually exclusive")
+        self._command_runner: LocalCommandRunner = (
+            partial(_run_local_command, process_factory=process_factory)
+            if command_runner is None else command_runner
+        )
         self._command_resolver = shutil.which if command_resolver is None else command_resolver
-        self._runtime_probe = _probe_local_runtime if runtime_probe is None else runtime_probe
+        self._runtime_probe: LocalRuntimeProbe = (
+            partial(_probe_local_runtime, process_factory=process_factory)
+            if runtime_probe is None else runtime_probe
+        )
         self._check_command_available = command_runner is None
 
     async def preflight(self, *, plugin: PluginResourceResponse) -> None:
@@ -434,9 +456,14 @@ class BubblewrapPluginPackageProcessLauncher:
         *,
         bubblewrap_executable: Path,
         readonly_bind_paths: Sequence[Path] | None = None,
+        protected_paths: Sequence[Path] = (),
     ) -> None:
         self._bubblewrap_executable = bubblewrap_executable
-        self._readonly_bind_paths = tuple(readonly_bind_paths or ())
+        self._readonly_bind_paths = (
+            None if readonly_bind_paths is None else tuple(readonly_bind_paths)
+        )
+        self._protected_paths = tuple(protected_paths)
+        self._protected_identities = tuple(path.resolve() for path in protected_paths)
 
     def argv(
         self,
@@ -470,6 +497,16 @@ class BubblewrapPluginPackageProcessLauncher:
         python_args: tuple[str, ...],
     ) -> tuple[str, ...]:
         root = target.root
+        _validate_runtime_mount_path(root)
+        if target.dependency_root is not None:
+            _validate_runtime_mount_path(target.dependency_root)
+        if any(
+            path.resolve() != identity
+            for path, identity in zip(
+                self._protected_paths, self._protected_identities, strict=True
+            )
+        ):
+            raise RuntimeCapabilityError("Plugin protected storage path changed")
         dependency_bind_args: tuple[str, ...] = ()
         if target.dependency_root is not None:
             dependency_bind_args = (
@@ -478,10 +515,17 @@ class BubblewrapPluginPackageProcessLauncher:
                 str(target.dependency_root),
             )
         readonly_bind_mounts = (
-            tuple((path, path) for path in self._readonly_bind_paths)
-            if self._readonly_bind_paths
+            tuple(_readonly_bind_mount(path) for path in self._readonly_bind_paths)
+            if self._readonly_bind_paths is not None
             else _default_python_runtime_readonly_bind_paths(python_executable)
         )
+        protected_paths = (
+            *self._protected_identities,
+            root.resolve(),
+            *((target.dependency_root.resolve(),) if target.dependency_root is not None else ()),
+        )
+        for source, destination in readonly_bind_mounts:
+            _validate_runtime_readonly_mount(source, destination, protected_paths)
         readonly_bind_args = tuple(
             argument
             for source, destination in readonly_bind_mounts
@@ -515,17 +559,52 @@ class BubblewrapPluginPackageProcessLauncher:
 
 
 def _readonly_bind_mount(path: Path) -> tuple[Path, Path]:
+    if not path.is_absolute():
+        raise RuntimeCapabilityError("Plugin runtime mount path is not absolute")
     return path.resolve(), path
+
+
+def _validate_runtime_mount_path(path: Path) -> None:
+    if not path.is_absolute():
+        raise RuntimeCapabilityError("Plugin runtime mount path is not absolute")
+    # Destinations remain lexical argv paths; checking only their aliases is insufficient.
+    for candidate in (Path(os.path.abspath(path)), path.resolve()):
+        anchor = Path(candidate.anchor)
+        if candidate == anchor or candidate == anchor / "tmp" or any(
+            candidate == anchor / name or candidate.is_relative_to(anchor / name)
+            for name in ("proc", "dev")
+        ):
+            raise RuntimeCapabilityError("Plugin runtime mount path is reserved")
+
+
+def _validate_runtime_readonly_mount(
+    source: Path, destination: Path, protected_paths: Sequence[Path]
+) -> None:
+    for path in (source, destination):
+        _validate_runtime_mount_path(path)
+        canonical = path.resolve()
+        if any(
+            canonical.is_relative_to(protected) or protected.is_relative_to(canonical)
+            for protected in protected_paths
+        ):
+            raise RuntimeCapabilityError("Plugin runtime mount overlaps protected storage")
 
 
 def _default_python_runtime_readonly_bind_paths(
     python_executable: str,
 ) -> tuple[tuple[Path, Path], ...]:
-    candidates = [
-        Path(python_executable).resolve().parent,
-        Path(sys.prefix),
-        Path(sys.base_prefix),
-    ]
+    executable = Path(python_executable)
+    current_executables = {
+        Path(sys.executable).resolve(),
+        Path(getattr(sys, "_base_executable", sys.executable)).resolve(),
+    }
+    if not executable.is_absolute() or executable.resolve() not in current_executables:
+        raise RuntimeCapabilityError("Plugin interpreter requires explicit runtime mounts")
+    candidates = [executable, Path(sysconfig.get_path("stdlib"))]
+    for name in ("DESTSHARED", "LIBDIR"):
+        value = sysconfig.get_config_var(name)
+        if isinstance(value, str) and value:
+            candidates.append(Path(value))
     for system_path in (Path("/lib"), Path("/lib64"), Path("/usr/lib"), Path("/usr/lib64")):
         if system_path.exists():
             candidates.append(system_path)
@@ -560,7 +639,9 @@ class PythonSubprocessPluginPackageRunner:
         self._environment = _minimal_python_subprocess_environment(environment)
 
     async def preflight(self, *, target: PluginPackageExecutionTarget) -> None:
-        _ensure_plugin_package_runner_target(target)
+        _ensure_plugin_package_runner_target(
+            target, inspection_timeout_seconds=self._timeout_seconds
+        )
         argv = (
             self._process_launcher.probe_argv(
                 python_executable=self._python_executable,
@@ -582,12 +663,11 @@ class PythonSubprocessPluginPackageRunner:
             raise RuntimeCapabilityError("Plugin package preflight failed") from error
         try:
             await asyncio.wait_for(process.wait(), timeout=self._timeout_seconds)
-        except TimeoutError as error:
-            with suppress(ProcessLookupError):
-                process.kill()
-            with suppress(Exception):
-                await process.wait()
-            raise RuntimeCapabilityError("Plugin package preflight timed out") from error
+        except BaseException as error:
+            await _cleanup_local_command(process, [])
+            if isinstance(error, TimeoutError):
+                raise RuntimeCapabilityError("Plugin package preflight timed out") from error
+            raise
         if process.returncode != 0:
             raise RuntimeCapabilityError("Plugin package preflight failed")
 
@@ -600,7 +680,9 @@ class PythonSubprocessPluginPackageRunner:
         arguments: Mapping[str, JsonValue],
         context: PluginInvocationContext,
     ) -> Mapping[str, JsonValue]:
-        _ensure_plugin_package_runner_target(target)
+        _ensure_plugin_package_runner_target(
+            target, inspection_timeout_seconds=self._timeout_seconds
+        )
         request = _plugin_package_runner_request(
             plugin=plugin,
             capability=capability,
@@ -644,12 +726,11 @@ class PythonSubprocessPluginPackageRunner:
                 ),
                 timeout=self._timeout_seconds,
             )
-        except TimeoutError as error:
-            with suppress(ProcessLookupError):
-                process.kill()
-            with suppress(Exception):
-                await process.wait()
-            raise RuntimeCapabilityError("Plugin tool timed out") from error
+        except BaseException as error:
+            await _cleanup_local_command(process, [])
+            if isinstance(error, TimeoutError):
+                raise RuntimeCapabilityError("Plugin tool timed out") from error
+            raise
         if process.returncode != 0:
             raise RuntimeCapabilityError("Plugin tool failed")
         try:
@@ -666,10 +747,6 @@ async def _communicate_with_bounded_stdout(
     max_stdout_bytes: int,
 ) -> bytes:
     if process.stdin is None or process.stdout is None:
-        with suppress(ProcessLookupError):
-            process.kill()
-        with suppress(Exception):
-            await process.wait()
         raise RuntimeCapabilityError("Plugin tool failed")
     try:
         process.stdin.write(payload)
@@ -686,17 +763,15 @@ async def _communicate_with_bounded_stdout(
             break
         total_size += len(chunk)
         if total_size > max_stdout_bytes:
-            with suppress(ProcessLookupError):
-                process.kill()
-            with suppress(Exception):
-                await process.wait()
             raise RuntimeCapabilityError("Plugin result is invalid")
         chunks.append(chunk)
     await process.wait()
     return b"".join(chunks)
 
 
-def _ensure_plugin_package_runner_target(target: PluginPackageExecutionTarget) -> None:
+def _ensure_plugin_package_runner_target(
+    target: PluginPackageExecutionTarget, *, inspection_timeout_seconds: float
+) -> None:
     _ensure_runtime_path_inside(target.root, target.entrypoint)
     if not target.root.is_dir():
         raise RuntimeCapabilityError("Plugin package artifact is unavailable")
@@ -704,6 +779,39 @@ def _ensure_plugin_package_runner_target(target: PluginPackageExecutionTarget) -
         raise RuntimeCapabilityError("Plugin package entrypoint is unavailable")
     if target.dependency_root is not None and not target.dependency_root.is_dir():
         raise RuntimeCapabilityError("Plugin dependency cache is unavailable")
+    deadline = default_monotonic() + inspection_timeout_seconds
+    _ensure_private_package_mount(target.root, deadline=deadline)
+    if target.dependency_root is not None:
+        _ensure_private_package_mount(target.dependency_root, deadline=deadline)
+
+
+def _ensure_private_package_mount(root: Path, *, deadline: float) -> None:
+    pending = [root]
+    while pending:
+        if default_monotonic() >= deadline:
+            raise RuntimeCapabilityError("Plugin package inspection timed out")
+        directory = pending.pop()
+        try:
+            info = directory.lstat()
+            if not stat.S_ISDIR(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
+                raise RuntimeCapabilityError("Plugin package mount contains unsafe filesystem entries")
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    if default_monotonic() >= deadline:
+                        raise RuntimeCapabilityError("Plugin package inspection timed out")
+                    info = Path(entry.path).lstat()
+                    if getattr(info, "st_file_attributes", 0) & 0x400:
+                        raise RuntimeCapabilityError(
+                            "Plugin package mount contains unsafe filesystem entries"
+                        )
+                    if stat.S_ISDIR(info.st_mode):
+                        pending.append(Path(entry.path))
+                    elif not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                        raise RuntimeCapabilityError(
+                            "Plugin package mount contains unsafe filesystem entries"
+                        )
+        except OSError as error:
+            raise RuntimeCapabilityError("Plugin package mount inspection failed") from error
 
 
 def _plugin_package_python_args(target: PluginPackageExecutionTarget) -> tuple[str, ...]:
@@ -742,6 +850,7 @@ class RuntimePluginService:
         tenant_id: UUID,
         admin_service: PluginConfigService,
         adapters: Mapping[str, PluginAdapter] | None = None,
+        adapter_factory: ScopedPluginAdapterFactory | None = None,
         dependency_policy: PluginPackageDependencyPolicy | None = None,
         cache_ttl_seconds: float = 60.0,
         monotonic: Callable[[], float] | None = None,
@@ -750,6 +859,7 @@ class RuntimePluginService:
         self._admin_service = admin_service
         self._adapters = _default_plugin_adapters(admin_service)
         self._adapters.update(adapters or {})
+        self._adapter_factory = adapter_factory
         self._dependency_policy = dependency_policy or PluginPackageDependencyPolicy()
         self._plugins_by_tenant: dict[UUID, tuple[PluginResourceResponse, ...]] = {}
         self._plugins_loaded_at: dict[UUID, float] = {}
@@ -857,6 +967,41 @@ class RuntimePluginService:
     def capability_manifest_source(self) -> RuntimePluginService:
         return self
 
+    def _adapters_for_plugin(
+        self, tenant_id: UUID, plugin: PluginResourceResponse
+    ) -> Mapping[str, PluginAdapter]:
+        if self._adapter_factory is None:
+            return self._adapters
+        try:
+            scoped = self._adapter_factory(tenant_id, plugin)
+            if not isinstance(scoped, Mapping) or any(
+                not callable(getattr(adapter, "invoke", None)) for adapter in scoped.values()
+            ):
+                return {}
+            adapters = dict(self._adapters)
+            # Selecting scoped execution must never retain the legacy host command runner.
+            adapters.pop("local_command", None)
+            adapters.update(scoped)
+            return adapters
+        except Exception:  # noqa: BLE001 - failed scope resolution must not select host execution
+            return {}
+
+    def _plugins_with_selected_runtime(
+        self, tenant_id: UUID, plugins: tuple[PluginResourceResponse, ...]
+    ) -> tuple[PluginResourceResponse, ...]:
+        selected: list[PluginResourceResponse] = []
+        for plugin in plugins:
+            adapters = self._adapters_for_plugin(tenant_id, plugin)
+            effective = _plugin_with_runtime_activation(
+                plugin, adapters, dependency_policy=self._dependency_policy
+            )
+            if self._adapter_factory is not None and any(
+                capability.adapter not in adapters for capability in plugin.capabilities
+            ):
+                effective = effective.model_copy(update={"enabled": False})
+            selected.append(effective)
+        return tuple(selected)
+
     def manifests_for_tenant(self, tenant_id: UUID) -> Mapping[str, JsonValue]:
         plugins = self._plugins_for_tenant(tenant_id)
         if plugins is None:
@@ -864,11 +1009,7 @@ class RuntimePluginService:
         return PluginConfigCapabilityManifestSource(
             cast(
                 Any,
-                _plugins_with_runtime_activation(
-                    plugins,
-                    self._adapters,
-                    dependency_policy=self._dependency_policy,
-                ),
+                self._plugins_with_selected_runtime(tenant_id, plugins),
             ),
             dependency_policy=self._dependency_policy,
         ).manifests()
@@ -880,14 +1021,27 @@ class RuntimePluginService:
         )
 
     async def preflight_plugin(self, plugin: PluginResourceResponse) -> None:
+        if self._adapter_factory is not None:
+            raise RuntimeCapabilityError("Plugin tenant scope is required")
+        await self._preflight_plugin(plugin, self._adapters)
+
+    async def preflight_plugin_for_tenant(
+        self, tenant_id: UUID, plugin: PluginResourceResponse
+    ) -> None:
+        await self._preflight_plugin(plugin, self._adapters_for_plugin(tenant_id, plugin))
+
+    @staticmethod
+    async def _preflight_plugin(
+        plugin: PluginResourceResponse, adapters: Mapping[str, PluginAdapter]
+    ) -> None:
         checked_adapters: set[str] = set()
         for capability in plugin.capabilities:
             if capability.adapter in checked_adapters:
                 continue
             checked_adapters.add(capability.adapter)
-            adapter = self._adapters.get(capability.adapter)
+            adapter = adapters.get(capability.adapter)
             if adapter is None:
-                raise RuntimeCapabilityError("Plugin adapter unavailable")
+                raise RuntimeCapabilityError("Plugin execution scope or adapter unavailable")
             preflight = getattr(adapter, "preflight", None)
             if callable(preflight):
                 await preflight(plugin=plugin)
@@ -918,9 +1072,14 @@ class RuntimePluginService:
             return ()
         rules: list[CapabilityRule] = []
         for plugin in plugins:
+            adapters = self._adapters_for_plugin(tenant_id, plugin)
+            if self._adapter_factory is not None and any(
+                capability.adapter not in adapters for capability in plugin.capabilities
+            ):
+                continue
             if not _plugin_is_running(
                 plugin,
-                self._adapters,
+                adapters,
                 dependency_policy=self._dependency_policy,
             ):
                 continue
@@ -973,7 +1132,7 @@ class RuntimePluginService:
             idempotency_key=idempotency_key,
         )
         try:
-            adapter = self._adapters.get(capability.adapter)
+            adapter = self._adapters_for_plugin(tenant_id, plugin).get(capability.adapter)
             if adapter is None:
                 raise RuntimeCapabilityError("Plugin backend unavailable")
             descriptor = _adapter_descriptor(capability.adapter, adapter)
@@ -1045,9 +1204,14 @@ class RuntimePluginService:
         if plugins is None:
             return None
         for plugin in plugins:
+            adapters = self._adapters_for_plugin(tenant_id, plugin)
+            if self._adapter_factory is not None and any(
+                capability.adapter not in adapters for capability in plugin.capabilities
+            ):
+                continue
             if not _plugin_is_running(
                 plugin,
-                self._adapters,
+                adapters,
                 dependency_policy=self._dependency_policy,
             ):
                 continue
@@ -1064,17 +1228,7 @@ class RuntimePluginService:
         plugins = self._plugins_for_tenant(tenant_id)
         if plugins is None:
             return None
-        manifest = PluginConfigCapabilityManifestSource(
-            cast(
-                Any,
-                _plugins_with_runtime_activation(
-                    plugins,
-                    self._adapters,
-                    dependency_policy=self._dependency_policy,
-                ),
-            ),
-            dependency_policy=self._dependency_policy,
-        ).manifests()
+        manifest = self.manifests_for_tenant(tenant_id)
         capabilities = manifest.get("capabilities")
         if not isinstance(capabilities, tuple | list):
             return None
@@ -1129,6 +1283,7 @@ async def build_runtime_plugin_service(
     tenant_id: UUID,
     admin_service: PluginConfigService,
     adapters: Mapping[str, PluginAdapter] | None = None,
+    adapter_factory: ScopedPluginAdapterFactory | None = None,
     dependency_policy: PluginPackageDependencyPolicy | None = None,
     cache_ttl_seconds: float = 60.0,
     monotonic: Callable[[], float] | None = None,
@@ -1137,6 +1292,7 @@ async def build_runtime_plugin_service(
         tenant_id=tenant_id,
         admin_service=admin_service,
         adapters=adapters,
+        adapter_factory=adapter_factory,
         dependency_policy=dependency_policy,
         cache_ttl_seconds=cache_ttl_seconds,
         monotonic=monotonic,
@@ -1629,9 +1785,11 @@ async def _run_local_command(
     timeout_seconds: float,
     environment: Mapping[str, str],
     max_output_bytes: int,
+    process_factory: LocalProcessFactory | None = None,
 ) -> tuple[int, str, str]:
     try:
-        process = await asyncio.create_subprocess_exec(
+        factory = asyncio.create_subprocess_exec if process_factory is None else process_factory
+        process = await factory(
             *argv,
             env=dict(environment),
             stdin=asyncio.subprocess.DEVNULL,
@@ -1640,16 +1798,38 @@ async def _run_local_command(
         )
     except Exception as error:
         raise RuntimeCapabilityError("Plugin command unavailable") from error
+
+    readers: list[asyncio.Task[bytes]] = []
+    total_size = 0
+
+    async def read_stream(stream: asyncio.StreamReader) -> bytes:
+        nonlocal total_size
+        output = bytearray()
+        while True:
+            chunk = await stream.read(max(1, min(65536, max_output_bytes + 1 - total_size)))
+            if not chunk:
+                return bytes(output)
+            total_size += len(chunk)
+            if total_size > max_output_bytes:
+                raise RuntimeCapabilityError("Plugin result is invalid")
+            output.extend(chunk)
+
+    async def collect_output() -> tuple[bytes, bytes]:
+        stdout, stderr = await asyncio.gather(*readers)
+        await process.wait()
+        return stdout, stderr
+
     try:
-        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout_seconds)
-    except TimeoutError as error:
-        with suppress(ProcessLookupError):
-            process.kill()
-        with suppress(Exception):
-            await process.wait()
-        raise RuntimeCapabilityError("Plugin tool timed out") from error
-    if len(stdout) + len(stderr) > max_output_bytes:
-        raise RuntimeCapabilityError("Plugin result is invalid")
+        if process.stdout is None or process.stderr is None:
+            raise RuntimeCapabilityError("Plugin tool failed")
+        for stream in (process.stdout, process.stderr):
+            readers.append(asyncio.create_task(read_stream(stream)))
+        stdout, stderr = await asyncio.wait_for(collect_output(), timeout=timeout_seconds)
+    except BaseException as error:
+        await _cleanup_local_command(process, readers)
+        if isinstance(error, TimeoutError):
+            raise RuntimeCapabilityError("Plugin tool timed out") from error
+        raise
     return (
         int(process.returncode or 0),
         stdout.decode("utf-8", errors="replace"),
@@ -1657,13 +1837,45 @@ async def _run_local_command(
     )
 
 
+async def _cleanup_local_command(
+    process: asyncio.subprocess.Process,
+    readers: list[asyncio.Task[bytes]],
+) -> None:
+    from agent_hub.subprocess_cleanup import ProcessCleanupIncomplete, drain_and_reap_process
+
+    async def cleanup() -> None:
+        with suppress(ProcessLookupError):
+            process.kill()
+        for reader in readers:
+            reader.cancel()
+        await asyncio.gather(*readers, return_exceptions=True)
+        try:
+            await drain_and_reap_process(process)
+        except ProcessCleanupIncomplete as error:
+            raise RuntimeCapabilityError("Plugin process cleanup incomplete") from error
+
+    # Keep reaping owned resources even if the caller cancels again during cleanup.
+    task = asyncio.create_task(cleanup())
+    cancelled = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancelled = True
+    task.result()
+    if cancelled:
+        raise asyncio.CancelledError
+
+
 async def _probe_local_runtime(
     executable: str,
     timeout_seconds: float,
     environment: Mapping[str, str],
+    *, process_factory: LocalProcessFactory | None = None,
 ) -> bool:
     try:
-        process = await asyncio.create_subprocess_exec(
+        factory = asyncio.create_subprocess_exec if process_factory is None else process_factory
+        process = await factory(
             executable,
             "info",
             "--format",
@@ -1677,12 +1889,11 @@ async def _probe_local_runtime(
         return False
     try:
         return await asyncio.wait_for(process.wait(), timeout=timeout_seconds) == 0
-    except TimeoutError:
-        with suppress(ProcessLookupError):
-            process.kill()
-        with suppress(Exception):
-            await process.wait()
-        return False
+    except BaseException as error:
+        await _cleanup_local_command(process, [])
+        if isinstance(error, TimeoutError):
+            return False
+        raise
 
 
 def _local_command_argv(
@@ -1956,6 +2167,7 @@ def build_plugin_package_subprocess_adapters(
     max_stdout_bytes: int = 262_144,
     dependency_policy: PluginPackageDependencyPolicy | None = None,
     launcher_probe: Callable[[Path], bool] | None = None,
+    protected_paths: Sequence[Path] = (),
 ) -> dict[str, PluginAdapter]:
     if any(adapter_id == "http_json" for adapter_id in adapter_ids):
         raise ValueError("plugin package subprocess adapter id is reserved")
@@ -1974,7 +2186,8 @@ def build_plugin_package_subprocess_adapters(
     runner = PythonSubprocessPluginPackageRunner(
         python_executable=python_executable,
         process_launcher=BubblewrapPluginPackageProcessLauncher(
-            bubblewrap_executable=bubblewrap_executable
+            bubblewrap_executable=bubblewrap_executable,
+            protected_paths=(package_store_dir, *protected_paths),
         ),
         timeout_seconds=timeout_seconds,
         max_stdin_bytes=max_stdin_bytes,
@@ -2015,7 +2228,7 @@ def _plugin_package_subprocess_registration_status(
         return "unsupported_isolation_backend"
     if os.name == "posix" and not os.access(bubblewrap_executable, os.X_OK):
         return "launcher_not_executable"
-    probe = launcher_probe or _probe_bubblewrap_launcher
+    probe = _probe_bubblewrap_launcher if launcher_probe is None else launcher_probe
     if not probe(bubblewrap_executable):
         return "launcher_probe_failed"
     return "ready"

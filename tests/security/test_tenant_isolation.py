@@ -22,9 +22,12 @@ class TenantAuth:
 
 
 class TenantScopedRunService(StubRunService):
-    async def get(self, tenant_id: UUID, run_id: UUID) -> RunSummary:
+    async def get(
+        self, tenant_id: UUID, run_id: UUID, *, actor_id: UUID | None = None
+    ) -> RunSummary:
         assert tenant_id == UUID("00000000-0000-4000-8000-000000000001")
-        return await super().get(tenant_id, run_id)
+        assert actor_id == UUID("11111111-1111-4111-8111-111111111111")
+        return await super().get(tenant_id, run_id, actor_id=actor_id)
 
 
 def test_run_detail_uses_authenticated_tenant_scope() -> None:

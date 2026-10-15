@@ -97,6 +97,7 @@ class DefaultRuntimeCapabilityPolicyGateway:
             self._approvals,
             self._run_repository,
             approval_reviewer=await self._approval_reviewer_for_request(request.tenant_id),
+            plugin_policy_source=self._plugin_policy_rules,
         )
         return await gateway.invoke(request, role=role)
 

@@ -30,7 +30,17 @@ from agent_hub.api.errors import (
     public_error_handler,
 )
 from agent_hub.api.middleware import RequestBodyLimitMiddleware, SafeExceptionMiddleware
-from agent_hub.api.routers import admin, auth, config, previews, runs, system, users, workspaces
+from agent_hub.api.routers import (
+    admin,
+    auth,
+    config,
+    plugin_handovers,
+    previews,
+    runs,
+    system,
+    users,
+    workspaces,
+)
 from agent_hub.auth.models import Role
 from agent_hub.auth.passwords import PasswordService
 from agent_hub.auth.rate_limit import RedisAuthRateLimiter
@@ -40,6 +50,7 @@ from agent_hub.auth.user_admin import PersistentUserAdminService
 from agent_hub.capabilities.defaults import build_runtime_capability_stack
 from agent_hub.capabilities.tools.registry import CompositeCapabilityManifestSource
 from agent_hub.capability_installer.environment import CapabilityEnvironmentManager
+from agent_hub.capability_installer.scoped_probe import build_scoped_cli_probe
 from agent_hub.capability_installer.service import CapabilityInstallerService
 from agent_hub.channels.base import InboundMessage
 from agent_hub.channels.dedup import InboundDedupRepository
@@ -75,9 +86,16 @@ from agent_hub.config.service import ConfigService
 from agent_hub.db.models import AdminResourceRow, TenantRow
 from agent_hub.db.session import build_database
 from agent_hub.domain.runs import TaskMode
+from agent_hub.execution_scope_policy import load_execution_scope_policy
 from agent_hub.harness.config import harness_scheduler_from_config
 from agent_hub.hermes import PersistentHermesRunAdvisor
-from agent_hub.mcp.runtime import build_runtime_mcp_service
+from agent_hub.mcp.client import StdioProcessFactory
+from agent_hub.mcp.runtime import (
+    McpClientFactory,
+    build_runtime_mcp_service,
+    build_scoped_mcp_client_factory,
+)
+from agent_hub.mcp.types import McpServerDefinition
 from agent_hub.memory.persistent import PersistentRuntimeMemoryRecall
 from agent_hub.models.capabilities import is_known_video_generation_model
 from agent_hub.models.capacity import CapacityPool, CredentialDescriptor, CredentialRegistry
@@ -99,7 +117,9 @@ from agent_hub.multimodal.video_providers import TextToVideoProvider, TextToVide
 from agent_hub.observability.logging import configure_logging
 from agent_hub.observability.metrics import default_metrics_registry
 from agent_hub.plugins.dependency_policy import plugin_package_dependency_policy_from_settings
+from agent_hub.plugins.handover_stage_reservations import StageReservationStore
 from agent_hub.plugins.runtime import (
+    ScopedPluginAdapterFactory,
     _plugin_package_subprocess_registration_status,
     build_plugin_package_subprocess_adapters,
     build_runtime_plugin_service,
@@ -1130,6 +1150,46 @@ async def _stop_scheduler_tick_loop(application: FastAPI) -> None:
         )
 
 
+def _unavailable_scoped_stdio_factory(server: McpServerDefinition) -> StdioProcessFactory:
+    raise OSError("Execution scope policy unavailable")
+
+
+def _plugin_snapshot_store_root(configured: Settings, *, separate: bool = False) -> Path:
+    selected = configured.plugin_source_snapshot_store_dir
+    if selected is not None:
+        if not selected.is_absolute() or selected == Path(selected.anchor) or ".." in selected.parts:
+            raise ValueError("Source snapshot store must be an absolute non-root directory")
+    elif separate:
+        selected = configured.plugin_package_store_dir.with_name(
+            configured.plugin_package_store_dir.name + "-sources"
+        ).absolute()
+    else:
+        return configured.plugin_package_store_dir
+    if separate:
+        source = selected.resolve()
+        artifacts = configured.plugin_package_store_dir.resolve()
+        if source.is_relative_to(artifacts) or artifacts.is_relative_to(source):
+            raise ValueError("Source snapshot and publication stores overlap")
+    return selected
+
+
+def _execution_scope_protected_paths(configured: Settings) -> tuple[Path, ...]:
+    return (
+        configured.skill_store_dir,
+        configured.plugin_package_store_dir,
+        _plugin_snapshot_store_root(configured, separate=True),
+        configured.plugin_package_dependency_cache_dir,
+        configured.attachment_store_dir,
+        configured.generated_artifact_dir,
+        configured.project_workspace_dir,
+        configured.capability_environment_root_dir,
+        Path(__file__).resolve().parent,
+        Path.cwd() / ".env",
+        Path("/etc/agent-hub"),
+        Path("/run/agent-hub"),
+    )
+
+
 def create_app(
     *,
     settings: Settings | None = None,
@@ -1149,6 +1209,9 @@ def create_app(
     mode_router: ModeRouterProtocol | None = None,
     task_queue: TaskQueue | None = None,
     preview_manager: PreviewManager | None = None,
+    plugin_adapter_factory: ScopedPluginAdapterFactory | None = None,
+    mcp_client_factory: McpClientFactory | None = None,
+    plugin_publication_reservations: StageReservationStore | None = None,
     feishu_gateway: ChannelGatewayProtocol | None = None,
     feishu_websocket_client_factory: FeishuWebSocketClientFactoryForSettings | None = None,
     database_factory: Callable[[str], DatabaseResource] = build_database,
@@ -1157,6 +1220,14 @@ def create_app(
     """Create an application without opening network resources at import time."""
 
     configured_settings = settings or Settings.model_construct()
+    if plugin_publication_reservations is not None and (
+        type(plugin_publication_reservations) is not StageReservationStore
+        or plugin_publication_reservations.store_root
+        != configured_settings.plugin_package_store_dir.resolve()
+    ):
+        raise ValueError("Publication reservation store differs from configured storage")
+    if plugin_publication_reservations is not None or configured_settings.plugin_source_snapshot_store_dir is not None:
+        _plugin_snapshot_store_root(configured_settings, separate=True)
     active_runtime_registry = runtime_registry
     configure_logging(level=configured_settings.log_level)
 
@@ -1173,6 +1244,7 @@ def create_app(
             AccessTokenService(configured.jwt_signing_key_value()) if auth_service is None else None
         )
         try:
+            application.state.plugin_handover_services = None
             application.state.settings = configured
             application.state.trusted_proxy_ips = configured.trusted_proxy_ips
             application.state.bootstrap_tenant_id = configured.bootstrap_tenant_id
@@ -1186,6 +1258,13 @@ def create_app(
                     environment_manager=CapabilityEnvironmentManager(
                         configured.capability_environment_root_dir,
                         quota_bytes=configured.capability_environment_disk_quota_bytes,
+                        cli_probe=(
+                            None if configured.execution_scope_policy_file is None
+                            else build_scoped_cli_probe(
+                                configured.execution_scope_policy_file,
+                                _execution_scope_protected_paths(configured),
+                            )
+                        ),
                     )
                 )
             if getattr(application.state, "project_workspace_store", None) is None:
@@ -1241,6 +1320,58 @@ def create_app(
                     active_sessions,
                     SecretCipher(configured.master_key_bytes()),
                 )
+                from agent_hub.files.workspace import ProjectWorkspaceStore
+                from agent_hub.plugins.handover_confirmation import (
+                    GeneratedPluginConfirmationService,
+                )
+                from agent_hub.plugins.handover_grants import DurableSourceGrantService
+                from agent_hub.plugins.handover_plans import GeneratedPluginPlanService
+                from agent_hub.plugins.handover_public import GeneratedPluginHandoverService
+                from agent_hub.plugins.handover_snapshots import (
+                    FrozenSourceSnapshotStore,
+                    InvalidSnapshot,
+                    SnapshotUnavailable,
+                )
+                from agent_hub.plugins.handover_sources import HandoverSourceService
+                from agent_hub.plugins.handover_storage import PluginHandoverStorage
+
+                # Missing or unsafe storage disables this lifecycle, not the whole API.
+                # Never replace durable authorization with an in-memory fallback.
+                try:
+                    handover_snapshots = FrozenSourceSnapshotStore(
+                        package_root=_plugin_snapshot_store_root(
+                            configured, separate=plugin_publication_reservations is not None,
+                        )
+                    )
+                except (InvalidSnapshot, SnapshotUnavailable) as error:
+                    _LOGGER.warning(
+                        "plugin_handover_unavailable error_type=%s", type(error).__name__
+                    )
+                else:
+                    handover_storage = PluginHandoverStorage(active_sessions)
+                    handover_grants = DurableSourceGrantService()
+                    handover_sources = HandoverSourceService(
+                        runs=RunRepository(active_sessions),
+                        workspaces=cast(
+                            ProjectWorkspaceStore, application.state.project_workspace_store
+                        ),
+                        generated_root=configured.generated_artifact_dir,
+                    )
+                    application.state.plugin_handover_services = GeneratedPluginHandoverService(
+                        plans=GeneratedPluginPlanService(
+                            sources=handover_sources,
+                            snapshots=handover_snapshots,
+                            grants=handover_grants,
+                            storage=handover_storage,
+                        ),
+                        confirmation=GeneratedPluginConfirmationService(
+                            storage=handover_storage,
+                            snapshots=handover_snapshots,
+                            grants=handover_grants,
+                        ),
+                        storage=handover_storage,
+                        grants=handover_grants,
+                    )
             if admin_resource_service is None and active_sessions is not None:
                 assert active_secret_service is not None
                 application.state.admin_resource_service = admin.PersistentAdminResourceService(
@@ -1267,10 +1398,38 @@ def create_app(
                         else application.state.admin_resource_service,
                     )
                     capability_run_repository = RunRepository(active_sessions)
+                    selected_plugin_factory = plugin_adapter_factory
+                    selected_mcp_factory = mcp_client_factory
+                    application.state.execution_scope_policy_status = "disabled"
+                    if configured.execution_scope_policy_file is not None:
+                        if plugin_adapter_factory is not None or mcp_client_factory is not None:
+                            raise ValueError("Execution policy and injected selectors are mutually exclusive")
+                        protected_scope_paths = _execution_scope_protected_paths(configured)
+                        try:
+                            scope_policy = load_execution_scope_policy(
+                                configured.execution_scope_policy_file,
+                                protected_paths=protected_scope_paths,
+                                environment_manager=getattr(
+                                    application.state.capability_installer_service,
+                                    "_environment_manager", None,
+                                ),
+                                authorized_workspace_root=configured.project_workspace_dir,
+                            )
+                        except (OSError, ValueError):
+                            selected_plugin_factory = lambda tenant, plugin: {}
+                            selected_mcp_factory = build_scoped_mcp_client_factory(
+                                _unavailable_scoped_stdio_factory
+                            )
+                            application.state.execution_scope_policy_status = "unavailable"
+                        else:
+                            selected_plugin_factory = scope_policy.plugin_adapters
+                            selected_mcp_factory = scope_policy.mcp_client_factory
+                            application.state.execution_scope_policy_status = "loaded"
                     runtime_mcp_service = await build_runtime_mcp_service(
                         tenant_id=configured.bootstrap_tenant_id,
                         admin_service=admin_service_for_capabilities,
                         run_repository=capability_run_repository,
+                        client_factory=selected_mcp_factory,
                     )
                     application.state.mcp_service = runtime_mcp_service
                     runtime_config_invalidation_bus = RuntimeConfigInvalidationBus(
@@ -1316,6 +1475,7 @@ def create_app(
                         tenant_id=configured.bootstrap_tenant_id,
                         admin_service=admin_service_for_capabilities,
                         dependency_policy=plugin_dependency_policy,
+                        adapter_factory=selected_plugin_factory,
                         adapters=build_plugin_package_subprocess_adapters(
                             enabled=configured.plugin_package_subprocess_runner_enabled,
                             adapter_ids=tuple(configured.plugin_package_subprocess_adapter_ids),
@@ -1332,6 +1492,18 @@ def create_app(
                                 configured.plugin_package_subprocess_max_stdout_bytes
                             ),
                             dependency_policy=plugin_dependency_policy,
+                            protected_paths=(
+                                configured.skill_store_dir,
+                                configured.plugin_package_dependency_cache_dir,
+                                configured.attachment_store_dir,
+                                configured.generated_artifact_dir,
+                                configured.project_workspace_dir,
+                                configured.capability_environment_root_dir,
+                                Path(__file__).resolve().parent,
+                                Path.cwd() / ".env",
+                                Path("/etc/agent-hub"),
+                                Path("/run/agent-hub"),
+                            ),
                         ),
                     )
                     application.state.plugin_service = runtime_plugin_service
@@ -1680,6 +1852,8 @@ def create_app(
     application.state.feishu_websocket_task = None
     application.state.multimedia_generation_executor = None
     application.state.project_workspace_store = None
+    application.state.plugin_handover_services = None
+    application.state.plugin_publication_reservations = plugin_publication_reservations
     application.state.preview_manager = (
         previews.WebPreviewService(preview_manager) if preview_manager is not None else None
     )
@@ -1714,6 +1888,7 @@ def create_app(
     application.router.routes.extend(auth.router.routes)
     application.router.routes.extend(config.router.routes)
     application.router.routes.extend(runs.router.routes)
+    application.router.routes.extend(plugin_handovers.router.routes)
     application.router.routes.extend(runs.admin_queue_router.routes)
     application.router.routes.extend(workspaces.router.routes)
     application.router.routes.extend(previews.router.routes)

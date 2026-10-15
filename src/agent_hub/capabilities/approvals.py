@@ -3,7 +3,8 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-from collections.abc import Awaitable, Callable
+import re
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Protocol
@@ -26,6 +27,52 @@ class ApprovalRejected(RuntimeError):
     pass
 
 
+@dataclass(frozen=True, slots=True)
+class PluginApprovalIdentity:
+    plugin_id: str
+    capability_id: str
+
+    def __post_init__(self) -> None:
+        if (
+            re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,127}", self.plugin_id) is None
+            or re.fullmatch(r"[a-z0-9][a-z0-9_.-]{0,127}", self.capability_id) is None
+        ):
+            raise ValueError("plugin approval identity is invalid")
+
+
+def plugin_approval_identity(
+    source: object | None, request: CapabilityRequest,
+) -> PluginApprovalIdentity | None:
+    """Resolve only loaded tenant configuration; request arguments are never identity."""
+    manifests = getattr(source, "manifests_for_tenant", None)
+    policy_parts = getattr(source, "capability_policy_parts", None)
+    if not callable(manifests) or not callable(policy_parts):
+        return None
+    try:
+        manifest = manifests(request.tenant_id)
+        if not isinstance(manifest, Mapping):
+            return None
+        items = manifest.get("capabilities")
+        if not isinstance(items, tuple | list):
+            return None
+        matches: list[PluginApprovalIdentity] = []
+        expected = (request.capability, request.operation, normalize_resource(request.resource))
+        for item in items:
+            if not isinstance(item, Mapping) or item.get("kind") != "plugin":
+                continue
+            if item.get("available") is not True:
+                continue
+            capability_id, plugin_id = item.get("id"), item.get("plugin_id")
+            if not isinstance(capability_id, str) or not isinstance(plugin_id, str):
+                continue
+            if policy_parts(request.tenant_id, capability_id) != expected:
+                continue
+            matches.append(PluginApprovalIdentity(plugin_id, capability_id))
+        return matches[0] if len(matches) == 1 else None
+    except Exception:  # noqa: BLE001 - uncertain discovery never supplies public evidence.
+        return None
+
+
 class RunStatusRepository(Protocol):
     async def begin_capability_approval(
         self,
@@ -35,6 +82,8 @@ class RunStatusRepository(Protocol):
         approval_id: str,
         approval_fingerprint: str,
         approval_scope: str | None = None,
+        actor_id: UUID | None = None,
+        plugin_identity: PluginApprovalIdentity | None = None,
     ) -> object: ...
 
     async def resolve_capability_approval(

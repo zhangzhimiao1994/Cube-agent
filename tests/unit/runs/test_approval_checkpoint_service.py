@@ -256,6 +256,23 @@ async def test_service_drains_unpersisted_request_and_stale_checkpoint(hybrid: b
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("hybrid", [False, True])
+async def test_actual_execute_drain_preserves_version_of_pending_request(hybrid: bool) -> None:
+    class VersionedApprovalRepository(ApprovalRepository):
+        def begin_approval(self) -> None:
+            super().begin_approval()
+            self.row.version += 1
+            self.request_version = self.row.version
+
+    repository = VersionedApprovalRepository()
+    runtime = QueuedApprovalRuntime(repository, hybrid=hybrid)
+    result = await make_service(repository, runtime).execute(repository.run_id)
+    assert result.status is RunStatus.WAITING_APPROVAL
+    assert repository.approval_observations == [False, False, True]
+    assert repository.row.version == repository.request_version
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("ending", ["runtime.failed", "runtime.cancelled", "runtime.completed"])
 async def test_drain_does_not_disguise_terminal_events(ending: str) -> None:
     repository = ApprovalRepository()

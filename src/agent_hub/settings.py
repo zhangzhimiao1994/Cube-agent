@@ -63,6 +63,7 @@ class Settings(BaseSettings):
     web_dir: Path | None = None
     skill_store_dir: Path = Path("/var/lib/agent-hub/skills")
     plugin_package_store_dir: Path = Path("/var/lib/agent-hub/plugin-packages")
+    plugin_source_snapshot_store_dir: Path | None = None
     capability_environment_root_dir: Path = Field(
         default_factory=_default_capability_environment_root_dir
     )
@@ -72,6 +73,7 @@ class Settings(BaseSettings):
         le=1_099_511_627_776,
     )
     plugin_package_subprocess_runner_enabled: bool = False
+    execution_scope_policy_file: Path | None = None
     plugin_package_subprocess_adapter_ids: frozenset[str] = Field(
         default=frozenset(),
         max_length=32,
@@ -113,6 +115,22 @@ class Settings(BaseSettings):
         default="default", min_length=1, max_length=64, pattern=r"^[a-z0-9][a-z0-9-]*$"
     )
     bootstrap_tenant_name: str = Field(default="Default", min_length=1, max_length=200)
+
+    @field_validator("execution_scope_policy_file")
+    @classmethod
+    def _absolute_execution_scope_policy_file(cls, value: Path | None) -> Path | None:
+        if value is not None and not value.is_absolute():
+            raise ValueError("Execution scope policy file must be absolute")
+        return value
+
+    @field_validator("plugin_source_snapshot_store_dir")
+    @classmethod
+    def _snapshot_store_directory(cls, value: Path | None) -> Path | None:
+        if value is not None and (
+            not value.is_absolute() or value == Path(value.anchor) or ".." in value.parts
+        ):
+            raise ValueError("Source snapshot store must be an absolute non-root directory")
+        return value
 
     @field_validator("jwt_signing_key", mode="after")
     @classmethod

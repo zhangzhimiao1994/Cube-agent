@@ -76,17 +76,11 @@ class FakePluginAcceptanceClient:
                 "enabled": False,
                 "approved": True,
             }
-        self.signing_keys = (
-            {"plugin-uat-key-flow-123"} if existing_resource else set()
-        )
+        self.signing_keys = {"plugin-uat-key-flow-123"} if existing_resource else set()
 
     def capability_is_active(self) -> bool:
         plugin = self.installed_plugins.get(self.plugin_id)
-        return bool(
-            plugin
-            and plugin.get("enabled") is True
-            and plugin.get("status") == "running"
-        )
+        return bool(plugin and plugin.get("enabled") is True and plugin.get("status") == "running")
 
     def request_archive(
         self,
@@ -191,9 +185,7 @@ class FakePluginAcceptanceClient:
             if self.cancel_requested:
                 self.cancel_detail_polls += 1
             status = (
-                "cancelled"
-                if self.cancel_requested and self.cancel_effective
-                else self.run_status
+                "cancelled" if self.cancel_requested and self.cancel_effective else self.run_status
             )
             execution_quiescent = (
                 status in {"completed", "failed"} and self.terminal_quiescent
@@ -328,6 +320,370 @@ class PrincipalClient:
 
 def _operator(client: FakePluginAcceptanceClient) -> PrincipalClient:
     return PrincipalClient(client, user_id=USER_ID, role="operator")
+
+
+class ApprovalPluginAcceptanceClient(FakePluginAcceptanceClient):
+    def __init__(
+        self,
+        *,
+        detail_changes: dict[str, object] | None = None,
+        event_changes: dict[str, object] | None = None,
+        payload_changes: dict[str, object] | None = None,
+        recheck_changes: dict[str, object] | None = None,
+        event_state: str = "pending",
+        repeated: bool = False,
+        approval_response_lost: bool = False,
+        post_approval_details_unavailable: bool = False,
+        ready_values: tuple[object, ...] = (True,),
+        omit_ready: bool = False,
+    ) -> None:
+        super().__init__()
+        self.plugin_id = "trusted-plugin"
+        self.capability_id = "calendar.create_event"
+        self.detail_changes = detail_changes or {}
+        self.event_changes = event_changes or {}
+        self.payload_changes = payload_changes or {}
+        self.recheck_changes = recheck_changes or {}
+        self.event_state = event_state
+        self.repeated = repeated
+        self.approval_response_lost = approval_response_lost
+        self.post_approval_details_unavailable = post_approval_details_unavailable
+        self.ready_values = ready_values
+        self.omit_ready = omit_ready
+        self.approval_reads = 0
+        self.details_reads = 0
+        self.approval_bodies: list[dict[str, object] | None] = []
+
+    def request_json(
+        self,
+        method: str,
+        path: str,
+        *,
+        body: dict[str, object] | None = None,
+        idempotency_key: str | None = None,
+    ) -> dict[str, object] | list[object]:
+        waiting = not self.approval_bodies or self.repeated or self.approval_response_lost
+        if (
+            method == "GET"
+            and path == f"/api/v1/runs/{RUN_ID}/details"
+            and self.approval_bodies
+            and self.post_approval_details_unavailable
+        ):
+            self.requests.append((method, path))
+            raise ConnectionError("post-approval details unavailable")
+        if (
+            method == "GET"
+            and path == f"/api/v1/runs/{RUN_ID}/details"
+            and waiting
+            and not self.cancel_requested
+        ):
+            self.requests.append((method, path))
+            self.details_reads += 1
+            details: dict[str, object] = {
+                "id": RUN_ID,
+                "status": "waiting_approval",
+                "approval_id": "approval-1",
+                "version": 2,
+                **self.detail_changes,
+            }
+            if self.details_reads > 1:
+                details.update(self.recheck_changes)
+            return details
+        if method == "GET" and path == f"/api/v1/runs/{RUN_ID}/capability-approvals" and waiting:
+            self.requests.append((method, path))
+            self.approval_reads += 1
+            if self.event_state == "unavailable":
+                raise ConnectionError("approval events unavailable")
+            event: dict[str, object] = {
+                "kind": "approval.requested",
+                "run_id": RUN_ID,
+                "approval_id": "approval-1",
+                "sequence": 1,
+                "actor": "plugin",
+                "action": "plugin.invoke",
+                "reason": "fixture approval",
+                "payload": {
+                    "plugin_id": self.plugin_id,
+                    "capability_id": self.capability_id,
+                    "version": 2,
+                    **self.payload_changes,
+                },
+                **self.event_changes,
+            }
+            items = [] if self.event_state == "missing" else [event]
+            if self.event_state == "duplicate":
+                items.append(dict(event))
+            if self.event_state == "resolved":
+                items.append({**event, "kind": "approval.resolved", "sequence": 2})
+            if self.event_state == "other_pending":
+                items.append({**event, "approval_id": "approval-other", "sequence": 2})
+            response: dict[str, object] = {"items": items}
+            if not self.omit_ready:
+                response["ready"] = self.ready_values[min(self.approval_reads - 1, len(self.ready_values) - 1)]
+            return response
+        if method == "POST" and path == f"/api/v1/runs/{RUN_ID}/approve-capability":
+            self.requests.append((method, path))
+            self.approval_bodies.append(body)
+            if self.approval_response_lost:
+                raise ConnectionError("approval response was lost")
+            return {"id": RUN_ID, "status": "queued", "version": 3}
+        return super().request_json(method, path, body=body, idempotency_key=idempotency_key)
+
+
+class ApprovalPollClock:
+    def __init__(self) -> None:
+        self.elapsed = 0.0
+        self.sleeps: list[float] = []
+
+    def monotonic(self) -> float:
+        return self.elapsed
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.elapsed += seconds
+
+
+def test_public_plugin_approval_waits_for_ready_then_posts_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_script()
+    clock = ApprovalPollClock()
+    monkeypatch.setattr(module, "time", clock)
+    backend = ApprovalPluginAcceptanceClient(ready_values=(False, False, False, True))
+    details = module._poll_run(
+        backend, RUN_ID, expected_plugin_id=backend.plugin_id,
+        expected_capability_id=backend.capability_id, wait_seconds=2, poll_interval_seconds=0.25,
+    )
+    assert details["status"] == "completed"
+    assert clock.sleeps == [0.25, 0.25, 0.25, 0.25]
+    assert backend.approval_bodies == [{"approval_id": "approval-1", "version": 2}]
+    assert backend.requests == [
+        ("GET", f"/api/v1/runs/{RUN_ID}/details"),
+        ("GET", f"/api/v1/runs/{RUN_ID}/capability-approvals"),
+    ] * 4 + [
+        ("GET", f"/api/v1/runs/{RUN_ID}/details"),
+        ("POST", f"/api/v1/runs/{RUN_ID}/approve-capability"),
+        ("GET", f"/api/v1/runs/{RUN_ID}/details"),
+    ]
+
+
+def test_public_plugin_approval_not_ready_times_out_without_post_or_freeze(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_script()
+    clock = ApprovalPollClock()
+    monkeypatch.setattr(module, "time", clock)
+    backend = ApprovalPluginAcceptanceClient(ready_values=(False,))
+    with pytest.raises(RuntimeError, match="did not reach a terminal status") as error:
+        module._poll_run(
+            backend, RUN_ID, expected_plugin_id=backend.plugin_id,
+            expected_capability_id=backend.capability_id, wait_seconds=0.5, poll_interval_seconds=0.25,
+        )
+    assert not isinstance(error.value, module.FrozenPluginApproval)
+    assert clock.sleeps == [0.25, 0.25]
+    assert backend.approval_reads == 3
+    assert backend.approval_bodies == []
+    assert all(method == "GET" for method, _ in backend.requests)
+
+
+@pytest.mark.parametrize("ready,omit", [(None, True), (None, False), (0, False), (1, False),
+                                        ("true", False), ("false", False), ([], False), ({}, False)])
+def test_public_plugin_approval_missing_or_nonbool_ready_freezes(
+    ready: object, omit: bool,
+) -> None:
+    module = _load_script()
+    backend = ApprovalPluginAcceptanceClient(ready_values=(ready,), omit_ready=omit)
+    with pytest.raises(module.FrozenPluginApproval, match="readiness"):
+        module._poll_run(
+            backend, RUN_ID, expected_plugin_id=backend.plugin_id,
+            expected_capability_id=backend.capability_id, wait_seconds=0, poll_interval_seconds=0,
+        )
+    assert backend.approval_bodies == []
+    assert all(method == "GET" for method, _ in backend.requests)
+
+
+@pytest.mark.parametrize("ready", [False, True])
+def test_verify_public_plugin_approval_returns_validated_readiness(ready: bool) -> None:
+    module = _load_script()
+    backend = ApprovalPluginAcceptanceClient(ready_values=(ready,))
+    response = backend.request_json("GET", f"/api/v1/runs/{RUN_ID}/capability-approvals")
+    assert module._verify_plugin_approval(
+        response, run_id=RUN_ID, approval_id="approval-1", version=2,
+        plugin_id=backend.plugin_id, capability_id=backend.capability_id,
+    ) is ready
+
+
+@pytest.mark.parametrize("ready", [False, None])
+def test_public_plugin_approval_checks_binding_before_readiness(ready: object) -> None:
+    module = _load_script()
+    backend = ApprovalPluginAcceptanceClient(
+        ready_values=(ready,), payload_changes={"version": 1},
+    )
+    with pytest.raises(module.FrozenPluginApproval, match="capability binding"):
+        module._poll_run(
+            backend, RUN_ID, expected_plugin_id=backend.plugin_id,
+            expected_capability_id=backend.capability_id, wait_seconds=0, poll_interval_seconds=0,
+        )
+    assert backend.approval_bodies == []
+
+
+def test_public_plugin_approval_requires_exact_binding(tmp_path: Path) -> None:
+    module = _load_script()
+    backend = ApprovalPluginAcceptanceClient()
+    report = module.run_real_user_plugin_acceptance(
+        backend,
+        operator_client=_operator(backend),
+        execution_id="bound-approval",
+        package_dir=tmp_path,
+        wait_seconds=1,
+        poll_interval_seconds=0,
+    )
+    assert report["acceptance_complete"] is True
+    assert backend.approval_bodies == [{"approval_id": "approval-1", "version": 2}]
+    assert backend.details_reads >= 2
+    assert report["source_basis"] == "controlled_fixture"
+    assert report["generated_source_acceptance"] is False
+
+
+@pytest.mark.parametrize(
+    ("section", "changes"),
+    [
+        ("detail", {"id": "foreign-run"}),
+        ("detail", {"id": None}),
+        ("detail", {"approval_id": None}),
+        ("detail", {"approval_id": ""}),
+        ("detail", {"approval_id": "   "}),
+        ("detail", {"version": None}),
+        ("detail", {"version": True}),
+        ("detail", {"version": 0}),
+        ("detail", {"version": "2"}),
+        ("event", {"run_id": "foreign-run"}),
+        ("event", {"run_id": None}),
+        ("event", {"approval_id": "foreign-approval"}),
+        ("event", {"approval_id": None}),
+        ("event", {"kind": "tool.requested"}),
+        ("payload", {"plugin_id": "foreign-plugin"}),
+        ("payload", {"plugin_id": None}),
+        ("payload", {"capability_id": "foreign-capability"}),
+        ("payload", {"capability_id": None}),
+        ("payload", {"version": 1}),
+        ("payload", {"version": None}),
+        ("payload", {"version": True}),
+    ],
+)
+def test_unbound_public_plugin_approval_freezes_without_writes(
+    tmp_path: Path, section: str, changes: dict[str, object]
+) -> None:
+    module = _load_script()
+    backend = ApprovalPluginAcceptanceClient(
+        detail_changes=changes if section == "detail" else None,
+        event_changes=changes if section == "event" else None,
+        payload_changes=changes if section == "payload" else None,
+    )
+    report = module.run_real_user_plugin_acceptance(
+        backend,
+        operator_client=_operator(backend),
+        execution_id="unbound-approval",
+        package_dir=tmp_path,
+        wait_seconds=0,
+        poll_interval_seconds=0,
+    )
+    assert report["acceptance_complete"] is False
+    assert report["cleanup_state"] == "frozen_waiting_for_approval_binding"
+    assert report["run_cleanup_blocked"] is True
+    assert report["recovery"]["frozen"] is True
+    assert all(step["method"] == "GET" for step in report["recovery"]["steps"])
+    assert backend.approval_bodies == []
+    assert not backend.cancel_requested
+    assert backend.capability_is_active()
+    assert backend.signing_keys
+
+
+@pytest.mark.parametrize(
+    "event_state", ["missing", "duplicate", "resolved", "other_pending", "unavailable"]
+)
+def test_uncertain_public_plugin_approval_events_freeze(tmp_path: Path, event_state: str) -> None:
+    module = _load_script()
+    backend = ApprovalPluginAcceptanceClient(event_state=event_state)
+    report = module.run_real_user_plugin_acceptance(
+        backend,
+        operator_client=_operator(backend),
+        execution_id="uncertain-approval",
+        package_dir=tmp_path,
+        wait_seconds=0,
+        poll_interval_seconds=0,
+    )
+    assert report["cleanup_state"] == "frozen_waiting_for_approval_binding"
+    assert backend.approval_bodies == []
+    assert not backend.cancel_requested
+    assert backend.capability_is_active()
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"version": 3},
+        {"approval_id": "approval-other"},
+        {"id": "foreign-run"},
+        {"status": "running"},
+    ],
+)
+def test_public_plugin_approval_rechecks_binding_before_post(
+    tmp_path: Path, changes: dict[str, object]
+) -> None:
+    module = _load_script()
+    backend = ApprovalPluginAcceptanceClient(recheck_changes=changes)
+    report = module.run_real_user_plugin_acceptance(
+        backend,
+        operator_client=_operator(backend),
+        execution_id="changed-approval",
+        package_dir=tmp_path,
+        wait_seconds=0,
+        poll_interval_seconds=0,
+    )
+    assert report["cleanup_state"] == "frozen_waiting_for_approval_binding"
+    assert backend.approval_bodies == []
+    assert not backend.cancel_requested
+
+
+@pytest.mark.parametrize("response_lost", [False, True])
+def test_public_plugin_approval_never_replays_or_cleans_up_unknown_approval(
+    tmp_path: Path, response_lost: bool
+) -> None:
+    module = _load_script()
+    backend = ApprovalPluginAcceptanceClient(
+        repeated=not response_lost, approval_response_lost=response_lost
+    )
+    report = module.run_real_user_plugin_acceptance(
+        backend,
+        operator_client=_operator(backend),
+        execution_id="once-only-approval",
+        package_dir=tmp_path,
+        wait_seconds=1,
+        poll_interval_seconds=0,
+    )
+    assert report["acceptance_complete"] is False
+    assert report["cleanup_state"] == "frozen_waiting_for_approval_binding"
+    assert backend.approval_bodies == [{"approval_id": "approval-1", "version": 2}]
+    assert not backend.cancel_requested
+    assert backend.capability_is_active()
+
+
+def test_public_plugin_approval_freezes_when_result_cannot_be_read(tmp_path: Path) -> None:
+    module = _load_script()
+    backend = ApprovalPluginAcceptanceClient(post_approval_details_unavailable=True)
+    report = module.run_real_user_plugin_acceptance(
+        backend,
+        operator_client=_operator(backend),
+        execution_id="unreadable-approval-result",
+        package_dir=tmp_path,
+        wait_seconds=0,
+        poll_interval_seconds=0,
+    )
+    assert report["cleanup_state"] == "frozen_waiting_for_approval_binding"
+    assert backend.approval_bodies == [{"approval_id": "approval-1", "version": 2}]
+    assert not backend.cancel_requested
+    assert backend.capability_is_active()
 
 
 def test_real_user_plugin_acceptance_separates_admin_and_operator_paths(
@@ -657,7 +1013,9 @@ def test_real_user_plugin_acceptance_cleans_up_after_evidence_failure(tmp_path: 
     assert any(path.endswith("/disable") for _, path in client.requests)
     assert any(path.endswith("/stop") for _, path in client.requests)
     assert any(path.endswith("/uninstall") for _, path in client.requests)
-    assert any(path.startswith("/api/v1/admin/plugins/signing-keys/") for _, path in client.requests)
+    assert any(
+        path.startswith("/api/v1/admin/plugins/signing-keys/") for _, path in client.requests
+    )
 
 
 def test_real_user_plugin_acceptance_cancels_nonterminal_run_before_cleanup(
@@ -784,12 +1142,22 @@ def test_run_disappearance_never_bypasses_execution_quiescence(status_code: int)
         )
 
 
-def test_temporary_operator_cleanup_error_preserves_deferred_recovery_state() -> None:
+@pytest.mark.parametrize(
+    "cleanup_state",
+    [
+        "deferred_waiting_for_execution_quiescence",
+        "deferred_waiting_for_run_identity",
+        "frozen_waiting_for_approval_binding",
+    ],
+)
+def test_temporary_operator_cleanup_error_preserves_deferred_recovery_state(
+    cleanup_state: str,
+) -> None:
     module = _load_script()
     report = {
         "status": "failed",
         "acceptance_complete": False,
-        "cleanup_state": "deferred_waiting_for_execution_quiescence",
+        "cleanup_state": cleanup_state,
         "recovery": {"required": True, "steps": [{"method": "GET", "path": "/details"}]},
         "errors": [],
     }
@@ -800,7 +1168,7 @@ def test_temporary_operator_cleanup_error_preserves_deferred_recovery_state() ->
         errors=["delete_user: execution still active"],
     )
 
-    assert report["cleanup_state"] == "deferred_waiting_for_execution_quiescence"
+    assert report["cleanup_state"] == cleanup_state
     recovery = report["recovery"]
     assert isinstance(recovery, dict)
     assert recovery["required"] is True
@@ -897,7 +1265,9 @@ def test_real_user_plugin_acceptance_cleans_up_after_lost_install_response(
 
     assert report["status"] == "failed"
     assert any(path.endswith("/uninstall") for _, path in client.requests)
-    assert any(path.startswith("/api/v1/admin/plugins/signing-keys/") for _, path in client.requests)
+    assert any(
+        path.startswith("/api/v1/admin/plugins/signing-keys/") for _, path in client.requests
+    )
 
 
 def test_real_user_plugin_acceptance_fails_when_signing_key_remains(
@@ -1075,6 +1445,8 @@ def test_ambiguous_run_submission_http_error_defers_cleanup_fail_closed(
     assert report["cleanup_state"] == "deferred_waiting_for_run_identity"
     assert report["run_cleanup_blocked"] is True
     assert report["recovery"]["reason"] == "run_submission_result_unknown"
+    assert report["recovery"]["frozen"] is True
+    assert all(step["method"] == "GET" for step in report["recovery"]["steps"])
     assert backend.installed_plugins
     assert backend.signing_keys
     assert not any(path.endswith("/uninstall") for _, path in admin.requests)
@@ -1175,8 +1547,9 @@ class CliClientFactory:
         run_response_lost: bool = False,
         operator_user_id: str = USER_ID,
         operator_tenant_id: str = "tenant-1",
+        backend: FakePluginAcceptanceClient | None = None,
     ) -> None:
-        self.backend = FakePluginAcceptanceClient(run_response_lost=run_response_lost)
+        self.backend = backend or FakePluginAcceptanceClient(run_response_lost=run_response_lost)
         self.admin = CliAdminClient(
             self.backend,
             create_response_lost=create_response_lost,
@@ -1336,19 +1709,46 @@ def test_cli_defers_all_cleanup_when_run_submission_response_is_lost(
     assert recovery["required"] is True
     assert recovery["reason"] == "run_submission_result_unknown"
     assert recovery["run_id"] is None
-    replay_submission = recovery["steps"][0]
-    assert replay_submission["method"] == "POST"
-    assert replay_submission["path"] == "/api/v1/runs"
-    assert replay_submission["body"]["mode"] == "dispatch"
-    assert replay_submission["body"]["skip_evolution_proposal"] is True
-    assert report["capability_id"] in replay_submission["body"]["message"]
-    assert replay_submission["idempotency_key"] == factory.backend.run_idempotency_keys[0]
-    assert replay_submission["capture"] == {"run_id": "id"}
-    assert recovery["steps"][1] == {
-        "method": "GET",
-        "path": "/api/v1/runs/{run_id}/details",
-        "require": {"execution_quiescent": True},
-    }
+    assert recovery["frozen"] is True
+    assert recovery["steps"] == []
+    lookup = recovery["identity_lookup"]
+    assert lookup["read_only"] is True
+    assert lookup["available"] is False
+    assert lookup["idempotency_key"] == factory.backend.run_idempotency_keys[0]
+    assert lookup["run_request"]["mode"] == "dispatch"
+    assert report["capability_id"] in lookup["run_request"]["message"]
+    assert factory.backend.run_idempotency_keys == [lookup["idempotency_key"]]
+
+
+@pytest.mark.parametrize("response_lost", [False, True])
+def test_cli_preserves_temporary_operator_and_read_only_recovery_on_frozen_approval(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, response_lost: bool
+) -> None:
+    module = _load_script()
+    backend = ApprovalPluginAcceptanceClient(
+        payload_changes={} if response_lost else {"plugin_id": "foreign-plugin"},
+        approval_response_lost=response_lost,
+    )
+    factory = CliClientFactory(backend=backend)
+    for name in ("USERNAME", "PASSWORD", "TENANT_ID"):
+        monkeypatch.delenv(f"AGENT_HUB_ACCEPTANCE_OPERATOR_{name}", raising=False)
+    monkeypatch.setattr(
+        module,
+        "_acceptance_credentials_from_env",
+        lambda: ("admin-user", "admin-password", "tenant-1"),
+    )
+    monkeypatch.setattr(module, "UrllibPluginAcceptanceClient", factory)
+    report_path = tmp_path / "report.json"
+    assert module.main(["--output", str(report_path), "--poll-interval", "0"]) == 1
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["cleanup_state"] == "frozen_waiting_for_approval_binding"
+    assert report["recovery"]["frozen"] is True
+    assert {step["method"] for step in report["recovery"]["steps"]} == {"GET"}
+    assert factory.admin.temporary_users
+    assert not any(method == "DELETE" for method, _ in factory.admin.requests)
+    assert not backend.cancel_requested
+    assert backend.capability_is_active()
+    assert len(backend.approval_bodies) == int(response_lost)
 
 
 def test_cli_removes_temporary_operator_when_operator_client_creation_fails(
@@ -1482,9 +1882,7 @@ def test_cli_rejects_operator_login_id_that_differs_from_created_user(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     module = _load_script()
-    factory = CliClientFactory(
-        operator_user_id="33333333-3333-4333-8333-333333333333"
-    )
+    factory = CliClientFactory(operator_user_id="33333333-3333-4333-8333-333333333333")
     monkeypatch.delenv("AGENT_HUB_ACCEPTANCE_OPERATOR_USERNAME", raising=False)
     monkeypatch.delenv("AGENT_HUB_ACCEPTANCE_OPERATOR_PASSWORD", raising=False)
     monkeypatch.setattr(

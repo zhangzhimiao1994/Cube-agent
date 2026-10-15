@@ -4,6 +4,7 @@ import { createPortal } from "react-dom";
 import { Link, useParams } from "react-router-dom";
 
 import { api, formatApiError, type RunDetail } from "../api/client";
+import { PluginHandoverPanel } from "../components/PluginHandoverPanel";
 import {
   ArtifactFileCard,
   artifactFileName,
@@ -3586,7 +3587,7 @@ export function RunDetailPage() {
   });
 
   if (run.isLoading) return <p>正在加载运行详情...</p>;
-  if (run.isError || !run.data) {
+  if (!run.data) {
     return <p role="alert">{formatApiError(run.error, "运行详情加载失败")}</p>;
   }
 
@@ -3643,6 +3644,9 @@ export function RunDetailPage() {
     <section>
       <p className="eyebrow">Run detail</p>
       <h2>运行详情</h2>
+      {run.isError ? <p role="alert" aria-label="运行详情刷新失败">
+        运行详情刷新失败，当前显示上次成功读取的数据。
+      </p> : null}
       <p>
         <Link to="/">返回对话任务</Link>
       </p>
@@ -3978,6 +3982,10 @@ export function RunDetailPage() {
       ) : null}
 
       <DetailProcessSummary cards={processCards} webPreviewScope={webPreviewScope} />
+      <PluginHandoverPanel key={runId} runId={runId} artifacts={run.data.artifacts}
+        workspaceScope={run.data.id === runId && run.data.explicit_details.project_id && run.data.explicit_details.workspace_session_id
+          ? { projectId: run.data.explicit_details.project_id, sessionId: run.data.explicit_details.workspace_session_id }
+          : undefined} />
 
       {failureDiagnostics.length > 0 ? (
         <section className="run-failure-diagnostics" aria-label="故障诊断">

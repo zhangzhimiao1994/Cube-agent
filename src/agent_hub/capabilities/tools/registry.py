@@ -252,6 +252,7 @@ class PluginConfigCapabilityManifestSource:
                 item: dict[str, JsonValue] = {
                     "id": capability.id,
                     "kind": "plugin",
+                    "plugin_id": plugin.id,
                     "adapter": capability.adapter,
                     "permission_class": capability.permission_class,
                     "sandbox_profile": capability.sandbox_profile,

@@ -16,6 +16,7 @@ import shutil
 import stat
 import sys
 import tarfile
+import tempfile
 import time
 import zipfile
 from collections.abc import (
@@ -27,11 +28,12 @@ from collections.abc import (
     Mapping,
     Sequence,
 )
+from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path, PurePosixPath
 from threading import Lock
-from typing import Annotated, Any, Literal, Protocol, cast, get_args
+from typing import Annotated, Any, Literal, Protocol, Self, cast, get_args
 from urllib.parse import unquote, urlsplit, urlunsplit
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
@@ -44,6 +46,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    PrivateAttr,
     SecretStr,
     ValidationError,
     ValidationInfo,
@@ -1472,6 +1475,170 @@ class PluginResourceResponse(PluginResourceRequest):
 type PluginActivationPreflight = Callable[[PluginResourceResponse], Awaitable[None]]
 
 
+@dataclass
+class _PluginAuditWrite:
+    action: str
+    details: dict[str, object]
+    actor_id: UUID | None
+    committed: bool = False
+
+
+@dataclass(frozen=True)
+class _PluginRegistrationSnapshot:
+    tenant_id: UUID
+    plugin_id: str
+    row_id: UUID
+    payload_sha256: str
+    handover_id: object
+
+
+def _plugin_registration_snapshot(
+    row: AdminResourceRow, tenant_id: UUID, plugin_id: str,
+) -> _PluginRegistrationSnapshot:
+    payload = json.dumps(row.payload, sort_keys=True, allow_nan=False).encode("utf-8")
+    return _PluginRegistrationSnapshot(
+        tenant_id, plugin_id, row.id, hashlib.sha256(payload).hexdigest(),
+        deepcopy(row.payload.get("_generated_handover_id")),
+    )
+
+
+class _PluginRegistrationPayload(dict[str, object]):
+    def __init__(
+        self, payload: dict[str, object], snapshot: _PluginRegistrationSnapshot,
+    ) -> None:
+        super().__init__(payload)
+        self.snapshot = snapshot
+
+
+class _PluginUninstallResponse(PluginResourceResponse):
+    _registration_snapshot: _PluginRegistrationSnapshot | None = PrivateAttr(default=None)
+
+
+class _PluginArchiveInstallRequest(PluginResourceRequest):
+    _baseline_payload: dict[str, object] = PrivateAttr(default_factory=dict)
+    _artifact_check: Callable[[], None] | None = PrivateAttr(default=None)
+
+
+class _PluginDeleteTarget(str):
+    """Private delete intent carried without changing service or legacy writer signatures."""
+
+    snapshot: _PluginRegistrationSnapshot | None
+    audit: _PluginAuditWrite | None
+    stage_package: Callable[[], None] | None
+
+    def __new__(
+        cls,
+        plugin_id: str,
+        *,
+        snapshot: _PluginRegistrationSnapshot | None = None,
+        audit: _PluginAuditWrite | None = None,
+    ) -> Self:
+        target = super().__new__(cls, plugin_id)
+        target.snapshot = snapshot
+        target.audit = audit
+        target.stage_package = None
+        return target
+
+
+class _PluginWritePayload(dict[str, object]):
+    """Internal write intent; snapshots are not serialized into registration JSON."""
+
+    def __init__(
+        self,
+        payload: dict[str, object],
+        *,
+        state_snapshot: dict[str, object] | None = None,
+        expected_payload: dict[str, object] | None = None,
+    ) -> None:
+        super().__init__(payload)
+        self.state_snapshot = deepcopy(state_snapshot)
+        self.expected_payload = deepcopy(expected_payload)
+        observed = state_snapshot if state_snapshot is not None else expected_payload
+        self.registration_snapshot = (
+            observed.snapshot if isinstance(observed, _PluginRegistrationPayload) else None
+        )
+        self.audit: _PluginAuditWrite | None = None
+        self.artifact_check: Callable[[], None] | None = None
+
+
+def _plugin_response_from_payload(payload: Mapping[str, object]) -> PluginResourceResponse:
+    return PluginResourceResponse.model_validate(
+        {key: value for key, value in payload.items() if key != "_generated_handover_id"}
+    )
+
+
+def _plugin_write_conflict() -> PublicAPIError:
+    return PublicAPIError(409, "plugin_registration_conflict", "plugin registration changed")
+
+
+def _plugin_payloads_equal(left: Mapping[str, object], right: Mapping[str, object]) -> bool:
+    try:
+        return json.dumps(left, sort_keys=True, allow_nan=False) == json.dumps(
+            right, sort_keys=True, allow_nan=False
+        )
+    except (TypeError, ValueError):
+        return False
+
+
+def _plugin_state_identity(payload: Mapping[str, object]) -> dict[str, object]:
+    identity = _plugin_response_from_payload(payload).model_dump(mode="json")
+    for key in ("enabled", "status", "health", "last_error_type"):
+        identity.pop(key, None)
+    package = identity.get("package_metadata")
+    if isinstance(package, dict):
+        for key in (
+            "approval_state", "approval_reason", "approved_by", "approved_at",
+            "activation_state", "activation_reason",
+        ):
+            package.pop(key, None)
+    return identity
+
+
+def _checked_plugin_write_payload(
+    current: dict[str, object],
+    payload: dict[str, object],
+    *,
+    state_snapshot: dict[str, object] | None = None,
+    expected_payload: dict[str, object] | None = None,
+) -> dict[str, object]:
+    marker = "_generated_handover_id"
+    if state_snapshot is None:
+        if marker in current or marker in payload:
+            raise _plugin_write_conflict()
+        if expected_payload is not None and not _plugin_payloads_equal(current, expected_payload):
+            raise _plugin_write_conflict()
+        return payload
+    # Compare the full row so a concurrent approval or lifecycle update is not lost.
+    if not current or not _plugin_payloads_equal(current, state_snapshot):
+        raise _plugin_write_conflict()
+    if marker in payload and (
+        marker not in current
+        or not _plugin_payloads_equal({marker: payload[marker]}, {marker: current[marker]})
+    ):
+        raise _plugin_write_conflict()
+    try:
+        if not _plugin_payloads_equal(
+            _plugin_state_identity(current), _plugin_state_identity(payload)
+        ):
+            raise _plugin_write_conflict()
+    except ValidationError:
+        raise _plugin_write_conflict() from None
+    updated = dict(payload)
+    if marker in current:
+        updated[marker] = current[marker]
+    return updated
+
+
+async def _acquire_plugin_registration_locks(
+    session: AsyncSession, tenant_id: UUID, plugin_ids: Iterable[str]
+) -> None:
+    # Lazy import: storage validates package models from this router.
+    from agent_hub.plugins.handover_storage import acquire_plugin_registration_lock
+
+    for plugin_id in sorted(set(plugin_ids)):
+        await acquire_plugin_registration_lock(session, tenant_id, plugin_id)
+
+
 class PluginArchiveInstallResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -1754,6 +1921,9 @@ class CapabilityManifestItemResponse(BaseModel):
     id: str = Field(min_length=1, max_length=128)
     kind: str = Field(min_length=1, max_length=64)
     adapter: str = Field(min_length=1, max_length=128)
+    plugin_id: str | None = Field(
+        default=None, min_length=1, max_length=128, exclude_if=lambda value: value is None
+    )
     permission_class: str = Field(min_length=1, max_length=128)
     sandbox_profile: str = Field(min_length=1, max_length=128)
     policy_effect: Literal["inherit", "allow", "require_approval", "deny"] = "inherit"
@@ -4815,16 +4985,22 @@ async def _current_plugin_for_activation_check(
     raise KeyError(plugin_id)
 
 
-def _plugin_activation_preflight(request: Request) -> PluginActivationPreflight:
+def _plugin_activation_preflight(
+    request: Request, *, tenant_id: UUID
+) -> PluginActivationPreflight:
     runtime = getattr(request.app.state, "plugin_service", None)
     preflight = getattr(runtime, "preflight_plugin", None)
+    scoped_preflight = getattr(runtime, "preflight_plugin_for_tenant", None)
 
     async def run(plugin: PluginResourceResponse) -> None:
-        if not callable(preflight):
+        if callable(scoped_preflight):
+            result = scoped_preflight(tenant_id, plugin)
+        elif callable(preflight):
+            result = preflight(plugin)
+        else:
             from agent_hub.capabilities.runtime import RuntimeCapabilityError
 
             raise RuntimeCapabilityError("Plugin runtime preflight unavailable")
-        result = preflight(plugin)
         if inspect.isawaitable(result):
             await result
 
@@ -4839,6 +5015,20 @@ def _plugin_activation_snapshot_sha256(plugin: PluginResourceResponse) -> str:
         separators=(",", ":"),
     ).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
+
+
+def _plugin_uninstall_snapshot_sha256(plugin: PluginResourceResponse) -> str:
+    public_hash = _plugin_activation_snapshot_sha256(plugin)
+    snapshot = (
+        plugin._registration_snapshot if isinstance(plugin, _PluginUninstallResponse) else None
+    )
+    if snapshot is None:
+        return public_hash
+    identity = (
+        str(snapshot.tenant_id), snapshot.plugin_id, str(snapshot.row_id),
+        snapshot.payload_sha256, public_hash,
+    )
+    return hashlib.sha256(json.dumps(identity).encode("utf-8")).hexdigest()
 
 
 async def _run_plugin_activation_preflight(
@@ -5151,6 +5341,30 @@ def _plugin_package_store_root(request: Request) -> Path:
     return Path(configured)
 
 
+def _plugin_package_filesystem_path(path: Path) -> Path:
+    if sys.platform != "win32":
+        return path
+    # Moving a package into staging can push existing descendants beyond MAX_PATH.
+    absolute = os.path.abspath(path)
+    if absolute.startswith("\\\\?\\"):
+        return Path(absolute)
+    if absolute.startswith("\\\\"):
+        return Path("\\\\?\\UNC\\" + absolute[2:])
+    return Path("\\\\?\\" + absolute)
+
+
+def _remove_plugin_package_tree(path: Path) -> None:
+    try:
+        shutil.rmtree(path)
+    except FileNotFoundError as error:
+        if sys.platform != "win32" or error.winerror not in {3, 206}:
+            raise
+        extended = _plugin_package_filesystem_path(path)
+        if not extended.exists():
+            raise
+        shutil.rmtree(extended)
+
+
 @dataclass(frozen=True, slots=True)
 class _StoredPluginPackageMetadata:
     package: PluginPackageMetadata | None
@@ -5193,27 +5407,71 @@ def _stored_plugin_package_metadata(
     store_root = _plugin_package_store_root(request)
     storage_key = f"{tenant_id}/{plugin_id}/{content_sha256}"
     artifact_root = store_root / str(tenant_id) / plugin_id / content_sha256
-    temp_root = artifact_root.parent / f"tmp-{uuid4().hex}"
+    from agent_hub.plugins.handover_confirmation import (
+        _PinnedDirectory,
+        _request_publication_reservations,
+    )
+    from agent_hub.plugins.handover_storage import Conflict
+
     artifact_created = False
     try:
-        artifact_root.parent.mkdir(parents=True, exist_ok=True)
+        reservations = _request_publication_reservations(request)
+        if reservations is None:
+            parent = _PinnedDirectory(artifact_root.parent, create=True)
+            parent.close()
         _ensure_path_inside(store_root, artifact_root)
-        _ensure_path_inside(store_root, temp_root)
-        artifact_root_existed = artifact_root.exists()
-        if not _plugin_package_artifact_matches(artifact_root, files):
-            for path, content in files:
-                target = temp_root.joinpath(*PurePosixPath(path).parts)
-                _ensure_path_inside(temp_root, target)
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_bytes(content)
-            if artifact_root.exists():
-                shutil.rmtree(artifact_root)
-            temp_root.replace(artifact_root)
-            artifact_created = not artifact_root_existed
-    except OSError as error:
-        with contextlib.suppress(OSError):
-            if temp_root.exists():
-                shutil.rmtree(temp_root)
+        try:
+            artifact_root.lstat()
+        except FileNotFoundError:
+            artifact_root_existed = False
+        else:
+            artifact_root_existed = True
+        if artifact_root_existed:
+            if not _plugin_package_artifact_matches(artifact_root, files):
+                raise PublicAPIError(
+                    409,
+                    "plugin_package_artifact_conflict",
+                    "plugin package artifact conflicts with verified package",
+                )
+        else:
+            from agent_hub.plugins.handover_confirmation import (
+                _publish_artifact,
+            )
+
+            try:
+                expires_at = package.signature_trust_expires_at
+                deadline = datetime.now(UTC) + timedelta(seconds=30)
+                if expires_at is not None:
+                    deadline = min(deadline, expires_at)
+                artifact_created = _publish_artifact(
+                    artifact_root, files,
+                    store_root=store_root, tenant=tenant_id, plugin_id=plugin_id,
+                    reservation_store=reservations,
+                    deadline=deadline,
+                    revalidate=lambda: expires_at is None or datetime.now(UTC) < expires_at,
+                )
+            except (FileExistsError, Conflict) as error:
+                raise PublicAPIError(
+                    409,
+                    "plugin_package_artifact_conflict",
+                    "plugin package artifact conflicts with verified package",
+                ) from error
+            except (ValueError, RuntimeError) as error:
+                raise PublicAPIError(
+                    503,
+                    "plugin_package_store_unavailable",
+                    "plugin package store is unavailable",
+                    details={"reason": "publication_journal_unavailable"},
+                ) from error
+    except (PublicAPIError, InvalidSkillPackage):
+        raise
+    except Conflict as error:
+        raise PublicAPIError(
+            409,
+            "plugin_package_artifact_conflict",
+            "plugin package artifact conflicts with verified package",
+        ) from error
+    except (OSError, RuntimeError, ValueError) as error:
         raise PublicAPIError(
             503,
             "plugin_package_store_unavailable",
@@ -5240,15 +5498,12 @@ def _plugin_package_artifact_matches(
     artifact_root: Path,
     files: tuple[tuple[str, bytes], ...],
 ) -> bool:
-    if not artifact_root.is_dir():
-        return False
+    from agent_hub.plugins.handover_confirmation import _artifact_matches
+    from agent_hub.plugins.handover_storage import Conflict
+
     try:
-        for path, content in files:
-            target = artifact_root.joinpath(*PurePosixPath(path).parts)
-            _ensure_path_inside(artifact_root, target)
-            if not target.is_file() or target.read_bytes() != content:
-                return False
-    except OSError:
+        _artifact_matches(artifact_root.absolute(), files, required=True)
+    except (Conflict, OSError):
         return False
     return True
 
@@ -5375,33 +5630,34 @@ def _plugin_package_uninstall_stage_lock(
     tenant_id: UUID,
     plugin_id: str,
 ) -> Iterator[None]:
+    from agent_hub.plugins.handover_confirmation import _shared_fs_lock
+    from agent_hub.plugins.handover_storage import Conflict
+
     plugin_id = _validated_plugin_path_segment(plugin_id)
-    lock_root = _plugin_package_uninstall_lock_root(request, tenant_id=tenant_id)
+    try:
+        with _shared_fs_lock(request, tenant_id, plugin_id):
+            yield
+    except Conflict:
+        raise OSError("plugin package stage lock is unavailable") from None
+
+
+@contextlib.contextmanager
+def _plugin_package_stage_lock_at_root(
+    store_root: Path, *, tenant_id: UUID, plugin_id: str,
+) -> Iterator[None]:
+    from agent_hub.plugins.handover_confirmation import _shared_fs_lock_at_root
+    from agent_hub.plugins.handover_storage import Conflict
+
+    plugin_id = _validated_plugin_path_segment(plugin_id)
+    lock_root = store_root / ".uninstall-locks" / str(tenant_id)
+    _ensure_path_inside(store_root, lock_root)
     lock_path = lock_root / f"{plugin_id}.lock"
     _ensure_path_inside(lock_root, lock_path)
-    lock_root.mkdir(parents=True, exist_ok=True)
-    with lock_path.open("a+b") as lock_file:
-        lock_file.seek(0, os.SEEK_END)
-        if lock_file.tell() == 0:
-            lock_file.write(b"\0")
-            lock_file.flush()
-        lock_file.seek(0)
-        if sys.platform == "win32":
-            import msvcrt
-
-            msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
-            try:
-                yield
-            finally:
-                lock_file.seek(0)
-                msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
-        else:
-            fcntl = cast(Any, __import__("fcntl"))
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-            try:
-                yield
-            finally:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+    try:
+        with _shared_fs_lock_at_root(store_root, tenant_id, plugin_id):
+            yield
+    except Conflict:
+        raise OSError("plugin package stage lock is unavailable") from None
 
 
 def _plugin_package_root(
@@ -5547,7 +5803,7 @@ def _stage_plugin_package_uninstall(
             tenant_id=tenant_id,
             plugin_id=plugin.id,
         ):
-            current_snapshot_sha256 = _plugin_activation_snapshot_sha256(plugin)
+            current_snapshot_sha256 = _plugin_uninstall_snapshot_sha256(plugin)
             try:
                 existing = _pending_plugin_package_uninstall_state(
                     request,
@@ -5596,13 +5852,29 @@ def _stage_plugin_package_uninstall(
                     plugin_id=plugin.id,
                 )
 
-            if existing is not None:
-                if existing.plugin_snapshot_sha256 != current_snapshot_sha256:
+            if existing is not None and (
+                existing.plugin_snapshot_sha256 != current_snapshot_sha256
+                or (package_root.exists() and existing.staged_artifact_root is not None)
+            ):
+                if (
+                    not isinstance(plugin, _PluginUninstallResponse)
+                    or plugin._registration_snapshot is None
+                ):
                     raise PublicAPIError(
                         503,
                         "plugin_uninstall_cleanup_unavailable",
-                        "plugin uninstall cleanup state belongs to an earlier registration",
+                        "earlier plugin uninstall registration identity is unavailable",
                     )
+                if not _preserve_conflicted_plugin_package_uninstall(
+                    existing, tenant_id=tenant_id, plugin_id=plugin.id,
+                ):
+                    raise PublicAPIError(
+                        503,
+                        "plugin_uninstall_cleanup_unavailable",
+                        "earlier plugin uninstall package preservation can be retried",
+                    )
+                existing = None
+            if existing is not None:
                 staged_artifact_root = existing.pending_root / "artifact"
                 if package_root.exists():
                     if staged_artifact_root.exists():
@@ -5668,7 +5940,7 @@ def _stage_plugin_package_uninstall(
     except (InvalidSkillPackage, OSError) as error:
         with contextlib.suppress(OSError):
             if owns_pending_root and pending_root.exists():
-                shutil.rmtree(pending_root)
+                _remove_plugin_package_tree(pending_root)
         with contextlib.suppress(OSError):
             if owns_claim and claim_path.exists():
                 claim_path.unlink()
@@ -5689,7 +5961,7 @@ def _restore_staged_plugin_package_uninstall(
             state.package_root.parent.mkdir(parents=True, exist_ok=True)
             state.staged_artifact_root.replace(state.package_root)
         if state.pending_root.exists():
-            shutil.rmtree(state.pending_root)
+            _remove_plugin_package_tree(state.pending_root)
     except OSError as error:
         raise PublicAPIError(
             503,
@@ -5701,6 +5973,86 @@ def _restore_staged_plugin_package_uninstall(
                 "package_artifact_removed": "false",
             },
         ) from error
+
+
+def _restore_conflicted_plugin_package_uninstall(
+    request: Request,
+    state: _PluginPackageUninstallState,
+    *,
+    tenant_id: UUID,
+    plugin_id: str,
+    preserve_only: bool = False,
+    restore_registered: bool = False,
+) -> None:
+    with _plugin_package_uninstall_stage_lock(request, tenant_id=tenant_id, plugin_id=plugin_id):
+        if not state.pending_root.exists():
+            return
+        operation_id, snapshot_sha256, created_at = _read_plugin_uninstall_state(
+            state.pending_root / "state.json", tenant_id=tenant_id, plugin_id=plugin_id,
+        )
+        if (operation_id, snapshot_sha256, created_at) != (
+            state.operation_id, state.plugin_snapshot_sha256, state.created_at,
+        ):
+            return
+        if (
+            restore_registered and not preserve_only
+            and state.staged_artifact_root is not None
+            and state.staged_artifact_root.exists() and state.package_root.exists()
+        ):
+            # The DB lock proves P is still registered; preserve uncommitted Q bytes.
+            backup_root = state.pending_root.parent.parent
+            displaced = Path(tempfile.mkdtemp(prefix="q-", dir=backup_root))
+            try:
+                (displaced / "state.json").write_text(
+                    (state.pending_root / "state.json").read_text(encoding="utf-8"),
+                    encoding="utf-8",
+                )
+                state.package_root.replace(displaced / "artifact")
+                _restore_staged_plugin_package_uninstall(state)
+                return
+            except OSError as error:
+                raise PublicAPIError(
+                    503, "plugin_uninstall_cleanup_pending",
+                    "plugin package restore is pending; both artifacts are preserved",
+                ) from error
+        if not preserve_only and not state.package_root.exists():
+            try:
+                _restore_staged_plugin_package_uninstall(state)
+                return
+            except PublicAPIError:
+                if not state.package_root.exists() or not state.pending_root.exists():
+                    raise
+        _preserve_conflicted_plugin_package_uninstall(
+            state, tenant_id=tenant_id, plugin_id=plugin_id,
+        )
+
+
+def _preserve_conflicted_plugin_package_uninstall(
+    state: _PluginPackageUninstallState, *, tenant_id: UUID, plugin_id: str,
+) -> bool:
+    # The caller holds the stage lock; state.json retains full tenant/operation ownership.
+    if _read_plugin_uninstall_state(
+        state.pending_root / "state.json", tenant_id=tenant_id, plugin_id=plugin_id,
+    ) != (state.operation_id, state.plugin_snapshot_sha256, state.created_at):
+        return False
+    backup_slot: Path | None = None
+    try:
+        backup_root = state.pending_root.parent.parent
+        backup_slot = Path(tempfile.mkdtemp(prefix="c-", dir=backup_root))
+        conflict_root = backup_slot / "p"
+        _ensure_path_inside(backup_root, conflict_root)
+        state.pending_root.rename(conflict_root)
+    except OSError as error:
+        if backup_slot is not None:
+            with contextlib.suppress(OSError):
+                backup_slot.rmdir()
+        _LOGGER.warning(
+            "plugin uninstall conflict backup pending tenant_id=%s plugin_id=%s "
+            "operation_id=%s error_type=%s",
+            tenant_id, plugin_id, state.operation_id, type(error).__name__,
+        )
+        return False
+    return True
 
 
 def _remove_empty_plugin_package_parents(path: Path, *, stop: Path) -> None:
@@ -5718,13 +6070,31 @@ def _finish_plugin_package_uninstall(
     state: _PluginPackageUninstallState,
 ) -> None:
     try:
-        if state.package_root.exists():
-            raise OSError("active plugin package directory still exists")
-        if state.pending_root.exists():
-            shutil.rmtree(state.pending_root)
-        if state.pending_root.exists():
-            raise OSError("plugin uninstall cleanup directory still exists")
-    except OSError as error:
+        tenant_id = UUID(state.package_root.parent.name)
+        plugin_id = state.package_root.name
+        if state.pending_root != _plugin_package_uninstall_pending_root(
+            request, tenant_id=tenant_id, plugin_id=plugin_id,
+        ) or state.package_root != _plugin_package_root(
+            request, tenant_id=tenant_id, plugin_id=plugin_id,
+        ):
+            raise ValueError("plugin uninstall cleanup identity mismatch")
+        with _plugin_package_uninstall_stage_lock(
+            request, tenant_id=tenant_id, plugin_id=plugin_id,
+        ):
+            if not state.pending_root.exists():
+                return
+            identity = _read_plugin_uninstall_state(
+                state.pending_root / "state.json", tenant_id=tenant_id, plugin_id=plugin_id,
+            )
+            if identity != (state.operation_id, state.plugin_snapshot_sha256, state.created_at):
+                return
+            if state.package_root.exists():
+                raise OSError("active plugin package directory still exists")
+            _remove_plugin_package_tree(state.pending_root)
+            store_root = _plugin_package_store_root(request)
+            _remove_empty_plugin_package_parents(state.package_root, stop=store_root)
+            _remove_empty_plugin_package_parents(state.pending_root.parent, stop=store_root)
+    except (OSError, ValueError, InvalidSkillPackage) as error:
         if state.pending_root.exists():
             raise PublicAPIError(
                 503,
@@ -5739,15 +6109,28 @@ def _finish_plugin_package_uninstall(
                 },
             ) from error
 
-    store_root = _plugin_package_store_root(request)
-    _remove_empty_plugin_package_parents(state.package_root, stop=store_root)
-    _remove_empty_plugin_package_parents(state.pending_root.parent, stop=store_root)
-
-
 def _mark_plugin_uninstall_audit_confirmed(state: _PluginPackageUninstallState) -> None:
     try:
-        state.audit_confirmed_path.touch(exist_ok=True)
-    except OSError as error:
+        tenant_id = UUID(state.package_root.parent.name)
+        plugin_id = _validated_plugin_path_segment(state.package_root.name)
+        store_root = state.package_root.parent.parent
+        if (
+            state.pending_root != store_root / ".uninstalling" / str(tenant_id) / plugin_id
+            or state.audit_confirmed_path != state.pending_root / "audit-confirmed"
+        ):
+            raise ValueError("plugin uninstall audit identity mismatch")
+        with _plugin_package_stage_lock_at_root(
+            store_root, tenant_id=tenant_id, plugin_id=plugin_id,
+        ):
+            if not state.pending_root.exists():
+                return
+            identity = _read_plugin_uninstall_state(
+                state.pending_root / "state.json", tenant_id=tenant_id, plugin_id=plugin_id,
+            )
+            if identity != (state.operation_id, state.plugin_snapshot_sha256, state.created_at):
+                return
+            state.audit_confirmed_path.touch(exist_ok=True)
+    except (OSError, ValueError, InvalidSkillPackage) as error:
         raise PublicAPIError(
             503,
             "plugin_uninstall_cleanup_pending",
@@ -11746,7 +12129,7 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         now = datetime.now(UTC)
         return tuple(
             _plugin_with_effective_package_trust(
-                PluginResourceResponse.model_validate(payload),
+                _plugin_response_from_payload(payload),
                 signing_keys,
                 now,
             )
@@ -11840,6 +12223,28 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             actor_id=actor_id,
         )
 
+    async def _write_plugin_payload_with_audit(
+        self,
+        plugin_id: str,
+        payload: _PluginWritePayload,
+        *,
+        action: str,
+        details: dict[str, object],
+        tenant_id: UUID | None,
+        actor_id: UUID | None,
+    ) -> bool:
+        audit = _PluginAuditWrite(action, details, actor_id)
+        payload.audit = audit
+        persisted = await self._upsert_admin_payload(
+            "plugin", plugin_id, payload, tenant_id=tenant_id,
+        )
+        if persisted and not audit.committed:
+            # Legacy persistence overrides still own their write and audit behavior.
+            await self._record_audit(
+                action, f"plugin:{plugin_id}", details, tenant_id=tenant_id, actor_id=actor_id,
+            )
+        return persisted
+
     async def upsert_plugin(
         self,
         request: PluginResourceRequest,
@@ -11850,7 +12255,15 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         content_sha256: str | None = None,
         package_metadata: PluginPackageMetadata | None = None,
     ) -> PluginResourceResponse:
-        current = await self._plugin_response(request.id, tenant_id=tenant_id)
+        payload = (
+            request._baseline_payload if isinstance(request, _PluginArchiveInstallRequest)
+            else await self._get_admin_payload("plugin", request.id, tenant_id=tenant_id)
+        )
+        current = (
+            await self._plugin_response(request.id, tenant_id=tenant_id)
+            if payload is None
+            else _plugin_response_from_payload(payload) if payload else None
+        )
         response = _plugin_response_from_request(
             request,
             current=current,
@@ -11858,11 +12271,16 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             content_sha256=content_sha256,
             package_metadata=package_metadata,
         )
-        if not await self._upsert_admin_payload(
-            "plugin",
+        write_payload = _PluginWritePayload(response.model_dump(mode="json"), expected_payload=payload)
+        if isinstance(request, _PluginArchiveInstallRequest):
+            write_payload.artifact_check = request._artifact_check
+        if not await self._write_plugin_payload_with_audit(
             response.id,
-            response.model_dump(mode="json"),
+            write_payload,
+            action="plugin.upsert",
+            details=_plugin_upsert_audit_details(response),
             tenant_id=tenant_id,
+            actor_id=actor_id,
         ):
             if tenant_id is not None and tenant_id != self._tenant_id:
                 raise KeyError(response.id)
@@ -11872,13 +12290,6 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
                 content_sha256=content_sha256,
                 package_metadata=package_metadata,
             )
-        await self._record_audit(
-            "plugin.upsert",
-            f"plugin:{response.id}",
-            _plugin_upsert_audit_details(response),
-            tenant_id=tenant_id,
-            actor_id=actor_id,
-        )
         return response
 
     async def get_capability_install_state(
@@ -11892,7 +12303,7 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             entry_id,
             tenant_id=tenant_id,
         )
-        if payload is None:
+        if not payload:
             return None
         return {str(key): str(value) for key, value in payload.items()}
 
@@ -11980,22 +12391,17 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         if not payload:
             raise KeyError(plugin_id)
         updated = _plugin_preflight_failed_response(
-            PluginResourceResponse.model_validate(payload)
+            _plugin_response_from_payload(payload)
         )
-        if not await self._upsert_admin_payload(
-            "plugin",
+        if not await self._write_plugin_payload_with_audit(
             updated.id,
-            updated.model_dump(mode="json"),
-            tenant_id=tenant_id,
-        ):
-            raise KeyError(plugin_id)
-        await self._record_audit(
-            "plugin.preflight.failed",
-            f"plugin:{updated.id}",
-            {"id": updated.id, "error_type": "plugin_preflight_failed"},
+            _PluginWritePayload(updated.model_dump(mode="json"), state_snapshot=payload),
+            action="plugin.preflight.failed",
+            details={"id": updated.id, "error_type": "plugin_preflight_failed"},
             tenant_id=tenant_id,
             actor_id=actor_id,
-        )
+        ):
+            raise KeyError(plugin_id)
         return updated
 
     async def enable_plugin(
@@ -12126,7 +12532,18 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         tenant_id: UUID | None,
         actor_id: UUID | None,
     ) -> None:
-        deleted = await self._delete_admin_payload("plugin", plugin_id, tenant_id=tenant_id)
+        snapshot = plugin_id.snapshot if isinstance(plugin_id, _PluginDeleteTarget) else None
+        if snapshot is None:
+            payload = await self._get_admin_payload("plugin", plugin_id, tenant_id=tenant_id)
+            if payload is not None and not payload:
+                raise KeyError(plugin_id)
+            if isinstance(payload, _PluginRegistrationPayload):
+                snapshot = payload.snapshot
+        audit = _PluginAuditWrite(action, {"id": str(plugin_id)}, actor_id)
+        target = _PluginDeleteTarget(plugin_id, snapshot=snapshot, audit=audit)
+        if isinstance(plugin_id, _PluginDeleteTarget):
+            target.stage_package = plugin_id.stage_package
+        deleted = await self._delete_admin_payload("plugin", target, tenant_id=tenant_id)
         if deleted is None:
             if tenant_id is not None and tenant_id != self._tenant_id:
                 raise KeyError(plugin_id)
@@ -12134,13 +12551,56 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             return
         if not deleted:
             raise KeyError(plugin_id)
-        await self._record_audit(
-            action,
-            f"plugin:{plugin_id}",
-            {"id": plugin_id},
-            tenant_id=tenant_id,
-            actor_id=actor_id,
+        if not audit.committed:
+            await self._record_audit(
+                action,
+                f"plugin:{plugin_id}",
+                {"id": plugin_id},
+                tenant_id=tenant_id,
+                actor_id=actor_id,
+            )
+
+    async def _plugin_for_uninstall(
+        self, plugin_id: str, *, tenant_id: UUID,
+    ) -> tuple[PluginResourceResponse, _PluginRegistrationSnapshot | None]:
+        payload = await self._get_admin_payload("plugin", plugin_id, tenant_id=tenant_id)
+        if payload is None:
+            return await _current_plugin_for_activation_check(
+                self, plugin_id, tenant_id=tenant_id,
+            ), None
+        if not payload:
+            raise KeyError(plugin_id)
+        snapshot = payload.snapshot if isinstance(payload, _PluginRegistrationPayload) else None
+        response = _PluginUninstallResponse.model_validate(
+            _plugin_response_from_payload(payload).model_dump(mode="python")
         )
+        response._registration_snapshot = snapshot
+        return response, snapshot
+
+    async def _restore_plugin_uninstall(
+        self, request: Request, state: _PluginPackageUninstallState,
+        *, tenant_id: UUID, plugin_id: str, snapshot: _PluginRegistrationSnapshot,
+    ) -> None:
+        if self._session_factory is None:
+            return
+        async with self._session_factory() as session, session.begin():
+            await _acquire_plugin_registration_locks(session, tenant_id, (plugin_id,))
+            current = (await session.execute(
+                select(AdminResourceRow).where(
+                    AdminResourceRow.tenant_id == tenant_id,
+                    AdminResourceRow.kind == "plugin",
+                    AdminResourceRow.resource_id == plugin_id,
+                ).with_for_update().execution_options(populate_existing=True)
+            )).scalar_one_or_none()
+            matches = current is not None and _plugin_registration_snapshot(
+                current, tenant_id, plugin_id,
+            ) == snapshot
+            _restore_conflicted_plugin_package_uninstall(
+                request, state, tenant_id=tenant_id, plugin_id=plugin_id,
+                preserve_only=not matches,
+                restore_registered=matches,
+            )
+
 
     async def _plugin_response(
         self,
@@ -12158,7 +12618,7 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             return None
         if not payload:
             return None
-        return PluginResourceResponse.model_validate(payload)
+        return _plugin_response_from_payload(payload)
 
     async def _set_plugin_lifecycle(
         self,
@@ -12193,7 +12653,7 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             )
         if not payload:
             raise KeyError(plugin_id)
-        current = PluginResourceResponse.model_validate(payload)
+        current = _plugin_response_from_payload(payload)
         if action in {"start", "enable", "reload"}:
             expected_sha256 = _plugin_activation_snapshot_sha256(current)
             try:
@@ -12206,23 +12666,20 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
                 )
                 if not latest_payload:
                     raise KeyError(plugin_id) from None
-                latest = PluginResourceResponse.model_validate(latest_payload)
+                latest = _plugin_response_from_payload(latest_payload)
                 _ensure_plugin_activation_snapshot_unchanged(expected_sha256, latest)
                 failed = _plugin_preflight_failed_response(latest)
-                if not await self._upsert_admin_payload(
-                    "plugin",
+                if not await self._write_plugin_payload_with_audit(
                     failed.id,
-                    failed.model_dump(mode="json"),
-                    tenant_id=tenant_id,
-                ):
-                    raise KeyError(plugin_id) from None
-                await self._record_audit(
-                    "plugin.preflight.failed",
-                    f"plugin:{failed.id}",
-                    {"id": failed.id, "error_type": "plugin_preflight_failed"},
+                    _PluginWritePayload(
+                        failed.model_dump(mode="json"), state_snapshot=payload
+                    ),
+                    action="plugin.preflight.failed",
+                    details={"id": failed.id, "error_type": "plugin_preflight_failed"},
                     tenant_id=tenant_id,
                     actor_id=actor_id,
-                )
+                ):
+                    raise KeyError(plugin_id) from None
                 raise
             latest_payload = await self._get_admin_payload(
                 "plugin",
@@ -12231,7 +12688,7 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             )
             if not latest_payload:
                 raise KeyError(plugin_id)
-            current = PluginResourceResponse.model_validate(latest_payload)
+            current = _plugin_response_from_payload(latest_payload)
             _ensure_plugin_activation_snapshot_unchanged(expected_sha256, current)
         if action == "enable":
             updated = _plugin_enabled_response(current)
@@ -12241,20 +12698,15 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             updated = _plugin_stopped_response(current)
         else:
             updated = _plugin_started_response(current)
-        if not await self._upsert_admin_payload(
-            "plugin",
+        if not await self._write_plugin_payload_with_audit(
             updated.id,
-            updated.model_dump(mode="json"),
-            tenant_id=tenant_id,
-        ):
-            raise KeyError(plugin_id)
-        await self._record_audit(
-            f"plugin.{action}",
-            f"plugin:{updated.id}",
-            {"id": updated.id},
+            _PluginWritePayload(updated.model_dump(mode="json"), state_snapshot=payload),
+            action=f"plugin.{action}",
+            details={"id": updated.id},
             tenant_id=tenant_id,
             actor_id=actor_id,
-        )
+        ):
+            raise KeyError(plugin_id)
         return updated
 
     async def _set_plugin_package_approval(
@@ -12283,24 +12735,18 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             )
         if not payload:
             raise KeyError(plugin_id)
-        current = PluginResourceResponse.model_validate(payload)
+        current = _plugin_response_from_payload(payload)
         updated = _plugin_with_package_approval(
             current,
             approval_state,
             request,
             actor_id=actor_id,
         )
-        if not await self._upsert_admin_payload(
-            "plugin",
+        if not await self._write_plugin_payload_with_audit(
             updated.id,
-            updated.model_dump(mode="json"),
-            tenant_id=tenant_id,
-        ):
-            raise KeyError(plugin_id)
-        await self._record_audit(
-            f"plugin.package.{approval_state}",
-            f"plugin:{updated.id}",
-            {
+            _PluginWritePayload(updated.model_dump(mode="json"), state_snapshot=payload),
+            action=f"plugin.package.{approval_state}",
+            details={
                 "id": updated.id,
                 "approval_state": approval_state,
                 "activation_state": (
@@ -12316,7 +12762,8 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             },
             tenant_id=tenant_id,
             actor_id=actor_id,
-        )
+        ):
+            raise KeyError(plugin_id)
         return updated
 
     def _skill_archive_path(self, skill_id: str) -> Path:
@@ -13117,10 +13564,13 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         action: str,
         resource: str,
         payload: dict[str, object] | None = None,
+        *,
+        tenant_id: UUID | None = None,
+        actor_id: UUID | None = None,
     ) -> None:
         event = AuditEventResponse(
             id=_new_audit_event_id(),
-            actor=str(self._actor_id),
+            actor=str(self._actor_id if actor_id is None else actor_id),
             action=action,
             resource=resource,
             details=_safe_audit_details(payload),
@@ -13129,7 +13579,7 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         await session.execute(
             insert(AdminResourceRow).values(
                 id=uuid4(),
-                tenant_id=self._tenant_id,
+                tenant_id=self._tenant_id if tenant_id is None else tenant_id,
                 kind="audit",
                 resource_id=event.id,
                 payload=event.model_dump(mode="json"),
@@ -13373,7 +13823,13 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
                     .where(AdminResourceRow.resource_id == resource_id)
                 )
             ).scalar_one_or_none()
-            return {} if row is None else dict(row.payload)
+            if row is None:
+                return {}
+            if kind == "plugin":
+                return _PluginRegistrationPayload(
+                    dict(row.payload), _plugin_registration_snapshot(row, target_tenant_id, resource_id),
+                )
+            return dict(row.payload)
 
     async def _upsert_admin_payload(
         self,
@@ -13386,6 +13842,67 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         if self._session_factory is None:
             return False
         target_tenant_id = self._tenant_id if tenant_id is None else tenant_id
+        if kind == "plugin":
+            state_snapshot = None
+            expected_payload = None
+            registration_snapshot = None
+            artifact_check = None
+            audit = None
+            if isinstance(payload, _PluginWritePayload):
+                state_snapshot = payload.state_snapshot
+                expected_payload = payload.expected_payload
+                registration_snapshot = payload.registration_snapshot
+                artifact_check = payload.artifact_check
+                audit = payload.audit
+            async with self._session_factory() as session, session.begin():
+                await _acquire_plugin_registration_locks(session, target_tenant_id, (resource_id,))
+                current = (
+                    await session.execute(
+                        select(AdminResourceRow)
+                        .where(AdminResourceRow.tenant_id == target_tenant_id)
+                        .where(AdminResourceRow.kind == kind)
+                        .where(AdminResourceRow.resource_id == resource_id)
+                        .with_for_update()
+                        .execution_options(populate_existing=True)
+                    )
+                ).scalar_one_or_none()
+                if registration_snapshot is not None and (
+                    current is None or _plugin_registration_snapshot(
+                        current, target_tenant_id, resource_id,
+                    ) != registration_snapshot
+                ):
+                    raise _plugin_write_conflict()
+                checked_payload = _checked_plugin_write_payload(
+                    {} if current is None else dict(current.payload),
+                    payload,
+                    state_snapshot=state_snapshot,
+                    expected_payload=expected_payload,
+                )
+                if artifact_check is not None:
+                    artifact_check()
+                await session.execute(
+                    insert(AdminResourceRow)
+                    .values(
+                        id=uuid4(), tenant_id=target_tenant_id, kind=kind,
+                        resource_id=resource_id, payload=checked_payload,
+                    )
+                    .on_conflict_do_update(
+                        index_elements=[
+                            AdminResourceRow.tenant_id,
+                            AdminResourceRow.kind,
+                            AdminResourceRow.resource_id,
+                        ],
+                        set_={"payload": checked_payload},
+                    )
+                )
+                if audit is not None:
+                    await self._record_audit_in_session(
+                        session, audit.action, f"plugin:{resource_id}", audit.details,
+                        tenant_id=target_tenant_id, actor_id=audit.actor_id,
+                    )
+            if audit is not None:
+                audit.committed = True
+            return True
         statement = (
             insert(AdminResourceRow)
             .values(
@@ -13423,7 +13940,25 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
                 kind == "schedule" for kind, _resource_id in deletes
             ):
                 await _acquire_scheduler_advisory_xact_lock(session)
+            plugin_ids = {resource_id for kind, resource_id, _payload in upserts if kind == "plugin"}
+            plugin_ids.update(resource_id for kind, resource_id in deletes if kind == "plugin")
+            if plugin_ids:
+                await _acquire_plugin_registration_locks(session, self._tenant_id, plugin_ids)
             for kind, resource_id, payload in upserts:
+                if kind == "plugin":
+                    current = (
+                        await session.execute(
+                            select(AdminResourceRow)
+                            .where(AdminResourceRow.tenant_id == self._tenant_id)
+                            .where(AdminResourceRow.kind == kind)
+                            .where(AdminResourceRow.resource_id == resource_id)
+                            .with_for_update()
+                            .execution_options(populate_existing=True)
+                        )
+                    ).scalar_one_or_none()
+                    payload = _checked_plugin_write_payload(
+                        {} if current is None else dict(current.payload), payload
+                    )
                 statement = (
                     insert(AdminResourceRow)
                     .values(
@@ -13462,16 +13997,55 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         if self._session_factory is None:
             return None
         target_tenant_id = self._tenant_id if tenant_id is None else tenant_id
-        if kind == "schedule":
+        if kind in {"schedule", "plugin"}:
+            target = resource_id if isinstance(resource_id, _PluginDeleteTarget) else None
             async with self._session_factory() as session, session.begin():
-                await _acquire_scheduler_advisory_xact_lock(session)
+                if kind == "schedule":
+                    await _acquire_scheduler_advisory_xact_lock(session)
+                else:
+                    await _acquire_plugin_registration_locks(
+                        session, target_tenant_id, (resource_id,)
+                    )
+                    current = (
+                        await session.execute(
+                            select(AdminResourceRow)
+                            .where(AdminResourceRow.tenant_id == target_tenant_id)
+                            .where(AdminResourceRow.kind == kind)
+                            .where(AdminResourceRow.resource_id == resource_id)
+                            .with_for_update()
+                            .execution_options(populate_existing=True)
+                        )
+                    ).scalar_one_or_none()
+                    if current is None:
+                        if target is not None and target.snapshot is not None:
+                            raise _plugin_write_conflict()
+                        return False
+                    if (
+                        target is not None
+                        and target.snapshot is not None
+                        and _plugin_registration_snapshot(
+                            current, target_tenant_id, str(resource_id),
+                        ) != target.snapshot
+                    ):
+                        raise _plugin_write_conflict()
+                    # The same SQL session owns the registration lock through staging and commit.
+                    if target is not None and target.stage_package is not None:
+                        target.stage_package()
                 result = await session.execute(
                     delete(AdminResourceRow)
                     .where(AdminResourceRow.tenant_id == target_tenant_id)
                     .where(AdminResourceRow.kind == kind)
                     .where(AdminResourceRow.resource_id == resource_id)
                 )
-                return bool(getattr(result, "rowcount", 0))
+                deleted = bool(getattr(result, "rowcount", 0))
+                if deleted and target is not None and target.audit is not None:
+                    await self._record_audit_in_session(
+                        session, target.audit.action, f"plugin:{resource_id}", target.audit.details,
+                        tenant_id=target_tenant_id, actor_id=target.audit.actor_id,
+                    )
+            if deleted and target is not None and target.audit is not None:
+                target.audit.committed = True
+            return deleted
         existing = await self._get_admin_payload(kind, resource_id, tenant_id=target_tenant_id)
         if not existing:
             return False
@@ -19312,7 +19886,7 @@ async def capability_installer_install(
             confirm=body.confirm,
             tenant_id=principal.tenant_id,
             actor_id=principal.user_id,
-            activation_preflight=_plugin_activation_preflight(request),
+            activation_preflight=_plugin_activation_preflight(request, tenant_id=principal.tenant_id),
         )
     except KeyError:
         raise PublicAPIError(404, "not_found", "not found") from None
@@ -19354,7 +19928,7 @@ async def capability_installer_install(
 
 @router.post(
     "/capability-installer/rollback",
-    responses=error_responses(401, 403, 404, 422),
+    responses=error_responses(401, 403, 404, 409, 422),
 )
 async def capability_installer_rollback(
     body: CapabilityInstallerPlanRequest,
@@ -19364,6 +19938,8 @@ async def capability_installer_rollback(
 ) -> dict[str, object]:
     _require(principal, "plugin:write")
     installer = _capability_installer_service(request)
+    from agent_hub.capability_installer.service import CapabilityInstallUnavailable
+
     try:
         plan = await installer.rollback(
             service,
@@ -19374,6 +19950,12 @@ async def capability_installer_rollback(
         )
     except KeyError:
         raise PublicAPIError(404, "not_found", "not found") from None
+    except CapabilityInstallUnavailable:
+        raise PublicAPIError(
+            409,
+            "capability_install_backend_unavailable",
+            "Capability rollback unavailable; inspect the environment and retained installation state",
+        ) from None
     await service.record_audit_event(
         actor=str(principal.user_id),
         action="capability_installer.rollback",
@@ -19577,17 +20159,40 @@ async def install_plugin_archive(
     )
     _validate_plugin_resource_config(request, plugin_request)
     _validate_plugin_capability_configs(request, plugin_request)
+    if isinstance(service, PersistentAdminResourceService) and service._session_factory is not None:
+        baseline = await service._get_admin_payload(
+            "plugin", plugin_request.id, tenant_id=principal.tenant_id,
+        )
+        bound_request = _PluginArchiveInstallRequest.model_validate(plugin_request.model_dump())
+        bound_request._baseline_payload = deepcopy({} if baseline is None else baseline)
+        plugin_request = bound_request
     try:
         _validate_runtime_registered_plugin_package(request, plugin_request, package_metadata)
-        stored_package = _stored_plugin_package_metadata(
-            request,
-            tenant_id=principal.tenant_id,
-            plugin_id=plugin_request.id,
-            package=package_metadata,
-            archive_bytes=archive_bytes,
-            content_sha256=content_sha256,
-        )
+        store_lock: contextlib.AbstractContextManager[None] = contextlib.nullcontext()
+        if (
+            package_metadata is not None and package_metadata.kind == "adapter_package"
+            and (package_metadata.signature_verification == "verified"
+                 or package_metadata.verified_public_key_sha256 is not None)
+        ):
+            store_lock = _plugin_package_uninstall_stage_lock(
+                request, tenant_id=principal.tenant_id, plugin_id=plugin_request.id,
+            )
+        with store_lock:
+            stored_package = _stored_plugin_package_metadata(
+                request,
+                tenant_id=principal.tenant_id,
+                plugin_id=plugin_request.id,
+                package=package_metadata,
+                archive_bytes=archive_bytes,
+                content_sha256=content_sha256,
+            )
         package_metadata = stored_package.package
+    except OSError:
+        raise PublicAPIError(
+            503,
+            "plugin_package_store_unavailable",
+            "plugin package store is unavailable",
+        ) from None
     except InvalidSkillPackage as error:
         raise PublicAPIError(
             422,
@@ -19595,24 +20200,36 @@ async def install_plugin_archive(
             "plugin package is invalid",
             details={"reason": _safe_model_check_detail(str(error))},
         ) from None
-    try:
-        plugin = await service.upsert_plugin(
-            plugin_request,
-            tenant_id=principal.tenant_id,
-            actor_id=principal.user_id,
-            source_filename=filename,
-            content_sha256=content_sha256,
-            package_metadata=package_metadata,
-        )
-    except Exception:
-        if stored_package.artifact_created:
-            _cleanup_plugin_package_metadata_artifact(
-                request,
-                plugin_id=plugin_request.id,
-                package=package_metadata,
-                tenant_id=principal.tenant_id,
-            )
-        raise
+    if isinstance(plugin_request, _PluginArchiveInstallRequest):
+        def check_artifact() -> None:
+            artifact = package_metadata.artifact if package_metadata is not None else None
+            if artifact is None:
+                return
+            try:
+                with _plugin_package_uninstall_stage_lock(
+                    request, tenant_id=principal.tenant_id, plugin_id=plugin_request.id,
+                ):
+                    root = _plugin_package_store_root(request).joinpath(*artifact.storage_key.split("/"))
+                    _ensure_path_inside(_plugin_package_store_root(request), root)
+                    if not _plugin_package_artifact_matches(root, _plugin_archive_signature_files(archive_bytes)):
+                        raise _plugin_write_conflict()
+            except OSError:
+                raise PublicAPIError(
+                    503,
+                    "plugin_package_store_unavailable",
+                    "plugin package store is unavailable",
+                ) from None
+        plugin_request._artifact_check = check_artifact
+    # A competing registration may already own this shared content-addressed artifact.
+    # Retain it on write failure until reclamation has an explicit ownership protocol.
+    plugin = await service.upsert_plugin(
+        plugin_request,
+        tenant_id=principal.tenant_id,
+        actor_id=principal.user_id,
+        source_filename=filename,
+        content_sha256=content_sha256,
+        package_metadata=package_metadata,
+    )
     await service.record_audit_event(
         actor=str(principal.user_id),
         action="plugin.install",
@@ -19718,7 +20335,7 @@ async def start_plugin(
             plugin_id,
             tenant_id=principal.tenant_id,
             actor_id=principal.user_id,
-            activation_preflight=_plugin_activation_preflight(request),
+            activation_preflight=_plugin_activation_preflight(request, tenant_id=principal.tenant_id),
         )
     except KeyError:
         raise PublicAPIError(404, "not_found", "not found") from None
@@ -19753,7 +20370,7 @@ async def enable_plugin(
             plugin_id,
             tenant_id=principal.tenant_id,
             actor_id=principal.user_id,
-            activation_preflight=_plugin_activation_preflight(request),
+            activation_preflight=_plugin_activation_preflight(request, tenant_id=principal.tenant_id),
         )
     except KeyError:
         raise PublicAPIError(404, "not_found", "not found") from None
@@ -19836,7 +20453,7 @@ async def reload_plugin(
             plugin_id,
             tenant_id=principal.tenant_id,
             actor_id=principal.user_id,
-            activation_preflight=_plugin_activation_preflight(request),
+            activation_preflight=_plugin_activation_preflight(request, tenant_id=principal.tenant_id),
         )
     except KeyError:
         raise PublicAPIError(404, "not_found", "not found") from None
@@ -19847,7 +20464,7 @@ async def reload_plugin(
 @router.post(
     "/plugins/{plugin_id}/uninstall",
     response_model=PluginUninstallResponse,
-    responses=error_responses(401, 403, 404, 422, 503),
+    responses=error_responses(401, 403, 404, 409, 422, 503),
 )
 async def uninstall_plugin(
     plugin_id: str,
@@ -19859,12 +20476,18 @@ async def uninstall_plugin(
     plugin_id = _validated_plugin_path_segment(plugin_id)
     state: _PluginPackageUninstallState | None = None
     current: PluginResourceResponse | None = None
+    registration_snapshot: _PluginRegistrationSnapshot | None = None
     try:
-        current = await _current_plugin_for_activation_check(
-            service,
-            plugin_id,
-            tenant_id=principal.tenant_id,
-        )
+        if isinstance(service, PersistentAdminResourceService):
+            current, registration_snapshot = await service._plugin_for_uninstall(
+                plugin_id, tenant_id=principal.tenant_id,
+            )
+        else:
+            current = await _current_plugin_for_activation_check(
+                service,
+                plugin_id,
+                tenant_id=principal.tenant_id,
+            )
     except KeyError:
         state = _pending_plugin_package_uninstall_state(
             request,
@@ -19889,17 +20512,28 @@ async def uninstall_plugin(
             raise PublicAPIError(404, "not_found", "not found") from None
 
     if current is not None:
-        state = _stage_plugin_package_uninstall(
-            request,
-            current,
-            tenant_id=principal.tenant_id,
-        )
+        target: str = plugin_id
+        if isinstance(service, PersistentAdminResourceService) and registration_snapshot is not None:
+            delete_target = _PluginDeleteTarget(plugin_id, snapshot=registration_snapshot)
+            plugin_to_stage = current
+
+            def stage_package() -> None:
+                nonlocal state
+                state = _stage_plugin_package_uninstall(
+                    request, plugin_to_stage, tenant_id=principal.tenant_id,
+                )
+
+            delete_target.stage_package = stage_package
+            target = delete_target
+        else:
+            state = _stage_plugin_package_uninstall(request, current, tenant_id=principal.tenant_id)
         try:
             await service.uninstall_plugin(
-                plugin_id,
+                target,
                 tenant_id=principal.tenant_id,
                 actor_id=principal.user_id,
             )
+            assert state is not None
             await _ensure_plugin_uninstall_audit(
                 service,
                 state,
@@ -19908,6 +20542,14 @@ async def uninstall_plugin(
                 actor_id=principal.user_id,
             )
         except Exception as error:
+            if state is None:
+                raise
+            if isinstance(error, PublicAPIError) and error.code == "plugin_registration_conflict":
+                _restore_conflicted_plugin_package_uninstall(
+                    request, state, tenant_id=principal.tenant_id, plugin_id=plugin_id,
+                    preserve_only=True,
+                )
+                raise
             registration_still_exists: bool | None
             try:
                 await _current_plugin_for_activation_check(
@@ -19929,7 +20571,15 @@ async def uninstall_plugin(
                 registration_still_exists = True
 
             if registration_still_exists is True:
-                _restore_staged_plugin_package_uninstall(state)
+                if isinstance(service, PersistentAdminResourceService) and registration_snapshot is not None:
+                    await service._restore_plugin_uninstall(
+                        request, state, tenant_id=principal.tenant_id, plugin_id=plugin_id,
+                        snapshot=registration_snapshot,
+                    )
+                else:
+                    _restore_conflicted_plugin_package_uninstall(
+                        request, state, tenant_id=principal.tenant_id, plugin_id=plugin_id,
+                    )
                 raise
             raise PublicAPIError(
                 503,

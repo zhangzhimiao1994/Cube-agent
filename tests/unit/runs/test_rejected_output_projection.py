@@ -178,7 +178,9 @@ def repository_for(event: RunEvent) -> tuple[RunRepository, Any, SimpleNamespace
     session = MagicMock()
     session.__aenter__ = AsyncMock(return_value=session)
     session.__aexit__ = AsyncMock(return_value=None)
-    session.scalar = AsyncMock(return_value=event.run_id)
+    session.scalar = AsyncMock(return_value=SimpleNamespace(
+        id=event.run_id, tenant_id=row.tenant_id, actor_id=None, routing_decision={},
+    ))
     session.scalars = AsyncMock(return_value=SimpleNamespace(all=lambda: [row]))
     return RunRepository(cast(Any, lambda: session)), session, row
 
@@ -241,6 +243,7 @@ async def test_public_api_serializes_only_checkpoint_summary_via_real_service() 
     event = checkpoint_event()
     repository, session, row = repository_for(event)
     principal = AuthenticatedPrincipal(user_id=uuid4(), tenant_id=row.tenant_id, role=Role.ADMIN)
+    session.scalar.return_value.actor_id = principal.user_id
 
     response = await run_events(
         event.run_id, cast(RunServiceProtocol, service_for(repository)), principal,

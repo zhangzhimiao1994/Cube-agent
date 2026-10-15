@@ -50,6 +50,9 @@ jobs:
           docker info --format '{{json .RegistryConfig.Mirrors}}' | python3 -c 'import json, sys; mirrors = json.load(sys.stdin); sys.exit(0 if isinstance(mirrors, list) and all(isinstance(mirror, str) for mirror in mirrors) and any(mirror.rstrip("/") == "https://mirror.gcr.io" for mirror in mirrors) else "Docker Hub mirror not active")'
       - run: docker compose -f tests/compose.yml up -d --wait
       - name: Run uv run pytest -q
+        env:
+          AGENT_HUB_TEST_DATABASE_URL: postgresql+asyncpg://agent_hub_test:agent_hub_test@127.0.0.1:54329/agent_hub_test
+          AGENT_HUB_HANDOVER_TEST_DB_ISOLATED: "1"
         shell: bash
         run: |
           set +e

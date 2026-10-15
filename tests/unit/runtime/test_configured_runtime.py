@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
 import pytest
 from pydantic import ValidationError
 
+import agent_hub.runtime.autogen.adapter as autogen_adapter
 import agent_hub.runtime.defaults as defaults_module
 from agent_hub.capabilities.runtime import RuntimeCapabilityError, RuntimeCapabilityGateway
 from agent_hub.config.repository import ConfigRevision, ConfigStatus
@@ -4653,7 +4654,7 @@ async def test_config_backed_discussion_runtime_injects_harness_tool_gateway(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     ProbeDiscussionRuntime.instances.clear()
-    monkeypatch.setattr(defaults_module, "AutoGenDiscussionRuntime", ProbeDiscussionRuntime)
+    monkeypatch.setattr(autogen_adapter, "AutoGenDiscussionRuntime", ProbeDiscussionRuntime)
     harness = object()
     runtime = ConfigBackedDiscussionRuntime(
         config_service=FakeConfigService(
@@ -4709,7 +4710,7 @@ async def test_config_backed_hybrid_runtime_injects_harness_tool_gateway_into_ch
     ProbeDiscussionRuntime.instances.clear()
     ProbeHybridRuntime.instances.clear()
     monkeypatch.setattr(defaults_module, "CrewDispatchRuntime", ProbeDispatchRuntime)
-    monkeypatch.setattr(defaults_module, "AutoGenDiscussionRuntime", ProbeDiscussionRuntime)
+    monkeypatch.setattr(autogen_adapter, "AutoGenDiscussionRuntime", ProbeDiscussionRuntime)
     monkeypatch.setattr(defaults_module, "HybridRuntime", ProbeHybridRuntime)
     harness = object()
     runtime = ConfigBackedHybridRuntime(
@@ -4770,7 +4771,7 @@ async def test_config_backed_hybrid_runtime_shares_artifact_repository_across_st
     ProbeDiscussionRuntime.instances.clear()
     ProbeHybridRuntime.instances.clear()
     monkeypatch.setattr(defaults_module, "CrewDispatchRuntime", ProbeDispatchRuntime)
-    monkeypatch.setattr(defaults_module, "AutoGenDiscussionRuntime", ProbeDiscussionRuntime)
+    monkeypatch.setattr(autogen_adapter, "AutoGenDiscussionRuntime", ProbeDiscussionRuntime)
     monkeypatch.setattr(defaults_module, "HybridRuntime", ProbeHybridRuntime)
     artifact_repository = InMemoryArtifactRepository()
     runtime = ConfigBackedHybridRuntime(
@@ -4833,7 +4834,7 @@ async def test_config_backed_hybrid_runtime_keeps_plan_digest_stable_across_budg
     ProbeDiscussionRuntime.instances.clear()
     ProbeHybridRuntime.instances.clear()
     monkeypatch.setattr(defaults_module, "CrewDispatchRuntime", ProbeDispatchRuntime)
-    monkeypatch.setattr(defaults_module, "AutoGenDiscussionRuntime", ProbeDiscussionRuntime)
+    monkeypatch.setattr(autogen_adapter, "AutoGenDiscussionRuntime", ProbeDiscussionRuntime)
     monkeypatch.setattr(defaults_module, "HybridRuntime", ProbeHybridRuntime)
     config = FakeConfigService(
         {
@@ -5102,7 +5103,7 @@ async def test_config_backed_discussion_runtime_emits_main_agent_role_plan(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     ProbeDiscussionRuntime.instances.clear()
-    monkeypatch.setattr(defaults_module, "AutoGenDiscussionRuntime", ProbeDiscussionRuntime)
+    monkeypatch.setattr(autogen_adapter, "AutoGenDiscussionRuntime", ProbeDiscussionRuntime)
     runtime = ConfigBackedDiscussionRuntime(
         config_service=FakeConfigService(
             {
@@ -5227,7 +5228,7 @@ async def test_config_backed_discussion_runtime_does_not_require_structured_mode
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     ProbeDiscussionRuntime.instances.clear()
-    monkeypatch.setattr(defaults_module, "AutoGenDiscussionRuntime", ProbeDiscussionRuntime)
+    monkeypatch.setattr(autogen_adapter, "AutoGenDiscussionRuntime", ProbeDiscussionRuntime)
     runtime = ConfigBackedDiscussionRuntime(
         config_service=FakeConfigService(
             {
@@ -5307,7 +5308,7 @@ async def test_config_backed_discussion_runtime_prepares_tenant_before_inventory
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     ProbeDiscussionRuntime.instances.clear()
-    monkeypatch.setattr(defaults_module, "AutoGenDiscussionRuntime", ProbeDiscussionRuntime)
+    monkeypatch.setattr(autogen_adapter, "AutoGenDiscussionRuntime", ProbeDiscussionRuntime)
     capability_gateway = TenantPreparedPluginManifestCapabilityGateway()
     runtime = ConfigBackedDiscussionRuntime(
         config_service=FakeConfigService(

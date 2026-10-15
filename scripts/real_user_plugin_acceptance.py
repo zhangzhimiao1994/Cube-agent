@@ -229,7 +229,7 @@ def build_acceptance_plugin(package_dir: Path, *, execution_id: str) -> Acceptan
         json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
-    adapter_source = f'''from __future__ import annotations
+    adapter_source = f"""from __future__ import annotations
 
 import json
 import sys
@@ -259,7 +259,7 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-'''
+"""
     (adapter_dir / "main.py").write_text(adapter_source, encoding="utf-8")
     private_key = ed25519.Ed25519PrivateKey.generate()
     archive_path = package_dir / f"{plugin_id}.zip"
@@ -381,9 +381,7 @@ def verify_public_plugin_invocation(
             break
     if correlated_details is None:
         raise RuntimeError("correlated plugin invocation audit was not found")
-    completed_event = next(
-        item for item in matching_events if item.get("kind") == "tool.completed"
-    )
+    completed_event = next(item for item in matching_events if item.get("kind") == "tool.completed")
     observed_nonces = {
         _runtime_nonce_from_identifier(completed_event.get("tool_name"), "_"),
         _runtime_nonce_from_identifier(correlated_details.get("capability_id"), "_"),
@@ -399,31 +397,142 @@ def verify_public_plugin_invocation(
     }
 
 
+class FrozenPluginApproval(RuntimeError):
+    """An unproven or ambiguous approval must not trigger further writes."""
+
+
+def _approval_identity(details: Mapping[str, object], run_id: str) -> tuple[str, int]:
+    approval_id = details.get("approval_id")
+    version = details.get("version")
+    if (
+        details.get("id") != run_id
+        or details.get("status") != "waiting_approval"
+        or not isinstance(approval_id, str)
+        or not approval_id.strip()
+        or type(version) is not int
+        or version <= 0
+    ):
+        raise FrozenPluginApproval("public plugin approval identity is not proven")
+    return approval_id, version
+
+
+def _verify_plugin_approval(
+    events: object,
+    *,
+    run_id: str,
+    approval_id: str,
+    version: int,
+    plugin_id: str,
+    capability_id: str,
+) -> bool:
+    projection = _mapping(events, "public approval events")
+    items = projection.get("items")
+    if not isinstance(items, list | tuple):
+        raise FrozenPluginApproval("public plugin approval events are missing")
+    pending: dict[str, Mapping[str, object]] = {}
+    requested: set[str] = set()
+    previous_sequence = 0
+    for item in items:
+        if not isinstance(item, Mapping):
+            raise FrozenPluginApproval("public plugin approval event is invalid")
+        kind = item.get("kind")
+        if kind not in {"approval.requested", "approval.resolved"}:
+            continue
+        event_id = item.get("approval_id")
+        sequence = item.get("sequence")
+        if (
+            item.get("run_id") != run_id
+            or not isinstance(event_id, str)
+            or not event_id.strip()
+            or type(sequence) is not int
+            or sequence <= previous_sequence
+        ):
+            raise FrozenPluginApproval("public plugin approval event identity is not proven")
+        previous_sequence = sequence
+        if kind == "approval.requested":
+            if event_id in requested:
+                raise FrozenPluginApproval("public plugin approval event is duplicated")
+            requested.add(event_id)
+            pending[event_id] = item
+        else:
+            if event_id not in pending:
+                raise FrozenPluginApproval("public plugin approval resolution is not bound")
+            del pending[event_id]
+    if set(pending) != {approval_id}:
+        raise FrozenPluginApproval("public plugin approval is not uniquely pending")
+    payload = pending[approval_id].get("payload")
+    if (
+        not isinstance(payload, Mapping)
+        or payload.get("plugin_id") != plugin_id
+        or payload.get("capability_id") != capability_id
+        or type(payload.get("version")) is not int
+        or payload.get("version") != version
+    ):
+        raise FrozenPluginApproval("public plugin approval capability binding is not proven")
+    ready = projection.get("ready")
+    if type(ready) is not bool:
+        raise FrozenPluginApproval("public plugin approval readiness is not proven")
+    return ready
+
+
 def _poll_run(
     client: PluginAcceptanceClient,
     run_id: str,
     *,
+    expected_plugin_id: str,
+    expected_capability_id: str,
     wait_seconds: float,
     poll_interval_seconds: float,
 ) -> Mapping[str, object]:
     deadline = time.monotonic() + max(wait_seconds, 0.1)
+    approval_attempted = False
     while True:
-        details = _mapping(
-            client.request_json("GET", f"/api/v1/runs/{quote(run_id, safe='')}/details"),
-            "public run details",
-        )
+        try:
+            details = _mapping(
+                client.request_json("GET", f"/api/v1/runs/{quote(run_id, safe='')}/details"),
+                "public run details",
+            )
+        except Exception:
+            if approval_attempted:
+                raise FrozenPluginApproval("public plugin approval result cannot be read") from None
+            raise
         status = details.get("status")
         if status in _TERMINAL_RUN_STATUSES:
             return details
         if status == "waiting_approval":
-            approval_id = details.get("approval_id")
-            version = details.get("version")
-            if isinstance(approval_id, str) and isinstance(version, int):
-                client.request_json(
-                    "POST",
-                    f"/api/v1/runs/{quote(run_id, safe='')}/approve-capability",
-                    body={"approval_id": approval_id, "version": version},
+            if approval_attempted:
+                raise FrozenPluginApproval("public plugin approval was already attempted")
+            try:
+                approval_id, version = _approval_identity(details, run_id)
+                ready = _verify_plugin_approval(
+                    client.request_json(
+                        "GET", f"/api/v1/runs/{quote(run_id, safe='')}/capability-approvals",
+                    ),
+                    run_id=run_id,
+                    approval_id=approval_id,
+                    version=version,
+                    plugin_id=expected_plugin_id,
+                    capability_id=expected_capability_id,
                 )
+                if ready:
+                    current = _mapping(
+                        client.request_json("GET", f"/api/v1/runs/{quote(run_id, safe='')}/details"),
+                        "public run details before approval",
+                    )
+                    if _approval_identity(current, run_id) != (approval_id, version):
+                        raise FrozenPluginApproval("public plugin approval changed before submission")
+                    approval_attempted = True
+                    client.request_json(
+                        "POST",
+                        f"/api/v1/runs/{quote(run_id, safe='')}/approve-capability",
+                        body={"approval_id": approval_id, "version": version},
+                    )
+            except FrozenPluginApproval:
+                raise
+            except Exception:  # noqa: BLE001 - uncertain reads/writes must freeze, not retry.
+                raise FrozenPluginApproval(
+                    "public plugin approval evidence or result is unknown"
+                ) from None
         if time.monotonic() >= deadline:
             raise RuntimeError("public plugin run did not reach a terminal status")
         if poll_interval_seconds > 0:
@@ -498,7 +607,6 @@ def _unknown_run_cleanup_recovery(
     run_idempotency_key: str,
     retry_after_seconds: float,
 ) -> dict[str, object]:
-    plugin_path = f"/api/v1/admin/plugins/{quote(package.plugin_id, safe='')}"
     return {
         "required": True,
         "reason": "run_submission_result_unknown",
@@ -506,21 +614,18 @@ def _unknown_run_cleanup_recovery(
         "plugin_id": package.plugin_id,
         "key_id": package.key_id,
         "retry_after_seconds": max(1, int(retry_after_seconds or 1)),
-        "steps": [
-            {
-                "method": "POST",
-                "path": "/api/v1/runs",
-                "body": run_request,
-                "idempotency_key": run_idempotency_key,
-                "capture": {"run_id": "id"},
-            },
-            {
-                "method": "GET",
-                "path": "/api/v1/runs/{run_id}/details",
-                "require": {"execution_quiescent": True},
-            },
-            *_resource_cleanup_recovery_steps(package, plugin_path=plugin_path),
-        ],
+        "frozen": True,
+        "resubmission_allowed": False,
+        # No public read-only idempotency lookup exists. Never invent a GET route or replay POST.
+        "identity_lookup": {
+            "read_only": True,
+            "available": False,
+            "reason": "read_only_request_lookup_unavailable",
+            "idempotency_key": run_idempotency_key,
+            "run_request": run_request,
+            "require": "exact original request/run identity, then terminal execution quiescence",
+        },
+        "steps": [],
     }
 
 
@@ -535,10 +640,14 @@ def _is_side_effect_free_run_submission_rejection(error: AcceptanceHTTPError) ->
     if not isinstance(error_payload, Mapping):
         return False
     error_code = error_payload.get("code")
-    return isinstance(error_code, str) and (
-        error.status_code,
-        error_code,
-    ) in _SIDE_EFFECT_FREE_RUN_SUBMISSION_REJECTIONS
+    return (
+        isinstance(error_code, str)
+        and (
+            error.status_code,
+            error_code,
+        )
+        in _SIDE_EFFECT_FREE_RUN_SUBMISSION_REJECTIONS
+    )
 
 
 def _resource_cleanup_recovery_steps(
@@ -552,10 +661,7 @@ def _resource_cleanup_recovery_steps(
         {"method": "POST", "path": f"{plugin_path}/uninstall", "body": {}},
         {
             "method": "DELETE",
-            "path": (
-                "/api/v1/admin/plugins/signing-keys/"
-                f"{quote(package.key_id, safe='')}"
-            ),
+            "path": (f"/api/v1/admin/plugins/signing-keys/{quote(package.key_id, safe='')}"),
         },
         {
             "method": "GET",
@@ -617,7 +723,10 @@ def _cleanup(
     if installed:
         try:
             plugins = _list(client.request_json("GET", "/api/v1/admin/plugins"), "plugin list")
-            if any(isinstance(item, Mapping) and item.get("id") == package.plugin_id for item in plugins):
+            if any(
+                isinstance(item, Mapping) and item.get("id") == package.plugin_id
+                for item in plugins
+            ):
                 raise RuntimeError("temporary plugin remains installed")
             manifest = client.request_json("GET", "/api/v1/admin/capabilities/manifest")
             if _manifest_capability(manifest, package.capability_id) is not None:
@@ -639,7 +748,7 @@ def run_real_user_plugin_acceptance(
     run_mode: str = "dispatch",
     direct_model: str | None = None,
 ) -> dict[str, object]:
-    """Run installation, public invocation, evidence checks, and unconditional cleanup."""
+    """Run the controlled fixture with evidence checks and quiescence-gated cleanup."""
 
     if run_mode != "dispatch":
         raise ValueError("plugin acceptance requires a tool-capable dispatch mode")
@@ -652,6 +761,7 @@ def run_real_user_plugin_acceptance(
     run_id = ""
     run_terminal = False
     run_cleanup_blocked = False
+    approval_binding_frozen = False
     run_submission_attempted = False
     run_submission_rejected = False
     run_submission_unknown = False
@@ -705,8 +815,7 @@ def run_real_user_plugin_acceptance(
             "plugin signing key list",
         )
         if any(
-            isinstance(item, Mapping) and item.get("id") == package.plugin_id
-            for item in plugins
+            isinstance(item, Mapping) and item.get("id") == package.plugin_id for item in plugins
         ) or any(
             isinstance(item, Mapping) and item.get("key_id") == package.key_id
             for item in signing_keys
@@ -777,7 +886,7 @@ def run_real_user_plugin_acceptance(
             "skip_evolution_proposal": True,
             "message": (
                 f"请自动选择并实际调用 {package.capability_id}，只调用一次。"
-                f"参数必须是 {{\"text\": {json.dumps(package.input_text, ensure_ascii=False)}}}。"
+                f'参数必须是 {{"text": {json.dumps(package.input_text, ensure_ascii=False)}}}。'
                 "完成后简要返回工具结果。"
             ),
         }
@@ -804,6 +913,8 @@ def run_real_user_plugin_acceptance(
         details = _poll_run(
             operator_client,
             run_id,
+            expected_plugin_id=package.plugin_id,
+            expected_capability_id=package.capability_id,
             wait_seconds=wait_seconds,
             poll_interval_seconds=poll_interval_seconds,
         )
@@ -838,6 +949,23 @@ def run_real_user_plugin_acceptance(
             )
         )
         phases.append("unique_result_validated")
+    except FrozenPluginApproval as error:
+        errors.append(str(error))
+        approval_binding_frozen = True
+        run_cleanup_blocked = True
+        recovery = {
+            "required": True,
+            "frozen": True,
+            "reason": "approval_binding_or_result_unproven",
+            "run_id": run_id,
+            "plugin_id": package.plugin_id,
+            "capability_id": package.capability_id,
+            "key_id": package.key_id,
+            "steps": [
+                {"method": "GET", "path": f"/api/v1/runs/{quote(run_id, safe='')}/details"},
+                {"method": "GET", "path": f"/api/v1/runs/{quote(run_id, safe='')}/events"},
+            ],
+        }
     except Exception as error:  # noqa: BLE001 - always clean up and return machine-readable evidence.
         errors.append(str(error))
     finally:
@@ -845,7 +973,7 @@ def run_real_user_plugin_acceptance(
         run_cleanup_errors: list[str] = []
         cleanup_completed: list[str]
         cleanup_errors: list[str]
-        if run_id:
+        if run_id and not approval_binding_frozen:
             if not run_terminal:
                 try:
                     operator_client.request_json(
@@ -872,7 +1000,7 @@ def run_real_user_plugin_acceptance(
                     run_id=run_id,
                     retry_after_seconds=max(poll_interval_seconds, 1),
                 )
-        elif run_submission_attempted and not run_submission_rejected:
+        elif not run_id and run_submission_attempted and not run_submission_rejected:
             run_submission_unknown = True
             run_cleanup_blocked = True
             assert run_request is not None
@@ -886,7 +1014,9 @@ def run_real_user_plugin_acceptance(
         if run_cleanup_blocked:
             cleanup_completed = []
             cleanup_errors = [
-                "plugin cleanup deferred because the public run submission result is unknown"
+                "plugin cleanup frozen because the approval binding or result is unproven"
+                if approval_binding_frozen
+                else "plugin cleanup deferred because the public run submission result is unknown"
                 if run_submission_unknown
                 else "plugin cleanup deferred because the public run is not confirmed execution-quiescent"
             ]
@@ -906,7 +1036,9 @@ def run_real_user_plugin_acceptance(
         and "verify_signing_key_removed" in cleanup_completed
     )
     cleanup_state = (
-        "deferred_waiting_for_run_identity"
+        "frozen_waiting_for_approval_binding"
+        if approval_binding_frozen
+        else "deferred_waiting_for_run_identity"
         if run_submission_unknown
         else "deferred_waiting_for_execution_quiescence"
         if run_cleanup_blocked
@@ -917,6 +1049,8 @@ def run_real_user_plugin_acceptance(
     return {
         "schema_version": 1,
         "kind": "real_user_plugin_acceptance",
+        "source_basis": "controlled_fixture",
+        "generated_source_acceptance": False,
         "status": "passed" if passed else "failed",
         "acceptance_complete": passed,
         "execution_id": execution_id,
@@ -986,9 +1120,7 @@ def _find_temporary_operator(
         raise RuntimeError("temporary operator cleanup principal is not an administrator")
     users = _list(admin_client.request_json("GET", "/api/v1/users"), "user list")
     matches = [
-        item
-        for item in users
-        if isinstance(item, Mapping) and item.get("username") == username
+        item for item in users if isinstance(item, Mapping) and item.get("username") == username
     ]
     if not matches:
         return None
@@ -1065,6 +1197,7 @@ def _record_temporary_operator_cleanup(
     report["status"] = "failed"
     report["acceptance_complete"] = False
     if report.get("cleanup_state") not in {
+        "frozen_waiting_for_approval_binding",
         "deferred_waiting_for_execution_quiescence",
         "deferred_waiting_for_run_identity",
     }:
@@ -1075,6 +1208,8 @@ def _setup_failure_report(execution_id: str, errors: list[str]) -> dict[str, obj
     return {
         "schema_version": 1,
         "kind": "real_user_plugin_acceptance",
+        "source_basis": "controlled_fixture",
+        "generated_source_acceptance": False,
         "status": "failed",
         "acceptance_complete": False,
         "execution_id": execution_id,
@@ -1117,7 +1252,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--direct-model",
         default=os.environ.get("AGENT_HUB_ACCEPTANCE_DIRECT_MODEL"),
     )
-    parser.add_argument("--execution-id", default=f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid4().hex[:8]}")
+    parser.add_argument(
+        "--execution-id", default=f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid4().hex[:8]}"
+    )
     parser.add_argument("--output")
     parser.add_argument(
         "--operator-username",
@@ -1223,10 +1360,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     raise RuntimeError("temporary operator login role is not operator")
                 if operator_principal.get("tenant_id") != temporary_operator_tenant:
                     raise RuntimeError("temporary operator login tenant does not match")
-                if (
-                    temporary_operator_id is not None
-                    and temporary_operator_id != operator_user_id
-                ):
+                if temporary_operator_id is not None and temporary_operator_id != operator_user_id:
                     raise RuntimeError(
                         "temporary operator user id differs from the creation response"
                     )
@@ -1257,7 +1391,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 else "temporary operator cleanup deferred because its run is not execution-quiescent"
             ]
             recovery = report.get("recovery")
-            if isinstance(recovery, dict):
+            if isinstance(recovery, dict) and recovery.get("frozen") is not True:
                 raw_steps = recovery.get("steps")
                 if isinstance(raw_steps, list):
                     raw_steps.extend(

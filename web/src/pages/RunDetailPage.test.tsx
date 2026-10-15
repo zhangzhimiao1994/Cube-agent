@@ -1,11 +1,14 @@
 import { readFileSync } from "node:fs";
 
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { api, WebPreviewSchema, type RunDetail } from "../api/client";
 import { TestApp } from "../app/router";
+import { RunDetailPage } from "./RunDetailPage";
 
 const runId = "55555555-5555-4555-8555-555555555555";
 const longArtifactText =
@@ -282,6 +285,186 @@ describe("RunDetailPage", () => {
     vi.unstubAllGlobals();
     window.sessionStorage.clear();
   });
+
+  it.each([
+    { details: { project_id: "project-a", workspace_session_id: "session-a" }, available: true },
+    { details: { project_id: "Project.A:1", workspace_session_id: "Session_2" }, available: true },
+    { details: {}, available: false },
+    { details: { project_id: "project-a" }, available: false },
+    { details: { project_id: " project-a", workspace_session_id: "session-a" }, available: false },
+    { details: { project_id: "project-a", workspace_session_id: "../other" }, available: false },
+    { details: { project_id: "project-a", workspace_session_id: "session-a" }, available: false, foreignRun: true },
+  ])("uses only current run explicit workspace fields %j through the real client", async ({ details, available, foreignRun }) => {
+    const workspaceReads: string[] = [];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, _init?: RequestInit) => {
+      const url = String(input);
+      const path = new URL(url, "https://agent-hub.test").pathname;
+      if (path === "/api/v1/auth/me") return jsonResponse({
+        user_id: "11111111-1111-4111-8111-111111111111", tenant_id: "33333333-3333-4333-8333-333333333333",
+        username: "operator", role: "operator", permissions: ["run:read", "run:create", "plugin:read"],
+      });
+      if (path === `/api/v1/admin/runs/${runId}`) return jsonResponse({ ...runDetail,
+        id: foreignRun ? "66666666-6666-4666-8666-666666666666" : runId,
+        conversation_id: "foreign-conversation", explicit_details: details });
+      if (path.startsWith("/api/v1/workspaces/")) {
+        workspaceReads.push(path);
+        const base = `/api/v1/workspaces/projects/${details.project_id}/sessions/${details.workspace_session_id}`;
+        return jsonResponse({ items: [{ path: "plugin.json", filename: "plugin.json", mime_type: "application/json",
+          size_bytes: 12, sha256: "a".repeat(64), download_url: `${base}/files/download?path=plugin.json` }],
+        bundle_download_url: `${base}/bundle/download` });
+      }
+      return jsonResponse({ error: { code: "not_found", message: "not found" } }, { status: 404 });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false, refetchOnWindowFocus: false } } });
+    const view = render(<QueryClientProvider client={client}>
+      <MemoryRouter initialEntries={[`/runs/${runId}`]}>
+        <Routes><Route path="/runs/:runId" element={<RunDetailPage />} /></Routes>
+      </MemoryRouter>
+    </QueryClientProvider>);
+    try {
+      const user = userEvent.setup();
+      await screen.findByRole("heading", { name: "运行详情" });
+      expect(workspaceReads).toEqual([]);
+      await user.click(screen.getByRole("button", { name: "插件安装计划" }));
+      await screen.findByText("当前账号：operator:11111111");
+      expect(workspaceReads).toEqual([]);
+      await user.click(screen.getByRole("radio", { name: "工作区文件" }));
+      if (available) {
+        await screen.findByRole("checkbox", { name: "plugin.json" });
+        expect(workspaceReads).toEqual([
+          `/api/v1/workspaces/projects/${encodeURIComponent(details.project_id!)}/sessions/${encodeURIComponent(details.workspace_session_id!)}/files`,
+        ]);
+      } else {
+        expect(screen.getByText(/当前运行没有可用的工作区范围/)).not.toBeNull();
+        expect(workspaceReads).toEqual([]);
+      }
+      expect(fetchMock.mock.calls.every(([, init]) => !init || init.method !== "POST")).toBe(true);
+    } finally { view.unmount(); client.clear(); }
+  });
+
+  it("keeps the original failure page when the first run fetch has no cached data", async () => {
+    const fetchMock = vi.fn(async () => jsonResponse({ error: {
+      code: "service_unavailable", message: "initial run read unavailable",
+    } }, { status: 503 }));
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const view = render(<QueryClientProvider client={client}>
+      <MemoryRouter initialEntries={[`/runs/${runId}`]}>
+        <Routes><Route path="/runs/:runId" element={<RunDetailPage />} /></Routes>
+      </MemoryRouter>
+    </QueryClientProvider>);
+    try {
+      const alert = await screen.findByRole("alert");
+      expect(alert.textContent).toContain("运行详情加载失败");
+      expect(alert.textContent).toContain("initial run read unavailable");
+      expect(screen.queryByRole("heading", { name: "运行详情" })).toBeNull();
+      expect(screen.queryByRole("button", { name: "插件安装计划" })).toBeNull();
+      expect(client.getQueryData(["run", runId])).toBeUndefined();
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    } finally {
+      view.unmount();
+      client.clear();
+    }
+  });
+
+  it.each([false, true])(
+    "preserves unknown create identity across real polling failure/recovery (closed=%s)",
+    async (closed) => {
+      const artifactId = "11111111-1111-4111-8111-111111111111";
+      const currentDetail: RunDetail = { ...runDetail, status: "running", artifacts: [{
+        id: artifactId, kind: "generated_file", title: "plugin.zip", filename: "plugin.zip",
+        text: "", mime_type: "application/zip", size_bytes: 4, sha256: "a".repeat(64),
+        download_url: `/api/v1/runs/${runId}/artifacts/${artifactId}/download`,
+      }] };
+      let pollFailure = false;
+      const creates: { body: string; key: string | null }[] = [];
+      const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const path = new URL(String(input), "https://agent-hub.test").pathname;
+        if (path === "/api/v1/auth/me") return jsonResponse({
+          user_id: artifactId, tenant_id: "33333333-3333-4333-8333-333333333333", role: "super_admin",
+        });
+        if (path === `/api/v1/admin/runs/${runId}`) {
+          if (pollFailure) return jsonResponse({ error: {
+            code: "service_unavailable", message: "PRIVATE_POLL_ERROR SQL params token",
+          } }, { status: 503 });
+          return jsonResponse(currentDetail);
+        }
+        if (path === `/api/v1/runs/${runId}/plugin-handovers`) {
+          creates.push({ body: String(init?.body), key: new Headers(init?.headers).get("Idempotency-Key") });
+          if (creates.length === 1) return jsonResponse({ error: {
+            code: "service_unavailable", message: "create result unknown",
+          } }, { status: 503 });
+          return jsonResponse({
+            schema_version: 1, handover_id: `gh-${"b".repeat(64)}`, run_id: runId,
+            creator_id: artifactId, installer_id: null, version: 1, status: "awaiting_signature",
+            created_at: "2026-10-13T00:00:00Z", updated_at: "2026-10-13T00:00:00Z",
+            expires_at: JSON.parse(String(init?.body)).expires_at,
+            source: { kind: "artifact", artifact_id: artifactId }, source_manifest_sha256: "c".repeat(64),
+            plan_hash: "d".repeat(64), plugin_id: "unit-plugin", plugin_version: "1.0.0",
+            permissions: [], risk_summary: [], signature_payload_sha256: null, archive_sha256: null,
+            key_id: null, receipt_id: null, audit_id: null, committed_at: null, result: null,
+            source_grant_id: `sg-${"e".repeat(64)}`, source_grant_binding_sha256: "f".repeat(64),
+          });
+        }
+        return jsonResponse({ error: { code: "not_found", message: "not found" } }, { status: 404 });
+      });
+      vi.stubGlobal("fetch", fetchMock);
+      const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      const view = render(<QueryClientProvider client={client}>
+        <MemoryRouter initialEntries={[`/runs/${runId}`]}>
+          <Routes><Route path="/runs/:runId" element={<RunDetailPage />} /></Routes>
+        </MemoryRouter>
+      </QueryClientProvider>);
+      try {
+        const user = userEvent.setup();
+        await screen.findByRole("heading", { name: "运行详情" });
+        await user.click(screen.getByRole("button", { name: "插件安装计划" }));
+        await waitFor(() => expect(screen.getByRole("button", { name: "创建安装计划" })
+          .hasAttribute("disabled")).toBe(false));
+        await user.click(screen.getByRole("button", { name: "创建安装计划" }));
+        await screen.findByText("创建计划失败：服务暂不可用。结果未确认，请刷新回执核实。");
+        expect(creates).toHaveLength(1);
+        const originalAttempt = { ...creates[0] };
+        expect(originalAttempt.key).toMatch(/^handover-[a-f0-9]{32}$/);
+        const originalDialog = screen.getByRole("dialog", { name: "插件安装计划" });
+        const originalEntry = screen.getByRole("button", { name: "插件安装计划" });
+        if (closed) await user.click(screen.getByRole("button", { name: "关闭安装计划" }));
+
+        pollFailure = true;
+        await waitFor(() => expect(client.getQueryState(["run", runId])?.status).toBe("error"),
+          { timeout: 2500 });
+        expect(client.getQueryData(["run", runId])).toEqual(currentDetail);
+        expect(screen.getByRole("heading", { name: "运行详情" })).not.toBeNull();
+        expect(screen.getByRole("button", { name: "插件安装计划" })).toBe(originalEntry);
+        expect(screen.getByRole("alert", { name: "运行详情刷新失败" }).textContent)
+          .toBe("运行详情刷新失败，当前显示上次成功读取的数据。");
+        expect(document.body.textContent).not.toContain("PRIVATE_POLL_ERROR");
+        if (!closed) expect(screen.getByRole("dialog", { name: "插件安装计划" })).toBe(originalDialog);
+        expect(creates).toHaveLength(1);
+
+        pollFailure = false;
+        await waitFor(() => expect(client.getQueryState(["run", runId])?.status).toBe("success"),
+          { timeout: 2500 });
+        await waitFor(() => expect(screen.queryByRole("alert", { name: "运行详情刷新失败" })).toBeNull());
+        expect(creates).toHaveLength(1);
+        if (closed) await user.click(screen.getByRole("button", { name: "插件安装计划" }));
+        const retry = screen.getByRole("button", { name: "重试创建原计划" });
+        await waitFor(() => expect(retry.hasAttribute("disabled")).toBe(false));
+        expect(screen.getByLabelText("计划到期时间").hasAttribute("disabled")).toBe(true);
+        await user.click(retry);
+        await screen.findByText("等待签名归档");
+        expect(creates).toEqual([originalAttempt, originalAttempt]);
+        const mutations = fetchMock.mock.calls.filter(([, init]) => init?.method === "POST");
+        expect(mutations).toHaveLength(2);
+        expect(mutations.every(([input]) => new URL(String(input), "https://agent-hub.test").pathname
+          === `/api/v1/runs/${runId}/plugin-handovers`)).toBe(true);
+      } finally {
+        view.unmount();
+        client.clear();
+      }
+    },
+  );
 
   it("keeps long run outputs behind categorized detail cards while preserving artifact downloads", async () => {
     const user = userEvent.setup();

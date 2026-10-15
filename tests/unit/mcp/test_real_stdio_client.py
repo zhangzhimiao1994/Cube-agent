@@ -1,13 +1,75 @@
 from __future__ import annotations
 
+import asyncio
 import sys
 from pathlib import Path
+from typing import Any
 from uuid import UUID
+
+import pytest
 
 from agent_hub.mcp.client import StdioMcpClient
 from agent_hub.mcp.types import McpServerDefinition, McpTransportKind
 
 TENANT_ID = UUID("66666666-6666-4666-8666-666666666666")
+
+
+async def test_stdio_log_flood_does_not_block_protocol(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    script = tmp_path / "noisy_mcp.py"
+    script.write_text(
+        "import sys\n"
+        "sys.stderr.buffer.write(b'x' * 1_000_000)\n"
+        "sys.stderr.buffer.flush()\n"
+        "sys.stdout.buffer.write("
+        "b'Content-Length: 36\\r\\n\\r\\n'"
+        'b\'{"jsonrpc":"2.0","id":1,"result":{}}\')\n'
+        "sys.stdout.buffer.flush()\n"
+        "sys.stdin.buffer.read()\n",
+        encoding="utf-8",
+    )
+    server = McpServerDefinition(
+        tenant_id=TENANT_ID,
+        id="noisy",
+        transport=McpTransportKind.STDIO,
+        command=sys.executable,
+        args=(str(script),),
+        executable_allowlist=(sys.executable,),
+    )
+    real_spawn = asyncio.create_subprocess_exec
+    rescued = asyncio.Event()
+    rescuers: list[asyncio.Task[None]] = []
+    processes: list[asyncio.subprocess.Process] = []
+
+    async def rescue(process: asyncio.subprocess.Process) -> None:
+        # Unblock the old implementation so a failing regression cannot leak a child.
+        await asyncio.sleep(3)
+        if process.stderr is not None:
+            rescued.set()
+            await process.stderr.read()
+
+    async def spawn(program: str, *args: str, **kwargs: Any) -> asyncio.subprocess.Process:
+        process = await real_spawn(program, *args, **kwargs)
+        processes.append(process)
+        rescuers.append(asyncio.create_task(rescue(process)))
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+    try:
+        assert await asyncio.wait_for(StdioMcpClient().health(server), timeout=10) == "healthy"
+        assert not rescued.is_set(), "stderr backpressure blocked the MCP response"
+        assert processes and all(process.returncode is not None for process in processes)
+    finally:
+        for task in rescuers:
+            task.cancel()
+        await asyncio.gather(*rescuers, return_exceptions=True)
+        for process in processes:
+            if process.returncode is None:
+                process.kill()
+            if process.stderr is not None:
+                await process.stderr.read()
+            await process.wait()
 
 
 async def test_stdio_client_invokes_real_mcp_server_process(tmp_path: Path) -> None:

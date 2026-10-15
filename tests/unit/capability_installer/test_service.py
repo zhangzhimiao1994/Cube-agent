@@ -18,6 +18,7 @@ from agent_hub.capability_installer.environment import (
     CliArtifactSpec,
     EnvironmentRecord,
     PythonEnvironmentSpec,
+    tenant_environment_id,
 )
 from agent_hub.capability_installer.service import (
     CapabilityInstallerService,
@@ -44,10 +45,15 @@ class RecordingAdminService:
 class RecordingEnvironmentManager:
     def __init__(self, root: Path, *, active_version: str | None = None) -> None:
         self.root = root
+        self.root.mkdir(parents=True, exist_ok=True)
         self.active_version = active_version
         self.cli_specs: list[CliArtifactSpec] = []
         self.python_specs: list[PythonEnvironmentSpec] = []
         self.restores: list[tuple[str, str | None]] = []
+        self.reference_owners: dict[tuple[str, str], set[str]] = {}
+
+    def add_reference(self, capability_id: str, version: str, owner: str) -> None:
+        self.reference_owners.setdefault((capability_id, version), set()).add(owner)
 
     def active(self, capability_id: str) -> EnvironmentRecord:
         if self.active_version is None:
@@ -335,7 +341,8 @@ async def test_installer_builds_cli_recipe_and_injects_versioned_executable_befo
     assert installed_plan.status == "installed"
     assert manager.cli_specs[0].version == "2.0.0"
     command = plugin.resource_config["command"]
-    assert command == str(tmp_path / "environments/managed_tool/versions/2.0.0/tool")
+    scoped_id = tenant_environment_id(TENANT_ID, "managed_tool")
+    assert command == str(tmp_path / "environments" / scoped_id / "versions/2.0.0/tool")
     assert Path(command).is_file()
     assert admin.started_preflight is preflight
     assert admin.state is not None
@@ -371,7 +378,7 @@ async def test_installer_maps_python_lock_recipe_to_versioned_environment(tmp_pa
 
     assert manager.python_specs == [
         PythonEnvironmentSpec(
-            "managed_tool",
+            tenant_environment_id(TENANT_ID, "managed_tool"),
             "3.1.0",
             tmp_path / "requirements.lock",
             tmp_path / "wheels",
@@ -435,7 +442,7 @@ async def test_activation_failure_restores_previous_active_environment(tmp_path:
         )
 
     assert manager.active_version == "1.0.0"
-    assert manager.restores[-1] == ("managed_tool", "1.0.0")
+    assert manager.restores[-1] == (tenant_environment_id(TENANT_ID, "managed_tool"), "1.0.0")
 
 
 @pytest.mark.asyncio

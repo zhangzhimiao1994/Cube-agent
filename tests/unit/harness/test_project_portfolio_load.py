@@ -255,28 +255,104 @@ def test_ultra_load_semantic_mutants_fail_with_honest_partial_counts(tmp_path: P
         assert counts['updated_traversals'] == 0 and counts['write_requests'] == 1064
 
 
-def test_legacy_controlled_bundle_does_not_satisfy_new_load_contract(tmp_path: Path) -> None:
+def test_legacy_controlled_bundle_has_bounded_semantic_contract_rejection(tmp_path: Path) -> None:
+    """Reject legacy semantics without requiring the reference's quadratic load writes."""
+    from urllib.parse import quote
+
     from agent_hub.runtime.project_scale_artifact import project_scale_artifact_zip_files
 
-    if shutil.which('node') is None or shutil.which('npm') is None:
+    npm = shutil.which('npm')
+    if shutil.which('node') is None or npm is None:
         pytest.skip('trusted real HTTP fixture requires Node and npm')
-    root = tmp_path / 'legacy-controlled'
-    root.mkdir()
     files = project_scale_artifact_zip_files(
         'Build a real ultra-large business project for flow=direct. '
         'Acceptance conditions require enterprise portfolio OS APIs, analytics, '
         'RBAC, persistence, tests, and verification evidence.'
     )
-    for name, content in files.items():
-        path = root / name
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content, encoding='utf-8')
-    result = _validate(root)
-    assert result['status'] == 'failed', result
-    assert result['cleanup_ok'] is True
-    assert any('portfolio load page' in reason for reason in result['reasons']), result
-    assert result['measurements']['target_projects'] == 1000
-    assert result['measurements']['initial_traversals'] < 4
+    taskkill = shutil.which('taskkill') if requirements._PLATFORM == 'nt' else None
+    with ExitStack() as stack:
+        root = Path(stack.enter_context(tempfile.TemporaryDirectory(
+            dir=tmp_path, prefix='legacy-controlled-',
+        )))
+        data = Path(stack.enter_context(tempfile.TemporaryDirectory(
+            dir=tmp_path, prefix='legacy-data-',
+        )))
+        runtime = Path(stack.enter_context(tempfile.TemporaryDirectory(
+            dir=tmp_path, prefix='legacy-runtime-',
+        )))
+        for name, content in files.items():
+            path = root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding='utf-8')
+        env = requirements._environment(str(data), str(runtime))
+        port = requirements._free_port()
+        env['PORT'] = str(port)
+        deadline = time.monotonic() + 25
+        process = subprocess.Popen(
+            [npm, 'start'], cwd=root, env=env, stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=requirements._PLATFORM == 'posix',
+        )
+        try:
+            api = requirements._PortfolioAPI(port, deadline)
+            requirements._ready_portfolio(api, process)
+            program_body = {'name': 'Bounded legacy program'}
+            program = api.create('/programs', program_body)
+            requirements._business_record_fields(program, program_body, 'program write')
+            expected: list[dict[str, object]] = []
+            for index in range(2):
+                body = {
+                    'program_id': program['id'], 'name': f'Bounded legacy project {index}',
+                    'owner': f'owner-{index}@example.test',
+                }
+                created = api.create('/projects', body)
+                requirements._business_record_fields(created, body, 'project write')
+                expected.append({
+                    'project_id': created['id'], 'program_id': body['program_id'],
+                    'name': body['name'], 'budget_total': 0, 'staffing_allocation': 0,
+                    'risk_count': 0, 'milestone_count': 0,
+                })
+            assert len({str(row['project_id']) for row in expected}) == 2
+            ordered = sorted(expected, key=lambda row: str(row['project_id']).encode(
+                'utf-16-be', errors='surrogatepass',
+            ))
+            read_path = f"/portfolio/read-model?program_id={quote(str(program['id']), safe='')}"
+            first = requirements._business_items(
+                api.get_object(f'{read_path}&offset=0&limit=1'), 'portfolio load page',
+            )
+            assert len(first) == 1
+            with pytest.raises(requirements._ValidationFailure, match='portfolio load page.*project_id'):
+                requirements._business_record_fields(first[0], ordered[0], 'portfolio load page')
+            second = requirements._business_items(
+                api.get_object(f'{read_path}&offset=1&limit=1'), 'portfolio load page',
+            )
+            assert len(second) == 1
+            assert first[0]['id'] == second[0]['id'] == expected[0]['project_id']
+            assert [first[0]['id'], second[0]['id']] != [row['project_id'] for row in ordered]
+            tail = requirements._business_items(
+                api.get_object(f'{read_path}&offset=2&limit=1'), 'portfolio load page',
+            )
+            assert len(tail) == 1 and tail[0]['id'] == expected[0]['project_id']
+            with pytest.raises(requirements._ValidationFailure, match='portfolio load page.*row count'):
+                requirements._require(len(tail) == len(ordered[2:3]), 'portfolio load page: row count')
+            persisted = json.loads((data / 'portfolio-os.json').read_text(encoding='utf-8'))
+            assert len(persisted['programs']) == 1 and len(persisted['projects']) == 2
+            requirements._remaining(deadline)
+        finally:
+            requirements._stop_tree(process, taskkill)
+            assert process.poll() is not None
+            close_deadline = time.monotonic() + 2
+            while True:
+                remaining = close_deadline - time.monotonic()
+                assert remaining > 0, 'legacy listener leaked after process-tree cleanup'
+                with socket.socket() as connection:
+                    connection.settimeout(min(0.1, remaining))
+                    if connection.connect_ex(('127.0.0.1', port)) != 0:
+                        break
+                time.sleep(min(0.05, max(0, close_deadline - time.monotonic())))
+    for owned in (root, data, runtime):
+        assert not owned.exists(), 'legacy fixture directory leaked'
+    assert list(tmp_path.iterdir()) == []
 
 
 @pytest.mark.parametrize('stage', ['headers', 'body'])
@@ -323,6 +399,10 @@ def test_load_deadline_is_unknown_and_still_cleans_up(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, expiry: str,
 ) -> None:
     root = _application(tmp_path, 'slow_program')
+    shutil.copyfile(_FIXTURE.parent / 'startup_port_race_hook.cjs', root / 'startup-hook.cjs')
+    (root / 'package.json').write_text(json.dumps({
+        'private': True, 'scripts': {'start': 'node --require ./startup-hook.cjs server.cjs'},
+    }), encoding='utf-8')
     npm = shutil.which('npm')
     assert npm is not None
     taskkill = shutil.which('taskkill') if requirements._PLATFORM == 'nt' else None
@@ -347,7 +427,9 @@ def test_load_deadline_is_unknown_and_still_cleans_up(
                 assert time.monotonic() < ready_deadline, 'trusted fixture never became ready'
                 with socket.socket() as connection:
                     connection.settimeout(0.1)
-                    if connection.connect_ex(('127.0.0.1', port)) == 0:
+                    launch_log = root / 'launches.jsonl'
+                    if (connection.connect_ex(('127.0.0.1', port)) == 0
+                            and launch_log.is_file() and launch_log.read_bytes().endswith(b'\n')):
                         break
                 time.sleep(0.05)
             assert not (root / 'requests.jsonl').exists()

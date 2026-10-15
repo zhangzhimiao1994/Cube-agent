@@ -183,9 +183,21 @@ class RunServiceProtocol(Protocol):
         version: int,
     ) -> SubmittedRun: ...
 
-    async def get(self, tenant_id: UUID, run_id: UUID) -> RunSummary: ...
+    async def get(
+        self, tenant_id: UUID, run_id: UUID, *, actor_id: UUID | None = None,
+    ) -> RunSummary: ...
 
-    async def events(self, tenant_id: UUID, run_id: UUID) -> tuple[dict[str, object], ...]: ...
+    async def events(
+        self, tenant_id: UUID, run_id: UUID, *, actor_id: UUID | None = None,
+    ) -> tuple[dict[str, object], ...]: ...
+
+    async def capability_approval_events(
+        self, tenant_id: UUID, run_id: UUID, *, actor_id: UUID,
+    ) -> tuple[dict[str, object], ...]: ...
+
+    async def capability_approval_ready(
+        self, tenant_id: UUID, run_id: UUID, *, actor_id: UUID,
+    ) -> bool: ...
 
     async def pause(self, tenant_id: UUID, run_id: UUID) -> RunSummary: ...
 
@@ -541,6 +553,10 @@ class RunSummaryResponse(BaseModel):
 
 class RunEventsResponse(BaseModel):
     items: tuple[dict[str, object], ...]
+
+
+class RunCapabilityApprovalsResponse(RunEventsResponse):
+    ready: bool
 
 
 def _repair_proposal_response(proposal: dict[str, object] | None) -> dict[str, object] | None:
@@ -1602,8 +1618,9 @@ async def approve_capability(
     service: Annotated[RunServiceProtocol, Depends(_run_service)],
     principal: Annotated[AuthenticatedPrincipal, Depends(require_permission("run:create"))],
 ) -> SubmittedRunResponse:
-    await _stop_run_preview(request, service, principal.tenant_id, run_id)
     try:
+        summary = await service.get(principal.tenant_id, run_id, actor_id=principal.user_id)
+        await _stop_conversation_preview(request, principal.tenant_id, summary.conversation_id)
         submitted = await service.approve_capability(
             tenant_id=principal.tenant_id,
             actor_id=principal.user_id,
@@ -1665,7 +1682,7 @@ async def get_run(
     principal: Annotated[AuthenticatedPrincipal, Depends(require_permission("run:read"))],
 ) -> RunSummaryResponse:
     try:
-        summary = await service.get(principal.tenant_id, run_id)
+        summary = await service.get(principal.tenant_id, run_id, actor_id=principal.user_id)
     except RunNotFound as error:
         raise _run_not_found() from error
     return RunSummaryResponse.from_summary(summary)
@@ -1678,10 +1695,31 @@ async def run_events(
     principal: Annotated[AuthenticatedPrincipal, Depends(require_permission("run:read"))],
 ) -> RunEventsResponse:
     try:
-        events = await service.events(principal.tenant_id, run_id)
+        events = await service.events(principal.tenant_id, run_id, actor_id=principal.user_id)
     except RunNotFound as error:
         raise _run_not_found() from error
     return RunEventsResponse(items=events)
+
+
+@router.get("/{run_id}/capability-approvals", response_model=RunCapabilityApprovalsResponse)
+async def run_capability_approvals(
+    run_id: UUID,
+    service: Annotated[RunServiceProtocol, Depends(_run_service)],
+    principal: Annotated[AuthenticatedPrincipal, Depends(require_permission("run:read"))],
+) -> RunCapabilityApprovalsResponse:
+    """Trusted approval history with its own sequence, independent of runtime events/SSE."""
+    try:
+        events = await service.capability_approval_events(
+            principal.tenant_id, run_id, actor_id=principal.user_id,
+        )
+        ready = await service.capability_approval_ready(
+            principal.tenant_id, run_id, actor_id=principal.user_id,
+        )
+    except RunNotFound as error:
+        raise _run_not_found() from error
+    except RunConflict as error:
+        raise _run_conflict(error) from error
+    return RunCapabilityApprovalsResponse(items=events, ready=ready)
 
 
 @router.get("/{run_id}/details", response_model=RunSummaryResponse)
@@ -1691,7 +1729,7 @@ async def run_details(
     principal: Annotated[AuthenticatedPrincipal, Depends(require_permission("run:read"))],
 ) -> RunSummaryResponse:
     try:
-        summary = await service.get(principal.tenant_id, run_id)
+        summary = await service.get(principal.tenant_id, run_id, actor_id=principal.user_id)
     except RunNotFound as error:
         raise _run_not_found() from error
     return RunSummaryResponse.from_summary(summary)

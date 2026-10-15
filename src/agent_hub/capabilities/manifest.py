@@ -70,6 +70,9 @@ def project_capability_manifest_item(
         "aliases": aliases,
     }
     failure_codes = _manifest_failure_codes(raw_item.get("failure_codes"))
+    plugin_id = raw_item.get("plugin_id")
+    if item["kind"] == "plugin" and is_safe_manifest_name(plugin_id):
+        item["plugin_id"] = plugin_id
     if failure_codes:
         item["failure_codes"] = failure_codes
     input_schema = raw_item.get("input_schema")

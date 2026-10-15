@@ -45,7 +45,10 @@ function readModel(project) {
   return row;
 }
 
+let markStartupReady;
+const startupReady = new Promise(resolve => { markStartupReady = resolve; });
 const server = http.createServer(async (req, res) => {
+  await startupReady;
   let raw = '';
   for await (const chunk of req) raw += chunk;
   const body = raw ? JSON.parse(raw) : {};
@@ -108,15 +111,17 @@ const server = http.createServer(async (req, res) => {
   return send(404, {error: {code: 'NOT_FOUND', message: 'Unknown endpoint'}});
 });
 
-const child = spawn(process.execPath, ['-e',
-  "require('node:http').createServer(()=>{}).listen(0,'127.0.0.1',function(){" +
-  "console.log(this.address().port)});process.on('SIGTERM',()=>{});"],
-  {stdio: ['ignore', 'pipe', 'ignore']});
-child.stdout.once('data', value => {
-  fs.appendFileSync('launches.jsonl', JSON.stringify({
-    pid: process.pid, childPid: child.pid, port: Number(process.env.PORT),
-    childPort: Number(value.toString()), data, home: process.env.HOME,
-    tmp: process.env.TMP, cache: process.env.npm_config_cache,
-  }) + '\n');
-  server.listen(Number(process.env.PORT), '127.0.0.1');
+server.listen(Number(process.env.PORT), '127.0.0.1', () => {
+  const child = spawn(process.execPath, ['-e',
+    "require('node:http').createServer(()=>{}).listen(0,'127.0.0.1',function(){" +
+    "console.log(this.address().port)});process.on('SIGTERM',()=>{});"],
+    {stdio: ['ignore', 'pipe', 'ignore']});
+  child.stdout.once('data', value => {
+    fs.appendFileSync('launches.jsonl', JSON.stringify({
+      pid: process.pid, childPid: child.pid, port: Number(process.env.PORT),
+      childPort: Number(value.toString()), data, home: process.env.HOME,
+      tmp: process.env.TMP, cache: process.env.npm_config_cache,
+    }) + '\n');
+    markStartupReady();
+  });
 });

@@ -1874,6 +1874,8 @@ async def test_approved_capability_resume_restores_after_replayable_approval_eve
     )
     approval_id = "approval-after-checkpoint"
     approval_fingerprint = "fingerprint-after-checkpoint"
+    # Runtime tool history and the gateway request have different approval subjects.
+    runtime_approval_id = "runtime-approval-after-checkpoint"
     async with run_session_factory() as session, session.begin():
         await repository.persist_event(
             session,
@@ -1895,7 +1897,7 @@ async def test_approved_capability_resume_restores_after_replayable_approval_eve
                 sequence=2,
                 run_id=submitted.id,
                 actor="operator",
-                approval_id=approval_id,
+                approval_id=runtime_approval_id,
                 action="tool_execute",
                 reason="requires_user_approval",
             ),
@@ -1909,10 +1911,21 @@ async def test_approved_capability_resume_restores_after_replayable_approval_eve
                 sequence=3,
                 run_id=submitted.id,
                 actor="operator",
-                approval_id=approval_id,
+                approval_id=runtime_approval_id,
                 decision="approved",
             ),
         )
+    with pytest.raises(RunConflict, match="approval identity collision or stale resolution"):
+        await repository.begin_capability_approval(
+            tenant_id=tenant_id,
+            run_id=submitted.id,
+            approval_id=runtime_approval_id,
+            approval_fingerprint=approval_fingerprint,
+        )
+    unchanged = await repository.get(tenant_id, submitted.id)
+    assert unchanged.status is RunStatus.RUNNING
+    assert unchanged.version == submitted.version
+    assert unchanged.routing_decision == submitted.routing_decision
     await repository.begin_capability_approval(
         tenant_id=tenant_id,
         run_id=submitted.id,
@@ -1946,6 +1959,10 @@ async def test_approved_capability_resume_restores_after_replayable_approval_eve
     assert runtime.restored[0].id == checkpoint.id
     assert [event["kind"] for event in events].count("approval.requested") == 1
     assert [event["kind"] for event in events].count("approval.resolved") == 1
+    assert {
+        event["approval_id"] for event in events
+        if event["kind"] in {"approval.requested", "approval.resolved"}
+    } == {runtime_approval_id}
     assert [event["kind"] for event in events].count("runtime.completed") == 1
     assert not any(event["kind"] == "runtime.failed" for event in events)
 
@@ -2033,6 +2050,8 @@ async def test_approved_capability_resume_crash_is_recovered_once_without_duplic
     )
     approval_id = "approval-resume-crash"
     approval_fingerprint = "fingerprint-resume-crash"
+    # Keep replayable runtime history separate from the gateway's approval authority.
+    runtime_approval_id = "runtime-approval-resume-crash"
     async with run_session_factory() as session, session.begin():
         await repository.persist_event(
             session,
@@ -2054,7 +2073,7 @@ async def test_approved_capability_resume_crash_is_recovered_once_without_duplic
                 sequence=2,
                 run_id=submitted.id,
                 actor="operator",
-                approval_id=approval_id,
+                approval_id=runtime_approval_id,
                 action="tool_execute",
                 reason="requires_user_approval",
             ),
@@ -2068,10 +2087,21 @@ async def test_approved_capability_resume_crash_is_recovered_once_without_duplic
                 sequence=3,
                 run_id=submitted.id,
                 actor="operator",
-                approval_id=approval_id,
+                approval_id=runtime_approval_id,
                 decision="approved",
             ),
         )
+    with pytest.raises(RunConflict, match="approval identity collision or stale resolution"):
+        await repository.begin_capability_approval(
+            tenant_id=tenant_id,
+            run_id=submitted.id,
+            approval_id=runtime_approval_id,
+            approval_fingerprint=approval_fingerprint,
+        )
+    unchanged = await repository.get(tenant_id, submitted.id)
+    assert unchanged.status is RunStatus.RUNNING
+    assert unchanged.version == submitted.version
+    assert unchanged.routing_decision == submitted.routing_decision
     await repository.begin_capability_approval(
         tenant_id=tenant_id,
         run_id=submitted.id,
@@ -2126,6 +2156,12 @@ async def test_approved_capability_resume_crash_is_recovered_once_without_duplic
     assert [event["kind"] for event in events].count("runtime.completed") == 1
     assert not any(event["kind"] == "runtime.failed" for event in events)
     assert len(approval_rows) == 1
+    assert approval_rows[0].action == "capability_tool"
+    assert approval_rows[0].status == "approved"
+    assert approval_rows[0].payload["approval_fingerprint"] == approval_fingerprint
+    public_request = approval_rows[0].payload["public_request"]
+    assert isinstance(public_request, dict)
+    assert public_request["approval_id"] == approval_id
     assert outbox_count == 1
 
 

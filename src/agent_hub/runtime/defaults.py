@@ -11,7 +11,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequenc
 from dataclasses import dataclass, replace
 from decimal import Decimal
 from threading import RLock
-from typing import Literal, Protocol, cast
+from typing import TYPE_CHECKING, Literal, Protocol, cast
 from uuid import UUID, uuid4
 
 from agent_hub.auth.models import Role
@@ -53,11 +53,6 @@ from agent_hub.models.types import (
 )
 from agent_hub.recovery_metadata import ORCHESTRATION_CONTRACT_RECOVERY_HINT
 from agent_hub.runtime.artifacts import ArtifactRepository
-from agent_hub.runtime.autogen.adapter import (
-    AutoGenDiscussionRuntime,
-    DiscussionParticipant,
-    DiscussionPlan,
-)
 from agent_hub.runtime.contracts import (
     EventKind,
     ExecutionRuntime,
@@ -93,6 +88,9 @@ from agent_hub.runtime.streams import closing_runtime_events
 from agent_hub.security.secrets import SecretService
 
 _LOGGER = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from agent_hub.runtime.autogen.adapter import DiscussionPlan
 
 _DEFAULT_DISPATCH_STEP_COST_BUDGET_USD = Decimal(10)
 _ROLE_PLANNING_TASK_MAX_CHARS = 2_000
@@ -1236,6 +1234,8 @@ class ConfigBackedDiscussionRuntime:
             capability_gateway=self._capability_gateway,
         )
         role_payload = _discussion_role_payload(plan)
+        from agent_hub.runtime.autogen.adapter import AutoGenDiscussionRuntime
+
         return _PlannedRuntime(
             AutoGenDiscussionRuntime(
                 gateway,
@@ -1494,6 +1494,8 @@ class ConfigBackedHybridRuntime:
             capability_gateway=self._capability_gateway,
         )
         role_payload = _hybrid_role_payload(dispatch_plan, discussion_plan)
+        from agent_hub.runtime.autogen.adapter import AutoGenDiscussionRuntime
+
         dispatch_runtime: ExecutionRuntime = CrewDispatchRuntime(
             gateway,
             dispatch_plan,
@@ -4607,6 +4609,8 @@ def _discussion_plan(
     *,
     capability_gateway: RuntimeCapabilityGatewayProtocol | None = None,
 ) -> DiscussionPlan:
+    from agent_hub.runtime.autogen.adapter import DiscussionParticipant, DiscussionPlan
+
     selected_roles = tuple(roles[:8])
     if len(selected_roles) < 2:
         selected_roles = (

@@ -171,7 +171,9 @@ class PreviewMutationRepository:
             routing_decision={"conversation_id": "conv-preview"},
         )
 
-    async def get(self, tenant_id: UUID, run_id: UUID) -> RunRecord:
+    async def get(
+        self, tenant_id: UUID, run_id: UUID, *, actor_id: UUID | None = None,
+    ) -> RunRecord:
         assert tenant_id == self.record.tenant_id
         assert run_id == self.record.id
         return self.record

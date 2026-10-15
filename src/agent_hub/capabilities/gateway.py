@@ -12,6 +12,7 @@ from agent_hub.capabilities.approvals import (
     ApprovalService,
     capability_approval_scope,
     fingerprint_capability_request,
+    plugin_approval_identity,
 )
 from agent_hub.capabilities.policy import CapabilityPolicy
 from agent_hub.capabilities.types import CapabilityRequest, PolicyEffect
@@ -75,11 +76,13 @@ class CapabilityGateway:
         run_repository: object,
         *,
         approval_reviewer: ApprovalReviewer | None = None,
+        plugin_policy_source: object | None = None,
     ) -> None:
         self._policy = policy
         self._approvals = approvals
         self._run_repository = run_repository
         self._approval_reviewer = approval_reviewer
+        self._plugin_policy_source = plugin_policy_source
         approvals.bind_run_repository(run_repository)  # type: ignore[arg-type]
 
     async def invoke(self, request: CapabilityRequest, *, role: Role) -> CapabilityResult:
@@ -127,12 +130,19 @@ class CapabilityGateway:
                 )
 
         async def begin_wait(approval: ApprovalRecord) -> None:
+            identity = plugin_approval_identity(self._plugin_policy_source, request)
+            identity_args = (
+                {"plugin_identity": identity}
+                if identity is not None else {}
+            )
             await self._run_repository.begin_capability_approval(  # type: ignore[attr-defined]
                 request.tenant_id,
                 request.run_id,
                 approval_id=approval.id,
                 approval_fingerprint=approval.request_fingerprint,
                 approval_scope=capability_approval_scope(request),
+                actor_id=request.user_id,
+                **identity_args,
             )
 
         approval = await self._approvals.start_waiting(

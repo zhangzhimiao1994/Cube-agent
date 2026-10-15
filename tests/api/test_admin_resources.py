@@ -3941,6 +3941,19 @@ SECRET_ID = UUID("22222222-2222-4222-8222-222222222222")
 USER_ID = UUID("11111111-1111-4111-8111-111111111111")
 
 
+@pytest.fixture
+def tmp_path(tmp_path: Path) -> Path:
+    # API filesystem fixtures model the trusted store provisioned by the full app.
+    directory = tmp_path / "private"
+    if sys.platform == "win32":
+        from agent_hub.plugins.handover_snapshots import _windows_security
+
+        _windows_security(directory, private=True, create=True)
+    else:
+        directory.mkdir(mode=0o700)
+    return directory
+
+
 class StubAuthService:
     def authenticate_token(self, token: str) -> AuthenticatedPrincipal:
         if token != "valid-token":
@@ -3987,6 +4000,12 @@ def client(preview_manager: StubPreviewManager | None = None) -> TestClient:
         plugin_package_store_dir=Path(tempfile.gettempdir())
         / f"agent-hub-test-plugin-packages-{uuid4()}"
     )
+    if sys.platform == "win32":
+        from agent_hub.plugins.handover_snapshots import _windows_security
+
+        _windows_security(
+            app.state.settings.plugin_package_store_dir, private=True, create=True
+        )
     return TestClient(app)
 
 
@@ -6707,7 +6726,7 @@ def test_plugin_archive_install_stores_verified_adapter_package_artifact(
     assert not (artifact_root / "plugin.json").exists()
 
 
-def test_plugin_archive_install_reuses_existing_verified_package_artifact_without_deleting_it(
+def test_plugin_archive_install_rejects_extra_members_without_deleting_existing_artifact(
     tmp_path: Path,
 ) -> None:
     settings = Settings.model_construct(plugin_package_store_dir=tmp_path)
@@ -6749,7 +6768,7 @@ def test_plugin_archive_install_reuses_existing_verified_package_artifact_withou
         content=archive_bytes,
     )
 
-    assert second.status_code == 200
+    assert second.status_code == 409
     assert marker.read_text() == "keep existing artifact directory"
     assert (artifact_root / "adapter" / "main.py").read_text() == (
         "def invoke():\n    return {'ok': True}\n"
@@ -7750,10 +7769,17 @@ def test_plugin_uninstall_completed_retry_is_idempotent(tmp_path: Path) -> None:
     }
 
 
-def test_plugin_archive_install_rolls_back_new_artifact_when_persist_fails(
+@pytest.mark.parametrize("concurrent_winner", [False, True])
+def test_plugin_archive_install_preserves_new_artifact_and_registration_when_write_fails(
     tmp_path: Path,
+    concurrent_winner: bool,
 ) -> None:
     class FailingPluginWriteService(InMemoryAdminResourceService):
+        fail_next = False
+        registrations_at_failure: dict[str, dict[str, object]]
+        audit_at_failure: list[dict[str, object]]
+        artifact_at_failure: dict[str, bytes]
+
         async def upsert_plugin(
             self,
             request: PluginResourceRequest,
@@ -7764,11 +7790,54 @@ def test_plugin_archive_install_rolls_back_new_artifact_when_persist_fails(
             content_sha256: str | None = None,
             package_metadata: PluginPackageMetadata | None = None,
         ) -> PluginResourceResponse:
-            raise RuntimeError("plugin persistence failed")
+            if not self.fail_next:
+                return await super().upsert_plugin(
+                    request,
+                    tenant_id=tenant_id,
+                    actor_id=actor_id,
+                    source_filename=source_filename,
+                    content_sha256=content_sha256,
+                    package_metadata=package_metadata,
+                )
+            self.fail_next = False
+            assert package_metadata is not None and package_metadata.artifact is not None
+            stored_root = tmp_path.joinpath(*package_metadata.artifact.storage_key.split("/"))
+            self.artifact_at_failure = {
+                path.relative_to(stored_root).as_posix(): path.read_bytes()
+                for path in stored_root.rglob("*")
+                if path.is_file()
+            }
+            if concurrent_winner:
+                # The real legacy writer registers Q after extraction; only A's write fails.
+                await super().upsert_plugin(
+                    request.model_copy(update={"name": "Concurrent winner Q"}),
+                    tenant_id=tenant_id,
+                    actor_id=actor_id,
+                    source_filename=source_filename,
+                    content_sha256=content_sha256,
+                    package_metadata=package_metadata,
+                )
+            self.registrations_at_failure = {
+                plugin_id: plugin.model_dump(mode="json")
+                for plugin_id, plugin in self.plugins.items()
+            }
+            self.audit_at_failure = [event.model_dump(mode="json") for event in self.audit_events]
+            if concurrent_winner:
+                raise PublicAPIError(
+                    409, "plugin_registration_conflict", "plugin registration changed"
+                )
+            raise PublicAPIError(503, "database_unavailable", "database temporarily unavailable")
 
     settings = Settings.model_construct(plugin_package_store_dir=tmp_path)
     api = client_with_settings(settings)
-    cast(Any, api.app).state.admin_resource_service = FailingPluginWriteService()
+    service = FailingPluginWriteService()
+    cast(Any, api.app).state.admin_resource_service = service
+    original = api.post(
+        "/api/v1/admin/plugins",
+        headers=headers(),
+        json={"id": "calendar", "name": "Original P", "version": "1.0.0"},
+    )
+    assert original.status_code == 200
     private_key = ed25519.Ed25519PrivateKey.generate()
     api.post(
         "/api/v1/admin/plugins/signing-keys",
@@ -7782,19 +7851,68 @@ def test_plugin_archive_install_rolls_back_new_artifact_when_persist_fails(
     archive_bytes = signed_plugin_archive(private_key)
     content_sha256 = hashlib.sha256(archive_bytes).hexdigest()
     artifact_root = tmp_path / str(TENANT_ID) / "calendar" / content_sha256
+    assert not artifact_root.exists()
+    before = api.get("/api/v1/admin/plugins", headers=headers()).json()
+    audit_before = [event.model_dump(mode="json") for event in service.audit_events]
+    install_headers = {
+        **headers(),
+        "Content-Type": "application/zip",
+        "X-Agent-Hub-Plugin-Filename": "calendar-plugin.zip",
+    }
+    service.fail_next = True
 
     response = api.post(
         "/api/v1/admin/plugins/install",
-        headers={
-            **headers(),
-            "Content-Type": "application/zip",
-            "X-Agent-Hub-Plugin-Filename": "calendar-plugin.zip",
-        },
+        headers=install_headers,
         content=archive_bytes,
     )
 
-    assert response.status_code == 500
-    assert not artifact_root.exists()
+    assert response.status_code == (409 if concurrent_winner else 503)
+    assert response.json()["error"]["code"] == (
+        "plugin_registration_conflict" if concurrent_winner else "database_unavailable"
+    )
+    after_failure = api.get("/api/v1/admin/plugins", headers=headers()).json()
+    assert {plugin["id"]: plugin for plugin in after_failure} == service.registrations_at_failure
+    assert [
+        event.model_dump(mode="json") for event in service.audit_events
+    ] == service.audit_at_failure
+    assert not any(event.action == "plugin.install" for event in service.audit_events)
+    if concurrent_winner:
+        winner = next(plugin for plugin in after_failure if plugin["id"] == "calendar")
+        assert winner["name"] == "Concurrent winner Q"
+        assert winner["content_sha256"] == content_sha256
+        assert winner["package_metadata"]["artifact"]["storage_key"] == (
+            f"{TENANT_ID}/calendar/{content_sha256}"
+        )
+        assert all(plugin in after_failure for plugin in before if plugin["id"] != "calendar")
+    else:
+        assert after_failure == before
+        assert service.audit_at_failure == audit_before
+    with zipfile.ZipFile(io.BytesIO(archive_bytes)) as archive:
+        assert (artifact_root / "adapter" / "main.py").read_bytes() == archive.read(
+            "adapter/main.py"
+        )
+    assert {
+        path.relative_to(artifact_root).as_posix(): path.read_bytes()
+        for path in artifact_root.rglob("*")
+        if path.is_file()
+    } == service.artifact_at_failure
+
+    # A new API attempt may reuse the intact artifact without consuming or rewriting it.
+    retried = api.post(
+        "/api/v1/admin/plugins/install", headers=install_headers, content=archive_bytes
+    )
+    assert retried.status_code == 200
+    assert retried.json()["plugin"]["content_sha256"] == content_sha256
+    assert retried.json()["plugin"]["package_metadata"]["artifact"]["storage_key"] == (
+        f"{TENANT_ID}/calendar/{content_sha256}"
+    )
+    assert sum(event.action == "plugin.install" for event in service.audit_events) == 1
+    assert {
+        path.relative_to(artifact_root).as_posix(): path.read_bytes()
+        for path in artifact_root.rglob("*")
+        if path.is_file()
+    } == service.artifact_at_failure
 
 
 def test_plugin_archive_install_keeps_existing_artifact_when_reused_persist_fails(
@@ -11701,6 +11819,7 @@ def test_plugin_admin_api_exposes_running_plugin_capabilities_in_manifest() -> N
     assert capabilities["search.web"] == {
         "id": "search.web",
         "kind": "plugin",
+        "plugin_id": "search",
         "adapter": "plugin_runtime",
         "permission_class": "network.read",
         "sandbox_profile": "remote_connector",

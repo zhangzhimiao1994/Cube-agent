@@ -12,7 +12,13 @@ from agent_hub.capabilities.approvals import ApprovalService, InMemoryApprovalSt
 from agent_hub.capabilities.gateway import CapabilityGateway
 from agent_hub.capabilities.policy import CapabilityPolicy
 from agent_hub.capabilities.runtime import RuntimeCapabilityError
-from agent_hub.mcp.client import McpClient, SseMcpClient, StdioMcpClient, StreamableHttpMcpClient
+from agent_hub.mcp.client import (
+    McpClient,
+    SseMcpClient,
+    StdioMcpClient,
+    StdioProcessFactory,
+    StreamableHttpMcpClient,
+)
 from agent_hub.mcp.service import McpService, McpTimeout, McpToolDenied, McpToolNotFound
 from agent_hub.mcp.types import McpInvocationContext, McpServerDefinition, McpTransportKind
 from agent_hub.runtime.contracts import JsonValue
@@ -39,6 +45,20 @@ class McpConfigService(Protocol):
 
 
 McpClientFactory = Callable[[McpServerDefinition], McpClient]
+
+
+def build_scoped_mcp_client_factory(
+    stdio_factory_resolver: Callable[[McpServerDefinition], StdioProcessFactory],
+) -> McpClientFactory:
+    def client_for_server(server: McpServerDefinition) -> McpClient:
+        if server.transport is not McpTransportKind.STDIO:
+            return _default_client_for_server(server)
+        process_factory = stdio_factory_resolver(server)
+        if not callable(process_factory):
+            raise TypeError("stdio process factory resolver must return a callable")
+        return StdioMcpClient(process_factory=process_factory)
+
+    return client_for_server
 
 
 class RuntimeMcpService:
@@ -98,10 +118,12 @@ class RuntimeMcpService:
         if not definitions:
             self._services_by_tenant[target_tenant_id] = None
             return
-        clients = {
-            server.id: (self._client_factory or _default_client_for_server)(server)
-            for server in definitions
-        }
+        # A failed scope rebuild must revoke access to the previous executor.
+        self._services_by_tenant[target_tenant_id] = None
+        client_factory = (
+            _default_client_for_server if self._client_factory is None else self._client_factory
+        )
+        clients = {server.id: client_factory(server) for server in definitions}
         service = McpService(
             servers=definitions,
             clients=clients,
@@ -215,7 +237,10 @@ async def build_runtime_mcp_service(
         run_repository=run_repository,
         client_factory=client_factory,
     )
-    await service.start()
+    try:
+        await service.start()
+    except Exception:  # noqa: BLE001 - optional MCP failure must not stop app startup
+        return service
     return service
 
 
@@ -283,4 +308,5 @@ __all__ = [
     "McpConfigService",
     "RuntimeMcpService",
     "build_runtime_mcp_service",
+    "build_scoped_mcp_client_factory",
 ]

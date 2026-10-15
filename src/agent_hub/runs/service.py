@@ -1392,13 +1392,14 @@ class RunService:
         approval_id: str,
         version: int,
     ) -> SubmittedRun:
-        del actor_id
+        await self._repository.get(tenant_id, run_id, actor_id=actor_id)
         await self._stop_run_preview(tenant_id, run_id)
         record = await self._repository.approve_capability_and_enqueue(
             tenant_id=tenant_id,
             run_id=run_id,
             approval_id=approval_id,
             version=version,
+            actor_id=actor_id,
         )
         return _submitted(record)
 
@@ -1411,12 +1412,12 @@ class RunService:
         approval_id: str,
         version: int,
     ) -> SubmittedRun:
-        del actor_id
         record = await self._repository.reject_capability_approval(
             tenant_id=tenant_id,
             run_id=run_id,
             approval_id=approval_id,
             version=version,
+            actor_id=actor_id,
         )
         return _submitted(record)
 
@@ -1537,8 +1538,11 @@ class RunService:
             return None
         return mode if type(mode) is TaskMode and mode is not TaskMode.AUTO else None
 
-    async def get(self, tenant_id: UUID, run_id: UUID) -> RunSummary:
-        record = await self._repository.get(tenant_id, run_id)
+    async def get(
+        self, tenant_id: UUID, run_id: UUID, *, actor_id: UUID | None = None,
+    ) -> RunSummary:
+        record = (await self._repository.get(tenant_id, run_id) if actor_id is None
+                  else await self._repository.get(tenant_id, run_id, actor_id=actor_id))
         return await self._summary(record)
 
     async def _stop_conversation_preview(
@@ -1560,8 +1564,26 @@ class RunService:
             _string_or_none(routing_decision.get("conversation_id")),
         )
 
-    async def events(self, tenant_id: UUID, run_id: UUID) -> tuple[dict[str, object], ...]:
-        return await self._repository.events(tenant_id, run_id)
+    async def events(
+        self, tenant_id: UUID, run_id: UUID, *, actor_id: UUID | None = None,
+    ) -> tuple[dict[str, object], ...]:
+        if actor_id is None:
+            return await self._repository.events(tenant_id, run_id)
+        return await self._repository.events(tenant_id, run_id, actor_id=actor_id)
+
+    async def capability_approval_events(
+        self, tenant_id: UUID, run_id: UUID, *, actor_id: UUID,
+    ) -> tuple[dict[str, object], ...]:
+        return await self._repository.capability_approval_events(
+            tenant_id, run_id, actor_id=actor_id,
+        )
+
+    async def capability_approval_ready(
+        self, tenant_id: UUID, run_id: UUID, *, actor_id: UUID,
+    ) -> bool:
+        return await self._repository.capability_approval_ready(
+            tenant_id, run_id, actor_id=actor_id,
+        )
 
     async def pause(self, tenant_id: UUID, run_id: UUID) -> RunSummary:
         record = await self._repository.update_control_status(tenant_id, run_id, RunStatus.PAUSED)
@@ -2096,7 +2118,10 @@ class RunService:
                                     terminal = RunStatus.CANCELLED
                                 elif event.kind is EventKind.RUNTIME_FAILED:
                                     terminal = RunStatus.FAILED
-                                if terminal is not RunStatus.RUNNING:
+                                if terminal is not RunStatus.RUNNING and (
+                                    terminal is not RunStatus.WAITING_APPROVAL
+                                    or locked.status != terminal.value
+                                ):
                                     locked.status = terminal.value
                                     locked.version += 1
                                 if draining_approval and terminal is not RunStatus.WAITING_APPROVAL:

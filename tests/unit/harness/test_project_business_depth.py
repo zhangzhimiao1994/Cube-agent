@@ -201,6 +201,37 @@ def test_ultra_persistent_business_api_passes(tmp_path: Path) -> None:
     _assert_ultra_trace(root, launches)
 
 
+@pytest.mark.parametrize('scale', ['large', 'ultra'])
+def test_primary_port_is_bound_before_descendant_and_business_restart(
+    tmp_path: Path, scale: str,
+) -> None:
+    root = _application(tmp_path, scale)
+    shutil.copyfile(_FIXTURES / 'startup_port_race_hook.cjs', root / 'startup-hook.cjs')
+    (root / 'package.json').write_text(json.dumps({
+        'private': True, 'scripts': {'start': 'node --require ./startup-hook.cjs server.cjs'},
+    }), encoding='utf-8')
+
+    failures = _validate(root, scale)
+
+    assert failures == (), failures
+    launches = _assert_stopped(root)
+    assert len(launches) == 2, 'the fixture must still perform a real persistence restart'
+    assert all(launch['port'] != launch['childPort'] for launch in launches)
+    order = [json.loads(line) for line in (root / 'startup-order.jsonl').read_text(
+        encoding='utf-8',
+    ).splitlines()]
+    assert len(order) == 2 and all(row['bound'] is True for row in order)
+    responses = [json.loads(line) for line in (root / 'startup-responses.jsonl').read_text(
+        encoding='utf-8',
+    ).splitlines()]
+    assert responses and all(row['childReady'] is True for row in responses)
+    assert {row['pid'] for row in _requests(root)} == {launch['pid'] for launch in launches}
+    if scale == 'large':
+        _assert_large_trace(root)
+    else:
+        _assert_ultra_trace(root, launches)
+
+
 @pytest.mark.parametrize('module', _MODULES)
 @pytest.mark.parametrize('mutation', ['drop', 'volatile', 'wrong_project', 'wrong_fields'])
 def test_ultra_module_fault_is_rejected(tmp_path: Path, module: str, mutation: str) -> None:
