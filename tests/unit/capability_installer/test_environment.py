@@ -29,7 +29,9 @@ class RecordingRunner:
         self.calls.append((args, dict(kwargs)))
         if args[1:3] == ("-m", "venv"):
             environment = Path(args[3])
-            executable = environment / ("Scripts/python.exe" if _is_windows_layout() else "bin/python")
+            executable = environment / (
+                "Scripts/python.exe" if _is_windows_layout() else "bin/python"
+            )
             executable.parent.mkdir(parents=True, exist_ok=True)
             executable.write_bytes(b"python")
         if self.fail_smoke and args[-1] in {"--version", "check"}:
@@ -72,6 +74,10 @@ def test_build_python_environment_uses_only_offline_hash_locked_wheels(tmp_path:
     assert record.path.name == "1.2.3"
     assert manager.active("document-search") == record
     install_argv, install_options = runner.calls[1]
+    lock_copy = Path(install_argv[-1])
+    assert lock_copy != lock.resolve()
+    assert lock_copy.parent == Path(str(install_options["cwd"]))
+    assert (record.path / lock_copy.name).read_bytes() == lock.read_bytes()
     assert install_argv[1:] == (
         "-m",
         "pip",
@@ -83,7 +89,7 @@ def test_build_python_environment_uses_only_offline_hash_locked_wheels(tmp_path:
         "--find-links",
         str(cache.resolve()),
         "-r",
-        str(lock.resolve()),
+        str(lock_copy),
     )
     assert install_options["shell"] is False
     smoke_argv, smoke_options = runner.calls[2]
@@ -127,15 +133,12 @@ def test_python_environment_rejects_extra_pip_directives_in_lock(tmp_path: Path)
     manager = CapabilityEnvironmentManager(tmp_path / "envs", runner=runner)
     lock = tmp_path / "requirements.lock"
     lock.write_text(
-        "demo-package==1.2.3 --find-links ../untrusted "
-        f"--hash=sha256:{'a' * 64}\n",
+        f"demo-package==1.2.3 --find-links ../untrusted --hash=sha256:{'a' * 64}\n",
         encoding="utf-8",
     )
 
     with pytest.raises(EnvironmentBuildError, match="directive|lock"):
-        manager.build_python(
-            PythonEnvironmentSpec("unsafe", "1.0.0", lock, cache, "demo_package")
-        )
+        manager.build_python(PythonEnvironmentSpec("unsafe", "1.0.0", lock, cache, "demo_package"))
 
     assert runner.calls == []
 
@@ -261,9 +264,7 @@ def test_concurrent_build_for_same_capability_is_serialized(tmp_path: Path) -> N
 
     artifact = tmp_path / "tool"
     artifact.write_bytes(b"tool")
-    spec = CliArtifactSpec(
-        "tool", "1.0.0", artifact, hashlib.sha256(b"tool").hexdigest(), "tool"
-    )
+    spec = CliArtifactSpec("tool", "1.0.0", artifact, hashlib.sha256(b"tool").hexdigest(), "tool")
     manager = CapabilityEnvironmentManager(tmp_path / "envs", runner=BlockingRunner())
     errors: list[BaseException] = []
 

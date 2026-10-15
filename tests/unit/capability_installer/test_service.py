@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 from typing import Any, cast
 from uuid import UUID
@@ -71,9 +72,7 @@ class RecordingEnvironmentManager:
         executable = spec.executable_name or "python"
         return self._record(spec.capability_id, spec.version, "python", executable)
 
-    def restore_active(
-        self, capability_id: str, version: str | None
-    ) -> EnvironmentRecord | None:
+    def restore_active(self, capability_id: str, version: str | None) -> EnvironmentRecord | None:
         self.restores.append((capability_id, version))
         self.active_version = version
         if version is None:
@@ -92,7 +91,9 @@ class RecordingEnvironmentManager:
 
 
 class InstallingAdminService:
-    def __init__(self, *, existing: PluginResourceRequest | None = None, fail_start: bool = False) -> None:
+    def __init__(
+        self, *, existing: PluginResourceRequest | None = None, fail_start: bool = False
+    ) -> None:
         self.plugins = () if existing is None else (existing,)
         self.current: PluginResourceRequest | None = existing
         self.fail_start = fail_start
@@ -230,7 +231,9 @@ async def test_installer_rejects_local_command_capability_when_command_is_missin
 
 
 @pytest.mark.asyncio
-async def test_installer_rejects_local_command_capability_when_dependency_command_is_missing() -> None:
+async def test_installer_rejects_local_command_capability_when_dependency_command_is_missing() -> (
+    None
+):
     installer = CapabilityInstallerService(
         command_resolver=lambda command: "C:/tools/strix.exe" if command == "strix" else None
     )
@@ -252,7 +255,9 @@ async def test_installer_rejects_local_command_capability_when_dependency_comman
 
 
 @pytest.mark.asyncio
-async def test_installer_rejects_local_command_capability_when_required_environment_is_missing() -> None:
+async def test_installer_rejects_local_command_capability_when_required_environment_is_missing() -> (
+    None
+):
     installer = CapabilityInstallerService(
         command_resolver=lambda command: f"C:/tools/{command}.exe",
         environment={},
@@ -275,7 +280,9 @@ async def test_installer_rejects_local_command_capability_when_required_environm
 
 
 @pytest.mark.asyncio
-async def test_installer_rejects_local_command_capability_when_docker_daemon_is_unavailable() -> None:
+async def test_installer_rejects_local_command_capability_when_docker_daemon_is_unavailable() -> (
+    None
+):
     probes: list[str] = []
 
     def probe_runtime(executable: str) -> bool:
@@ -351,6 +358,8 @@ async def test_installer_builds_cli_recipe_and_injects_versioned_executable_befo
 
 @pytest.mark.asyncio
 async def test_installer_maps_python_lock_recipe_to_versioned_environment(tmp_path: Path) -> None:
+    lock_bytes = b"trusted-tool==3.1.0 --hash=sha256:" + b"a" * 64 + b"\n"
+    (tmp_path / "requirements.lock").write_bytes(lock_bytes)
     recipe = PythonLockEnvironmentRecipe(
         version="3.1.0",
         lock_file=tmp_path / "requirements.lock",
@@ -384,12 +393,176 @@ async def test_installer_maps_python_lock_recipe_to_versioned_environment(tmp_pa
             tmp_path / "wheels",
             "trusted_tool",
             "trusted-tool",
+            lock_sha256=hashlib.sha256(lock_bytes).hexdigest(),
         )
     ]
 
 
+def _python_lock_installer(
+    tmp_path: Path,
+) -> tuple[CapabilityInstallerService, RecordingEnvironmentManager, Path]:
+    lock = tmp_path / "requirements.lock"
+    lock.write_bytes(b"trusted-tool==1.0 --hash=sha256:" + b"a" * 64 + b"\n")
+    recipe = PythonLockEnvironmentRecipe(
+        version="1.0.0",
+        lock_file=lock,
+        wheel_cache=tmp_path / "wheels",
+        smoke_module="trusted_tool",
+        executable_name="trusted-tool",
+    )
+    manager = RecordingEnvironmentManager(tmp_path / "environments")
+    installer = CapabilityInstallerService(
+        TrustedCapabilityCatalog((_managed_entry(recipe),)),
+        environment_manager=cast(CapabilityEnvironmentManager, manager),
+    )
+    return installer, manager, lock
+
+
+def test_python_install_plan_binds_exact_lock_content_and_changes_with_bytes(
+    tmp_path: Path,
+) -> None:
+    installer, _, lock = _python_lock_installer(tmp_path)
+    first = installer.plan("managed_tool", query="install")
+    assert first.environment_recipe is not None
+    assert (
+        first.environment_recipe.get("lock_sha256") == hashlib.sha256(lock.read_bytes()).hexdigest()
+    )
+    lock.write_bytes(b"trusted-tool==2.0 --hash=sha256:" + b"b" * 64 + b"\n")
+    assert installer.plan("managed_tool", query="install").id != first.id
+
+
 @pytest.mark.asyncio
-async def test_installer_fails_closed_when_recipe_has_no_environment_manager(tmp_path: Path) -> None:
+async def test_python_install_rejects_lock_change_after_confirmation_before_any_effect(
+    tmp_path: Path,
+) -> None:
+    installer, manager, lock = _python_lock_installer(tmp_path)
+    approved = installer.plan("managed_tool", query="install")
+    lock.write_bytes(b"trusted-tool==2.0 --hash=sha256:" + b"b" * 64 + b"\n")
+    admin = InstallingAdminService()
+    with pytest.raises(ValueError, match="plan mismatch"):
+        await installer.install(
+            admin,
+            entry_id="managed_tool",
+            query="install",
+            plan_id=approved.id,
+            confirm=True,
+            tenant_id=TENANT_ID,
+            actor_id=ACTOR_ID,
+        )
+    assert manager.python_specs == [] and manager.restores == []
+    assert admin.current is None and admin.state is None
+
+
+@pytest.mark.asyncio
+async def test_python_install_passes_the_confirmed_digest_to_the_environment_builder(
+    tmp_path: Path,
+) -> None:
+    installer, manager, lock = _python_lock_installer(tmp_path)
+    expected = hashlib.sha256(lock.read_bytes()).hexdigest()
+    plan = installer.plan("managed_tool", query="install")
+    await installer.install(
+        InstallingAdminService(),
+        entry_id="managed_tool",
+        query="install",
+        plan_id=plan.id,
+        confirm=True,
+        tenant_id=TENANT_ID,
+        actor_id=ACTOR_ID,
+    )
+    assert len(manager.python_specs) == 1
+    assert getattr(manager.python_specs[0], "lock_sha256", None) == expected
+
+
+@pytest.mark.asyncio
+async def test_python_install_without_confirmation_does_not_even_read_the_lock(
+    tmp_path: Path,
+) -> None:
+    installer, manager, lock = _python_lock_installer(tmp_path)
+    plan = installer.plan("managed_tool", query="install")
+    lock.unlink()
+    with pytest.raises(PermissionError, match="requires confirmation"):
+        await installer.install(
+            InstallingAdminService(),
+            entry_id="managed_tool",
+            query="install",
+            plan_id=plan.id,
+            confirm=False,
+            tenant_id=TENANT_ID,
+            actor_id=ACTOR_ID,
+        )
+    assert manager.python_specs == [] and manager.restores == []
+
+
+@pytest.mark.asyncio
+async def test_python_rollback_uses_the_saved_confirmed_plan_after_source_lock_is_removed(
+    tmp_path: Path,
+) -> None:
+    installer, manager, lock = _python_lock_installer(tmp_path)
+    approved = installer.plan("managed_tool", query="install")
+    admin = InstallingAdminService()
+    await installer.install(
+        admin,
+        entry_id="managed_tool",
+        query="install",
+        plan_id=approved.id,
+        confirm=True,
+        tenant_id=TENANT_ID,
+        actor_id=ACTOR_ID,
+    )
+    lock.unlink()
+    rolled_back = await installer.rollback(
+        admin,
+        entry_id="managed_tool",
+        query="rollback",
+        tenant_id=TENANT_ID,
+        actor_id=ACTOR_ID,
+    )
+    assert rolled_back.status == "rolled_back" and rolled_back.id == approved.id
+    assert admin.current is None and admin.state is None and manager.active_version is None
+
+
+@pytest.mark.parametrize("corruption", ("invalid-json", "changed-plan-id"))
+@pytest.mark.asyncio
+async def test_python_rollback_refuses_damaged_plan_before_any_compensation_effect(
+    tmp_path: Path,
+    corruption: str,
+) -> None:
+    installer, manager, _ = _python_lock_installer(tmp_path)
+    approved = installer.plan("managed_tool", query="install")
+    admin = InstallingAdminService()
+    await installer.install(
+        admin,
+        entry_id="managed_tool",
+        query="install",
+        plan_id=approved.id,
+        confirm=True,
+        tenant_id=TENANT_ID,
+        actor_id=ACTOR_ID,
+    )
+    assert admin.state is not None
+    if corruption == "invalid-json":
+        admin.state["confirmed_plan"] = "{"
+    else:
+        admin.state["plan_id"] = "different-plan"
+    before = dict(admin.state)
+    plugin = admin.current
+    restores = list(manager.restores)
+    with pytest.raises(CapabilityInstallUnavailable, match="确认计划"):
+        await installer.rollback(
+            admin,
+            entry_id="managed_tool",
+            query="rollback",
+            tenant_id=TENANT_ID,
+            actor_id=ACTOR_ID,
+        )
+    assert admin.state == before and admin.current is plugin
+    assert manager.restores == restores and manager.active_version == "1.0.0"
+
+
+@pytest.mark.asyncio
+async def test_installer_fails_closed_when_recipe_has_no_environment_manager(
+    tmp_path: Path,
+) -> None:
     recipe = CliArtifactEnvironmentRecipe(
         version="1.0.0",
         artifact_path=tmp_path / "tool",

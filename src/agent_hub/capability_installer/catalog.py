@@ -10,6 +10,7 @@ from typing import Annotated, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from agent_hub.api.routers.admin import PluginCapabilityRequest, PluginResourceRequest
+from agent_hub.capability_installer.environment import capture_python_lock
 
 CapabilityInstallRisk = Literal[
     "read_only",
@@ -41,9 +42,7 @@ class PythonLockEnvironmentRecipe(BaseModel):
     version: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
     lock_file: Path
     wheel_cache: Path
-    smoke_module: str = Field(
-        min_length=1, max_length=256, pattern=r"^[A-Za-z_][A-Za-z0-9_.]*$"
-    )
+    smoke_module: str = Field(min_length=1, max_length=256, pattern=r"^[A-Za-z_][A-Za-z0-9_.]*$")
     executable_name: str = Field(
         min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*$"
     )
@@ -119,7 +118,9 @@ class TrustedCapabilityCatalog:
             score = _match_score(entry, query_tokens)
             if score > 0:
                 scored.append((score, entry))
-        return tuple(entry for _score, entry in sorted(scored, key=lambda item: (-item[0], item[1].id)))
+        return tuple(
+            entry for _score, entry in sorted(scored, key=lambda item: (-item[0], item[1].id))
+        )
 
     def plan(self, entry_id: str, *, query: str) -> CapabilityInstallPlan:
         entry = self.get(entry_id)
@@ -129,6 +130,11 @@ class TrustedCapabilityCatalog:
             if entry.environment_recipe is not None
             else None
         )
+        if isinstance(entry.environment_recipe, PythonLockEnvironmentRecipe):
+            assert recipe_payload is not None
+            recipe_payload["lock_sha256"] = capture_python_lock(
+                entry.environment_recipe.lock_file
+            ).sha256
         plan_seed = json.dumps(
             {
                 "entry_id": entry.id,

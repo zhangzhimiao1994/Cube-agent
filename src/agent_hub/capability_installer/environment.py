@@ -37,6 +37,7 @@ _PINNED_REQUIREMENT = re.compile(
     r"^[A-Za-z0-9][A-Za-z0-9._-]*(?:\[[A-Za-z0-9._,-]+\])?"
     r"==[A-Za-z0-9][A-Za-z0-9._+!-]*$"
 )
+_LOCK_CAPTURE_FORMAT = "raw-sha256-v1"
 
 
 class EnvironmentBuildError(RuntimeError):
@@ -64,6 +65,12 @@ class CommandRunner(Protocol):
 
 
 @dataclass(frozen=True, slots=True)
+class CapturedPythonLock:
+    raw_bytes: bytes
+    sha256: str
+
+
+@dataclass(frozen=True, slots=True)
 class PythonEnvironmentSpec:
     capability_id: str
     version: str
@@ -71,6 +78,7 @@ class PythonEnvironmentSpec:
     wheel_cache: Path
     smoke_module: str
     executable_name: str | None = None
+    lock_sha256: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,6 +122,16 @@ class CapabilityEnvironmentManager:
         self._cli_probe = cli_probe
         self._python_executable = python_executable
         self._lock_timeout_seconds = lock_timeout_seconds
+        if os.name == "nt" and not self._root.exists():
+            from agent_hub.plugins.handover_snapshots import InvalidSnapshot, _windows_security
+
+            self._root.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                _windows_security(self._root, private=True, create=True)
+            except (OSError, InvalidSnapshot) as error:
+                raise EnvironmentBuildError(
+                    "environment root private ACL creation failed"
+                ) from error
         self._staging.mkdir(parents=True, exist_ok=True)
         self._locks.mkdir(parents=True, exist_ok=True)
 
@@ -131,27 +149,41 @@ class CapabilityEnvironmentManager:
 
     def build_python(self, spec: PythonEnvironmentSpec) -> EnvironmentRecord:
         capability_id, version = self._validate_identity(spec.capability_id, spec.version)
-        lock_file = spec.lock_file.resolve(strict=True)
         wheel_cache = spec.wheel_cache.resolve(strict=True)
         if not wheel_cache.is_dir():
             raise EnvironmentBuildError("wheel cache must be a local directory")
         if not _SAFE_MODULE.fullmatch(spec.smoke_module):
             raise EnvironmentBuildError("invalid Python smoke module")
-        lock_digest = _validate_hashed_lock(lock_file)
+        captured_lock = capture_python_lock(spec.lock_file)
+        if spec.lock_sha256 is not None:
+            if not re.fullmatch(r"[0-9a-fA-F]{64}", spec.lock_sha256):
+                raise EnvironmentBuildError(
+                    "Python lock SHA256 must contain 64 hexadecimal characters"
+                )
+            if captured_lock.sha256 != spec.lock_sha256.lower():
+                raise EnvironmentBuildError("Python lock SHA256 mismatch")
         metadata = {
             "capability_id": capability_id,
             "version": version,
             "kind": "python",
             "executable": _venv_executable_relative(spec.executable_name),
-            "content_sha256": lock_digest,
+            "content_sha256": captured_lock.sha256,
+            "lock_capture_format": _LOCK_CAPTURE_FORMAT,
         }
         with self._build_lock(capability_id):
             existing = self._matching_existing(capability_id, version, metadata)
             if existing is not None:
                 self._activate(existing)
                 return existing
-            staging = self._new_staging(capability_id, version)
+            staging = self._new_python_staging()
             try:
+                lock_copy = staging / "captured-requirements.lock"
+                flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+                flags |= getattr(os, "O_BINARY", 0)
+                with os.fdopen(os.open(lock_copy, flags, 0o600), "wb") as stream:
+                    stream.write(captured_lock.raw_bytes)
+                    stream.flush()
+                    os.fsync(stream.fileno())
                 self._run(
                     [
                         str(Path(self._python_executable).resolve(strict=True)),
@@ -176,7 +208,7 @@ class CapabilityEnvironmentManager:
                         "--find-links",
                         str(wheel_cache),
                         "-r",
-                        str(lock_file),
+                        str(lock_copy),
                     ],
                     cwd=staging,
                     env=_isolated_environment(staging),
@@ -493,7 +525,9 @@ class CapabilityEnvironmentManager:
             return None
         record = self._record(capability_id, version)
         if any(
-            getattr(record, key) != value for key, value in metadata.items() if key != "executable"
+            getattr(record, key) != value
+            for key, value in metadata.items()
+            if key not in ("executable", "lock_capture_format")
         ):
             raise EnvironmentBuildError(
                 "immutable environment version already exists with other content"
@@ -556,6 +590,10 @@ class CapabilityEnvironmentManager:
                 )
             if payload["kind"] != "python":
                 raise EnvironmentBuildError("Python attestation record kind changed")
+            if payload.get("lock_capture_format") != _LOCK_CAPTURE_FORMAT:
+                raise EnvironmentBuildError(
+                    "Python environment lacks captured lock binding; use an explicit new version"
+                )
             try:
                 attestation_sha256 = verify_tree(
                     path,
@@ -633,6 +671,39 @@ class CapabilityEnvironmentManager:
         path.mkdir(parents=False, exist_ok=False)
         return path
 
+    def _new_python_staging(self) -> Path:
+        from agent_hub.plugins.handover_snapshots import InvalidSnapshot, _Directory
+
+        try:
+            root = _Directory(self._root, private=False)
+            try:
+                parent = _Directory(self._staging, private=False)
+                try:
+                    name = uuid4().hex
+                    path = parent.path / name
+                    if parent.fd is None:
+                        from agent_hub.plugins.handover_stage_journal import (
+                            _exclusive_windows_directory,
+                        )
+
+                        _exclusive_windows_directory(path, parent.path)
+                    else:
+                        os.mkdir(name, mode=0o700, dir_fd=parent.fd)
+                        parent.sync()
+                    child = _Directory(path, private=True)
+                    try:
+                        root.check()
+                        parent.check()
+                        return child.path
+                    finally:
+                        child.close()
+                finally:
+                    parent.close()
+            finally:
+                root.close()
+        except (OSError, InvalidSnapshot) as error:
+            raise EnvironmentBuildError("Python staging ownership or identity is unsafe") from error
+
     def _versions(self, capability_id: str) -> Path:
         return self._root / capability_id / "versions"
 
@@ -684,10 +755,24 @@ class CapabilityEnvironmentManager:
                 pass
 
 
+def capture_python_lock(path: Path) -> CapturedPythonLock:
+    """Capture one stable regular lock; validate text while binding the original bytes."""
+    try:
+        raw, _ = read_control(path.absolute())
+        content = raw.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
+    except (OSError, ValueError) as error:
+        raise EnvironmentBuildError(
+            "Python lock file must be a stable regular UTF-8 file"
+        ) from error
+    _validate_hashed_requirements(content)
+    return CapturedPythonLock(raw_bytes=raw, sha256=hashlib.sha256(raw).hexdigest())
+
+
 def _validate_hashed_lock(path: Path) -> str:
-    if not path.is_file():
-        raise EnvironmentBuildError("Python lock file must be a local file")
-    content = path.read_text(encoding="utf-8")
+    return capture_python_lock(path).sha256
+
+
+def _validate_hashed_requirements(content: str) -> None:
     if "://" in content or re.search(
         r"(^|\s)(?:--index-url|--extra-index-url|-e|--editable|@)(?:\s|$)", content
     ):
@@ -709,7 +794,6 @@ def _validate_hashed_lock(path: Path) -> str:
             ):
                 raise EnvironmentBuildError("extra pip directives are forbidden in lock files")
             raise EnvironmentBuildError("every Python requirement must include a SHA256 hash")
-    return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
 def _safe_component(value: str, label: str) -> str:
@@ -809,10 +893,12 @@ def _remove_tree(path: Path) -> None:
 
 __all__ = [
     "CapabilityEnvironmentManager",
+    "CapturedPythonLock",
     "CliArtifactSpec",
     "EnvironmentBuildError",
     "EnvironmentInUseError",
     "EnvironmentQuotaExceeded",
     "EnvironmentRecord",
     "PythonEnvironmentSpec",
+    "capture_python_lock",
 ]

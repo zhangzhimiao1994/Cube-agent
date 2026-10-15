@@ -20032,7 +20032,7 @@ async def capability_installer_resolve(
 
 @router.post(
     "/capability-installer/plan",
-    responses=error_responses(401, 403, 404, 422),
+    responses=error_responses(401, 403, 404, 409, 422),
 )
 async def capability_installer_plan(
     body: CapabilityInstallerPlanRequest,
@@ -20041,16 +20041,23 @@ async def capability_installer_plan(
 ) -> dict[str, object]:
     _require(principal, "plugin:read")
     installer = _capability_installer_service(request)
+    from agent_hub.capability_installer.service import CapabilityInstallUnavailable
+
     try:
         plan = installer.plan(body.entry_id, query=body.query)
     except KeyError:
         raise PublicAPIError(404, "not_found", "not found") from None
+    except CapabilityInstallUnavailable:
+        raise PublicAPIError(
+            409, "capability_install_backend_unavailable",
+            "受信环境锁文件不可用，请核对后重新生成安装计划",
+        ) from None
     return {"plan": plan.model_dump(mode="json")}
 
 
 @router.post(
     "/capability-installer/cancel",
-    responses=error_responses(401, 403, 404, 422),
+    responses=error_responses(401, 403, 404, 409, 422),
 )
 async def capability_installer_cancel(
     body: CapabilityInstallerPlanRequest,
@@ -20060,10 +20067,17 @@ async def capability_installer_cancel(
 ) -> dict[str, object]:
     _require(principal, "plugin:write")
     installer = _capability_installer_service(request)
+    from agent_hub.capability_installer.service import CapabilityInstallUnavailable
+
     try:
         plan = installer.cancel(body.entry_id, query=body.query)
     except KeyError:
         raise PublicAPIError(404, "not_found", "not found") from None
+    except CapabilityInstallUnavailable:
+        raise PublicAPIError(
+            409, "capability_install_backend_unavailable",
+            "受信环境锁文件不可用，请核对后重新生成安装计划",
+        ) from None
     await service.record_audit_event(
         actor=str(principal.user_id),
         action="capability_installer.cancel",
@@ -20089,6 +20103,8 @@ async def capability_installer_install(
     try:
         from agent_hub.capability_installer.service import CapabilityInstallUnavailable
 
+        if body.confirm is not True:
+            raise PermissionError("capability install requires confirmation")
         expected_plan = installer.plan(body.entry_id, query=body.query)
         if expected_plan.id != body.plan_id:
             raise PublicAPIError(

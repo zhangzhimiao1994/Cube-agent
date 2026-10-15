@@ -18,6 +18,8 @@ Installer rollback state is stored separately from plugin `resource_config`, so 
 
 Executable capabilities run from immutable, versioned environments. Dependency material is offline or hash verified, smoke-tested before activation, and switched atomically. Failed activation keeps the previous environment available for rollback. Cleanup respects active references and configured quotas.
 
+Python recipe plans bind the SHA-256 of the original lock-file bytes. Changing the lock requires a new plan and confirmation; pip consumes a private captured copy, not the mutable source path. Environments created before captured-lock attestation require an explicit new version rather than silent reuse. Rollback uses the saved confirmed plan and does not require the original lock file to remain available.
+
 Linux native execution uses a socket-activated privileged broker and constrained transient systemd units. The API and worker stay unprivileged. The broker enforces package path and hash, caller identity, filesystem bindings, resource limits, timeout, output limits, private networking policy, and termination. Docker can be configured as an additional backend, but a missing Docker daemon does not make the systemd backend unavailable.
 
 Remote HTTP and MCP transports validate destinations and redirects to prevent server-side request forgery. Capability dispatch performs preflight and execution-time checks so a runtime cannot become silently stale between planning and execution.

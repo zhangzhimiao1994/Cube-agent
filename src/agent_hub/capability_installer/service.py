@@ -64,7 +64,12 @@ class CapabilityInstallerService:
         return self._catalog.resolve(query)
 
     def plan(self, entry_id: str, *, query: str) -> CapabilityInstallPlan:
-        return self._catalog.plan(entry_id, query=query)
+        try:
+            return self._catalog.plan(entry_id, query=query)
+        except EnvironmentBuildError as error:
+            raise CapabilityInstallUnavailable(
+                "受信 Python 锁文件暂不可用，请核对文件后重新生成安装计划"
+            ) from error
 
     def cancel(self, entry_id: str, *, query: str) -> CapabilityInstallPlan:
         return self.plan(entry_id, query=query).model_copy(update={"status": "cancelled"})
@@ -132,6 +137,12 @@ class CapabilityInstallerService:
             raise ValueError("capability install plan mismatch")
         entry = self._catalog.get(entry_id)
         recipe = entry.environment_recipe
+        lock_sha256: str | None = None
+        if isinstance(recipe, PythonLockEnvironmentRecipe):
+            digest = (plan.environment_recipe or {}).get("lock_sha256")
+            if not isinstance(digest, str):
+                raise CapabilityInstallUnavailable("Python install plan does not bind lock content")
+            lock_sha256 = digest
         if recipe is not None and self._environment_manager is None:
             raise CapabilityInstallUnavailable("受信环境配方需要已配置环境管理器")
         if recipe is None:
@@ -172,7 +183,10 @@ class CapabilityInstallerService:
             else:
                 prepared, preparation_cancelled = await _complete_owned_operation(
                     asyncio.to_thread(
-                        self._prepare_plugin_request, entry, environment_capability_id
+                        self._prepare_plugin_request,
+                        entry,
+                        environment_capability_id,
+                        lock_sha256=lock_sha256,
                     ),
                 )
                 plugin_request, environment_record = prepared
@@ -438,6 +452,23 @@ class CapabilityInstallerService:
             entry.id,
             tenant_id=tenant_id,
         )
+        confirmed_plan = None if state is None else state.get("confirmed_plan")
+        if isinstance(confirmed_plan, str):
+            try:
+                rollback_plan = CapabilityInstallPlan.model_validate_json(confirmed_plan)
+            except ValueError as error:
+                raise CapabilityInstallUnavailable(
+                    "已安装能力的确认计划损坏，回滚前请核对状态"
+                ) from error
+            if (
+                rollback_plan.id != state.get("plan_id")
+                or rollback_plan.entry_id != entry.id
+                or rollback_plan.plugin_id != entry.plugin.id
+                or _confirmed_plan_snapshot(rollback_plan) != confirmed_plan
+            ):
+                raise CapabilityInstallUnavailable("已安装能力的确认计划不匹配，回滚前请核对状态")
+        else:
+            rollback_plan = self.plan(entry_id, query=query)
         if state is not None and state.get("plugin_id") == entry.plugin.id:
             environment_managed = state.get("environment_managed") == "true"
             if environment_managed and self._environment_manager is None:
@@ -525,7 +556,7 @@ class CapabilityInstallerService:
                                 error,
                             )
                 raise
-        return self.plan(entry_id, query=query).model_copy(update={"status": "rolled_back"})
+        return rollback_plan.model_copy(update={"status": "rolled_back"})
 
     def _active_environment_version(self, capability_id: str) -> str | None:
         if self._environment_manager is None:
@@ -539,6 +570,8 @@ class CapabilityInstallerService:
         self,
         entry: CapabilityCatalogEntry,
         environment_capability_id: str | None = None,
+        *,
+        lock_sha256: str | None = None,
     ) -> tuple[Any, EnvironmentRecord | None]:
         plugin = entry.plugin.model_copy(deep=True)
         recipe = entry.environment_recipe
@@ -567,6 +600,7 @@ class CapabilityInstallerService:
                             recipe.wheel_cache,
                             recipe.smoke_module,
                             recipe.executable_name,
+                            lock_sha256=lock_sha256,
                         )
                     )
             except (EnvironmentBuildError, OSError, ValueError) as error:

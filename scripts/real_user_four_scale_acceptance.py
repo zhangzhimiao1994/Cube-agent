@@ -1646,6 +1646,24 @@ def _create_or_recover_case_resource(
     return resource
 
 
+def _normalize_selected_case_ids(selected: Sequence[str] | None) -> tuple[str, ...] | None:
+    if selected is None:
+        return None
+    if isinstance(selected, (str, bytes)) or not isinstance(selected, Sequence) or not selected:
+        raise ValueError("selected_case_ids must be a nonempty sequence of canonical case IDs")
+    canonical = [f"{scale}:{route}" for _, scale, route, _ in _ACCEPTANCE_CASES]
+    if any(not isinstance(case_id, str) or case_id not in canonical for case_id in selected):
+        raise ValueError("selected_case_ids contains a noncanonical case ID")
+    if len(set(selected)) != len(selected):
+        raise ValueError("selected_case_ids must not contain duplicates")
+    return tuple(case_id for case_id in canonical if case_id in selected)
+
+
+def _reject_selected_report(report: Mapping[str, object]) -> None:
+    if "selected_case_ids" in report or "selected_execution_complete" in report:
+        raise ValueError("selected-case reports cannot resume or finalize; use a fresh execution")
+
+
 def run_real_user_four_scale_acceptance(
     client: RealUserAcceptanceClient,
     *,
@@ -1663,13 +1681,18 @@ def run_real_user_four_scale_acceptance(
     evidence_root: Path | None = None,
     defer_preview: bool = False,
     stop_on_failure: bool = False,
+    selected_case_ids: Sequence[str] | None = None,
 ) -> dict[str, object]:
     if type(defer_preview) is not bool:
         raise TypeError("defer_preview must be a boolean")
     if type(stop_on_failure) is not bool:
         raise TypeError("stop_on_failure must be a boolean")
+    selected = _normalize_selected_case_ids(selected_case_ids)
+    if selected is not None and resume_report is not None:
+        raise ValueError("selected_case_ids requires a fresh execution, not resume")
     if resume_report is not None:
         _reject_deferred_report(resume_report)
+        _reject_selected_report(resume_report)
         if defer_preview:
             raise ValueError("deferred preview execution cannot resume existing reports")
     profile = _model_profile(logical_model)
@@ -1714,6 +1737,7 @@ def run_real_user_four_scale_acceptance(
             authentication_method=authentication_method,
             finished=finished,
             defer_preview=defer_preview,
+            selected_case_ids=selected,
         )
 
     client.configure_submission_journal(journal, lambda: _save_report(output_path, snapshot()))
@@ -1721,6 +1745,8 @@ def run_real_user_four_scale_acceptance(
 
     for case_kind, scale, route_intent, case_key in _ACCEPTANCE_CASES:
         case_id = f"{scale}:{route_intent}"
+        if selected is not None and case_id not in selected:
+            continue
         previous = next((case for case in cases if case.get("case_id") == case_id), None)
         if previous is not None and _has_complete_core_evidence(
             previous, safe_execution_id=safe_execution_id, case_key=case_key
@@ -1730,21 +1756,13 @@ def run_real_user_four_scale_acceptance(
             continue
         attempt = _case_attempt(previous) + 1 if previous is not None else 1
         scope_token = _case_execution_token(safe_execution_id, case_key, attempt)
-        project_id = _bounded_identifier(f"uat-{scope_token}", 128)
-        conversation_id = _bounded_identifier(
-            f"conv-{scope_token}",
-            128,
-        )
+        project_id, conversation_id, workspace_session_id = _case_resource_ids(scope_token)
         project_label = (
             f"真实用户 {scale} AUTO 规模验收"
             if case_kind == "auto_scale"
             else f"真实用户 {route_intent} 模式能力验收"
         )
         runner_execution_id = scope_token
-        workspace_session_id = _safe_workspace_session_token(
-            conversation_id,
-            runner_execution_id,
-        )
         client.set_submission_context({
             "case_id": case_id, "attempt": attempt, "project_id": project_id,
             "conversation_id": conversation_id, "workspace_session_id": workspace_session_id,
@@ -2009,6 +2027,7 @@ def _matrix_report(
     authentication_method: str,
     finished: bool,
     defer_preview: bool = False,
+    selected_case_ids: Sequence[str] | None = None,
 ) -> dict[str, object]:
 
     coverage = _matrix_mode_coverage(cases, execution_id=execution_id)
@@ -2113,6 +2132,19 @@ def _matrix_report(
             pending_case_count=sum(case.get("status") == "pending_preview" for case in cases),
             dynamic_web_preview=_deferred_preview(),
         )
+    if selected_case_ids is not None:
+        selected_ok = (
+            finished and len(cases) == len(selected_case_ids)
+            and client.submission_journal is not None
+            and not client.submission_journal.has_unresolved
+            and all(case.get("exact_mode_coverage_ok") is True for case in cases)
+            and (report.get("delivery_passed_case_count") if defer_preview
+                 else coverage["core_passed_case_count"]) == len(selected_case_ids)
+        )
+        report["selected_case_ids"] = list(selected_case_ids)
+        report["selected_execution_complete"] = selected_ok
+        if selected_ok and len(selected_case_ids) < len(_ACCEPTANCE_CASES):
+            report["status"] = "pending_matrix_coverage"
     return report
 
 
@@ -2180,12 +2212,12 @@ def _submission_journal_from_report(
         scope = _case_execution_token(
             _safe_identifier(cast(str, identity["execution_id"])), case_keys[case_id], attempt,
         )
-        conversation = _bounded_identifier(f"conv-{scope}", 128)
+        project, conversation, session = _case_resource_ids(scope)
         if context != {
             "case_id": case_id, "attempt": attempt,
-            "project_id": _bounded_identifier(f"uat-{scope}", 128),
+            "project_id": project,
             "conversation_id": conversation,
-            "workspace_session_id": _safe_workspace_session_token(conversation, scope),
+            "workspace_session_id": session,
         }:
             raise ValueError("submission journal does not match the canonical case scope")
         case = (case_id, attempt)
@@ -2307,6 +2339,11 @@ def _resume_cases(
         case = by_id.get(f"{scale}:{route}")
         if case is None:
             continue
+        project = case.get("project")
+        if isinstance(project, Mapping) and isinstance(project.get("project_id"), str) and (
+            len(project["project_id"]) > 64
+        ):
+            raise ValueError("legacy oversized project scope requires a fresh execution")
         if not _has_complete_core_evidence(
             case, safe_execution_id=_safe_identifier(execution_id), case_key=case_key
         ):
@@ -2337,10 +2374,20 @@ def _case_attempt(case: Mapping[str, object] | None) -> int:
 
 def _case_execution_token(execution_id: str, case_key: str, attempt: int) -> str:
     if attempt == 1:
-        return f"{execution_id}-{case_key}"
+        token = f"{execution_id}-{case_key}"
+        if len(f"uat-{token}") <= 64:
+            return token
+        digest = hashlib.sha256(execution_id.encode("utf-8")).hexdigest()[:16]
+        return f"{case_key}-{digest}"
     # Keep retry identity within the runner's 64-character workspace limit.
     digest = hashlib.sha256(execution_id.encode("utf-8")).hexdigest()[:16]
     return f"{case_key}-retry-{attempt}-{digest}"
+
+
+def _case_resource_ids(scope_token: str) -> tuple[str, str, str]:
+    project = _bounded_identifier(f"uat-{scope_token}", 64)
+    conversation = _bounded_identifier(f"conv-{scope_token}", 128)
+    return project, conversation, _safe_workspace_session_token(conversation, scope_token)
 
 
 def _has_complete_core_evidence(
@@ -2382,9 +2429,7 @@ def _has_complete_core_evidence(
         return False
     attempt = _case_attempt(case)
     scope_token = _case_execution_token(safe_execution_id, case_key, attempt)
-    project_id = _bounded_identifier(f"uat-{scope_token}", 128)
-    conversation_id = _bounded_identifier(f"conv-{scope_token}", 128)
-    session_id = _safe_workspace_session_token(conversation_id, scope_token)
+    project_id, conversation_id, session_id = _case_resource_ids(scope_token)
     root = (
         f"/api/v1/workspaces/projects/{quote(project_id, safe='')}"
         f"/sessions/{quote(session_id, safe='')}"
@@ -2562,7 +2607,10 @@ def _is_explicit_preview_not_found(error: Exception) -> bool:
 
 
 def _bounded_identifier(value: str, limit: int) -> str:
-    return value[:limit].rstrip("-")
+    if len(value) <= limit:
+        return value.rstrip("-")
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
+    return f"{value[:limit - len(digest) - 1].rstrip('-')}-{digest}"
 
 
 def _default_execution_id() -> str:
@@ -2814,6 +2862,7 @@ def finalize_real_device_acceptance(
     """Merge deployed desktop/mobile evidence into a completed acceptance report."""
 
     _reject_deferred_report(automated_report)
+    _reject_selected_report(automated_report)
     profile = _report_model_profile(automated_report)
     _validate_report_model_profile(automated_report, profile)
     if _report_model_profile(evidence) != profile:
@@ -3013,6 +3062,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--stop-on-failure", action="store_true",
         help="Stop after saving the first known failed case; unknown submissions always stop.",
     )
+    parser.add_argument(
+        "--case", dest="selected_case_ids", action="append", metavar="SCALE:MODE",
+        help="Select a canonical case for a fresh execution; repeat to select more cases.",
+    )
     parser.add_argument("--finalize-report")
     parser.add_argument("--real-device-evidence")
     parser.add_argument("--evidence-root", type=Path, help="Trusted browser evidence directory.")
@@ -3025,9 +3078,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
     try:
+        args.selected_case_ids = _normalize_selected_case_ids(args.selected_case_ids)
         profile = _model_profile(args.logical_model)
     except ValueError as error:
         parser.error(str(error))
+    if args.selected_case_ids is not None and (
+        args.resume_report or args.finalize_report or args.real_device_evidence
+    ):
+        parser.error("selected cases (--case) cannot resume or finalize existing reports")
 
     if args.finalize_report or args.real_device_evidence:
         if args.defer_preview:
@@ -3039,6 +3097,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         try:
             automated = _read_json_mapping(args.finalize_report)
             _reject_deferred_report(automated)
+            _reject_selected_report(automated)
             device_evidence = _read_json_mapping(args.real_device_evidence)
             saved_profile = _report_model_profile(automated)
             _validate_report_model_profile(automated, saved_profile)
@@ -3080,6 +3139,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         try:
             resume_report = _read_json_mapping(args.resume_report)
             _reject_deferred_report(resume_report)
+            _reject_selected_report(resume_report)
             _validate_report_model_profile(resume_report, profile)
         except (OSError, TypeError, ValueError) as error:
             parser.error(f"cannot read resume report: {error}")
@@ -3130,6 +3190,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             logical_model=args.logical_model,
             defer_preview=args.defer_preview,
             stop_on_failure=args.stop_on_failure,
+            selected_case_ids=args.selected_case_ids,
             evidence_root=(
                 args.evidence_root.absolute() if args.evidence_root is not None else None
             ),

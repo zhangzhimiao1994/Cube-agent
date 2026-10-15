@@ -2686,11 +2686,13 @@ def matrix_harness(
     return module, delegate, plans, scoped_workspace_paths
 
 
+@pytest.mark.parametrize("explicit_none", [False, True])
 def test_real_user_acceptance_runs_four_auto_scales_and_every_mode_at_every_scale(
     matrix_harness: tuple[Any, Any, list[Any], list[str]],
+    explicit_none: bool,
 ) -> None:
     module, delegate, plans, scoped_workspace_paths = matrix_harness
-    payload = run_matrix(module, delegate)
+    payload = run_matrix(module, delegate, **({"selected_case_ids": None} if explicit_none else {}))
 
     assert len(payload["cases"]) == 20
     assert [
@@ -2748,6 +2750,7 @@ def test_real_user_acceptance_runs_four_auto_scales_and_every_mode_at_every_scal
     assert payload["real_device_acceptance"]["status"] == "pending_real_device"
     assert payload["real_device_acceptance"]["counted_as_complete"] is False
     assert payload["blocked_admin_run_requests"] == []
+    assert "selected_case_ids" not in payload and "selected_execution_complete" not in payload
 
 
 def run_matrix(module: Any, delegate: Any, **kwargs: Any) -> dict[str, Any]:
@@ -2871,6 +2874,206 @@ def test_defer_preview_separates_twenty_deliveries_without_preview_requests(
             assert item[key] is False
     assert all("web-previews" not in path for _, path in delegate.requests)
     assert payload["success_policy"]["public_preview_lifecycle_required"] is True
+    assert "selected_case_ids" not in payload and "selected_execution_complete" not in payload
+
+
+@pytest.mark.parametrize("selection", [
+    [], ["small:auto", "small:auto"], ["small:other"], ["Small:auto"],
+    "small:auto", [None], [""], ["small:direct", "unknown:auto"],
+])
+def test_selected_cases_invalid_before_authentication_or_checkpoint(
+    matrix_harness: tuple[Any, Any, list[Any], list[str]], tmp_path: Path, selection: Any,
+) -> None:
+    module, delegate, plans, _ = matrix_harness
+    output = tmp_path / "not-created.json"
+    with pytest.raises(ValueError, match="selected_case_ids"):
+        run_matrix(module, delegate, selected_case_ids=selection, output_path=str(output))
+    assert delegate.requests == plans == []
+    assert not output.exists()
+
+
+@pytest.mark.parametrize("defer_preview", [True, False])
+@pytest.mark.parametrize("selection", ["one", "unpaid18", "all20"])
+def test_selected_cases_exact_canonical_subset_keeps_full_matrix_denominators(
+    matrix_harness: tuple[Any, Any, list[Any], list[str]],
+    defer_preview: bool, selection: str,
+) -> None:
+    module, delegate, plans, _ = matrix_harness
+    canonical = [f"{scale}:{route}" for _, scale, route, _ in module._ACCEPTANCE_CASES]
+    selected = ["small:direct"] if selection == "one" else canonical[2:] if selection == "unpaid18" else canonical
+    report = run_matrix(module, delegate, selected_case_ids=tuple(reversed(selected)),
+                        defer_preview=defer_preview)
+    assert report["selected_case_ids"] == selected
+    assert report["selected_execution_complete"] is True
+    assert [plan.requests[0].case_id for plan in plans] == selected
+    assert [case["case_id"] for case in report["cases"]] == selected
+    assert [record["context"]["case_id"] for record in report["submission_journal"]["records"]] == selected
+    assert len(delegate.submissions) == len(delegate.created_projects) == len(delegate.created_conversations) == len(selected)
+    assert report["auto_scale_case_count"] == 4
+    assert report["mode_capability_case_count"] == 16
+    assert report["acceptance_complete"] is False
+    assert report["core_acceptance_ok"] is (not defer_preview and len(selected) == 20)
+    if defer_preview:
+        assert report["delivery_acceptance_ok"] is (len(selected) == 20)
+        assert report["delivery_passed_case_count"] == len(selected)
+        assert report["delivery_unsubmitted_case_count"] == 20 - len(selected)
+        assert all("web-previews" not in path for _, path in delegate.requests)
+    if len(selected) < 20:
+        assert report["automated_acceptance_complete"] is False
+        assert report["exact_mode_coverage_complete"] is False
+        assert report["status"] == "pending_matrix_coverage"
+
+
+@pytest.mark.parametrize("stop_on_failure", [True, False])
+def test_selected_cases_known_failure_obeys_stop_on_failure(
+    matrix_harness: tuple[Any, Any, list[Any], list[str]], monkeypatch: Any,
+    stop_on_failure: bool,
+) -> None:
+    module, delegate, plans, _ = matrix_harness
+    execute = module.execute_project_scale_plan
+
+    def failed_first(*args: Any, **kwargs: Any) -> ProjectScaleExecutionReport:
+        result = cast(ProjectScaleExecutionReport, execute(*args, **kwargs))
+        if result.results[0].case_id == "large:auto":
+            return replace(result, results=(replace(result.results[0], errors=("known failure",)),))
+        return result
+
+    monkeypatch.setattr(module, "execute_project_scale_plan", failed_first)
+    selected = ["large:auto", "ultra:auto"]
+    report = run_matrix(module, delegate, selected_case_ids=selected,
+                        defer_preview=True, stop_on_failure=stop_on_failure)
+    expected = selected[:1] if stop_on_failure else selected
+    assert [plan.requests[0].case_id for plan in plans] == expected
+    assert len(delegate.submissions) == len(expected)
+    assert report["selected_execution_complete"] is False
+    assert report["delivery_failed_case_count"] == 1
+    assert report["delivery_unsubmitted_case_count"] == 20 - len(expected)
+
+
+@pytest.mark.parametrize("defer_preview", [True, False])
+def test_selected_cases_safe_upgrade_is_delivery_not_exact_selection_completion(
+    matrix_harness: tuple[Any, Any, list[Any], list[str]], monkeypatch: Any,
+    defer_preview: bool,
+) -> None:
+    module, delegate, plans, _ = matrix_harness
+    execute = module.execute_project_scale_plan
+
+    def safe_upgrade(*args: Any, **kwargs: Any) -> ProjectScaleExecutionReport:
+        report = cast(ProjectScaleExecutionReport, execute(*args, **kwargs))
+        if report.results[0].case_id == "large:direct":
+            result = replace(report.results[0], final_observed_mode="hybrid",
+                             route_reason="project_scale_mode_upgrade", mode_source="project_scale_assessment")
+            return replace(report, results=(result,))
+        return report
+
+    monkeypatch.setattr(module, "execute_project_scale_plan", safe_upgrade)
+    report = run_matrix(module, delegate, selected_case_ids=["large:auto", "large:direct"],
+                        defer_preview=defer_preview)
+    assert len(plans) == len(delegate.submissions) == 2
+    assert report["cases"][0]["exact_mode_coverage_ok"] is True
+    assert report["cases"][1]["coverage_credit"] == "safe_upgrade"
+    assert report["cases"][1]["exact_mode_coverage_ok"] is False
+    assert report["selected_execution_complete"] is False
+    assert report["core_acceptance_ok"] is report["automated_acceptance_complete"] is report["acceptance_complete"] is False
+    if defer_preview:
+        assert report["delivery_passed_case_count"] == 2
+        assert report["delivery_safe_upgrade_case_count"] == 1
+        assert report["delivery_unsubmitted_case_count"] == 18
+        assert report["delivery_acceptance_ok"] is False
+
+
+@pytest.mark.parametrize("stop_on_failure", [True, False])
+def test_selected_cases_unknown_always_stops_with_durable_intent(
+    matrix_harness: tuple[Any, Any, list[Any], list[str]], monkeypatch: Any,
+    tmp_path: Path, stop_on_failure: bool,
+) -> None:
+    module, delegate, plans, _ = matrix_harness
+    request = delegate.request_json
+
+    def unknown(method: str, path: str, **kwargs: Any) -> Any:
+        response = request(method, path, **kwargs)
+        if method == "POST" and path == "/api/v1/runs":
+            raise TimeoutError("offline response lost")
+        return response
+
+    monkeypatch.setattr(delegate, "request_json", unknown)
+    output = tmp_path / "unknown-subset.json"
+    with pytest.raises(ValueError, match="unresolved submission"):
+        run_matrix(module, delegate, selected_case_ids=["ultra:auto", "large:auto"],
+                   defer_preview=True, stop_on_failure=stop_on_failure, output_path=str(output))
+    report = json.loads(output.read_text(encoding="utf-8"))
+    assert report["selected_case_ids"] == ["large:auto", "ultra:auto"]
+    assert report["selected_execution_complete"] is False
+    assert len(plans) == len(delegate.submissions) == 1
+    assert report["submission_journal"]["records"][0]["state"] == "unresolved"
+
+
+@pytest.mark.parametrize("defer_preview", [True, False])
+def test_selected_cases_cannot_mix_resume_before_authentication(
+    matrix_harness: tuple[Any, Any, list[Any], list[str]], defer_preview: bool,
+) -> None:
+    module, delegate, plans, _ = matrix_harness
+    with pytest.raises(ValueError, match="selected"):
+        run_matrix(module, delegate, selected_case_ids=["large:auto"], defer_preview=defer_preview,
+                   resume_report={})
+    assert delegate.requests == plans == []
+
+
+def test_selected_cases_reports_cannot_resume_or_finalize_without_selection_argument(
+    matrix_harness: tuple[Any, Any, list[Any], list[str]], tmp_path: Path,
+) -> None:
+    module, delegate, plans, _ = matrix_harness
+    saved = _pending_automated_report()
+    saved.update(selected_case_ids=["small:auto"], selected_execution_complete=True)
+    output = tmp_path / "subset.json"
+    output.write_text(json.dumps(saved), encoding="utf-8")
+    before = output.read_bytes()
+    with pytest.raises(ValueError, match="selected"):
+        run_matrix(module, delegate, resume_report=saved, output_path=str(output))
+    with pytest.raises(ValueError, match="selected"):
+        module.finalize_real_device_acceptance(saved, _real_device_evidence("matrix-123"))
+    assert output.read_bytes() == before and delegate.requests == plans == []
+
+
+@pytest.mark.parametrize("arguments", [
+    ["--case", "small:other"], ["--case", "small:auto", "--case", "small:auto"],
+    ["--case", "large:auto", "--resume", "never-read.json"],
+    ["--case", "large:auto", "--finalize-report", "never-read.json", "--real-device-evidence", "never-read-device.json"],
+])
+def test_selected_cases_cli_invalid_before_credentials_or_history_reads(
+    monkeypatch: Any, arguments: list[str],
+) -> None:
+    module = load_script()
+
+    def forbidden(*args: Any, **kwargs: Any) -> None:
+        pytest.fail("selection must reject before credentials, HTTP or historical reads")
+
+    monkeypatch.setattr(module, "_acceptance_credentials_from_env", forbidden)
+    monkeypatch.setattr(module, "_read_json_mapping", forbidden)
+    monkeypatch.setattr(module, "UrllibAcceptanceClient", forbidden)
+    with pytest.raises(SystemExit) as error:
+        module.main(arguments)
+    assert error.value.code == 2
+
+
+def test_selected_cases_cli_repeatable_case_executes_only_canonical_selection(
+    matrix_harness: tuple[Any, Any, list[Any], list[str]], monkeypatch: Any, tmp_path: Path,
+) -> None:
+    module, delegate, plans, _ = matrix_harness
+    monkeypatch.setenv("AGENT_HUB_ACCEPTANCE_BEARER_TOKEN", "offline-token")
+    monkeypatch.setattr(module, "UrllibAcceptanceClient", lambda **kwargs: delegate)
+    output = tmp_path / "selected-cli.json"
+    assert module.main(["--case", "ultra:auto", "--case", "large:auto", "--defer-preview",
+                        "--execution-id", "fresh-subset", "--output", str(output)]) == 2
+    report = json.loads(output.read_text(encoding="utf-8"))
+    assert report["selected_execution_complete"] is True
+    assert report["selected_case_ids"] == ["large:auto", "ultra:auto"]
+    assert [plan.requests[0].case_id for plan in plans] == report["selected_case_ids"]
+    before = output.read_bytes()
+    submissions = copy.deepcopy(delegate.submissions)
+    with pytest.raises(SystemExit):
+        module.main(["--case", "large:auto", "--output", str(output)])
+    assert output.read_bytes() == before and delegate.submissions == submissions
 
 
 @pytest.mark.parametrize("failure", [
@@ -5219,6 +5422,178 @@ def test_repeated_failed_attempts_use_distinct_workspaces_with_long_execution_id
     case = next(item for item in resumed["cases"] if item["case_id"] == "small:multi_agent")
     assert case["attempt"] == 3
     assert case["core_acceptance_ok"] is True
+
+
+@pytest.mark.parametrize("execution_id", (
+    "matrix-123", "f20-" + "a" * 32,
+    "fresh20-64d-20261015-" + "a" * 32,
+    "matrix-" + "a" * 128, "matrix-" + "a" * 1024,
+))
+def test_resource_ids_match_actual_api_schema_for_twenty_cases_and_retries(
+    matrix_harness: tuple[Any, Any, list[Any], list[str]],
+    monkeypatch: Any, execution_id: str,
+) -> None:
+    from pydantic import BaseModel
+
+    from agent_hub.api.routers.admin import (
+        ConversationCreateRequest,
+        ProjectWorkspaceCreateRequest,
+    )
+    from agent_hub.api.routers.runs import CreateRunRequest
+
+    module, delegate, plans, _ = matrix_harness
+    original_request = delegate.request_json
+    models: dict[str, type[BaseModel]] = {
+        "/api/v1/admin/project-workspaces": ProjectWorkspaceCreateRequest,
+        "/api/v1/admin/conversations": ConversationCreateRequest,
+        "/api/v1/runs": CreateRunRequest,
+    }
+    schema_errors: list[str] = []
+
+    def validated_request(method: str, path: str, **kwargs: Any) -> Any:
+        if method == "POST" and path in models:
+            try:
+                models[path].model_validate(kwargs["body"])
+            except ValueError as error:
+                schema_errors.append(str(error))
+                raise
+        return original_request(method, path, **kwargs)
+
+    monkeypatch.setattr(delegate, "request_json", validated_request)
+    execute = module.execute_project_scale_plan
+
+    def interrupted(plan: Any, client: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("offline interruption before run submission")
+
+    monkeypatch.setattr(module, "execute_project_scale_plan", interrupted)
+    first = run_matrix(module, delegate, execution_id=execution_id)
+    assert schema_errors == []
+    assert len(delegate.created_projects) == len(delegate.created_conversations) == 20
+    assert delegate.submissions == []
+    assert first["submission_journal"]["records"] == []
+    first_snapshot = copy.deepcopy(first)
+    monkeypatch.setattr(module, "execute_project_scale_plan", execute)
+    resumed = run_matrix(module, delegate, execution_id=execution_id, resume_report=first)
+    assert schema_errors == []
+    assert first == first_snapshot
+    assert len(plans) == len(delegate.submissions) == 20
+    assert resumed["core_acceptance_ok"] is True
+    for values, limit in ((delegate.created_projects, 64), (delegate.created_conversations, 128),
+                          (delegate.project_workspace_paths, 64), (delegate.conversation_workspace_paths, 64)):
+        assert len(values) == len(set(values)) == 40
+        assert all(1 <= len(value) <= limit for value in values)
+    for record in resumed["submission_journal"]["records"]:
+        context = record["context"]
+        body = delegate.run_bodies[record["idempotency_key"]]
+        assert all(context[key] == body[key]
+                   for key in ("project_id", "conversation_id", "workspace_session_id"))
+    plans.clear()
+    submissions = copy.deepcopy(delegate.submissions)
+    complete = run_matrix(module, delegate, execution_id=execution_id, resume_report=resumed)
+    assert plans == [] and delegate.submissions == submissions
+    assert complete["submission_journal"] == resumed["submission_journal"]
+    assert complete["cases"] == resumed["cases"]
+
+
+def test_long_execution_resource_ids_preserve_full_identity_and_short_ids() -> None:
+    module = load_script()
+    for attempt in (1, 2, 3):
+        all_ids: list[tuple[str, str, str]] = []
+        for execution_id in ("matrix-" + "a" * 256 + "-one", "matrix-" + "a" * 256 + "-two"):
+            for _, _, _, case_key in module._ACCEPTANCE_CASES:
+                token = module._case_execution_token(execution_id, case_key, attempt)
+                project = module._bounded_identifier(f"uat-{token}", 64)
+                conversation = module._bounded_identifier(f"conv-{token}", 128)
+                all_ids.append((project, conversation,
+                                module._safe_workspace_session_token(conversation, token)))
+        assert all(len({ids[index] for ids in all_ids}) == 40 for index in range(3))
+    for _, _, _, case_key in module._ACCEPTANCE_CASES:
+        token = module._case_execution_token("matrix-123", case_key, 1)
+        assert token == f"matrix-123-{case_key}"
+        assert module._bounded_identifier(f"uat-{token}", 64) == f"uat-{token}"
+        assert module._bounded_identifier(f"conv-{token}", 128) == f"conv-{token}"
+
+
+def test_valid_token60_scope_keeps_project64_conversation65_and_actual_schema() -> None:
+    from agent_hub.api.routers.admin import ConversationCreateRequest, ProjectWorkspaceCreateRequest
+    from agent_hub.api.routers.runs import CreateRunRequest
+
+    module = load_script()
+    execution_id, case_key = "f20-" + "a" * 32, "mode-medium-multi-agent"
+    token = f"{execution_id}-{case_key}"
+    project, conversation = f"uat-{token}", f"conv-{token}"
+    session = module._safe_workspace_session_token(conversation, token)
+    assert (len(token), len(project), len(conversation), len(session)) == (60, 64, 65, 64)
+    assert ProjectWorkspaceCreateRequest.model_validate({
+        "project_id": project, "label": "Boundary", "workspace_path": session,
+    }).project_id == project
+    assert ConversationCreateRequest.model_validate({
+        "conversation_id": conversation, "project_id": project, "workspace_path": session,
+    }).conversation_id == conversation
+    plan = module.build_real_user_scale_plan(
+        scale="medium", route_intent="multi_agent", project_id=project, project_label="Boundary",
+        conversation_id=conversation, workspace_session_id=session,
+    )
+    assert CreateRunRequest.model_validate(plan.requests[0].body).workspace_session_id == session
+    assert module._case_execution_token(execution_id, case_key, 1) == token
+    assert module._case_resource_ids(token) == (project, conversation, session)
+
+
+def test_valid_token60_legacy_paid_journal_resumes_without_scope_migration_or_posts(
+    matrix_harness: tuple[Any, Any, list[Any], list[str]], monkeypatch: Any,
+) -> None:
+    module, delegate, plans, _ = matrix_harness
+    execution_id = "f20-" + "a" * 32
+    with monkeypatch.context() as legacy:
+        legacy.setattr(module, "_case_execution_token",
+                       lambda execution, key, attempt: f"{execution}-{key}")
+        legacy.setattr(module, "_bounded_identifier", lambda value, limit: value[:128].rstrip("-"))
+        saved = run_matrix(module, delegate, execution_id=execution_id)
+    boundary = next(case for case in saved["cases"] if case["case_id"] == "medium:multi_agent")
+    assert len(boundary["project"]["project_id"]) == 64
+    assert len(boundary["conversation"]["conversation_id"]) == 65
+    original = copy.deepcopy(saved)
+    submissions = copy.deepcopy(delegate.submissions)
+    plans.clear()
+    resumed = run_matrix(module, delegate, execution_id=execution_id, resume_report=saved)
+    assert saved == original
+    assert resumed["core_acceptance_ok"] is True
+    assert resumed["cases"] == saved["cases"]
+    assert resumed["submission_journal"] == saved["submission_journal"]
+    assert plans == [] and delegate.submissions == submissions
+
+
+@pytest.mark.parametrize("paid", (False, True))
+def test_legacy_oversized_scope_is_not_migrated_or_replayed(
+    matrix_harness: tuple[Any, Any, list[Any], list[str]],
+    monkeypatch: Any, tmp_path: Path, paid: bool,
+) -> None:
+    module, delegate, plans, _ = matrix_harness
+    execution_id = "fresh20-64d-20261015-" + "a" * 32
+    checkpoint = tmp_path / "legacy.json"
+    with monkeypatch.context() as legacy:
+        legacy.setattr(module, "_case_execution_token",
+                       lambda execution, key, attempt: f"{execution}-{key}")
+        legacy.setattr(module, "_bounded_identifier", lambda value, limit: value[:128].rstrip("-"))
+        if not paid:
+            original_request = delegate.request_json
+
+            def reject_project(method: str, path: str, **kwargs: Any) -> Any:
+                if method == "POST" and path == "/api/v1/admin/project-workspaces":
+                    raise RuntimeError("HTTP 422 offline legacy project")
+                return original_request(method, path, **kwargs)
+
+            legacy.setattr(delegate, "request_json", reject_project)
+        saved = run_matrix(module, delegate, execution_id=execution_id, output_path=str(checkpoint))
+    before = checkpoint.read_bytes()
+    original = copy.deepcopy(saved)
+    posts = copy.deepcopy(delegate.submissions)
+    plans.clear()
+    with pytest.raises(ValueError, match="canonical case scope|fresh execution"):
+        run_matrix(module, delegate, execution_id=execution_id,
+                   output_path=str(checkpoint), resume_report=saved)
+    assert checkpoint.read_bytes() == before and saved == original
+    assert plans == [] and delegate.submissions == posts
 
 
 @pytest.mark.parametrize("failure", ["identity", "checkpoint"])
