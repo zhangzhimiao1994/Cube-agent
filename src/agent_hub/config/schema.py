@@ -37,7 +37,6 @@ class StrictConfigModel(BaseModel):
 
 
 _DEFAULT_DEPLOYMENT_CONTEXT_WINDOW_TOKENS = 65_536
-_DEFAULT_DEPLOYMENT_MAX_OUTPUT_TOKENS = 8_192
 
 
 class DeploymentDefinition(StrictConfigModel):
@@ -125,9 +124,8 @@ class DeploymentDefinition(StrictConfigModel):
                 self.context_window_tokens
                 or _DEFAULT_DEPLOYMENT_CONTEXT_WINDOW_TOKENS
             ),
-            "max_output_tokens": (
-                self.max_output_tokens or _DEFAULT_DEPLOYMENT_MAX_OUTPUT_TOKENS
-            ),
+            # Request budgets remain bounded; only configured provider limits are hard caps.
+            "max_output_tokens": self.max_output_tokens,
             "capabilities": frozenset(ModelCapability(item) for item in self.capabilities),
             "input_per_million_usd": self.input_per_million_usd,
             "output_per_million_usd": self.output_per_million_usd,

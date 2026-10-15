@@ -41,6 +41,7 @@ from agent_hub.models.types import (
     StructuredResponseSchema,
     TokenUsage,
 )
+from tests.unit.models.test_capacity import RefreshBarrierRedis, pool
 
 
 class AsyncChunkStream:
@@ -1520,6 +1521,87 @@ async def test_short_lease_renews_before_expiry_with_large_heartbeat_cap() -> No
     block.set()
     await task
     assert capacity.renews >= 1
+
+
+@pytest.mark.parametrize("streaming", [False, True], ids=["complete", "stream"])
+@pytest.mark.parametrize("outcome", ["success", "conflict", "timeout", "cancel"])
+async def test_native_pool_admission_coordinates_parallel_heartbeat_refresh(
+    streaming: bool, outcome: str,
+) -> None:
+    redis = RefreshBarrierRedis()
+    selected = deployment("selected")
+    root = pool(redis, [selected])
+    capacity = root.scoped([selected])
+    await capacity.initialize()
+    existing = await capacity.acquire([selected], wait_timeout=0, estimated_tokens=1)
+    events: list[object] = []
+    secrets = SecretStub(events)
+    transport = StreamingTransportStub(events, [{"choices": [{"delta": {"content": "ok"}}]}])
+    gateway = ModelGateway(
+        ModelRegistry([selected]), root, secrets, transport,
+        capacity_wait_timeout=0.2, heartbeat_interval=0.005,
+    )
+    model_request = replace(
+        request(allow_fallback=False), max_output_tokens=12288,
+        timeout_seconds=0.15 if outcome == "timeout" else 1,
+    )
+
+    async def invoke() -> None:
+        if streaming:
+            _events = [event async for event in gateway.stream_openai_compatible_events(model_request)]
+        else:
+            assert (await gateway.complete(model_request)).text == "ok"
+
+    redis.block_acquire = True
+    pending = asyncio.create_task(invoke())
+    heartbeat = None
+    try:
+        await asyncio.wait_for(redis.acquire_started.wait(), timeout=1)
+        redis.block_registration = True
+        heartbeat = asyncio.create_task(gateway._heartbeat(capacity, existing))
+        await asyncio.wait_for(redis.registration_started.wait(), timeout=1)
+        redis.acquire_released.set()
+        done, _ = await asyncio.wait({pending}, timeout=0.02)
+        assert not done, "a successful provisional lease must wait for heartbeat registration"
+        assert not secrets.references and not transport.calls and not transport.stream_calls
+        if outcome == "cancel":
+            pending.cancel("caller cancelled")
+            with pytest.raises(asyncio.CancelledError, match="caller cancelled"):
+                await asyncio.wait_for(pending, timeout=0.3)
+        elif outcome == "timeout":
+            with pytest.raises(CapacityUnavailable):
+                await asyncio.wait_for(pending, timeout=0.3)
+        else:
+            redis.conflict_registration = outcome == "conflict"
+            redis.allow_registration.set()
+            if outcome == "conflict":
+                with pytest.raises(CapacityConfigurationError):
+                    await asyncio.wait_for(pending, timeout=1)
+            else:
+                await asyncio.wait_for(pending, timeout=1)
+        if root._lease_cleanups:
+            await asyncio.wait_for(asyncio.gather(*root._lease_cleanups), timeout=1)
+        calls = transport.stream_calls if streaming else transport.calls
+        assert len(calls) == (1 if outcome == "success" else 0)
+        assert len(secrets.references) == len(calls)
+        if calls:
+            assert calls[0][0] == selected and calls[0][1].max_output_tokens == 12288
+        assert redis.acquire_token_estimates == [1, ConservativeTokenEstimator().estimate(model_request)]
+        assert redis.lease_ids == {existing.id}
+        assert redis.released_lease_ids == redis.issued_lease_ids[1:]
+        assert root._waiters == 0
+    finally:
+        redis.block_registration = False
+        redis.allow_registration.set()
+        redis.acquire_released.set()
+        pending.cancel()
+        if heartbeat is not None:
+            heartbeat.cancel()
+        await asyncio.wait_for(asyncio.gather(
+            *([pending] if heartbeat is None else [pending, heartbeat]), return_exceptions=True,
+        ), timeout=1)
+        await capacity.release(existing)
+    assert not redis.lease_ids and root._waiters == 0
 
 
 async def test_heartbeat_ownership_conflict_cancels_transport_and_releases_once() -> None:

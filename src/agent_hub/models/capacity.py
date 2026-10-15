@@ -6,7 +6,7 @@ import math
 import re
 import time
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from importlib.resources import files
 from types import MappingProxyType
@@ -635,6 +635,29 @@ class CapacityPool:
             self._initialized = False
             raise CapacityConfigurationError("model capacity pool is not initialized")
 
+    async def _wait_for_registration_refresh(self, deadline: float) -> float:
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        remaining = deadline - started
+        if remaining <= 0:
+            raise CapacityWaitTimeout("model capacity queue timeout")
+        try:
+            async with asyncio.timeout(remaining):
+                # Only join a refresh already in progress; never hold this lock
+                # across admission polling or a Redis lease RPC.
+                async with self._registration_lock:
+                    pass
+        except TimeoutError:
+            raise CapacityWaitTimeout("model capacity queue timeout") from None
+        return max(0.0, loop.time() - started)
+
+    async def _await_initialized(self, deadline: float) -> float:
+        waited = 0.0
+        if self._refresh_in_progress:
+            waited = await self._wait_for_registration_refresh(deadline)
+        self._require_initialized()
+        return waited
+
     async def acquire(
         self,
         candidates: Sequence[Deployment],
@@ -655,23 +678,24 @@ class CapacityPool:
         ):
             raise ValueError("wait_timeout must be nonnegative and finite")
         token_estimates = _deployment_token_estimates(ordered, estimated_tokens)
-        self._require_initialized()
+        if not self._refresh_in_progress:
+            self._require_initialized()
         for candidate in ordered:
             if self._catalog_by_id.get(candidate.id) != candidate:
                 raise CapacityConfigurationError("candidate is outside initialized catalog")
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + float(wait_timeout)
+        # Zero wait still permits one bounded, non-polling admission scan.
+        rpc_deadline = deadline if wait_timeout else loop.time() + self._poll_interval
         async with self._waiter_lock:
             if self._waiters >= self._max_waiters:
                 raise CapacityQueueFull("model capacity queue is full")
             self._waiters += 1
         try:
-            loop = asyncio.get_running_loop()
-            deadline = loop.time() + float(wait_timeout)
-            # Zero wait still permits one bounded, non-polling admission scan.
-            rpc_deadline = deadline if wait_timeout else loop.time() + self._poll_interval
             while True:
-                self._require_initialized()
+                await self._await_initialized(rpc_deadline)
                 for deployment in self._ordered_candidates(ordered):
-                    self._require_initialized()
+                    await self._await_initialized(rpc_deadline)
                     remaining = rpc_deadline - loop.time()
                     if remaining <= 0:
                         raise CapacityWaitTimeout("model capacity queue timeout")
@@ -681,14 +705,23 @@ class CapacityPool:
                     )
                     if lease is not None:
                         try:
-                            self._require_initialized()
-                        except CapacityConfigurationError:
+                            # Do not spend the provisional lease's renewal safety
+                            # window waiting for metadata before handing it out.
+                            waited = await self._await_initialized(min(
+                                rpc_deadline, loop.time() + lease.renew_after_seconds,
+                            ))
+                        except (
+                            asyncio.CancelledError, CapacityConfigurationError, CapacityWaitTimeout,
+                        ) as error:
                             await self._release_id_ignoring_errors(
                                 self._keys(lease.quota_scope_id)["leases"], lease.id,
-                                timeout=max(0, rpc_deadline - loop.time()),
+                                timeout=(max(0, rpc_deadline - loop.time())
+                                         if isinstance(error, CapacityConfigurationError) else 0),
                             )
                             raise
-                        return lease
+                        return replace(lease, renew_after_seconds=max(
+                            0.0, lease.renew_after_seconds - waited,
+                        )) if waited else lease
                 await self._wait_for_next_poll(deadline)
         finally:
             async with self._waiter_lock:
@@ -1102,6 +1135,13 @@ class _CapacityScopeView:
             state.initialized = False
             raise CapacityConfigurationError("model capacity pool is not initialized")
 
+    async def _await_initialized(self, deadline: float) -> float:
+        waited = 0.0
+        if self._registration_state.refresh_in_progress:
+            waited = await self._root._wait_for_registration_refresh(deadline)
+        self._require_initialized()
+        return waited
+
     async def acquire(
         self,
         candidates: Sequence[Deployment],
@@ -1122,23 +1162,24 @@ class _CapacityScopeView:
         ):
             raise ValueError("wait_timeout must be nonnegative and finite")
         token_estimates = _deployment_token_estimates(ordered, estimated_tokens)
-        self._require_initialized()
+        if not self._registration_state.refresh_in_progress:
+            self._require_initialized()
         for candidate in ordered:
             if self._catalog_by_id.get(candidate.id) != candidate:
                 raise CapacityConfigurationError("candidate is outside initialized catalog")
         root = self._root
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + float(wait_timeout)
+        rpc_deadline = deadline if wait_timeout else loop.time() + root._poll_interval
         async with root._waiter_lock:
             if root._waiters >= root._max_waiters:
                 raise CapacityQueueFull("model capacity queue is full")
             root._waiters += 1
         try:
-            loop = asyncio.get_running_loop()
-            deadline = loop.time() + float(wait_timeout)
-            rpc_deadline = deadline if wait_timeout else loop.time() + root._poll_interval
             while True:
-                self._require_initialized()
+                await self._await_initialized(rpc_deadline)
                 for deployment in root._ordered_candidates(ordered):
-                    self._require_initialized()
+                    await self._await_initialized(rpc_deadline)
                     remaining = rpc_deadline - loop.time()
                     if remaining <= 0:
                         raise CapacityWaitTimeout("model capacity queue timeout")
@@ -1148,14 +1189,21 @@ class _CapacityScopeView:
                     )
                     if lease is not None:
                         try:
-                            self._require_initialized()
-                        except CapacityConfigurationError:
+                            waited = await self._await_initialized(min(
+                                rpc_deadline, loop.time() + lease.renew_after_seconds,
+                            ))
+                        except (
+                            asyncio.CancelledError, CapacityConfigurationError, CapacityWaitTimeout,
+                        ) as error:
                             await root._release_id_ignoring_errors(
                                 root._keys(lease.quota_scope_id)["leases"], lease.id,
-                                timeout=max(0, rpc_deadline - loop.time()),
+                                timeout=(max(0, rpc_deadline - loop.time())
+                                         if isinstance(error, CapacityConfigurationError) else 0),
                             )
                             raise
-                        return lease
+                        return replace(lease, renew_after_seconds=max(
+                            0.0, lease.renew_after_seconds - waited,
+                        )) if waited else lease
                 await root._wait_for_next_poll(deadline)
         finally:
             async with root._waiter_lock:

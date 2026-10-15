@@ -291,14 +291,14 @@ def test_deployment_token_limits_round_trip_and_build_runtime_deployment() -> No
     assert runtime.max_output_tokens == 16_384
 
 
-def test_deployment_runtime_applies_safe_token_defaults_for_legacy_config() -> None:
+def test_deployment_runtime_keeps_legacy_context_default_without_inventing_output_limit() -> None:
     runtime = deployment().to_deployment(
         deployment_id="primary-1",
         logical_model="primary",
     )
 
     assert runtime.context_window_tokens == 65_536
-    assert runtime.max_output_tokens == 8_192
+    assert runtime.max_output_tokens is None
 
 
 def test_deployment_pricing_distinguishes_unknown_from_explicit_free() -> None:

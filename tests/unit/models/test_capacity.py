@@ -13,6 +13,7 @@ from agent_hub.models.capacity import (
     CapacityConfigurationError,
     CapacityPool,
     CapacityQueueFull,
+    CapacityWaitTimeout,
 )
 from agent_hub.models.types import Deployment
 
@@ -93,11 +94,15 @@ class RefreshBarrierRedis(InMemoryCapacityRedis):
         super().__init__()
         self.block_registration = False
         self.fail_registration = False
+        self.conflict_registration = False
         self.registration_started = asyncio.Event()
         self.allow_registration = asyncio.Event()
         self.block_acquire = False
         self.acquire_released = asyncio.Event()
         self.release_calls = 0
+        self.block_release = False
+        self.release_started = asyncio.Event()
+        self.allow_release = asyncio.Event()
         self.lease_ids: set[str] = set()
         self.issued_lease_ids: list[str] = []
         self.released_lease_ids: list[str] = []
@@ -107,6 +112,9 @@ class RefreshBarrierRedis(InMemoryCapacityRedis):
             self.acquire_started.set()
             await self.acquire_released.wait()
         if key_count == 1 and len(args) == 3:
+            self.release_started.set()
+            if self.block_release:
+                await self.allow_release.wait()
             self.release_calls += 1
             self.released_lease_ids.append(str(args[1]))
             self.lease_ids.discard(str(args[1]))
@@ -116,6 +124,8 @@ class RefreshBarrierRedis(InMemoryCapacityRedis):
                 await self.allow_registration.wait()
             if self.fail_registration:
                 raise ConnectionError("registration unavailable")
+            if self.conflict_registration:
+                return [0, 0, 1]
         result = await super().eval(script, key_count, *args)
         if key_count == 5 and isinstance(result, list) and result[0] == 1:
             lease_id = str(args[5])
@@ -283,7 +293,10 @@ async def test_initialize_waiting_for_refresh_has_bounded_cancellation(
 
 
 @pytest.mark.parametrize("scoped", [False, True], ids=["root", "scope"])
-async def test_acquire_rejects_refresh_started_after_initialize(scoped: bool) -> None:
+@pytest.mark.parametrize("stage", ["before", "waiter", "rpc"])
+async def test_acquire_waits_for_refresh_started_after_initialize(
+    scoped: bool, stage: str,
+) -> None:
     redis = RefreshBarrierRedis()
     selected = deployment("selected", "selected-scope")
     root = pool(redis, [selected])
@@ -292,21 +305,168 @@ async def test_acquire_rejects_refresh_started_after_initialize(scoped: bool) ->
     await capacity.initialize()
     existing = await capacity.acquire([selected], wait_timeout=0, estimated_tokens=1)
     await reader.initialize()
+    if stage == "waiter":
+        await root._waiter_lock.acquire()
+    elif stage == "rpc":
+        redis.block_acquire = True
+    pending = None
+    if stage != "before":
+        pending = asyncio.create_task(reader.acquire([selected], wait_timeout=1, estimated_tokens=12288))
+        if stage == "rpc":
+            await asyncio.wait_for(redis.acquire_started.wait(), timeout=1)
+        else:
+            done, _ = await asyncio.wait({pending}, timeout=0.02)
+            assert not done
     redis.block_registration = True
     renewal = asyncio.create_task(capacity.renew(existing))
     try:
         await asyncio.wait_for(redis.registration_started.wait(), timeout=1)
-        with pytest.raises(CapacityConfigurationError):
-            await reader.acquire([selected], wait_timeout=0, estimated_tokens=1)
-        assert redis.acquire_calls == 1
+        if pending is None:
+            pending = asyncio.create_task(reader.acquire([selected], wait_timeout=1, estimated_tokens=12288))
+        elif stage == "waiter":
+            root._waiter_lock.release()
+        else:
+            redis.acquire_released.set()
+        done, _ = await asyncio.wait({pending}, timeout=0.02)
+        assert not done, "admission must wait for the concurrent refresh"
+        assert redis.acquire_calls == (2 if stage == "rpc" else 1)
     finally:
+        if stage == "waiter" and root._waiter_lock.locked():
+            root._waiter_lock.release()
+        redis.acquire_released.set()
         redis.block_registration = False
         redis.allow_registration.set()
         await asyncio.wait_for(renewal, timeout=1)
         await capacity.release(existing)
-    acquired = await reader.acquire([selected], wait_timeout=0, estimated_tokens=1)
+        results = [] if pending is None else await asyncio.gather(pending, return_exceptions=True)
+    assert len(results) == 1
+    acquired = results[0]
+    assert not isinstance(acquired, BaseException)
+    assert acquired.deployment_id == selected.id
+    assert acquired.quota_scope_id == selected.quota_scope_id
+    assert redis.acquire_token_estimates == [1, 12288]
+    assert redis.lease_ids == {acquired.id}
     await reader.release(acquired)
-    assert root._waiters == 0
+    assert not redis.lease_ids and root._waiters == 0
+
+
+@pytest.mark.parametrize("scoped", [False, True], ids=["root", "scope"])
+@pytest.mark.parametrize(("stage", "outcome"), [
+    (stage, outcome) for stage in ("before", "rpc")
+    for outcome in ("failure", "conflict", "expired", "timeout", "cancel")
+] + [("rpc", "lease-window")])
+async def test_refresh_coordination_fails_closed_and_releases_only_own_lease(
+    scoped: bool, stage: str, outcome: str,
+) -> None:
+    redis = RefreshBarrierRedis()
+    selected = deployment("selected", "selected-scope")
+    now = 0.0
+    root = CapacityPool(
+        redis, deployments=[selected], fingerprint_resolver=fingerprint, monotonic=lambda: now,
+        lease_seconds=0.1 if outcome == "lease-window" else 60,
+    )
+    capacity = root.scoped([selected]) if scoped else root
+    await capacity.initialize()
+    existing = await capacity.acquire([selected], wait_timeout=0, estimated_tokens=1)
+    pending = None
+    if stage == "rpc":
+        redis.block_acquire = True
+        pending = asyncio.create_task(capacity.acquire(
+            [selected], wait_timeout=0.1 if outcome == "timeout" else 1, estimated_tokens=12288,
+        ))
+        await asyncio.wait_for(redis.acquire_started.wait(), timeout=1)
+    redis.block_registration = True
+    renewal = asyncio.create_task(capacity.renew(existing))
+    try:
+        await asyncio.wait_for(redis.registration_started.wait(), timeout=1)
+        if pending is None:
+            pending = asyncio.create_task(capacity.acquire(
+                [selected], wait_timeout=0.1 if outcome == "timeout" else 1,
+                estimated_tokens=12288,
+            ))
+        redis.acquire_released.set()
+        done, _ = await asyncio.wait({pending}, timeout=0.02)
+        assert not done, "an active refresh is transient until its outcome is known"
+        if outcome == "cancel":
+            pending.cancel("caller cancelled")
+            with pytest.raises(asyncio.CancelledError, match="caller cancelled"):
+                await asyncio.wait_for(pending, timeout=0.3)
+        elif outcome in {"timeout", "lease-window"}:
+            with pytest.raises(CapacityWaitTimeout):
+                await asyncio.wait_for(pending, timeout=0.3)
+        else:
+            redis.fail_registration = outcome == "failure"
+            redis.conflict_registration = outcome == "conflict"
+            if outcome == "expired":
+                now = 3600.0
+            redis.allow_registration.set()
+            with pytest.raises(CapacityConfigurationError):
+                await asyncio.wait_for(pending, timeout=1)
+        if root._lease_cleanups:
+            await asyncio.wait_for(asyncio.gather(*root._lease_cleanups), timeout=1)
+        assert redis.lease_ids == {existing.id}
+        assert redis.acquire_token_estimates == ([1, 12288] if stage == "rpc" else [1])
+        assert redis.released_lease_ids == (redis.issued_lease_ids[1:] if stage == "rpc" else [])
+        assert root._waiters == 0
+    finally:
+        redis.block_registration = False
+        redis.allow_registration.set()
+        redis.acquire_released.set()
+        if pending is not None and not pending.done():
+            pending.cancel()
+        results = await asyncio.wait_for(asyncio.gather(
+            *([renewal] if pending is None else [renewal, pending]), return_exceptions=True,
+        ), timeout=1)
+        await capacity.release(existing)
+    if outcome in {"failure", "conflict"}:
+        assert isinstance(results[0], CapacityBackendError if outcome == "failure" else CapacityConfigurationError)
+    assert not redis.lease_ids and root._waiters == 0
+
+
+@pytest.mark.parametrize("scoped", [False, True], ids=["root", "scope"])
+@pytest.mark.parametrize("outcome", ["cancel", "lease-window"])
+async def test_post_lease_refresh_stop_does_not_wait_for_blocked_cleanup(
+    scoped: bool, outcome: str,
+) -> None:
+    redis = RefreshBarrierRedis()
+    selected = deployment("selected", "selected-scope")
+    root = CapacityPool(
+        redis, deployments=[selected], fingerprint_resolver=fingerprint,
+        lease_seconds=0.2 if outcome == "lease-window" else 60,
+    )
+    capacity = root.scoped([selected]) if scoped else root
+    await capacity.initialize()
+    existing = await capacity.acquire([selected], wait_timeout=0, estimated_tokens=1)
+    redis.block_acquire = True
+    pending = asyncio.create_task(capacity.acquire([selected], wait_timeout=1, estimated_tokens=12288))
+    await asyncio.wait_for(redis.acquire_started.wait(), timeout=1)
+    redis.block_registration = True
+    renewal = asyncio.create_task(capacity.renew(existing))
+    try:
+        await asyncio.wait_for(redis.registration_started.wait(), timeout=1)
+        redis.acquire_released.set()
+        done, _ = await asyncio.wait({pending}, timeout=0.02)
+        assert not done
+        redis.block_release = True
+        if outcome == "cancel":
+            pending.cancel("caller cancelled")
+        done, _ = await asyncio.wait({pending}, timeout=0.25)
+        assert pending in done, "stopping admission must not wait for lease cleanup"
+        with pytest.raises(asyncio.CancelledError if outcome == "cancel" else CapacityWaitTimeout):
+            await pending
+        assert redis.release_started.is_set() and root._waiters == 0
+        assert len(redis.lease_ids) == 2
+    finally:
+        redis.block_registration = False
+        redis.allow_registration.set()
+        redis.allow_release.set()
+        pending.cancel()
+        await asyncio.wait_for(asyncio.gather(renewal, pending, return_exceptions=True), timeout=1)
+        if root._lease_cleanups:
+            await asyncio.wait_for(asyncio.gather(*root._lease_cleanups), timeout=1)
+        assert redis.lease_ids == {existing.id}
+        await capacity.release(existing)
+    assert not redis.lease_ids and root._waiters == 0
 
 
 @pytest.mark.parametrize("scoped", [False, True], ids=["root", "scope"])
