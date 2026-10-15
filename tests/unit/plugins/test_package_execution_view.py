@@ -25,6 +25,10 @@ NATIVE = pytest.mark.skipif(
     sys.platform != "linux", reason="requires native Linux descriptors/memfd"
 )
 SOURCE = b"VALUE = 1\n"
+# Independent Linux UAPI oracle, never imported from the implementation or fcntl headers.
+LINUX_ADD_SEALS = 1024 + 9
+LINUX_GET_SEALS = 1024 + 10
+LINUX_REQUIRED_SEALS = 0x0001 | 0x0002 | 0x0004 | 0x0008
 
 
 @pytest.fixture
@@ -309,6 +313,80 @@ def test_unrelated_shared_ancestor_changes_do_not_invalidate_native_capture(
     assert changed
 
 
+@pytest.mark.parametrize("failure", ["none", "add", "get", "missing-bit"])
+def test_non_native_missing_fcntl_constants_preserves_seal_protocol(
+    monkeypatch: pytest.MonkeyPatch, view: ModuleType, failure: str,
+) -> None:
+    """Boundary doubles only: this test does not prove native kernel sealing."""
+    calls: list[tuple[int, int]] = []
+    closed: list[int] = []
+    written = bytearray()
+
+    def writing(fd: int, data: memoryview) -> int:
+        assert fd == 97
+        written.extend(data)
+        return len(data)
+
+    def control(fd: int, operation: int, argument: int = 0) -> int:
+        assert fd == 97 and written == SOURCE
+        calls.append((operation, argument))
+        if operation == LINUX_ADD_SEALS:
+            assert argument == LINUX_REQUIRED_SEALS
+            if failure == "add":
+                raise OSError("kernel add seals failed")
+            return 0
+        assert operation == LINUX_GET_SEALS
+        if failure == "get":
+            raise OSError("kernel get seals failed")
+        return LINUX_REQUIRED_SEALS & ~0x0008 if failure == "missing-bit" else LINUX_REQUIRED_SEALS
+
+    fcntl_without_constants = ModuleType("fcntl")
+    monkeypatch.setattr(fcntl_without_constants, "fcntl", control, raising=False)
+    monkeypatch.setitem(sys.modules, "fcntl", fcntl_without_constants)
+    monkeypatch.setattr(view, "sys", SimpleNamespace(platform="linux"))
+    monkeypatch.setattr(view, "os", SimpleNamespace(
+        MFD_CLOEXEC=1, MFD_ALLOW_SEALING=2, SEEK_SET=0,
+        memfd_create=lambda *args: 97, write=writing, get_inheritable=lambda fd: False,
+        fstat=lambda fd: SimpleNamespace(st_size=len(written)),
+        lseek=lambda *args: 0, close=closed.append,
+    ))
+    if failure == "none":
+        sealed = view._seal_file(_CapturedFile("main.py", SOURCE), view._Budget(100, math.inf))
+        assert sealed.path == "main.py" and sealed.fd == 97
+        assert not closed
+    else:
+        with pytest.raises(ValueError if failure == "missing-bit" else OSError):
+            view._seal_file(_CapturedFile("main.py", SOURCE), view._Budget(100, math.inf))
+        assert closed == [97]
+    assert calls == [(LINUX_ADD_SEALS, LINUX_REQUIRED_SEALS)] + (
+        [] if failure == "add" else [(LINUX_GET_SEALS, 0)]
+    )
+
+
+@NATIVE
+def test_native_missing_fcntl_constants_still_seals_and_owns_descriptors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, view: ModuleType,
+) -> None:
+    if sys.platform != "linux":
+        pytest.skip("requires native Linux descriptors/memfd")
+    import fcntl
+
+    for name in ("F_ADD_SEALS", "F_GET_SEALS", "F_SEAL_SEAL", "F_SEAL_SHRINK",
+                 "F_SEAL_GROW", "F_SEAL_WRITE"):
+        monkeypatch.delattr(fcntl, name, raising=False)
+    root = package(tmp_path)
+    with view.capture_sealed_package(root, (member(),)) as sealed:
+        fd = sealed.files[0].fd
+        assert fcntl.fcntl(fd, LINUX_GET_SEALS) & LINUX_REQUIRED_SEALS == LINUX_REQUIRED_SEALS
+        with pytest.raises(OSError):
+            os.write(fd, b"X")
+        with pytest.raises(OSError):
+            os.ftruncate(fd, 0)
+        assert os.read(fd, 100) == SOURCE
+    with pytest.raises(OSError):
+        os.fstat(fd)
+
+
 @NATIVE
 def test_exact_approved_bytes_are_sealed_cloexec_and_owned(
     tmp_path: Path, view: ModuleType
@@ -327,8 +405,9 @@ def test_exact_approved_bytes_are_sealed_cloexec_and_owned(
         assert sealed.pass_fds == tuple(item.fd for item in sealed.files)
         for item in sealed.files:
             assert os.get_inheritable(item.fd) is False
-            mask = fcntl.F_SEAL_WRITE | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_GROW | fcntl.F_SEAL_SEAL
-            assert fcntl.fcntl(item.fd, fcntl.F_GET_SEALS) & mask == mask
+            assert (
+                fcntl.fcntl(item.fd, LINUX_GET_SEALS) & LINUX_REQUIRED_SEALS == LINUX_REQUIRED_SEALS
+            )
             with pytest.raises(OSError):
                 os.write(item.fd, b"X")
             with pytest.raises(OSError):
@@ -510,7 +589,8 @@ def test_capture_rejects_replacement_and_read_races(
 
 @NATIVE
 @pytest.mark.parametrize(
-    "failure", ["consumer", "cancel", "capture-cancel", "read", "memfd", "write", "seal"]
+    "failure", ["consumer", "cancel", "capture-cancel", "read", "memfd", "write", "seal",
+                "get-seal", "incomplete-seal"]
 )
 def test_all_owned_descriptors_close_on_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str, view: ModuleType
@@ -556,8 +636,13 @@ def test_all_owned_descriptors_close_on_failure(
         return original_write(fd, data)
 
     def sealing(fd: int, operation: int, argument: int = 0) -> int:
-        if failure == "seal" and operation == fcntl.F_ADD_SEALS:
+        if failure == "seal" and operation == LINUX_ADD_SEALS:
             raise OSError("private-host-path private-source")
+        if operation == LINUX_GET_SEALS:
+            if failure == "get-seal":
+                raise OSError("private-host-path private-source")
+            if failure == "incomplete-seal":
+                return original_fcntl(fd, operation, argument) & ~0x0008
         return original_fcntl(fd, operation, argument)
 
     monkeypatch.setattr(view.os, "open", opening)

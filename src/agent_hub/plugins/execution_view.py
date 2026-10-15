@@ -26,6 +26,11 @@ _FAILURE = "Plugin package immutable capture failed"
 _MAX_DEPTH = 64
 _MAX_PATH_BYTES = 4096
 _CHUNK_BYTES = 65536
+# Linux UAPI is fixed even when Python was built against headers without these names.
+# https://github.com/torvalds/linux/blob/master/include/uapi/linux/fcntl.h
+_LINUX_F_ADD_SEALS = 1033
+_LINUX_F_GET_SEALS = 1034
+_LINUX_REQUIRED_SEALS = 0x000F
 
 
 @dataclass(frozen=True, slots=True)
@@ -346,10 +351,9 @@ def _seal_file(file: _CapturedFile, budget: _Budget) -> SealedPackageFile:
             if count <= 0:
                 raise ValueError(_FAILURE)
             remaining = remaining[count:]
-        seals = fcntl.F_SEAL_WRITE | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_GROW | fcntl.F_SEAL_SEAL
-        fcntl.fcntl(fd, fcntl.F_ADD_SEALS, seals)
+        fcntl.fcntl(fd, _LINUX_F_ADD_SEALS, _LINUX_REQUIRED_SEALS)
         if (
-            fcntl.fcntl(fd, fcntl.F_GET_SEALS) & seals != seals
+            fcntl.fcntl(fd, _LINUX_F_GET_SEALS) & _LINUX_REQUIRED_SEALS != _LINUX_REQUIRED_SEALS
             or os.get_inheritable(fd)
             or os.fstat(fd).st_size != len(file.data)
         ):
