@@ -6,7 +6,8 @@ import json
 import os
 import subprocess
 import sys
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 from typing import Protocol, cast
@@ -33,6 +34,27 @@ from agent_hub.runtime.contracts import JsonValue
 
 _TENANT = UUID("11111111-1111-4111-8111-111111111111")
 _OTHER = UUID("22222222-2222-4222-8222-222222222222")
+_HOST_PLATFORM = sys.platform
+_HOST_GETEUID = getattr(os, "geteuid", None)
+
+
+@contextmanager
+def _native_filesystem_identity() -> Iterator[None]:
+    # Namespace mocks must not change real staging ownership or Windows ACL handling.
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(sys, "platform", _HOST_PLATFORM)
+        if _HOST_GETEUID is None:
+            patch.delattr(os, "geteuid", raising=False)
+        else:
+            patch.setattr(os, "geteuid", _HOST_GETEUID)
+        yield
+
+
+def _build_python(
+    manager: CapabilityEnvironmentManager, spec: PythonEnvironmentSpec
+) -> EnvironmentRecord:
+    with _native_filesystem_identity():
+        return manager.build_python(spec)
 
 
 class _Adapter(PluginAdapter, Protocol):
@@ -42,9 +64,10 @@ class _Adapter(PluginAdapter, Protocol):
 class _Fixture:
     def __init__(self, root: Path) -> None:
         self.root = root
-        self.manager = CapabilityEnvironmentManager(
-            root / "environments", cli_probe=lambda *_: None
-        )
+        with _native_filesystem_identity():
+            self.manager = CapabilityEnvironmentManager(
+                root / "environments", cli_probe=lambda *_: None
+            )
         for name in ("workspace", "runtime", "other-store"):
             (root / name).mkdir()
         for name in ("bwrap", "probe", "static"):
@@ -574,7 +597,8 @@ async def test_real_python_record_is_revalidated_on_invoke(
     wheels.mkdir()
     lock = scope.root / "requirements.lock"
     lock.write_text("demo==1.0.0 --hash=sha256:" + "a" * 64 + "\n", encoding="ascii")
-    record = scope.manager.build_python(
+    record = _build_python(
+        scope.manager,
         PythonEnvironmentSpec(scope.physical_id, "p1", lock, wheels, "module")
     )
     scope.record = record

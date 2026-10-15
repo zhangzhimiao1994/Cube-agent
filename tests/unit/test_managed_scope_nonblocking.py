@@ -21,6 +21,7 @@ from agent_hub.capability_installer.environment import (
 from agent_hub.capability_installer.managed_scope import ManagedEnvironmentPluginAdapter
 from agent_hub.plugins.runtime import LocalCommandPluginAdapter
 from tests.unit.test_managed_environment_scope import (
+    _build_python,
     _Fixture,
     _invoke,
     _Process,
@@ -52,7 +53,8 @@ def _installed(
         wheels.mkdir()
         lock = tmp_path / "requirements.lock"
         lock.write_text("demo==1.0.0 --hash=sha256:" + "a" * 64 + "\n", encoding="ascii")
-        scope.record = scope.manager.build_python(
+        scope.record = _build_python(
+            scope.manager,
             PythonEnvironmentSpec(scope.physical_id, "p1", lock, wheels, "module")
         )
     else:
