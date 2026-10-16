@@ -3732,6 +3732,7 @@ class _RunState:
     token: _RunToken
     workspace_delivery_continuation: bool = True
     workspace_meaningful_progress: bool = True
+    workspace_feedback_retention: bool = True
     builtin_tool_input_contract: bool = True
     incomplete_recovery_output_growth: bool = True
     first_tool_incomplete_recovery_output_growth: bool = True
@@ -4030,6 +4031,10 @@ class CrewDispatchRuntime:
                 )
                 state.workspace_meaningful_progress = cast(
                     bool, restored.state.get("workspace_meaningful_progress", False),
+                )
+                # Old checkpoints must retain their original request fingerprints.
+                state.workspace_feedback_retention = cast(
+                    bool, restored.state.get("workspace_feedback_retention", False),
                 )
                 state.builtin_tool_input_contract = cast(
                     bool, restored.state.get("builtin_tool_input_contract", False),
@@ -5769,6 +5774,7 @@ class CrewDispatchRuntime:
         schema: StructuredResponseSchema | None,
         *,
         limits: _CrewContentLimits | None = None,
+        preserve_feedback: bool = False,
     ) -> tuple[ModelMessage, ...]:
         max_prompt_bytes = (
             limits.interaction_prompt_bytes if limits is not None
@@ -5782,6 +5788,7 @@ class CrewDispatchRuntime:
             messages,
             max_prompt_bytes=max_prompt_bytes,
             message_limit=message_limit,
+            preserve_feedback=preserve_feedback,
         )
         if schema is None:
             return tuple(messages)
@@ -7036,6 +7043,7 @@ class CrewDispatchRuntime:
                     request_messages,
                     response_schema,
                     limits=content_limits,
+                    preserve_feedback=workspace_continuation and run_state.workspace_feedback_retention,
                 ),
                 required_capabilities=frozenset(round_required_capabilities),
                 timeout_seconds=_model_call_timeout_seconds(
@@ -7061,6 +7069,7 @@ class CrewDispatchRuntime:
                     # a full original request SHA can select the pre-repair view.
                     request = replace(request, messages=self._response_contract_messages(
                         request_messages, response_schema, limits=content_limits,
+                        preserve_feedback=workspace_continuation and run_state.workspace_feedback_retention,
                     ))
                     cached_key = self._model_call_key(
                         context.run_id, step.id, model_attempt_index, "step", agent.id, call_cursor.value,
@@ -7088,6 +7097,7 @@ class CrewDispatchRuntime:
                             candidate = replace(request, messages=self._response_contract_messages(
                                 (*replay_prefix, *request_messages[initial_message_count:]),
                                 response_schema, limits=content_limits,
+                                preserve_feedback=workspace_continuation and run_state.workspace_feedback_retention,
                             ))
                             if self._model_request_sha256(candidate) == cached_model["request_sha256"]:
                                 if (cached_model["status"] == "rejected"
@@ -8511,6 +8521,163 @@ class CrewDispatchRuntime:
         *,
         max_prompt_bytes: int = _SOFT_INTERACTION_PROMPT_BYTES,
         message_limit: int = _SOFT_INTERACTION_MESSAGE_LIMIT,
+        preserve_feedback: bool = False,
+    ) -> tuple[ModelMessage, ...]:
+        if not preserve_feedback:
+            return CrewDispatchRuntime._legacy_compact_interaction_messages(
+                messages, max_prompt_bytes=max_prompt_bytes, message_limit=message_limit,
+            )
+
+        def encoded_content(message: ModelMessage) -> bytes:
+            return json.dumps(
+                _mutable_json(message.content), ensure_ascii=False, allow_nan=False,
+                sort_keys=True, separators=(",", ":"),
+            ).encode("utf-8")
+
+        def require_bounds(window: Sequence[ModelMessage]) -> None:
+            if (len(window) > message_limit
+                    or sum(len(encoded_content(message)) for message in window) > max_prompt_bytes):
+                _fail("interaction feedback exceeds bounded context")
+
+        current = tuple(messages)
+        sizes = tuple(len(encoded_content(message)) for message in current)
+        if len(current) <= message_limit and sum(sizes) <= max_prompt_bytes:
+            return current
+        feedback_prefixes = (
+            "UNTRUSTED_CAPABILITY_RESULTS_JSON=", "UNTRUSTED_CAPABILITY_REJECTIONS_JSON=",
+        )
+        control_prefixes = (
+            "WORKSPACE_OBSERVATION_STALL:", "CAPABILITY_ARGUMENT_CORRECTION:",
+            "WORKSPACE_DELIVERY_CONTINUATION:", "CAPABILITY_RESULT_CONTINUATION:",
+        )
+        feedback = [index for index, message in enumerate(current)
+                    if message.role == "user" and isinstance(message.content, str)
+                    and message.content.startswith(feedback_prefixes)]
+        anchor_count = min(2, len(current))
+        previous_feedback = feedback[-2] if len(feedback) > 1 else anchor_count - 1
+        controls: dict[str, int] = {}
+        for index, message in enumerate(current):
+            if (index <= previous_feedback or message.role != "system"
+                    or not isinstance(message.content, str)):
+                continue
+            for prefix in control_prefixes:
+                if message.content.startswith(prefix):
+                    controls[prefix] = index
+        if not feedback and not controls:
+            legacy = CrewDispatchRuntime._legacy_compact_interaction_messages(
+                current, max_prompt_bytes=max_prompt_bytes, message_limit=message_limit,
+            )
+            require_bounds(legacy)
+            return legacy
+
+        # Latest result/rejection and its controls are indivisible, never converted to system data.
+        required = set(range(anchor_count)) | set(controls.values())
+        if feedback:
+            required.add(feedback[-1])
+        retained = {index: current[index] for index in required}
+        require_bounds(tuple(retained.values()))
+        remaining_bytes = max_prompt_bytes - sum(sizes[index] for index in required)
+        remaining_count = message_limit - len(required)
+        progress_indices = [index for index, message in enumerate(current)
+                            if message.role == "user" and isinstance(message.content, str)
+                            and message.content.startswith("WORKSPACE_DELIVERY_PROGRESS_JSON=")]
+
+        def omission_summary(omitted: Sequence[ModelMessage]) -> ModelMessage:
+            digest = hashlib.sha256(b"\n".join(
+                message.role.encode("utf-8") + b":" + encoded_content(message)
+                for message in omitted
+            )).hexdigest()
+            return ModelMessage(role="system", content=(
+                "EARLIER_INTERACTION_WINDOW_COMPRESSED: Older model and capability-result "
+                "messages remain available through the artifact/checkpoint ledger. Continue "
+                f"from the retained recent state. omitted_messages={len(omitted)} sha256={digest}"
+            ))
+
+        summary_bytes = len(encoded_content(omission_summary(current)))
+        reserve_summary = remaining_count > 0 and remaining_bytes >= summary_bytes
+        if progress_indices:
+            index = progress_indices[-1]
+            if index not in retained and remaining_count > 0:
+                # Progress metadata yields space to full feedback, not the reverse.
+                if remaining_count == 1:
+                    reserve_summary = False
+                progress = CrewDispatchRuntime._bounded_interaction_progress(
+                    current[index], max_bytes=remaining_bytes - (summary_bytes if reserve_summary else 0),
+                )
+                if progress is None and reserve_summary:
+                    progress = CrewDispatchRuntime._bounded_interaction_progress(
+                        current[index], max_bytes=remaining_bytes,
+                    )
+                    if progress is not None:
+                        reserve_summary = False
+                if progress is not None:
+                    retained[index] = progress
+                    remaining_bytes -= len(encoded_content(progress))
+                    remaining_count -= 1
+        for index in reversed(range(anchor_count, len(current))):
+            if index in retained or index in progress_indices:
+                continue
+            if (remaining_count <= int(reserve_summary)
+                    or sizes[index] > remaining_bytes - (summary_bytes if reserve_summary else 0)):
+                continue
+            retained[index] = current[index]
+            remaining_count -= 1
+            remaining_bytes -= sizes[index]
+        omitted = tuple(message for index, message in enumerate(current)
+                        if retained.get(index) is not message)
+        summary = (omission_summary(omitted),) if omitted and reserve_summary else ()
+        result = (*current[:anchor_count], *summary,
+                  *(retained[index] for index in sorted(retained) if index >= anchor_count))
+        require_bounds(result)
+        return result
+
+    @staticmethod
+    def _bounded_interaction_progress(message: ModelMessage, *, max_bytes: int) -> ModelMessage | None:
+        def size(value: ModelMessage) -> int:
+            return len(json.dumps(_mutable_json(value.content), ensure_ascii=False,
+                                  allow_nan=False, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+
+        if size(message) <= max_bytes:
+            return message
+        prefix = "WORKSPACE_DELIVERY_PROGRESS_JSON="
+        if message.role != "user" or not isinstance(message.content, str) or not message.content.startswith(prefix):
+            return None
+        try:
+            packet = json.loads(message.content[len(prefix):])
+            if (not isinstance(packet, dict) or not isinstance(packet.get("files"), list)
+                    or type(packet.get("file_count")) is not int
+                    or packet["file_count"] < len(packet["files"])
+                    or type(packet.get("omitted_files")) is not int
+                    or packet["omitted_files"] != packet["file_count"] - len(packet["files"])):
+                return None
+            files: list[object] = []
+
+            def candidate() -> ModelMessage:
+                return replace(message, content=prefix + json.dumps(
+                    {"files": files, "file_count": packet["file_count"],
+                     "omitted_files": packet["file_count"] - len(files)},
+                    ensure_ascii=False, allow_nan=False, sort_keys=True, separators=(",", ":"),
+                ))
+
+            bounded = candidate()
+            if size(bounded) > max_bytes:
+                return None
+            for item in packet["files"]:
+                files.append(item)
+                next_candidate = candidate()
+                if size(next_candidate) > max_bytes:
+                    break
+                bounded = next_candidate
+            return bounded
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _legacy_compact_interaction_messages(
+        messages: Sequence[ModelMessage],
+        *,
+        max_prompt_bytes: int = _SOFT_INTERACTION_PROMPT_BYTES,
+        message_limit: int = _SOFT_INTERACTION_MESSAGE_LIMIT,
     ) -> tuple[ModelMessage, ...]:
         def encoded_content(message: ModelMessage) -> bytes:
             return json.dumps(
@@ -9233,6 +9400,8 @@ class CrewDispatchRuntime:
                    if any(builtin_tool_input_schema(name) is not None for step in plan.steps for name in step.tools) else {}),
                 **({"workspace_meaningful_progress": meaningful_progress}
                    if any(_is_incremental_workspace_contract_step(step) for step in plan.steps) else {}),
+                **({"workspace_feedback_retention": run_state.workspace_feedback_retention}
+                   if any(_is_incremental_workspace_contract_step(step) for step in plan.steps) else {}),
                 "incomplete_recovery_output_growth": run_state.incomplete_recovery_output_growth,
                 "initial_incomplete_chain_growth": run_state.initial_incomplete_chain_growth,
                 **({"first_tool_incomplete_recovery_output_growth":
@@ -9338,6 +9507,7 @@ class CrewDispatchRuntime:
         optional_state_keys = {
             "repair_reopened_contract_ids", "workspace_delivery_continuation",
             "workspace_meaningful_progress",
+            "workspace_feedback_retention",
             "builtin_tool_input_contract",
             "incomplete_recovery_output_growth",
             "first_tool_incomplete_recovery_output_growth",
@@ -9370,6 +9540,9 @@ class CrewDispatchRuntime:
         timeout_progress_units = state.get("timeout_progress_units")
         if (
             type(state.get("workspace_delivery_continuation", False)) is not bool
+            or type(state.get("workspace_feedback_retention", False)) is not bool
+            or (state.get("workspace_feedback_retention", False)
+                and checkpoint.runtime_version != _RUNTIME_VERSION)
             or type(state.get("builtin_tool_input_contract", False)) is not bool
             or (state.get("builtin_tool_input_contract", False)
                 and checkpoint.runtime_version != _RUNTIME_VERSION)
