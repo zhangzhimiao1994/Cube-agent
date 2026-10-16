@@ -55,7 +55,7 @@ def workspace_progress_key(name: str, arguments_sha256: str, result: object) -> 
             value = ({k: file[k] for k in ("filename", "sha256", "size_bytes") if k in file}
                      if isinstance(file, Mapping) else {})
     elif name == "read_context":
-        value = {k: result.get(k) for k in ("query", "matches", "truncated")}
+        value = {k: result.get(k) for k in ("matches", "truncated")}
     else:
         return None
     raw = json.dumps([name, _plain(value)], sort_keys=True, ensure_ascii=False,

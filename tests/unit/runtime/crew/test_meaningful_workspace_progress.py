@@ -24,7 +24,7 @@ from agent_hub.runtime.crew.adapter import (
     ModelOutcomeUncertain,
     RuntimeExecutionError,
 )
-from agent_hub.runtime.progress import artifact_progress_key
+from agent_hub.runtime.progress import artifact_progress_key, workspace_progress_key
 from tests.unit.runtime.crew.test_adapter_failure_reason import (
     WorkspaceDeliverySequenceGateway,
     WorkspaceDeliverySequenceHarness,
@@ -37,6 +37,16 @@ from tests.unit.runtime.crew.test_adapter_failure_reason import (
 
 TOOLS = ("workspace.write_text", "workspace.read", "workspace.list", "workspace.bundle")
 FINAL = ModelResponse(text="Workspace delivered.", usage=TokenUsage(1, 1, 2))
+
+
+def test_context_query_echo_is_not_new_observed_information() -> None:
+    empty = {"query": "first", "matches": (), "truncated": False}
+    repeated = {"query": "different wording", "matches": (), "truncated": False}
+    changed = {"query": "first", "matches": ({"text": "new source fact"},), "truncated": False}
+    first = workspace_progress_key("read_context", "a" * 64, empty)
+    assert first is not None
+    assert workspace_progress_key("read_context", "b" * 64, repeated) == first
+    assert workspace_progress_key("read_context", "a" * 64, changed) != first
 
 
 def test_unexecuted_provisional_tool_artifact_cannot_grant_progress() -> None:
