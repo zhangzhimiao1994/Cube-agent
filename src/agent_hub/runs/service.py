@@ -626,6 +626,7 @@ class RunService:
         resolved_execution_backend = normalize_execution_backend(execution_backend)
         operator_selection: dict[str, object] = {
             "requested_mode": requested_mode.value,
+            "role_planning_intent_version": 1,
             "selected_agent_ids": list(agent_ids),
             "workflow_id": workflow_id,
             "allow_workflow_adjustment": allow_workflow_adjustment,

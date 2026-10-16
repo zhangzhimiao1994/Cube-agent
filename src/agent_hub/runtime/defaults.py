@@ -73,6 +73,7 @@ from agent_hub.runtime.project_scale_artifact import (
     is_project_scale_preseed_request,
 )
 from agent_hub.runtime.registry import RuntimeRegistry
+from agent_hub.runtime.role_intent import role_planning_intent_version, role_planning_intent_view
 from agent_hub.runtime.role_planner import (
     RoleAssignment,
     RolePlanner,
@@ -970,6 +971,7 @@ class ConfigBackedDispatchRuntime:
         )
         if config is None:
             return UnavailableRuntime(TaskMode.DISPATCH)
+        intent_version = role_planning_intent_version(context.routing_decision)
         try:
             gateway, logical_model, fallback_policy = await _gateway_for_config(
                 config,
@@ -998,10 +1000,10 @@ class ConfigBackedDispatchRuntime:
         else:
             planned_roles = self._role_planner.plan(
                 RolePlanningRequest(
-                    task=_role_planning_task(context.request),
+                    task=_role_planning_task(context.request, intent_version=intent_version),
                     mode=TaskMode.DISPATCH,
-                    profile=_task_profile(context.request),
-                    profiles=_task_profiles(context.request),
+                    profile=_task_profile(context.request, intent_version=intent_version),
+                    profiles=_task_profiles(context.request, intent_version=intent_version),
                     high_risk=_high_risk_task(context.request),
                     requested_skills=_requested_skills(context),
                     default_model=logical_model,
@@ -1163,6 +1165,7 @@ class ConfigBackedDiscussionRuntime:
         )
         if config is None:
             return UnavailableRuntime(TaskMode.DISCUSS)
+        intent_version = role_planning_intent_version(context.routing_decision)
         try:
             gateway, logical_model, fallback_policy = await _gateway_for_config(
                 config,
@@ -1191,10 +1194,10 @@ class ConfigBackedDiscussionRuntime:
         else:
             planned_roles = self._role_planner.plan(
                 RolePlanningRequest(
-                    task=_role_planning_task(context.request),
+                    task=_role_planning_task(context.request, intent_version=intent_version),
                     mode=TaskMode.DISCUSS,
-                    profile=_task_profile(context.request),
-                    profiles=_task_profiles(context.request),
+                    profile=_task_profile(context.request, intent_version=intent_version),
+                    profiles=_task_profiles(context.request, intent_version=intent_version),
                     high_risk=_high_risk_task(context.request),
                     requested_skills=_requested_skills(context),
                     default_model=logical_model,
@@ -1334,6 +1337,7 @@ class ConfigBackedHybridRuntime:
         )
         if config is None:
             return UnavailableRuntime(TaskMode.HYBRID)
+        intent_version = role_planning_intent_version(context.routing_decision)
         try:
             gateway, logical_model, fallback_policy = await _gateway_for_config(
                 config,
@@ -1351,8 +1355,8 @@ class ConfigBackedHybridRuntime:
             routing_decision=context.routing_decision,
         )
         deployment_constraint = _deployment_routing_constraint(config, context.routing_decision)
-        profile = _task_profile(context.request)
-        profiles = _task_profiles(context.request)
+        profile = _task_profile(context.request, intent_version=intent_version)
+        profiles = _task_profiles(context.request, intent_version=intent_version)
         high_risk = _high_risk_task(context.request)
         selected_dispatch_roles = _selected_config_role_assignments(
             context,
@@ -1371,7 +1375,7 @@ class ConfigBackedHybridRuntime:
         else:
             dispatch_roles = self._role_planner.plan(
                 RolePlanningRequest(
-                    task=_role_planning_task(context.request),
+                    task=_role_planning_task(context.request, intent_version=intent_version),
                     mode=TaskMode.DISPATCH,
                     profile=profile,
                     profiles=profiles,
@@ -1395,7 +1399,7 @@ class ConfigBackedHybridRuntime:
         else:
             discussion_roles = self._role_planner.plan(
                 RolePlanningRequest(
-                    task=_role_planning_task(context.request),
+                    task=_role_planning_task(context.request, intent_version=intent_version),
                     mode=TaskMode.DISCUSS,
                     profile=profile,
                     profiles=profiles,
@@ -1692,7 +1696,9 @@ def _deployment_routing_constraint(
 
 def _software_delivery_guidance(context: TaskContext, tools: tuple[str, ...]) -> str:
     if (
-        TaskProfile.SOFTWARE not in _task_profiles(context.request)
+        TaskProfile.SOFTWARE not in _task_profiles(
+            context.request, intent_version=role_planning_intent_version(context.routing_decision),
+        )
         and not _is_project_scale_generated_project_request(context)
     ):
         return ""
@@ -1748,7 +1754,9 @@ def _software_delivery_guidance(context: TaskContext, tools: tuple[str, ...]) ->
 
 
 def _software_final_guidance(context: TaskContext) -> str:
-    if TaskProfile.SOFTWARE not in _task_profiles(context.request):
+    if TaskProfile.SOFTWARE not in _task_profiles(
+        context.request, intent_version=role_planning_intent_version(context.routing_decision),
+    ):
         return ""
     guidance = (
         "Do not claim the project works without verification evidence. "
@@ -4689,8 +4697,8 @@ def _autogen_participant_ids(roles: tuple[RoleAssignment, ...]) -> tuple[str, ..
     return tuple(identifiers)
 
 
-def _role_planning_task(task: object) -> str:
-    text = " ".join(str(task).split())
+def _role_planning_task(task: object, *, intent_version: int = 0) -> str:
+    text = " ".join(role_planning_intent_view(task, version=intent_version).split())
     if len(text) <= _ROLE_PLANNING_TASK_MAX_CHARS:
         return text
     suffix_length = min(_ROLE_PLANNING_TASK_SUFFIX_CHARS, _ROLE_PLANNING_TASK_MAX_CHARS // 3)
@@ -4699,8 +4707,8 @@ def _role_planning_task(task: object) -> str:
     return f"{text[:prefix_length].rstrip()}{marker}{text[-suffix_length:].lstrip()}"
 
 
-def _task_profile(task: object) -> TaskProfile:
-    text = str(task).lower()
+def _task_profile(task: object, *, intent_version: int = 0) -> TaskProfile:
+    text = role_planning_intent_view(task, version=intent_version).lower()
     if any(keyword in text for keyword in ("deploy", "部署", "install", "安装", "server")):
         return TaskProfile.DEPLOYMENT
     if any(keyword in text for keyword in _SOFTWARE_TASK_KEYWORDS):
@@ -4712,8 +4720,8 @@ def _task_profile(task: object) -> TaskProfile:
     return TaskProfile.GENERAL
 
 
-def _task_profiles(task: object) -> tuple[TaskProfile, ...]:
-    text = str(task).lower()
+def _task_profiles(task: object, *, intent_version: int = 0) -> tuple[TaskProfile, ...]:
+    text = role_planning_intent_view(task, version=intent_version).lower()
     profiles: list[TaskProfile] = []
     if any(keyword in text for keyword in ("deploy", "部署", "install", "安装", "server")):
         profiles.append(TaskProfile.DEPLOYMENT)
