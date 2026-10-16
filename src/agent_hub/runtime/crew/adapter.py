@@ -116,7 +116,11 @@ from agent_hub.runtime.generated_file_recovery import (
 )
 from agent_hub.runtime.hermes_context import runtime_memory_context_text
 from agent_hub.runtime.instruction_context import model_request_sha256
-from agent_hub.runtime.progress import artifact_progress_key, count_artifact_progress
+from agent_hub.runtime.progress import (
+    artifact_progress_key,
+    count_artifact_progress,
+    workspace_progress_key,
+)
 from agent_hub.runtime.project_scale_artifact import (
     PROJECT_SCALE_ARTIFACT_TOOL_NAME,
     augment_project_scale_artifact_result,
@@ -3733,6 +3737,7 @@ class _RunState:
     workspace_delivery_continuation: bool = True
     workspace_meaningful_progress: bool = True
     workspace_feedback_retention: bool = True
+    workspace_context_refresh: bool = True
     builtin_tool_input_contract: bool = True
     incomplete_recovery_output_growth: bool = True
     first_tool_incomplete_recovery_output_growth: bool = True
@@ -4035,6 +4040,9 @@ class CrewDispatchRuntime:
                 # Old checkpoints must retain their original request fingerprints.
                 state.workspace_feedback_retention = cast(
                     bool, restored.state.get("workspace_feedback_retention", False),
+                )
+                state.workspace_context_refresh = cast(
+                    bool, restored.state.get("workspace_context_refresh", False),
                 )
                 state.builtin_tool_input_contract = cast(
                     bool, restored.state.get("builtin_tool_input_contract", False),
@@ -6804,6 +6812,46 @@ class CrewDispatchRuntime:
             repair=reservation, tool_ledger=tool_ledger, allow_structured_repair=False,
         )
 
+    @staticmethod
+    def _visible_workspace_read_keys(messages: Sequence[ModelMessage]) -> frozenset[str] | None:
+        def unique(pairs: list[tuple[str, object]]) -> dict[str, object]:
+            result = dict(pairs)
+            if len(result) != len(pairs):
+                raise ValueError("ambiguous feedback")
+            return result
+
+        def invalid_constant(_: str) -> None:
+            raise ValueError("invalid feedback")
+
+        keys: set[str] = set()
+        prefix = "UNTRUSTED_CAPABILITY_RESULTS_JSON="
+        for message in messages:
+            if (message.role != "user" or not isinstance(message.content, str)
+                    or not message.content.startswith(prefix)):
+                continue
+            try:
+                packet = json.loads(message.content[len(prefix):], object_pairs_hook=unique,
+                                    parse_constant=invalid_constant)
+                if not isinstance(packet, list):
+                    return None
+                for item in packet:
+                    if not isinstance(item, Mapping) or not isinstance(item.get("name"), str):
+                        return None
+                    name, result = item["name"], item.get("result")
+                    if name not in {"workspace.read", "workspace_read", "read_context"}:
+                        continue
+                    if not isinstance(result, Mapping):
+                        return None
+                    if name == "read_context" and "path" not in result:
+                        continue
+                    key = workspace_progress_key(name, "", result)
+                    if key is None:
+                        return None
+                    keys.add(key)
+            except (TypeError, ValueError):
+                return None
+        return frozenset(keys)
+
     async def _complete_gateway_messages(
         self,
         context: TaskContext,
@@ -6925,6 +6973,19 @@ class CrewDispatchRuntime:
             and _is_incremental_workspace_contract_step(step)
         )
         meaningful_progress = workspace_continuation and run_state.workspace_meaningful_progress
+        context_refresh = meaningful_progress and run_state.workspace_context_refresh
+        # Prior writes open one initial epoch; replay rebuilds this attempt's spent reads.
+        context_refresh_epoch_open = context_refresh and any(
+            state.get("step_id") == step.id and state.get("status") == "succeeded"
+            and state.get("name") == "workspace.write_text"
+            and type(state.get("attempt")) is int and cast(int, state["attempt"]) < model_attempt
+            and (artifact := tool_ledger.artifacts.get(tool_key)) is not None
+            and artifact.type == "tool_result"
+            and artifact.content.get("tool_name") == "workspace.write_text"
+            and artifact_progress_key(artifact) is not None
+            for tool_key, state in tool_ledger.states.items()
+        )
+        refreshed_read_keys: set[str] = set()
         progress_keys = {
             prior_progress_key for tool_key, state in tool_ledger.states.items()
             if meaningful_progress and state.get("step_id") == step.id
@@ -7289,16 +7350,33 @@ class CrewDispatchRuntime:
             reused_generated_file_results = 0
             reused_semantic_results = 0
             round_progressed = False
+            round_context_refreshed = False
+            visible_read_keys = self._visible_workspace_read_keys(request.messages) if context_refresh else None
             argument_correction_requested = False
             opaque_read_rejection_requested = False
 
-            def record_round_progress(artifact: Artifact, *, replayed: bool = False) -> None:
+            def record_round_progress(
+                artifact: Artifact, *, replayed: bool = False,
+                visible: frozenset[str] | None = visible_read_keys,
+            ) -> None:
                 nonlocal round_progressed, step_deadline
+                nonlocal round_context_refreshed, context_refresh_epoch_open
                 if meaningful_progress:
                     progress_key = artifact_progress_key(artifact)
-                    if progress_key is None or progress_key in progress_keys:
+                    if progress_key is None:
+                        return
+                    if progress_key in progress_keys:
+                        if (context_refresh and context_refresh_epoch_open
+                                and artifact.content.get("tool_name") in {"workspace.read", "workspace_read"}
+                                and visible is not None and progress_key not in visible
+                                and progress_key not in refreshed_read_keys):
+                            refreshed_read_keys.add(progress_key)
+                            round_context_refreshed = True
                         return
                     progress_keys.add(progress_key)
+                    if context_refresh and artifact.content.get("tool_name") == "workspace.write_text":
+                        context_refresh_epoch_open = True
+                        refreshed_read_keys.clear()
                 if round_progressed:
                     return
                 round_progressed = True
@@ -7377,7 +7455,8 @@ class CrewDispatchRuntime:
                     None
                     if generated_file_result is not None or (
                         workspace_continuation
-                        and tool_call.name in {"workspace.read", "workspace.list"}
+                        and (tool_call.name in {"workspace.read", "workspace.list"}
+                             or (context_refresh and tool_call.name == "workspace_read"))
                     )
                     else _succeeded_semantic_tool_result(
                         tool_ledger,
@@ -8141,7 +8220,7 @@ class CrewDispatchRuntime:
                 ))
                 continue
             if meaningful_progress:
-                if round_progressed:
+                if round_progressed or round_context_refreshed:
                     stall_corrected = False
                 elif stall_corrected:
                     _fail("workspace delivery stalled after unchanged observations")
@@ -9402,6 +9481,8 @@ class CrewDispatchRuntime:
                    if any(_is_incremental_workspace_contract_step(step) for step in plan.steps) else {}),
                 **({"workspace_feedback_retention": run_state.workspace_feedback_retention}
                    if any(_is_incremental_workspace_contract_step(step) for step in plan.steps) else {}),
+                **({"workspace_context_refresh": run_state.workspace_context_refresh}
+                   if any(_is_incremental_workspace_contract_step(step) for step in plan.steps) else {}),
                 "incomplete_recovery_output_growth": run_state.incomplete_recovery_output_growth,
                 "initial_incomplete_chain_growth": run_state.initial_incomplete_chain_growth,
                 **({"first_tool_incomplete_recovery_output_growth":
@@ -9508,6 +9589,7 @@ class CrewDispatchRuntime:
             "repair_reopened_contract_ids", "workspace_delivery_continuation",
             "workspace_meaningful_progress",
             "workspace_feedback_retention",
+            "workspace_context_refresh",
             "builtin_tool_input_contract",
             "incomplete_recovery_output_growth",
             "first_tool_incomplete_recovery_output_growth",
@@ -9540,6 +9622,9 @@ class CrewDispatchRuntime:
         timeout_progress_units = state.get("timeout_progress_units")
         if (
             type(state.get("workspace_delivery_continuation", False)) is not bool
+            or type(state.get("workspace_context_refresh", False)) is not bool
+            or (state.get("workspace_context_refresh", False)
+                and checkpoint.runtime_version != _RUNTIME_VERSION)
             or type(state.get("workspace_feedback_retention", False)) is not bool
             or (state.get("workspace_feedback_retention", False)
                 and checkpoint.runtime_version != _RUNTIME_VERSION)
