@@ -4141,11 +4141,6 @@ class CrewDispatchRuntime:
                         cast(tuple[str, ...], restored_repair_contract_ids)
                     )
                 repair_payload = self_repair_recovery_plan_payload(context.routing_decision)
-                repair_tool_key_steps = (
-                    _orchestration_repair_reopen_steps(plan, repair_payload)
-                    if context.routing_decision.get("self_repair_accepted") is True
-                    else frozenset()
-                )
                 repair_reopened_steps = _apply_orchestration_repair_recovery(
                     plan,
                     context.routing_decision,
@@ -4163,6 +4158,14 @@ class CrewDispatchRuntime:
                     repair_reopened_contract_ids = _orchestration_repair_contract_ids(
                         repair_payload
                     )
+                repair_tool_key_steps = (
+                    _orchestration_repair_reopen_steps(plan, repair_payload)
+                    if context.routing_decision.get("self_repair_accepted") is True
+                    and repair_reopened_contract_ids
+                    and repair_reopened_contract_ids
+                    == _orchestration_repair_contract_ids(repair_payload)
+                    else frozenset()
+                )
                 hydrating_restored = False
                 self._restored_checkpoint = None
                 restored_phase = restored.state.get("phase")

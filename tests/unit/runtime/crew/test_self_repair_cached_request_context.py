@@ -5,16 +5,25 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import cast
 from unittest.mock import patch
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 
+from agent_hub.auth.models import Role
+from agent_hub.capabilities.runtime import RuntimeCapabilityError
+from agent_hub.harness.types import HarnessToolCallRequest, HarnessToolCallResult
 from agent_hub.models.gateway import GatewayCompletion, GatewayRejectedOutput
 from agent_hub.models.types import ModelRequest, ModelResponse, RejectedOutputEvidence, TokenUsage
 from agent_hub.runs.repository import _retained_self_repair_contexts
 from agent_hub.runs.self_repair import repair_context_from_proposal
 from agent_hub.runtime.artifacts import InMemoryArtifactRepository
-from agent_hub.runtime.contracts import EventKind, JsonValue, RuntimeCheckpoint, TaskContext
+from agent_hub.runtime.contracts import (
+    EventKind,
+    JsonValue,
+    RunEvent,
+    RuntimeCheckpoint,
+    TaskContext,
+)
 from agent_hub.runtime.crew import adapter
 from agent_hub.runtime.crew.plan import AgentSpec, DispatchPlan, DispatchStep
 from tests.unit.runtime.crew.test_adapter_failure_reason import (
@@ -49,12 +58,14 @@ def runtime(gateway: WorkspaceDeliverySequenceGateway, harness: MissingPathHarne
 
 
 async def saved_failure(*, factory: adapter.CrewObjectFactory | None = None,
-                        already_accepted: bool = False) -> tuple[
+                        already_accepted: bool = False, minimal_prefix: bool = False) -> tuple[
                             RuntimeCheckpoint, TaskContext, InMemoryArtifactRepository, MissingPathHarness]:
     repository = InMemoryArtifactRepository()
     harness = MissingPathHarness("exception")
     responses = (ModelResponse(text='{"summary":"Component plan"}', tool_calls=(), usage=TokenUsage(1, 1, 2)),) * 6
-    gateway = WorkspaceDeliverySequenceGateway((*responses, write(), observe("workspace.read"), wrong_read(with_list=True)))
+    implementation = ((wrong_read(with_list=True),) if minimal_prefix else
+                      (write(), observe("workspace.read"), wrong_read(with_list=True)))
+    gateway = WorkspaceDeliverySequenceGateway((*responses, *implementation))
     old = runtime(gateway, harness, repository, factory=factory)
     context = _workspace_delivery_sequence_context().model_copy(update={"token_budget": 100_000})
     if already_accepted:
@@ -70,7 +81,7 @@ async def saved_failure(*, factory: adapter.CrewObjectFactory | None = None,
             pass
     checkpoint = await old.save_checkpoint()
     assert len(checkpoint.state["completed"]) == 6  # type: ignore[arg-type]
-    assert len(gateway.requests) == 9
+    assert len(gateway.requests) == (7 if minimal_prefix else 9)
     sequence = checkpoint.state["next_sequence"]
     assert isinstance(sequence, int)
     context = context.model_copy(update={"checkpoint": checkpoint})
@@ -289,6 +300,85 @@ async def test_known_rejection_cannot_reenter_internal_correction_with_old_repai
             pass
     assert not fresh.requests and len(harness.calls) == calls
     assert checkpoint.to_payload() == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("framework", ("fixed", "real"))
+async def test_orchestration_noop_reuses_successful_list_before_failed_read_correction(
+    tmp_path: Path, framework: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name in ("OTEL_SDK_DISABLED", "CREWAI_DISABLE_TELEMETRY", "CREWAI_DISABLE_TRACKING", "CREWAI_TESTING"):
+        monkeypatch.setenv(name, "true")
+    monkeypatch.setenv("CREWAI_TRACING_ENABLED", "false")
+    factory = adapter.CrewAIObjectFactory(storage_dir=tmp_path) if framework == "real" else None
+    checkpoint, context, repository, harness = await saved_failure(factory=factory, minimal_prefix=True)
+    scope = context.routing_decision["self_repair_context"]
+    assert isinstance(scope, Mapping)
+    context = context.model_copy(update={"routing_decision": {**context.routing_decision,
+        "self_repair_context": {**scope, "recovery_strategy": "retry_blocked_contract_chain_after_replanning",
+            "orchestration_recovery_hint": "retry_blocked_contract_chain",
+            "blocked_contract_ids": ["plan0-to-implementer_step"]}}})
+    before = checkpoint.to_payload()
+    reached = asyncio.Event()
+    denied: list[str] = []
+    requests: list[ModelRequest] = []
+    original_invoke = harness.invoke
+
+    async def guard(tenant_id: UUID, request: HarnessToolCallRequest, *,
+                    user_id: UUID | None = None, role: Role | None = None) -> HarnessToolCallResult:
+        if request.tool_name != "workspace.read" or "path" in request.arguments:
+            denied.append(request.tool_name)
+            reached.set()
+            raise RuntimeCapabilityError("successful capability must not execute again")
+        return await original_invoke(tenant_id, request, user_id=user_id, role=role)
+
+    monkeypatch.setattr(harness, "invoke", guard)
+
+    class BoundaryGateway(WorkspaceDeliverySequenceGateway):
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+            requests.append(request)
+            reached.set()
+            await asyncio.Event().wait()
+            raise AssertionError("new model boundary must not complete")
+
+    restored = runtime(BoundaryGateway(()), harness, repository, factory=factory)
+    await restored.restore_checkpoint(checkpoint)
+    events: list[RunEvent] = []
+    step_started = asyncio.Event()
+
+    async def consume() -> None:
+        async for event in restored.run(context):
+            events.append(event)
+            if event.kind is EventKind.STEP_STARTED:
+                step_started.set()
+
+    consumer = asyncio.create_task(consume())
+    try:
+        async with asyncio.timeout(10):
+            await reached.wait()
+        assert not denied, f"successful tools replayed: {denied}"
+        async with asyncio.timeout(10):
+            await step_started.wait()
+        assert len(requests) == 1
+        text = "\n".join(str(message.content) for message in requests[0].messages)
+        assert "CAPABILITY_ARGUMENT_CORRECTION" in text and "workspace_read_path_required" in text
+        assert sum(call.tool_name == "workspace.list" for call in harness.calls) == 1
+        assert sum(call.tool_name == "workspace.read" for call in harness.calls) == 2
+        retained = await restored.save_checkpoint()
+        models, retained_models = checkpoint.state["models"], retained.state["models"]
+        assert isinstance(models, Mapping) and isinstance(retained_models, Mapping)
+        assert all(retained_models[key] == value for key, value in models.items())
+        tools = cast(Mapping[str, Mapping[str, JsonValue]], checkpoint.state["tools"])
+        retained_tools = cast(Mapping[str, Mapping[str, JsonValue]], retained.state["tools"])
+        assert all(retained_tools[key] == row for key, row in tools.items() if row["status"] == "succeeded")
+        assert retained.state["completed"] == checkpoint.state["completed"]
+        assert retained.state["usage"] == checkpoint.state["usage"]
+        assert retained.state["repair_reopened_contract_ids"] == ()
+        assert [event.step_id for event in events if event.kind is EventKind.STEP_STARTED] == ["implementer_step"]
+        assert checkpoint.to_payload() == before
+    finally:
+        await restored.cancel()
+        await asyncio.gather(consumer, return_exceptions=True)
 
 
 @pytest.mark.asyncio
