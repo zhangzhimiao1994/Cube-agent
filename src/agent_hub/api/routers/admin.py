@@ -1965,6 +1965,15 @@ class CapabilityManifestItemResponse(BaseModel):
         exclude_if=lambda value: not value,
     )
     input_schema: dict[str, JsonValue] | None = None
+    description: str | None = Field(
+        default=None, min_length=1, exclude_if=lambda value: value is None,
+    )
+    input_contract_version: int | None = Field(
+        default=None, ge=1, le=1, strict=True, exclude_if=lambda value: value is None,
+    )
+    input_contract_added_fields: list[Literal["input_schema", "description"]] = Field(
+        default_factory=list, max_length=2, exclude_if=lambda value: not value,
+    )
     output_schema: dict[str, JsonValue] | None = None
     package_dependency_lock: CapabilityManifestPackageDependencyLockResponse | None = Field(
         default=None,
