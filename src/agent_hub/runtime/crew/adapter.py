@@ -3169,6 +3169,10 @@ class CrewStepGeneration(Protocol):
     ) -> str: ...
 
 
+class _CrewMessagesCaptured(Exception):
+    """Stop a framework-only prompt reconstruction before any gateway call."""
+
+
 class _CrewAIGeneration:
     """Private real CrewAI generation; no framework object crosses this class."""
 
@@ -5500,6 +5504,90 @@ class CrewDispatchRuntime:
         call_cursor = _ModelCallCursor()
         runtime = self
         step_timeout = asyncio.timeout(self._remaining_timeout(run_state, step_deadline))
+        repair_replay_prompts: tuple[str, ...] = ()
+        repair_scope = context.routing_decision.get("self_repair_context")
+        repair_sequence = context.routing_decision.get("self_repair_source_event_sequence")
+        repair_baseline = context.routing_decision.get("self_repair_recovery_baseline_sequence")
+        repair_attempt = context.routing_decision.get("self_repair_attempt")
+        repair_max_attempts = context.routing_decision.get("self_repair_max_attempts")
+        if (
+            _is_incremental_workspace_contract_step(step)
+            and context.routing_decision.get("source") == "self_repair"
+            and context.routing_decision.get("self_repair_accepted") is True
+            and context.routing_decision.get("self_repair_source_run_id") == str(context.run_id)
+            and isinstance(repair_scope, Mapping)
+            and repair_scope.get("source") == "self_repair"
+            and repair_scope.get("source_run_id") == str(context.run_id)
+            and type(repair_sequence) is int and 0 < repair_sequence <= 2**63 - 1
+            and repair_scope.get("source_event_sequence") == repair_sequence
+            and type(repair_baseline) is int and repair_sequence <= repair_baseline <= 2**63 - 1
+            and type(repair_attempt) is int and type(repair_max_attempts) is int
+            and 1 <= repair_attempt <= repair_max_attempts <= 3
+            and repair_scope.get("attempt") == repair_attempt
+            and repair_scope.get("max_attempts") == repair_max_attempts
+        ):
+            original_user = dict(user)
+            original_user.pop("self_repair_context", None)
+            original_user.pop("orchestration_repair", None)
+            replay_users = [original_user]
+            history = context.routing_decision.get("self_repair_context_history", ())
+            if not isinstance(history, (list, tuple)) or len(history) > 2:
+                _fail("self repair context history is invalid")
+            previous_attempt = previous_sequence = 0
+            for entry in history:
+                if not isinstance(entry, Mapping):
+                    _fail("self repair context history is invalid")
+                entry_attempt, entry_sequence = entry.get("attempt"), entry.get("source_event_sequence")
+                entry_max_attempts = entry.get("max_attempts")
+                if (
+                    entry.get("schema_version") != 1 or entry.get("source") != "self_repair"
+                    or entry.get("source_run_id") != str(context.run_id)
+                    or type(entry_attempt) is not int or type(entry_sequence) is not int
+                    or type(entry_max_attempts) is not int
+                    or not previous_attempt < entry_attempt < repair_attempt
+                    or not previous_sequence < entry_sequence < repair_sequence
+                    or not entry_attempt <= entry_max_attempts <= 3
+                    or not isinstance(entry.get("instruction"), str)
+                ):
+                    _fail("self repair context history is invalid")
+                previous_attempt, previous_sequence = entry_attempt, entry_sequence
+                historical_decision = {**context.routing_decision, "self_repair_context": entry}
+                historical_user = dict(original_user)
+                historical_user["self_repair_context"] = self_repair_context_text(historical_decision)
+                historical_plan = self_repair_recovery_plan_payload(historical_decision)
+                if historical_plan is not None:
+                    historical_user["orchestration_repair"] = historical_plan
+                replay_users.append(historical_user)
+            repair_replay_prompts = tuple(json.dumps(
+                value, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+            ) for value in replay_users)
+
+        async def repair_replay_messages() -> tuple[object, ...]:
+            # Re-render the original structured task through the same framework;
+            # never strip substrings from historical or untrusted model messages.
+            captured: object = None
+
+            class CaptureBridge:
+                async def complete(self, messages: object) -> str:
+                    nonlocal captured
+                    captured = messages
+                    raise _CrewMessagesCaptured
+
+            assert generation is not None
+            results: list[object] = []
+            for prompt in repair_replay_prompts:
+                captured = None
+                try:
+                    await generation.execute(
+                        step.id, prompt, CaptureBridge(), agent_id=agent.id,
+                        storage_scope=(context.tenant_id, context.run_id),
+                    )
+                except _CrewMessagesCaptured:
+                    pass
+                if captured is None:
+                    _fail("CrewAI bypassed the request reconstruction bridge")
+                results.append(captured)
+            return tuple(results)
 
         def advance_step_deadline(deadline: float) -> None:
             nonlocal step_deadline
@@ -5539,6 +5627,7 @@ class CrewDispatchRuntime:
                     use_repair_tool_keys=use_repair_tool_keys,
                     on_step_progress=advance_step_deadline,
                     incomplete_recovery_model=incomplete_recovery_model,
+                    repair_replay_messages=repair_replay_messages if repair_replay_prompts else None,
                 )
                 text = last_completion.response.text
                 if text is None:
@@ -6730,6 +6819,7 @@ class CrewDispatchRuntime:
         use_repair_tool_keys: bool = False,
         on_step_progress: Callable[[float], None] | None = None,
         incomplete_recovery_model: str | None = None,
+        repair_replay_messages: Callable[[], Coroutine[Any, Any, tuple[object, ...]]] | None = None,
     ) -> GatewayCompletion:
         max_output_tokens = min(agent.max_output_tokens, step.token_budget)
         reserved_max_output_tokens: int | None = None
@@ -6780,6 +6870,9 @@ class CrewDispatchRuntime:
         messages = list(
             self._guidance_messages(context, crew_messages, limits=content_limits)
         )
+        initial_message_count = len(messages)
+        initial_content_limits = content_limits
+        replay_prefixes: tuple[tuple[ModelMessage, ...], ...] | None = None
         tool_metadata_by_name = _capability_manifest_tool_metadata_map(
             self._capabilities,
             tenant_id=context.tenant_id,
@@ -6960,6 +7053,57 @@ class CrewDispatchRuntime:
             )
             chain_link: Mapping[str, JsonValue] | None = None
             while True:
+                if repair_replay_messages is not None:
+                    # A new call always receives current approved guidance. Only
+                    # a full original request SHA can select the pre-repair view.
+                    request = replace(request, messages=self._response_contract_messages(
+                        request_messages, response_schema, limits=content_limits,
+                    ))
+                    cached_key = self._model_call_key(
+                        context.run_id, step.id, model_attempt_index, "step", agent.id, call_cursor.value,
+                    )
+                    cached_model = model_ledger.states.get(cached_key)
+                    private_rejection = model_ledger.rejected_outputs.get(cached_key, {})
+                    if (
+                        cached_model is not None
+                        and (cached_model["status"] in {"succeeded", "running", "received_cancelled"}
+                             or (cached_model["status"] == "rejected"
+                                 and cached_model["failure_reason"] == "model initial-chain incomplete"
+                                 and private_rejection.get("disposition") == "rejected"
+                                 and private_rejection.get("usage_status") == "known"
+                                 and private_rejection.get("output_status") == "incomplete"
+                                 and private_rejection.get("reason") == "incomplete"))
+                        and cached_model["request_sha256"] != self._model_request_sha256(request)
+                    ):
+                        # A prepared request has not been sent: never dispatch an
+                        # old-guidance candidate under a new repair approval.
+                        if replay_prefixes is None:
+                            replay_prefixes = tuple(self._guidance_messages(
+                                context, value, limits=initial_content_limits,
+                            ) for value in await repair_replay_messages())
+                        for replay_prefix in replay_prefixes:
+                            candidate = replace(request, messages=self._response_contract_messages(
+                                (*replay_prefix, *request_messages[initial_message_count:]),
+                                response_schema, limits=content_limits,
+                            ))
+                            if self._model_request_sha256(candidate) == cached_model["request_sha256"]:
+                                if (cached_model["status"] == "rejected"
+                                        and run_state.initial_incomplete_chain_growth
+                                        and candidate.response_schema is not None):
+                                    # Mirror the executor's requalification: the old
+                                    # view may only raise back to the outer chain,
+                                    # never derive an internal paid correction.
+                                    earlier_tools = self._initial_chain_prior_tools(
+                                        step, call_cursor.value, model_ledger.states, tool_ledger,
+                                    )
+                                    if not self._initial_chain_eligible(
+                                        step, agent.id, model_attempt_index, call_cursor.value,
+                                        self._rejected_from_private(private_rejection), round_reservation,
+                                        model_ledger.states, earlier_tools,
+                                    ):
+                                        continue
+                                request = candidate
+                                break
                 try:
                     completion, model_artifact = await self._execute_model_request(
                         context, step, agent.id, request, purpose="step", attempt=model_attempt_index,

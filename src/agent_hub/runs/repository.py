@@ -204,6 +204,54 @@ def _self_repair_acceptance_already_applied(
     )
 
 
+def _retained_self_repair_contexts(
+    decision: dict[str, object], *, run_id: UUID, next_attempt: int, next_sequence: object,
+) -> list[dict[str, object]]:
+    if decision.get("source") != "self_repair" or decision.get("self_repair_accepted") is not True:
+        return []
+    previous = decision.get("self_repair_context")
+    if previous is None:
+        return []
+    history = decision.get("self_repair_context_history", [])
+    invalid = "self repair context history is invalid"
+    previous_attempt = decision.get("self_repair_attempt")
+    if (type(previous_attempt) is not int or not 1 <= previous_attempt < next_attempt <= 3
+            or next_attempt != previous_attempt + 1 or type(next_sequence) is not int
+            or not 0 < next_sequence <= 2**63 - 1 or not isinstance(history, list)
+            or len(history) != previous_attempt - 1):
+        raise RunConflict(invalid)
+    retained: list[dict[str, object]] = []
+    last_sequence = 0
+    for expected_attempt, context in enumerate([*history, previous], start=1):
+        if not isinstance(context, dict):
+            raise RunConflict(invalid)
+        sequence, attempt, maximum = (context.get(key) for key in
+                                      ("source_event_sequence", "attempt", "max_attempts"))
+        if (context.get("source") != "self_repair" or context.get("source_run_id") != str(run_id)
+                or type(sequence) is not int or not last_sequence < sequence < next_sequence
+                or type(attempt) is not int or attempt != expected_attempt
+                or type(maximum) is not int or not attempt <= maximum <= 3):
+            raise RunConflict(invalid)
+        bounded = repair_context_from_proposal(context)
+        try:
+            canonical = json.dumps(bounded, sort_keys=True, allow_nan=False)
+            unchanged = canonical == json.dumps(context, sort_keys=True, allow_nan=False)
+        except (TypeError, ValueError, RecursionError):
+            unchanged = False
+        if not unchanged:
+            raise RunConflict(invalid)
+        retained.append(bounded)
+        last_sequence = sequence
+    if (not isinstance(previous, dict)
+            or decision.get("self_repair_source_run_id") != str(run_id)
+            or type(decision.get("self_repair_source_event_sequence")) is not int
+            or decision.get("self_repair_source_event_sequence") != last_sequence
+            or type(decision.get("self_repair_max_attempts")) is not int
+            or decision.get("self_repair_max_attempts") != previous.get("max_attempts")):
+        raise RunConflict(invalid)
+    return retained
+
+
 def _mode_choice_already_applied(
     routing_decision: dict[str, object],
     *,
@@ -811,6 +859,10 @@ class RunRepository:
             max_attempts = proposal.get("max_attempts", 1)
             if type(attempt) is not int or type(max_attempts) is not int or attempt > max_attempts:
                 raise RunConflict("self repair proposal exceeds retry budget")
+            retained_contexts = _retained_self_repair_contexts(
+                routing_decision, run_id=run_id, next_attempt=attempt,
+                next_sequence=proposal.get("source_event_sequence"),
+            )
             recovery_baseline_sequence = await self.next_event_sequence(session, row.id) - 1
             next_decision = {
                 key: value
@@ -833,6 +885,10 @@ class RunRepository:
                     "self_repair_context": repair_context_from_proposal(proposal),
                 }
             )
+            if retained_contexts:
+                next_decision["self_repair_context_history"] = retained_contexts
+            else:
+                next_decision.pop("self_repair_context_history", None)
             row.routing_decision = next_decision
             row.status = RunStatus.QUEUED.value
             row.version += 1
