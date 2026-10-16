@@ -67,6 +67,7 @@ from agent_hub.runtime.failure_reason import (
     safe_runtime_failure_reason,
 )
 from agent_hub.runtime.instruction_context import InstructionContextLoader
+from agent_hub.runtime.progress import artifact_progress_key
 from agent_hub.runtime.registry import RuntimeRegistry
 from agent_hub.runtime.streams import closing_runtime_events
 
@@ -1819,6 +1820,8 @@ class RunService:
                     configured_tokens=self._runtime_token_budget,
                     mode=mode,
                 )
+                if checkpoint is None:
+                    routing_decision["runtime_progress_policy"] = "semantic_workspace_v1"
                 row.routing_decision = routing_decision
         if claimed_record is not None:
             if claimed_record.status is RunStatus.FAILED:
@@ -1896,18 +1899,31 @@ class RunService:
                 mode=mode,
             )
             non_progress_artifact_ids: frozenset[str] = frozenset()
+            checkpoint_progress_keys: dict[str, str | None] = {}
+            meaningful_progress = (
+                runtime_routing_decision.get("runtime_progress_policy") == "semantic_workspace_v1"
+                or checkpoint is None
+                or checkpoint.state.get("workspace_meaningful_progress") is True
+            )
             if checkpoint is not None and isinstance(
                 checkpoint_registry := checkpoint.state.get("artifact_registry"), Mapping
             ):
-                # Registry hashes carry no type; match persisted receipt artifacts on recovery.
-                non_progress_artifact_ids = frozenset(
-                    str(event.artifact.id)
+                # Only the checkpoint's exact historical prefix may seed observation credit.
+                checkpoint_progress_keys = {
+                    str(event.artifact.id): _runtime_artifact_progress_key(
+                        event.artifact, meaningful_progress=meaningful_progress,
+                    )
                     for event in await self._repository.raw_events(tenant_id, run_id)
-                    if event.artifact is not None and event.artifact.type == "model_attempt"
+                    if event.artifact is not None
                     and checkpoint_registry.get(str(event.artifact.id)) == event.artifact.content_sha256
+                }
+                non_progress_artifact_ids = frozenset(
+                    artifact_id for artifact_id, key in checkpoint_progress_keys.items()
+                    if key is None
                 )
             checkpoint_progress_units = _checkpoint_progress_units(
                 checkpoint, non_progress_artifact_ids=non_progress_artifact_ids,
+                artifact_progress_keys=checkpoint_progress_keys,
             )
             token_budget = _runtime_token_budget(
                 mode,
@@ -2033,6 +2049,8 @@ class RunService:
                     routing_decision=runtime_routing_decision,
                     initial_progress_units=checkpoint_progress_units,
                     non_progress_artifact_ids=non_progress_artifact_ids,
+                    initial_artifact_progress_keys=checkpoint_progress_keys,
+                    meaningful_progress=meaningful_progress,
                 )
                 async with asyncio.timeout(None) as approval_timeout, aclosing(runtime_events):
                     approval_drain.timeout = approval_timeout
@@ -5026,8 +5044,15 @@ def _routing_runtime_timeout_seconds(
     return min(absolute_timeout, initial_timeout + soft_timeout * progress_share)
 
 
+def _runtime_artifact_progress_key(artifact: Artifact, *, meaningful_progress: bool) -> str | None:
+    if meaningful_progress:
+        return artifact_progress_key(artifact)
+    return None if artifact.type == "model_attempt" else "artifact:" + str(artifact.id)
+
+
 def _checkpoint_progress_units(
     checkpoint: RuntimeCheckpoint | None, *, non_progress_artifact_ids: frozenset[str] = frozenset(),
+    artifact_progress_keys: Mapping[str, str | None] | None = None,
 ) -> int:
     if checkpoint is None:
         return 0
@@ -5048,8 +5073,13 @@ def _checkpoint_progress_units(
         else set()
     )
     artifact_units = (
-        sum(1 for artifact_id in registry
-            if artifact_id not in input_ids and artifact_id not in non_progress_artifact_ids)
+        len({
+            key for artifact_id in registry
+            if artifact_id not in input_ids and artifact_id not in non_progress_artifact_ids
+            and (key := (artifact_progress_keys or {}).get(
+                artifact_id, "artifact:" + str(artifact_id),
+            )) is not None
+        })
         if isinstance(registry, Mapping)
         else 0
     )
@@ -5162,33 +5192,52 @@ async def _adaptive_runtime_events(
     routing_decision: Mapping[str, object],
     initial_progress_units: int,
     non_progress_artifact_ids: frozenset[str] = frozenset(),
+    initial_artifact_progress_keys: Mapping[str, str | None] | None = None,
+    meaningful_progress: bool = True,
 ) -> AsyncGenerator[RunEvent, None]:
     progress_units = max(0, initial_progress_units)
     seen_tool_calls: set[str] = set()
-    seen_artifacts: set[UUID] = set()
+    artifact_keys = dict(initial_artifact_progress_keys or {})
+    seen_artifacts: set[str] = set(artifact_keys)
+    seen_progress_keys = {key for key in artifact_keys.values() if key is not None}
     metadata_artifact_ids = set(non_progress_artifact_ids)
     async with closing_runtime_events(runtime.run(context)) as stream:
         async for event in stream:
-            if event.artifact is not None and event.artifact.type == "model_attempt":
-                metadata_artifact_ids.add(str(event.artifact.id))
+            new_artifact_key = None
+            if event.artifact is not None:
+                artifact_id = str(event.artifact.id)
+                key = _runtime_artifact_progress_key(
+                    event.artifact, meaningful_progress=meaningful_progress,
+                )
+                artifact_keys[artifact_id] = key
+                if key is None:
+                    metadata_artifact_ids.add(artifact_id)
+                if artifact_id not in seen_artifacts:
+                    seen_artifacts.add(artifact_id)
+                    if key is not None and key not in seen_progress_keys:
+                        seen_progress_keys.add(key)
+                        new_artifact_key = key
             if event.kind is EventKind.TOOL_COMPLETED and event.tool_call_id is not None:
                 if event.tool_call_id not in seen_tool_calls:
                     seen_tool_calls.add(event.tool_call_id)
-                    progress_units += 1
-                if event.artifact is not None:
-                    seen_artifacts.add(event.artifact.id)
+                    unproven_observation = meaningful_progress and event.tool_name in {
+                        "workspace.read", "workspace_read", "workspace.list", "read_context",
+                    }
+                    if new_artifact_key is not None or (
+                        event.artifact is None and not unproven_observation
+                    ):
+                        progress_units += 1
             elif (
                 event.kind is EventKind.ARTIFACT_CREATED and event.artifact is not None
-                and event.artifact.type != "model_attempt"
+                and new_artifact_key is not None
             ):
-                if event.artifact.id not in seen_artifacts:
-                    seen_artifacts.add(event.artifact.id)
-                    progress_units += 1
+                progress_units += 1
             elif event.kind is EventKind.CHECKPOINT_SAVED and event.checkpoint is not None:
                 progress_units = max(
                     progress_units,
                     _checkpoint_progress_units(
                         event.checkpoint, non_progress_artifact_ids=frozenset(metadata_artifact_ids),
+                        artifact_progress_keys=artifact_keys,
                     ),
                 )
             extended_budget = _runtime_token_budget(

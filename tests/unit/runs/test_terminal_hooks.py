@@ -1248,6 +1248,7 @@ async def test_execute_notifies_terminal_hooks_after_completed_run() -> None:
                 "runtime_token_soft_base_tokens": 1_000_000,
                 "runtime_token_absolute_tokens": 10_000_000,
                 "runtime_plan_token_budget": 10_000_000,
+                "runtime_progress_policy": "semantic_workspace_v1",
             },
         }
     ]
@@ -2958,6 +2959,7 @@ async def test_execute_backfills_terminal_hooks_once_for_terminal_run_after_cras
                 "runtime_token_soft_base_tokens": 1_000_000,
                 "runtime_token_absolute_tokens": 10_000_000,
                 "runtime_plan_token_budget": 10_000_000,
+                "runtime_progress_policy": "semantic_workspace_v1",
             },
         }
     ]

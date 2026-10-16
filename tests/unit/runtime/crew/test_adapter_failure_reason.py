@@ -4118,8 +4118,9 @@ async def test_workspace_delivery_new_file_progress_allows_another_delivery_corr
     assert checkpoint.state["usage"] == {"tokens": 12, "cost_usd": "0"}
 
 
+@pytest.mark.parametrize("meaningful", (False, True))
 async def test_workspace_delivery_same_content_rewrite_does_not_renew_delivery_correction(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, meaningful: bool,
 ) -> None:
     original_lookup = crew_adapter._succeeded_semantic_tool_result
 
@@ -4148,11 +4149,16 @@ async def test_workspace_delivery_same_content_rewrite_does_not_renew_delivery_c
     runtime = _workspace_delivery_sequence_runtime(gateway, harness)
     events: list[RunEvent] = []
 
-    with pytest.raises(RuntimeExecutionError, match="project workspace bundle is missing"):
-        async for event in runtime.run(_workspace_delivery_sequence_context()):
+    stream = runtime.run(_workspace_delivery_sequence_context())
+    assert isinstance(stream, CrewRunStream)
+    stream._state.workspace_meaningful_progress = meaningful
+    reason = ("workspace delivery stalled" if meaningful
+              else "project workspace bundle is missing")
+    with pytest.raises(RuntimeExecutionError, match=reason):
+        async for event in stream:
             events.append(event)
 
-    assert len(gateway.requests) == 4
+    assert len(gateway.requests) == (3 if meaningful else 4)
     assert [call.tool_name for call in harness.calls] == [
         "workspace.write_text", "workspace.write_text",
     ]
@@ -4173,7 +4179,7 @@ async def test_workspace_delivery_same_content_rewrite_does_not_renew_delivery_c
     assert not any(event.kind is EventKind.RUNTIME_COMPLETED for event in events)
     assert _workspace_delivery_final_attachments(events) == []
     checkpoint = await runtime.save_checkpoint()
-    assert checkpoint.state["usage"] == {"tokens": 8, "cost_usd": "0"}
+    assert checkpoint.state["usage"] == {"tokens": 6 if meaningful else 8, "cost_usd": "0"}
     tools = checkpoint.state["tools"]
     assert isinstance(tools, Mapping) and len(tools) == 2
     assert all(isinstance(state, Mapping) and state["status"] == "succeeded"

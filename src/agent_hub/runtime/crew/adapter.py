@@ -112,6 +112,7 @@ from agent_hub.runtime.generated_file_recovery import (
 )
 from agent_hub.runtime.hermes_context import runtime_memory_context_text
 from agent_hub.runtime.instruction_context import model_request_sha256
+from agent_hub.runtime.progress import artifact_progress_key, count_artifact_progress
 from agent_hub.runtime.project_scale_artifact import (
     PROJECT_SCALE_ARTIFACT_TOOL_NAME,
     augment_project_scale_artifact_result,
@@ -3480,6 +3481,21 @@ def _workspace_assistant_tool_history(
     return ModelMessage(role="assistant", content=prefix + encoded)
 
 
+def _workspace_progress_units(
+    completed: Sequence[str],
+    input_ids: set[str],
+    tools: Mapping[str, Mapping[str, JsonValue]],
+    artifacts: Mapping[str, Artifact],
+) -> int:
+    excluded = input_ids | {
+        str(state["artifact_id"]) for state in tools.values()
+        if state.get("status") != "succeeded" and state.get("artifact_id") is not None
+    }
+    return len(completed) + count_artifact_progress(
+        artifact for key, artifact in artifacts.items() if key not in excluded
+    )
+
+
 @dataclass(slots=True)
 class _ModelLedger:
     states: dict[str, Mapping[str, JsonValue]] = field(default_factory=dict)
@@ -3671,6 +3687,7 @@ class _RunToken:
 class _RunState:
     token: _RunToken
     workspace_delivery_continuation: bool = True
+    workspace_meaningful_progress: bool = True
     incomplete_recovery_output_growth: bool = True
     first_tool_incomplete_recovery_output_growth: bool = True
     incomplete_continuation_output_growth: bool = True
@@ -3965,6 +3982,9 @@ class CrewDispatchRuntime:
                 self._validate_checkpoint(restored, context, plan)
                 state.workspace_delivery_continuation = cast(
                     bool, restored.state.get("workspace_delivery_continuation", False),
+                )
+                state.workspace_meaningful_progress = cast(
+                    bool, restored.state.get("workspace_meaningful_progress", False),
                 )
                 state.incomplete_recovery_output_growth = cast(
                     bool, restored.state.get("incomplete_recovery_output_growth", False),
@@ -6755,6 +6775,15 @@ class CrewDispatchRuntime:
             run_state.workspace_delivery_continuation
             and _is_incremental_workspace_contract_step(step)
         )
+        meaningful_progress = workspace_continuation and run_state.workspace_meaningful_progress
+        progress_keys = {
+            prior_progress_key for tool_key, state in tool_ledger.states.items()
+            if meaningful_progress and state.get("step_id") == step.id
+            and type(state.get("attempt")) is int and cast(int, state["attempt"]) < model_attempt
+            and state.get("status") == "succeeded" and tool_key in tool_ledger.artifacts
+            if (prior_progress_key := artifact_progress_key(tool_ledger.artifacts[tool_key])) is not None
+        }
+        stall_corrected = False
         delivery_correction_progress: set[str] = set()
         workspace_metadata_budget = max(
             512, min(8_192, content_limits.interaction_prompt_bytes // 8),
@@ -6958,6 +6987,8 @@ class CrewDispatchRuntime:
                     )
                     for state in tool_ledger.states.values()
                 ):
+                    if meaningful_progress and stall_corrected:
+                        _fail("workspace delivery stalled after unchanged observations")
                     delivery_progress = hashlib.sha256(json.dumps(
                         _workspace_delivery_file_metadata(
                             tool_ledger, step_id=step.id, attempt=model_attempt,
@@ -6972,6 +7003,8 @@ class CrewDispatchRuntime:
                         and _round < active_round_limit
                     ):
                         delivery_correction_progress.add(delivery_progress)
+                        if meaningful_progress:
+                            stall_corrected = True
                         messages.append(ModelMessage(
                             role="system",
                             content=(
@@ -7056,11 +7089,18 @@ class CrewDispatchRuntime:
             argument_correction_requested = False
             opaque_read_rejection_requested = False
 
-            def record_round_progress() -> None:
+            def record_round_progress(artifact: Artifact, *, replayed: bool = False) -> None:
                 nonlocal round_progressed, step_deadline
+                if meaningful_progress:
+                    progress_key = artifact_progress_key(artifact)
+                    if progress_key is None or progress_key in progress_keys:
+                        return
+                    progress_keys.add(progress_key)
                 if round_progressed:
                     return
                 round_progressed = True
+                if meaningful_progress and replayed:
+                    return
                 if run_state.deadline is not None:
                     step_deadline = _tool_progress_step_deadline(
                         context,
@@ -7162,7 +7202,7 @@ class CrewDispatchRuntime:
                     evidence.append(semantic_artifact)
                     if semantic_artifact.source_ids == (str(trigger_model_artifact.id),):
                         # Hydration must rebuild the original continuation, including its tools.
-                        record_round_progress()
+                        record_round_progress(semantic_artifact, replayed=True)
                     else:
                         reused_semantic_results += 1
                     continue
@@ -7265,7 +7305,7 @@ class CrewDispatchRuntime:
                         and artifact.source_ids == (str(trigger_model_artifact.id),)
                     ):
                         # Exact replay must preserve the original continuation's tool mode.
-                        record_round_progress()
+                        record_round_progress(artifact, replayed=True)
                     else:
                         reused_semantic_results += 1
                     continue
@@ -7488,7 +7528,7 @@ class CrewDispatchRuntime:
                         await tool_boundary(idempotency_key, succeeded, artifact)
                         evidence.append(artifact)
                         results.append({"name": tool_call.name, "result": result})
-                        record_round_progress()
+                        record_round_progress(artifact)
                         continue
                     rejection = _correctable_tool_argument_rejection(
                         tool_call,
@@ -7854,7 +7894,7 @@ class CrewDispatchRuntime:
                 await tool_boundary(idempotency_key, succeeded, artifact)
                 evidence.append(artifact)
                 results.append({"name": tool_call.name, "result": result})
-                record_round_progress()
+                record_round_progress(artifact)
             reused_result_count = reused_generated_file_results + reused_semantic_results
             if workspace_continuation:
                 messages.append(_workspace_assistant_tool_history(
@@ -7895,6 +7935,22 @@ class CrewDispatchRuntime:
                     ),
                 ))
                 continue
+            if meaningful_progress:
+                if round_progressed:
+                    stall_corrected = False
+                elif stall_corrected:
+                    _fail("workspace delivery stalled after unchanged observations")
+                else:
+                    stall_corrected = True
+                    messages.append(ModelMessage(role="system", content=(
+                        "WORKSPACE_OBSERVATION_STALL: Repeated observations supplied no new "
+                        "workspace information or delivery changes. Do not reread unchanged "
+                        "files or repeat an unchanged listing. Make a concrete authorized "
+                        "correction, inspect a genuinely new dependency if necessary, or "
+                        "finish the missing delivery files and workspace.bundle. Do not "
+                        "fabricate completion. One further unchanged round will stop this "
+                        "step; permissions, approvals and execution budgets are unchanged."
+                    )))
             if reused_generated_file_results == len(response.tool_calls):
                 return _generated_file_ready_completion(completion, response)
             force_result_synthesis = reused_result_count == len(response.tool_calls)
@@ -8940,6 +8996,14 @@ class CrewDispatchRuntime:
         progress_units = len(completed) + sum(
             artifact_id not in input_ids for artifact_id in checkpoint_artifacts
         )
+        meaningful_progress = (
+            run_state.workspace_meaningful_progress and run_state.workspace_delivery_continuation
+            and any(_is_incremental_workspace_contract_step(step) for step in plan.steps)
+        )
+        if meaningful_progress:
+            progress_units = _workspace_progress_units(
+                tuple(completed), input_ids, tool_ledger.states, checkpoint_artifacts,
+            )
         adaptive_deadline = run_state.adaptive_deadline
         if adaptive_deadline is not None:
             loop_time = asyncio.get_running_loop().time()
@@ -8970,6 +9034,8 @@ class CrewDispatchRuntime:
             state={
                 "plan_digest": plan.digest,
                 "workspace_delivery_continuation": run_state.workspace_delivery_continuation,
+                **({"workspace_meaningful_progress": meaningful_progress}
+                   if any(_is_incremental_workspace_contract_step(step) for step in plan.steps) else {}),
                 "incomplete_recovery_output_growth": run_state.incomplete_recovery_output_growth,
                 "initial_incomplete_chain_growth": run_state.initial_incomplete_chain_growth,
                 **({"first_tool_incomplete_recovery_output_growth":
@@ -9074,6 +9140,7 @@ class CrewDispatchRuntime:
         }
         optional_state_keys = {
             "repair_reopened_contract_ids", "workspace_delivery_continuation",
+            "workspace_meaningful_progress",
             "incomplete_recovery_output_growth",
             "first_tool_incomplete_recovery_output_growth",
             "incomplete_continuation_output_growth",
@@ -9105,6 +9172,10 @@ class CrewDispatchRuntime:
         timeout_progress_units = state.get("timeout_progress_units")
         if (
             type(state.get("workspace_delivery_continuation", False)) is not bool
+            or type(state.get("workspace_meaningful_progress", False)) is not bool
+            or (state.get("workspace_meaningful_progress", False)
+                and (checkpoint.runtime_version != _RUNTIME_VERSION
+                     or not state.get("workspace_delivery_continuation", False)))
             or type(state.get("incomplete_recovery_output_growth", False)) is not bool
             or type(state.get("first_tool_incomplete_recovery_output_growth", False)) is not bool
             or type(state.get("incomplete_continuation_output_growth", False)) is not bool
@@ -10737,6 +10808,14 @@ class CrewDispatchRuntime:
             )),
             checkpoint.runtime_version,
         )
+        if run_state.workspace_meaningful_progress and checkpoint.state.get("workspace_meaningful_progress") is True:
+            derived_progress = _workspace_progress_units(
+                tuple(completed), {reference["id"] for reference in cast(
+                    tuple[Mapping[str, str], ...], checkpoint.state["input_refs"],
+                )}, tool_ledger.states, registry,
+            )
+            if checkpoint.state.get("timeout_progress_units") != derived_progress:
+                _fail("runtime checkpoint workspace progress is invalid")
         if outcome_error is not None and not (
             isinstance(outcome_error, _ModelContractFailed)
             and usage_ledger.terminal_phase is not None

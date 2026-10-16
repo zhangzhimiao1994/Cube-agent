@@ -357,24 +357,45 @@ class HybridRuntime:
                                 raise RuntimeExecutionError(
                                     "hybrid child exceeded token budget"
                                 )
+                            semantic_child = event.checkpoint.state.get(
+                                "workspace_meaningful_progress",
+                            ) is True
+                            child_progress = event.checkpoint.state.get("timeout_progress_units")
+                            previous_progress = (
+                                child_checkpoint.state.get("timeout_progress_units", 0)
+                                if child_checkpoint is not None else 0
+                            )
+                            if semantic_child and (
+                                type(child_progress) is not int or child_progress < 0
+                                or type(previous_progress) is not int
+                                or child_progress < previous_progress
+                            ):
+                                raise RuntimeExecutionError("hybrid child progress is invalid")
+                            fingerprint_state = (
+                                {"stage": stage_index, "workspace_progress_units": child_progress}
+                                if semantic_child else
+                                {"stage": stage_index,
+                                 "state_sha256": event.checkpoint.state_sha256,
+                                 "consumed_tokens": stage_budget.consumed_tokens}
+                            )
                             child_progress_fingerprint = hashlib.sha256(
                                 json.dumps(
-                                    {
-                                        "stage": stage_index,
-                                        "state_sha256": event.checkpoint.state_sha256,
-                                        "consumed_tokens": stage_budget.consumed_tokens,
-                                    },
+                                    fingerprint_state,
                                     sort_keys=True,
                                     separators=(",", ":"),
                                 ).encode("utf-8")
                             ).hexdigest()
                             if child_progress_fingerprint != last_child_progress_fingerprint:
                                 last_child_progress_fingerprint = child_progress_fingerprint
-                                timeout_progress_units += 1
+                                timeout_progress_units += (
+                                    cast(int, child_progress) - cast(int, previous_progress)
+                                    if semantic_child else 1
+                                )
                                 adaptive_deadline.observe(
                                     progress_units=timeout_progress_units,
                                     now=monotonic(),
                                 )
+                            child_checkpoint = event.checkpoint
                             deadline = adaptive_deadline.deadline
                             in_stage_checkpoint = self._checkpoint(
                                 context,
