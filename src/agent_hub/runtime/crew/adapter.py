@@ -3431,6 +3431,28 @@ def _succeeded_semantic_tool_result(
     return None
 
 
+def _causal_semantic_tool_result(
+    ledger: _ToolLedger, *, step_id: str, call: ToolCall, arguments_sha256: str,
+    evidence: Sequence[Artifact], consumed_artifact_ids: set[str], trigger_model_artifact_id: str,
+    workspace_continuation: bool = False, context_refresh: bool = False,
+) -> Artifact | None:
+    if reusable_generated_file_result(call.name, evidence, arguments=call.arguments) is not None or (
+        workspace_continuation and (
+            call.name in {"workspace.read", "workspace.list"}
+            or (context_refresh and call.name == "workspace_read")
+        )
+    ):
+        return None
+    reused = _succeeded_semantic_tool_result(
+        ledger, step_id=step_id, name=call.name, arguments_sha256=arguments_sha256,
+        allowed_artifact_ids=consumed_artifact_ids,
+    )
+    if (workspace_continuation and call.name == "workspace.bundle" and reused is not None
+            and reused.source_ids != (trigger_model_artifact_id,)):
+        return None
+    return reused
+
+
 def _workspace_delivery_file_metadata(
     ledger: _ToolLedger,
     *,
@@ -6194,7 +6216,7 @@ class CrewDispatchRuntime:
         self, step: DispatchStep, actor: str, attempt: int, call_index: int,
         models: Mapping[str, Mapping[str, JsonValue]], model_artifacts: Mapping[str, Artifact],
         tools: Mapping[str, Mapping[str, JsonValue]], tool_artifacts: Mapping[str, Artifact],
-        source_ids: tuple[str, ...], *, closed: bool = False,
+        source_ids: tuple[str, ...], *, closed: bool = False, source_artifacts: Sequence[Artifact] = (),
     ) -> str | None:
         if actor != step.agent or attempt != 0 or call_index < 1 or not step.tools or (
             _is_project_scale_tool_contract_step(step) or _is_incremental_workspace_contract_step(step)
@@ -6225,9 +6247,12 @@ class CrewDispatchRuntime:
             or state["name"] not in step.tools for state in step_tools.values()
         ):
             return None
+        tool_ledger = _ToolLedger(states=step_tools, artifacts=dict(tool_artifacts))
+        by_id = {str(item.id): item for item in (*source_artifacts, *model_artifacts.values(), *tool_artifacts.values())}
         chain: list[JsonValue] = []
         evidence_ids: list[str] = []
         consumed: set[str] = set()
+        consumed_artifact_ids: set[str] = set()
         base_ids: tuple[str, ...] = ()
         for index, (key, state) in enumerate(prior):
             artifact = model_artifacts.get(key)
@@ -6248,20 +6273,37 @@ class CrewDispatchRuntime:
             chain.append({"key": key, "state": dict(state), "sha256": artifact.content_sha256})
             evidence_ids.append(str(artifact.id))
             calls = completion.response.tool_calls
-            round_tools = {cast(int, value["tool_index"]): (tool_key, value)
-                           for tool_key, value in step_tools.items() if value["round"] == index}
-            if len(round_tools) != len(calls):
+            round_entries = [(tool_key, value) for tool_key, value in step_tools.items() if value["round"] == index]
+            round_tools = {cast(int, value["tool_index"]): (tool_key, value) for tool_key, value in round_entries}
+            if len(round_tools) != len(round_entries) or any(
+                type(slot) is not int or slot < 0 or slot >= len(calls) for slot in round_tools
+            ):
                 return None
             for tool_index, call in enumerate(calls):
                 entry = round_tools.get(tool_index)
-                if entry is None or call.name not in step.tools:
+                if call.name not in step.tools:
                     return None
-                tool_key, tool_state = entry
-                result = tool_artifacts.get(tool_key)
                 arguments_sha = hashlib.sha256(json.dumps(
                     _mutable_json(call.arguments), ensure_ascii=False, allow_nan=False,
                     sort_keys=True, separators=(",", ":"),
                 ).encode("utf-8")).hexdigest()
+                if entry is None:
+                    # Only earlier, fully verified receipts may fill a semantic reuse slot.
+                    if call.name == PROJECT_ZIP_TOOL_NAME and any(item not in by_id for item in base_ids):
+                        return None
+                    reused = _causal_semantic_tool_result(
+                        tool_ledger, step_id=step.id, call=call, arguments_sha256=arguments_sha,
+                        evidence=tuple(by_id[item] for item in (*base_ids, *evidence_ids) if item in by_id),
+                        consumed_artifact_ids=consumed_artifact_ids, trigger_model_artifact_id=str(artifact.id),
+                    )
+                    if reused is None:
+                        return None
+                    evidence_ids.append(str(reused.id))
+                    chain.append({"reuse": {"model_artifact_id": str(artifact.id), "tool_index": tool_index,
+                                  "artifact_id": str(reused.id), "sha256": reused.content_sha256}})
+                    continue
+                tool_key, tool_state = entry
+                result = tool_artifacts.get(tool_key)
                 if result is None or (
                     tool_state["name"] != call.name or tool_state["arguments_sha256"] != arguments_sha
                     or tool_state["trigger_model_artifact_id"] != str(artifact.id)
@@ -6269,9 +6311,11 @@ class CrewDispatchRuntime:
                     or tool_state["sha256"] != result.content_sha256
                     or result.recompute_content_sha256() != result.content_sha256
                     or result.source_ids != (str(artifact.id),) or result.producer != actor
+                    or str(result.id) in consumed_artifact_ids
                 ):
                     return None
                 consumed.add(tool_key)
+                consumed_artifact_ids.add(str(result.id))
                 evidence_ids.append(str(result.id))
                 chain.append({"key": tool_key, "state": dict(tool_state), "sha256": result.content_sha256})
         if consumed != set(step_tools) or source_ids != _lineage_window_ids(
@@ -6580,6 +6624,7 @@ class CrewDispatchRuntime:
                 and self._post_tool_history_sha256(
                     step, actor, attempt, index, ledger.states, ledger.artifacts,
                     tool_ledger.states, tool_ledger.artifacts, tuple(str(source.id) for source in sources),
+                    source_artifacts=sources,
                 ) is not None
             )
             rejected_state = dict(running)
@@ -6733,6 +6778,7 @@ class CrewDispatchRuntime:
             step, actor, attempt, index, ledger.states, ledger.artifacts,
             tool_ledger.states, tool_ledger.artifacts, tuple(str(source.id) for source in sources),
             closed=previous is not None and previous["source_key"] == key and previous["status"] == "succeeded",
+            source_artifacts=sources,
         )
         if (
             evidence is None or evidence.status != "incomplete" or evidence.reason != "incomplete"
@@ -10579,6 +10625,7 @@ class CrewDispatchRuntime:
                 tool_ledger.states, tool_ledger.artifacts, cast(tuple[str, ...], private["source_ids"]),
                 closed=reservation is not None and reservation["source_key"] == key
                 and reservation["status"] == "succeeded",
+                source_artifacts=artifacts,
             )
             if history_sha is None or (reservation is not None and (
                 reservation.get("mode") != "post_tool_finalization"
@@ -10853,30 +10900,12 @@ class CrewDispatchRuntime:
                         arguments_sha256 = hashlib.sha256(canonical_arguments.encode("utf-8")).hexdigest()
                         entry = round_tools.get(tool_index)
                         if entry is None:
-                            generated_file_result = reusable_generated_file_result(
-                                tool_call.name,
-                                tuple(by_id[artifact_id] for artifact_id in (*input_ids, *evidence_ids)),
-                                arguments=tool_call.arguments,
+                            reused = _causal_semantic_tool_result(
+                                tool_ledger, step_id=step.id, call=tool_call, arguments_sha256=arguments_sha256,
+                                evidence=tuple(by_id[artifact_id] for artifact_id in (*input_ids, *evidence_ids)),
+                                consumed_artifact_ids=consumed_tools, trigger_model_artifact_id=str(model_artifact.id),
+                                workspace_continuation=workspace_continuation, context_refresh=context_refresh,
                             )
-                            reused = (
-                                None
-                                if generated_file_result is not None or (
-                                    workspace_continuation and (
-                                        tool_call.name in {"workspace.read", "workspace.list"}
-                                        or (context_refresh and tool_call.name == "workspace_read")
-                                    )
-                                )
-                                else _succeeded_semantic_tool_result(
-                                    tool_ledger,
-                                    step_id=step.id,
-                                    name=tool_call.name,
-                                    arguments_sha256=arguments_sha256,
-                                    allowed_artifact_ids=consumed_tools,
-                                )
-                            )
-                            if (workspace_continuation and tool_call.name == "workspace.bundle"
-                                    and reused is not None and reused.source_ids != (str(model_artifact.id),)):
-                                reused = None
                             if reused is None:
                                 if tool_index < last_persisted_tool_index:
                                     _fail("runtime checkpoint capability artifact lineage is invalid")
