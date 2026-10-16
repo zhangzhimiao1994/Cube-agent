@@ -1367,6 +1367,14 @@ class RunService:
         )
         return _submitted(record)
 
+    async def retry_recovery(
+        self, *, tenant_id: UUID, actor_id: UUID, run_id: UUID, version: int,
+    ) -> SubmittedRun:
+        record = await self._repository.retry_self_repair_recovery_and_enqueue(
+            tenant_id=tenant_id, actor_id=actor_id, run_id=run_id, version=version,
+        )
+        return _submitted(record)
+
     async def approve_project_preflight(
         self,
         *,

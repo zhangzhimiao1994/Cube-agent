@@ -153,6 +153,10 @@ class RunServiceProtocol(Protocol):
         version: int,
     ) -> SubmittedRun: ...
 
+    async def retry_recovery(
+        self, *, tenant_id: UUID, actor_id: UUID, run_id: UUID, version: int,
+    ) -> SubmittedRun: ...
+
     async def approve_project_preflight(
         self,
         *,
@@ -427,6 +431,12 @@ class ReviseTemporaryAgentRequest(BaseModel):
 class AcceptSelfRepairRequest(BaseModel):
     decision_token: str = Field(min_length=32, max_length=160)
     version: int = Field(ge=1)
+
+
+class RetryRecoveryRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    version: int = Field(ge=1, strict=True)
 
 
 class ProjectPreflightApprovalRequest(BaseModel):
@@ -1572,6 +1582,29 @@ async def accept_self_repair(
             str(error),
             details={"reason": str(error)},
         ) from error
+    return SubmittedRunResponse.from_submitted(submitted)
+
+
+@router.post(
+    "/{run_id}/retry-recovery",
+    response_model=SubmittedRunResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def retry_recovery(
+    run_id: UUID,
+    body: RetryRecoveryRequest,
+    service: Annotated[RunServiceProtocol, Depends(_run_service)],
+    principal: Annotated[AuthenticatedPrincipal, Depends(require_permission("run:resume"))],
+) -> SubmittedRunResponse:
+    try:
+        submitted = await service.retry_recovery(
+            tenant_id=principal.tenant_id, actor_id=principal.user_id,
+            run_id=run_id, version=body.version,
+        )
+    except RunNotFound as error:
+        raise _run_not_found() from error
+    except RunConflict as error:
+        raise _run_conflict(error) from error
     return SubmittedRunResponse.from_submitted(submitted)
 
 

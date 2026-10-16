@@ -59,6 +59,7 @@ _SELF_REPAIR_RECOVERY_BASELINE_EVENT_KINDS = frozenset(
         EventKind.STEP_FAILED.value,
         "observer.notice",
         "repair.classified",
+        "terminal.notified",
     }
 )
 
@@ -903,6 +904,62 @@ class RunRepository:
                     payload={"run_id": str(run_id)},
                 )
             )
+            await session.flush()
+            return self._record(row)
+
+    async def retry_self_repair_recovery_and_enqueue(
+        self,
+        *,
+        tenant_id: UUID,
+        actor_id: UUID,
+        run_id: UUID,
+        version: int,
+    ) -> RunRecord:
+        async with self._session_factory() as session, session.begin():
+            row = await session.scalar(self._run_select(tenant_id, run_id).with_for_update())
+            if row is None or row.tenant_id != tenant_id or row.id != run_id or row.actor_id != actor_id:
+                raise RunNotFound("run was not found")
+            if RunStatus(row.status) is not RunStatus.FAILED or row.version != version:
+                raise RunConflict("run is not awaiting a recovery retry at this version")
+            if self.has_worker_execution(row) or row.blocked_by_run_id is not None:
+                raise RunConflict("run recovery retry is not quiescent")
+            routing = dict(row.routing_decision or {})
+            baseline = _self_repair_recovery_baseline_sequence(routing)
+            if baseline <= 0 or routing.get("self_repair_source_run_id") != str(run_id):
+                raise RunConflict("run has no approved self repair recovery baseline")
+            checkpoint = await self.latest_checkpoint(session, tenant_id=tenant_id, run_id=run_id)
+            if checkpoint is None or checkpoint.tenant_id != tenant_id or checkpoint.run_id != run_id:
+                raise RunConflict("run recovery checkpoint is unavailable")
+            tail = (await session.execute(
+                select(RunEventRow.sequence, RunEventRow.kind, RunEventRow.payload)
+                .where(
+                    RunEventRow.tenant_id == tenant_id,
+                    RunEventRow.run_id == run_id,
+                    RunEventRow.sequence > baseline,
+                )
+                .order_by(RunEventRow.sequence)
+            )).all()
+            if not tail or any(
+                kind != EventKind.RUNTIME_FAILED.value
+                or not isinstance(payload, dict)
+                or payload.get("reason") != RECOVERY_BLOCKED_FAILURE_REASON
+                for _, kind, payload in tail
+            ):
+                raise RunConflict("run recovery retry requires only preexecution guard failures")
+            last_sequence = tail[-1][0]
+            if await self._recovery_blocked_after_checkpoint(
+                session, run_id=run_id, minimum_event_sequence=last_sequence,
+            ):
+                raise RunConflict("run recovery retry has non-replayable execution after checkpoint")
+            row.routing_decision = {**routing, "self_repair_recovery_baseline_sequence": last_sequence}
+            row.status = RunStatus.QUEUED.value
+            row.version += 1
+            session.add(RunOutboxRow(
+                id=uuid4(), tenant_id=tenant_id, run_id=run_id,
+                task_name="agent_hub.runs.execute",
+                idempotency_key=f"{tenant_id}:{run_id}:recovery-retry:{version}",
+                payload={"run_id": str(run_id)},
+            ))
             await session.flush()
             return self._record(row)
 

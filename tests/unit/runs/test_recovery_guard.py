@@ -7,6 +7,7 @@ from typing import Any, Self, cast
 from uuid import UUID, uuid4
 
 import pytest
+from sqlalchemy import create_engine, text
 from sqlalchemy.dialects import postgresql
 
 from agent_hub.db.models import RunOutboxRow
@@ -296,6 +297,7 @@ def test_self_repair_baseline_only_ignores_diagnostic_events() -> None:
     assert _is_self_repair_recovery_baseline_event_kind("step.failed")
     assert _is_self_repair_recovery_baseline_event_kind("repair.classified")
     assert _is_self_repair_recovery_baseline_event_kind("observer.notice")
+    assert _is_self_repair_recovery_baseline_event_kind("terminal.notified")
     assert not _is_self_repair_recovery_baseline_event_kind("tool.completed")
     assert not _is_self_repair_recovery_baseline_event_kind("artifact.created")
 
@@ -319,6 +321,81 @@ async def test_recovery_block_query_ignores_only_baseline_diagnostic_events() ->
     assert "agent_hub_run_events.kind NOT IN" in compiled
     assert "NOT (" in compiled
     assert session.statements[1].compile(dialect=postgresql.dialect()).params["sequence_1"] == 3  # type: ignore[attr-defined, no-untyped-call]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "policy,notification_sequence,unsafe_kind,blocked",
+    [
+        ("accepted", 175, None, False),
+        ("ordinary", 175, None, True),
+        ("unapproved", 175, None, True),
+        ("other_source", 175, None, True),
+        ("accepted", 176, None, True),
+        ("accepted", 175, "tool.started", True),
+        ("accepted", 175, "tool.completed", True),
+        ("accepted", 175, "artifact.created", True),
+        ("accepted", 175, "model.started", True),
+        ("accepted", 175, "model.completed", True),
+        ("accepted", 175, "step.completed", True),
+        ("accepted", 175, "runtime.completed", True),
+    ],
+)
+async def test_terminal_notification_real_query_claim_respects_approved_baseline(
+    policy: str, notification_sequence: int, unsafe_kind: str | None, blocked: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    routing = _accepted_self_repair_routing(baseline_sequence=175)
+    if policy == "ordinary":
+        routing = {}
+    elif policy == "unapproved":
+        routing["self_repair_accepted"] = False
+    elif policy == "other_source":
+        routing["source"] = "manual"
+    repository = _RecoveryBlockingRepository(
+        status=RunStatus.QUEUED, routing_decision=routing, blocked_after_sequence=0,
+    )
+    repository.row.version = 7
+    # Keep the real SQL predicate; the existing fixture substitutes only run-row/lease I/O.
+    monkeypatch.setattr(repository, "_recovery_blocked_after_checkpoint",
+                        RunRepository._recovery_blocked_after_checkpoint.__get__(repository))
+    tail = [(172, "step.failed"), (173, "runtime.failed"),
+            (174, unsafe_kind or "repair.classified"), (notification_sequence, "terminal.notified")]
+    engine = create_engine("sqlite:///:memory:")
+    try:
+        with engine.connect() as connection:
+            connection.execute(text("CREATE TABLE agent_hub_run_checkpoints (run_id CHAR(32), sequence INTEGER)"))
+            connection.execute(text("CREATE TABLE agent_hub_run_events (run_id CHAR(32), sequence INTEGER, kind TEXT)"))
+            connection.execute(text("INSERT INTO agent_hub_run_checkpoints VALUES (:run_id, 171)"),
+                               {"run_id": repository.run_id.hex})
+            connection.execute(text("INSERT INTO agent_hub_run_events VALUES (:run_id, :sequence, :kind)"),
+                               [{"run_id": repository.run_id.hex, "sequence": seq, "kind": kind} for seq, kind in tail])
+
+            class Session(_FakeTransaction):
+                async def scalar(self, statement: Any) -> Any:
+                    return connection.scalar(statement)
+
+            claimed = await repository.claim_for_execution(
+                cast(Any, Session()), repository.run_id, allow_running_recovery=False,
+                worker_id="recovered-worker", worker_lease_token=repository.lease_token,
+                worker_lease_expires_at=repository.lease_expires_at,
+            )
+            saved = connection.execute(text("SELECT sequence, kind FROM agent_hub_run_events ORDER BY sequence"))
+            assert [(row[0], row[1]) for row in saved] == tail
+            assert not _is_recovery_replayable_event_kind("terminal.notified")
+            if blocked:
+                assert isinstance(claimed, RunRecord) and claimed.status is RunStatus.FAILED
+                assert claimed.version == 9
+                assert [event.kind for event in repository.persisted_events] == [EventKind.RUNTIME_FAILED]
+                assert repository.row.worker_lease_token is None
+            else:
+                assert not isinstance(claimed, RunRecord)
+                row, checkpoint = claimed
+                assert row.version == 8 and row.status == RunStatus.RUNNING.value
+                assert checkpoint is repository.checkpoint and repository.persisted_events == []
+                assert row.worker_lease_token == repository.lease_token
+    finally:
+        engine.dispose()
 
 
 @pytest.mark.asyncio
