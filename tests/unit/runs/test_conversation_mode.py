@@ -829,12 +829,35 @@ async def test_auto_reuses_previous_mode_when_mixed_model_is_context() -> None:
     assert routing["reason"] == "conversation_mode_continuation"
 
 
-async def test_auto_submission_switches_mode_when_user_explicitly_requests_it() -> None:
+@pytest.mark.parametrize(
+    ("message", "expected_mode"),
+    [
+        ("这轮切换到讨论模式", TaskMode.DISCUSS),
+        ("切换到直接模式", TaskMode.DIRECT),
+        ("切换到“直接模式”", TaskMode.DIRECT),
+        ("use direct mode", TaskMode.DIRECT),
+        ("use `direct` mode", TaskMode.DIRECT),
+        ('switch to "hybrid"', TaskMode.HYBRID),
+        ("switch to hybrid", TaskMode.HYBRID),
+        ("Please switch to hybrid, then bundle the existing files.", TaskMode.HYBRID),
+        ("Build a real medium business project; use direct mode.", TaskMode.DIRECT),
+        ("change to dispatch mode and continue the task", TaskMode.DISPATCH),
+        ("select discussion mode", TaskMode.DISCUSS),
+        ("set to workflow mode", TaskMode.DISPATCH),
+        ("请使用混合模式并继续任务", TaskMode.HYBRID),
+        ("切换到混合模型", TaskMode.HYBRID),
+        ("改用混合模型并继续任务", TaskMode.HYBRID),
+        ('The example is "use direct mode"; switch to hybrid.', TaskMode.HYBRID),
+    ],
+)
+async def test_auto_submission_switches_mode_when_user_explicitly_requests_it(
+    message: str, expected_mode: TaskMode
+) -> None:
     repository = ConversationModeRepository(TaskMode.HYBRID)
     router = WaitingRouter()
     service = RunService(
         repository,  # type: ignore[arg-type]
-        runtime_registry=RuntimeRegistry((UnavailableRuntime(TaskMode.DISCUSS),)),
+        runtime_registry=RuntimeRegistry((UnavailableRuntime(expected_mode),)),
         router=router,
         task_queue=RecordingQueue(),
     )
@@ -842,20 +865,20 @@ async def test_auto_submission_switches_mode_when_user_explicitly_requests_it() 
     submitted = await service.submit(
         tenant_id=uuid4(),
         actor_id=uuid4(),
-        message="这轮切换到讨论模式",
+        message=message,
         mode=TaskMode.AUTO,
         conversation_id="conv-1",
         idempotency_key="idem-mode-switch",
     )
 
     assert submitted.status is RunStatus.QUEUED
-    assert submitted.mode is TaskMode.DISCUSS
+    assert submitted.mode is expected_mode
     assert router.calls == 0
     routing = repository.created[0]["routing_decision"]
     assert isinstance(routing, dict)
     assert routing.items() >= {
         "reason": "conversation_mode_switch",
-        "main_agent_selected_mode": "discuss",
+        "main_agent_selected_mode": expected_mode.value,
         "mode_source": "explicit_user_request",
         "selected_agent_ids": [],
         "workflow_id": None,
@@ -869,6 +892,75 @@ async def test_auto_submission_switches_mode_when_user_explicitly_requests_it() 
             "sandbox_profile": "workspace_write",
             "requested_permissions": ["workspace.read", "workspace.write", "command.run"],
     }.items()
+
+
+@pytest.mark.parametrize(
+    "task",
+    [
+        "Use workspace.write_text in a directory then bundle.",
+        "Use workspace.write_text, then redirect to the download.",
+        "Use a direct dependency and bundle the application.",
+        "Use a hybrid architecture for the application.",
+        "Read about how to use direct mode, then bundle the existing application.",
+        "Read documentation on how to switch to hybrid mode.",
+        "How do I use direct mode? Continue the existing project.",
+        "继续项目，引用直接模式文档。",
+        "说明如何使用直接模式，然后打包项目。",
+        "使用混合模型架构处理当前任务。",
+        "Reuse direct mode documentation as reference.",
+        'Use the existing files. Reference: "use direct mode".',
+        "Use the existing files. Reference: 'switch to hybrid'.",
+        "使用现有文件。引用：‘切换到直接模式’。",
+        "使用现有文件。引用：“使用直接模式”。",
+        'Use the existing files. JSON: {"instruction": "use direct mode"}.',
+        "Use the existing files. `use direct mode` is sample code.",
+        "Use `workspace.write_text` direct mode documentation as reference.",
+        'Use "workspace.write_text" direct mode documentation as reference.',
+        "Use the existing files.\n```text\nuse direct mode\n```",
+        "Use the existing files.\n~~~text\nswitch to hybrid\n~~~",
+        "Use the existing files.\n> use direct mode\nBundle the result.",
+        "不要切换到直接模式，继续当前任务。",
+        "Don't switch to hybrid; continue the task.",
+        "Do not switch to direct mode; continue the task.",
+        "Don't use direct mode; continue the task.",
+        "Do not select hybrid mode; continue the task.",
+        "不要使用直接模式，继续当前任务。",
+    ],
+)
+@pytest.mark.parametrize("previous_mode", [None, TaskMode.DIRECT])
+async def test_auto_project_delivery_does_not_treat_task_or_reference_as_mode_switch(
+    task: str, previous_mode: TaskMode | None
+) -> None:
+    repository = ConversationModeRepository(previous_mode)
+    queue = RecordingQueue()
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((UnavailableRuntime(TaskMode.DISPATCH),)),
+        router=None,
+        task_queue=queue,
+    )
+
+    submitted = await service.submit(
+        tenant_id=uuid4(),
+        actor_id=uuid4(),
+        message=f"Build a real medium business project: a CRM-lite website. {task}",
+        mode=TaskMode.AUTO,
+        conversation_id="conv-project-mode-boundary",
+        project_id="existing-project",
+        workspace_session_id="existing-workspace",
+    )
+
+    assert submitted.status is RunStatus.QUEUED
+    assert submitted.mode is TaskMode.DISPATCH
+    routing = repository.created[0]["routing_decision"]
+    assert isinstance(routing, dict)
+    assert routing["reason"] == (
+        "project_scale_mode_upgrade" if previous_mode else "main_agent_local_resolution"
+    )
+    assert routing["project_delivery"] == "workspace"
+    assert routing["project_id"] == "existing-project"
+    assert routing["workspace_session_id"] == "existing-workspace"
+    assert len(repository.created) == 1
 
 
 async def test_auto_submission_does_not_reuse_previous_mode_when_user_requests_new_conversation() -> None:

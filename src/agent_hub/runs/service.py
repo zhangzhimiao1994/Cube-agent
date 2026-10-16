@@ -4890,7 +4890,27 @@ def _explicit_new_conversation_request(message: str) -> bool:
 
 
 def _explicit_conversation_mode_switch(message: str) -> TaskMode | None:
-    normalized = re.sub(r"\s+", " ", message).strip().casefold()
+    def quoted_target(match: re.Match[str]) -> str:
+        target = match.group()[1:-1].strip().casefold()
+        if re.fullmatch(
+            r"(?:direct|hybrid)(?:\s+mode)?|(?:discuss|discussion|dispatch|workflow)\s+mode"
+            r"|直接模式|直接回复|直接回答|普通对话|混合模式|混合模型|先讨论再执行|讨论后执行"
+            r"|讨论模式|评审模式|审查模式|派发模式|调度模式|执行模式|工作流模式",
+            target,
+        ):
+            return target
+        return "\x00"
+
+    # Examples, quoted payloads and code are task data, not routing commands.
+    command_text = re.sub(r"(?s)(```|~~~).*?(?:\1|$)", "\x00", message)
+    command_text = re.sub(r"(?m)^[ \t]*>[^\n]*", "\x00", command_text)
+    command_text = re.sub(
+        r'`[^`]*`|"(?:\\.|[^"\\])*"|(?<!\w)\'(?:\\.|[^\'\\])*\'(?!\w)'
+        r"|“[^”]*”|‘[^’]*’|「[^」]*」|『[^』]*』",
+        quoted_target,
+        command_text,
+    )
+    normalized = re.sub(r"\s+", " ", command_text).strip().casefold()
     if not normalized:
         return None
     negative_markers = (
@@ -4907,56 +4927,57 @@ def _explicit_conversation_mode_switch(message: str) -> TaskMode | None:
         "don't switch",
         "no switch",
     )
-    if any(marker in normalized for marker in negative_markers):
+    if any(marker in normalized for marker in negative_markers) or re.search(
+        r"\b(?:do\s+not|don't|dont|never)\s+(?:switch|change|use|select|set)\b"
+        r"|(?:不要|不用|别|无需|不必)(?:使用|选择|设为|改用|用|走)",
+        normalized,
+    ):
         return None
-    switch_markers = (
-        "切换",
-        "切到",
-        "换成",
-        "换为",
-        "改成",
-        "改为",
-        "改用",
-        "使用",
-        "选择",
-        "设为",
-        "走",
-        "用",
-        "switch",
-        "change to",
-        "use",
-        "select",
-        "set to",
+    command = (
+        r"(?:切换(?:到|为|成)?|切到|换成|换为|改成|改为|改用|使用|选择|设为|走|用)\s*"
+        r"|\b(?:switch(?:\s+to)?|change\s+to|use|select|set\s+to)\s+"
     )
-    if not any(marker in normalized for marker in switch_markers):
-        return None
-    mode_markers: tuple[tuple[TaskMode, tuple[str, ...]], ...] = (
+    bare_mode_end = r"(?=\s*(?:$|[.,;!?，。；！？]|\b(?:and|then)\b))"
+
+    def command_requested(pattern: str) -> bool:
+        for match in re.finditer(pattern, normalized):
+            prefix = re.split(
+                r"[\x00.,;!?，。；！？]|\b(?:and|then)\b|然后|并且", normalized[:match.start()]
+            )[-1].strip()
+            if not prefix or re.fullmatch(
+                r"(?:(?:请你|请|麻烦你|麻烦|你|帮我|给我|这轮|这次|本轮|本次|现在|接下来|后续|就)\s*)+"
+                r"|(?:(?:please|now|this\s+(?:time|turn|run)|for\s+this\s+(?:task|run)"
+                r"|i\s+(?:want|would\s+like)\s+to|i'd\s+like\s+to|can\s+you|could\s+you|let's)\s*)+",
+                prefix,
+            ):
+                return True
+        return False
+
+    if command_requested(
+        r"(?:切换(?:到|为|成)?|切到|换成|换为|改成|改为|改用)\s*混合模型"
+        r"(?=$|[\s.,;!?，。；！？]|并|然后|继续)",
+    ):
+        return TaskMode.HYBRID
+    mode_patterns = (
         (
             TaskMode.HYBRID,
-            (
-                "混合模式",
-                "混合模型",
-                "hybrid mode",
-                "hybrid",
-                "先讨论再执行",
-                "讨论后执行",
-            ),
+            r"混合模式|先讨论再执行|讨论后执行|hybrid\s+mode\b|hybrid" + bare_mode_end,
         ),
         (
             TaskMode.DISCUSS,
-            ("讨论模式", "评审模式", "审查模式", "discuss mode", "discussion mode"),
+            r"讨论模式|评审模式|审查模式|(?:discuss|discussion)\s+mode\b",
         ),
         (
             TaskMode.DISPATCH,
-            ("派发模式", "调度模式", "执行模式", "工作流模式", "dispatch mode", "workflow mode"),
+            r"派发模式|调度模式|执行模式|工作流模式|(?:dispatch|workflow)\s+mode\b",
         ),
         (
             TaskMode.DIRECT,
-            ("直接模式", "直接回复", "直接回答", "普通对话", "direct mode", "direct"),
+            r"直接模式|直接回复|直接回答|普通对话|direct\s+mode\b|direct" + bare_mode_end,
         ),
     )
-    for mode, markers in mode_markers:
-        if any(marker in normalized for marker in markers):
+    for mode, pattern in mode_patterns:
+        if command_requested(rf"(?:{command})(?:{pattern})"):
             return mode
     return None
 
