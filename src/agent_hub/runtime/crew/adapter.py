@@ -3414,6 +3414,7 @@ def _succeeded_semantic_tool_result(
     step_id: str,
     name: str,
     arguments_sha256: str,
+    allowed_artifact_ids: set[str] | None = None,
 ) -> Artifact | None:
     for key, state in ledger.states.items():
         if (
@@ -3423,7 +3424,9 @@ def _succeeded_semantic_tool_result(
             and state.get("arguments_sha256") == arguments_sha256
         ):
             artifact = ledger.artifacts.get(key)
-            if artifact is not None:
+            if artifact is not None and (
+                allowed_artifact_ids is None or str(artifact.id) in allowed_artifact_ids
+            ):
                 return artifact
     return None
 
@@ -9970,7 +9973,10 @@ class CrewDispatchRuntime:
             )
             if key not in {legacy_tool_key, trigger_tool_key}:
                 _fail("runtime checkpoint is incompatible")
-            tool_indices.setdefault((tool_step_id, attempt, round_index), set()).add(tool_index)
+            indices = tool_indices.setdefault((tool_step_id, attempt, round_index), set())
+            if tool_index in indices:
+                _fail("runtime checkpoint is incompatible")
+            indices.add(tool_index)
             if status in {"succeeded", "rejected"}:
                 if (
                     type(value["artifact_id"]) is not str
@@ -10126,8 +10132,7 @@ class CrewDispatchRuntime:
         self._validate_structured_checkpoint(checkpoint, plan)
         if any(indices != set(range(max(indices) + 1)) for indices in model_indices.values()):
             _fail("runtime checkpoint is incompatible")
-        if any(indices != set(range(max(indices) + 1)) for indices in tool_indices.values()):
-            _fail("runtime checkpoint is incompatible")
+        # Semantic reuse creates no new tool slot; graph validation proves each gap.
         model_triggers = {
             (
                 model_state["step_id"],
@@ -10552,6 +10557,10 @@ class CrewDispatchRuntime:
         review_ledger: _ReviewLedger,
         input_ids: tuple[str, ...],
         runtime_version: str = _RUNTIME_VERSION,
+        *,
+        workspace_delivery_continuation: bool = False,
+        workspace_meaningful_progress: bool = False,
+        workspace_context_refresh: bool = False,
     ) -> None:
         by_id = {str(artifact.id): artifact for artifact in artifacts}
         if len(by_id) != len(artifacts):
@@ -10765,6 +10774,12 @@ class CrewDispatchRuntime:
             )
 
         for step in plan.steps:
+            workspace_continuation = (
+                workspace_delivery_continuation and _is_incremental_workspace_contract_step(step)
+            )
+            context_refresh = (
+                workspace_continuation and workspace_meaningful_progress and workspace_context_refresh
+            )
             if step.depends_on and any(
                 dependency not in completed for dependency in step.depends_on
             ):
@@ -10819,8 +10834,9 @@ class CrewDispatchRuntime:
                     evidence_ids.append(str(model_artifact.id))
                     round_tools = tools.get((step.id, cast(int, state["attempt"]), call_index), {})
                     calls = completion.response.tool_calls
-                    if len(round_tools) > len(calls):
+                    if any(index >= len(calls) for index in round_tools):
                         _fail("runtime checkpoint capability artifact lineage is invalid")
+                    last_persisted_tool_index = max(round_tools, default=-1)
                     resolved_tool_count = 0
                     for tool_index in range(len(calls)):
                         tool_call = _scope_project_workspace_tool_call(
@@ -10837,14 +10853,33 @@ class CrewDispatchRuntime:
                         arguments_sha256 = hashlib.sha256(canonical_arguments.encode("utf-8")).hexdigest()
                         entry = round_tools.get(tool_index)
                         if entry is None:
-                            reused = _succeeded_semantic_tool_result(
-                                tool_ledger,
-                                step_id=step.id,
-                                name=tool_call.name,
-                                arguments_sha256=arguments_sha256,
+                            generated_file_result = reusable_generated_file_result(
+                                tool_call.name,
+                                tuple(by_id[artifact_id] for artifact_id in (*input_ids, *evidence_ids)),
+                                arguments=tool_call.arguments,
                             )
-                            # Reuse must point to a receipt already validated in this graph.
-                            if reused is None or str(reused.id) not in consumed_tools:
+                            reused = (
+                                None
+                                if generated_file_result is not None or (
+                                    workspace_continuation and (
+                                        tool_call.name in {"workspace.read", "workspace.list"}
+                                        or (context_refresh and tool_call.name == "workspace_read")
+                                    )
+                                )
+                                else _succeeded_semantic_tool_result(
+                                    tool_ledger,
+                                    step_id=step.id,
+                                    name=tool_call.name,
+                                    arguments_sha256=arguments_sha256,
+                                    allowed_artifact_ids=consumed_tools,
+                                )
+                            )
+                            if (workspace_continuation and tool_call.name == "workspace.bundle"
+                                    and reused is not None and reused.source_ids != (str(model_artifact.id),)):
+                                reused = None
+                            if reused is None:
+                                if tool_index < last_persisted_tool_index:
+                                    _fail("runtime checkpoint capability artifact lineage is invalid")
                                 break
                             evidence_ids.append(str(reused.id))
                             resolved_tool_count += 1
@@ -10857,7 +10892,7 @@ class CrewDispatchRuntime:
                         ):
                             _fail("runtime checkpoint capability artifact lineage is invalid")
                         if tool_artifact is None:
-                            if tool_index != len(round_tools) - 1:
+                            if tool_index != last_persisted_tool_index:
                                 _fail("runtime checkpoint artifact graph is invalid")
                             incomplete = True
                             break
@@ -11266,6 +11301,15 @@ class CrewDispatchRuntime:
                 tuple[Mapping[str, str], ...], checkpoint.state["input_refs"],
             )),
             checkpoint.runtime_version,
+            workspace_delivery_continuation=cast(
+                bool, checkpoint.state.get("workspace_delivery_continuation", False),
+            ),
+            workspace_meaningful_progress=cast(
+                bool, checkpoint.state.get("workspace_meaningful_progress", False),
+            ),
+            workspace_context_refresh=cast(
+                bool, checkpoint.state.get("workspace_context_refresh", False),
+            ),
         )
         if run_state.workspace_meaningful_progress and checkpoint.state.get("workspace_meaningful_progress") is True:
             derived_progress = _workspace_progress_units(
