@@ -19,6 +19,10 @@ from agent_hub.capabilities.manifest import (
     project_capability_manifest_item,
 )
 from agent_hub.capabilities.scoped_read import ScopedReadError, read_scoped_file
+from agent_hub.capabilities.tools.builtin_contracts import (
+    builtin_tool_description,
+    builtin_tool_input_schema,
+)
 from agent_hub.capabilities.tools.calculator import Calculator
 from agent_hub.capabilities.tools.http_read import HttpReader, HttpReadError
 from agent_hub.capabilities.tools.project_zip import (
@@ -920,6 +924,11 @@ class RuntimeCapabilityGateway:
         input_schema = _builtin_input_schema(name)
         if input_schema is not None:
             item["input_schema"] = input_schema
+        description = builtin_tool_description(name)
+        if description is not None:
+            item["description"] = description
+            item["input_contract_version"] = 1
+            item["input_contract_added_fields"] = ("input_schema", "description")
         return item
 
     def _builtin_availability_reason(self, name: str) -> str | None:
@@ -1157,6 +1166,8 @@ def _manifest_builtin_name(name: str) -> str | None:
 
 
 def _builtin_aliases(name: str) -> tuple[str, ...]:
+    if name == "calculator.evaluate":
+        return ("calculator", "calculator_evaluate")
     alias = _BUILTIN_ALIASES.get(name)
     return () if alias is None else (alias,)
 
@@ -1201,6 +1212,9 @@ def _builtin_sandbox_profile(name: str) -> str:
 
 
 def _builtin_input_schema(name: str) -> Mapping[str, JsonValue] | None:
+    builtin_schema = builtin_tool_input_schema(name)
+    if builtin_schema is not None:
+        return builtin_schema
     if name == _PROJECT_PREFLIGHT_TOOL:
         return project_preflight_model_input_schema()
     if name == _WORKSPACE_WRITE_TOOL:

@@ -34,6 +34,10 @@ from jsonschema.validators import validator_for  # type: ignore[import-untyped]
 
 from agent_hub.auth.models import Role
 from agent_hub.capabilities.runtime import RuntimeCapabilityError
+from agent_hub.capabilities.tools.builtin_contracts import (
+    builtin_tool_description,
+    builtin_tool_input_schema,
+)
 from agent_hub.capabilities.tools.project_zip import (
     PROJECT_ZIP_TOOL_NAME,
     project_zip_evidence_arguments,
@@ -582,13 +586,36 @@ def _tool_name_mapping(internal_names: tuple[str, ...]) -> dict[str, str]:
 def _tool_definitions(
     internal_names: tuple[str, ...],
     metadata_by_name: Mapping[str, Mapping[str, JsonValue]] | None = None,
+    *, builtin_contract: bool = True,
 ) -> tuple[ToolDefinition, ...]:
     mapping = _tool_name_mapping(internal_names)
     metadata = metadata_by_name or {}
     return tuple(
         _tool_definition(external_name, internal_name, metadata.get(internal_name, {}))
+        if builtin_contract else _legacy_builtin_tool_definition(
+            external_name, internal_name, metadata.get(internal_name, {}),
+        )
         for external_name, internal_name in sorted(mapping.items())
     )
+
+
+def _legacy_builtin_tool_definition(
+    external_name: str, internal_name: str, metadata: Mapping[str, JsonValue],
+) -> ToolDefinition:
+    prior_metadata = dict(metadata)
+    added_fields = metadata.get("input_contract_added_fields")
+    if (metadata.get("kind") == "builtin" and metadata.get("adapter") == "runtime_builtin"
+        and type(metadata.get("input_contract_version")) is int and metadata["input_contract_version"] == 1
+        and isinstance(added_fields, tuple | list)
+        and all(isinstance(field, str) and field in {"input_schema", "description"} for field in added_fields)):
+        for field in added_fields:
+            prior_metadata.pop(cast(str, field), None)
+    return ToolDefinition(name=external_name,
+        description=_description_with_failure_codes(
+            _manifest_description(prior_metadata, internal_name) or _tool_description(internal_name, builtin_contract=False),
+            _manifest_failure_codes(prior_metadata),
+        ),
+        parameters=_tool_parameters(internal_name, prior_metadata, builtin_contract=False))
 
 
 def _tool_definition(
@@ -609,7 +636,10 @@ def _tool_definition(
     )
 
 
-def _tool_description(internal_name: str) -> str:
+def _tool_description(internal_name: str, *, builtin_contract: bool = True) -> str:
+    description = builtin_tool_description(internal_name) if builtin_contract else None
+    if description is not None:
+        return description
     if internal_name == "project.generate_zip":
         return (
             "Generate a downloadable project ZIP. Use files as an object mapping "
@@ -619,7 +649,7 @@ def _tool_description(internal_name: str) -> str:
         return "Generate a downloadable DOCX document from title and section content."
     if internal_name == "presentation.generate_pptx":
         return "Generate a downloadable PPTX presentation from title and slide content."
-    if internal_name in {"read_context", "workspace.read", "workspace_read"}:
+    if _is_read_context_tool(internal_name):
         return "Read approved workspace or conversation context."
     if internal_name == "workspace.write_text":
         return (
@@ -658,7 +688,7 @@ def _is_correctable_tool_argument_failure(name: str, reason: str) -> bool:
         name == "workspace.write_text" and reason in _CORRECTABLE_WORKSPACE_PATH_FAILURES
     ) or (
         name in {"workspace.read", "workspace_read"}
-        and reason == "workspace read denied or scoped file unavailable"
+        and reason in {"workspace read denied or scoped file unavailable", "workspace reader requires path"}
     )
 
 
@@ -667,6 +697,12 @@ def _tool_argument_rejection_result(
     reason: str,
 ) -> Mapping[str, JsonValue]:
     if tool_call.name in {"workspace.read", "workspace_read"}:
+        if reason == "workspace reader requires path":
+            return {
+                "status": "rejected", "error_code": "workspace_read_path_required",
+                "message": "A relative workspace file path is required; query is not supported.",
+                "tool_name": tool_call.name,
+            }
         return {
             "status": "rejected",
             "error_code": "workspace_read_unavailable",
@@ -971,10 +1007,14 @@ def _read_context_unavailable_result(
 def _tool_parameters(
     internal_name: str,
     metadata: Mapping[str, JsonValue] | None = None,
+    *, builtin_contract: bool = True,
 ) -> Mapping[str, JsonValue]:
     manifest_schema = _manifest_input_schema(metadata or {})
     if manifest_schema is not None:
         return manifest_schema
+    builtin_schema = builtin_tool_input_schema(internal_name) if builtin_contract else None
+    if builtin_schema is not None:
+        return builtin_schema
     if internal_name == "project.generate_zip":
         return {
             "type": "object",
@@ -3688,6 +3728,7 @@ class _RunState:
     token: _RunToken
     workspace_delivery_continuation: bool = True
     workspace_meaningful_progress: bool = True
+    builtin_tool_input_contract: bool = True
     incomplete_recovery_output_growth: bool = True
     first_tool_incomplete_recovery_output_growth: bool = True
     incomplete_continuation_output_growth: bool = True
@@ -3985,6 +4026,9 @@ class CrewDispatchRuntime:
                 )
                 state.workspace_meaningful_progress = cast(
                     bool, restored.state.get("workspace_meaningful_progress", False),
+                )
+                state.builtin_tool_input_contract = cast(
+                    bool, restored.state.get("builtin_tool_input_contract", False),
                 )
                 state.incomplete_recovery_output_growth = cast(
                     bool, restored.state.get("incomplete_recovery_output_growth", False),
@@ -6741,7 +6785,9 @@ class CrewDispatchRuntime:
             tenant_id=context.tenant_id,
             names=step.tools,
         )
-        request_tools = _tool_definitions(step.tools, tool_metadata_by_name)
+        request_tools = _tool_definitions(
+            step.tools, tool_metadata_by_name, builtin_contract=run_state.builtin_tool_input_contract,
+        )
         unavailable_tools = _unavailable_step_tools(
             self._capabilities,
             context.tenant_id,
@@ -7238,7 +7284,7 @@ class CrewDispatchRuntime:
                     name=tool_call.name,
                     arguments_sha256=arguments_sha256,
                 ):
-                    if not workspace_continuation or tool_call.name not in {
+                    if not workspace_continuation or not isinstance(tool_call.arguments.get("path"), str) or tool_call.name not in {
                         "workspace.read", "workspace_read",
                     }:
                         _fail("capability argument correction repeated rejected request")
@@ -7572,9 +7618,10 @@ class CrewDispatchRuntime:
                         evidence.append(rejection_artifact)
                         results.append({"name": tool_call.name, "result": rejection_result})
                         argument_correction_requested = True
-                        opaque_read_rejection_requested = tool_call.name in {
-                            "workspace.read", "workspace_read",
-                        }
+                        opaque_read_rejection_requested = (
+                            tool_call.name in {"workspace.read", "workspace_read"}
+                            and failed_reason == "workspace read denied or scoped file unavailable"
+                        )
                         break
                     failed["status"] = "failed"
                     await tool_boundary(idempotency_key, failed, None)
@@ -7769,9 +7816,10 @@ class CrewDispatchRuntime:
                         evidence.append(rejection_artifact)
                         results.append({"name": tool_call.name, "result": rejection_result})
                         argument_correction_requested = True
-                        opaque_read_rejection_requested = tool_call.name in {
-                            "workspace.read", "workspace_read",
-                        }
+                        opaque_read_rejection_requested = (
+                            tool_call.name in {"workspace.read", "workspace_read"}
+                            and failed_reason == "workspace read denied or scoped file unavailable"
+                        )
                         break
                     failed["status"] = "failed"
                     await tool_boundary(idempotency_key, failed, None)
@@ -9034,6 +9082,8 @@ class CrewDispatchRuntime:
             state={
                 "plan_digest": plan.digest,
                 "workspace_delivery_continuation": run_state.workspace_delivery_continuation,
+                **({"builtin_tool_input_contract": run_state.builtin_tool_input_contract}
+                   if any(builtin_tool_input_schema(name) is not None for step in plan.steps for name in step.tools) else {}),
                 **({"workspace_meaningful_progress": meaningful_progress}
                    if any(_is_incremental_workspace_contract_step(step) for step in plan.steps) else {}),
                 "incomplete_recovery_output_growth": run_state.incomplete_recovery_output_growth,
@@ -9141,6 +9191,7 @@ class CrewDispatchRuntime:
         optional_state_keys = {
             "repair_reopened_contract_ids", "workspace_delivery_continuation",
             "workspace_meaningful_progress",
+            "builtin_tool_input_contract",
             "incomplete_recovery_output_growth",
             "first_tool_incomplete_recovery_output_growth",
             "incomplete_continuation_output_growth",
@@ -9172,6 +9223,9 @@ class CrewDispatchRuntime:
         timeout_progress_units = state.get("timeout_progress_units")
         if (
             type(state.get("workspace_delivery_continuation", False)) is not bool
+            or type(state.get("builtin_tool_input_contract", False)) is not bool
+            or (state.get("builtin_tool_input_contract", False)
+                and checkpoint.runtime_version != _RUNTIME_VERSION)
             or type(state.get("workspace_meaningful_progress", False)) is not bool
             or (state.get("workspace_meaningful_progress", False)
                 and (checkpoint.runtime_version != _RUNTIME_VERSION

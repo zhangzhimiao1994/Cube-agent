@@ -7,6 +7,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
 
+from agent_hub.capabilities.tools.builtin_contracts import (
+    builtin_tool_description,
+    builtin_tool_input_schema,
+)
 from agent_hub.capabilities.tools.registry import (
     CompositeCapabilityManifestSource,
     PluginConfigCapabilityManifestSource,
@@ -19,6 +23,11 @@ from agent_hub.plugins.dependency_policy import (
     plugin_package_dependency_lock,
 )
 from agent_hub.runtime.contracts import JsonValue
+
+
+def _builtin_contract_fields(name: str) -> Mapping[str, JsonValue]:
+    return {"input_schema": builtin_tool_input_schema(name), "description": builtin_tool_description(name),
+            "input_contract_version": 1, "input_contract_added_fields": ("input_schema", "description")}
 
 
 def _artifact_origin(name: str, version: str, sha256: str) -> dict[str, str]:
@@ -100,15 +109,17 @@ def test_registry_exposes_builtin_capability_manifests() -> None:
         "capabilities": (
             {
                 "id": "calculator.evaluate",
+                **_builtin_contract_fields("calculator.evaluate"),
                 "kind": "builtin",
                 "adapter": "runtime_builtin",
                 "permission_class": "calculator.evaluate",
                 "sandbox_profile": "in_process",
                 "replay_safe": True,
-                "aliases": (),
+                "aliases": ("calculator", "calculator_evaluate"),
             },
             {
                 "id": "document.generate_docx",
+                **_builtin_contract_fields("document.generate_docx"),
                 "kind": "builtin",
                 "adapter": "runtime_builtin",
                 "permission_class": "file.create",
@@ -118,6 +129,7 @@ def test_registry_exposes_builtin_capability_manifests() -> None:
             },
             {
                 "id": "http.read",
+                **_builtin_contract_fields("http.read"),
                 "kind": "builtin",
                 "adapter": "runtime_builtin",
                 "permission_class": "network.read",
@@ -127,6 +139,7 @@ def test_registry_exposes_builtin_capability_manifests() -> None:
             },
             {
                 "id": "presentation.generate_pptx",
+                **_builtin_contract_fields("presentation.generate_pptx"),
                 "kind": "builtin",
                 "adapter": "runtime_builtin",
                 "permission_class": "file.create",
@@ -136,6 +149,9 @@ def test_registry_exposes_builtin_capability_manifests() -> None:
             },
             {
                 "id": "project.generate_zip",
+                "description": builtin_tool_description("project.generate_zip"),
+                "input_contract_version": 1,
+                "input_contract_added_fields": ("description",),
                 "kind": "builtin",
                 "adapter": "runtime_builtin",
                 "permission_class": "file.create",
@@ -255,6 +271,7 @@ def test_registry_exposes_builtin_capability_manifests() -> None:
             },
             {
                 "id": "workspace.read",
+                **_builtin_contract_fields("workspace.read"),
                 "kind": "builtin",
                 "adapter": "runtime_builtin",
                 "permission_class": "file.read",

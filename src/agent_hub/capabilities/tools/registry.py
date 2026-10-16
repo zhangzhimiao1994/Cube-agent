@@ -13,6 +13,7 @@ from agent_hub.plugins.dependency_policy import (
 from agent_hub.project_preflight import project_preflight_model_input_schema
 from agent_hub.runtime.contracts import JsonValue
 
+from .builtin_contracts import builtin_tool_description, builtin_tool_input_schema
 from .project_zip import (
     PROJECT_ZIP_TOOL_NAME,
     project_zip_input_schema,
@@ -94,6 +95,8 @@ class ToolManifest:
     aliases: tuple[str, ...] = ()
     input_schema: Mapping[str, JsonValue] | None = None
     operational_limits: Mapping[str, JsonValue] | None = None
+    description: str | None = None
+    input_contract_added_fields: tuple[str, ...] = ()
 
     def to_public_dict(self) -> Mapping[str, JsonValue]:
         payload: dict[str, JsonValue] = {
@@ -109,6 +112,11 @@ class ToolManifest:
             payload["input_schema"] = dict(self.input_schema)
         if self.operational_limits is not None:
             payload["operational_limits"] = dict(self.operational_limits)
+        if self.description is not None:
+            payload["description"] = self.description
+        if self.input_contract_added_fields:
+            payload["input_contract_version"] = 1
+            payload["input_contract_added_fields"] = self.input_contract_added_fields
         return payload
 
 
@@ -130,9 +138,13 @@ class ToolRegistry:
         aliases: tuple[str, ...] = (),
         input_schema: Mapping[str, JsonValue] | None = None,
         operational_limits: Mapping[str, JsonValue] | None = None,
+        description: str | None = None,
+        input_contract_added_fields: tuple[str, ...] = (),
     ) -> None:
         if not name or name in self._tools:
             raise ValueError("tool name is invalid")
+        if any(field not in {"input_schema", "description"} for field in input_contract_added_fields):
+            raise ValueError("input contract field is invalid")
         manifest = ToolManifest(
             id=name,
             kind=_nonblank(kind, "kind"),
@@ -143,6 +155,8 @@ class ToolRegistry:
             aliases=_aliases(aliases),
             input_schema=input_schema,
             operational_limits=operational_limits,
+            description=_nonblank(description, "description") if description is not None else None,
+            input_contract_added_fields=input_contract_added_fields,
         )
         self._tools[name] = tool
         self._manifests[name] = manifest
@@ -294,6 +308,10 @@ def create_builtin_tool_registry() -> ToolRegistry:
         permission_class="calculator.evaluate",
         sandbox_profile="in_process",
         replay_safe=True,
+        aliases=("calculator", "calculator_evaluate"),
+        input_schema=builtin_tool_input_schema("calculator.evaluate"),
+        description=builtin_tool_description("calculator.evaluate"),
+        input_contract_added_fields=("input_schema", "description"),
     )
     registry.register(
         "document.generate_docx",
@@ -303,6 +321,9 @@ def create_builtin_tool_registry() -> ToolRegistry:
         permission_class="file.create",
         sandbox_profile="generated_artifact_store",
         replay_safe=True,
+        input_schema=builtin_tool_input_schema("document.generate_docx"),
+        description=builtin_tool_description("document.generate_docx"),
+        input_contract_added_fields=("input_schema", "description"),
     )
     registry.register(
         "http.read",
@@ -312,6 +333,9 @@ def create_builtin_tool_registry() -> ToolRegistry:
         permission_class="network.read",
         sandbox_profile="http_read",
         replay_safe=False,
+        input_schema=builtin_tool_input_schema("http.read"),
+        description=builtin_tool_description("http.read"),
+        input_contract_added_fields=("input_schema", "description"),
     )
     registry.register(
         "presentation.generate_pptx",
@@ -321,6 +345,9 @@ def create_builtin_tool_registry() -> ToolRegistry:
         permission_class="file.create",
         sandbox_profile="generated_artifact_store",
         replay_safe=True,
+        input_schema=builtin_tool_input_schema("presentation.generate_pptx"),
+        description=builtin_tool_description("presentation.generate_pptx"),
+        input_contract_added_fields=("input_schema", "description"),
     )
     registry.register(
         "project.preflight_architecture",
@@ -342,6 +369,8 @@ def create_builtin_tool_registry() -> ToolRegistry:
         replay_safe=True,
         input_schema=project_zip_input_schema(),
         operational_limits=project_zip_operational_limits(),
+        description=builtin_tool_description(PROJECT_ZIP_TOOL_NAME),
+        input_contract_added_fields=("description",),
     )
     registry.register(
         "workspace.read",
@@ -352,6 +381,9 @@ def create_builtin_tool_registry() -> ToolRegistry:
         sandbox_profile="workspace_read",
         replay_safe=True,
         aliases=("workspace_read",),
+        input_schema=builtin_tool_input_schema("workspace.read"),
+        description=builtin_tool_description("workspace.read"),
+        input_contract_added_fields=("input_schema", "description"),
     )
     registry.register(
         "workspace.write_text",

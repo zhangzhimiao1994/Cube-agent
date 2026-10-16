@@ -2,8 +2,53 @@ from __future__ import annotations
 
 import os
 import stat
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from agent_hub.runtime.contracts import JsonValue
+
+
+def read_tool_description(name: str) -> str | None:
+    if name in {"workspace.read", "workspace_read"}:
+        return (
+            "Read one authorized workspace file by required path. Use the relative file path "
+            "returned by workspace.list or workspace.write_text, without prepending workspace/current. "
+            "This tool does not accept query or search conversations."
+        )
+    if name == "read_context":
+        return (
+            "Read available runtime context using optional query (or text). This does not search "
+            "workspace file contents. An explicit path instead reads that authorized workspace file."
+        )
+    return None
+
+
+def read_tool_input_schema(name: str) -> Mapping[str, JsonValue] | None:
+    path: Mapping[str, JsonValue] = {
+        "type": "string", "minLength": 1,
+        "description": "Relative file path within the authorized run/project scope, not a search query.",
+    }
+    if name in {"workspace.read", "workspace_read"}:
+        return {"type": "object", "additionalProperties": False, "required": ("path",),
+                "properties": {"path": path}}
+    if name == "read_context":
+        query: Mapping[str, JsonValue] = {"type": "string", "minLength": 1, "pattern": r"\S"}
+        return {"type": "object", "additionalProperties": False,
+                "properties": {"query": {}, "text": {}, "path": path},
+                # Match the executor: path wins; otherwise non-null query wins over text.
+                "anyOf": (
+                    {"required": ("path",)},
+                    {"not": {"required": ("path",)}, "required": ("query",),
+                     "properties": {"query": query}},
+                    {"not": {"required": ("path",)}, "properties": {
+                        "query": {"type": "null"},
+                        "text": {"type": ("string", "null"), "minLength": 1, "pattern": r"\S"},
+                    }},
+                )}
+    return None
 
 
 class UnsafePath(ValueError):

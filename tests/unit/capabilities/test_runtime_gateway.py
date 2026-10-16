@@ -10,6 +10,10 @@ from zipfile import ZipFile
 import pytest
 
 from agent_hub.capabilities.runtime import RuntimeCapabilityError, RuntimeCapabilityGateway
+from agent_hub.capabilities.tools.builtin_contracts import (
+    builtin_tool_description,
+    builtin_tool_input_schema,
+)
 from agent_hub.capabilities.tools.http_read import HttpReader, HttpReadResult
 from agent_hub.capabilities.tools.registry import CompositeCapabilityManifestSource, ToolRegistry
 from agent_hub.runtime.contracts import JsonValue
@@ -19,6 +23,11 @@ from tests.unit.skills.test_package import skill_zip
 
 TENANT_ID = UUID("66666666-6666-4666-8666-666666666666")
 RUN_ID = UUID("77777777-7777-4777-8777-777777777777")
+
+
+def _builtin_contract_fields(name: str) -> Mapping[str, JsonValue]:
+    return {"input_schema": builtin_tool_input_schema(name), "description": builtin_tool_description(name),
+            "input_contract_version": 1, "input_contract_added_fields": ("input_schema", "description")}
 
 
 def _workspace_tool_manifest_items(
@@ -1256,6 +1265,7 @@ def test_runtime_gateway_exposes_capability_manifest_for_builtins_and_skills(
         "capabilities": (
             {
                 "id": "calculator.evaluate",
+                **_builtin_contract_fields("calculator.evaluate"),
                 "kind": "builtin",
                 "adapter": "runtime_builtin",
                 "permission_class": "calculator.evaluate",
@@ -1263,10 +1273,11 @@ def test_runtime_gateway_exposes_capability_manifest_for_builtins_and_skills(
                 "available": True,
                 "availability_reason": None,
                 "replay_safe": True,
-                "aliases": ("calculator",),
+                "aliases": ("calculator", "calculator_evaluate"),
             },
             {
                 "id": "http.read",
+                **_builtin_contract_fields("http.read"),
                 "kind": "builtin",
                 "adapter": "runtime_builtin",
                 "permission_class": "network.read",
@@ -1278,6 +1289,7 @@ def test_runtime_gateway_exposes_capability_manifest_for_builtins_and_skills(
             },
             {
                 "id": "document.generate_docx",
+                **_builtin_contract_fields("document.generate_docx"),
                 "kind": "builtin",
                 "adapter": "runtime_builtin",
                 "permission_class": "file.create",
@@ -1289,6 +1301,7 @@ def test_runtime_gateway_exposes_capability_manifest_for_builtins_and_skills(
             },
             {
                 "id": "presentation.generate_pptx",
+                **_builtin_contract_fields("presentation.generate_pptx"),
                 "kind": "builtin",
                 "adapter": "runtime_builtin",
                 "permission_class": "file.create",
@@ -1322,6 +1335,7 @@ def test_runtime_gateway_exposes_capability_manifest_for_builtins_and_skills(
             },
             {
                 "id": "project.generate_zip",
+                **_builtin_contract_fields("project.generate_zip"),
                 "kind": "builtin",
                 "adapter": "runtime_builtin",
                 "permission_class": "file.create",
@@ -1334,6 +1348,7 @@ def test_runtime_gateway_exposes_capability_manifest_for_builtins_and_skills(
             *_workspace_tool_manifest_items(configured=False),
             {
                 "id": "read_context",
+                **_builtin_contract_fields("read_context"),
                 "kind": "builtin",
                 "adapter": "runtime_builtin",
                 "permission_class": "context.read",
@@ -1345,6 +1360,7 @@ def test_runtime_gateway_exposes_capability_manifest_for_builtins_and_skills(
             },
             {
                 "id": "workspace.read",
+                **_builtin_contract_fields("workspace.read"),
                 "kind": "builtin",
                 "adapter": "runtime_builtin",
                 "permission_class": "file.read",
@@ -1388,6 +1404,7 @@ def test_runtime_gateway_capability_manifest_omits_skill_package_internals(
     assert manifest["capabilities"] == (
         {
             "id": "calculator.evaluate",
+            **_builtin_contract_fields("calculator.evaluate"),
             "kind": "builtin",
             "adapter": "runtime_builtin",
             "permission_class": "calculator.evaluate",
@@ -1395,10 +1412,11 @@ def test_runtime_gateway_capability_manifest_omits_skill_package_internals(
             "available": True,
             "availability_reason": None,
             "replay_safe": True,
-            "aliases": ("calculator",),
+            "aliases": ("calculator", "calculator_evaluate"),
         },
         {
             "id": "http.read",
+            **_builtin_contract_fields("http.read"),
             "kind": "builtin",
             "adapter": "runtime_builtin",
             "permission_class": "network.read",
@@ -1410,6 +1428,7 @@ def test_runtime_gateway_capability_manifest_omits_skill_package_internals(
         },
         {
             "id": "document.generate_docx",
+            **_builtin_contract_fields("document.generate_docx"),
             "kind": "builtin",
             "adapter": "runtime_builtin",
             "permission_class": "file.create",
@@ -1421,6 +1440,7 @@ def test_runtime_gateway_capability_manifest_omits_skill_package_internals(
         },
         {
             "id": "presentation.generate_pptx",
+            **_builtin_contract_fields("presentation.generate_pptx"),
             "kind": "builtin",
             "adapter": "runtime_builtin",
             "permission_class": "file.create",
@@ -1454,6 +1474,7 @@ def test_runtime_gateway_capability_manifest_omits_skill_package_internals(
         },
         {
             "id": "project.generate_zip",
+            **_builtin_contract_fields("project.generate_zip"),
             "kind": "builtin",
             "adapter": "runtime_builtin",
             "permission_class": "file.create",
@@ -1466,6 +1487,7 @@ def test_runtime_gateway_capability_manifest_omits_skill_package_internals(
         *_workspace_tool_manifest_items(configured=False),
         {
             "id": "read_context",
+            **_builtin_contract_fields("read_context"),
             "kind": "builtin",
             "adapter": "runtime_builtin",
             "permission_class": "context.read",
@@ -1477,6 +1499,7 @@ def test_runtime_gateway_capability_manifest_omits_skill_package_internals(
         },
         {
             "id": "workspace.read",
+            **_builtin_contract_fields("workspace.read"),
             "kind": "builtin",
             "adapter": "runtime_builtin",
             "permission_class": "file.read",

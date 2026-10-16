@@ -6191,8 +6191,9 @@ def test_tool_sandbox_accepts_dot_and_underscore_builtin_names() -> None:
     assert _tool_sandbox("web.search") == "restricted"
 
 
-def test_project_zip_tool_definition_exposes_required_file_schema() -> None:
-    (definition,) = _tool_definitions(("project.generate_zip",))
+@pytest.mark.parametrize("builtin_contract", (False, True))
+def test_project_zip_tool_definition_exposes_required_file_schema(builtin_contract: bool) -> None:
+    (definition,) = _tool_definitions(("project.generate_zip",), builtin_contract=builtin_contract)
 
     assert definition.name == "project_generate_zip"
     assert definition.parameters["required"] == ("title", "files")
@@ -6200,8 +6201,15 @@ def test_project_zip_tool_definition_exposes_required_file_schema() -> None:
     assert isinstance(properties, Mapping)
     files = properties["files"]
     assert isinstance(files, Mapping)
+    if builtin_contract:
+        variants = files["anyOf"]
+        assert isinstance(variants, tuple) and len(variants) == 2
+        files = variants[0]
+        assert isinstance(files, Mapping)
     assert files["type"] == "object"
-    assert files["additionalProperties"] == {"type": "string"}
+    assert files["additionalProperties"] == {
+        "type": "string", **({"x-max-utf8-bytes": 256_000} if builtin_contract else {}),
+    }
 
 
 def test_workspace_write_tool_definition_documents_safe_relative_paths() -> None:

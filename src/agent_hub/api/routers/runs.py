@@ -526,6 +526,7 @@ class RunSummaryResponse(BaseModel):
     execution_quiescent: bool = False
     execution_lease_expires_at: datetime | None = None
     approval_kind: str | None = None
+    repair_proposal: dict[str, object] | None = None
 
     @classmethod
     def from_summary(cls, run: RunSummary) -> RunSummaryResponse:
@@ -550,6 +551,7 @@ class RunSummaryResponse(BaseModel):
             execution_quiescent=run.execution_quiescent,
             execution_lease_expires_at=run.execution_lease_expires_at,
             approval_kind=run.approval_kind,
+            repair_proposal=_repair_proposal_response(run.repair_proposal),
         )
 
 

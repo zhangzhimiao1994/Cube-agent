@@ -214,6 +214,7 @@ class RunSummary:
     execution_quiescent: bool = False
     execution_lease_expires_at: datetime | None = None
     approval_kind: str | None = None
+    repair_proposal: dict[str, object] | None = None
 
 
 class VibeCodingUnavailable(RuntimeError):
@@ -2827,10 +2828,15 @@ class RunService:
             record,
             now=datetime.now(UTC),
         )
-        waiting_for_decision = record.status in {
-            RunStatus.WAITING_USER_MODE,
-            RunStatus.WAITING_APPROVAL,
-        }
+        repair_proposal = _pending_repair_proposal(record, routing_decision)
+        waiting_for_decision = (
+            record.status in {RunStatus.WAITING_USER_MODE, RunStatus.WAITING_APPROVAL}
+            and not (
+                routing_decision.get("approval_kind") == "self_repair"
+                and (routing_decision.get("source") == "self_repair"
+                     or routing_decision.get("self_repair_accepted") is True)
+            )
+        ) or repair_proposal is not None
         capability_approval_id = (
             _string_or_none(routing_decision.get("approval_id"))
             if record.status is RunStatus.WAITING_APPROVAL
@@ -2858,7 +2864,7 @@ class RunService:
             ),
             clarification_reason=(
                 str(routing_decision.get("reason", "routing_requires_user_choice"))
-                if waiting_for_decision
+                if waiting_for_decision and record.status is not RunStatus.FAILED
                 else None
             ),
             approval_id=capability_approval_id,
@@ -2871,7 +2877,8 @@ class RunService:
             execution_lease_expires_at=lease_expires_at,
             approval_kind=(
                 approval_kind
-                if record.status is RunStatus.WAITING_APPROVAL
+                if waiting_for_decision
+                and (record.status is RunStatus.WAITING_APPROVAL or repair_proposal is not None)
                 and isinstance(approval_kind, str)
                 and approval_kind in {
                     "capability_tool",
@@ -2884,6 +2891,7 @@ class RunService:
                 }
                 else None
             ),
+            repair_proposal=repair_proposal,
         )
 
     async def _safe_notify_terminal_hooks(
@@ -3672,6 +3680,27 @@ def _has_recorded_self_repair_proposal(
     return routing_decision.get("approval_kind") == "self_repair" and isinstance(
         proposal, Mapping
     )
+
+
+def _pending_repair_proposal(
+    record: RunRecord, decision: Mapping[str, object],
+) -> dict[str, object] | None:
+    """Reconnect reads expose actionable proposals, not accepted receipt history."""
+    proposal = decision.get("repair_proposal")
+    token = decision.get("decision_token")
+    if (
+        record.status not in {RunStatus.FAILED, RunStatus.WAITING_APPROVAL}
+        or decision.get("approval_kind") != "self_repair"
+        or decision.get("source") == "self_repair"
+        or decision.get("self_repair_accepted") is True
+        or not isinstance(proposal, dict)
+        or proposal.get("kind") != "self_repair"
+        or proposal.get("source_run_id") != str(record.id)
+        or proposal.get("requires_approval") is not True
+        or not isinstance(token, str) or not token.strip()
+    ):
+        return None
+    return proposal
 
 
 def _submitted(record: RunRecord) -> SubmittedRun:
