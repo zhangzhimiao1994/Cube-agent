@@ -17,6 +17,7 @@ from tests.unit.runs.test_harness_decision import (
 from tests.unit.runtime.test_role_planning_intent import finish
 
 FLAGS = ('workspace_maintenance_contract_version', 'post_tool_finalization_growth_version')
+INTENT_VERSION = 'workspace_maintenance_intent_version'
 
 
 @pytest.mark.parametrize('mode', [TaskMode.DIRECT, TaskMode.DISPATCH, TaskMode.DISCUSS, TaskMode.HYBRID])
@@ -28,11 +29,12 @@ def test_fresh_submit_persists_independent_policies_without_trusting_channel(mod
     finish(service.submit(tenant_id=TENANT_ID, actor_id=ACTOR_ID, actor_role=Role.OPERATOR,
         message=message, mode=mode, project_id='existing', workspace_session_id='session',
         sandbox_profile='read_only', requested_permissions=('workspace.read',),
-        channel_context={key: '0' for key in (*FLAGS, 'role_planning_intent_version')}))
+        channel_context={key: '0' for key in (*FLAGS, 'role_planning_intent_version', INTENT_VERSION)}))
     record = repository.created[0]; route = record['routing_decision']
     assert isinstance(route, dict)
     for key in (*FLAGS, 'role_planning_intent_version'):
         assert type(route[key]) is int and route[key] == 1
+    assert type(route.get(INTENT_VERSION)) is int and route[INTENT_VERSION] == 2
     assert record['request'] == message and record['actor_id'] == ACTOR_ID and record['actor_role'] is Role.OPERATOR
     assert route['requested_mode'] == mode.value
     assert route['sandbox_profile'] == 'read_only' and route['requested_permissions'] == ['workspace.read']
@@ -48,6 +50,7 @@ def test_fresh_auto_route_has_both_independent_policies() -> None:
     route = repository.created[-1]['routing_decision']
     assert isinstance(route, dict)
     assert all(type(route[key]) is int and route[key] == 1 for key in FLAGS)
+    assert type(route.get(INTENT_VERSION)) is int and route[INTENT_VERSION] == 2
 
 
 @pytest.mark.parametrize('version', [None, 0, 1])
@@ -62,3 +65,16 @@ def test_budget_refresh_preserves_or_omits_policies_without_upgrading(version: i
         assert (key in refreshed) is (version is not None)
         if version is not None:
             assert refreshed[key] == version
+
+
+@pytest.mark.parametrize('version', [None, 1, 2])
+def test_budget_refresh_does_not_upgrade_maintenance_intent_version(version: int | None) -> None:
+    route: dict[str, object] = {'project_scale': 'medium'}
+    if version is not None:
+        route[INTENT_VERSION] = version
+    before = dict(route)
+    refreshed = _with_runtime_token_budget_policy(route, configured_tokens=100000, mode=TaskMode.DISPATCH)
+    assert route == before
+    assert (INTENT_VERSION in refreshed) is (version is not None)
+    if version is not None:
+        assert refreshed[INTENT_VERSION] == version
