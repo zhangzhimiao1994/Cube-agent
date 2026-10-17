@@ -70,10 +70,12 @@ def harness(*, pressure: bool = True) -> Observations:
 
 async def collect(
     responses: tuple[ModelResponse, ...], *, pressure: bool = True, enabled: bool = True,
+    round_continuation: bool = True,
 ) -> tuple[list[RunEvent], str | None, RuntimeCheckpoint, WorkspaceDeliverySequenceGateway, Observations]:
     gateway, tools = WorkspaceDeliverySequenceGateway(responses), harness(pressure=pressure)
     runtime = _workspace_delivery_sequence_runtime(gateway, tools, tools=TOOLS)
     stream = cast(CrewRunStream, runtime.run(context(pressure=pressure)))
+    stream._state.workspace_refresh_round_continuation = round_continuation
     if not enabled and hasattr(stream._state, "workspace_context_refresh"):
         stream._state.workspace_context_refresh = False
     events: list[RunEvent] = []
@@ -213,13 +215,14 @@ async def test_new_global_write_key_opens_another_bounded_epoch() -> None:
     assert len(gateway.requests) == len(responses)
 
 
-async def test_refresh_does_not_extend_active_round_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_legacy_refresh_does_not_extend_active_round_limit(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(adapter, "_tool_round_budget", lambda *args: adapter._ToolRoundBudget(5, 1, 30))
     responses = (*prefix(), observe("workspace.read", A), observe("workspace.read", B), *tail())
-    _events, reason, _checkpoint, gateway, tools = await collect(responses)
+    _events, reason, checkpoint, gateway, tools = await collect(responses, round_continuation=False)
     assert reason == "step capability round limit exceeded"
     assert len(gateway.requests) == 6
     assert len([call for call in tools.calls if call.tool_name == "workspace.read"]) == 3
+    assert "workspace_refresh_round_continuation" not in checkpoint.state
 
 
 def test_read_visibility_uses_only_complete_user_result_frames_not_progress_or_system_text() -> None:
@@ -416,7 +419,8 @@ async def test_internal_retry_refresh_does_not_extend_configured_limits(
                  observe("workspace.read", A), observe("workspace.read", B),
                  _workspace_delivery_bundle_response() if boundary == "rounds" else empty,
                  _workspace_delivery_bundle_response(), FINAL)
-    events, reason, checkpoint, gateway, tools = await collect(responses)
+    events, reason, checkpoint, gateway, tools = await collect(
+        responses, round_continuation=boundary != "rounds")
     assert reason == ("step capability round limit exceeded" if boundary == "rounds"
                       else "model response text is empty")
     assert len([event for event in events if event.kind is EventKind.STEP_RETRYING]) == 1

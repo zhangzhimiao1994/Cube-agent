@@ -4311,10 +4311,11 @@ def _capability_plan_item(
     capability_gateway: RuntimeCapabilityGatewayProtocol | None,
 ) -> Mapping[str, JsonValue]:
     replay_safe = _is_replay_safe_capability(name, capability_gateway=capability_gateway)
+    # Replay safety is not tenant/run-scoped authorization evidence.
     return {
         "name": name,
         "replay_safe": replay_safe,
-        "approval_policy": "not_required" if replay_safe else "runtime_policy",
+        "approval_policy": "runtime_policy",
     }
 
 

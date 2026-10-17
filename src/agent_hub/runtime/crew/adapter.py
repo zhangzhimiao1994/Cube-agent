@@ -3774,6 +3774,7 @@ class _RunState:
     workspace_meaningful_progress: bool = True
     workspace_feedback_retention: bool = True
     workspace_context_refresh: bool = True
+    workspace_refresh_round_continuation: bool = True
     builtin_tool_input_contract: bool = True
     incomplete_recovery_output_growth: bool = True
     first_tool_incomplete_recovery_output_growth: bool = True
@@ -4106,6 +4107,9 @@ class CrewDispatchRuntime:
                 )
                 state.workspace_context_refresh = cast(
                     bool, restored.state.get("workspace_context_refresh", False),
+                )
+                state.workspace_refresh_round_continuation = cast(
+                    bool, restored.state.get("workspace_refresh_round_continuation", False),
                 )
                 state.builtin_tool_input_contract = cast(
                     bool, restored.state.get("builtin_tool_input_contract", False),
@@ -8557,7 +8561,10 @@ class CrewDispatchRuntime:
             if reused_generated_file_results == len(response.tool_calls):
                 return _generated_file_ready_completion(completion, response)
             force_result_synthesis = reused_result_count == len(response.tool_calls)
-            last_round_progressed = round_progressed
+            last_round_progressed = round_progressed or (
+                run_state.workspace_refresh_round_continuation
+                and context_refresh and round_context_refreshed
+            )
             messages.append(
                 ModelMessage(
                     role="system",
@@ -9805,6 +9812,9 @@ class CrewDispatchRuntime:
                    if any(_is_incremental_workspace_contract_step(step) for step in plan.steps) else {}),
                 **({"workspace_context_refresh": run_state.workspace_context_refresh}
                    if any(_is_incremental_workspace_contract_step(step) for step in plan.steps) else {}),
+                **({"workspace_refresh_round_continuation": True}
+                   if run_state.workspace_refresh_round_continuation
+                   and meaningful_progress and run_state.workspace_context_refresh else {}),
                 "incomplete_recovery_output_growth": run_state.incomplete_recovery_output_growth,
                 "initial_incomplete_chain_growth": run_state.initial_incomplete_chain_growth,
                 **({"post_tool_finalization_growth_version": 1}
@@ -9916,6 +9926,7 @@ class CrewDispatchRuntime:
             "workspace_meaningful_progress",
             "workspace_feedback_retention",
             "workspace_context_refresh",
+            "workspace_refresh_round_continuation",
             "builtin_tool_input_contract",
             "incomplete_recovery_output_growth",
             "first_tool_incomplete_recovery_output_growth",
@@ -9963,6 +9974,14 @@ class CrewDispatchRuntime:
             or type(state.get("workspace_context_refresh", False)) is not bool
             or (state.get("workspace_context_refresh", False)
                 and checkpoint.runtime_version != _RUNTIME_VERSION)
+            or type(state.get("workspace_refresh_round_continuation", False)) is not bool
+            or (state.get("workspace_refresh_round_continuation", False) and (
+                checkpoint.runtime_version != _RUNTIME_VERSION
+                or state.get("workspace_delivery_continuation") is not True
+                or state.get("workspace_meaningful_progress") is not True
+                or state.get("workspace_context_refresh") is not True
+                or not any(_is_incremental_workspace_contract_step(step) for step in plan.steps)
+            ))
             or type(state.get("workspace_feedback_retention", False)) is not bool
             or (state.get("workspace_feedback_retention", False)
                 and checkpoint.runtime_version != _RUNTIME_VERSION)

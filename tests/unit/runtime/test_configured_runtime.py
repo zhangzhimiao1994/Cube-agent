@@ -4050,7 +4050,7 @@ async def test_config_backed_dispatch_runtime_exposes_capability_execution_plan(
                     {
                         "name": "read_context",
                         "replay_safe": True,
-                        "approval_policy": "not_required",
+                        "approval_policy": "runtime_policy",
                     },
                     {
                         "name": "docx",
