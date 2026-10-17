@@ -17,6 +17,7 @@ from openai import (
 )
 
 from agent_hub.models.failure_receipt import _valid_usage
+from agent_hub.models.native_messages import NativeAssistantMessage, NativeToolCall
 from agent_hub.models.responses import (
     ResponsesContractError,
     parse_response,
@@ -36,6 +37,8 @@ from agent_hub.models.types import (
     ToolCall,
     ToolDefinition,
     _freeze_json,
+    model_message_payload,
+    native_request_compatible,
 )
 
 _SAFE_PROVIDER_VALUE = re.compile(r"^[A-Za-z0-9_./:-]{1,256}$")
@@ -218,18 +221,7 @@ def _json_mutable(value: JsonValue) -> object:
 
 
 def _messages(request: ModelRequest) -> list[dict[str, object]]:
-    normalized: list[dict[str, object]] = []
-    for message in request.messages:
-        content: object
-        if isinstance(message.content, str):
-            content = message.content
-        else:
-            content = [
-                {key: _json_mutable(cast(JsonValue, item)) for key, item in part.items()}
-                for part in message.content
-            ]
-        normalized.append({"role": message.role, "content": content})
-    return normalized
+    return [model_message_payload(message) for message in request.messages]
 
 
 def _tools(tools: Sequence[ToolDefinition]) -> list[dict[str, object]]:
@@ -269,6 +261,11 @@ def _safe_provider_string(
 def _sensitive_values(request: ModelRequest, api_key: str) -> tuple[str, ...]:
     values = [api_key]
     for message in request.messages:
+        if message.native_assistant is not None:
+            native = message.native_assistant
+            values.extend(value for value in (native.content, native.reasoning_content) if value)
+            for call in native.tool_calls:
+                values.extend((call.id, call.arguments))
         if isinstance(message.content, str):
             values.append(message.content)
             continue
@@ -289,6 +286,8 @@ def _validate_transport_request(
     request: ModelRequest,
     api_key: str,
 ) -> Exception | None:
+    if not native_request_compatible(deployment, request):
+        return ValueError("native continuation deployment or protocol is incompatible")
     if not api_key or not api_key.strip():
         return ValueError("API key must not be blank")
     if request.response_schema is not None and (
@@ -306,6 +305,10 @@ def _chat_completion_create_kwargs(
     *,
     stream: bool,
 ) -> dict[str, object]:
+    if not native_request_compatible(deployment, request):
+        raise ValueError("native continuation deployment or protocol is incompatible")
+    if stream and request.native_tool_continuation:
+        raise ValueError("native continuation streaming is unsupported")
     create_kwargs: dict[str, object] = {
         "model": deployment.request_model or deployment.provider_model,
         "messages": _messages(request),
@@ -446,7 +449,11 @@ def _parse_response(
     response: object,
     deployment_id: str,
     sensitive_values: Sequence[str],
+    *,
+    native_tool_continuation: bool = False,
 ) -> ModelResponse:
+    if type(native_tool_continuation) is not bool:
+        raise ValueError("native capture flag must be a boolean")
     # Accounting evidence is independent of whether any output can be accepted.
     raw_usage = _attribute(response, "usage")
     usage: TokenUsage | None = None
@@ -502,9 +509,24 @@ def _parse_response(
         reason = "invalid_tool"
         tool_calls = _parse_tool_calls(_attribute(message, "tool_calls"), deployment_id)
         reason = "invalid_output"
+        native: NativeAssistantMessage | None = None
+        if native_tool_continuation:
+            if _attribute(message, "role") != "assistant":
+                raise rejected(reason)
+            raw_calls = cast(Sequence[object], _attribute(message, "tool_calls") or ())
+            if any(_attribute(raw_call, "type") != "function" for raw_call in raw_calls):
+                raise rejected("invalid_tool")
+            native = NativeAssistantMessage(
+                deployment_id, content, tuple(
+                    NativeToolCall(call.id, call.name, cast(str, _attribute(
+                        _attribute(raw_call, "function"), "arguments")))
+                    for call, raw_call in zip(tool_calls, raw_calls, strict=True)
+                ), cast(str | None, _attribute(message, "reasoning_content")),
+            )
         return ModelResponse(
             text=content, tool_calls=tool_calls, usage=usage,
             provider_metadata=_metadata(response, choice, sensitive_values),
+            native_assistant=native,
         )
     except (ModelResponseError, TypeError, ValueError, RecursionError, OverflowError):
         raise rejected(reason, choice=choice, content=content) from None
@@ -775,6 +797,8 @@ class LiteLLMClient:
         request: ModelRequest,
         api_key: str,
     ) -> AsyncIterator[object]:
+        if request.native_tool_continuation:
+            raise ValueError("native continuation streaming is unsupported")
         validation_error = _validate_transport_request(deployment, request, api_key)
         if validation_error is not None:
             raise validation_error
@@ -822,7 +846,8 @@ class LiteLLMClient:
                 stream=False,
             )
             response = await client.chat.completions.create(**create_kwargs)
-            parsed = _parse_response(response, deployment.id, sensitive_values)
+            parsed = _parse_response(response, deployment.id, sensitive_values,
+                                     native_tool_continuation=request.native_tool_continuation)
         except asyncio.CancelledError:
             await _close_ignoring_failures(client)
             return _CANCELLED
@@ -838,7 +863,8 @@ class LiteLLMClient:
                 legacy_kwargs["max_tokens"] = legacy_kwargs.pop("max_completion_tokens")
                 try:
                     response = await client.chat.completions.create(**legacy_kwargs)
-                    parsed = _parse_response(response, deployment.id, sensitive_values)
+                    parsed = _parse_response(response, deployment.id, sensitive_values,
+                                             native_tool_continuation=request.native_tool_continuation)
                 except asyncio.CancelledError:
                     await _close_ignoring_failures(client)
                     return _CANCELLED
@@ -864,7 +890,8 @@ class LiteLLMClient:
                 )
                 try:
                     response = await client.chat.completions.create(**create_kwargs)
-                    parsed = _parse_response(response, deployment.id, sensitive_values)
+                    parsed = _parse_response(response, deployment.id, sensitive_values,
+                                             native_tool_continuation=request.native_tool_continuation)
                 except asyncio.CancelledError:
                     await _close_ignoring_failures(client)
                     return _CANCELLED

@@ -126,7 +126,7 @@ def test_migration_extends_verified_question_search_head(migration: ModuleType) 
     assert len(migration.revision) <= 32
     assert migration.down_revision == previous.revision
     scripts = ScriptDirectory.from_config(_config())
-    assert scripts.get_heads() == [migration.revision]
+    assert migration.revision in {entry.revision for entry in scripts.walk_revisions()}
     assert scripts.get_revision(migration.revision).down_revision == previous.revision
 
 

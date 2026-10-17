@@ -19,7 +19,7 @@ from agent_hub.capabilities.scoped_read import (
     authorized_workspace_scope,
     read_scoped_file,
 )
-from agent_hub.models.types import ModelRequest
+from agent_hub.models.types import ModelMessage, ModelRequest, model_message_payload
 
 MAX_SOURCE_BYTES = 8192
 _PATHS: tuple[Literal["AGENTS.md", "SKILL.md"], ...] = ("AGENTS.md", "SKILL.md")
@@ -30,8 +30,12 @@ def _sha(data: bytes) -> str:
 
 
 def _request_json(value: object) -> object:
+    if isinstance(value, ModelMessage):
+        return _request_json(model_message_payload(value))
     if is_dataclass(value) and not isinstance(value, type):
-        return {item.name: _request_json(getattr(value, item.name)) for item in fields(value)}
+        return {item.name: _request_json(getattr(value, item.name)) for item in fields(value)
+                if not (isinstance(value, ModelRequest) and item.name == "native_tool_continuation"
+                        and value.native_tool_continuation is False)}
     if isinstance(value, Mapping):
         return {key: _request_json(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):

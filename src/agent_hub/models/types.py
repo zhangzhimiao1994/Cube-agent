@@ -9,6 +9,8 @@ from types import MappingProxyType
 from typing import Literal, cast
 from urllib.parse import urlsplit
 
+from agent_hub.models.native_messages import NativeAssistantMessage
+
 _SAFE_IDENTIFIER = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 _SAFE_SCHEMA_NAME = re.compile(r"^[A-Za-z0-9_-]+$")
 _MAX_IDENTIFIER_LENGTH = 128
@@ -254,9 +256,21 @@ class Deployment:
 class ModelMessage:
     role: str
     content: MessageContent = field(repr=False)
+    native_assistant: NativeAssistantMessage | None = field(default=None, repr=False)
+    tool_call_id: str | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         _require_unpadded("role", self.role, max_length=64)
+        if self.native_assistant is not None and (
+            type(self.native_assistant) is not NativeAssistantMessage or self.role != "assistant"
+            or self.tool_call_id is not None
+            or self.content != (self.native_assistant.content or "")
+        ):
+            raise ValueError("native assistant message is invalid")
+        if self.tool_call_id is not None:
+            if self.role != "tool" or not isinstance(self.content, str):
+                raise ValueError("native tool result is invalid")
+            _require_unpadded("tool call id", self.tool_call_id, max_length=512)
         if isinstance(self.content, str):
             return
         if not isinstance(self.content, list | tuple):
@@ -313,9 +327,12 @@ class ModelRequest:
     max_output_tokens: int = 4096
     response_schema: StructuredResponseSchema | None = field(default=None, repr=False)
     tools: tuple[ToolDefinition, ...] = field(default_factory=tuple, repr=False)
+    native_tool_continuation: bool = False
 
     def __post_init__(self) -> None:
         _require_safe_identifier("logical_model", self.logical_model)
+        if type(self.native_tool_continuation) is not bool:
+            raise ValueError("native_tool_continuation must be a boolean")
         if (
             isinstance(self.timeout_seconds, bool)
             or not isinstance(self.timeout_seconds, int | float)
@@ -337,6 +354,16 @@ class ModelRequest:
         messages = tuple(self.messages)
         if not all(isinstance(message, ModelMessage) for message in messages):
             raise ValueError("messages must contain only ModelMessage values")
+        if not self.native_tool_continuation and any(
+            message.native_assistant is not None or message.tool_call_id is not None
+            for message in messages
+        ):
+            raise ValueError("native messages require explicit opt-in")
+        if len({message.native_assistant.deployment_id for message in messages
+                if message.native_assistant is not None}) > 1:
+            raise ValueError("native history contains incompatible deployments")
+        if self.native_tool_continuation:
+            _validate_native_message_history(messages)
         tools = tuple(self.tools)
         if not all(isinstance(tool, ToolDefinition) for tool in tools):
             raise ValueError("tools must contain only ToolDefinition values")
@@ -456,8 +483,11 @@ class ModelResponse:
     provider_metadata: Mapping[str, JsonScalar] = field(
         default_factory=lambda: MappingProxyType({}), repr=False
     )
+    native_assistant: NativeAssistantMessage | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
+        if self.native_assistant is not None and type(self.native_assistant) is not NativeAssistantMessage:
+            raise ValueError("native response must be a trusted message")
         if self.text is not None and not isinstance(self.text, str):
             raise TypeError("response text must be a string or None")
         tool_calls = tuple(self.tool_calls)
@@ -491,6 +521,56 @@ class ModelResponse:
             "provider_metadata",
             MappingProxyType(metadata),
         )
+
+
+def _validate_native_message_history(messages: tuple[ModelMessage, ...]) -> None:
+    pending: set[str] = set()
+    seen: set[str] = set()
+    for message in messages:
+        native = message.native_assistant
+        if native is not None:
+            identifiers = {call.id for call in native.tool_calls}
+            if pending or identifiers & seen:
+                raise ValueError("native call/result group is invalid")
+            pending = identifiers
+            seen.update(identifiers)
+        elif message.tool_call_id is not None:
+            if message.tool_call_id not in pending:
+                raise ValueError("native tool result is unbound or duplicated")
+            pending.remove(message.tool_call_id)
+        elif message.role == "tool" or (pending and message.role != "system"):
+            raise ValueError("native call/result group is incomplete")
+    if pending:
+        raise ValueError("native call/result group is incomplete")
+
+
+def model_message_payload(message: ModelMessage) -> dict[str, object]:
+    """Private wire/hash/accounting shape; never a public event projection."""
+    if message.native_assistant is not None:
+        return message.native_assistant.to_wire()
+
+    def mutable(value: object) -> object:
+        if isinstance(value, Mapping):
+            return {key: mutable(item) for key, item in value.items()}
+        if isinstance(value, tuple | list):
+            return [mutable(item) for item in value]
+        return value
+
+    payload = {"role": message.role, "content": mutable(message.content)}
+    if message.tool_call_id is not None:
+        payload["tool_call_id"] = message.tool_call_id
+    return payload
+
+
+def native_request_compatible(deployment: Deployment, request: ModelRequest) -> bool:
+    """Native private history stays on its exact Chat deployment."""
+    if not request.native_tool_continuation:
+        return True
+    return (deployment.structured_output_api == "chat_completions"
+            and not is_messages_endpoint_api_base(deployment.api_base)
+            and all(message.native_assistant is None
+                    or message.native_assistant.deployment_id == deployment.id
+                    for message in request.messages))
 
 
 ModelMessage.__hash__ = None  # type: ignore[assignment]

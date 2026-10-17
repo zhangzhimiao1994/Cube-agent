@@ -184,6 +184,22 @@ def test_nested_event_artifacts_match_direct_projection_without_resanitizing_met
     assert payload == before
 
 
+@pytest.mark.parametrize("key", [
+    "reasoning_content", "Reasoning_Content", "provider_continuation", "native_assistant",
+])
+def test_provider_continuation_is_never_published_as_event_or_nested_artifact(key: str) -> None:
+    payload: dict[str, object] = {
+        "kind": "model.completed",
+        "payload": {"items": [{key: "PRIVATE_PROVIDER_CONTINUATION", "text": "Done."}]},
+        key: "PRIVATE_PROVIDER_CONTINUATION",
+    }
+    before = deepcopy(payload)
+    public = _public_event_payload(payload)
+    assert "PRIVATE_PROVIDER_CONTINUATION" not in json.dumps(public)
+    assert public["payload"] == {"items": [{"text": "Done."}]}
+    assert payload == before
+
+
 async def test_repository_public_events_and_artifact_lists_share_projection_and_preserve_raw() -> None:
     tenant_id, run_id = uuid4(), uuid4()
     artifact = model_response()

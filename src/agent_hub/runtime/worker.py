@@ -29,6 +29,7 @@ from agent_hub.plugins.runtime import (
     build_plugin_package_subprocess_adapters,
 )
 from agent_hub.runs.artifacts import PostgresArtifactRepository
+from agent_hub.runs.provider_continuation import PostgresProviderContinuationRepository
 from agent_hub.runs.repository import RunRepository
 from agent_hub.runs.service import RunService
 from agent_hub.runtime.defaults import configured_runtime_registry
@@ -360,6 +361,7 @@ def build_worker_service(
             capability_gateway=runtime_capability_stack.runtime_gateway,
             harness_tool_gateway=runtime_capability_stack.harness_tool_gateway,
             artifact_repository=PostgresArtifactRepository(database.session_factory),
+            provider_continuation_repository=PostgresProviderContinuationRepository(database.session_factory),
         ),
         router=None,
         task_queue=queue,

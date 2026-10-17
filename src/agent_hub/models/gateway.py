@@ -51,6 +51,8 @@ from agent_hub.models.types import (
     RejectedOutputEvidence,
     TokenUsage,
     _require_safe_identifier,
+    model_message_payload,
+    native_request_compatible,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -528,7 +530,7 @@ class ConservativeTokenEstimator:
         payload: dict[str, object] = {
             "logical_model": request.logical_model,
             "messages": [
-                {"role": message.role, "content": self._mutable_json(message.content)}
+                model_message_payload(message)
                 for message in request.messages
             ],
             "required_capabilities": sorted(str(item) for item in request.required_capabilities),
@@ -542,6 +544,11 @@ class ConservativeTokenEstimator:
                 "name": request.response_schema.name,
                 "schema": self._mutable_json(request.response_schema.schema),
             }
+        if request.native_tool_continuation and request.tools:
+            payload["tools"] = [{"type": "function", "function": {
+                "name": tool.name, "description": tool.description,
+                "parameters": self._mutable_json(tool.parameters),
+            }} for tool in request.tools]
         normalized = json.dumps(
             payload,
             ensure_ascii=False,
@@ -1128,6 +1135,17 @@ class ModelGateway:
             return next(iter(unique_estimates))
         return MappingProxyType(estimates)
 
+    def supports_native_tool_continuation(self, request: ModelRequest) -> bool:
+        """Opt in without removing an existing protocol or fallback candidate."""
+        if any(message.native_assistant is not None for message in request.messages):
+            return True
+        try:
+            groups, _, _, _ = self._capable_candidate_groups(replace(request, native_tool_continuation=False))
+        except NoCapableDeployment:
+            return False
+        native = replace(request, native_tool_continuation=True)
+        return bool(groups) and all(native_request_compatible(item, native) for _, group in groups for item in group)
+
     def _capable_candidate_groups(
         self, request: ModelRequest
     ) -> tuple[
@@ -1144,6 +1162,10 @@ class ModelGateway:
                 candidates = self._registry.candidates(
                     logical_model, request.required_capabilities
                 )
+                if request.native_tool_continuation:
+                    candidates = tuple(item for item in candidates if native_request_compatible(item, request))
+                    if not candidates:
+                        raise NoCapableDeployment("native continuation has no compatible Chat deployment")
             except NoCapableDeployment as error:
                 if first_capability_error is None:
                     first_capability_error = error

@@ -135,6 +135,9 @@ _SENSITIVE_PUBLIC_KEYS = frozenset(
         "storage_key",
         "hidden_reasoning",
         "chain_of_thought",
+        "reasoning_content",
+        "provider_continuation",
+        "native_assistant",
     }
 )
 _SENSITIVE_PUBLIC_TEXT = re.compile(

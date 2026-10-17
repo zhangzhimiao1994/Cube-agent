@@ -392,6 +392,28 @@ class RuntimeArtifactRow(Base):
     permanent: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
 
 
+class ProviderContinuationRow(Base):
+    """Private provider bytes only; never joined into public run artifacts/events."""
+
+    __tablename__ = "agent_hub_provider_continuations"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "run_id", "ledger_key", name="uq_provider_continuations_ledger"),
+        CheckConstraint("byte_size > 0 AND byte_size <= 1048576", name="ck_provider_continuation_size"),
+        CheckConstraint("octet_length(payload) = byte_size", name="ck_provider_continuation_payload_size"),
+        CheckConstraint("sha256 ~ '^[0-9a-f]{64}$'", name="ck_provider_continuation_sha256"),
+        CheckConstraint("ledger_key ~ '^[a-z0-9][a-z0-9_.:-]{0,127}$'", name="ck_provider_continuation_ledger"),
+        Index("ix_provider_continuations_run", "tenant_id", "run_id"),
+    )
+
+    id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), primary_key=True)
+    tenant_id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), nullable=False)
+    run_id: Mapped[UUID] = mapped_column(ForeignKey("agent_hub_runs.id", ondelete="CASCADE"), nullable=False)
+    ledger_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    payload: Mapped[str] = mapped_column(Text, nullable=False)
+    byte_size: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+
 class RuntimeArtifactWriteRow(Base):
     """Durable owners and abort fences, independent of artifact row lifetime."""
 

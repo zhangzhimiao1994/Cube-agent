@@ -9,7 +9,7 @@ import json
 import logging
 import re
 from collections.abc import AsyncIterator, Mapping
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import dataclass, field, replace
 from typing import Never, Protocol, cast
 from uuid import UUID, uuid4
 
@@ -43,6 +43,7 @@ from agent_hub.runtime.contracts import (
 )
 from agent_hub.runtime.failure_reason import safe_model_gateway_failure_reason
 from agent_hub.runtime.hermes_context import runtime_memory_context_text
+from agent_hub.runtime.instruction_context import model_request_sha256
 from agent_hub.runtime.model_scope import ModelScopeTracker
 from agent_hub.runtime.project_preflight_context import project_preflight_context_text
 from agent_hub.runtime.project_scale_artifact import (
@@ -1691,14 +1692,7 @@ class DirectRuntime:
                 if not submission_started:
                     await gateway_task
                     raise RuntimeExecutionError("model request was not submitted")
-                request_payload = asdict(request)
-                request_payload["required_capabilities"] = sorted(
-                    item.value for item in request.required_capabilities
-                )
-                request_sha256 = hashlib.sha256(json.dumps(
-                    request_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
-                ).encode("utf-8")).hexdigest()
-                del request_payload
+                request_sha256 = model_request_sha256(request)
                 yield RunEvent(
                     kind="context.injected", sequence=1, run_id=context.run_id,
                     payload=cast(dict[str, JsonValue], instructions.injection_metadata(

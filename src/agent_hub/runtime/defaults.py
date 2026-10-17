@@ -97,9 +97,14 @@ _LOGGER = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from agent_hub.runtime.autogen.adapter import DiscussionPlan
+    from agent_hub.runtime.provider_continuation import ProviderContinuationRepository
 
 class _WorkspaceMaintenanceStepOptions(TypedDict, total=False):
     workspace_maintenance_contract_version: Literal[1]
+
+
+class _ProviderContinuationRuntimeOptions(TypedDict, total=False):
+    provider_continuation_repository: ProviderContinuationRepository
 
 
 _DEFAULT_DISPATCH_STEP_COST_BUDGET_USD = Decimal(10)
@@ -926,6 +931,7 @@ class ConfigBackedDispatchRuntime:
         capability_gateway: RuntimeCapabilityGatewayProtocol | None = None,
         harness_tool_gateway: HarnessToolInvoker | None = None,
         artifact_repository: ArtifactRepository | None = None,
+        provider_continuation_repository: ProviderContinuationRepository | None = None,
     ) -> None:
         self._config_service = config_service
         self._secret_service = secret_service
@@ -935,6 +941,7 @@ class ConfigBackedDispatchRuntime:
         self._capability_gateway = capability_gateway
         self._harness_tool_gateway = harness_tool_gateway
         self._artifact_repository = artifact_repository
+        self._provider_continuation_repository = provider_continuation_repository
         self._pending_checkpoints: dict[UUID, RuntimeCheckpoint] = {}
         self._active: dict[tuple[UUID, UUID], ExecutionRuntime] = {}
 
@@ -1078,6 +1085,9 @@ class ConfigBackedDispatchRuntime:
             capability_gateway=self._capability_gateway,
             harness_tool_gateway=self._harness_tool_gateway,
             artifact_repository=self._artifact_repository,
+            **cast(_ProviderContinuationRuntimeOptions,
+                   {"provider_continuation_repository": self._provider_continuation_repository}
+                   if self._provider_continuation_repository is not None else {}),
         )
         if self._harness_tool_gateway is not None and _is_project_scale_artifact_request(context):
             dispatch_runtime = ProjectScaleArtifactPreseedRuntime(
@@ -1294,6 +1304,7 @@ class ConfigBackedHybridRuntime:
         capability_gateway: RuntimeCapabilityGatewayProtocol | None = None,
         harness_tool_gateway: HarnessToolInvoker | None = None,
         artifact_repository: ArtifactRepository | None = None,
+        provider_continuation_repository: ProviderContinuationRepository | None = None,
     ) -> None:
         self._config_service = config_service
         self._secret_service = secret_service
@@ -1303,6 +1314,7 @@ class ConfigBackedHybridRuntime:
         self._capability_gateway = capability_gateway
         self._harness_tool_gateway = harness_tool_gateway
         self._artifact_repository = artifact_repository
+        self._provider_continuation_repository = provider_continuation_repository
         self._pending_checkpoints: dict[UUID, RuntimeCheckpoint] = {}
         self._active: dict[tuple[UUID, UUID], ExecutionRuntime] = {}
 
@@ -1518,6 +1530,9 @@ class ConfigBackedHybridRuntime:
             capability_gateway=self._capability_gateway,
             harness_tool_gateway=self._harness_tool_gateway,
             artifact_repository=self._artifact_repository,
+            **cast(_ProviderContinuationRuntimeOptions,
+                   {"provider_continuation_repository": self._provider_continuation_repository}
+                   if self._provider_continuation_repository is not None else {}),
         )
         if self._harness_tool_gateway is not None and _is_project_scale_artifact_request(context):
             dispatch_runtime = ProjectScaleArtifactPreseedRuntime(
@@ -4893,6 +4908,7 @@ def configured_runtime_registry(
     capability_gateway: RuntimeCapabilityGatewayProtocol | None = None,
     harness_tool_gateway: HarnessToolInvoker | None = None,
     artifact_repository: ArtifactRepository | None = None,
+    provider_continuation_repository: ProviderContinuationRepository | None = None,
 ) -> RuntimeRegistry:
     async def capacity_factory(
         tenant_id: UUID,
@@ -4924,6 +4940,7 @@ def configured_runtime_registry(
                 capability_gateway=capability_gateway,
                 harness_tool_gateway=harness_tool_gateway,
                 artifact_repository=artifact_repository,
+                provider_continuation_repository=provider_continuation_repository,
             ),
             ConfigBackedDiscussionRuntime(
                 config_service=config_service,
@@ -4941,6 +4958,7 @@ def configured_runtime_registry(
                 capability_gateway=capability_gateway,
                 harness_tool_gateway=harness_tool_gateway,
                 artifact_repository=artifact_repository,
+                provider_continuation_repository=provider_continuation_repository,
             ),
         )
     )

@@ -136,6 +136,7 @@ from agent_hub.routing.types import (
 from agent_hub.runs.artifacts import PostgresArtifactRepository
 from agent_hub.runs.conversation_queue import ConversationQueueRepository
 from agent_hub.runs.conversations import ConversationRepository
+from agent_hub.runs.provider_continuation import PostgresProviderContinuationRepository
 from agent_hub.runs.repository import RunRepository
 from agent_hub.runs.service import (
     HarnessSchedulerProtocol,
@@ -1616,6 +1617,7 @@ def create_app(
                         capability_gateway=runtime_capability_stack.runtime_gateway,
                         harness_tool_gateway=runtime_capability_stack.harness_tool_gateway,
                         artifact_repository=PostgresArtifactRepository(active_sessions),
+                        provider_continuation_repository=PostgresProviderContinuationRepository(active_sessions),
                     )
                 if active_mode_router is None and active_secret_service is not None:
                     assert active_redis is not None
