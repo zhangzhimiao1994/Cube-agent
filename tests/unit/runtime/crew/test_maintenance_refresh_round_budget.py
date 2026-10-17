@@ -146,6 +146,8 @@ def checkpoint_flag(checkpoint: RuntimeCheckpoint, value: JsonValue) -> RuntimeC
     payload = checkpoint.to_payload()
     state = cast(dict[str, JsonValue], payload["state"])
     state.pop(FLAG, None)
+    if value is not True:
+        state.pop("workspace_productive_boundary", None)
     if value is not None:
         state[FLAG] = value
     payload["state_sha256"] = ""

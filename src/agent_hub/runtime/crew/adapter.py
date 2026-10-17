@@ -3747,6 +3747,7 @@ class _RunState:
     workspace_feedback_retention: bool = True
     workspace_context_refresh: bool = True
     workspace_refresh_round_continuation: bool = True
+    workspace_productive_boundary: bool = True
     native_tool_continuation: bool = False
     builtin_tool_input_contract: bool = True
     incomplete_recovery_output_growth: bool = True
@@ -4086,6 +4087,9 @@ class CrewDispatchRuntime:
                 )
                 state.workspace_refresh_round_continuation = cast(
                     bool, restored.state.get("workspace_refresh_round_continuation", False),
+                )
+                state.workspace_productive_boundary = cast(
+                    bool, restored.state.get("workspace_productive_boundary", False),
                 )
                 state.native_tool_continuation = cast(
                     bool, restored.state.get("native_tool_continuation", False),
@@ -7342,6 +7346,7 @@ class CrewDispatchRuntime:
         round_budget = _tool_round_budget(context, step)
         active_round_limit = round_budget.initial_limit
         last_round_progressed = True
+        productive_boundary_spent = False
         force_result_synthesis = False
         workspace_continuation = (
             run_state.workspace_delivery_continuation
@@ -7739,6 +7744,24 @@ class CrewDispatchRuntime:
                         active_round_limit + round_budget.extension_size,
                         round_budget.hard_limit,
                     )
+                elif (active_round_limit < round_budget.hard_limit
+                      and context_refresh and run_state.workspace_productive_boundary
+                      and run_state.workspace_refresh_round_continuation
+                      and not productive_boundary_spent):
+                    from agent_hub.runtime.crew.workspace_boundary import (
+                        productive_workspace_proposal,
+                    )
+
+                    if not productive_workspace_proposal(
+                        calls=response.tool_calls, planned_tools=step.tools,
+                        step_id=step.id, actor=step.agent, attempt=model_attempt, round_index=_round,
+                        states=tool_ledger.states, artifacts=tool_ledger.artifacts,
+                    ):
+                        _fail("step capability round limit exceeded")
+                    # One execution opportunity, not progress, authorization or a
+                    # window of speculative reads. Replay derives it from prefix only.
+                    productive_boundary_spent = True
+                    active_round_limit += 1
                 else:
                     reusable_results = tuple(
                         reusable_generated_file_result(
@@ -8613,6 +8636,19 @@ class CrewDispatchRuntime:
                 evidence.append(artifact)
                 results.append({"name": tool_call.name, "result": result})
                 record_round_progress(artifact)
+            if productive_boundary_spent:
+                from agent_hub.runtime.crew.workspace_boundary import (
+                    productive_workspace_success,
+                )
+
+                if productive_workspace_success(
+                    calls=response.tool_calls, planned_tools=step.tools,
+                    step_id=step.id, actor=step.agent, attempt=model_attempt, round_index=_round,
+                    states=tool_ledger.states, artifacts=tool_ledger.artifacts,
+                ):
+                    # Exact successful receipts reset the phase, including during
+                    # replay. Reads, proposals and rejected/unknown calls cannot.
+                    productive_boundary_spent = False
             reused_result_count = reused_generated_file_results + reused_semantic_results
             native_feedback = run_state.native_tool_continuation and response.native_assistant is not None
             if native_feedback:
@@ -9947,6 +9983,11 @@ class CrewDispatchRuntime:
                 "plan_digest": plan.digest,
                 "workspace_delivery_continuation": run_state.workspace_delivery_continuation,
                 **({"native_tool_continuation": True} if run_state.native_tool_continuation else {}),
+                **({"workspace_productive_boundary": True}
+                   if run_state.workspace_productive_boundary and meaningful_progress
+                   and run_state.workspace_context_refresh
+                   and run_state.workspace_refresh_round_continuation
+                   and any(_is_incremental_workspace_contract_step(step) for step in plan.steps) else {}),
                 **({"builtin_tool_input_contract": run_state.builtin_tool_input_contract}
                    if any(builtin_tool_input_schema(name) is not None for step in plan.steps for name in step.tools) else {}),
                 **({"workspace_meaningful_progress": meaningful_progress}
@@ -10065,6 +10106,7 @@ class CrewDispatchRuntime:
             "audit_overflow",
         }
         optional_state_keys = {
+            "workspace_productive_boundary",
             "native_tool_continuation",
             "repair_reopened_contract_ids", "workspace_delivery_continuation",
             "workspace_meaningful_progress",
@@ -10105,6 +10147,15 @@ class CrewDispatchRuntime:
         timeout_progress_units = state.get("timeout_progress_units")
         if (
             type(state.get("native_tool_continuation", False)) is not bool
+            or type(state.get("workspace_productive_boundary", False)) is not bool
+            or (state.get("workspace_productive_boundary", False) and (
+                checkpoint.runtime_version != _RUNTIME_VERSION
+                or state.get("workspace_delivery_continuation") is not True
+                or state.get("workspace_meaningful_progress") is not True
+                or state.get("workspace_context_refresh") is not True
+                or state.get("workspace_refresh_round_continuation") is not True
+                or not any(_is_incremental_workspace_contract_step(step) for step in plan.steps)
+            ))
             or (state.get("native_tool_continuation", False)
                 and checkpoint.runtime_version != _RUNTIME_VERSION)
             or ("post_tool_finalization_growth_version" in state and (
