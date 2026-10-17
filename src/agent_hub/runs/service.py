@@ -627,6 +627,8 @@ class RunService:
         operator_selection: dict[str, object] = {
             "requested_mode": requested_mode.value,
             "role_planning_intent_version": 1,
+            "workspace_maintenance_contract_version": 1,
+            "post_tool_finalization_growth_version": 1,
             "selected_agent_ids": list(agent_ids),
             "workflow_id": workflow_id,
             "allow_workflow_adjustment": allow_workflow_adjustment,

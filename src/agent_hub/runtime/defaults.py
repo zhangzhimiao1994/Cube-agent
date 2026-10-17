@@ -11,7 +11,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequenc
 from dataclasses import dataclass, replace
 from decimal import Decimal
 from threading import RLock
-from typing import TYPE_CHECKING, Literal, Protocol, cast
+from typing import TYPE_CHECKING, Literal, Protocol, TypedDict, cast
 from uuid import UUID, uuid4
 
 from agent_hub.auth.models import Role
@@ -87,11 +87,20 @@ from agent_hub.runtime.self_repair_context import (
 )
 from agent_hub.runtime.streams import closing_runtime_events
 from agent_hub.security.secrets import SecretService
+from agent_hub.workspace_maintenance_contract import (
+    WORKSPACE_MAINTENANCE_CONTRACT_GUIDANCE,
+    workspace_maintenance_contract_active,
+    workspace_maintenance_contract_version,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from agent_hub.runtime.autogen.adapter import DiscussionPlan
+
+class _WorkspaceMaintenanceStepOptions(TypedDict, total=False):
+    workspace_maintenance_contract_version: Literal[1]
+
 
 _DEFAULT_DISPATCH_STEP_COST_BUDGET_USD = Decimal(10)
 _ROLE_PLANNING_TASK_MAX_CHARS = 2_000
@@ -972,6 +981,7 @@ class ConfigBackedDispatchRuntime:
         if config is None:
             return UnavailableRuntime(TaskMode.DISPATCH)
         intent_version = role_planning_intent_version(context.routing_decision)
+        workspace_maintenance_contract_version(context.routing_decision)
         try:
             gateway, logical_model, fallback_policy = await _gateway_for_config(
                 config,
@@ -1166,6 +1176,7 @@ class ConfigBackedDiscussionRuntime:
         if config is None:
             return UnavailableRuntime(TaskMode.DISCUSS)
         intent_version = role_planning_intent_version(context.routing_decision)
+        workspace_maintenance_contract_version(context.routing_decision)
         try:
             gateway, logical_model, fallback_policy = await _gateway_for_config(
                 config,
@@ -1338,6 +1349,7 @@ class ConfigBackedHybridRuntime:
         if config is None:
             return UnavailableRuntime(TaskMode.HYBRID)
         intent_version = role_planning_intent_version(context.routing_decision)
+        workspace_maintenance_contract_version(context.routing_decision)
         try:
             gateway, logical_model, fallback_policy = await _gateway_for_config(
                 config,
@@ -1694,7 +1706,11 @@ def _deployment_routing_constraint(
         raise HarnessModelSelectionError(str(error)) from error
 
 
-def _software_delivery_guidance(context: TaskContext, tools: tuple[str, ...]) -> str:
+def _software_delivery_guidance(
+    context: TaskContext, tools: tuple[str, ...], *, maintenance_producer: bool = False,
+) -> str:
+    if maintenance_producer and workspace_maintenance_contract_active(context.request, context.routing_decision, tools):
+        return "\n" + WORKSPACE_MAINTENANCE_CONTRACT_GUIDANCE + "\n"
     if (
         TaskProfile.SOFTWARE not in _task_profiles(
             context.request, intent_version=role_planning_intent_version(context.routing_decision),
@@ -1841,6 +1857,7 @@ def _dispatch_plan(
     config: PlatformConfig | None = None,
     deployment_constraint: DeploymentRoutingConstraint | None = None,
 ) -> DispatchPlan:
+    workspace_maintenance_contract_version(context.routing_decision)
     selected_roles = tuple(roles)
     if not selected_roles:
         selected_roles = (
@@ -1883,6 +1900,13 @@ def _dispatch_plan(
             capability_gateway=capability_gateway,
             include_request=role.id == request_owner,
         )
+        for role in selected_roles
+    }
+    maintenance_step_options: dict[str, _WorkspaceMaintenanceStepOptions] = {
+        role.id: {"workspace_maintenance_contract_version": 1}
+        if role.purpose is RolePurpose.EXECUTE and workspace_maintenance_contract_active(
+            context.request, context.routing_decision, role_tools_by_id[role.id],
+        ) else {}
         for role in selected_roles
     }
     role_fallbacks_by_id = role_fallbacks_by_id or {}
@@ -2057,7 +2081,7 @@ def _dispatch_plan(
                 f"{memory_guidance}"
                 f"{preflight_guidance}"
                 f"{_project_preflight_implementation_guidance(preflight_context)}"
-                f"{_software_delivery_guidance(context, role_tools_by_id[role.id])}"
+                f"{_software_delivery_guidance(context, role_tools_by_id[role.id], maintenance_producer=bool(maintenance_step_options[role.id]))}"
                 "Return only the role-specific result, evidence, risks, and verification."
             ),
             depends_on=_dispatch_step_dependencies(
@@ -2082,6 +2106,7 @@ def _dispatch_plan(
                 post_product_step_timeout=post_product_step_timeout,
             ),
             cost_budget_usd=step_cost_budget,
+            **maintenance_step_options[role.id],
         )
         for role in selected_roles
     )
@@ -2553,6 +2578,10 @@ def _role_allowed_tools(
             continue
         if callable(is_available) and is_available(context.tenant_id, name):
             filtered.append(name)
+    if role.purpose is RolePurpose.EXECUTE and workspace_maintenance_contract_active(
+        context.request, context.routing_decision, filtered,
+    ):
+        filtered = [name for name in filtered if name not in {"read_context", "project.generate_zip"}]
     if (
         role.id == "implementer"
         and "project.generate_zip" in filtered
