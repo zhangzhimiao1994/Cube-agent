@@ -3780,6 +3780,7 @@ class _RunState:
     incomplete_continuation_output_growth: bool = True
     initial_incomplete_chain_growth: bool = True
     post_tool_finalization_growth_version: int = 0
+    workspace_maintenance_feedback_version: int = 0
     deadline: float | None = None
     adaptive_deadline: AdaptiveDeadline | None = None
     crew_generation: CrewStepGeneration | None = None
@@ -4058,6 +4059,10 @@ class CrewDispatchRuntime:
             if type(growth_version) is not int or growth_version not in {0, 1}:
                 _fail("post-tool finalization growth version is invalid")
             state.post_tool_finalization_growth_version = growth_version
+            feedback_version = context.routing_decision.get("workspace_maintenance_feedback_version", 0)
+            if type(feedback_version) is not int or feedback_version not in {0, 1}:
+                _fail("workspace maintenance feedback version is invalid")
+            state.workspace_maintenance_feedback_version = feedback_version
             self._validate_checkpoint_metadata_budget(plan)
             loop_time = asyncio.get_running_loop().time()
             initial_timeout = min(context.timeout_seconds, plan.total_timeout_seconds)
@@ -4085,6 +4090,10 @@ class CrewDispatchRuntime:
                 )
                 if state.post_tool_finalization_growth_version and growth_version != 1:
                     _fail("post-tool finalization growth version changed")
+                # The stored policy, not a refreshed route, determines replay messages.
+                state.workspace_maintenance_feedback_version = cast(
+                    int, restored.state.get("workspace_maintenance_feedback_version", 0),
+                )
                 state.workspace_delivery_continuation = cast(
                     bool, restored.state.get("workspace_delivery_continuation", False),
                 )
@@ -5838,6 +5847,7 @@ class CrewDispatchRuntime:
         *,
         limits: _CrewContentLimits | None = None,
         preserve_feedback: bool = False,
+        preserve_maintenance_control: bool = False,
     ) -> tuple[ModelMessage, ...]:
         max_prompt_bytes = (
             limits.interaction_prompt_bytes if limits is not None
@@ -5852,6 +5862,7 @@ class CrewDispatchRuntime:
             max_prompt_bytes=max_prompt_bytes,
             message_limit=message_limit,
             preserve_feedback=preserve_feedback,
+            **({"preserve_maintenance_control": True} if preserve_maintenance_control else {}),
         )
         if schema is None:
             return tuple(messages)
@@ -7235,8 +7246,14 @@ class CrewDispatchRuntime:
         )
         meaningful_progress = workspace_continuation and run_state.workspace_meaningful_progress
         context_refresh = meaningful_progress and run_state.workspace_context_refresh
-        # Prior writes open one initial epoch; replay rebuilds this attempt's spent reads.
-        context_refresh_epoch_open = context_refresh and any(
+        maintenance_feedback = (
+            run_state.workspace_maintenance_feedback_version == 1
+            and step.workspace_maintenance_contract_version == 1
+        )
+        initial_context_refresh = context_refresh and maintenance_feedback
+        # Opted-in native steps also get one bounded prewrite epoch. Prior writes
+        # retain their existing epochs; replay rebuilds this attempt's spent reads.
+        context_refresh_epoch_open = initial_context_refresh or (context_refresh and any(
             state.get("step_id") == step.id and state.get("status") == "succeeded"
             and state.get("name") == "workspace.write_text"
             and type(state.get("attempt")) is int and cast(int, state["attempt"]) < model_attempt
@@ -7245,8 +7262,25 @@ class CrewDispatchRuntime:
             and artifact.content.get("tool_name") == "workspace.write_text"
             and artifact_progress_key(artifact) is not None
             for tool_key, state in tool_ledger.states.items()
-        )
+        ))
         refreshed_read_keys: set[str] = set()
+        if initial_context_refresh:
+            # Earlier attempts cannot reopen an already-spent prewrite read key.
+            # Current-attempt cached replay spends keys in its original round order.
+            prior_read_keys: set[str] = set()
+            for tool_key, prior_state in tool_ledger.states.items():
+                if (prior_state.get("step_id") != step.id
+                        or prior_state.get("status") != "succeeded"
+                        or type(prior_state.get("attempt")) is not int
+                        or cast(int, prior_state["attempt"]) >= model_attempt
+                        or (prior_artifact := tool_ledger.artifacts.get(tool_key)) is None
+                        or prior_artifact.content.get("tool_name") not in {"workspace.read", "workspace_read"}):
+                    continue
+                prior_key = artifact_progress_key(prior_artifact)
+                if prior_key is not None:
+                    if prior_key in prior_read_keys:
+                        refreshed_read_keys.add(prior_key)
+                    prior_read_keys.add(prior_key)
         progress_keys = {
             prior_progress_key for tool_key, state in tool_ledger.states.items()
             if meaningful_progress and state.get("step_id") == step.id
@@ -7366,6 +7400,7 @@ class CrewDispatchRuntime:
                     response_schema,
                     limits=content_limits,
                     preserve_feedback=workspace_continuation and run_state.workspace_feedback_retention,
+                    preserve_maintenance_control=maintenance_feedback,
                 ),
                 required_capabilities=frozenset(round_required_capabilities),
                 timeout_seconds=_model_call_timeout_seconds(
@@ -7392,6 +7427,7 @@ class CrewDispatchRuntime:
                     request = replace(request, messages=self._response_contract_messages(
                         request_messages, response_schema, limits=content_limits,
                         preserve_feedback=workspace_continuation and run_state.workspace_feedback_retention,
+                        preserve_maintenance_control=maintenance_feedback,
                     ))
                     cached_key = self._model_call_key(
                         context.run_id, step.id, model_attempt_index, "step", agent.id, call_cursor.value,
@@ -7420,6 +7456,7 @@ class CrewDispatchRuntime:
                                 (*replay_prefix, *request_messages[initial_message_count:]),
                                 response_schema, limits=content_limits,
                                 preserve_feedback=workspace_continuation and run_state.workspace_feedback_retention,
+                                preserve_maintenance_control=maintenance_feedback,
                             ))
                             if self._model_request_sha256(candidate) == cached_model["request_sha256"]:
                                 if (cached_model["status"] == "rejected"
@@ -8883,6 +8920,7 @@ class CrewDispatchRuntime:
         max_prompt_bytes: int = _SOFT_INTERACTION_PROMPT_BYTES,
         message_limit: int = _SOFT_INTERACTION_MESSAGE_LIMIT,
         preserve_feedback: bool = False,
+        preserve_maintenance_control: bool = False,
     ) -> tuple[ModelMessage, ...]:
         if not preserve_feedback:
             return CrewDispatchRuntime._legacy_compact_interaction_messages(
@@ -8907,10 +8945,12 @@ class CrewDispatchRuntime:
         feedback_prefixes = (
             "UNTRUSTED_CAPABILITY_RESULTS_JSON=", "UNTRUSTED_CAPABILITY_REJECTIONS_JSON=",
         )
-        control_prefixes = (
+        control_prefixes: tuple[str, ...] = (
             "WORKSPACE_OBSERVATION_STALL:", "CAPABILITY_ARGUMENT_CORRECTION:",
             "WORKSPACE_DELIVERY_CONTINUATION:", "CAPABILITY_RESULT_CONTINUATION:",
         )
+        if preserve_maintenance_control:
+            control_prefixes += ("WORKSPACE_MAINTENANCE_DELIVERY_CONTINUATION:",)
         feedback = [index for index, message in enumerate(current)
                     if message.role == "user" and isinstance(message.content, str)
                     and message.content.startswith(feedback_prefixes)]
@@ -9769,6 +9809,8 @@ class CrewDispatchRuntime:
                 "initial_incomplete_chain_growth": run_state.initial_incomplete_chain_growth,
                 **({"post_tool_finalization_growth_version": 1}
                    if run_state.post_tool_finalization_growth_version == 1 else {}),
+                **({"workspace_maintenance_feedback_version": 1}
+                   if run_state.workspace_maintenance_feedback_version == 1 else {}),
                 **({"first_tool_incomplete_recovery_output_growth":
                     run_state.first_tool_incomplete_recovery_output_growth}
                    if any(step.tools for step in plan.steps) else {}),
@@ -9880,6 +9922,7 @@ class CrewDispatchRuntime:
             "incomplete_continuation_output_growth",
             "initial_incomplete_chain_growth",
             "post_tool_finalization_growth_version",
+            "workspace_maintenance_feedback_version",
         }
         if checkpoint.runtime_version in _REMAINING_TIMEOUT_RUNTIME_VERSIONS:
             required_state_keys.add("remaining_timeout_seconds")
@@ -9909,6 +9952,11 @@ class CrewDispatchRuntime:
             ("post_tool_finalization_growth_version" in state and (
                 type(state["post_tool_finalization_growth_version"]) is not int
                 or state["post_tool_finalization_growth_version"] != 1
+                or checkpoint.runtime_version != _RUNTIME_VERSION
+            ))
+            or ("workspace_maintenance_feedback_version" in state and (
+                type(state["workspace_maintenance_feedback_version"]) is not int
+                or state["workspace_maintenance_feedback_version"] not in {0, 1}
                 or checkpoint.runtime_version != _RUNTIME_VERSION
             ))
             or type(state.get("workspace_delivery_continuation", False)) is not bool
