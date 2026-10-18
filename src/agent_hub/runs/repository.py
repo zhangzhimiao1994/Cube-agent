@@ -1092,7 +1092,7 @@ class RunRepository:
             rows = await session.scalars(
                 self._running_for_recovery_select(limit=limit, now=now)
             )
-            return tuple(rows.all())
+            return tuple(_database_uuid(run_id) for run_id in rows.all())
 
     async def terminal_worker_executions_for_recovery(
         self,
@@ -1767,8 +1767,8 @@ class RunRepository:
             ).all()
             return tuple(
                 PendingOutbox(
-                    id=row.id,
-                    run_id=row.run_id,
+                    id=_database_uuid(row.id),
+                    run_id=_database_uuid(row.run_id),
                     idempotency_key=row.idempotency_key,
                 )
                 for row in rows
@@ -1787,7 +1787,7 @@ class RunRepository:
             )
             if row is None or row.delivered:
                 return False
-            await deliver(row.run_id, row.idempotency_key)
+            await deliver(_database_uuid(row.run_id), row.idempotency_key)
             row.delivered = True
             row.delivered_at = func.now()
             await session.flush()

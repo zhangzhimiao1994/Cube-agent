@@ -224,7 +224,8 @@ async def test_worker_persists_admission_before_releasing_waiting_execution(mode
     child=Child(mode)
     runtime=EngineeringAdmissionRuntime(child,Pending())
     service=RunService(repository,runtime_registry=RuntimeRegistry((runtime,)),router=None,task_queue=object())
-    submitted=await service.execute(repository.run_id)
+    execution_id=DriverUUID(str(repository.run_id)) if driver_uuid else repository.run_id
+    submitted=await service.execute(execution_id)
     assert submitted.status is RunStatus.WAITING_APPROVAL
     assert child.calls==[]
     assert checkpoint_waits_for_approval(repository.checkpoint,'approval_current')

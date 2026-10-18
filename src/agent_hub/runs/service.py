@@ -46,7 +46,13 @@ from agent_hub.runs.conversation_queue import (
 )
 from agent_hub.runs.conversations import ConversationArchived, ConversationRecord
 from agent_hub.runs.observer import ObserverDecision, ObserverPolicy, RunMonitor
-from agent_hub.runs.repository import RunAlreadyActive, RunConflict, RunRecord, RunRepository
+from agent_hub.runs.repository import (
+    RunAlreadyActive,
+    RunConflict,
+    RunRecord,
+    RunRepository,
+    _database_uuid,
+)
 from agent_hub.runs.self_repair import (
     SelfRepairDecision,
     SelfRepairPolicy,
@@ -1803,6 +1809,7 @@ class RunService:
         crash_after_event_kind: EventKind | None = None,
         allow_running_recovery: bool = False,
     ) -> SubmittedRun:
+        run_id = _database_uuid(run_id)
         claimed_record: RunRecord | None = None
         worker_lease_token = uuid4()
         async with await self._repository.run_transaction() as session, session.begin():

@@ -1508,10 +1508,12 @@ async def test_execute_forwards_persisted_actor_identity_to_runtime_context(driv
         task_queue=object(),  # type: ignore[arg-type]
     )
 
-    submitted = await service.execute(repository.run_id)
+    execution_id = DriverUUID(str(repository.run_id)) if driver_uuid else repository.run_id
+    submitted = await service.execute(execution_id)
 
     assert submitted.status is RunStatus.COMPLETED
     assert len(runtime.contexts) == 1
+    assert type(runtime.contexts[0].run_id) is UUID
     assert runtime.contexts[0].actor_id == ACTOR_ID
     assert type(runtime.contexts[0].actor_id) is UUID
     assert type(runtime.contexts[0].tenant_id) is UUID
