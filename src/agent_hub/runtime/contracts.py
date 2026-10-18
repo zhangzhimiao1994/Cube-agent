@@ -25,6 +25,13 @@ from pydantic import (
 
 from agent_hub.auth.models import Role
 from agent_hub.domain.runs import TaskMode
+from agent_hub.models.capacity import (
+    CapacityBackendReason,
+    CapacityCommitState,
+    CapacityExceptionCategory,
+    CapacityOperation,
+    CapacityTimeoutOrigin,
+)
 from agent_hub.models.failure_receipt import MAX_GATEWAY_FAILURE_ATTEMPTS
 from agent_hub.models.gateway import ScopeIncompletePhase, ScopeIncompleteReason
 from agent_hub.runtime.instruction_context import InstructionContext
@@ -101,12 +108,17 @@ _SAFE_TOOL_EVENT_PAYLOAD_KEYS = frozenset(
 _REQUIRED_FAILURE_DIAGNOSTIC_KEYS = frozenset(
     {"error_code", "error_stage", "error_category", "error_summary", "retryable", "suggested_action"}
 )
+_CAPACITY_DIAGNOSTIC_ENUMS = {
+    'capacity_operation': CapacityOperation, 'capacity_backend_reason': CapacityBackendReason,
+    'capacity_exception_category': CapacityExceptionCategory,
+    'capacity_timeout_origin': CapacityTimeoutOrigin, 'capacity_commit_state': CapacityCommitState,
+}
 _OPTIONAL_FAILURE_DIAGNOSTIC_KEYS = frozenset(
     {
         "status_code", "hybrid_child_mode", "orchestration_recovery_hint", "step_id", "actor",
         "compression_trigger",
     }
-)
+) | frozenset(_CAPACITY_DIAGNOSTIC_ENUMS)
 _FAILURE_DIAGNOSTIC_KEYS = _REQUIRED_FAILURE_DIAGNOSTIC_KEYS | _OPTIONAL_FAILURE_DIAGNOSTIC_KEYS
 _GATEWAY_SCOPE_DIAGNOSTIC_KEYS = frozenset({
     "gateway_scope_phase", "gateway_scope_reason",
@@ -272,6 +284,16 @@ def _validate_failure_diagnostic(payload: Mapping[str, JsonValue]) -> None:
 
 def _validate_gateway_scope_diagnostic(payload: Mapping[str, JsonValue]) -> None:
     fields = {key for key in payload if key.startswith("gateway_scope_")}
+    capacity_fields = set(payload) & _CAPACITY_DIAGNOSTIC_ENUMS.keys()
+    if capacity_fields:
+        allowed = _CAPACITY_DIAGNOSTIC_ENUMS
+        # Scope records the first gap; a later fallback can supply backend details.
+        if capacity_fields != set(allowed) or fields != _GATEWAY_SCOPE_DIAGNOSTIC_KEYS:
+            raise ValueError('capacity diagnostic fields are invalid')
+        for name, enum in allowed.items():
+            value = payload[name]
+            if type(value) is not str or value not in {item.value for item in enum}:
+                raise ValueError('capacity diagnostic value is invalid')
     if not fields:
         return
     if fields != _GATEWAY_SCOPE_DIAGNOSTIC_KEYS:
@@ -866,7 +888,8 @@ class RunEvent(_RuntimeContractModel):
         object.__setattr__(self, "payload", _freeze_object(self.payload, name="event payload"))
         if _contains_sensitive_key(self.payload):
             raise ValueError("event payload contains sensitive data")
-        if any(key.startswith("gateway_scope_") for key in self.payload):
+        if (any(key.startswith("gateway_scope_") for key in self.payload)
+                or self.payload.keys() & _CAPACITY_DIAGNOSTIC_ENUMS.keys()):
             if self.kind not in {EventKind.STEP_FAILED, EventKind.RUNTIME_FAILED}:
                 raise ValueError("gateway scope diagnostic event kind is invalid")
             _validate_gateway_scope_diagnostic(self.payload)

@@ -10,8 +10,9 @@ from agent_hub.models.capacity import (
     CapacityQueueFull,
     CapacityUnavailable,
     CapacityWaitTimeout,
+    capacity_backend_diagnostic_payload,
 )
-from agent_hub.models.gateway import ModelGatewayError
+from agent_hub.models.gateway import ModelGatewayError, get_gateway_scope_diagnostic
 from agent_hub.models.litellm_client import ModelResponseError, ModelTransportError
 from agent_hub.models.registry import NoCapableDeployment
 
@@ -114,7 +115,22 @@ def safe_runtime_failure_diagnostic(
 
     reason = safe_runtime_failure_reason(error, fallback=fallback)
     status_code = error.status_code if isinstance(error, ModelTransportError) else None
-    return runtime_failure_diagnostic_from_reason(reason, status_code=status_code)
+    return {**runtime_failure_diagnostic_from_reason(reason, status_code=status_code),
+            **gateway_scope_failure_payload(error)}
+
+
+def gateway_scope_failure_payload(error: object) -> RuntimeFailureDiagnostic:
+    """Project issued capacity observations only; absence preserves legacy payloads."""
+    scope = get_gateway_scope_diagnostic(error)
+    details = capacity_backend_diagnostic_payload(None if scope is None else scope.capacity_backend)
+    if scope is None or details is None:
+        return {}
+    return {
+        'gateway_scope_phase': scope.phase.value, 'gateway_scope_reason': scope.reason.value,
+        'gateway_scope_transport_entered_count': scope.transport_entered_count,
+        'gateway_scope_failure_attempt_count': scope.failure_attempt_count,
+        **{'capacity_' + key: value for key, value in details.items()},
+    }
 
 
 def runtime_failure_diagnostic_from_reason(
@@ -858,6 +874,7 @@ __all__ = [
     "ORCHESTRATION_CHECKPOINT_FAILURE_REASON",
     "RECOVERY_BLOCKED_FAILURE_REASON",
     "SENSITIVE_FAILURE_REASON",
+    "gateway_scope_failure_payload",
     "is_legacy_generic_failure_reason",
     "is_safe_failure_reason",
     "normalize_failure_reason",

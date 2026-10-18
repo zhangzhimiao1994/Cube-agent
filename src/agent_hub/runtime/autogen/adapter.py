@@ -91,6 +91,8 @@ from agent_hub.runtime.contracts import (
 )
 from agent_hub.runtime.engineering_actions import required_engineering_action
 from agent_hub.runtime.failure_reason import (
+    gateway_scope_failure_payload,
+    runtime_failure_diagnostic_from_reason,
     safe_model_gateway_failure_reason,
     safe_runtime_failure_reason,
 )
@@ -347,6 +349,7 @@ class _DiscussionDurability:
         self.engineering_tool_prefix = engineering_tool_prefix
         self._model_lock = asyncio.Lock()
         self.failure_reason: str | None = None
+        self.failure_payload: dict[str, str | int | bool] = {}
 
     @property
     def artifacts(self) -> tuple[Artifact, ...]:
@@ -406,6 +409,7 @@ class _DiscussionDurability:
                 status = entry.get("status")
                 if status == "running":
                     self.failure_reason = "model_outcome_uncertain"
+                    self.failure_payload = {}
                     raise ModelOutcomeUncertain("model outcome is uncertain")
                 if status != "succeeded":
                     raise RuntimeExecutionError("durable model ledger is invalid")
@@ -469,9 +473,10 @@ class _DiscussionDurability:
         self._model_lock.release()
         return artifact
 
-    def fail_model(self, reason: str | None = None) -> None:
+    def fail_model(self, reason: str | None = None, *, source: object = None) -> None:
         if reason and self.failure_reason is None:
             self.failure_reason = reason
+            self.failure_payload = gateway_scope_failure_payload(source)
         if self._model_lock.locked():
             self._model_lock.release()
 
@@ -502,6 +507,7 @@ class _DiscussionDurability:
             if status == "running":
                 if not replay_safe:
                     self.failure_reason = "tool_outcome_uncertain"
+                    self.failure_payload = {}
                     raise ToolOutcomeUncertain("capability outcome is uncertain")
                 return None, idempotency_key
             if status not in {"succeeded", "failed"}:
@@ -1891,7 +1897,7 @@ class GatewayChatCompletionClient(ChatCompletionClient):
                 raise
             except Exception as error:
                 if self._durability is not None:
-                    self._durability.fail_model(safe_model_gateway_failure_reason(error))
+                    self._durability.fail_model(safe_model_gateway_failure_reason(error), source=error)
                 raise
         response = completion.response
         if response.usage is None:
@@ -2795,6 +2801,10 @@ class AutoGenDiscussionRuntime:
                 sequence=sequence,
                 run_id=context.run_id,
                 reason=failure_reason,
+                payload={
+                    **runtime_failure_diagnostic_from_reason(failure_reason),
+                    **durability.failure_payload,
+                } if durability is not None and durability.failure_payload else {},
             )
         finally:
             if wall_handle is not None:

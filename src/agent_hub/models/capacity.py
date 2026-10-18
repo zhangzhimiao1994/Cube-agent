@@ -8,10 +8,13 @@ import time
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
+from enum import StrEnum
 from importlib.resources import files
 from types import MappingProxyType
-from typing import Protocol, cast
+from typing import Protocol, TypeGuard, cast
 from uuid import UUID, uuid4
+
+from redis import exceptions as redis_errors
 
 from agent_hub.models.types import Deployment, _require_safe_identifier
 
@@ -62,6 +65,161 @@ class CapacityQueueFull(CapacityUnavailable):
 
 class CapacityBackendError(RuntimeError):
     """Stable fail-closed error for unavailable or malformed capacity state."""
+
+
+class CapacityOperation(StrEnum):
+    INITIALIZE = "initialize"
+    REGISTER_FINGERPRINT = "register_fingerprint"
+    REGISTER_SCOPE = "register_scope"
+    ACQUIRE = "acquire"
+
+
+class CapacityBackendReason(StrEnum):
+    TIMEOUT = "timeout"
+    CONNECTION_ERROR = "connection_error"
+    SERVER_ERROR = "server_error"
+    PROGRAMMING_ERROR = "programming_error"
+    UNKNOWN_ERROR = "unknown_error"
+
+
+class CapacityExceptionCategory(StrEnum):
+    BUILTIN_TIMEOUT = "builtin_timeout"
+    REDIS_TIMEOUT = "redis_timeout"
+    REDIS_CONNECTION = "redis_connection"
+    REDIS_SERVER = "redis_server"
+    TYPE_ERROR = "type_error"
+    RUNTIME_ERROR = "runtime_error"
+    UNKNOWN = "unknown"
+
+
+class CapacityTimeoutOrigin(StrEnum):
+    NONE = "none"
+    CLIENT = "client"
+    REDIS = "redis"
+    LOCAL_DEADLINE = "local_deadline"
+
+
+class CapacityCommitState(StrEnum):
+    NOT_STARTED = "not_started"
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True, slots=True)
+class CapacityBackendDiagnostic:
+    """Native observations only; no field authorizes retry or proves rollback."""
+
+    operation: CapacityOperation
+    backend_reason: CapacityBackendReason
+    exception_category: CapacityExceptionCategory
+    timeout_origin: CapacityTimeoutOrigin
+    commit_state: CapacityCommitState
+    _issuer: object | None = field(default=None, init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if (type(self.operation) is not CapacityOperation
+                or type(self.backend_reason) is not CapacityBackendReason
+                or type(self.exception_category) is not CapacityExceptionCategory
+                or type(self.timeout_origin) is not CapacityTimeoutOrigin
+                or type(self.commit_state) is not CapacityCommitState):
+            raise ValueError("invalid capacity backend diagnostic")
+
+
+_CAPACITY_DIAGNOSTIC_ISSUER = object()
+_CAPACITY_DIAGNOSTIC_ATTRIBUTE = "_capacity_backend_diagnostic"
+
+
+def _is_issued_capacity_diagnostic(value: object) -> TypeGuard[CapacityBackendDiagnostic]:
+    if type(value) is not CapacityBackendDiagnostic:
+        return False
+    if value._issuer is not _CAPACITY_DIAGNOSTIC_ISSUER:
+        return False
+    value.__post_init__()
+    return True
+
+
+def get_capacity_backend_diagnostic(error: object) -> CapacityBackendDiagnostic | None:
+    """Read only an exact native error's issuer- and identity-bound metadata."""
+    if type(error) is not CapacityBackendError:
+        return None
+    try:
+        namespace = object.__getattribute__(error, "__dict__")
+        binding = namespace.get(_CAPACITY_DIAGNOSTIC_ATTRIBUTE) if type(namespace) is dict else None
+        if (type(binding) is not tuple or len(binding) != 3
+                or binding[0] is not _CAPACITY_DIAGNOSTIC_ISSUER or binding[1] is not error):
+            return None
+        value = binding[2]
+        return value if _is_issued_capacity_diagnostic(value) else None
+    except BaseException:  # noqa: BLE001 - diagnostics cannot replace failures.
+        return None
+
+
+def capacity_backend_diagnostic_payload(value: object) -> dict[str, str] | None:
+    """Project issued enum metadata only; None means omit all capacity detail fields."""
+    try:
+        if not _is_issued_capacity_diagnostic(value):
+            return None
+        return {
+            "operation": value.operation.value,
+            "backend_reason": value.backend_reason.value,
+            "exception_category": value.exception_category.value,
+            "timeout_origin": value.timeout_origin.value,
+            "commit_state": value.commit_state.value,
+        }
+    except BaseException:  # noqa: BLE001 - optional projection must remain fail closed.
+        return None
+
+
+def _capacity_backend_failure(
+    operation: CapacityOperation, error: BaseException, *,
+    commit_state: CapacityCommitState = CapacityCommitState.UNKNOWN,
+    local_deadline: bool = False,
+) -> CapacityBackendError:
+    # Identity comparisons avoid adapter __class__, metaclass equality/hash and properties.
+    kind = type(error)
+    reason = CapacityBackendReason.UNKNOWN_ERROR
+    category = CapacityExceptionCategory.UNKNOWN
+    origin = CapacityTimeoutOrigin.NONE
+    if kind is TimeoutError:
+        reason, category = CapacityBackendReason.TIMEOUT, CapacityExceptionCategory.BUILTIN_TIMEOUT
+        origin = (CapacityTimeoutOrigin.LOCAL_DEADLINE if local_deadline
+                  else CapacityTimeoutOrigin.CLIENT)
+    elif kind is redis_errors.TimeoutError:
+        reason, category = CapacityBackendReason.TIMEOUT, CapacityExceptionCategory.REDIS_TIMEOUT
+        origin = CapacityTimeoutOrigin.REDIS
+    elif any(kind is native for native in (
+        redis_errors.ConnectionError, redis_errors.AuthenticationError,
+        redis_errors.AuthorizationError, redis_errors.BusyLoadingError,
+        redis_errors.MaxConnectionsError,
+    )):
+        reason = CapacityBackendReason.CONNECTION_ERROR
+        category = CapacityExceptionCategory.REDIS_CONNECTION
+    elif any(kind is native for native in (
+        redis_errors.ResponseError, redis_errors.NoScriptError, redis_errors.OutOfMemoryError,
+        redis_errors.ExecAbortError, redis_errors.ReadOnlyError, redis_errors.NoPermissionError,
+        redis_errors.ModuleError, redis_errors.AuthenticationWrongNumberOfArgsError,
+        redis_errors.ClusterDownError, redis_errors.AskError, redis_errors.TryAgainError,
+        redis_errors.ClusterCrossSlotError, redis_errors.MovedError, redis_errors.MasterDownError,
+    )):
+        reason, category = CapacityBackendReason.SERVER_ERROR, CapacityExceptionCategory.REDIS_SERVER
+    elif kind is TypeError or kind is RuntimeError:
+        reason = CapacityBackendReason.PROGRAMMING_ERROR
+        category = (CapacityExceptionCategory.TYPE_ERROR if kind is TypeError
+                    else CapacityExceptionCategory.RUNTIME_ERROR)
+    diagnostic = CapacityBackendDiagnostic(operation, reason, category, origin, commit_state)
+    object.__setattr__(diagnostic, "_issuer", _CAPACITY_DIAGNOSTIC_ISSUER)
+    failure = CapacityBackendError("model capacity backend unavailable")
+    failure.__dict__[_CAPACITY_DIAGNOSTIC_ATTRIBUTE] = (
+        _CAPACITY_DIAGNOSTIC_ISSUER, failure, diagnostic,
+    )
+    return failure
+
+
+def _capacity_initialization_timeout() -> CapacityBackendError:
+    failure = _capacity_backend_failure(
+        CapacityOperation.INITIALIZE, TimeoutError(), local_deadline=True,
+    )
+    failure.args = ("model capacity initialization timed out",)
+    return failure
 
 
 class CapacityConfigurationError(RuntimeError):
@@ -568,8 +726,10 @@ class CapacityPool:
     async def _registration_eval(
         self, script: str, key_count: int, *args: object
     ) -> tuple[object, asyncio.CancelledError | None]:
+        operation = (CapacityOperation.REGISTER_FINGERPRINT if script is _CLAIM_FINGERPRINT_SCRIPT
+                     else CapacityOperation.REGISTER_SCOPE)
         task = asyncio.create_task(asyncio.wait_for(
-            self._redis.eval(script, key_count, *args),
+            self._diagnosed_eval(operation, script, key_count, *args),
             timeout=min(_REGISTRATION_CLEANUP_TIMEOUT, self._lease_ms / 1000),
         ))
         try:
@@ -581,6 +741,20 @@ class CapacityPool:
                 del inner_error
                 raise cancellation from None
             return result, cancellation
+        except TimeoutError as error:
+            raise _capacity_backend_failure(operation, error, local_deadline=True) from None
+
+    async def _diagnosed_eval(
+        self, operation: CapacityOperation, script: str, key_count: int, *args: object,
+    ) -> object:
+        commit_state = CapacityCommitState.NOT_STARTED
+        try:
+            evaluate = self._redis.eval
+            # A synchronous adapter can mutate before raising, including TypeError.
+            commit_state = CapacityCommitState.UNKNOWN
+            return await evaluate(script, key_count, *args)
+        except Exception as error:  # noqa: BLE001 - classify before redaction, never inspect body.
+            raise _capacity_backend_failure(operation, error, commit_state=commit_state) from None
 
     async def _rollback_registration(
         self,
@@ -781,7 +955,8 @@ class CapacityPool:
         deadline = loop.time() + timeout
         try:
             result = await asyncio.wait_for(
-                self._redis.eval(
+                self._diagnosed_eval(
+                    CapacityOperation.ACQUIRE,
                     _ACQUIRE_SCRIPT,
                     5,
                     keys["leases"],
@@ -799,11 +974,14 @@ class CapacityPool:
         except asyncio.CancelledError:
             await self._release_id_ignoring_errors(keys["leases"], lease_id, timeout=0)
             raise
-        except Exception:  # noqa: BLE001 - capacity must fail closed and redact Redis details
+        except Exception as error:  # noqa: BLE001 - preserve native diagnostic before cleanup.
+            failure = (error if get_capacity_backend_diagnostic(error) is not None else
+                       _capacity_backend_failure(CapacityOperation.ACQUIRE, error,
+                                                 local_deadline=True))
             await self._release_id_ignoring_errors(
                 keys["leases"], lease_id, timeout=max(0, deadline - loop.time()),
             )
-            raise CapacityBackendError("model capacity backend unavailable") from None
+            raise failure from None
         try:
             acquired, active, _effective, final_value = self._integer_result(result, 4)
             self._observed_loads[deployment.quota_scope_id] = active

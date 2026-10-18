@@ -21,6 +21,7 @@ if TYPE_CHECKING:
     from agent_hub.harness.provider import NormalizedProviderEvent
     from agent_hub.harness.streaming import OpenAICompatibleChunkTransport
 from agent_hub.models.capacity import (
+    CapacityBackendDiagnostic,
     CapacityBackendError,
     CapacityConfigurationError,
     CapacityLease,
@@ -28,7 +29,10 @@ from agent_hub.models.capacity import (
     CapacityQueueFull,
     CapacityUnavailable,
     CapacityWaitTimeout,
+    _capacity_initialization_timeout,
     _CapacityScopeView,
+    _is_issued_capacity_diagnostic,
+    get_capacity_backend_diagnostic,
 )
 from agent_hub.models.failure_receipt import (
     MAX_GATEWAY_FAILURE_ATTEMPTS,
@@ -81,7 +85,17 @@ def _log_capacity_failure(error: BaseException) -> None:
         if len(args) == 1 and type(args[0]) is str:
             reason = _CAPACITY_FAILURE_REASONS[type(error)].get(args[0], "unclassified")
     try:
-        _LOGGER.warning("model_capacity_failure kind=%s reason=%s", kind, reason)
+        diagnostic = get_capacity_backend_diagnostic(error)
+        if diagnostic is None:
+            _LOGGER.warning("model_capacity_failure kind=%s reason=%s", kind, reason)
+        else:
+            _LOGGER.warning(
+                "model_capacity_failure kind=%s reason=%s operation=%s backend_reason=%s "
+                "exception_category=%s timeout_origin=%s commit_state=%s",
+                kind, reason, diagnostic.operation.value, diagnostic.backend_reason.value,
+                diagnostic.exception_category.value, diagnostic.timeout_origin.value,
+                diagnostic.commit_state.value,
+            )
     except BaseException:  # noqa: BLE001 - logging must not replace the original outcome.
         return
 
@@ -125,6 +139,7 @@ class GatewayScopeDiagnostic:
     reason: ScopeIncompleteReason
     transport_entered_count: int
     failure_attempt_count: int
+    capacity_backend: CapacityBackendDiagnostic | None = field(default=None, repr=False, compare=False)
     _issuer: object | None = field(default=None, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
@@ -133,7 +148,9 @@ class GatewayScopeDiagnostic:
                 or type(self.transport_entered_count) is not int
                 or type(self.failure_attempt_count) is not int
                 or not 0 <= self.failure_attempt_count <= self.transport_entered_count
-                or self.failure_attempt_count > MAX_GATEWAY_FAILURE_ATTEMPTS):
+                or self.failure_attempt_count > MAX_GATEWAY_FAILURE_ATTEMPTS
+                or (self.capacity_backend is not None
+                    and not _is_issued_capacity_diagnostic(self.capacity_backend))):
             raise ValueError("invalid gateway scope diagnostic")
 
 
@@ -163,6 +180,21 @@ def get_gateway_scope_diagnostic(value: object) -> GatewayScopeDiagnostic | None
         return diagnostic
     except BaseException:  # noqa: BLE001 - optional diagnostics cannot expose adapter details.
         return None
+
+
+def preserve_gateway_scope_diagnostic(target: BaseException, source: object) -> None:
+    """Rebind issued diagnostics only; never transfer receipts or retry authority."""
+    diagnostic = get_gateway_scope_diagnostic(source)
+    if diagnostic is None:
+        return
+    try:
+        namespace = object.__getattribute__(target, "__dict__")
+        if type(namespace) is dict:
+            namespace[_SCOPE_DIAGNOSTIC_ATTRIBUTE] = (
+                _SCOPE_DIAGNOSTIC_ISSUER, target, diagnostic,
+            )
+    except BaseException:  # noqa: BLE001 - preservation cannot replace the runtime outcome.
+        return
 
 
 class ModelGatewayError(RuntimeError):
@@ -289,6 +321,7 @@ class _GatewayFailureHistory:
     entered_count: int = 0
     history_complete: bool = True
     first_incomplete: tuple[ScopeIncompletePhase, ScopeIncompleteReason] | None = None
+    capacity_backend: CapacityBackendDiagnostic | None = None
 
     def mark_incomplete(self, phase: ScopeIncompletePhase, reason: ScopeIncompleteReason) -> None:
         self.history_complete = False
@@ -300,6 +333,7 @@ class _GatewayFailureHistory:
             return None
         diagnostic = GatewayScopeDiagnostic(
             *self.first_incomplete, self.entered_count, len(self.attempts),
+            capacity_backend=self.capacity_backend,
         )
         object.__setattr__(diagnostic, "_issuer", _SCOPE_DIAGNOSTIC_ISSUER)
         return diagnostic
@@ -712,6 +746,7 @@ class ModelGateway:
                 failure_history.mark_incomplete(ScopeIncompletePhase.CANCELLATION,
                                                 ScopeIncompleteReason.CANCELLED)
             elif isinstance(error, (CapacityBackendError, CapacityConfigurationError)):
+                failure_history.capacity_backend = get_capacity_backend_diagnostic(error)
                 _log_capacity_failure(error)
                 failure_history.mark_incomplete(ScopeIncompletePhase.PRETRANSPORT_CAPACITY,
                                                 ScopeIncompleteReason.CAPACITY_BACKEND_FAILURE)
@@ -1059,7 +1094,7 @@ class ModelGateway:
                 task.result()
                 return
             if isinstance(capacity, CapacityPool | _CapacityScopeView):
-                raise CapacityBackendError("model capacity initialization timed out")
+                raise _capacity_initialization_timeout()
             raise TimeoutError
         finally:
             if not task.done():

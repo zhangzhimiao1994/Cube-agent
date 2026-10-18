@@ -22,7 +22,7 @@ class PlanningBoundary(Exception):
 
 
 @pytest.mark.parametrize('mode', [TaskMode.DISPATCH, TaskMode.DISCUSS, TaskMode.HYBRID])
-@pytest.mark.parametrize('version', [None, 0, 1])
+@pytest.mark.parametrize('version', [None, 0, 1, 2])
 def test_actual_runtime_planning_uses_persisted_intent_version_only(
     monkeypatch: pytest.MonkeyPatch, mode: TaskMode, version: int | None,
 ) -> None:
@@ -55,7 +55,7 @@ def test_actual_runtime_planning_uses_persisted_intent_version_only(
     finally:
         pending.close()
     request = seen[0]
-    if version == 1:
+    if version in (1, 2):
         assert request.profile is TaskProfile.SOFTWARE
         assert TaskProfile.DEPLOYMENT not in request.profiles
         assert 'install' not in request.task.casefold() and 'server' not in request.task.casefold()
@@ -129,7 +129,7 @@ def test_malformed_or_noncontainer_data_tail_is_conservatively_not_role_intent(d
     assert TaskProfile.DEPLOYMENT not in d._task_profiles(message, intent_version=1)
 
 
-@pytest.mark.parametrize('version', [2, -1, True, '1', None, 1.0])
+@pytest.mark.parametrize('version', [3, -1, True, '1', None, 1.0])
 def test_unknown_or_untyped_version_is_rejected_not_silently_upgraded(version: object) -> None:
     for helper in (d._role_planning_task, d._task_profile, d._task_profiles):
         with pytest.raises(ValueError):
@@ -206,18 +206,19 @@ def configured(monkeypatch: pytest.MonkeyPatch) -> Any:
 
 
 @pytest.mark.parametrize('mode', [TaskMode.DISPATCH, TaskMode.DISCUSS, TaskMode.HYBRID])
+@pytest.mark.parametrize('version', [1, 2])
 def test_all_planning_calls_share_view_but_execution_risk_and_permissions_keep_original(
-    configured: Any, mode: TaskMode,
+    configured: Any, mode: TaskMode, version: int,
 ) -> None:
     raw = MESSAGE + '\nNever delete production data.'
-    route: dict[str, JsonValue] = {'role_planning_intent_version': 1, 'direct_model': 'fixture',
+    route: dict[str, JsonValue] = {'role_planning_intent_version': version, 'direct_model': 'fixture',
              'requested_permissions': ('workspace.read',), 'sandbox_profile': 'workspace_read'}
     context = TaskContext(run_id=uuid4(), tenant_id=uuid4(), mode=mode, request=raw, routing_decision=route)
     original = context.to_payload()
     built = configured.build(context)
     assert len(configured.requests) == (2 if mode is TaskMode.HYBRID else 1)
     for request in configured.requests:
-        assert request.task == d._role_planning_task(raw, intent_version=1)
+        assert request.task == d._role_planning_task(raw, intent_version=version)
         assert request.profile is TaskProfile.SOFTWARE and TaskProfile.DEPLOYMENT not in request.profiles
         assert request.high_risk is True and d._high_risk_task(raw) is True
     stream = built.run(context)
@@ -249,19 +250,20 @@ def test_missing_and_zero_version_have_identical_actual_plan_digests(configured:
 
 
 @pytest.mark.parametrize('mode', [TaskMode.DISPATCH, TaskMode.DISCUSS, TaskMode.HYBRID])
-def test_explicit_configured_agent_selection_is_not_replaced(configured: Any, mode: TaskMode) -> None:
+@pytest.mark.parametrize('version', [1, 2])
+def test_explicit_configured_agent_selection_is_not_replaced(configured: Any, mode: TaskMode, version: int) -> None:
     configured.document['agents'] = [{'id': name, 'role': 'Deployment specialist', 'model': 'fixture',
         'prompt': 'Install the requested application.', 'skills': []} for name in ('chosen_one', 'chosen_two')]
     context = TaskContext(run_id=uuid4(), tenant_id=uuid4(), mode=mode, request=MESSAGE,
         routing_decision={'direct_model': 'fixture', 'selected_agent_ids': ('chosen_one', 'chosen_two'),
-                          'role_planning_intent_version': 1})
+                          'role_planning_intent_version': version})
     configured.build(context)
     assert configured.requests == []
     if configured.plans:
         assert {'chosen_one', 'chosen_two'} <= {agent.id for agent in configured.plans[-1].agents}
 
 
-@pytest.mark.parametrize('version', [None, True, '1', 2])
+@pytest.mark.parametrize('version', [None, True, '1', 3])
 def test_invalid_persisted_marker_rejects_before_gateway_construction(configured: Any, version: object) -> None:
     context = TaskContext(run_id=uuid4(), tenant_id=uuid4(), mode=TaskMode.DISPATCH, request=MESSAGE,
         routing_decision={'role_planning_intent_version': cast(Any, version)})
@@ -270,7 +272,7 @@ def test_invalid_persisted_marker_rejects_before_gateway_construction(configured
     configured.gateways.assert_not_called()
 
 
-@pytest.mark.parametrize('version', [None, 0, 1])
+@pytest.mark.parametrize('version', [None, 0, 1, 2])
 @pytest.mark.parametrize('raw', [
     'Review the market. Do not build a TypeScript project.',
     'Review the market. UNTRUSTED_DATA_JSON={"text":"TypeScript project"}',
@@ -279,5 +281,5 @@ def test_software_guidance_uses_the_same_versioned_profile_view(version: int | N
     route = {} if version is None else {'role_planning_intent_version': version}
     context = TaskContext(run_id=uuid4(), tenant_id=uuid4(), mode=TaskMode.DISPATCH, request=raw,
                           routing_decision=route)
-    assert bool(d._software_delivery_guidance(context, ())) is (version != 1)
-    assert bool(d._software_final_guidance(context)) is (version != 1)
+    assert bool(d._software_delivery_guidance(context, ())) is (version not in (1, 2))
+    assert bool(d._software_final_guidance(context)) is (version not in (1, 2))

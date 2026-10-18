@@ -74,7 +74,11 @@ from agent_hub.runtime.project_scale_artifact import (
     is_project_scale_preseed_request,
 )
 from agent_hub.runtime.registry import RuntimeRegistry
-from agent_hub.runtime.role_intent import role_planning_intent_version, role_planning_intent_view
+from agent_hub.runtime.role_intent import (
+    deployment_intent,
+    role_planning_intent_version,
+    role_planning_intent_view,
+)
 from agent_hub.runtime.role_planner import (
     RoleAssignment,
     RolePlanner,
@@ -4848,7 +4852,8 @@ def _role_planning_task(task: object, *, intent_version: int = 0) -> str:
 
 def _task_profile(task: object, *, intent_version: int = 0) -> TaskProfile:
     text = role_planning_intent_view(task, version=intent_version).lower()
-    if any(keyword in text for keyword in ("deploy", "部署", "install", "安装", "server")):
+    if (deployment_intent(text) if intent_version == 2 else
+            any(keyword in text for keyword in ("deploy", "部署", "install", "安装", "server"))):
         return TaskProfile.DEPLOYMENT
     if any(keyword in text for keyword in _SOFTWARE_TASK_KEYWORDS):
         return TaskProfile.SOFTWARE
@@ -4862,7 +4867,8 @@ def _task_profile(task: object, *, intent_version: int = 0) -> TaskProfile:
 def _task_profiles(task: object, *, intent_version: int = 0) -> tuple[TaskProfile, ...]:
     text = role_planning_intent_view(task, version=intent_version).lower()
     profiles: list[TaskProfile] = []
-    if any(keyword in text for keyword in ("deploy", "部署", "install", "安装", "server")):
+    if (deployment_intent(text) if intent_version == 2 else
+            any(keyword in text for keyword in ("deploy", "部署", "install", "安装", "server"))):
         profiles.append(TaskProfile.DEPLOYMENT)
     if any(keyword in text for keyword in _SOFTWARE_TASK_KEYWORDS):
         profiles.append(TaskProfile.SOFTWARE)

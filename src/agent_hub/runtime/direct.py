@@ -23,6 +23,7 @@ from agent_hub.models.gateway import (
     GatewayCompletion,
     GatewayRejectedOutput,
     ModelGatewayError,
+    preserve_gateway_scope_diagnostic,
 )
 from agent_hub.models.litellm_client import ModelResponseError, ModelTransportError
 from agent_hub.models.types import (
@@ -458,8 +459,11 @@ class RuntimeBusy(RuntimeExecutionError):
     """The registered runtime instance is already executing one run."""
 
 
-def _raise_execution_error(message: str) -> Never:
-    raise RuntimeExecutionError(message) from None
+def _raise_execution_error(message: str, source: object = None) -> Never:
+    error = RuntimeExecutionError(message)
+    if source is not None:
+        preserve_gateway_scope_diagnostic(error, source)
+    raise error from None
 
 
 def _gateway_failure_reason(error: Exception) -> str:
@@ -1854,6 +1858,7 @@ class DirectRuntime:
                 raise asyncio.CancelledError
             gateway_task = asyncio.create_task(self._complete_with_scope(request))
             self._active_task = gateway_task
+            failure_source: RuntimeExecutionError | None = None
             try:
                 async with asyncio.timeout(remaining_seconds):
                     completion = await gateway_task
@@ -1861,11 +1866,14 @@ class DirectRuntime:
                 raise
             except Exception as error:  # noqa: BLE001 - redact gateway boundary
                 failure_reason = _gateway_failure_reason(error)
+                failure_source = RuntimeExecutionError(failure_reason)
+                preserve_gateway_scope_diagnostic(failure_source, error)
                 error.__traceback__ = None
                 error.__context__ = None
                 error.__cause__ = None
                 del error
-                _raise_execution_error(failure_reason)
+            if failure_source is not None:
+                _raise_execution_error(str(failure_source), source=failure_source)
             validated_completion = self._strict_completion(completion)
             if validated_completion is None:
                 _raise_execution_error("model response is invalid")
@@ -2090,6 +2098,7 @@ class DirectRuntime:
             while True:
                 attempt_count += 1
                 gateway_failed = False
+                failure_source = None
                 failure_reason = "model gateway failed"
                 fingerprint = "unknown:None:model gateway failed"
                 fingerprint_count = 0
@@ -2104,6 +2113,8 @@ class DirectRuntime:
                     fingerprint_count = failure_fingerprints.get(fingerprint, 0) + 1
                     failure_fingerprints[fingerprint] = fingerprint_count
                     retryable = _retryable_gateway_failure(error)
+                    failure_source = RuntimeExecutionError(failure_reason)
+                    preserve_gateway_scope_diagnostic(failure_source, error)
                     error.__traceback__ = None
                     error.__context__ = None
                     error.__cause__ = None
@@ -2128,7 +2139,7 @@ class DirectRuntime:
                         or retry_request is None
                     ):
                         del completion, request, included_source_ids, context
-                        _raise_execution_error(failure_reason)
+                        _raise_execution_error(failure_reason, source=failure_source)
                     request = retry_request
                     gateway_task = asyncio.create_task(submit_model(request))
                     gateway_task.add_done_callback(lambda _task: submission_ready.set())

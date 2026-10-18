@@ -60,6 +60,7 @@ from agent_hub.models.gateway import (
     ScopeIncompletePhase,
     ScopeIncompleteReason,
     get_gateway_scope_diagnostic,
+    preserve_gateway_scope_diagnostic,
 )
 from agent_hub.models.registry import ModelRegistry, NoCapableDeployment
 from agent_hub.models.types import (
@@ -112,6 +113,7 @@ from agent_hub.runtime.crew.plan import (
 from agent_hub.runtime.engineering_actions import required_engineering_action
 from agent_hub.runtime.failure_reason import (
     ORCHESTRATION_CHECKPOINT_FAILURE_REASON,
+    gateway_scope_failure_payload,
     runtime_failure_diagnostic_from_reason,
     safe_runtime_failure_reason,
 )
@@ -1713,6 +1715,7 @@ def _gateway_scope_failure(
         failure_type = _GatewayScopeContractFailure if contract else _GatewayScopeFailure
         failure = failure_type(reason, diagnostic)
         _GATEWAY_SCOPE_CARRIERS[failure] = diagnostic
+        preserve_gateway_scope_diagnostic(failure, source)
         return failure
     return _ModelContractFailed(reason) if contract else RuntimeExecutionError(reason)
 
@@ -1723,6 +1726,7 @@ def _gateway_scope_review_failure(reason: str, source: Exception) -> _ReviewFail
         return _ReviewFailed(reason)
     failure = _GatewayScopeReviewFailure(reason, diagnostic)
     _GATEWAY_SCOPE_CARRIERS[failure] = diagnostic
+    preserve_gateway_scope_diagnostic(failure, source)
     return failure
 
 
@@ -1735,6 +1739,7 @@ def _gateway_scope_payload(error: Exception) -> dict[str, JsonValue]:
         "gateway_scope_reason": diagnostic.reason.value,
         "gateway_scope_transport_entered_count": diagnostic.transport_entered_count,
         "gateway_scope_failure_attempt_count": diagnostic.failure_attempt_count,
+        **gateway_scope_failure_payload(error),
     }
 
 

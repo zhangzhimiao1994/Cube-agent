@@ -15,6 +15,7 @@ from typing import Protocol, cast
 from uuid import UUID, uuid4
 
 from agent_hub.domain.runs import TaskMode
+from agent_hub.models.gateway import preserve_gateway_scope_diagnostic
 from agent_hub.runtime.adaptive_budget import AdaptiveDeadline, deadline_from_routing
 from agent_hub.runtime.artifacts import (
     ArtifactReference,
@@ -31,6 +32,7 @@ from agent_hub.runtime.contracts import (
     TaskContext,
 )
 from agent_hub.runtime.failure_reason import (
+    gateway_scope_failure_payload,
     runtime_failure_diagnostic_from_reason,
     safe_runtime_failure_reason,
 )
@@ -48,6 +50,12 @@ from agent_hub.runtime.token_budget import (
 )
 
 _RUNTIME_TYPE = "hybrid"
+_CAPACITY_FAILURE_KEYS = frozenset({
+    "gateway_scope_phase", "gateway_scope_reason",
+    "gateway_scope_transport_entered_count", "gateway_scope_failure_attempt_count",
+    "capacity_operation", "capacity_backend_reason", "capacity_exception_category",
+    "capacity_timeout_origin", "capacity_commit_state",
+})
 _RUNTIME_VERSION = "3"
 _PREVIOUS_RUNTIME_VERSION = "2"
 _LEGACY_RUNTIME_VERSION = "1"
@@ -57,6 +65,15 @@ _MAX_HANDOFF_ANCHORS = 8
 
 class RuntimeExecutionError(RuntimeError):
     """Stable composite runtime failure."""
+
+
+class _ChildRuntimeFailure(RuntimeExecutionError):
+    def __init__(self, message: str, event: RunEvent) -> None:
+        super().__init__(message)
+        validated = RunEvent.from_payload(event.to_payload())
+        self.failure_payload = {
+            key: value for key, value in validated.payload.items() if key in _CAPACITY_FAILURE_KEYS
+        } if "capacity_operation" in validated.payload else {}
 
 
 class RuntimeBusy(RuntimeExecutionError):
@@ -510,6 +527,10 @@ class HybridRuntime:
             raise
         except (ArtifactRepositoryError, RuntimeExecutionError, ValueError, TypeError) as error:
             failure_reason = _safe_failure_reason(error, fallback="hybrid_failed")
+            failure_payload = (
+                error.failure_payload if isinstance(error, _ChildRuntimeFailure)
+                else gateway_scope_failure_payload(error)
+            )
             partial_reason = (
                 None if isinstance(error, _ChildModelScopeError)
                 else _partial_hybrid_completion_reason(artifacts, failure_reason)
@@ -570,6 +591,10 @@ class HybridRuntime:
                 sequence=sequence,
                 run_id=context.run_id,
                 reason=failure_reason,
+                payload={
+                    **runtime_failure_diagnostic_from_reason(failure_reason),
+                    **failure_payload,
+                } if failure_payload else {},
             )
         finally:
             self._active_child = None
@@ -692,7 +717,7 @@ class HybridRuntime:
                         child_failure_reason = item.reason
                     if item.kind is EventKind.RUNTIME_FAILED:
                         reason = item.reason or child_failure_reason or "runtime failed"
-                        raise RuntimeExecutionError(f"hybrid {mode.value} failed: {reason}")
+                        raise _ChildRuntimeFailure(f"hybrid {mode.value} failed: {reason}", item)
                     if item.kind is EventKind.RUNTIME_CANCELLED:
                         raise asyncio.CancelledError
                     if item.kind is EventKind.RUNTIME_COMPLETED:
@@ -726,9 +751,11 @@ class HybridRuntime:
         except RuntimeExecutionError:
             raise
         except Exception as error:  # noqa: BLE001 - child runtime boundary is normalized.
-            raise RuntimeExecutionError(
+            failure = RuntimeExecutionError(
                 f"hybrid {mode.value} failed: {_safe_failure_reason(error, fallback='runtime failed')}"
-            ) from None
+            )
+            preserve_gateway_scope_diagnostic(failure, error)
+            raise failure from None
         self._active_child = None
         _seal_child_model_scope(scope_artifacts, stage_budget.model_scope)
         if not terminal_seen:

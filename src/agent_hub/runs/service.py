@@ -632,7 +632,7 @@ class RunService:
         resolved_execution_backend = normalize_execution_backend(execution_backend)
         operator_selection: dict[str, object] = {
             "requested_mode": requested_mode.value,
-            "role_planning_intent_version": 1,
+            "role_planning_intent_version": 2,
             "workspace_maintenance_contract_version": 1,
             "workspace_maintenance_intent_version": 2,
             "post_tool_finalization_growth_version": 1,
