@@ -4,12 +4,12 @@ import asyncio
 import json
 import subprocess
 import sys
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -19,6 +19,7 @@ from agent_hub.capabilities.gateway import CapabilityResult, CapabilityStatus
 from agent_hub.capabilities.runtime import RuntimeCapabilityError
 from agent_hub.domain.runs import TaskMode
 from agent_hub.harness import HarnessToolGateway
+from agent_hub.harness.types import HarnessToolCallRequest, HarnessToolCallResult
 from agent_hub.models.gateway import GatewayCompletion
 from agent_hub.models.types import ModelResponse, TokenUsage, ToolCall
 from agent_hub.runtime.artifacts import InMemoryArtifactRepository
@@ -87,7 +88,9 @@ class ProcessBackend:
 
 
 class Policy:
-    def __init__(self, context: TaskContext, status: CapabilityStatus = CapabilityStatus.ALLOWED):
+    def __init__(
+        self, context: TaskContext, status: CapabilityStatus = CapabilityStatus.ALLOWED,
+    ) -> None:
         self.context = context
         self.status = status
         self.calls: list[Any] = []
@@ -109,7 +112,7 @@ class Policy:
 
 
 class RepairModel:
-    def __init__(self, *, autogen: bool = False):
+    def __init__(self, *, autogen: bool = False) -> None:
         self.requests: list[Any] = []
         self.autogen = autogen
         self.stage = 0
@@ -136,7 +139,9 @@ class RepairModel:
                     for message in request.messages
                     if message.role == "system" and isinstance(message.content, str)
                 )
-            names = ("project.verify", "workspace.read", "workspace.write_text", "project.verify")
+            names: tuple[str, ...] = (
+                "project.verify", "workspace.read", "workspace.write_text", "project.verify",
+            )
             if self.bundle:
                 names = (*names, "workspace.bundle")
             response = ModelResponse(
@@ -169,8 +174,10 @@ def context(mode: TaskMode = TaskMode.DISPATCH) -> TaskContext:
     )
 
 
-def crew(model: Any, backend: ProcessBackend, policy: Policy, repository: Any = None,
-         *, incremental=False) -> Any:
+def crew(
+    model: Any, backend: ProcessBackend, policy: Policy,
+    repository: Any = None, *, incremental: bool = False,
+) -> Any:
     tools = (*TOOLS, "workspace.bundle") if incremental else TOOLS
     plan = DispatchPlan(
         agents=(AgentSpec(
@@ -192,7 +199,9 @@ def crew(model: Any, backend: ProcessBackend, policy: Policy, repository: Any = 
 
 
 @pytest.mark.parametrize("failure", ("exit", "timeout"))
-async def test_process_failure_reaches_same_model_read_repair_and_reverify(tmp_path: Path, failure: str):
+async def test_process_failure_reaches_same_model_read_repair_and_reverify(
+    tmp_path: Path, failure: str,
+) -> None:
     ctx = context()
     backend, model = ProcessBackend(tmp_path, failure), RepairModel()
     policy = Policy(ctx)
@@ -212,7 +221,7 @@ async def test_process_failure_reaches_same_model_read_repair_and_reverify(tmp_p
 
 
 @pytest.mark.parametrize("failure", ("backend", "unknown", "denied", "waiting"))
-async def test_untyped_or_policy_failure_stays_terminal(tmp_path: Path, failure: str):
+async def test_untyped_or_policy_failure_stays_terminal(tmp_path: Path, failure: str) -> None:
     ctx = context()
     backend, model = ProcessBackend(tmp_path, failure), RepairModel()
     policy = Policy(ctx, {
@@ -225,7 +234,7 @@ async def test_untyped_or_policy_failure_stays_terminal(tmp_path: Path, failure:
     assert "workspace.write_text" not in backend.calls
 
 
-async def test_failed_observation_checkpoint_resumes_without_replaying_process(tmp_path: Path):
+async def test_failed_observation_checkpoint_resumes_without_replaying_process(tmp_path: Path) -> None:
     ctx = context()
     backend, model = ProcessBackend(tmp_path), PausingModel()
     policy, repository = Policy(ctx), InMemoryArtifactRepository()
@@ -253,21 +262,26 @@ async def test_failed_observation_checkpoint_resumes_without_replaying_process(t
 
 class ReceiptHarness:
     """Mutate only receipts, keeping the real authorization and execution path."""
-    def __init__(self, backend, policy, mutation=None):
+    def __init__(
+        self, backend: ProcessBackend, policy: Policy,
+        mutation: Callable[[HarnessToolCallResult], HarnessToolCallResult] | None = None,
+    ) -> None:
         self.gateway = HarnessToolGateway(backend, policy_gateway=policy)
         self.mutation = mutation
 
-    async def invoke(self, tenant_id, request, **kwargs):
+    async def invoke(
+        self, tenant_id: UUID, request: HarnessToolCallRequest, **kwargs: Any,
+    ) -> HarnessToolCallResult:
         result = await self.gateway.invoke(tenant_id, request, **kwargs)
         if result.status == "failed" and self.mutation is not None:
             return self.mutation(result)
         return result
 
 
-def malformed_receipt(result, defect):
+def malformed_receipt(result: HarnessToolCallResult, defect: str) -> HarnessToolCallResult:
     payload = json.loads(json.dumps(dict(result.payload), default=dict))
     diagnostic = payload["execution_diagnostic"]
-    overrides = {}
+    overrides: dict[str, Any] = {}
     if defect == "missing":
         del payload["execution_diagnostic"]
     elif defect == "shape":
@@ -300,7 +314,9 @@ DEFECTS = ("missing", "shape", "success", "unknown", "bool_exit", "version", "ti
 
 
 @pytest.mark.parametrize("defect", DEFECTS)
-async def test_invalid_failure_evidence_cannot_open_continuation(tmp_path, defect):
+async def test_invalid_failure_evidence_cannot_open_continuation(
+    tmp_path: Path, defect: str,
+) -> None:
     ctx = context()
     backend, model, policy = ProcessBackend(tmp_path), RepairModel(), Policy(ctx)
     runner = crew(model, backend, policy)
@@ -310,12 +326,12 @@ async def test_invalid_failure_evidence_cannot_open_continuation(tmp_path, defec
     assert len(model.requests) == 1 and backend.calls == ["project.verify"]
 
 
-async def test_native_tool_history_carries_failed_observation_through_repair(tmp_path):
+async def test_native_tool_history_carries_failed_observation_through_repair(tmp_path: Path) -> None:
     from agent_hub.models.native_messages import NativeAssistantMessage, NativeToolCall
     from agent_hub.runtime.provider_continuation import InMemoryProviderContinuationRepository
 
     class NativeModel(RepairModel):
-        async def complete_with_context(self, request):
+        async def complete_with_context(self, request: Any) -> GatewayCompletion:
             completion = await super().complete_with_context(request)
             response = completion.response
             if response.tool_calls:

@@ -10,7 +10,7 @@ from agent_hub.runtime.autogen.adapter import (
     DiscussionParticipant,
     DiscussionPlan,
 )
-from agent_hub.runtime.contracts import EventKind
+from agent_hub.runtime.contracts import Artifact, EventKind, RunEvent
 from tests.unit.runtime.crew.test_execution_diagnostic_continuation import (
     DEFECTS,
     TOOLS,
@@ -23,7 +23,9 @@ from tests.unit.runtime.crew.test_execution_diagnostic_continuation import (
 )
 
 
-def runtime(model, backend, policy):
+def runtime(
+    model: RepairModel, backend: ProcessBackend, policy: Policy,
+) -> AutoGenDiscussionRuntime:
     return AutoGenDiscussionRuntime(
         model,
         DiscussionPlan(
@@ -40,7 +42,9 @@ def runtime(model, backend, policy):
 
 
 @pytest.mark.parametrize("failure", ("exit", "timeout"))
-async def test_process_failure_reaches_same_model_read_repair_and_reverify(tmp_path: Path, failure: str):
+async def test_process_failure_reaches_same_model_read_repair_and_reverify(
+    tmp_path: Path, failure: str,
+) -> None:
     ctx = context(TaskMode.DISCUSS)
     backend, model = ProcessBackend(tmp_path, failure), RepairModel(autogen=True)
     policy = Policy(ctx)
@@ -56,7 +60,7 @@ async def test_process_failure_reaches_same_model_read_repair_and_reverify(tmp_p
 
 
 @pytest.mark.parametrize("failure", ("backend", "unknown", "denied", "waiting"))
-async def test_untyped_or_policy_failure_stays_terminal(tmp_path: Path, failure: str):
+async def test_untyped_or_policy_failure_stays_terminal(tmp_path: Path, failure: str) -> None:
     ctx = context(TaskMode.DISCUSS)
     backend, model = ProcessBackend(tmp_path, failure), RepairModel(autogen=True)
     policy = Policy(ctx, {
@@ -68,7 +72,9 @@ async def test_untyped_or_policy_failure_stays_terminal(tmp_path: Path, failure:
 
 
 @pytest.mark.parametrize("defect", DEFECTS)
-async def test_invalid_failure_evidence_cannot_open_continuation(tmp_path, defect):
+async def test_invalid_failure_evidence_cannot_open_continuation(
+    tmp_path: Path, defect: str,
+) -> None:
     ctx = context(TaskMode.DISCUSS)
     backend, model, policy = ProcessBackend(tmp_path), RepairModel(autogen=True), Policy(ctx)
     runner = runtime(model, backend, policy)
@@ -78,7 +84,9 @@ async def test_invalid_failure_evidence_cannot_open_continuation(tmp_path, defec
     assert backend.calls == ["project.verify"]
 
 
-async def test_failed_observation_checkpoint_resumes_without_replaying_process(tmp_path, monkeypatch):
+async def test_failed_observation_checkpoint_resumes_without_replaying_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     import asyncio
 
     from agent_hub.runtime.autogen.adapter import _DiscussionDurability
@@ -90,7 +98,7 @@ async def test_failed_observation_checkpoint_resumes_without_replaying_process(t
     ready = asyncio.Event()
     original = _DiscussionDurability.fail_tool
 
-    async def pause_after_checkpoint(durability, artifact):
+    async def pause_after_checkpoint(durability: _DiscussionDurability, artifact: Artifact) -> None:
         nonlocal saved
         await original(durability, artifact)
         saved = runner._last_checkpoint
@@ -99,7 +107,7 @@ async def test_failed_observation_checkpoint_resumes_without_replaying_process(t
 
     monkeypatch.setattr(_DiscussionDurability, "fail_tool", pause_after_checkpoint)
 
-    async def consume():
+    async def consume() -> list[RunEvent]:
         return [event async for event in runner.run(ctx)]
 
     consumer = asyncio.create_task(consume())

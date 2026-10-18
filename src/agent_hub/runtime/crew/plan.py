@@ -201,6 +201,7 @@ class DispatchStep(_PlanModel):
     depends_on: tuple[str, ...] = ()
     tools: tuple[str, ...] = ()
     workspace_maintenance_contract_version: Literal[0, 1] = Field(default=0, exclude_if=lambda value: value == 0)
+    engineering_delivery_contract_version: Literal[0, 1] = Field(default=0, exclude_if=lambda value: value == 0)
     tool_argument_budget_bytes: dict[str, int] = Field(default_factory=dict)
     reviewer: str | None = None
     reviewer_retries: int = Field(default=0, ge=0, le=8)
@@ -209,7 +210,7 @@ class DispatchStep(_PlanModel):
     timeout_seconds: float = Field(default=60.0, gt=0, le=3600, allow_inf_nan=False)
     cost_budget_usd: Decimal = Field(default=Decimal(0), ge=0, le=Decimal(1000000))
 
-    @field_validator("workspace_maintenance_contract_version", mode="before")
+    @field_validator("workspace_maintenance_contract_version", "engineering_delivery_contract_version", mode="before")
     @classmethod
     def maintenance_version(cls, value: object) -> object:
         if type(value) is not int or value not in (0, 1):

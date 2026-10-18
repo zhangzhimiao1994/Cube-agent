@@ -4,6 +4,7 @@ import pytest
 
 from agent_hub.config.schema import (
     AgentDefinition,
+    Capability,
     DeploymentDefinition,
     LogicalModelDefinition,
     PlatformConfig,
@@ -108,7 +109,7 @@ def test_provider_profiles_are_derived_only_from_real_configured_deployments() -
 @pytest.mark.parametrize("provider", ["deepseek", "qwen", "anthropic", "local", "openai"])
 @pytest.mark.parametrize("capabilities", [{"text", "tool_calling"}, {"text"}, {"tool_calling"}])
 def test_configured_tools_select_host_workspace_sandbox_independent_of_provider(
-    provider: str, capabilities: set[str]
+    provider: str, capabilities: set[Capability]
 ) -> None:
     config = PlatformConfig(
         models={

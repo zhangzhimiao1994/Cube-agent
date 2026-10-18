@@ -2127,6 +2127,12 @@ def _dispatch_plan(
                 multi_agent_chain=multi_agent_chain,
             ),
             tools=role_tools_by_id[role.id],
+            engineering_delivery_contract_version=(
+                1 if context.routing_decision.get("engineering_delivery_contract_version") == 1
+                and role.purpose is RolePurpose.EXECUTE
+                and {"workspace.write_text", "workspace.bundle", "project.verify"}.issubset(role_tools_by_id[role.id])
+                else 0
+            ),
             tool_argument_budget_bytes=_tool_argument_budgets_for_step(
                 context,
                 role_tools_by_id[role.id],
@@ -2586,7 +2592,9 @@ def _role_allowed_tools(
         requested = (*requested, "project.inspect")
     if "workspace.read" in requested or "run_safe_command" in requested:
         requested = tuple(name for name in requested if name != "run_safe_command")
-        requested = tuple(dict.fromkeys((*requested, "project.verify")))
+        if (context is None or context.routing_decision.get("engineering_delivery_contract_version") != 1
+                or role.purpose in {RolePurpose.EXECUTE, RolePurpose.VERIFY}):
+            requested = tuple(dict.fromkeys((*requested, "project.verify")))
     if context is None or capability_gateway is None:
         return ()
     requested = tuple(

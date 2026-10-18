@@ -2046,6 +2046,7 @@ def _is_incremental_workspace_contract_step(step: DispatchStep) -> bool:
         and (
             _is_real_project_scale_handoff(step.task)
             or step.workspace_maintenance_contract_version == 1
+            or step.engineering_delivery_contract_version == 1
         )
     )
 

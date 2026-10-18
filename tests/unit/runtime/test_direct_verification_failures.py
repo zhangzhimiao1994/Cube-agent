@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import traceback
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import pytest
 
@@ -114,8 +114,8 @@ async def test_direct_untrusted_verification_result_is_classified_and_fail_close
             return {"status": "failed", "failure_reason": "tool unavailable"}
         diagnostic = dict(process_diagnostic().to_payload())
         payload: dict[str, Any] = {"execution_diagnostic": diagnostic}
-        status = "failed"
-        reason = "project build failed"
+        status: Literal["succeeded", "failed"] = "failed"
+        reason: str | None = "project build failed"
         if case in {"truncated_failure", "foreign_call", "foreign_tool"}:
             reason = "tool unavailable"
         if case in {"truncated_success", "unknown_success", "missing_verification",

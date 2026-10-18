@@ -212,7 +212,7 @@ async def test_snapshot_preserves_safe_read_only_modes_with_mode_bound_digest(
                     st_mode=stat.S_IFREG | source_mode,
                     st_nlink=info.st_nlink,
                     st_size=info.st_size,
-                    st_file_attributes=info.st_file_attributes,
+                    st_file_attributes=getattr(info, 'st_file_attributes', 0),
                 )
             return info
 

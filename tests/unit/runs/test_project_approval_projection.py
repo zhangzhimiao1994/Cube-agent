@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, cast
 from uuid import uuid4
 
 import pytest
@@ -44,6 +44,7 @@ def project_approval() -> tuple[RunRow, RunApprovalRow]:
 
 
 def _scope(run: RunRow, capability: str, operation: str, resource: str) -> str:
+    assert run.actor_id is not None
     request = CapabilityRequest(
         tenant_id=run.tenant_id, user_id=run.actor_id, run_id=run.id, agent_id="implementer",
         capability=capability, operation=operation, resource=resource,
@@ -54,6 +55,7 @@ def _scope(run: RunRow, capability: str, operation: str, resource: str) -> str:
 
 def _bind_scope(run: RunRow, approval: RunApprovalRow, scope: Any) -> None:
     approval.payload["approval_scope"] = scope
+    assert run.routing_decision is not None
     run.routing_decision["approval_scope"] = scope
 
 
@@ -162,7 +164,7 @@ def test_plugin_binding_and_history_stay_unchanged(
     binding = {"plugin_id": "trusted-plugin", "capability_id": "calendar.create_event",
                "run_id": str(run.id), "version": 2}
     approval.payload["public_binding"] = dict(binding)
-    approval.payload["public_request"]["payload"] = dict(binding)
+    cast(dict[str, Any], approval.payload["public_request"])["payload"] = dict(binding)
     _resolve(run, approval, status)
     original = deepcopy(approval.payload)
 
@@ -183,6 +185,8 @@ def test_pending_projection_rejects_mismatching_evidence(
 ) -> None:
     run, approval = project_approval
     _bind_scope(run, approval, _scope(run, "file", "write", "workspace/current"))
+    assert run.routing_decision is not None
+    public_request = cast(dict[str, Any], approval.payload["public_request"])
     if mutation == "scope":
         run.routing_decision["approval_scope"] = _scope(
             run, "command", "run", "workspace/current/project-verification",
@@ -202,11 +206,11 @@ def test_pending_projection_rejects_mismatching_evidence(
     elif mutation == "run":
         approval.run_id = uuid4()
     elif mutation == "request_run":
-        approval.payload["public_request"]["run_id"] = str(uuid4())
+        public_request["run_id"] = str(uuid4())
     elif mutation == "request_version":
-        approval.payload["public_request"]["payload"]["version"] = True
+        public_request["payload"]["version"] = True
     elif mutation == "binding_extension":
-        approval.payload["public_request"]["payload"]["tool_name"] = "PRIVATE-TOOL"
+        public_request["payload"]["tool_name"] = "PRIVATE-TOOL"
     elif mutation == "public_resolution":
         approval.payload["public_resolution"] = {}
     elif mutation == "public_request":

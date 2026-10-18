@@ -1,37 +1,40 @@
+from collections.abc import Callable
 from datetime import UTC, datetime
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import cast
 from unittest.mock import AsyncMock, MagicMock
 from uuid import UUID, uuid4
 
 import pytest
-from asyncpg.pgproto.pgproto import UUID as DriverUUID
+from asyncpg.pgproto.pgproto import UUID as DriverUUID  # type: ignore[import-untyped]
 from sqlalchemy.dialects import postgresql
+from sqlalchemy.engine import Dialect
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from agent_hub.db.models import RunOutboxRow
+from agent_hub.db.models import RunOutboxRow, RunRow
 from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.runs.repository import RunRepository
 
 
-def test_postgres_driver_uuid_identity_is_canonical_at_repository_boundary():
+def test_postgres_driver_uuid_identity_is_canonical_at_repository_boundary() -> None:
     identifiers={key:DriverUUID(str(uuid4())) for key in (
         'id','tenant_id','actor_id','blocked_by_run_id','worker_lease_token')}
     assert all(isinstance(value,UUID) and type(value) is not UUID for value in identifiers.values())
     row=SimpleNamespace(**identifiers,actor_role='operator',request='Owned diagnostic',mode='direct',
         status='running',version=1,created_at=datetime.now(UTC),routing_decision={},worker_id='worker',
         worker_lease_expires_at=None,worker_heartbeat_at=None)
-    record=RunRepository._record(row)
+    record=RunRepository._record(cast(RunRow, row))
     for key,value in identifiers.items():
         assert type(getattr(record,key)) is UUID
         assert getattr(record,key)==value
     assert record.status is RunStatus.RUNNING and record.mode is TaskMode.DIRECT
 
 
-def test_nullable_database_uuid_fields_remain_none():
+def test_nullable_database_uuid_fields_remain_none() -> None:
     row=SimpleNamespace(id=uuid4(),tenant_id=uuid4(),actor_id=None,actor_role=None,request='Read',
         mode=None,status='queued',version=1,created_at=datetime.now(UTC),routing_decision=None,
         blocked_by_run_id=None,worker_lease_token=None)
-    record=RunRepository._record(row)
+    record=RunRepository._record(cast(RunRow, row))
     assert record.actor_id is None and record.blocked_by_run_id is None and record.worker_lease_token is None
 
 
@@ -41,7 +44,7 @@ def _repository_session() -> tuple[RunRepository, MagicMock]:
     session.scalar = AsyncMock()
     session.scalars = AsyncMock()
     session.flush = AsyncMock()
-    return RunRepository(cast(Any, lambda: session)), session
+    return RunRepository(cast(async_sessionmaker[AsyncSession], lambda: session)), session
 
 
 def _outbox_row() -> RunOutboxRow:
@@ -65,7 +68,8 @@ async def test_pending_outbox_canonicalizes_real_driver_uuid_identities() -> Non
     assert type(pending.id) is UUID and pending.id == row.id
     assert type(pending.run_id) is UUID and pending.run_id == row.run_id
     assert pending.idempotency_key == row.idempotency_key
-    statement = session.scalars.call_args.args[0].compile(dialect=postgresql.dialect())
+    statement = session.scalars.call_args.args[0].compile(
+        dialect=cast(Callable[[], Dialect], postgresql.dialect)())
     assert "delivered IS false" in str(statement)
     assert statement.params["param_1"] == 7
 
@@ -75,7 +79,7 @@ async def test_deliver_outbox_canonicalizes_reread_driver_uuid_before_callback()
     repository, session = _repository_session()
     row = _outbox_row()
     session.scalar.return_value = row
-    deliveries = []
+    deliveries: list[tuple[UUID, str]] = []
 
     async def deliver(run_id: UUID, idempotency_key: str) -> None:
         assert type(run_id) is UUID
@@ -87,7 +91,8 @@ async def test_deliver_outbox_canonicalizes_reread_driver_uuid_before_callback()
     assert deliveries == [(row.run_id, row.idempotency_key)]
     assert row.delivered is True and row.delivered_at is not None
     assert session.flush.await_count == 1
-    statement = session.scalar.call_args.args[0].compile(dialect=postgresql.dialect())
+    statement = session.scalar.call_args.args[0].compile(
+        dialect=cast(Callable[[], Dialect], postgresql.dialect)())
     assert "FOR UPDATE SKIP LOCKED" in str(statement)
     assert statement.params["id_1"] == row.id
 
@@ -103,7 +108,8 @@ async def test_recovery_candidates_canonicalize_real_driver_uuids_without_changi
 
     assert candidates == tuple(identifiers)
     assert all(type(run_id) is UUID for run_id in candidates)
-    statement = session.scalars.call_args.args[0].compile(dialect=postgresql.dialect())
+    statement = session.scalars.call_args.args[0].compile(
+        dialect=cast(Callable[[], Dialect], postgresql.dialect)())
     assert "worker_lease_expires_at IS NOT NULL" in str(statement)
     assert "worker_lease_expires_at <=" in str(statement)
     assert statement.params["worker_lease_expires_at_1"] == now

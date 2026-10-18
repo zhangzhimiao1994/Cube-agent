@@ -1245,6 +1245,7 @@ async def test_execute_notifies_terminal_hooks_after_completed_run() -> None:
             "routing_decision": {
                 "source": "evolution",
                 "evolution_run_id": "evolution_1",
+                "engineering_delivery_contract_version": 1,
                 "runtime_token_soft_base_tokens": 1_000_000,
                 "runtime_token_absolute_tokens": 10_000_000,
                 "runtime_plan_token_budget": 10_000_000,
@@ -1496,7 +1497,7 @@ async def test_execute_forwards_persisted_actor_identity_to_runtime_context(driv
     repository = ExecutableFakeRepository(routing_decision={"source": "manual"})
     repository.row.actor_role = Role.OPERATOR.value
     if driver_uuid:
-        from asyncpg.pgproto.pgproto import UUID as DriverUUID
+        from asyncpg.pgproto.pgproto import UUID as DriverUUID  # type: ignore[import-untyped]
 
         repository.row.actor_id = DriverUUID(str(repository.row.actor_id))
         repository.row.tenant_id = DriverUUID(str(repository.row.tenant_id))
@@ -1518,6 +1519,7 @@ async def test_execute_forwards_persisted_actor_identity_to_runtime_context(driv
     assert type(runtime.contexts[0].actor_id) is UUID
     assert type(runtime.contexts[0].tenant_id) is UUID
     assert runtime.contexts[0].actor_role is Role.OPERATOR
+    assert runtime.contexts[0].routing_decision["engineering_delivery_contract_version"] == 1
 
 
 @pytest.mark.asyncio
@@ -2966,6 +2968,7 @@ async def test_execute_backfills_terminal_hooks_once_for_terminal_run_after_cras
             "mode": TaskMode.DISPATCH,
             "routing_decision": {
                 "source": "manual",
+                "engineering_delivery_contract_version": 1,
                 "runtime_token_soft_base_tokens": 1_000_000,
                 "runtime_token_absolute_tokens": 10_000_000,
                 "runtime_plan_token_budget": 10_000_000,
