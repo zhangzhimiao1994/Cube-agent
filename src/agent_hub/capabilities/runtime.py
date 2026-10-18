@@ -227,6 +227,7 @@ class RuntimeCapabilityGateway:
                                        executor=project_executor)
             if project_workspace_dir is not None else None
         )
+        self._project_delivery_receipts: dict[tuple[UUID, UUID], tuple[str, str]] = {}
 
     def is_replay_safe(self, name: str) -> bool:
         normalized_name = _normalize_tool_name(name)
@@ -365,10 +366,19 @@ class RuntimeCapabilityGateway:
                 raise RuntimeCapabilityError("project.verify takes no arguments")
             if self._project_verification is None or not self._project_executor_configured:
                 raise RuntimeCapabilityError("project execution backend is unavailable")
+            self._project_delivery_receipts.pop((tenant_id, run_id), None)
             try:
-                return await self._project_verification.verify(
+                result = await self._project_verification.verify(
                     tenant_id=tenant_id, run_id=run_id, actor=actor,
                 )
+                receipt = cast(Mapping[str, JsonValue], result["verification"])
+                receipt_digest = hashlib.sha256(json.dumps(
+                    receipt, default=dict, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+                ).encode("ascii")).hexdigest()
+                self._project_delivery_receipts[(tenant_id, run_id)] = (
+                    cast(str, receipt["source_sha256"]), receipt_digest,
+                )
+                return result
             except ProjectVerificationError as error:
                 raise RuntimeCapabilityError(str(error), execution_diagnostic=error.diagnostic,
                                              project_failure=error.project_failure) from None
@@ -693,9 +703,10 @@ class RuntimeCapabilityGateway:
         project_id, session_id = await self._project_workspace_scope(tenant_id, run_id)
         title = _optional_string(arguments, "title") or "Project Workspace"
         verified_source: str | None = None
+        delivery_receipt = self._project_delivery_receipts.get((tenant_id, run_id))
         if self._project_executor_configured and self._project_verification is not None:
             files = store.list_files(tenant_id, project_id, session_id)
-            if any(item.path == "package.json" for item in files):
+            if delivery_receipt is not None or any(item.path == "package.json" for item in files):
                 try:
                     verified_source = await self._project_verification.require_current_receipt(tenant_id, run_id)
                 except ProjectVerificationError as error:
@@ -732,6 +743,10 @@ class RuntimeCapabilityGateway:
             cast(Mapping[str, JsonValue], item.to_public_dict()) for item in files
         )
         result["bundle_download_url"] = store.bundle_download_url(project_id, session_id)
+        if delivery_receipt is not None and delivery_receipt[0] == verified_source:
+            # The receipt was issued by verify(), and _bundle_workspace checked the actual ZIP bytes.
+            result["verification_source_sha256"] = verified_source
+            result["verification_receipt_sha256"] = delivery_receipt[1]
         return result
 
     @staticmethod

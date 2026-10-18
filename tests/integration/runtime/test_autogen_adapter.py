@@ -567,7 +567,8 @@ async def test_completed_checkpoint_resumes_without_paid_calls() -> None:
     assert resumed_events[-1].reason == "explicit_completion"
 
 
-async def test_autogen_tool_calls_use_only_capability_gateway() -> None:
+@pytest.mark.parametrize("tool_text", [None, "", "I will search the approved sources."])
+async def test_autogen_tool_calls_use_only_capability_gateway(tool_text: str | None) -> None:
     class ToolGateway(ScriptedGateway):
         async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
             self.requests.append(request)
@@ -579,10 +580,10 @@ async def test_autogen_tool_calls_use_only_capability_gateway() -> None:
                 )
             elif index == 2:
                 response = ModelResponse(
-                    text=None,
+                    text=tool_text,
                     tool_calls=(
                         GatewayToolCall(
-                            id="call_1", name="web.search", arguments={"query": "evidence"}
+                            id="call_1", name="web_search", arguments={"query": "evidence"}
                         ),
                     ),
                     usage=TokenUsage(prompt_tokens=1, completion_tokens=1, total_tokens=2),
@@ -653,6 +654,7 @@ async def test_autogen_tool_calls_use_only_capability_gateway() -> None:
     assert any(event.kind is EventKind.TOOL_STARTED for event in events)
     assert any(event.kind is EventKind.TOOL_COMPLETED for event in events)
     assert ModelCapability.TOOL_CALLING in gateway.requests[1].required_capabilities
+    assert gateway.requests[1].tools[0].name == "web_search"
     assert events[-1].reason == "explicit_completion"
 
 
@@ -846,7 +848,7 @@ async def test_excessive_tool_calls_are_rejected_before_capability_side_effect()
     assert len(terminal_events(events)) == 1
 
 
-@pytest.mark.parametrize("malformation", ["mixed", "empty", "unknown_tool"])
+@pytest.mark.parametrize("malformation", ["mixed_unknown_tool", "empty", "unknown_tool"])
 async def test_malformed_provider_output_fails_closed_with_one_terminal(
     malformation: str,
 ) -> None:
@@ -862,12 +864,12 @@ async def test_malformed_provider_output_fails_closed_with_one_terminal(
                 calls = (
                     GatewayToolCall(
                         id="call_1",
-                        name="other.tool" if malformation == "unknown_tool" else "web.search",
+                        name="other.tool" if malformation.endswith("unknown_tool") else "web.search",
                         arguments={},
                     ),
                 )
                 response = ModelResponse(
-                    text="invalid" if malformation == "mixed" else None,
+                    text="invalid" if malformation == "mixed_unknown_tool" else None,
                     tool_calls=() if malformation == "empty" else calls,
                     usage=TokenUsage(prompt_tokens=1, completion_tokens=1, total_tokens=2),
                 )

@@ -291,6 +291,10 @@ class DispatchStep(_PlanModel):
 
     @model_validator(mode="after")
     def review_invariants(self) -> DispatchStep:
+        if self.engineering_delivery_contract_version == 1 and not {
+            "workspace.write_text", "project.verify", "workspace.bundle",
+        }.issubset(self.tools):
+            raise ValueError("engineering delivery requires write, verify and bundle capabilities")
         if self.reviewer is None and self.reviewer_retries:
             raise ValueError("review retries require a reviewer")
         if self.reviewer == self.agent:

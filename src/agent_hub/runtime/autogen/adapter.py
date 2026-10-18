@@ -63,6 +63,7 @@ from agent_hub.models.types import (
     ModelRequest,
     ModelResponse,
     TokenUsage,
+    ToolDefinition,
 )
 from agent_hub.models.types import ToolCall as GatewayToolCall
 from agent_hub.project_preflight import scoped_project_preflight_arguments
@@ -350,7 +351,11 @@ class _DiscussionDurability:
         )
 
     @staticmethod
-    def request_hash(request: ModelRequest) -> str:
+    def request_hash(
+        request: ModelRequest,
+        *,
+        tool_names: Mapping[str, str] | None = None,
+    ) -> str:
         payload = {
             "logical_model": request.logical_model,
             "messages": [
@@ -359,13 +364,29 @@ class _DiscussionDurability:
             "capabilities": sorted(item.value for item in request.required_capabilities),
             "max_output_tokens": request.max_output_tokens,
         }
+        if request.tools:
+            # Bind both provider schemas and framework targets; keep no-tool legacy hashes.
+            payload["tools"] = [
+                {
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": _mutable_json(tool.parameters),
+                }
+                for tool in request.tools
+            ]
+            payload["tool_names"] = dict(tool_names or {})
         return hashlib.sha256(
             json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest()
 
-    async def before_model(self, request: ModelRequest) -> GatewayCompletion | None:
+    async def before_model(
+        self,
+        request: ModelRequest,
+        *,
+        tool_names: Mapping[str, str] | None = None,
+    ) -> GatewayCompletion | None:
         await self._model_lock.acquire()
-        request_hash = self.request_hash(request)
+        request_hash = self.request_hash(request, tool_names=tool_names)
         try:
             if self._model_cursor < len(self.model_entries):
                 entry = self.model_entries[self._model_cursor]
@@ -393,10 +414,16 @@ class _DiscussionDurability:
                 self._model_lock.release()
             raise
 
-    async def succeed_model(self, request: ModelRequest, completion: GatewayCompletion) -> Artifact:
+    async def succeed_model(
+        self,
+        request: ModelRequest,
+        completion: GatewayCompletion,
+        *,
+        tool_names: Mapping[str, str] | None = None,
+    ) -> Artifact:
         entry = self.model_entries[self._model_cursor]
         if entry.get("status") != "running" or entry.get("request_hash") != self.request_hash(
-            request
+            request, tool_names=tool_names
         ):
             self.fail_model()
             raise RuntimeExecutionError("durable model ledger mismatch")
@@ -797,7 +824,7 @@ def _description_with_failure_codes(description: str, failure_codes: Sequence[st
     suffix = " Failure codes: " + ", ".join(safe_codes) + "."
     if len((description + suffix).encode("utf-8")) > 2_000:
         return description
-    return description + suffix
+    return description[:1024 - len(suffix)].rstrip() + suffix
 
 
 def _manifest_input_schema(metadata: Mapping[str, JsonValue]) -> Mapping[str, JsonValue] | None:
@@ -1655,6 +1682,44 @@ class GatewayCapabilityTool(BaseTool[_DynamicToolArguments, _DynamicToolResult])
         return _DynamicToolResult(result=cast(dict[str, object], dict(tool_result.payload)))
 
 
+def _model_tool_definitions(
+    tools: Sequence[Tool | ToolSchema],
+) -> tuple[tuple[ToolDefinition, ...], dict[str, str]]:
+    definitions: list[ToolDefinition] = []
+    names: dict[str, str] = {}
+    for tool in tools:
+        schema = tool if isinstance(tool, Mapping) else tool.schema
+        internal_name = schema["name"]
+        if type(internal_name) is not str or not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", internal_name):
+            raise RuntimeExecutionError("AutoGen tool name is invalid")
+        external_name = internal_name.replace(".", "_")
+        if len(external_name) > 64:
+            suffix = hashlib.sha256(internal_name.encode()).hexdigest()[:16]
+            external_name = f"{external_name[:47]}_{suffix}"
+        if any(name in names for name in {internal_name, external_name}):
+            raise RuntimeExecutionError("AutoGen tool names are ambiguous")
+        names[internal_name] = internal_name
+        names[external_name] = internal_name
+        description = schema.get("description") or f"Approved Agent Hub capability {internal_name}"
+        if not isinstance(description, str):
+            raise RuntimeExecutionError("AutoGen tool schema is invalid")
+        description = description.strip()[:1024].rstrip() or f"Approved Agent Hub capability {internal_name}"
+        try:
+            definitions.append(
+                ToolDefinition(
+                    name=external_name,
+                    description=description,
+                    parameters=cast(
+                        Mapping[str, JsonValue],
+                        schema.get("parameters", {"type": "object", "properties": {}}),
+                    ),
+                )
+            )
+        except (TypeError, ValueError):
+            raise RuntimeExecutionError("AutoGen tool schema is invalid") from None
+    return tuple(definitions), names
+
+
 class GatewayChatCompletionClient(ChatCompletionClient):
     """Exact AutoGen 0.7.5 model interface backed only by ModelGateway."""
 
@@ -1689,7 +1754,10 @@ class GatewayChatCompletionClient(ChatCompletionClient):
         extra_create_args: Mapping[str, Any] = {},
         cancellation_token: CancellationToken | None = None,
     ) -> CreateResult:
-        del tool_choice, extra_create_args
+        del extra_create_args
+        if not isinstance(tool_choice, str) or tool_choice not in {"auto", "none"}:
+            raise RuntimeExecutionError("unsupported AutoGen tool choice")
+        model_tools, tool_names = _model_tool_definitions(tools if tool_choice == "auto" else ())
         if json_output not in {None, False}:
             raise RuntimeExecutionError("unsupported AutoGen model request")
         if len(messages) > self._compaction_window.absolute_safety_limit:
@@ -1711,13 +1779,16 @@ class GatewayChatCompletionClient(ChatCompletionClient):
             messages=normalized,
             required_capabilities=frozenset(
                 {ModelCapability.TEXT, ModelCapability.TOOL_CALLING}
-                if tools
+                if model_tools
                 else {ModelCapability.TEXT}
             ),
             max_output_tokens=self._max_output_tokens,
+            tools=model_tools,
         )
         completion = (
-            await self._durability.before_model(request) if self._durability is not None else None
+            await self._durability.before_model(request, tool_names=tool_names)
+            if self._durability is not None
+            else None
         )
         replayed = completion is not None
         if completion is None:
@@ -1744,10 +1815,6 @@ class GatewayChatCompletionClient(ChatCompletionClient):
             if not replayed and self._durability is not None:
                 self._durability.fail_model("discussion_failed")
             raise RuntimeExecutionError("model tool call limit exceeded")
-        if response.text is not None and response.tool_calls:
-            if not replayed and self._durability is not None:
-                self._durability.fail_model("discussion_failed")
-            raise RuntimeExecutionError("model response is invalid")
         if response.text is None and not response.tool_calls:
             if not replayed and self._durability is not None:
                 self._durability.fail_model("discussion_failed")
@@ -1764,23 +1831,19 @@ class GatewayChatCompletionClient(ChatCompletionClient):
         if not replayed:
             self._usage.tokens += response.usage.total_tokens
             self._usage.cost_usd += cost_usd
-        available_tools = {
-            item.name if isinstance(item, BaseTool) else cast(ToolSchema, item)["name"]
-            for item in tools
-        }
-        if any(call.name not in available_tools for call in response.tool_calls):
+        if any(call.name not in tool_names for call in response.tool_calls):
             if not replayed and self._durability is not None:
                 self._durability.fail_model("discussion_failed")
             raise RuntimeExecutionError("model requested an unavailable capability")
         if not replayed and self._durability is not None:
-            await self._durability.succeed_model(request, completion)
+            await self._durability.succeed_model(request, completion, tool_names=tool_names)
         content: str | list[FunctionCall]
         finish_reason: Literal["stop", "function_calls"]
         if response.tool_calls:
             content = [
                 FunctionCall(
                     id=call.id,
-                    name=call.name,
+                    name=tool_names[call.name],
                     arguments=json.dumps(
                         dict(call.arguments),
                         ensure_ascii=False,
@@ -1802,7 +1865,7 @@ class GatewayChatCompletionClient(ChatCompletionClient):
             content=content,
             usage=usage,
             cached=False,
-            thought=None,
+            thought=(response.text or None) if response.tool_calls else None,
         )
 
     def create_stream(

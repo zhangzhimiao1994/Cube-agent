@@ -10,7 +10,13 @@ from agent_hub.runtime.contracts import TaskContext
 from agent_hub.runtime.crew.adapter import _is_incremental_workspace_contract_step
 from agent_hub.runtime.crew.plan import DispatchPlan, DispatchStep
 from agent_hub.runtime.defaults import ConfigBackedDirectRuntime, _role_allowed_tools
-from agent_hub.runtime.role_planner import RoleAssignment, RolePurpose
+from agent_hub.runtime.role_planner import (
+    RoleAssignment,
+    RolePlanner,
+    RolePlanningRequest,
+    RolePurpose,
+    TaskProfile,
+)
 from tests.unit.runtime.test_configured_runtime import (
     TENANT_ID,
     FakeCapabilityAvailability,
@@ -81,6 +87,64 @@ def test_generated_engineering_plan_persists_new_contract_without_reclassifying_
     assert legacy.digest != current.digest
     assert DispatchPlan.from_payload(legacy.to_payload()).digest == legacy.digest
     assert DispatchPlan.from_payload(current.to_payload()).digest == current.digest
+
+
+@pytest.mark.parametrize('version', [0, 1])
+@pytest.mark.parametrize('mode', [TaskMode.DISPATCH, TaskMode.HYBRID])
+def test_mixed_engineering_installation_waits_for_source_without_dependency_cycle(
+    version: int, mode: TaskMode,
+) -> None:
+    roles = RolePlanner().plan(RolePlanningRequest(
+        task='Build a Node.js module and install its dependencies.', mode=mode,
+        profile=TaskProfile.DEPLOYMENT, profiles=(TaskProfile.DEPLOYMENT, TaskProfile.SOFTWARE),
+        default_model='main',
+    )).roles
+    context = TaskContext(run_id=uuid4(), tenant_id=TENANT_ID, mode=mode,
+        request='Build a Node.js module and install its dependencies.',
+        routing_decision={'engineering_delivery_contract_version': version})
+    gateway = FakeCapabilityAvailability({'read_context', 'workspace.read', 'workspace.write_text',
+        'workspace.list', 'workspace.bundle', 'project.inspect', 'project.verify'})
+    plan = defaults._dispatch_plan(roles, context, capability_gateway=gateway)
+    steps = {step.id: step for step in plan.steps}
+    assert 'project.verify' in steps['installer_step'].tools
+    if version == 1:
+        assert 'implementer_step' in steps['installer_step'].depends_on
+        assert 'installer_step' not in steps['implementer_step'].depends_on
+        assert steps['implementer_step'].engineering_delivery_contract_version == 1
+    else:
+        assert 'installer_step' in steps['implementer_step'].depends_on
+        assert 'implementer_step' not in steps['installer_step'].depends_on
+
+
+@pytest.mark.parametrize('missing', ['workspace.write_text', 'workspace.bundle', 'project.verify'])
+def test_engineering_writer_cannot_silently_downgrade_when_capability_is_missing(missing: str) -> None:
+    tools = {'workspace.write_text', 'workspace.read', 'workspace.bundle', 'project.verify'}
+    role = RoleAssignment(id='builder', role='Builder', purpose=RolePurpose.EXECUTE,
+        mission='Build the module.', must_answer=('What works?',), allowed_tools=tuple(sorted(tools)),
+        forbidden_actions=('Do not escape scope.',), skills=(), output_schema={'summary': 'string'}, model='main')
+    context = TaskContext(run_id=uuid4(), tenant_id=TENANT_ID, mode=TaskMode.DISPATCH,
+        request='Build a Node.js module.', routing_decision={'engineering_delivery_contract_version': 1})
+    with pytest.raises(ValueError, match='engineering delivery requires'):
+        defaults._dispatch_plan((role,), context,
+            capability_gateway=FakeCapabilityAvailability(tools - {missing}))
+
+
+def test_writable_verifier_does_not_leave_installer_outside_both_dependency_sets() -> None:
+    def role(identifier: str, purpose: RolePurpose, tools: tuple[str, ...]) -> RoleAssignment:
+        return RoleAssignment(id=identifier, role=identifier, purpose=purpose, mission='Check project.',
+            must_answer=('What passed?',), allowed_tools=tools, forbidden_actions=('Do not escape scope.',), skills=(),
+            output_schema={'summary': 'string'}, model='main')
+
+    roles = (role('installer', RolePurpose.EXECUTE, ('run_safe_command',)),
+        role('tester', RolePurpose.VERIFY, ('workspace.write_text', 'workspace.bundle', 'workspace.read')))
+    context = TaskContext(run_id=uuid4(), tenant_id=TENANT_ID, mode=TaskMode.DISPATCH,
+        request='Verify the project.', routing_decision={'engineering_delivery_contract_version': 1})
+    available = FakeCapabilityAvailability({'workspace.write_text', 'workspace.bundle',
+        'workspace.read', 'project.verify', 'project.inspect'})
+    plan = defaults._dispatch_plan(roles, context, capability_gateway=available)
+    steps = {s.id: s for s in plan.steps}
+    assert steps['installer_step'].depends_on == ()
+    assert steps['tester_step'].depends_on == ('installer_step',)
 
 
 async def test_config_backed_direct_injects_common_harness_policy_gateway(

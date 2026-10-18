@@ -1936,6 +1936,25 @@ def _dispatch_plan(
         )
         for role in selected_roles
     }
+    # Verification consumes source. Mixed software/ops plans must not schedule
+    # an installation-only executor before the writer it needs.
+    workspace_consumers = {
+        role.id for role in selected_roles
+        if context.routing_decision.get("engineering_delivery_contract_version") == 1
+        and "project.verify" in role_tools_by_id[role.id]
+        and "workspace.write_text" not in role_tools_by_id[role.id]
+    } if any(not _is_post_product_role(role)
+             and "workspace.write_text" in role_tools_by_id[role.id] for role in selected_roles) else set()
+    engineering_writers = {
+        role.id for role in selected_roles
+        if context.routing_decision.get("engineering_delivery_contract_version") == 1
+        and role.purpose is RolePurpose.EXECUTE
+        and "workspace.write_text" in (*role.allowed_tools, *role.skills, *role_tools_by_id[role.id])
+    }
+    if any(not {"workspace.write_text", "workspace.bundle", "project.verify"}.issubset(
+        role_tools_by_id[role_id],
+    ) for role_id in engineering_writers):
+        raise ValueError("engineering delivery requires available write, verify and bundle capabilities")
     maintenance_step_options: dict[str, _WorkspaceMaintenanceStepOptions] = {
         role.id: {"workspace_maintenance_contract_version": 1}
         if role.purpose is RolePurpose.EXECUTE and workspace_maintenance_contract_active(
@@ -2062,18 +2081,21 @@ def _dispatch_plan(
         post_product_step_timeout=post_product_step_timeout,
     )
     producer_step_ids = tuple(
-        f"{role.id}_step" for role in selected_roles if not _is_post_product_role(role)
+        f"{role.id}_step" for role in selected_roles
+        if not _is_post_product_role(role) and role.id not in workspace_consumers
     )
     approval_free_producer_step_ids = tuple(
         f"{role.id}_step"
         for role in selected_roles
         if not _is_post_product_role(role)
+        and role.id not in workspace_consumers
         and not _dispatch_role_may_require_approval(role)
     )
     approval_execute_step_ids = tuple(
         f"{role.id}_step"
         for role in selected_roles
         if role.purpose is RolePurpose.EXECUTE
+        and role.id not in workspace_consumers
         and _dispatch_role_may_require_approval(role)
     )
     preflight_dependencies = (_PROJECT_PREFLIGHT_STEP_ID,) if preflight_context else ()
@@ -2125,13 +2147,11 @@ def _dispatch_plan(
                 approval_execute_step_ids=approval_execute_step_ids,
                 preflight_dependencies=preflight_dependencies,
                 multi_agent_chain=multi_agent_chain,
+                workspace_consumer=role.id in workspace_consumers,
             ),
             tools=role_tools_by_id[role.id],
             engineering_delivery_contract_version=(
-                1 if context.routing_decision.get("engineering_delivery_contract_version") == 1
-                and role.purpose is RolePurpose.EXECUTE
-                and {"workspace.write_text", "workspace.bundle", "project.verify"}.issubset(role_tools_by_id[role.id])
-                else 0
+                1 if role.id in engineering_writers else 0
             ),
             tool_argument_budget_bytes=_tool_argument_budgets_for_step(
                 context,
@@ -2295,6 +2315,7 @@ def _dispatch_step_dependencies(
     approval_execute_step_ids: tuple[str, ...],
     preflight_dependencies: tuple[str, ...],
     multi_agent_chain: bool,
+    workspace_consumer: bool = False,
 ) -> tuple[str, ...]:
     if multi_agent_chain:
         return {
@@ -2302,7 +2323,7 @@ def _dispatch_step_dependencies(
             "implementer": ("architect_step",),
             "tester": ("implementer_step",),
         }[role.id]
-    if _is_post_product_role(role) and producer_step_ids:
+    if (_is_post_product_role(role) or workspace_consumer) and producer_step_ids:
         return producer_step_ids
     if role.purpose is RolePurpose.EXECUTE and _dispatch_role_may_require_approval(role):
         current_step_id = f"{role.id}_step"
