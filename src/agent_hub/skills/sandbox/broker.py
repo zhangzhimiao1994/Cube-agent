@@ -28,6 +28,11 @@ from agent_hub.skills.sandbox.base import (
     run_subprocess_with_limits,
     validate_execution_id,
 )
+from agent_hub.skills.sandbox.project import (
+    ProjectBrokerRequest,
+    ProjectExecutionBroker,
+    ProjectTerminateRequest,
+)
 
 BROKER_SOCKET_PATH = Path("/run/agent-hub/skill-broker.sock")
 _PROTOCOL_VERSION: Literal[1] = 1
@@ -113,6 +118,7 @@ class BrokerPolicy:
         Path("/var/lib/agent-hub/attachments"),
         Path("/var/lib/agent-hub/workspaces"),
     )
+    project_workspace_root: Path = Path("/var/lib/agent-hub/workspaces")
 
 
 def validate_broker_request(
@@ -243,6 +249,7 @@ def build_broker_terminate_command(execution_id: str, policy: BrokerPolicy) -> t
         policy.systemctl,
         "kill",
         "--kill-who=all",
+        "--signal=SIGKILL",
         f"agent-hub-skill-{execution_id}.service",
     )
 
@@ -308,6 +315,12 @@ class SkillBroker:
         self._policy = policy
         self._processes: dict[str, asyncio.subprocess.Process] = {}
         self._execution_slots = asyncio.Semaphore(8)
+        self._project_broker = ProjectExecutionBroker(policy, self._execution_slots)
+
+    async def handle_project(
+        self, request: ProjectBrokerRequest | ProjectTerminateRequest, *, peer_uid: int,
+    ) -> BrokerResponse:
+        return await self._project_broker.handle(request, peer_uid=peer_uid)
 
     async def handle(self, request: BrokerRequest, *, peer_uid: int) -> BrokerResponse:
         try:
@@ -356,21 +369,60 @@ class SkillBroker:
             self._processes.pop(invocation.execution_id, None)
 
     async def _terminate(self, execution_id: str, backend: BrokerBackend) -> None:
-        process = self._processes.get(execution_id)
-        if process is not None and process.returncode is None:
-            process.kill()
         if backend == "docker":
             from agent_hub.skills.sandbox.docker import build_docker_terminate_command
 
             command = build_docker_terminate_command(execution_id, executable=self._policy.docker)
         else:
             command = build_broker_terminate_command(execution_id, self._policy)
-        killer = await asyncio.create_subprocess_exec(
-            *command,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
-        await asyncio.wait_for(killer.wait(), timeout=5)
+        failure = BrokerRequestError(f"{backend}_termination_cleanup_incomplete")
+        killer: asyncio.subprocess.Process | None = None
+        try:
+            # Killing the launcher alone does not terminate the isolated workload.
+            process = self._processes.get(execution_id)
+            if process is not None and process.returncode is None:
+                with contextlib.suppress(ProcessLookupError):
+                    process.kill()
+            async with asyncio.timeout(5):
+                killer = await asyncio.create_subprocess_exec(
+                    *command,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                returncode = await killer.wait()
+        except BaseException as error:  # noqa: BLE001 - reclaim the owned helper on every failure
+            interruption = error
+            if killer is not None:
+
+                async def reap(helper: asyncio.subprocess.Process) -> None:
+                    if helper.returncode is None:
+                        with contextlib.suppress(ProcessLookupError):
+                            helper.kill()
+                    await asyncio.wait_for(helper.wait(), timeout=1)
+
+                recovery = asyncio.create_task(reap(killer))
+                # The recovery task has its own deadline, below base.py's 10s grace.
+                while not recovery.done():
+                    try:
+                        await asyncio.shield(recovery)
+                    except asyncio.CancelledError as cancellation:
+                        interruption = cancellation
+                    except Exception:  # noqa: BLE001 - retrieve the recovery failure below
+                        break
+                try:
+                    recovery.result()
+                except Exception:  # noqa: BLE001 - never expose helper errors on the wire
+                    if isinstance(interruption, asyncio.CancelledError):
+                        raise interruption from failure
+                    raise failure from None
+            if isinstance(interruption, asyncio.CancelledError) or not isinstance(
+                interruption, Exception
+            ):
+                raise interruption
+            raise failure from None
+        # Nonzero also covers missing units/containers; absence is not proven by an exit code.
+        if returncode != 0:
+            raise failure
 
     async def _probe(self, backend: BrokerBackend) -> BrokerResponse:
         if backend == "docker":
@@ -472,11 +524,29 @@ async def _serve_client(
     writer: asyncio.StreamWriter,
     broker: SystemdBroker,
 ) -> None:
+    is_project = False
     try:
         peer_uid = _peer_uid(writer)
         payload = await _read_frame(reader, _MAX_REQUEST_BYTES)
-        request = BrokerRequest.model_validate_json(payload, strict=True)
-        response = await broker.handle(request, peer_uid=peer_uid)
+        envelope = json.loads(payload)
+        if isinstance(envelope, dict) and type(envelope.get("version")) is int and envelope["version"] == 2:
+            is_project = True
+            if envelope.get("action") == "terminate_project":
+                project_request: ProjectBrokerRequest | ProjectTerminateRequest = (
+                    ProjectTerminateRequest.model_validate_json(payload, strict=True)
+                )
+            else:
+                project_request = ProjectBrokerRequest.model_validate_json(payload, strict=True)
+            response = await broker.handle_project(project_request, peer_uid=peer_uid)
+        else:
+            request = BrokerRequest.model_validate_json(payload, strict=True)
+            response = await broker.handle(request, peer_uid=peer_uid)
+    except asyncio.CancelledError:
+        if not is_project:
+            writer.close()
+            await writer.wait_closed()
+            raise
+        response = BrokerResponse(ok=False, error="project execution cancelled")
     except (BrokerRequestError, OSError, ValueError) as error:
         response = BrokerResponse(ok=False, error=str(error))
     try:

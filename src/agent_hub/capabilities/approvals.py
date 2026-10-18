@@ -371,6 +371,11 @@ def fingerprint_capability_request(request: CapabilityRequest) -> str:
 def capability_approval_scope(request: CapabilityRequest) -> str | None:
     normalized_resource = normalize_resource(request.resource)
     if (
+        request.capability == "command" and request.operation == "run"
+        and normalized_resource == "workspace/current/project-verification"
+    ):
+        return _run_capability_scope(request, normalized_resource)
+    if (
         request.capability == "file"
         and request.operation == "write"
         and normalized_resource == "workspace/current"

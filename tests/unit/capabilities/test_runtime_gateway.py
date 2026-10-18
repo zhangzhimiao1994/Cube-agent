@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import os
 from collections.abc import Callable, Mapping
 from pathlib import Path
+from types import MappingProxyType
 from typing import cast
 from uuid import UUID
 from zipfile import ZipFile
@@ -134,6 +136,212 @@ class BackendFailureSandbox(FakeSandbox):
             stderr="Cannot connect to the Docker daemon",
             timed_out=False,
         )
+
+
+class ResultSandbox(FakeSandbox):
+    def __init__(self, result: SkillResult | Exception) -> None:
+        super().__init__()
+        self.result = result
+
+    async def run(self, invocation: SkillInvocation) -> SkillResult:
+        self.invocations.append(invocation)
+        if isinstance(self.result, Exception):
+            raise self.result
+        return self.result
+
+
+async def _skill_execution_failure(
+    tmp_path: Path, result: SkillResult | Exception, *, backend: str = "systemd",
+) -> RuntimeCapabilityError:
+    skill_dir = tmp_path / "skills" / str(TENANT_ID)
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "docx.zip").write_bytes(skill_zip())
+    sandbox = ResultSandbox(result)
+    gateway = RuntimeCapabilityGateway(
+        skill_store_dir=tmp_path / "skills",
+        run_repository=FakeRunRepository(
+            stored_run(tenant=TENANT_ID, run=RUN_ID, execution_backend=backend)
+        ),
+        skill_sandboxes={backend: sandbox},
+    )
+    with pytest.raises(RuntimeCapabilityError) as caught:
+        await gateway.execute(
+            tenant_id=TENANT_ID, run_id=RUN_ID, actor="writer", name="docx",
+            arguments={}, idempotency_key="diagnostic_1",
+        )
+    assert len(sandbox.invocations) == 1
+    assert not gateway.is_replay_safe("docx")
+    return caught.value
+
+
+@pytest.mark.parametrize(
+    ("exit_code", "timed_out", "backend", "stderr", "reason"),
+    [
+        (1, False, "systemd", "ModuleNotFoundError: No module named 'PIL'",
+         "skill execution failed"),
+        (None, True, "systemd", "deadline reached", "skill execution timed out"),
+        (125, False, "docker", "Cannot connect to the Docker daemon",
+         "execution backend is unavailable: docker"),
+    ],
+)
+async def test_skill_failure_preserves_completed_execution_diagnostic(
+    tmp_path: Path, exit_code: int | None, timed_out: bool, backend: str,
+    stderr: str, reason: str,
+) -> None:
+    error = await _skill_execution_failure(
+        tmp_path,
+        SkillResult(exit_code=exit_code, timed_out=timed_out, stdout="progress", stderr=stderr),
+        backend=backend,
+    )
+    assert str(error) == reason
+    diagnostic = getattr(error, "execution_diagnostic", None)
+    assert diagnostic is not None, "completed process evidence was discarded"
+    payload = diagnostic.to_payload()
+    assert payload["schema_version"] == 1
+    assert payload["backend"] == backend
+    assert payload["exit_code"] == exit_code
+    assert payload["timed_out"] is timed_out
+    assert payload["stdout"] == "progress"
+    assert payload["stderr"] == stderr
+    assert "pip" not in repr(payload)
+
+
+async def test_skill_diagnostic_bounds_unicode_and_marks_truncation(tmp_path: Path) -> None:
+    output = "\u4e2d\U0001f642" * 10_000
+    error = await _skill_execution_failure(
+        tmp_path, SkillResult(exit_code=1, timed_out=False, stdout=output, stderr=output),
+    )
+    diagnostic = getattr(error, "execution_diagnostic", None)
+    assert diagnostic is not None, "bounded process evidence is missing"
+    payload = diagnostic.to_payload()
+    for stream in ("stdout", "stderr"):
+        text = payload[stream]
+        assert len(text.encode("utf-8")) <= 4096
+        assert text.endswith("\n[truncated]")
+        assert "\ufffd" not in text
+        metadata = payload[f"{stream}_metadata"]
+        assert metadata["truncated"] is True
+        assert metadata["sanitized_bytes"] == 70_000
+        assert metadata["returned_bytes"] == len(text.encode("utf-8"))
+        assert metadata["sha256"] == hashlib.sha256(output.encode("utf-8")).hexdigest()
+
+
+@pytest.mark.parametrize(
+    "sensitive_line",
+    ["API_KEY=private-value", "Authorization: Basic private-value", "cookie=private-value",
+     "TOKEN=private-value", "password=private-value", "credential: private-value",
+     "Bearer private-value", "sk-private-value", "secret=private-value",
+     pytest.param("x" * 5000 + " API_KEY=private-value", id="sensitive-after-limit")],
+)
+async def test_skill_diagnostic_removes_whole_sensitive_lines_before_bounding(
+    tmp_path: Path, sensitive_line: str,
+) -> None:
+    output = f"before\n{sensitive_line}\nafter"
+    error = await _skill_execution_failure(
+        tmp_path, SkillResult(exit_code=1, timed_out=False, stdout=output, stderr=output),
+    )
+    diagnostic = getattr(error, "execution_diagnostic", None)
+    assert diagnostic is not None, "sanitized process evidence is missing"
+    payload = diagnostic.to_payload()
+    assert str(error) == "skill execution failed"
+    assert "private-value" not in repr(error)
+    assert "private-value" not in repr(payload)
+    for stream in ("stdout", "stderr"):
+        assert payload[stream] == "before\nafter"
+        metadata = payload[f"{stream}_metadata"]
+        assert metadata["redacted_lines"] == 1
+        assert metadata["truncated"] is False
+        assert metadata["sanitized_bytes"] == 12
+        assert metadata["sha256"] == hashlib.sha256(b"before\nafter").hexdigest()
+
+
+async def test_backend_os_error_has_no_completed_process_evidence(tmp_path: Path) -> None:
+    error = await _skill_execution_failure(tmp_path, OSError("API_KEY=private-value"))
+    assert str(error) == "execution backend is unavailable: systemd"
+    assert getattr(error, "execution_diagnostic", None) is None
+    assert "private-value" not in repr(error)
+
+
+async def test_skill_result_without_exit_or_timeout_has_no_diagnostic(tmp_path: Path) -> None:
+    error = await _skill_execution_failure(
+        tmp_path,
+        SkillResult(exit_code=None, timed_out=False, stdout="unconfirmed", stderr="unconfirmed"),
+    )
+    assert str(error) == "skill execution failed"
+    assert error.execution_diagnostic is None
+
+
+def test_runtime_capability_error_preserves_empty_legacy_constructor() -> None:
+    error = RuntimeCapabilityError()
+    assert str(error) == ""
+    assert error.execution_diagnostic is None
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["nonstring_key", "nested_key", "object", "bytes", "nan", "inf", "negative_inf",
+     "mapping_cycle", "list_cycle", "tuple_cycle", "not_mapping"],
+)
+async def test_skill_invalid_json_is_stable_and_never_enters_sandbox(
+    tmp_path: Path, case: str,
+) -> None:
+    mapping_cycle: dict[str, object] = {}
+    mapping_cycle["self"] = mapping_cycle
+    list_cycle: list[object] = []
+    list_cycle.append(list_cycle)
+    tuple_child: list[object] = []
+    tuple_cycle = (tuple_child,)
+    tuple_child.append(tuple_cycle)
+    cases: dict[str, object] = {
+        "nonstring_key": {1: "value"},
+        "nested_key": {"nested": (MappingProxyType({False: "value"}),)},
+        "object": {"nested": (MappingProxyType({"value": object()}),)},
+        "bytes": {"value": b"synthetic-private-value"},
+        "nan": {"nested": (float("nan"),)},
+        "inf": {"value": float("inf")},
+        "negative_inf": {"value": float("-inf")},
+        "mapping_cycle": mapping_cycle,
+        "list_cycle": {"value": list_cycle},
+        "tuple_cycle": {"value": tuple_cycle},
+        "not_mapping": ["value"],
+    }
+    skill_dir = tmp_path / str(TENANT_ID)
+    skill_dir.mkdir()
+    (skill_dir / "docx.zip").write_bytes(skill_zip())
+    sandbox = FakeSandbox()
+    gateway = RuntimeCapabilityGateway(skill_store_dir=tmp_path, skill_sandbox=sandbox)
+
+    with pytest.raises(RuntimeCapabilityError) as caught:
+        await gateway.execute(
+            tenant_id=TENANT_ID, run_id=RUN_ID, actor="writer", name="docx",
+            arguments=cast(Mapping[str, JsonValue], cases[case]), idempotency_key="invalid_json_1",
+        )
+
+    assert str(caught.value) == "capability arguments are invalid"
+    assert caught.value.execution_diagnostic is None
+    assert sandbox.invocations == []
+
+
+async def test_skill_json_allows_shared_containers_without_treating_them_as_cycles(
+    tmp_path: Path,
+) -> None:
+    shared = MappingProxyType({"steps": (1, 2)})
+    skill_dir = tmp_path / str(TENANT_ID)
+    skill_dir.mkdir()
+    (skill_dir / "docx.zip").write_bytes(skill_zip())
+    sandbox = FakeSandbox()
+    gateway = RuntimeCapabilityGateway(skill_store_dir=tmp_path, skill_sandbox=sandbox)
+
+    result = await gateway.execute(
+        tenant_id=TENANT_ID, run_id=RUN_ID, actor="writer", name="docx",
+        arguments={"first": shared, "second": shared}, idempotency_key="shared_json_1",
+    )
+
+    assert result["result"] == {"ok": True}
+    assert len(sandbox.invocations) == 1
+    assert sandbox.invocations[0].input["arguments"] == {
+        "first": {"steps": [1, 2]}, "second": {"steps": [1, 2]},
+    }
 
 
 class FakeManifestSource:
@@ -1264,6 +1472,27 @@ def test_runtime_gateway_exposes_capability_manifest_for_builtins_and_skills(
         "schema_version": 1,
         "capabilities": (
             {
+                "id": "project.verify",
+                **_builtin_contract_fields("project.verify"),
+                "kind": "builtin",
+                "adapter": "runtime_builtin",
+                "permission_class": "command.run",
+                "sandbox_profile": "project_execution",
+                "available": False,
+                "availability_reason": "project_workspace_store_not_configured",
+                "replay_safe": False,
+                "aliases": (),
+            },
+            {
+                "id": "project.inspect",
+                **_builtin_contract_fields("project.inspect"),
+                "kind": "builtin", "adapter": "runtime_builtin",
+                "permission_class": "file.read", "sandbox_profile": "workspace_read",
+                "available": False,
+                "availability_reason": "project_workspace_store_not_configured",
+                "replay_safe": True, "aliases": (),
+            },
+            {
                 "id": "calculator.evaluate",
                 **_builtin_contract_fields("calculator.evaluate"),
                 "kind": "builtin",
@@ -1402,6 +1631,27 @@ def test_runtime_gateway_capability_manifest_omits_skill_package_internals(
     manifest = gateway.capability_manifest(TENANT_ID)
 
     assert manifest["capabilities"] == (
+        {
+            "id": "project.verify",
+            **_builtin_contract_fields("project.verify"),
+            "kind": "builtin",
+            "adapter": "runtime_builtin",
+            "permission_class": "command.run",
+            "sandbox_profile": "project_execution",
+            "available": False,
+            "availability_reason": "project_workspace_store_not_configured",
+            "replay_safe": False,
+            "aliases": (),
+        },
+        {
+            "id": "project.inspect",
+            **_builtin_contract_fields("project.inspect"),
+            "kind": "builtin", "adapter": "runtime_builtin",
+            "permission_class": "file.read", "sandbox_profile": "workspace_read",
+            "available": False,
+            "availability_reason": "project_workspace_store_not_configured",
+            "replay_safe": True, "aliases": (),
+        },
         {
             "id": "calculator.evaluate",
             **_builtin_contract_fields("calculator.evaluate"),
@@ -2028,6 +2278,8 @@ def test_runtime_gateway_capability_manifest_skips_bad_registry_sources(
     manifest_items = cast(tuple[Mapping[str, JsonValue], ...], manifest["capabilities"])
 
     assert {item["id"] for item in manifest_items} == {
+        "project.verify",
+        "project.inspect",
         "calculator.evaluate",
         "http.read",
         "document.generate_docx",

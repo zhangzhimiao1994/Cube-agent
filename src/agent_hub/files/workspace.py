@@ -8,7 +8,7 @@ import re
 import shutil
 import subprocess
 import zipfile
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import asdict, dataclass
 from hashlib import sha256
 from itertools import islice
@@ -32,6 +32,26 @@ WorkspacePlatform = Literal["windows", "linux", "other"]
 ExecutableFinder = Callable[[str], str | None]
 _MAX_DIRECTORY_SCAN = 2_048
 _MAX_DIRECTORY_RESULTS = 256
+_EXCLUDED_WORKSPACE_DIRECTORIES = frozenset({
+    "node_modules",
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+    ".bundles",
+})
+PROJECT_PRIVATE_NAMES = frozenset({
+    "credentials", "credentials.json", "credentials.yaml", "credentials.yml",
+    "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519", "netrc", "npmrc", "pypirc",
+})
+PROJECT_PRIVATE_SUFFIXES = (".pem", ".key", ".p12", ".pfx", ".pyc")
+
+
+def project_private_entry(name: str) -> bool:
+    lower = name.casefold()
+    return lower in PROJECT_PRIVATE_NAMES or lower.endswith(PROJECT_PRIVATE_SUFFIXES)
 
 
 @dataclass(frozen=True, slots=True)
@@ -269,12 +289,9 @@ class ProjectWorkspaceStore:
         if not session_root.exists():
             return ()
         files: list[ProjectWorkspaceFile] = []
-        for path in sorted(session_root.rglob("*"), key=lambda item: item.as_posix()):
-            if not path.is_file():
-                continue
+        paths = (path for _, entries in _walk_workspace(session_root) for path in entries)
+        for path in sorted(paths, key=lambda item: item.as_posix()):
             relative = path.relative_to(session_root).as_posix()
-            if relative.startswith(".bundles/"):
-                continue
             safe_path = _safe_workspace_path(relative)
             resolved = self._resolve_candidate(
                 tenant_id,
@@ -326,14 +343,18 @@ class ProjectWorkspaceStore:
             target.unlink()
             removed.append(item.path)
         for directory in sorted(
-            (path for path in session_root.rglob("*") if path.is_dir()),
+            (path for path, _ in _walk_workspace(session_root) if path != session_root),
             key=lambda path: len(path.parts),
             reverse=True,
         ):
-            if directory.name == ".bundles":
-                continue
             try:
-                directory.rmdir()
+                # Nonempty ancestors of excluded directories must also be preserved.
+                if (
+                    not directory.is_symlink()
+                    and not directory.is_junction()
+                    and next(directory.iterdir(), None) is None
+                ):
+                    directory.rmdir()
             except OSError:
                 pass
         return tuple(removed)
@@ -531,6 +552,27 @@ class ProjectWorkspaceStore:
                 f"?path={encoded_path}"
             ),
         )
+
+
+def _walk_workspace(session_root: Path) -> Iterator[tuple[Path, list[Path]]]:
+    for current, directories, filenames in os.walk(session_root, topdown=True, followlinks=False):
+        directory = Path(current)
+        # Prune before os.walk descends; followlinks=False alone does not block junctions.
+        directories[:] = [
+            name
+            for name in directories
+            if name.casefold() not in _EXCLUDED_WORKSPACE_DIRECTORIES
+            and not project_private_entry(name)
+            and not (directory / name).is_symlink()
+            and not (directory / name).is_junction()
+        ]
+        files = [directory / name for name in filenames]
+        yield directory, [
+            path
+            for path in files
+            if not project_private_entry(path.name)
+            and not path.is_symlink() and not path.is_junction() and path.is_file()
+        ]
 
 
 def _safe_workspace_segment(value: str) -> str:

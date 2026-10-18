@@ -2585,16 +2585,33 @@ def _public_plugin_approval_events(
             or routing.get("approval_id") != approval.approval_id
             or not isinstance(approval.payload.get("approval_fingerprint"), str)
             or routing.get("approval_fingerprint") != approval.payload.get("approval_fingerprint")
+            or routing.get("approval_scope") != approval.payload.get("approval_scope")
             or binding["version"] != run.version
             or "public_resolution" in approval.payload
         ):
             raise RunConflict("pending capability approval evidence is stale")
+        public_binding = dict(binding)
+        if "public_binding" not in approval.payload and isinstance(run.actor_id, UUID):
+            for capability, operation, resource in (
+                ("file", "write", "workspace/current"),
+                ("command", "run", "workspace/current/project-verification"),
+            ):
+                scope = (
+                    f"capability-scope:v1:tenant={run.tenant_id}:user={run.actor_id}:"
+                    f"run={run.id}:capability={capability}:operation={operation}:resource={resource}"
+                )
+                if approval.payload.get("approval_scope") == scope:
+                    public_binding.update({
+                        "capability": capability, "operation": operation,
+                        "resource": resource, "approval_scope": scope,
+                    })
+                    break
         # Construct a whitelist view; even stored envelope extensions cannot leak arguments/source.
         public.append({
             "kind": "approval.requested", "sequence": requested["sequence"], "run_id": str(run.id),
             "approval_id": approval.approval_id, "actor": "capability_gateway",
             "action": "capability_tool", "reason": "capability requires approval",
-            "payload": dict(binding), "created_at": approval.created_at,
+            "payload": public_binding, "created_at": approval.created_at,
         })
         if approval.status != "pending":
             resolved = approval.payload.get("public_resolution")

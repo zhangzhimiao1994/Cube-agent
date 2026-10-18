@@ -226,6 +226,8 @@ def _read_windows_locked(root: Path, parts: tuple[str, ...], *, max_bytes: int =
             3, 0x00200000 | 0x02000000, None,
         )
         if raw is None or raw == ctypes.c_void_p(-1).value:
+            if ctypes.get_last_error() in (2, 3):  # ERROR_FILE_NOT_FOUND / ERROR_PATH_NOT_FOUND
+                raise FileNotFoundError
             raise ScopedReadError
         handle = cast(int, raw)
         try:

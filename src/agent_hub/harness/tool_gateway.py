@@ -7,6 +7,7 @@ from typing import Protocol
 from uuid import UUID
 
 from agent_hub.auth.models import Role
+from agent_hub.capabilities.execution_diagnostics import ExecutionDiagnostic
 from agent_hub.capabilities.gateway import CapabilityResult, CapabilityStatus
 from agent_hub.capabilities.runtime import RuntimeCapabilityError
 from agent_hub.capabilities.types import CapabilityRequest
@@ -197,7 +198,13 @@ class HarnessToolGateway:
                     idempotency_key=request.idempotency_key,
                 )
         except RuntimeCapabilityError as error:
-            return self._failure(request, _deterministic_failure_reason(error))
+            diagnostic = error.execution_diagnostic
+            failure_payload: Mapping[str, JsonValue] | None = None
+            if type(diagnostic) is ExecutionDiagnostic:
+                failure_payload = {"execution_diagnostic": diagnostic.to_payload()}
+            return self._failure(
+                request, _deterministic_failure_reason(error), payload=failure_payload,
+            )
         except Exception as error:
             error.__traceback__ = None
             error.__context__ = None
@@ -413,6 +420,8 @@ _SAFE_POLICY_TOKEN = re.compile(r"^[a-z][a-z0-9_-]{0,127}$")
 _SAFE_AVAILABILITY_REASON = re.compile(r"^[A-Za-z][A-Za-z0-9_.:-]{0,127}$")
 
 _STATIC_BUILTIN_POLICY_PARTS: Mapping[str, CapabilityPolicyParts] = {
+    "project.verify": ("command", "run", "workspace/current/project-verification"),
+    "project.inspect": ("file", "read", "workspace/current"),
     "calculator": ("calculator", "evaluate", "calculator"),
     "calculator_evaluate": ("calculator", "evaluate", "calculator"),
     "calculator.evaluate": ("calculator", "evaluate", "calculator"),

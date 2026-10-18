@@ -15,6 +15,8 @@ def builtin_tool_input_schema(name: str) -> Mapping[str, JsonValue] | None:
     read_schema = read_tool_input_schema(name)
     if read_schema is not None:
         return read_schema
+    if name in {"project.inspect", "project.verify"}:
+        return {"type": "object", "additionalProperties": False, "properties": {}}
     if name == PROJECT_ZIP_TOOL_NAME:
         return project_zip_input_schema()
     if name in {"calculator.evaluate", "calculator", "calculator_evaluate", "http.read"}:
@@ -49,6 +51,19 @@ def builtin_tool_description(name: str) -> str | None:
     read_description = read_tool_description(name)
     if read_description is not None:
         return read_description
+    if name == "project.verify":
+        return (
+            "Install declared project dependencies under approved source/network policy, then "
+            "run build and test in an isolated disposable workspace. Takes no arguments. "
+            "Failed checks return evidence to diagnose and repair; rerun after changing source. "
+            "Requires command and dependency-install authorization; never claim delivery before success."
+        )
+    if name == "project.inspect":
+        return (
+            "Inspect current run's project manifests, declared dependencies, runtime constraints "
+            "and build/test script presence without executing code. Takes no arguments. "
+            "Does not install dependencies or prove execution environment readiness."
+        )
     if name in {"calculator.evaluate", "calculator", "calculator_evaluate"}:
         return "Evaluate a calculator expression supplied as the required nonblank expression string."
     if name == "http.read":

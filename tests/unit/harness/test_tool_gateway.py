@@ -1,14 +1,19 @@
 from collections.abc import Mapping
+from pathlib import Path
+from types import MappingProxyType
 from uuid import UUID
 
 import pytest
 
 from agent_hub.auth.models import Role
+from agent_hub.capabilities.execution_diagnostics import ExecutionDiagnostic
 from agent_hub.capabilities.gateway import CapabilityResult, CapabilityStatus
-from agent_hub.capabilities.runtime import RuntimeCapabilityError
+from agent_hub.capabilities.runtime import RuntimeCapabilityError, RuntimeCapabilityGateway
 from agent_hub.capabilities.types import CapabilityRequest
 from agent_hub.harness.tool_gateway import HarnessToolGateway
 from agent_hub.harness.types import HarnessToolCallRequest, JsonValue
+from agent_hub.skills.sandbox.base import SkillInvocation, SkillResult
+from tests.unit.skills.test_package import skill_zip
 
 TENANT_ID = UUID("44444444-4444-4444-8444-444444444444")
 USER_ID = UUID("66666666-6666-4666-8666-666666666666")
@@ -280,6 +285,190 @@ class DeterministicFailureRuntimeCapabilityGateway(FakeRuntimeCapabilityGateway)
     ) -> Mapping[str, JsonValue]:
         del tenant_id, run_id, actor, name, arguments, idempotency_key
         raise RuntimeCapabilityError("files must be an object")
+
+
+class ExecutionResultSandbox:
+    def __init__(self, result: SkillResult | Exception) -> None:
+        self.result = result
+        self.calls = 0
+        self.invocations: list[SkillInvocation] = []
+
+    async def run(self, invocation: SkillInvocation) -> SkillResult:
+        self.calls += 1
+        self.invocations.append(invocation)
+        if isinstance(self.result, Exception):
+            raise self.result
+        return self.result
+
+    async def terminate(self, execution_id: str) -> None:
+        raise AssertionError("gateway must not terminate or retry a completed execution")
+
+
+class ErrorRuntimeCapabilityGateway(FakeRuntimeCapabilityGateway):
+    def __init__(self, error: Exception) -> None:
+        super().__init__()
+        self.error = error
+
+    async def execute(
+        self, *, tenant_id: UUID, run_id: UUID, actor: str, name: str,
+        arguments: Mapping[str, JsonValue], idempotency_key: str,
+    ) -> Mapping[str, JsonValue]:
+        await super().execute(
+            tenant_id=tenant_id, run_id=run_id, actor=actor, name=name,
+            arguments=arguments, idempotency_key=idempotency_key,
+        )
+        raise self.error
+
+
+@pytest.mark.parametrize("exit_code", [0, 1])
+@pytest.mark.parametrize("raise_backend_errors", [False, True])
+async def test_real_skill_bridge_thaws_nested_arguments_and_preserves_result(
+    tmp_path: Path, exit_code: int, raise_backend_errors: bool,
+) -> None:
+    skill_dir = tmp_path / str(TENANT_ID)
+    skill_dir.mkdir()
+    (skill_dir / "docx.zip").write_bytes(skill_zip())
+    stdout = '{"ok":true}' if exit_code == 0 else "API_KEY=private-value\nprogress"
+    stderr = "notice" if exit_code == 0 else "ModuleNotFoundError: No module named 'PIL'"
+    sandbox = ExecutionResultSandbox(SkillResult(
+        exit_code=exit_code, timed_out=False, stdout=stdout, stderr=stderr,
+    ))
+    runtime = RuntimeCapabilityGateway(skill_store_dir=tmp_path, skill_sandbox=sandbox)
+    policy = FakePolicyGateway(CapabilityStatus.ALLOWED)
+    gateway = HarnessToolGateway(
+        runtime, policy_gateway=policy, raise_backend_errors=raise_backend_errors,
+    )
+    call = HarnessToolCallRequest(
+        run_id=RUN_ID, actor="writer", tool_name="docx",
+        arguments={
+            "batch": ({"path": "draft.txt", "options": {"steps": (1, {"enabled": True})}},),
+            "scalars": (None, False, 3, 1.5, "\u4e2d\u6587"),
+            "empty": {},
+        },
+        approval_required=False, sandbox="restricted", idempotency_key="bridge_1",
+    )
+    assert isinstance(call.arguments, MappingProxyType)
+    batch = call.arguments["batch"]
+    assert isinstance(batch, tuple)
+    assert isinstance(batch[0], MappingProxyType)
+
+    result = await gateway.invoke(TENANT_ID, call, user_id=USER_ID, role=Role.OPERATOR)
+
+    assert sandbox.calls == 1
+    assert sandbox.invocations[0].input["arguments"] == {
+        "batch": [{"path": "draft.txt", "options": {"steps": [1, {"enabled": True}]}}],
+        "scalars": [None, False, 3, 1.5, "\u4e2d\u6587"],
+        "empty": {},
+    }
+    assert len(policy.requests) == 1
+    assert not runtime.is_replay_safe("docx")
+    if exit_code == 0:
+        assert result.status == "succeeded"
+        assert result.failure_reason is None
+        assert result.payload == {
+            "execution_backend": "systemd", "stdout": '{"ok":true}',
+            "stderr": "notice", "result": {"ok": True},
+        }
+    else:
+        assert result.status == "failed"
+        assert result.failure_reason == "skill execution failed"
+        diagnostic = result.payload["execution_diagnostic"]
+        assert isinstance(diagnostic, Mapping)
+        assert diagnostic["schema_version"] == 1
+        assert diagnostic["backend"] == "systemd"
+        assert diagnostic["exit_code"] == 1
+        assert diagnostic["timed_out"] is False
+        assert diagnostic["stdout"] == "progress"
+        assert diagnostic["stderr"] == "ModuleNotFoundError: No module named 'PIL'"
+        assert "private-value" not in repr(result)
+
+
+@pytest.mark.parametrize("raise_backend_errors", [False, True])
+async def test_gateway_preserves_typed_skill_failure_evidence(
+    tmp_path: Path, raise_backend_errors: bool,
+) -> None:
+    skill_dir = tmp_path / str(TENANT_ID)
+    skill_dir.mkdir()
+    (skill_dir / "docx.zip").write_bytes(skill_zip())
+    sandbox = ExecutionResultSandbox(SkillResult(
+        exit_code=1, timed_out=False, stdout="API_KEY=private-value\nprogress",
+        stderr="ModuleNotFoundError: No module named 'PIL'",
+    ))
+    runtime = RuntimeCapabilityGateway(skill_store_dir=tmp_path, skill_sandbox=sandbox)
+    with pytest.raises(RuntimeCapabilityError) as caught:
+        await runtime.execute(
+            tenant_id=TENANT_ID, run_id=RUN_ID, actor="writer", name="docx",
+            arguments={}, idempotency_key="diagnostic_1",
+        )
+    backend = ErrorRuntimeCapabilityGateway(caught.value)
+    policy = FakePolicyGateway(CapabilityStatus.ALLOWED)
+    gateway = HarnessToolGateway(
+        backend, policy_gateway=policy, raise_backend_errors=raise_backend_errors,
+    )
+    result = await gateway.invoke(
+        TENANT_ID,
+        HarnessToolCallRequest(
+            run_id=RUN_ID, actor="writer", tool_name="docx", arguments={},
+            approval_required=False, sandbox="restricted", idempotency_key="diagnostic_1",
+        ),
+        user_id=USER_ID, role=Role.OPERATOR,
+    )
+    assert result.status == "failed"
+    assert result.failure_reason == "skill execution failed"
+    assert "execution_diagnostic" in result.payload, "gateway discarded typed failure evidence"
+    evidence = result.payload["execution_diagnostic"]
+    assert isinstance(evidence, Mapping)
+    assert evidence["schema_version"] == 1
+    assert evidence["backend"] == "systemd"
+    assert evidence["exit_code"] == 1
+    assert evidence["timed_out"] is False
+    assert evidence["stdout"] == "progress"
+    assert evidence["stderr"] == "ModuleNotFoundError: No module named 'PIL'"
+    assert "private-value" not in repr(result)
+    assert sandbox.calls == 1
+    assert [call[0] for call in backend.calls] == ["available", "execute"]
+    assert len(policy.requests) == 1
+    assert not runtime.is_replay_safe("docx")
+
+
+@pytest.mark.parametrize("typed_attribute", [False, True])
+async def test_gateway_ignores_diagnostic_shaped_attributes_on_unknown_exception(
+    typed_attribute: bool,
+) -> None:
+    error = RuntimeError("API_KEY=private-value")
+    forged_attribute = (
+        ExecutionDiagnostic(
+            backend="systemd",
+            result=SkillResult(exit_code=1, timed_out=False, stdout="", stderr="not evidence"),
+        )
+        if typed_attribute else {"stderr": "private-value"}
+    )
+    error.execution_diagnostic = forged_attribute  # type: ignore[attr-defined]
+    backend = ErrorRuntimeCapabilityGateway(error)
+    result = await HarnessToolGateway(backend).invoke(
+        TENANT_ID,
+        HarnessToolCallRequest(
+            run_id=RUN_ID, actor="writer", tool_name="docx", arguments={},
+            approval_required=False, sandbox="restricted", idempotency_key="unknown_1",
+        ),
+    )
+    assert result.status == "failed"
+    assert result.failure_reason == "tool execution failed"
+    assert result.payload == {}
+    assert "private-value" not in repr(result)
+    assert [call[0] for call in backend.calls] == ["available", "execute"]
+
+
+async def test_gateway_ignores_untyped_payload_on_known_error() -> None:
+    error = RuntimeCapabilityError("skill execution failed")
+    error._execution_diagnostic = {"stderr": "private-value"}  # type: ignore[assignment]
+    result = await HarnessToolGateway(ErrorRuntimeCapabilityGateway(error)).invoke(
+        TENANT_ID, request(),
+    )
+    assert result.status == "failed"
+    assert result.failure_reason == "skill execution failed"
+    assert result.payload == {}
+    assert "private-value" not in repr(result)
 
 
 class FakePolicyGateway:
@@ -1031,6 +1220,7 @@ async def test_harness_tool_gateway_maps_workspace_write_to_file_write_policy() 
 @pytest.mark.parametrize(
     ("tool_name", "arguments", "expected"),
     (
+        ("project.verify", {}, ("command", "run", "workspace/current/project-verification")),
         ("calculator", {}, ("calculator", "evaluate", "calculator")),
         ("calculator_evaluate", {}, ("calculator", "evaluate", "calculator")),
         ("calculator.evaluate", {}, ("calculator", "evaluate", "calculator")),
@@ -1311,3 +1501,4 @@ async def test_harness_tool_gateway_reports_deterministic_capability_errors_when
 
     assert result.status == "failed"
     assert result.failure_reason == "files must be an object"
+    assert result.payload == {}

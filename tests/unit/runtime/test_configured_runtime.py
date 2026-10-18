@@ -6701,12 +6701,13 @@ def test_dispatch_plan_requires_verification_before_final_project_zip() -> None:
             mode=TaskMode.DISPATCH,
             request="生成一个最简单的 hello world Node 项目，并给我可下载压缩包。",
         ),
-        capability_gateway=FakeCapabilityAvailability({"run_safe_command", "project.generate_zip"}),
+        capability_gateway=FakeCapabilityAvailability({"project.verify", "project.generate_zip"}),
     )
 
     implementer_step = next(step for step in plan.steps if step.agent == "implementer")
     final_step = next(step for step in plan.steps if step.id == "final_response_step")
-    assert "Run an available safe command smoke test before final packaging" in implementer_step.task
+    assert "execute isolated build/tests" in implementer_step.task
+    assert "project.verify" in implementer_step.tools
     assert "List every file path included in the ZIP" in implementer_step.task
     assert "project.generate_zip" in implementer_step.task
     assert "final_attachment" in implementer_step.task
@@ -7073,7 +7074,6 @@ def test_natural_large_website_uses_workspace_bundle_budget_and_preview_contract
     final_step = next(step for step in plan.steps if step.id == "final_response_step")
     assert architect_step.tools == ()
     assert implementer_step.tools == (
-        "run_safe_command",
         "workspace.write_text",
         "workspace.list",
         "workspace.bundle",

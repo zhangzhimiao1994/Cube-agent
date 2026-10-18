@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, cast
@@ -67,6 +67,13 @@ class DefaultRuntimeCapabilityPolicyGateway:
     ) -> CapabilityResult:
         approval_required = await self._tool_approval_required(request.tenant_id)
         extra_rules = self._extra_policy_rules(request)
+        project_effect = await _project_verification_effect(self._run_repository, request)
+        if project_effect in {PolicyEffect.DENY, PolicyEffect.REQUIRE_APPROVAL}:
+            extra_rules = (*extra_rules, CapabilityRule(
+                tenant_id=request.tenant_id, role=role, agent_id=request.agent_id,
+                capability=request.capability, operation=request.operation,
+                resource_prefix=request.resource, effect=project_effect,
+            ))
         explicit_plugin_effect = _explicit_policy_effect(extra_rules, request, role)
         policy = default_capability_policy(
             request.tenant_id,
@@ -86,7 +93,7 @@ class DefaultRuntimeCapabilityPolicyGateway:
                 request.run_id,
                 reason="capability denied",
             )
-        if explicit_plugin_effect is PolicyEffect.ALLOW:
+        if explicit_plugin_effect is PolicyEffect.ALLOW and project_effect is None:
             return CapabilityResult(CapabilityStatus.ALLOWED, request.run_id)
         if await _has_approved_capability_request(self._run_repository, request):
             return CapabilityResult(CapabilityStatus.ALLOWED, request.run_id)
@@ -278,6 +285,7 @@ def default_capability_policy(
             ("file", "write", "workspace/current", generated_effect),
             ("file", "create", "workspace", generated_effect),
             ("file", "create", "generated", generated_effect),
+            ("command", "run", "workspace/current/project-verification", generated_effect),
             ("context", "read", "context", PolicyEffect.ALLOW),
             ("skill", "use", "skill", skill_effect),
             ("mcp", "invoke", "mcp", mcp_effect),
@@ -285,6 +293,36 @@ def default_capability_policy(
         )
     )
     return CapabilityPolicy(default_rules + extra_rules)
+
+
+async def _project_verification_effect(
+    repository: object, request: CapabilityRequest,
+) -> PolicyEffect | None:
+    resource = normalize_resource(request.resource)
+    if not (request.capability == "command" and request.operation == "run"
+            and resource is not None and (resource == "workspace/current/project-verification"
+                or resource.startswith("workspace/current/project-verification/"))):
+        return None
+    if request.resource != "workspace/current/project-verification":
+        return PolicyEffect.DENY
+    try:
+        from agent_hub.capabilities.scoped_read import authorized_workspace_scope
+
+        getter = getattr(repository, "get", None)
+        if not callable(getter):
+            return PolicyEffect.DENY
+        record = await getter(request.tenant_id, request.run_id)
+        authorized_workspace_scope(record, tenant_id=request.tenant_id, run_id=request.run_id)
+        routing = getattr(record, "routing_decision", None)
+        if not isinstance(routing, Mapping):
+            return PolicyEffect.DENY
+        permissions = routing.get("requested_permissions", ())
+        if (routing.get("sandbox_profile") not in {"restricted", "workspace_write"}
+            or not isinstance(permissions, (list, tuple)) or "command.run" not in permissions):
+            return PolicyEffect.DENY
+        return PolicyEffect.ALLOW if "network.read" in permissions else PolicyEffect.REQUIRE_APPROVAL
+    except Exception:  # noqa: BLE001 - missing authority cannot enable project execution.
+        return PolicyEffect.DENY
 
 
 def build_runtime_capability_stack(

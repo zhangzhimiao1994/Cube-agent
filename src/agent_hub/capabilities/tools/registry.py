@@ -301,6 +301,20 @@ class PluginConfigCapabilityManifestSource:
 def create_builtin_tool_registry() -> ToolRegistry:
     registry = ToolRegistry()
     registry.register(
+        "project.verify", object(), kind="builtin", adapter="runtime_builtin",
+        permission_class="command.run", sandbox_profile="project_execution", replay_safe=False,
+        input_schema=builtin_tool_input_schema("project.verify"),
+        description=builtin_tool_description("project.verify"),
+        input_contract_added_fields=("input_schema", "description"),
+    )
+    registry.register(
+        "project.inspect", object(), kind="builtin", adapter="runtime_builtin",
+        permission_class="file.read", sandbox_profile="workspace_read", replay_safe=True,
+        input_schema=builtin_tool_input_schema("project.inspect"),
+        description=builtin_tool_description("project.inspect"),
+        input_contract_added_fields=("input_schema", "description"),
+    )
+    registry.register(
         "calculator.evaluate",
         object(),
         kind="builtin",

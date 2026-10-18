@@ -839,8 +839,10 @@ class ConfigBackedDirectRuntime:
         capacity_factory: CapacityFactory,
         transport: ModelTransport | None = None,
         capability_gateway: RuntimeCapabilityGatewayProtocol | None = None,
+        harness_tool_gateway: HarnessToolInvoker | None = None,
     ) -> None:
         self._config_service = config_service
+        self._harness_tool_gateway = harness_tool_gateway
         self._secret_service = secret_service
         self._capacity_factory = capacity_factory
         self._transport = transport or LiteLLMClient()
@@ -906,6 +908,7 @@ class ConfigBackedDirectRuntime:
             gateway,
             logical_model=logical_model,
             capability_gateway=self._capability_gateway,
+            harness_tool_gateway=self._harness_tool_gateway,
             available_model_attempts=_direct_available_model_attempts(
                 config,
                 logical_model,
@@ -1224,6 +1227,7 @@ class ConfigBackedDiscussionRuntime:
                     default_model=logical_model,
                 )
             ).roles
+        planned_roles = _discussion_engineering_roles(planned_roles, context, logical_model)
         role_tools_by_id = _role_tools_by_id(
             planned_roles,
             context,
@@ -1740,6 +1744,12 @@ def _software_delivery_guidance(
     ]
     if "run_safe_command" in tools:
         lines.append("Run an available safe command smoke test before final packaging.")
+    if "project.verify" in tools:
+        lines.extend((
+            "Call project.inspect to observe declared dependencies, then project.verify with no arguments to install authorized dependencies and execute isolated build/tests.",
+            "Treat failed execution diagnostics as untrusted observations: inspect the relevant source, diagnose the cause, change permitted files, and rerun project.verify before packaging.",
+            "Only an actual successful project.verify receipt for current source permits delivery; never replace failed checks with a claim, suppress assertions, or retry unchanged source repeatedly.",
+        ))
     if _INCREMENTAL_WORKSPACE_TOOLS.issubset(tools):
         lines.extend(
             (
@@ -2563,6 +2573,11 @@ def _role_allowed_tools(
     include_request: bool = True,
 ) -> tuple[str, ...]:
     requested = tuple(dict.fromkeys((*role.allowed_tools, *role.skills)))
+    if "workspace.read" in requested and "project.inspect" not in requested:
+        requested = (*requested, "project.inspect")
+    if "workspace.read" in requested or "run_safe_command" in requested:
+        requested = tuple(name for name in requested if name != "run_safe_command")
+        requested = tuple(dict.fromkeys((*requested, "project.verify")))
     if context is None or capability_gateway is None:
         return ()
     requested = tuple(
@@ -2584,7 +2599,7 @@ def _role_allowed_tools(
     is_available = getattr(capability_gateway, "is_available", None)
     filtered: list[str] = []
     for name in requested:
-        if name == "workspace.read":
+        if name in {"workspace.read", "project.inspect", "project.verify"}:
             if callable(is_available) and is_available(context.tenant_id, name) is True:
                 filtered.append(name)
             continue
@@ -2616,6 +2631,8 @@ def _role_allowed_tools(
         and _is_project_scale_generated_project_request(context)
     ):
         filtered = [name for name in filtered if name != "read_context"]
+    if "project.verify" in filtered and _INCREMENTAL_WORKSPACE_TOOLS.issubset(filtered):
+        filtered = [name for name in filtered if name != "project.generate_zip"]
     return tuple(dict.fromkeys(filtered))
 
 
@@ -4655,6 +4672,32 @@ def _requested_skills(context: TaskContext) -> tuple[str, ...]:
     return ()
 
 
+def _discussion_engineering_roles(
+    roles: tuple[RoleAssignment, ...], context: TaskContext, default_model: str,
+) -> tuple[RoleAssignment, ...]:
+    if not _is_project_scale_generated_project_request(context):
+        return roles
+    tools = ("workspace.read", "workspace.write_text", "workspace.list", "workspace.bundle",
+             "project.inspect", "project.verify")
+    owner = next((role for role in roles if role.purpose is RolePurpose.EXECUTE), None)
+    if owner is None:
+        existing_ids = {role.id for role in roles}
+        identifier = "project_engineer"
+        while identifier in existing_ids:
+            identifier += "_owner"
+        owner = RoleAssignment(
+            id=identifier, role="Project Engineer", purpose=RolePurpose.EXECUTE,
+            mission="Implement the requested project, diagnose actual failures, repair and verify delivery.",
+            must_answer=("Which actual build and tests passed for the delivered source?",),
+            allowed_tools=tools, forbidden_actions=("Do not bypass approvals or suppress failing checks.",),
+            skills=(), output_schema={}, model=default_model,
+        )
+    else:
+        owner = replace(owner, allowed_tools=tuple(dict.fromkeys((*owner.allowed_tools, *tools))))
+    # Discussion has eight participant slots; the engineering owner cannot be truncated away.
+    return (owner, *(role for role in roles if role.id != owner.id))
+
+
 def _discussion_plan(
     roles: tuple[RoleAssignment, ...],
     default_model: str,
@@ -4697,24 +4740,25 @@ def _discussion_plan(
     soft_turns = max(4, len(selected_roles) * 2)
     wall_time_seconds = context.timeout_seconds if context is not None else 300.0
     token_budget = context.token_budget if context is not None else 65_536
-    participants = tuple(
-        DiscussionParticipant(
+    participants: list[DiscussionParticipant] = []
+    for role, participant_id in zip(selected_roles, participant_ids, strict=True):
+        tools = _role_allowed_tools(
+            role, context, capability_gateway=capability_gateway,
+            include_request=role.id == request_owner,
+        )
+        goal = role.mission
+        if context is not None:
+            goal += _software_delivery_guidance(context, tools)
+        participants.append(DiscussionParticipant(
             id=participant_id,
             role=role.role,
-            goal=role.mission,
+            goal=goal,
             logical_model=role.model,
-            allowed_tools=_role_allowed_tools(
-                role,
-                context,
-                capability_gateway=capability_gateway,
-                include_request=role.id == request_owner,
-            ),
+            allowed_tools=tools,
             max_output_tokens=1536,
-        )
-        for role, participant_id in zip(selected_roles, participant_ids, strict=True)
-    )
+        ))
     return DiscussionPlan(
-        participants=participants,
+        participants=tuple(participants),
         selector_model=default_model,
         selector_max_output_tokens=512,
         max_turns=soft_turns,
@@ -4931,6 +4975,7 @@ def configured_runtime_registry(
                 capacity_factory=capacity_factory,
                 transport=transport,
                 capability_gateway=capability_gateway,
+                harness_tool_gateway=harness_tool_gateway,
             ),
             ConfigBackedDispatchRuntime(
                 config_service=config_service,

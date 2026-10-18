@@ -6,6 +6,7 @@ import json
 import math
 import re
 import shutil
+import sys
 import tempfile
 import zipfile
 from collections.abc import Awaitable, Mapping
@@ -14,9 +15,21 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Protocol, cast
 from uuid import UUID, uuid4
 
+from agent_hub.capabilities.execution_diagnostics import ExecutionDiagnostic
 from agent_hub.capabilities.manifest import (
     is_safe_manifest_name,
     project_capability_manifest_item,
+)
+from agent_hub.capabilities.project_inspection import (
+    PROJECT_INSPECT_TOOL,
+    ProjectInspectionError,
+    inspect_project,
+)
+from agent_hub.capabilities.project_verification import (
+    PROJECT_VERIFY_TOOL,
+    ProjectExecutor,
+    ProjectVerificationError,
+    ProjectVerificationService,
 )
 from agent_hub.capabilities.scoped_read import ScopedReadError, read_scoped_file
 from agent_hub.capabilities.tools.builtin_contracts import (
@@ -53,6 +66,7 @@ from agent_hub.skills.sandbox.base import (
     SANDBOX_PROFILES,
     SandboxProfile,
     SkillInvocation,
+    SkillResult,
     SkillSandbox,
 )
 from agent_hub.skills.sandbox.docker import DockerSkillSandbox
@@ -72,6 +86,8 @@ _MAX_PROJECT_FILES = PROJECT_ZIP_MAX_FILES
 _MAX_PROJECT_FILE_BYTES = PROJECT_ZIP_MAX_FILE_BYTES
 _MAX_PROJECT_ZIP_SOURCE_BYTES = PROJECT_ZIP_ABSOLUTE_TOTAL_SOURCE_BYTES
 _DOTTED_BUILT_INS = frozenset({
+    PROJECT_VERIFY_TOOL,
+    PROJECT_INSPECT_TOOL,
     "calculator.evaluate",
     "http.read",
     "workspace.read",
@@ -85,6 +101,7 @@ _DOTTED_BUILT_INS = frozenset({
     _WORKSPACE_BUNDLE_TOOL,
 })
 _REPLAY_SAFE = frozenset({
+    PROJECT_INSPECT_TOOL,
     "calculator",
     "calculator_evaluate",
     "calculator.evaluate",
@@ -105,6 +122,8 @@ _BUILTIN_ALIASES = {
     "workspace.read": "workspace_read",
 }
 _MANIFEST_BUILTINS = (
+    PROJECT_VERIFY_TOOL,
+    PROJECT_INSPECT_TOOL,
     "calculator.evaluate",
     "http.read",
     _DOCX_TOOL,
@@ -121,6 +140,18 @@ _MANIFEST_BUILTINS = (
 
 class RuntimeCapabilityError(RuntimeError):
     """Stable runtime capability failure."""
+
+    def __init__(
+        self, *args: object, execution_diagnostic: ExecutionDiagnostic | None = None,
+    ) -> None:
+        if execution_diagnostic is not None and type(execution_diagnostic) is not ExecutionDiagnostic:
+            raise TypeError("execution_diagnostic must be ExecutionDiagnostic")
+        super().__init__(*args)
+        self._execution_diagnostic = execution_diagnostic
+
+    @property
+    def execution_diagnostic(self) -> ExecutionDiagnostic | None:
+        return self._execution_diagnostic
 
 
 class CapabilityManifestSource(Protocol):
@@ -151,6 +182,7 @@ class RuntimeCapabilityGateway:
         calculator: Calculator | None = None,
         http_reader: HttpReader | None = None,
         tool_registry: CapabilityManifestProvider | None = None,
+        project_executor: ProjectExecutor | None = None,
     ) -> None:
         self._skill_store_dir = skill_store_dir
         self._workspace_root = workspace_root
@@ -180,6 +212,12 @@ class RuntimeCapabilityGateway:
         self._http_reader = http_reader or HttpReader.production()
         self._tool_registry = tool_registry
         self._tenant_id = tenant_id
+        self._project_executor_configured = project_executor is not None or sys.platform == "linux"
+        self._project_verification = (
+            ProjectVerificationService(root=project_workspace_dir, repository=run_repository,
+                                       executor=project_executor)
+            if project_workspace_dir is not None else None
+        )
 
     def is_replay_safe(self, name: str) -> bool:
         normalized_name = _normalize_tool_name(name)
@@ -301,6 +339,29 @@ class RuntimeCapabilityGateway:
             return await self._execute_workspace_list(tenant_id, run_id)
         if normalized_name == _WORKSPACE_BUNDLE_TOOL:
             return await self._execute_workspace_bundle(tenant_id, run_id, arguments)
+        if normalized_name == PROJECT_INSPECT_TOOL:
+            if arguments:
+                raise RuntimeCapabilityError("project.inspect takes no arguments")
+            if self._project_workspace_dir is None:
+                raise RuntimeCapabilityError("project inspection scope unavailable")
+            try:
+                return await inspect_project(
+                    repository=self._run_repository, tenant_id=tenant_id, run_id=run_id,
+                    project_root=self._project_workspace_dir,
+                )
+            except ProjectInspectionError as error:
+                raise RuntimeCapabilityError(str(error)) from None
+        if normalized_name == PROJECT_VERIFY_TOOL:
+            if arguments:
+                raise RuntimeCapabilityError("project.verify takes no arguments")
+            if self._project_verification is None or not self._project_executor_configured:
+                raise RuntimeCapabilityError("project execution backend is unavailable")
+            try:
+                return await self._project_verification.verify(
+                    tenant_id=tenant_id, run_id=run_id, actor=actor,
+                )
+            except ProjectVerificationError as error:
+                raise RuntimeCapabilityError(str(error), execution_diagnostic=error.diagnostic) from None
         return await self._execute_skill(
             tenant_id=tenant_id,
             run_id=run_id,
@@ -500,6 +561,10 @@ class RuntimeCapabilityGateway:
         store = self._require_generated_file_store()
         title = _required_string(arguments, "title")
         files = _project_files(arguments)
+        if self._project_executor_configured and "package.json" in files:
+            raise RuntimeCapabilityError(
+                "Node project delivery requires workspace.write_text, project.verify and workspace.bundle"
+            )
         workspace_files = self._copy_project_files_to_workspace(tenant_id, arguments, files)
         filename = _filename(arguments, title=title, extension=".zip")
         artifact_id = uuid4()
@@ -614,6 +679,14 @@ class RuntimeCapabilityGateway:
         generated_store = self._require_generated_file_store()
         project_id, session_id = await self._project_workspace_scope(tenant_id, run_id)
         title = _optional_string(arguments, "title") or "Project Workspace"
+        verified_source: str | None = None
+        if self._project_executor_configured and self._project_verification is not None:
+            files = store.list_files(tenant_id, project_id, session_id)
+            if any(item.path == "package.json" for item in files):
+                try:
+                    verified_source = await self._project_verification.require_current_receipt(tenant_id, run_id)
+                except ProjectVerificationError as error:
+                    raise RuntimeCapabilityError(str(error)) from None
         filename = _filename(arguments, title=title, extension=".zip")
         try:
             artifact_id = uuid4()
@@ -627,6 +700,7 @@ class RuntimeCapabilityGateway:
                 session_id=session_id,
                 artifact_id=artifact_id,
                 filename=filename,
+                verified_source_sha256=verified_source,
             )
         except (OSError, ValueError) as error:
             raise RuntimeCapabilityError(str(error)) from None
@@ -658,9 +732,26 @@ class RuntimeCapabilityGateway:
         session_id: str,
         artifact_id: UUID,
         filename: str,
+        verified_source_sha256: str | None = None,
     ) -> tuple[GeneratedFileMetadata, tuple[ProjectWorkspaceFile, ...]]:
         bundle = store.create_session_zip(tenant_id, project_id, session_id)
         try:
+            if verified_source_sha256 is not None:
+                hashes: dict[str, str] = {}
+                with zipfile.ZipFile(bundle.path) as archive:
+                    for entry in archive.infolist():
+                        if entry.filename in hashes:
+                            raise ValueError("bundle does not match verified source")
+                        digest = hashlib.sha256(b"x\0" if (entry.external_attr >> 16) & 0o111 else b"f\0")
+                        with archive.open(entry) as stream:
+                            while chunk := stream.read(65536):
+                                digest.update(chunk)
+                        hashes[entry.filename] = digest.hexdigest()
+                bundled = hashlib.sha256(json.dumps(
+                    hashes, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+                ).encode("ascii")).hexdigest()
+                if bundled != verified_source_sha256:
+                    raise ValueError("bundle does not match verified source")
             metadata = generated_store.store_path(
                 tenant_id=tenant_id,
                 run_id=run_id,
@@ -848,14 +939,23 @@ class RuntimeCapabilityGateway:
                 ) from None
         finally:
             shutil.rmtree(writable_tmp_path, ignore_errors=True)
+        diagnostic = (
+            ExecutionDiagnostic(backend=execution_backend, result=result)
+            if type(result) is SkillResult
+            and (result.timed_out or (result.exit_code is not None and result.exit_code != 0))
+            else None
+        )
         if result.timed_out:
-            raise RuntimeCapabilityError("skill execution timed out")
+            raise RuntimeCapabilityError(
+                "skill execution timed out", execution_diagnostic=diagnostic,
+            )
         if result.exit_code != 0:
             if _backend_process_unavailable(execution_backend, result.stderr):
                 raise RuntimeCapabilityError(
-                    f"execution backend is unavailable: {execution_backend}"
+                    f"execution backend is unavailable: {execution_backend}",
+                    execution_diagnostic=diagnostic,
                 )
-            raise RuntimeCapabilityError("skill execution failed")
+            raise RuntimeCapabilityError("skill execution failed", execution_diagnostic=diagnostic)
         parsed = _parse_stdout(result.stdout)
         return {
             "execution_backend": execution_backend,
@@ -932,6 +1032,18 @@ class RuntimeCapabilityGateway:
         return item
 
     def _builtin_availability_reason(self, name: str) -> str | None:
+        if name == PROJECT_VERIFY_TOOL:
+            if self._project_workspace_dir is None:
+                return "project_workspace_store_not_configured"
+            if not callable(getattr(self._run_repository, "get", None)):
+                return "workspace_scope_not_configured"
+            if not self._project_executor_configured:
+                return "project_execution_backend_unavailable"
+        if name == PROJECT_INSPECT_TOOL:
+            if self._project_workspace_dir is None:
+                return "project_workspace_store_not_configured"
+            if not callable(getattr(self._run_repository, "get", None)):
+                return "workspace_scope_not_configured"
         if name == "workspace.read":
             if self._workspace_root is None and self._project_workspace_dir is None:
                 return "workspace_root_not_configured"
@@ -1179,6 +1291,8 @@ def _tuple_strings(value: object) -> tuple[str, ...]:
 
 
 def _builtin_permission_class(name: str) -> str:
+    if name == PROJECT_VERIFY_TOOL:
+        return "command.run"
     if name == "calculator.evaluate":
         return "calculator.evaluate"
     if name == "read_context":
@@ -1187,7 +1301,7 @@ def _builtin_permission_class(name: str) -> str:
         return "network.read"
     if name == "workspace.read":
         return "file.read"
-    if name == _WORKSPACE_LIST_TOOL:
+    if name in {_WORKSPACE_LIST_TOOL, PROJECT_INSPECT_TOOL}:
         return "file.read"
     if name == _WORKSPACE_WRITE_TOOL:
         return "file.write"
@@ -1195,11 +1309,13 @@ def _builtin_permission_class(name: str) -> str:
 
 
 def _builtin_sandbox_profile(name: str) -> str:
+    if name == PROJECT_VERIFY_TOOL:
+        return "project_execution"
     if name in {"calculator.evaluate", "read_context"}:
         return "in_process"
     if name == "http.read":
         return "http_read"
-    if name == "workspace.read":
+    if name in {"workspace.read", PROJECT_INSPECT_TOOL}:
         return "workspace_read"
     if name in {
         _PROJECT_PREFLIGHT_TOOL,
@@ -1602,8 +1718,37 @@ def _backend_process_unavailable(execution_backend: str, stderr: str) -> bool:
 
 
 def _json_dict(value: Mapping[str, JsonValue]) -> dict[str, object]:
-    encoded = json.dumps(value, ensure_ascii=False, allow_nan=False)
-    parsed = json.loads(encoded)
+    active_containers: set[int] = set()
+
+    def visit(item: object) -> object:
+        if item is None or type(item) in {bool, int, str}:
+            return item
+        if type(item) is float:
+            if not math.isfinite(item):
+                raise ValueError("nonfinite JSON number")
+            return item
+        if not isinstance(item, Mapping | list | tuple):
+            raise TypeError("value is not JSON-compatible")
+        identity = id(item)
+        if identity in active_containers:
+            raise ValueError("cyclic JSON value")
+        active_containers.add(identity)
+        try:
+            if isinstance(item, Mapping):
+                result: dict[str, object] = {}
+                for key, child in item.items():
+                    if type(key) is not str:
+                        raise TypeError("JSON object keys must be strings")
+                    result[key] = visit(child)
+                return result
+            return [visit(child) for child in item]
+        finally:
+            active_containers.remove(identity)
+
+    try:
+        parsed = visit(value)
+    except (TypeError, ValueError, RecursionError):
+        raise RuntimeCapabilityError("capability arguments are invalid") from None
     if not isinstance(parsed, dict):
         raise RuntimeCapabilityError("capability arguments are invalid")
     return parsed

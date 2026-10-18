@@ -462,7 +462,7 @@ class _DiscussionDurability:
                     self.failure_reason = "tool_outcome_uncertain"
                     raise ToolOutcomeUncertain("capability outcome is uncertain")
                 return None, idempotency_key
-            if status != "succeeded":
+            if status not in {"succeeded", "failed"}:
                 raise RuntimeExecutionError("durable capability ledger is invalid")
             artifact = self._artifacts.get(cast(str, entry["artifact_id"]))
             if artifact is None or artifact.content_sha256 != entry.get("artifact_sha256"):
@@ -470,6 +470,8 @@ class _DiscussionDurability:
             result = artifact.content.get("result")
             if not isinstance(result, Mapping):
                 raise RuntimeExecutionError("durable capability result is invalid")
+            if status == "failed" and _execution_failure_result(result) != result:
+                raise RuntimeExecutionError("durable capability failure evidence is invalid")
             self._tool_cursor += 1
             return result, idempotency_key
         self.tool_entries.append({"status": "running", "replay_safe": replay_safe, **identity})
@@ -477,12 +479,20 @@ class _DiscussionDurability:
         return None, idempotency_key
 
     async def succeed_tool(self, artifact: Artifact) -> None:
+        await self._finish_tool(artifact, status="succeeded")
+
+    async def fail_tool(self, artifact: Artifact) -> None:
+        await self._finish_tool(artifact, status="failed")
+
+    async def _finish_tool(
+        self, artifact: Artifact, *, status: Literal["succeeded", "failed"],
+    ) -> None:
         entry = self.tool_entries[self._tool_cursor]
         write_id = await self._store(artifact)
         previous = dict(entry)
         self._artifacts[str(artifact.id)] = artifact
         entry.update(
-            status="succeeded",
+            status=status,
             artifact_id=str(artifact.id),
             artifact_sha256=artifact.content_sha256,
         )
@@ -1222,6 +1232,55 @@ class _ToolRecord:
     reason: str | None = None
 
 
+class _ExecutionObservationError(RuntimeError):
+    """Let AutoGen retain is_error=True for a durably recorded process observation."""
+
+    def __init__(self, result: Mapping[str, JsonValue]) -> None:
+        super().__init__(json.dumps(
+            _mutable_json(result), ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        ))
+
+
+def _execution_failure_result(payload: object) -> Mapping[str, JsonValue] | None:
+    """Accept only the bounded F01 receipt supplied by the trusted tool gateway."""
+    if not isinstance(payload, Mapping) or "approval_id" in payload:
+        return None
+    diagnostic = payload.get("execution_diagnostic")
+    if not isinstance(diagnostic, Mapping) or set(diagnostic) != {
+        "schema_version", "backend", "exit_code", "timed_out", "stdout", "stderr",
+        "stdout_metadata", "stderr_metadata",
+    }:
+        return None
+    exit_code, timed_out = diagnostic["exit_code"], diagnostic["timed_out"]
+    if (
+        type(diagnostic["schema_version"]) is not int or diagnostic["schema_version"] != 1
+        or type(timed_out) is not bool
+        or (exit_code is not None and type(exit_code) is not int)
+        or (not timed_out and (exit_code is None or exit_code == 0))
+        or type(diagnostic["backend"]) is not str
+        or re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", diagnostic["backend"]) is None
+    ):
+        return None
+    for stream in ("stdout", "stderr"):
+        text, metadata = diagnostic[stream], diagnostic[f"{stream}_metadata"]
+        if (
+            type(text) is not str or len(text.encode("utf-8")) > 4096
+            or not isinstance(metadata, Mapping)
+            or set(metadata) != {
+                "sanitized_bytes", "returned_bytes", "sha256", "truncated", "redacted", "redacted_lines",
+            }
+            or any(type(metadata[key]) is not int or metadata[key] < 0
+                   for key in ("sanitized_bytes", "returned_bytes", "redacted_lines"))
+            or metadata["returned_bytes"] != len(text.encode("utf-8"))
+            or metadata["sanitized_bytes"] < metadata["returned_bytes"]
+            or any(type(metadata[key]) is not bool for key in ("truncated", "redacted"))
+            or type(metadata["sha256"]) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", metadata["sha256"]) is None
+        ):
+            return None
+    return {"status": "failed", "untrusted": True, "execution_diagnostic": diagnostic}
+
+
 class GatewayCapabilityTool(BaseTool[_DynamicToolArguments, _DynamicToolResult]):
     """AutoGen tool facade with no execution path outside HarnessToolGateway."""
 
@@ -1371,7 +1430,17 @@ class GatewayCapabilityTool(BaseTool[_DynamicToolArguments, _DynamicToolResult])
             )
         )
         if replayed is not None:
-            artifact = Artifact(
+            failed = _execution_failure_result(replayed) == replayed
+            artifact = next((
+                item for item in self._durability.artifacts
+                if item.producer == self._actor
+                and item.content.get("tool_name") == self.name
+                and item.content.get("arguments_sha256") == arguments_hash
+                and item.content.get("result") == replayed
+            ), None) if failed else None
+            if failed and artifact is None:
+                raise RuntimeExecutionError("durable capability failure evidence is unavailable")
+            artifact = artifact or Artifact(
                 id=uuid4(),
                 type="tool_result",
                 producer=self._actor,
@@ -1383,21 +1452,24 @@ class GatewayCapabilityTool(BaseTool[_DynamicToolArguments, _DynamicToolResult])
             )
             self._records.append(
                 _ToolRecord(
-                    EventKind.TOOL_COMPLETED,
+                    EventKind.TOOL_FAILED if failed else EventKind.TOOL_COMPLETED,
                     self._actor,
                     safe_call_id,
                     self.name,
                     payload=safe_tool_event_payload(
                         name=self.name,
-                        status="succeeded",
+                        status="failed" if failed else "succeeded",
                         result=replayed,
                         artifact_id=str(artifact.id),
                         replay_safe=replay_safe,
                     ),
-                    artifact=artifact,
+                    artifact=None if failed else artifact,
+                    reason="process execution failed" if failed else None,
                 )
             )
-            return _DynamicToolResult(result=cast(dict[str, object], dict(replayed)))
+            if failed:
+                raise _ExecutionObservationError(replayed)
+            return _DynamicToolResult(result=cast(dict[str, object], _mutable_json(replayed)))
         try:
             tool_request = HarnessToolCallRequest(
                 run_id=self._run_id,
@@ -1466,6 +1538,31 @@ class GatewayCapabilityTool(BaseTool[_DynamicToolArguments, _DynamicToolResult])
             )
             raise RuntimeExecutionError("capability outcome is uncertain") from None
         if tool_result.status != "succeeded":
+            execution_failure = (
+                _execution_failure_result(tool_result.payload)
+                if tool_result.call_id == tool_request.call_id
+                and tool_result.tool_name == self.name and not tool_result.truncated
+                else None
+            )
+            if execution_failure is not None:
+                artifact = Artifact(
+                    id=uuid4(), type="tool_result", producer=self._actor,
+                    content={
+                        "result": execution_failure, "tool_name": self.name,
+                        "arguments_sha256": arguments_hash,
+                    },
+                )
+                await self._durability.fail_tool(artifact)
+                self._records.append(_ToolRecord(
+                    EventKind.TOOL_FAILED, self._actor, safe_call_id, self.name,
+                    payload=safe_tool_event_payload(
+                        name=self.name, status="failed", result=execution_failure,
+                        artifact_id=str(artifact.id), replay_safe=replay_safe,
+                        failure_kind="capability_failed",
+                    ),
+                    reason=tool_result.failure_reason or "process execution failed",
+                ))
+                raise _ExecutionObservationError(execution_failure)
             reusable_result = reusable_generated_file_result(
                 self.name,
                 self._durability.artifacts,
@@ -2201,7 +2298,16 @@ class AutoGenDiscussionRuntime:
                     drained_tool_events = drain_tool_records()
                     for event in drained_tool_events:
                         yield event
-                    if any(event.kind is EventKind.TOOL_FAILED for event in drained_tool_events):
+                    if any(
+                        event.kind is EventKind.TOOL_FAILED and (
+                            not any(
+                                str(artifact.id) == event.payload.get("artifact_id")
+                                and _execution_failure_result(artifact.content.get("result")) is not None
+                                for artifact in durability.artifacts
+                            )
+                        )
+                        for event in drained_tool_events
+                    ):
                         raise RuntimeExecutionError("capability execution failed") from None
                     if isinstance(item, BaseChatMessage) and item.source != "user":
                         text = item.to_text()
