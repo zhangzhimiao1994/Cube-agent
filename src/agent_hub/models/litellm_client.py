@@ -1335,6 +1335,7 @@ def _should_negotiate_auto_tool_choice(
 ) -> bool:
     # Match the complete structured rejection, not echoed prompt words or adapter text.
     if (type(error) is not BadRequestError or error.status_code != 400
+            or error.response.status_code != 400
             or request.required_tool is None
             or kwargs.get("tool_choice") != {
                 "type": "function", "function": {"name": request.required_tool},
@@ -1345,7 +1346,13 @@ def _should_negotiate_auto_tool_choice(
         return False
     message = body.get("message")
     rejection = "The tool_choice parameter does not support being set to required or object in thinking mode"
-    return type(message) is str and message in (rejection, rejection + ".")
+    if type(message) is not str:
+        return False
+    if message in (rejection, rejection + "."):
+        return True
+    wrapped_rejection = "<400> InternalError.Algo.InvalidParameter: " + rejection
+    return (body.get("code") == "invalid_parameter_error"
+            and message in (wrapped_rejection, wrapped_rejection + "."))
 
 
 def _should_retry_with_legacy_max_tokens(error: Exception) -> bool:
