@@ -24,6 +24,14 @@ from agent_hub.runtime.streams import closing_runtime_events
 _TOOLS = ('workspace.write_text', 'project.verify', 'workspace.bundle')
 _TYPE = 'engineering_admission'
 _KEYS = {'phase', 'approval_id', 'tool_name', 'context_sha256', 'completed'}
+_GATE_CODES = {
+    'capability denied':'denied',
+    'capability authorization unavailable':'gate_unavailable',
+    'capability identity unavailable':'identity_unavailable',
+    'tool unavailable':'tool_unavailable',
+    'capability requires approval':'invalid_approval_receipt',
+    'approval required':'approval_unavailable',
+}
 
 
 class _Authorizer(Protocol):
@@ -90,7 +98,7 @@ class EngineeringAdmissionRuntime:
                 raise RuntimeError('engineering admission checkpoint context mismatch')
         else:
             if type(context.actor_id) is not UUID or not isinstance(context.actor_role,Role):
-                raise RuntimeError('engineering authorization identity unavailable')
+                raise RuntimeError('engineering permission gate failed: identity_unavailable')
             if self._restored is not None:
                 cp = self._restored
                 if (not admission_checkpoint_valid(cp) or cp.run_id != context.run_id
@@ -101,7 +109,7 @@ class EngineeringAdmissionRuntime:
             elif context.checkpoint is not None:
                 raise RuntimeError('engineering admission checkpoint was not restored')
             if not callable(getattr(self._authorizer,'authorize',None)):
-                raise RuntimeError('engineering authorization unavailable')
+                raise RuntimeError('engineering permission gate failed: gate_unavailable')
             loop = asyncio.get_running_loop()
             deadline = loop.time() + context.timeout_seconds
             for tool in _TOOLS:
@@ -130,13 +138,14 @@ class EngineeringAdmissionRuntime:
                     self._task = None
                 if (not isinstance(result,HarnessToolCallResult) or result.truncated
                     or result.call_id != request.call_id or result.tool_name != tool):
-                    raise RuntimeError('engineering authorization result invalid')
+                    raise RuntimeError('engineering permission gate failed: invalid_result')
                 if result.status == 'succeeded' and result.payload.get('authorized') is True:
                     continue
                 approval = result.payload.get('approval_id')
                 if (result.status != 'failed' or result.failure_reason != 'capability requires approval'
                     or not isinstance(approval,str) or not re.fullmatch(r'approval_[A-Za-z0-9_-]{1,100}',approval)):
-                    raise RuntimeError('engineering authorization denied')
+                    code = _GATE_CODES.get(result.failure_reason or '', 'unclassified')
+                    raise RuntimeError('engineering permission gate failed: ' + code)
                 self._last = RuntimeCheckpoint(id=uuid4(),runtime_type=_TYPE,runtime_version='1',
                     run_id=context.run_id,tenant_id=context.tenant_id,mode=context.mode,
                     state={'phase':'before_model','completed':False,'approval_id':approval,

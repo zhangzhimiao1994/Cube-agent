@@ -115,9 +115,24 @@ async def test_denial_and_malformed_admission_fail_closed_without_child():
                 status='failed',failure_reason='capability denied',payload={})
     child=Child(original.mode)
     runtime=EngineeringAdmissionRuntime(child,Denied())
-    with pytest.raises(RuntimeError,match='authorization denied'):
+    with pytest.raises(RuntimeError,match='permission gate failed: denied'):
         _=[e async for e in runtime.run(original)]
     assert child.calls==[]
+
+
+async def test_permission_failure_keeps_safe_machine_diagnostic():
+    from agent_hub.runtime.failure_reason import safe_runtime_failure_diagnostic
+    original=context(TaskMode.DIRECT)
+    class Denied:
+        async def authorize(self,tenant_id,request,**kwargs):
+            return HarnessToolCallResult(call_id=request.call_id,tool_name=request.tool_name,
+                status='failed',failure_reason='capability authorization unavailable',payload={})
+    runtime=EngineeringAdmissionRuntime(Child(original.mode),Denied())
+    with pytest.raises(RuntimeError) as caught:
+        _=[e async for e in runtime.run(original)]
+    diagnostic=safe_runtime_failure_diagnostic(caught.value)
+    assert diagnostic['error_code']=='runtime.engineering_permission.gate_unavailable'
+    assert diagnostic['error_summary']=='engineering permission gate failed: gate_unavailable'
 
 
 async def test_child_checkpoint_is_delegated_not_replayed_as_admission():

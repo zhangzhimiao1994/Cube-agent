@@ -125,6 +125,19 @@ def runtime_failure_diagnostic_from_reason(
     """Classify an already-redacted failure reason into UI/operator hints."""
 
     normalized = normalize_failure_reason(reason or "") or "runtime_failed"
+    admission = re.fullmatch(
+        r'engineering permission gate failed: (denied|gate_unavailable|identity_unavailable|tool_unavailable|invalid_approval_receipt|approval_unavailable|invalid_result|unclassified)',
+        normalized,
+    )
+    if admission is not None:
+        return _base_diagnostic(
+            normalized,
+            error_stage='engineering_admission',
+            error_category='permission_gate',
+            error_code='runtime.engineering_permission.' + admission[1],
+            retryable=False,
+            suggested_action='项目尚未开始执行；请核查当前用户的项目权限和持久化审批记录，不要重放旧运行。',
+        )
     if normalized.lower().startswith("capability failed:"):
         return _base_diagnostic(
             "capability failed",
