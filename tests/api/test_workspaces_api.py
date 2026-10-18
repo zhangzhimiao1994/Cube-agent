@@ -1,19 +1,24 @@
 from __future__ import annotations
 
+import asyncio
 import platform
+import random
 import subprocess
 import zipfile
+from io import BytesIO
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from uuid import uuid4
+from uuid import UUID, uuid4
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
+from starlette.types import Message, Receive, Scope, Send
 
 from agent_hub.app import create_app
 from agent_hub.auth.models import AuthenticatedPrincipal, InvalidCredentials, Role
 from agent_hub.capabilities.runtime import RuntimeCapabilityGateway
 from agent_hub.files import workspace as workspace_module
-from agent_hub.files.workspace import ProjectWorkspaceStore
+from agent_hub.files.workspace import ProjectWorkspaceBundle, ProjectWorkspaceStore
 
 
 class StubAuthService:
@@ -433,7 +438,10 @@ def test_downloads_project_session_workspace_file(tmp_path: Path) -> None:
     assert "plan.md" in response.headers["content-disposition"]
 
 
-def test_downloads_project_session_workspace_zip(tmp_path: Path) -> None:
+def test_downloads_project_session_workspace_zip(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     client, store, principal = client_with_workspace(tmp_path)
     store.write_bytes(
         principal.tenant_id, "project", "session", "src/app.py", b"print('ok')\n", "text/x-python"
@@ -441,6 +449,19 @@ def test_downloads_project_session_workspace_zip(tmp_path: Path) -> None:
     store.write_bytes(
         principal.tenant_id, "project", "session", "README.md", b"# Demo\n", "text/markdown"
     )
+    retained_bundle = store.create_session_zip(principal.tenant_id, "project", "session")
+    retained_content = retained_bundle.path.read_bytes()
+    artifact = retained_bundle.path.parent / "artifact.txt"
+    artifact.write_bytes(b"keep this artifact")
+    bundles: list[ProjectWorkspaceBundle] = []
+    create_session_zip = store.create_session_zip
+
+    def capture_bundle(tenant_id: UUID, project_id: str, session_id: str) -> ProjectWorkspaceBundle:
+        bundle = create_session_zip(tenant_id, project_id, session_id)
+        bundles.append(bundle)
+        return bundle
+
+    monkeypatch.setattr(store, "create_session_zip", capture_bundle)
 
     response = client.get(
         "/api/v1/workspaces/projects/project/sessions/session/bundle/download",
@@ -453,6 +474,86 @@ def test_downloads_project_session_workspace_zip(tmp_path: Path) -> None:
     archive_path.write_bytes(response.content)
     with zipfile.ZipFile(archive_path) as archive:
         assert archive.namelist() == ["README.md", "src/app.py"]
+        assert archive.testzip() is None
+        assert archive.read("README.md") == b"# Demo\n"
+        assert archive.read("src/app.py") == b"print('ok')\n"
+    assert len(bundles) == 1
+    assert not bundles[0].path.exists()
+    assert retained_bundle.path.read_bytes() == retained_content
+    assert artifact.read_bytes() == b"keep this artifact"
+    assert store.resolve_file(principal.tenant_id, "project", "session", "README.md").read_bytes() == (
+        b"# Demo\n"
+    )
+
+
+async def test_overlapping_workspace_zip_downloads_clean_only_their_own_bundle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, store, principal = client_with_workspace(tmp_path)
+    first_content = random.Random(0).randbytes(160_000)
+    second_content = random.Random(1).randbytes(160_000)
+    store.write_bytes(
+        principal.tenant_id, "project", "session", "payload.bin", first_content,
+        "application/octet-stream",
+    )
+    bundles: list[ProjectWorkspaceBundle] = []
+    create_session_zip = store.create_session_zip
+
+    def capture_bundle(tenant_id: UUID, project_id: str, session_id: str) -> ProjectWorkspaceBundle:
+        bundle = create_session_zip(tenant_id, project_id, session_id)
+        bundles.append(bundle)
+        return bundle
+
+    monkeypatch.setattr(store, "create_session_zip", capture_bundle)
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+
+    async def app(scope: Scope, receive: Receive, send: Send) -> None:
+        async def gated_send(message: Message) -> None:
+            if scope["query_string"] == b"hold=first" and message["type"] == "http.response.start":
+                first_started.set()
+                await release_first.wait()
+            await send(message)
+
+        await client.app(scope, receive, gated_send)
+
+    url = "/api/v1/workspaces/projects/project/sessions/session/bundle/download"
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1"
+    ) as async_client:
+        first_download = asyncio.create_task(async_client.get(url + "?hold=first", headers=bearer()))
+        try:
+            await asyncio.wait_for(first_started.wait(), timeout=5)
+            assert len(bundles) == 1
+            assert bundles[0].path.is_file()
+            store.write_bytes(
+                principal.tenant_id, "project", "session", "payload.bin", second_content,
+                "application/octet-stream",
+            )
+            second_response = await async_client.get(url, headers=bearer())
+            assert second_response.status_code == 200
+            assert len(bundles) == 2
+            assert bundles[0].path != bundles[1].path
+            assert bundles[0].path.is_file()
+            with zipfile.ZipFile(BytesIO(second_response.content)) as archive:
+                assert archive.namelist() == ["payload.bin"]
+                assert archive.testzip() is None
+                assert archive.read("payload.bin") == second_content
+            assert not bundles[1].path.exists()
+        finally:
+            release_first.set()
+            first_response = await asyncio.wait_for(first_download, timeout=5)
+
+    assert first_response.status_code == 200
+    with zipfile.ZipFile(BytesIO(first_response.content)) as archive:
+        assert archive.namelist() == ["payload.bin"]
+        assert archive.testzip() is None
+        assert archive.read("payload.bin") == first_content
+    assert all(not bundle.path.exists() for bundle in bundles)
+    assert store.resolve_file(
+        principal.tenant_id, "project", "session", "payload.bin"
+    ).read_bytes() == second_content
 
 
 async def test_downloads_runtime_generated_project_as_workspace_zip(tmp_path: Path) -> None:

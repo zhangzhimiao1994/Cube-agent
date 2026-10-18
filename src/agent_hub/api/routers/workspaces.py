@@ -11,6 +11,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict
+from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
 
 from agent_hub.api.dependencies import require_permission
@@ -285,4 +286,9 @@ async def download_workspace_bundle(
         bundle = store.create_session_zip(principal.tenant_id, project_id, session_id)
     except (FileNotFoundError, ValueError):
         raise PublicAPIError(404, "not_found", "not found") from None
-    return FileResponse(bundle.path, media_type=bundle.mime_type, filename=bundle.filename)
+    return FileResponse(
+        bundle.path,
+        media_type=bundle.mime_type,
+        filename=bundle.filename,
+        background=BackgroundTask(bundle.path.unlink, missing_ok=True),
+    )

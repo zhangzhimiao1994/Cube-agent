@@ -336,7 +336,10 @@ def test_workspace_zip_long_path(tmp_path: Path) -> None:
     updated_bundle = store.create_session_zip(tenant_id, project_id, session_id)
 
     assert updated_bundle.filename == public_filename
-    assert updated_bundle.path == bundle.path
+    assert updated_bundle.path != bundle.path
+    assert len(str(updated_bundle.path)) < 260
+    with zipfile.ZipFile(bundle.path) as archive:
+        assert archive.read("src/main.js") == source
     assert updated_bundle.files == store.list_files(tenant_id, project_id, session_id)
     with zipfile.ZipFile(updated_bundle.path) as archive:
         assert archive.namelist() == ["README.md", "src/main.js"]

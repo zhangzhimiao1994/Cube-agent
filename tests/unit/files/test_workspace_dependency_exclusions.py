@@ -24,6 +24,20 @@ EXCLUDED_DIRECTORIES = (
 )
 
 
+def test_each_bundle_has_exclusive_bytes_while_another_download_rebuilds(tmp_path: Path) -> None:
+    tenant = uuid4()
+    store = ProjectWorkspaceStore(tmp_path)
+    store.write_bytes(tenant, 'project', 'session', 'main.js', b'verified source', 'text/plain')
+    first = store.create_session_zip(tenant, 'project', 'session')
+    verified = first.path.read_bytes()
+    store.write_bytes(tenant, 'project', 'session', 'main.js', b'new unverified source', 'text/plain')
+    second = store.create_session_zip(tenant, 'project', 'session')
+    assert first.path != second.path
+    assert first.path.read_bytes() == verified
+    with zipfile.ZipFile(second.path) as archive:
+        assert archive.read('main.js') == b'new unverified source'
+
+
 @pytest.mark.parametrize('private', ['credentials', 'credentials.json', 'client.key', 'id_ed25519'])
 def test_zip_cannot_include_files_omitted_from_verification_snapshot(tmp_path: Path, private: str) -> None:
     tenant = uuid4()

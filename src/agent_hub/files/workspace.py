@@ -7,6 +7,7 @@ import platform as platform_module
 import re
 import shutil
 import subprocess
+import tempfile
 import zipfile
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import asdict, dataclass
@@ -396,16 +397,22 @@ class ProjectWorkspaceStore:
         session = _safe_workspace_segment(session_id)
         bundle_dir = self.session_root(tenant_id, project_id, session_id) / ".bundles"
         bundle_dir.mkdir(parents=True, exist_ok=True)
-        # The directory already scopes the bundle; keep its internal name short on Windows.
-        bundle_path = (bundle_dir / "workspace.zip").resolve()
-        if not bundle_path.is_relative_to(self.session_root(tenant_id, project_id, session_id)):
+        if not bundle_dir.resolve().is_relative_to(self.session_root(tenant_id, project_id, session_id)):
             raise ValueError("workspace path escapes session root")
-        with zipfile.ZipFile(bundle_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-            for item in files:
-                archive.write(
-                    self.resolve_file(tenant_id, project_id, session_id, item.path),
-                    arcname=item.path,
-                )
+        # Exclusive, short names keep concurrent tool packaging/downloads independent.
+        descriptor, temporary = tempfile.mkstemp(prefix="", suffix=".zip", dir=bundle_dir)
+        os.close(descriptor)
+        bundle_path = Path(temporary)
+        try:
+            with zipfile.ZipFile(bundle_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                for item in files:
+                    archive.write(
+                        self.resolve_file(tenant_id, project_id, session_id, item.path),
+                        arcname=item.path,
+                    )
+        except BaseException:
+            bundle_path.unlink(missing_ok=True)
+            raise
         return ProjectWorkspaceBundle(
             path=bundle_path,
             filename=f"{project}-{session}-workspace.zip",
