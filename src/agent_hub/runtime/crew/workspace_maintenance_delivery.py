@@ -30,6 +30,7 @@ def _file_metadata(value: object) -> tuple[str, str, int] | None:
 def maintenance_delivery_ready(
     *, step_id: str, actor: str, attempt: int, round_index: int,
     states: Mapping[str, Mapping[str, JsonValue]], artifacts: Mapping[str, Artifact],
+    require_write: bool = True,
 ) -> bool:
     """Inspect only the causal prefix of a previously validated runtime ledger."""
     if type(attempt) is not int or attempt < 0 or type(round_index) is not int or round_index < 0:
@@ -81,9 +82,9 @@ def maintenance_delivery_ready(
                 writes[item[0]] = position, item
         else:
             bundles.append((position, result))
-    if not writes:
+    if not writes and require_write:
         return False
-    latest_write = max(position for position, _ in writes.values())
+    latest_write = max((position for position, _ in writes.values()), default=(-1, -1, -1))
     expected = {path: item for path, (_, item) in writes.items()}
     for position, result in bundles:
         if position <= latest_write or result.get("presentation") != "final_attachment":
@@ -106,6 +107,6 @@ def maintenance_delivery_ready(
                 break
             actual[entry[0]] = entry
         else:
-            if all(actual.get(path) == item for path, item in expected.items()):
+            if actual and all(actual.get(path) == item for path, item in expected.items()):
                 return True
     return False

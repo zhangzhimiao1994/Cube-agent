@@ -2153,6 +2153,10 @@ def _dispatch_plan(
             engineering_delivery_contract_version=(
                 1 if role.id in engineering_writers else 0
             ),
+            engineering_action_version=(
+                1 if role.id in engineering_writers
+                and context.routing_decision.get("engineering_action_version") == 1 else 0
+            ),
             tool_argument_budget_bytes=_tool_argument_budgets_for_step(
                 context,
                 role_tools_by_id[role.id],
@@ -2361,6 +2365,9 @@ def _role_max_output_tokens(
     *,
     tools: tuple[str, ...],
 ) -> int:
+    if (context.routing_decision.get("engineering_action_version") == 1
+            and role.purpose is RolePurpose.EXECUTE and "workspace.write_text" in tools):
+        return min(context.token_budget, 24_576)
     if not _is_project_scale_generated_project_request(context):
         return 4096
     if role.id == "implementer" and (
@@ -2609,6 +2616,9 @@ def _role_allowed_tools(
     include_request: bool = True,
 ) -> tuple[str, ...]:
     requested = tuple(dict.fromkeys((*role.allowed_tools, *role.skills)))
+    if (context is not None and context.routing_decision.get("engineering_action_version") == 1
+            and role.purpose is RolePurpose.EXECUTE and "workspace.write_text" in requested):
+        requested = tuple(dict.fromkeys((*requested, "project.inspect")))
     if "workspace.read" in requested and "project.inspect" not in requested:
         requested = (*requested, "project.inspect")
     if "workspace.read" in requested or "run_safe_command" in requested:
@@ -4793,7 +4803,9 @@ def _discussion_plan(
             goal=goal,
             logical_model=role.model,
             allowed_tools=tools,
-            max_output_tokens=1536,
+            max_output_tokens=(min(token_budget, _role_max_output_tokens(context, role, tools=tools))
+                if context is not None and context.routing_decision.get("engineering_action_version") == 1
+                and role.purpose is RolePurpose.EXECUTE and "workspace.write_text" in tools else 1536),
         ))
     return DiscussionPlan(
         participants=tuple(participants),

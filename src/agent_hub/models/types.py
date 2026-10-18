@@ -328,6 +328,7 @@ class ModelRequest:
     response_schema: StructuredResponseSchema | None = field(default=None, repr=False)
     tools: tuple[ToolDefinition, ...] = field(default_factory=tuple, repr=False)
     native_tool_continuation: bool = False
+    required_tool: str | None = None
 
     def __post_init__(self) -> None:
         _require_safe_identifier("logical_model", self.logical_model)
@@ -367,6 +368,14 @@ class ModelRequest:
         tools = tuple(self.tools)
         if not all(isinstance(tool, ToolDefinition) for tool in tools):
             raise ValueError("tools must contain only ToolDefinition values")
+        if self.required_tool is not None and (
+            type(self.required_tool) is not str
+            or not 1 <= len(self.required_tool) <= 64
+            or _SAFE_SCHEMA_NAME.fullmatch(self.required_tool) is None
+            or sum(type(tool.name) is str and tool.name == self.required_tool
+                   for tool in tools) != 1
+        ):
+            raise ValueError("required_tool must name exactly one provider-safe tool definition")
         object.__setattr__(self, "messages", messages)
         object.__setattr__(self, "tools", tools)
         object.__setattr__(

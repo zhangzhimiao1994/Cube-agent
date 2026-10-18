@@ -66,7 +66,8 @@ def ready(data: tuple[dict[str, Mapping[str, JsonValue]], dict[str, Artifact], d
 
     states, artifacts, _ = data
     return engineering_delivery_ready(step_id="build", actor="implementer", states=states,
-                                      artifacts=artifacts, **prefix)
+                                      artifacts=artifacts, attempt=prefix.get('attempt'),
+                                      round_index=prefix.get('round_index'))
 
 
 def change_result(data: tuple[dict[str, Mapping[str, JsonValue]], dict[str, Artifact], dict[str, Artifact]],
@@ -84,6 +85,17 @@ def test_real_write_verify_bundle_and_prefix() -> None:
     assert ready(data)
     assert not ready(data, attempt=0, round_index=2)
     assert ready(data, attempt=0, round_index=3)
+
+
+def test_verified_existing_project_does_not_require_a_cosmetic_write() -> None:
+    from agent_hub.runtime.crew.engineering_delivery import engineering_delivery_ready
+
+    states, artifacts, _ = fixture()
+    del states['0']
+    del artifacts['0']
+    assert not engineering_delivery_ready(step_id='build', actor='implementer', states=states, artifacts=artifacts)
+    assert engineering_delivery_ready(step_id='build', actor='implementer', states=states,
+        artifacts=artifacts, require_write=False)
 
 
 @pytest.mark.parametrize("missing", ("0", "1", "2"))

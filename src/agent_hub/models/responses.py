@@ -291,7 +291,10 @@ def response_create_kwargs(deployment: Deployment, request: ModelRequest) -> dic
             }
             for tool in request.tools
         ]
-        payload["tool_choice"] = "auto"
+        payload["tool_choice"] = (
+            {"type": "function", "name": request.required_tool}
+            if request.required_tool is not None else "auto"
+        )
     _plain_json(payload, max_bytes=input_byte_limit)
     return payload
 
@@ -488,6 +491,10 @@ def _parse_output(
             "output_limit", status="completed", reject_site=_RejectSite.OUTPUT_LIMIT,
         )
     text = "".join(texts) if texts else None
+    if request.required_tool is not None and (
+        not calls or any(call.name != request.required_tool for call in calls)
+    ):
+        raise rejected("invalid_tool", reject_site=_RejectSite.INVALID_TOOL)
     if calls and texts:
         raise ResponsesContractError(
             "Responses output mixes final text and function calls",

@@ -8,12 +8,87 @@ import re
 from collections.abc import Mapping
 from typing import cast
 
-from agent_hub.runtime.contracts import Artifact, JsonValue
+from agent_hub.runtime.contracts import Artifact, JsonValue, TaskContext
 from agent_hub.runtime.crew.workspace_maintenance_delivery import (
+    _file_metadata,
     maintenance_delivery_ready,
 )
+from agent_hub.runtime.engineering_actions import EngineeringProgress
 
 Position = tuple[int, int, int]
+
+
+def engineering_action_progress(
+    *, context: TaskContext, step_id: str, actor: str,
+    states: Mapping[str, Mapping[str, JsonValue]], artifacts: Mapping[str, Artifact],
+    attempt: int, round_index: int, completion_proposed: bool = False, recovering: bool = False,
+) -> EngineeringProgress:
+    rows: list[tuple[Position, str, Mapping[str, JsonValue]]] = []
+    uncertain = EngineeringProgress(uncertain=True)
+    for key, row in states.items():
+        if row.get('step_id') != step_id:
+            continue
+        coordinates = tuple(row.get(name) for name in ('attempt', 'round', 'tool_index'))
+        if any(type(value) is not int or value < 0 for value in coordinates):
+            return uncertain
+        position = cast(Position, coordinates)
+        if position[:2] < (attempt, round_index):
+            rows.append((position, key, row))
+    inspected = existing = wrote = seen = verified = failed = False
+    known: dict[str, tuple[str, str, int]] = {}
+    for _, key, row in sorted(rows):
+        name, status = row.get('name'), row.get('status')
+        if status in {'prepared', 'running', 'uncertain', 'UNKNOWN'}:
+            return uncertain
+        if name not in {'project.inspect', 'workspace.write_text', 'project.verify', 'workspace.bundle'}:
+            if status == 'succeeded' and name not in {
+                'read_context', 'workspace.read', 'workspace_read', 'workspace.list', 'workspace.search',
+            }:
+                inspected = verified = failed = False
+            continue
+        if (name == 'workspace.bundle' and status == 'failed'
+                and row.get('engineering_bundle_correction') == 1
+                and row.get('artifact_id') is None):
+            continue
+        result = _trusted_result(key, row, actor, artifacts)
+        if result is None:
+            return uncertain
+        if status == 'rejected':
+            continue
+        if name == 'project.inspect' and status == 'succeeded':
+            scope = result.get('scope')
+            if (not isinstance(scope, Mapping) or scope.get('run_id') != str(context.run_id)
+                    or scope.get('tenant_id') != str(context.tenant_id)):
+                return uncertain
+            inspected = True
+            manifests, operations, issues = result.get('manifests'), result.get('operations'), result.get('issues')
+            if not wrote and isinstance(manifests, tuple | list) and isinstance(operations, Mapping):
+                existing = (isinstance(issues, tuple | list) and not issues
+                    and operations.get('build') == 'declared' and operations.get('test') == 'declared'
+                    and any(isinstance(item, Mapping) and item.get('path') == 'package.json'
+                            and item.get('status') == 'observed' for item in manifests))
+        elif name == 'workspace.write_text' and status == 'succeeded':
+            files = result.get('workspace_files')
+            item = (_file_metadata(files[0]) if isinstance(files, tuple | list) and len(files) == 1
+                    else _file_metadata(result))
+            if item is None:
+                return uncertain
+            wrote = True
+            verified = False
+            if known.get(item[0]) != item:
+                failed = False
+            known[item[0]] = item
+        elif name == 'project.verify':
+            seen = True
+            verified = status == 'succeeded' and _successful_source(result) is not None
+            failed = status == 'failed' and result.get('status') == 'failed'
+            if not verified and not failed:
+                return uncertain
+    return EngineeringProgress(inspected=inspected, existing_project=existing, has_writes=wrote,
+        verification_seen=seen, verification_current=verified, verification_failed_current=failed,
+        completion_proposed=completion_proposed, recovering=recovering,
+        bundle_current=engineering_delivery_ready(step_id=step_id, actor=actor, states=states,
+            artifacts=artifacts, attempt=attempt, round_index=round_index, require_write=False))
 
 
 def _trusted_result(key: str, row: Mapping[str, JsonValue], actor: str,
@@ -55,6 +130,7 @@ def engineering_delivery_ready(
     *, step_id: str, actor: str, states: Mapping[str, Mapping[str, JsonValue]],
     artifacts: Mapping[str, Artifact],
     attempt: int | None = None, round_index: int | None = None,
+    require_write: bool = True,
 ) -> bool:
     """Require trusted write -> successful verify -> matching current final bundle.
 
@@ -89,9 +165,9 @@ def engineering_delivery_ready(
     end_attempt = max(position[0] for position, _, _ in rows) + 1 if attempt is None else attempt
     if not maintenance_delivery_ready(step_id=step_id, actor=actor, attempt=end_attempt,
                                       round_index=0 if round_index is None else round_index,
-                                      states=delivery_states, artifacts=artifacts):
+                                      states=delivery_states, artifacts=artifacts, require_write=require_write):
         return False
-    wrote = False
+    wrote = not require_write
     verified: tuple[Position, str, str] | None = None
     ready = False
     for position, key, row in sorted(rows):
@@ -123,7 +199,7 @@ def engineering_delivery_ready(
                          and maintenance_delivery_ready(
                              step_id=step_id, actor=actor, attempt=position[0], round_index=position[1] + 1,
                              states={k: r for p, k, r in rows if p <= position and k not in superseded_bundles},
-                             artifacts=artifacts,
+                             artifacts=artifacts, require_write=require_write,
                          ))
         elif name not in {"read_context", "project.inspect", "workspace.read", "workspace_read",
                           "workspace.list", "workspace.search"}:

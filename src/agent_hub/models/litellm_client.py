@@ -288,6 +288,8 @@ def _validate_transport_request(
 ) -> Exception | None:
     if not native_request_compatible(deployment, request):
         return ValueError("native continuation deployment or protocol is incompatible")
+    if request.required_tool is not None and _is_messages_endpoint(deployment.api_base):
+        return ValueError("required_tool is unsupported for messages endpoints")
     if not api_key or not api_key.strip():
         return ValueError("API key must not be blank")
     if request.response_schema is not None and (
@@ -327,7 +329,10 @@ def _chat_completion_create_kwargs(
         }
     if request.tools:
         create_kwargs["tools"] = _tools(request.tools)
-        create_kwargs["tool_choice"] = "auto"
+        create_kwargs["tool_choice"] = (
+            {"type": "function", "function": {"name": request.required_tool}}
+            if request.required_tool is not None else "auto"
+        )
     return create_kwargs
 
 
@@ -782,6 +787,21 @@ class LiteLLMClient:
             outcome = await self._complete_outcome(deployment, request, api_key)
         except Exception as error:  # noqa: BLE001 - include client construction and retry setup
             outcome = safe_model_client_error(deployment.id, error, _sensitive_values(request, api_key))
+        if isinstance(outcome, ModelResponse) and request.required_tool is not None and (
+            not outcome.tool_calls
+            or any(call.name != request.required_tool for call in outcome.tool_calls)
+        ):
+            usage = outcome.usage
+            usage_status: RejectedUsageStatus = (
+                "known" if _valid_usage(usage) else "missing" if usage is None else "invalid"
+            )
+            outcome = ModelResponseError(
+                "model response rejected",
+                evidence=RejectedOutputEvidence(
+                    final_text=None, usage=usage if usage_status == "known" else None,
+                    usage_status=usage_status, status="completed", reason="invalid_tool",
+                ),
+            )
         del deployment, request, api_key
         if isinstance(outcome, _CancelledOutcome):
             if outcome.receipt is not None:

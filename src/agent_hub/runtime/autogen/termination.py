@@ -34,6 +34,7 @@ class CompositeDiscussionTermination(TerminationCondition):
     monotonic: Callable[[], float] = time.monotonic
     completion_marker: str = "[COMPLETE]"
     consensus_marker: str = "[CONSENSUS]"
+    delivery_ready: Callable[[], bool] | None = None
     reason: str | None = field(default=None, init=False)
     _started_at: float = field(default=0.0, init=False)
     _turns: int = field(default=0, init=False)
@@ -68,12 +69,12 @@ class CompositeDiscussionTermination(TerminationCondition):
             self.reason = "wall_time"
         elif self.usage.tokens >= self.token_budget or self.usage.cost_usd >= self.cost_budget_usd:
             self.reason = "budget_exhausted"
-        elif any(
+        elif (self.delivery_ready is None or self.delivery_ready()) and any(
             isinstance(message, BaseChatMessage) and self.completion_marker in message.to_text()
             for message in messages
         ):
             self.reason = "explicit_completion"
-        elif len(self._votes) >= self.consensus_votes:
+        elif (self.delivery_ready is None or self.delivery_ready()) and len(self._votes) >= self.consensus_votes:
             self.reason = "consensus"
         elif self._turns >= self.max_turns:
             self.reason = "max_turns"

@@ -147,6 +147,34 @@ def test_writable_verifier_does_not_leave_installer_outside_both_dependency_sets
     assert steps['tester_step'].depends_on == ('installer_step',)
 
 
+def test_new_action_contract_is_versioned_and_requires_inspection() -> None:
+    tools = ('workspace.write_text', 'project.verify', 'workspace.bundle')
+    legacy = DispatchStep(id='build', agent='builder', task='Build.', tools=tools,
+        engineering_delivery_contract_version=1)
+    assert 'engineering_action_version' not in legacy.model_dump(mode='json')
+    with pytest.raises(ValueError, match='inspection'):
+        DispatchStep(id='build', agent='builder', task='Build.', tools=tools,
+            engineering_delivery_contract_version=1, engineering_action_version=1)
+    current = DispatchStep(id='build', agent='builder', task='Build.',
+        tools=(*tools, 'project.inspect'), engineering_delivery_contract_version=1,
+        engineering_action_version=1)
+    assert current.engineering_action_version == 1
+
+
+def test_action_writer_exposes_inspection_even_without_workspace_read_tool() -> None:
+    role = RoleAssignment(id='builder', role='Builder', purpose=RolePurpose.EXECUTE,
+        mission='Build the module.', must_answer=('What passed?',),
+        allowed_tools=('workspace.write_text', 'project.verify', 'workspace.bundle'),
+        forbidden_actions=('Do not escape scope.',), skills=(), output_schema={'summary': 'string'}, model='main')
+    context = TaskContext(run_id=uuid4(), tenant_id=TENANT_ID, mode=TaskMode.DISPATCH,
+        request='Build a Node.js module.', routing_decision={
+            'engineering_delivery_contract_version': 1, 'engineering_action_version': 1})
+    plan = defaults._dispatch_plan((role,), context, capability_gateway=FakeCapabilityAvailability({
+        'workspace.write_text', 'project.verify', 'workspace.bundle', 'project.inspect'}))
+    assert plan.steps[0].engineering_action_version == 1
+    assert 'project.inspect' in plan.steps[0].tools
+
+
 async def test_config_backed_direct_injects_common_harness_policy_gateway(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -195,6 +223,11 @@ def test_discussion_engineering_owner_survives_role_limit_and_uses_common_tools(
     owners = [role for role in plan.participants if 'workspace.write_text' in role.allowed_tools]
     assert len(owners) == 1
     assert {'project.verify', 'workspace.bundle'} <= set(owners[0].allowed_tools)
+    current = context.model_copy(update={'routing_decision': {
+        **context.routing_decision, 'engineering_action_version': 1}})
+    new_plan = defaults._discussion_plan(roles, 'main', current, capability_gateway=available)
+    writer = next(participant for participant in new_plan.participants if 'workspace.write_text' in participant.allowed_tools)
+    assert writer.max_output_tokens == min(current.token_budget, 24_576)
     assert defaults._discussion_engineering_roles(readers, TaskContext(
         run_id=uuid4(), tenant_id=TENANT_ID, mode=TaskMode.DISCUSS, request='Discuss this idea.',
     ), 'main') == readers

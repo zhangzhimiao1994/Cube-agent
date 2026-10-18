@@ -34,8 +34,9 @@ def _request_json(value: object) -> object:
         return _request_json(model_message_payload(value))
     if is_dataclass(value) and not isinstance(value, type):
         return {item.name: _request_json(getattr(value, item.name)) for item in fields(value)
-                if not (isinstance(value, ModelRequest) and item.name == "native_tool_continuation"
-                        and value.native_tool_continuation is False)}
+                if not (isinstance(value, ModelRequest) and (
+                    item.name == "native_tool_continuation" and value.native_tool_continuation is False
+                    or item.name == "required_tool" and value.required_tool is None))}
     if isinstance(value, Mapping):
         return {key: _request_json(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):

@@ -1845,6 +1845,7 @@ class RunService:
                 if checkpoint is None:
                     routing_decision["runtime_progress_policy"] = "semantic_workspace_v1"
                     routing_decision["engineering_delivery_contract_version"] = 1
+                    routing_decision["engineering_action_version"] = 1
                 row.routing_decision = routing_decision
         if claimed_record is not None:
             if claimed_record.status is RunStatus.FAILED:

@@ -21,7 +21,7 @@ from collections.abc import (
     Mapping,
     Sequence,
 )
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from decimal import Decimal
 from typing import Any, Literal, Protocol, cast
 from uuid import UUID, uuid4
@@ -74,6 +74,12 @@ from agent_hub.runtime.artifacts import (
     ArtifactRepositoryError,
     InMemoryArtifactRepository,
 )
+from agent_hub.runtime.autogen.engineering_delivery import (
+    engineering_delivery_ready,
+    engineering_delivery_required,
+    engineering_evidence_limits,
+    engineering_progress,
+)
 from agent_hub.runtime.autogen.termination import CompositeDiscussionTermination, DiscussionUsage
 from agent_hub.runtime.contracts import (
     Artifact,
@@ -83,6 +89,7 @@ from agent_hub.runtime.contracts import (
     RuntimeCheckpoint,
     TaskContext,
 )
+from agent_hub.runtime.engineering_actions import required_engineering_action
 from agent_hub.runtime.failure_reason import (
     safe_model_gateway_failure_reason,
     safe_runtime_failure_reason,
@@ -325,6 +332,7 @@ class _DiscussionDurability:
         model_entries: tuple[_LedgerEntry, ...] = (),
         tool_entries: tuple[_LedgerEntry, ...] = (),
         artifacts: tuple[Artifact, ...] = (),
+        engineering_tool_prefix: int = 0,
     ) -> None:
         self._publish = publish
         self._store = store
@@ -335,7 +343,8 @@ class _DiscussionDurability:
         self.tool_entries = [dict(entry) for entry in tool_entries]
         self._artifacts = {str(artifact.id): artifact for artifact in artifacts}
         self._model_cursor = 0
-        self._tool_cursor = 0
+        self._tool_cursor = engineering_tool_prefix
+        self.engineering_tool_prefix = engineering_tool_prefix
         self._model_lock = asyncio.Lock()
         self.failure_reason: str | None = None
 
@@ -375,6 +384,8 @@ class _DiscussionDurability:
                 for tool in request.tools
             ]
             payload["tool_names"] = dict(tool_names or {})
+        if request.required_tool is not None:
+            payload["required_tool"] = request.required_tool
         return hashlib.sha256(
             json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest()
@@ -406,7 +417,10 @@ class _DiscussionDurability:
                 completion = self._completion_from_artifact(artifact)
                 self._model_lock.release()
                 return completion
-            self.model_entries.append({"status": "running", "request_hash": request_hash})
+            self.model_entries.append({"status": "running", "request_hash": request_hash, **({
+                "required_tool": request.required_tool, "max_output_tokens": request.max_output_tokens,
+                "timeout_seconds": request.timeout_seconds,
+            } if request.required_tool is not None else {})})
             await self._checkpoint()
             return None
         except BaseException:
@@ -536,17 +550,21 @@ class _DiscussionDurability:
             raise
         self._finalize(write_id)
 
-    async def compact(self) -> None:
+    async def compact(self, *, preserve_engineering: bool = False) -> None:
         async with self._model_lock:
             self.model_entries.clear()
-            self.tool_entries.clear()
+            if preserve_engineering:
+                self.engineering_tool_prefix = self._tool_cursor
+            else:
+                self.tool_entries.clear()
             self._artifacts = {
                 artifact_id: artifact
                 for artifact_id, artifact in self._artifacts.items()
                 if artifact.type == "tool_result"
             }
             self._model_cursor = 0
-            self._tool_cursor = 0
+            if not preserve_engineering:
+                self._tool_cursor = 0
 
     @staticmethod
     def _completion_artifact(completion: GatewayCompletion) -> Artifact:
@@ -1733,6 +1751,8 @@ class GatewayChatCompletionClient(ChatCompletionClient):
         supports_tool_calls: bool = False,
         durability: _DiscussionDurability | None = None,
         compaction_window: _MessageCompactionWindow = _DEFAULT_MESSAGE_COMPACTION_WINDOW,
+        engineering_action: Callable[[bool], str | None] | None = None,
+        engineering_budget: Callable[[], tuple[int, float]] | None = None,
     ) -> None:
         self._gateway = gateway
         self._logical_model = logical_model
@@ -1741,6 +1761,8 @@ class GatewayChatCompletionClient(ChatCompletionClient):
         self._supports_tool_calls = supports_tool_calls
         self._durability = durability
         self._compaction_window = compaction_window
+        self._engineering_action = engineering_action
+        self._engineering_budget = engineering_budget
         self._actual = RequestUsage(prompt_tokens=0, completion_tokens=0)
         self._total = RequestUsage(prompt_tokens=0, completion_tokens=0)
 
@@ -1785,6 +1807,72 @@ class GatewayChatCompletionClient(ChatCompletionClient):
             max_output_tokens=self._max_output_tokens,
             tools=model_tools,
         )
+        action = self._engineering_action(False) if self._engineering_action is not None else None
+        if action is not None:
+            request, tool_names = self._required_request(request, tool_names, action)
+        completion, usage = await self._complete_model_request(request, tool_names, cancellation_token)
+        response = completion.response
+        if not response.tool_calls and self._engineering_action is not None:
+            action = self._engineering_action(True)
+            if action is not None:
+                followup, names = self._required_request(
+                    replace(request, messages=(*request.messages,
+                        ModelMessage(role="assistant", content=response.text or ""),
+                        ModelMessage(role="user", content=f"Perform the required engineering milestone {action} using its approved tool."))),
+                    tool_names, action,
+                )
+                completion, followup_usage = await self._complete_model_request(followup, names, cancellation_token)
+                usage = RequestUsage(prompt_tokens=usage.prompt_tokens + followup_usage.prompt_tokens,
+                                     completion_tokens=usage.completion_tokens + followup_usage.completion_tokens)
+                self._actual = usage
+                response, tool_names = completion.response, names
+        content: str | list[FunctionCall]
+        finish_reason: Literal["stop", "function_calls"]
+        if response.tool_calls:
+            content = [FunctionCall(id=call.id, name=tool_names[call.name], arguments=json.dumps(
+                dict(call.arguments), ensure_ascii=False, allow_nan=False, sort_keys=True, separators=(",", ":"),
+            )) for call in response.tool_calls]
+            finish_reason = "function_calls"
+        elif response.text is not None:
+            content, finish_reason = response.text, "stop"
+        else:
+            raise RuntimeExecutionError("model response is invalid")
+        return CreateResult(finish_reason=finish_reason, content=content, usage=usage, cached=False,
+                            thought=(response.text or None) if response.tool_calls else None)
+
+    def _required_request(
+        self, request: ModelRequest, tool_names: Mapping[str, str], action: str,
+    ) -> tuple[ModelRequest, dict[str, str]]:
+        selected = tuple(tool for tool in request.tools if tool_names.get(tool.name) == action)
+        if len(selected) != 1:
+            raise RuntimeExecutionError("required engineering capability is unavailable")
+        name = selected[0].name
+        replay_entry = (self._durability.model_entries[self._durability._model_cursor]
+                        if self._durability is not None
+                        and self._durability._model_cursor < len(self._durability.model_entries) else None)
+        if replay_entry is not None:
+            tokens, seconds = replay_entry.get("max_output_tokens"), replay_entry.get("timeout_seconds")
+            if (replay_entry.get("required_tool") != name or type(tokens) is not int
+                or not 0 < tokens <= self._max_output_tokens or isinstance(seconds, bool)
+                or not isinstance(seconds, int | float) or not math.isfinite(seconds) or seconds <= 0):
+                raise RuntimeExecutionError("durable required engineering request mismatch")
+        else:
+            if self._engineering_budget is None:
+                raise RuntimeExecutionError("engineering action budget is unavailable")
+            tokens, seconds = self._engineering_budget()
+            if (type(tokens) is not int or tokens <= 0 or isinstance(seconds, bool)
+                or not isinstance(seconds, int | float) or not math.isfinite(seconds) or seconds <= 0):
+                raise RuntimeExecutionError("engineering action budget is exhausted")
+        return replace(request, tools=selected, required_tool=name,
+                       max_output_tokens=min(self._max_output_tokens, tokens),
+                       timeout_seconds=min(request.timeout_seconds, float(seconds))), {
+            key: value for key, value in tool_names.items() if value == action
+        }
+
+    async def _complete_model_request(
+        self, request: ModelRequest, tool_names: Mapping[str, str],
+        cancellation_token: CancellationToken | None,
+    ) -> tuple[GatewayCompletion, RequestUsage]:
         completion = (
             await self._durability.before_model(request, tool_names=tool_names)
             if self._durability is not None
@@ -1837,36 +1925,10 @@ class GatewayChatCompletionClient(ChatCompletionClient):
             raise RuntimeExecutionError("model requested an unavailable capability")
         if not replayed and self._durability is not None:
             await self._durability.succeed_model(request, completion, tool_names=tool_names)
-        content: str | list[FunctionCall]
-        finish_reason: Literal["stop", "function_calls"]
-        if response.tool_calls:
-            content = [
-                FunctionCall(
-                    id=call.id,
-                    name=tool_names[call.name],
-                    arguments=json.dumps(
-                        dict(call.arguments),
-                        ensure_ascii=False,
-                        allow_nan=False,
-                        sort_keys=True,
-                        separators=(",", ":"),
-                    ),
-                )
-                for call in response.tool_calls
-            ]
-            finish_reason = "function_calls"
-        elif response.text is not None:
-            content = response.text
-            finish_reason = "stop"
-        else:
-            raise RuntimeExecutionError("model response is invalid")
-        return CreateResult(
-            finish_reason=finish_reason,
-            content=content,
-            usage=usage,
-            cached=False,
-            thought=(response.text or None) if response.tool_calls else None,
-        )
+        if request.required_tool is not None and (len(response.tool_calls) != 1
+            or response.tool_calls[0].name != request.required_tool):
+            raise RuntimeExecutionError("required engineering tool was not returned")
+        return completion, usage
 
     def create_stream(
         self,
@@ -2037,6 +2099,50 @@ class AutoGenDiscussionRuntime:
         message_artifacts: list[Artifact] = []
         usage = DiscussionUsage()
         durability: _DiscussionDurability | None = None
+        allowed_tools = {participant.id: participant.allowed_tools for participant in self._plan.participants}
+        engineering = engineering_delivery_required(context, allowed_tools)
+        action_version = context.routing_decision.get("engineering_action_version")
+        actions = engineering and type(action_version) is int and action_version == 1
+        owner = next((participant.id for participant in self._plan.participants
+                      if "workspace.write_text" in participant.allowed_tools), None)
+
+        def delivery_ready() -> bool:
+            if not engineering:
+                return True
+            if durability is None:
+                return False
+            progress = engineering_progress(context, tool_entries=durability.tool_entries,
+                artifacts=durability.artifacts, allowed_tools=allowed_tools) if actions else None
+            return (progress is None or (progress.inspected and not progress.uncertain)) and engineering_delivery_ready(
+                run_id=context.run_id, tool_entries=durability.tool_entries,
+                artifacts=durability.artifacts, allowed_tools=allowed_tools,
+                require_write=not (progress is not None and progress.existing_project),
+            )
+
+        def next_action(proposed: bool) -> str | None:
+            if durability is None:
+                raise RuntimeExecutionError("engineering action evidence is unavailable")
+            # Completed future rows belong to replay, not the current causal
+            # prefix. Uncertain future outcomes must never trigger another call.
+            if any(row.get("status") not in ("succeeded", "failed")
+                   for row in durability.tool_entries[durability._tool_cursor:]):
+                raise ToolOutcomeUncertain("capability outcome is uncertain")
+            progress = engineering_progress(
+                context, tool_entries=durability.tool_entries[:durability._tool_cursor],
+                artifacts=durability.artifacts, allowed_tools=allowed_tools, completion_proposed=proposed,
+                recovering=(self._restored is not None
+                            and durability._model_cursor >= len(durability.model_entries)),
+            )
+            if progress.uncertain:
+                raise RuntimeExecutionError("engineering action evidence is invalid")
+            return required_engineering_action(progress)
+
+        def action_budget() -> tuple[int, float]:
+            deadline = self._wall_deadline
+            return (max(0, min(self._plan.token_budget, context.token_budget) - usage.tokens)
+                    if usage.cost_usd < self._plan.cost_budget_usd else 0,
+                    max(0.0, deadline - asyncio.get_running_loop().time()) if deadline is not None else 0.0)
+
         wall_expired = asyncio.Event()
         wall_handle: asyncio.TimerHandle | None = None
         try:
@@ -2054,6 +2160,18 @@ class AutoGenDiscussionRuntime:
                 sequence = cast(int, restored.state["next_sequence"])
                 if restored.state["terminal"] is True:
                     restored_reason = cast(str, restored.state["reason"])
+                    progress = engineering_progress(
+                        context, tool_entries=self._restored_ledger(restored, "tool_ledger"),
+                        artifacts=ledger_artifacts, allowed_tools=allowed_tools,
+                    ) if actions else None
+                    if progress is not None and (not progress.inspected or progress.uncertain):
+                        raise RuntimeExecutionError("engineering_delivery_missing")
+                    if engineering and not engineering_delivery_ready(
+                        run_id=context.run_id, tool_entries=self._restored_ledger(restored, "tool_ledger"),
+                        artifacts=ledger_artifacts, allowed_tools=allowed_tools,
+                        require_write=not (progress is not None and progress.existing_project),
+                    ):
+                        raise RuntimeExecutionError("engineering_delivery_missing")
                     yield RunEvent(
                         kind=EventKind.RUNTIME_COMPLETED,
                         sequence=sequence,
@@ -2128,6 +2246,7 @@ class AutoGenDiscussionRuntime:
                     usage=usage,
                     model_ledger=model_entries,
                     tool_ledger=tool_entries,
+                    engineering_tool_prefix=(durability.engineering_tool_prefix if durability is not None else 0),
                 )
                 self._last_checkpoint = checkpoint
 
@@ -2149,6 +2268,8 @@ class AutoGenDiscussionRuntime:
                 model_entries=self._restored_ledger(restored, "model_ledger"),
                 tool_entries=self._restored_ledger(restored, "tool_ledger"),
                 artifacts=ledger_artifacts,
+                engineering_tool_prefix=cast(int, restored.state.get("engineering_tool_prefix", 0))
+                if engineering and restored is not None else 0,
             )
             cancelled = lambda: (
                 self._cancel_token is None
@@ -2165,6 +2286,7 @@ class AutoGenDiscussionRuntime:
                     cancelled=cancelled,
                     adaptive_deadline=self._wall_budget,
                     monotonic=asyncio.get_running_loop().time,
+                    delivery_ready=delivery_ready if engineering else None,
                 ),
                 control=discussion_control,
                 participants=frozenset(self.participant_ids),
@@ -2181,6 +2303,8 @@ class AutoGenDiscussionRuntime:
                     supports_tool_calls=bool(participant.allowed_tools),
                     durability=durability,
                     compaction_window=compaction_window,
+                    engineering_action=next_action if actions and participant.id == owner else None,
+                    engineering_budget=action_budget if actions and participant.id == owner else None,
                 )
                 for participant in self._plan.participants
             }
@@ -2275,12 +2399,26 @@ class AutoGenDiscussionRuntime:
                             f"Role: {participant.role}. Goal: {participant.goal}. "
                             "Return only explicit conclusions and citations. Never reveal hidden reasoning. "
                             "Use [CONSENSUS] to vote, or [COMPLETE] only for a finished answer."
+                            + (" Engineering delivery is required: use workspace.write_text to implement; "
+                               "project.verify must pass install, build and test after the last change; "
+                               "then workspace.bundle must deliver the current verified files. "
+                               "Diagnose failed checks and repair within existing permissions and budgets. "
+                               "Text, code snippets, votes and [COMPLETE] are not delivery."
+                               if engineering else "")
                         ),
                     ),
                 )
                 for participant in self._plan.participants
             ]
             framework_runtime = SingleThreadedAgentRuntime(tracer_provider=NoOpTracerProvider())
+            team_options: dict[str, Any] = {}
+            if engineering:
+                team_options["selector_prompt"] = (
+                    "Select the next speaker from {participants}. Roles:\n{roles}\nHistory:\n{history}\n"
+                    "This engineering task requires actual workspace.write_text, passing project.verify, "
+                    "and current workspace.bundle. Prefer the engineering writer until these are delivered; "
+                    "do not treat [COMPLETE] or consensus text as delivery. Return only one speaker name."
+                )
             team = SelectorGroupChat(
                 agents,
                 selector,
@@ -2290,6 +2428,7 @@ class AutoGenDiscussionRuntime:
                 # constrains candidates through the published participant list.
                 allow_repeated_speaker=True,
                 runtime=framework_runtime,
+                **team_options,
             )
             self.last_team = team
             source_ids = _bounded_source_ids((*context.artifacts, *message_artifacts))
@@ -2393,7 +2532,7 @@ class AutoGenDiscussionRuntime:
                         write_id = await self._store_artifact(context, artifact)
                         message_artifacts.append(artifact)
                         try:
-                            await durability.compact()
+                            await durability.compact(preserve_engineering=engineering)
                             checkpoint = self._checkpoint(
                                 context,
                                 next_sequence=sequence + 3,
@@ -2401,6 +2540,9 @@ class AutoGenDiscussionRuntime:
                                 reason=None,
                                 artifacts=tuple(message_artifacts) + durability.artifacts,
                                 usage=usage,
+                                model_ledger=tuple(durability.model_entries) if engineering else (),
+                                tool_ledger=tuple(durability.tool_entries) if engineering else (),
+                                engineering_tool_prefix=durability.engineering_tool_prefix,
                             )
                         except BaseException:
                             message_artifacts.pop()
@@ -2470,6 +2612,8 @@ class AutoGenDiscussionRuntime:
             if wall_expired.is_set():
                 reason = "wall_time"
             reason = reason or termination.reason or "max_turns"
+            if not delivery_ready():
+                raise RuntimeExecutionError("engineering_delivery_missing")
             last_discussion = next(
                 (
                     preview
@@ -2502,6 +2646,7 @@ class AutoGenDiscussionRuntime:
                 usage=usage,
                 model_ledger=(tuple(durability.model_entries) if durability is not None else ()),
                 tool_ledger=(tuple(durability.tool_entries) if durability is not None else ()),
+                engineering_tool_prefix=durability.engineering_tool_prefix if durability is not None else 0,
             )
             self._last_checkpoint = checkpoint
             yield RunEvent(
@@ -2540,6 +2685,10 @@ class AutoGenDiscussionRuntime:
             )
         except asyncio.CancelledError:
             if wall_expired.is_set():
+                if not delivery_ready():
+                    yield RunEvent(kind=EventKind.RUNTIME_FAILED, sequence=sequence,
+                                   run_id=context.run_id, reason="engineering_delivery_missing")
+                    return
                 checkpoint = self._checkpoint(
                     context,
                     next_sequence=sequence + 2,
@@ -2552,6 +2701,7 @@ class AutoGenDiscussionRuntime:
                         tuple(durability.model_entries) if durability is not None else ()
                     ),
                     tool_ledger=(tuple(durability.tool_entries) if durability is not None else ()),
+                    engineering_tool_prefix=durability.engineering_tool_prefix if durability is not None else 0,
                 )
                 self._last_checkpoint = checkpoint
                 yield RunEvent(
@@ -2581,6 +2731,7 @@ class AutoGenDiscussionRuntime:
                         tuple(durability.model_entries) if durability is not None else ()
                     ),
                     tool_ledger=(tuple(durability.tool_entries) if durability is not None else ()),
+                    engineering_tool_prefix=durability.engineering_tool_prefix if durability is not None else 0,
                 )
                 self._last_checkpoint = checkpoint
                 yield RunEvent(
@@ -2609,7 +2760,7 @@ class AutoGenDiscussionRuntime:
             error.__context__ = None
             error.__cause__ = None
             del error
-            if _can_complete_with_partial_discussion(message_artifacts, failure_reason):
+            if delivery_ready() and _can_complete_with_partial_discussion(message_artifacts, failure_reason):
                 checkpoint = self._checkpoint(
                     context,
                     next_sequence=sequence + 2,
@@ -2622,6 +2773,7 @@ class AutoGenDiscussionRuntime:
                         tuple(durability.model_entries) if durability is not None else ()
                     ),
                     tool_ledger=(tuple(durability.tool_entries) if durability is not None else ()),
+                    engineering_tool_prefix=durability.engineering_tool_prefix if durability is not None else 0,
                 )
                 self._last_checkpoint = checkpoint
                 yield RunEvent(
@@ -2832,6 +2984,7 @@ class AutoGenDiscussionRuntime:
         usage: DiscussionUsage,
         model_ledger: tuple[_LedgerEntry, ...] = (),
         tool_ledger: tuple[_LedgerEntry, ...] = (),
+        engineering_tool_prefix: int = 0,
     ) -> RuntimeCheckpoint:
         discussion_control = self._discussion_control
         if discussion_control is None:
@@ -2853,33 +3006,69 @@ class AutoGenDiscussionRuntime:
             )
         else:
             remaining_absolute_timeout_seconds = max(0.0, wall_deadline - loop_time)
-        return RuntimeCheckpoint(
-            id=uuid4(),
-            runtime_type=_RUNTIME_TYPE,
-            runtime_version=_RUNTIME_VERSION,
-            run_id=context.run_id,
-            tenant_id=context.tenant_id,
-            mode=self.mode,
-            state={
-                "plan_digest": self._plan.digest,
-                "autogen_version": _AUTOGEN_VERSION,
-                "terminal": terminal,
-                "reason": reason,
-                "next_sequence": next_sequence,
-                "artifact_registry": {
-                    str(item.id): item.content_sha256
-                    for item in _bounded_checkpoint_artifacts(artifacts)
-                },
-                "usage": {"tokens": usage.tokens, "cost_usd": str(usage.cost_usd)},
-                "discussion_control": discussion_control.to_state(),
-                "remaining_timeout_seconds": max(
-                    0.0,
-                    wall_deadline - loop_time,
-                ),
-                "remaining_absolute_timeout_seconds": remaining_absolute_timeout_seconds,
-                "model_ledger": model_ledger,
-                "tool_ledger": tool_ledger,
+        engineering = engineering_delivery_required(
+            context, {participant.id: participant.allowed_tools for participant in self._plan.participants},
+        )
+        checkpoint_artifacts = _bounded_checkpoint_artifacts(artifacts)
+        required: tuple[Artifact, ...] = ()
+        optional: tuple[Artifact, ...] = ()
+        if engineering:
+            required_ids = {entry.get("artifact_id") for entry in (*model_ledger, *tool_ledger)
+                            if isinstance(entry.get("artifact_id"), str)}
+            required = tuple(item for item in artifacts if str(item.id) in required_ids)
+            if {str(item.id) for item in required} != required_ids:
+                raise RuntimeExecutionError("engineering_delivery_evidence_limit")
+            optional = tuple(item for item in artifacts if str(item.id) not in required_ids)
+            optional = _bounded_checkpoint_artifacts(optional)
+            checkpoint_artifacts = (*optional, *required)
+        checkpoint_id = uuid4()
+        state: dict[str, JsonValue] = {
+            "plan_digest": self._plan.digest,
+            "autogen_version": _AUTOGEN_VERSION,
+            "terminal": terminal,
+            "reason": reason,
+            "next_sequence": next_sequence,
+            "artifact_registry": {
+                str(item.id): item.content_sha256 for item in checkpoint_artifacts
             },
+            "usage": {"tokens": usage.tokens, "cost_usd": str(usage.cost_usd)},
+            "discussion_control": discussion_control.to_state(),
+            "remaining_timeout_seconds": max(0.0, wall_deadline - loop_time),
+            "remaining_absolute_timeout_seconds": remaining_absolute_timeout_seconds,
+            "model_ledger": model_ledger,
+            "tool_ledger": tool_ledger,
+            **({"engineering_tool_prefix": engineering_tool_prefix} if engineering else {}),
+            **({"engineering_action_version": 1} if engineering
+               and type(context.routing_decision.get("engineering_action_version")) is int
+               and context.routing_decision.get("engineering_action_version") == 1 else {}),
+        }
+        if engineering:
+            while True:
+                try:
+                    engineering_evidence_limits(
+                        {"id": str(checkpoint_id), "runtime_type": _RUNTIME_TYPE,
+                         "runtime_version": _RUNTIME_VERSION, "run_id": str(context.run_id),
+                         "tenant_id": str(context.tenant_id), "mode": self.mode.value,
+                         "state": state, "state_sha256": "0" * 64},
+                        token_budget=min(self._plan.token_budget, context.token_budget),
+                        used_tokens=usage.tokens,
+                        timeout_seconds=min(self._plan.wall_time_seconds, context.timeout_seconds),
+                        remaining_seconds=max(0.0, wall_deadline - loop_time),
+                        max_turns=self._plan.max_turns, tool_fanout=_MAX_TOOL_CALLS_PER_RESPONSE,
+                    )
+                    break
+                except ValueError:
+                    if not optional:
+                        raise RuntimeExecutionError("engineering_delivery_evidence_limit") from None
+                    # Only transcript hints may be compacted to free metadata
+                    # headroom. Never drop a ledger row or its required reference.
+                    optional = optional[1:]
+                    state["artifact_registry"] = {
+                        str(item.id): item.content_sha256 for item in (*optional, *required)
+                    }
+        return RuntimeCheckpoint(
+            id=checkpoint_id, runtime_type=_RUNTIME_TYPE, runtime_version=_RUNTIME_VERSION,
+            run_id=context.run_id, tenant_id=context.tenant_id, mode=self.mode, state=state,
         )
 
     def _validate_checkpoint(self, checkpoint: RuntimeCheckpoint, context: TaskContext) -> None:
@@ -2915,11 +3104,23 @@ class AutoGenDiscussionRuntime:
                 }
             )
         optional_state = (
-            {"remaining_absolute_timeout_seconds"}
+            {"remaining_absolute_timeout_seconds", "engineering_tool_prefix", "engineering_action_version"}
             if checkpoint.runtime_version == _RUNTIME_VERSION
             else set()
         )
         if not required_state <= set(state) <= required_state | optional_state:
+            raise RuntimeExecutionError("runtime checkpoint is incompatible")
+        engineering = engineering_delivery_required(
+            context, {participant.id: participant.allowed_tools for participant in self._plan.participants},
+        )
+        if "engineering_tool_prefix" in state and not engineering:
+            raise RuntimeExecutionError("runtime checkpoint is incompatible")
+        action_version = context.routing_decision.get("engineering_action_version")
+        actions = engineering and type(action_version) is int and action_version == 1
+        if (("engineering_action_version" in state) != actions
+            or ("engineering_action_version" in state and (
+                type(state["engineering_action_version"]) is not int
+                or state["engineering_action_version"] != 1))):
             raise RuntimeExecutionError("runtime checkpoint is incompatible")
         registry = state["artifact_registry"]
         usage = state["usage"]
@@ -2936,7 +3137,7 @@ class AutoGenDiscussionRuntime:
             or type(state["next_sequence"]) is not int
             or not 1 <= state["next_sequence"] < 2**63
             or not isinstance(registry, Mapping)
-            or len(registry) > 64
+            or (not engineering and len(registry) > _CHECKPOINT_ARTIFACT_WINDOW)
             or not isinstance(usage, Mapping)
             or set(usage) != {"tokens", "cost_usd"}
             or type(usage["tokens"]) is not int
@@ -2966,9 +3167,14 @@ class AutoGenDiscussionRuntime:
             )
             or not isinstance(model_ledger, tuple)
             or not isinstance(tool_ledger, tuple)
-            or len(model_ledger) > 64
-            or len(tool_ledger) > 64
+            or (not engineering and (len(model_ledger) > 64 or len(tool_ledger) > 64))
             or any(not isinstance(entry, Mapping) for entry in (*model_ledger, *tool_ledger))
+            or ("engineering_tool_prefix" in state and (
+                type(state["engineering_tool_prefix"]) is not int
+                or not 0 <= state["engineering_tool_prefix"] <= len(tool_ledger)
+                or any(not isinstance(entry, Mapping) or entry.get("status") not in {"succeeded", "failed"}
+                       for entry in tool_ledger[:state["engineering_tool_prefix"]])
+            ))
         ):
             raise RuntimeExecutionError("runtime checkpoint is incompatible")
         try:
@@ -2988,6 +3194,20 @@ class AutoGenDiscussionRuntime:
             or (state["terminal"] is True and type(state["reason"]) is not str)
         ):
             raise RuntimeExecutionError("runtime checkpoint is incompatible")
+        if engineering:
+            try:
+                engineering_evidence_limits(
+                    checkpoint.to_payload(),
+                    token_budget=min(self._plan.token_budget, context.token_budget),
+                    used_tokens=usage["tokens"],
+                    timeout_seconds=min(self._plan.wall_time_seconds, context.timeout_seconds),
+                    remaining_seconds=(float(remaining_timeout_seconds)
+                                       if isinstance(remaining_timeout_seconds, int | float)
+                                       else min(self._plan.wall_time_seconds, context.timeout_seconds)),
+                    max_turns=self._plan.max_turns, tool_fanout=_MAX_TOOL_CALLS_PER_RESPONSE,
+                )
+            except ValueError:
+                raise RuntimeExecutionError("runtime checkpoint is incompatible") from None
 
     async def _hydrate_checkpoint(
         self, checkpoint: RuntimeCheckpoint, context: TaskContext

@@ -99,13 +99,17 @@ from agent_hub.runtime.contracts import (
 from agent_hub.runtime.contracts import (
     _freeze_json as _freeze_bounded_json,
 )
-from agent_hub.runtime.crew.engineering_delivery import engineering_delivery_ready
+from agent_hub.runtime.crew.engineering_delivery import (
+    engineering_action_progress,
+    engineering_delivery_ready,
+)
 from agent_hub.runtime.crew.plan import (
     AgentSpec,
     DispatchPlan,
     DispatchStep,
     InvalidDispatchPlan,
 )
+from agent_hub.runtime.engineering_actions import required_engineering_action
 from agent_hub.runtime.failure_reason import (
     ORCHESTRATION_CHECKPOINT_FAILURE_REASON,
     runtime_failure_diagnostic_from_reason,
@@ -4266,6 +4270,7 @@ class CrewDispatchRuntime:
                             and not engineering_delivery_ready(
                                 step_id=restored_step.id, actor=restored_step.agent,
                                 states=tool_ledger.states, artifacts=tool_ledger.artifacts,
+                                require_write=restored_step.engineering_action_version != 1,
                             )):
                         _fail("engineering delivery evidence is missing from completed checkpoint")
                 artifact_registry.update(restored_artifacts)
@@ -5109,6 +5114,7 @@ class CrewDispatchRuntime:
                         and not engineering_delivery_ready(
                             step_id=step.id, actor=step.agent, states=tool_ledger.states,
                             artifacts=tool_ledger.artifacts,
+                            require_write=step.engineering_action_version != 1,
                         )):
                     _fail("engineering delivery requires trusted write, verification and current bundle")
                 _validate_structured_role_output(plan, step, agent, completion.response.text)
@@ -7490,6 +7496,7 @@ class CrewDispatchRuntime:
         }
         stall_corrected = False
         delivery_correction_progress: set[str] = set()
+        completion_proposed = False
         workspace_metadata_budget = max(
             512, min(8_192, content_limits.interaction_prompt_bytes // 8),
         )
@@ -7506,7 +7513,24 @@ class CrewDispatchRuntime:
                 > _MAX_CHECKPOINT_ARTIFACTS - (_MAX_TOOL_CALLS_PER_RESPONSE + 1)
             ):
                 force_result_synthesis = True
+            required_action = None
+            if step.engineering_action_version == 1:
+                progress = engineering_action_progress(
+                    context=context, step_id=step.id, actor=step.agent, states=tool_ledger.states,
+                    artifacts=tool_ledger.artifacts, attempt=model_attempt, round_index=_round,
+                    completion_proposed=completion_proposed, recovering=recovery_attempt > 0 and _round == 0,
+                )
+                if progress.uncertain:
+                    raise CapabilityOutcomeUncertain("engineering action evidence is unavailable")
+                required_action = required_engineering_action(progress)
             round_tools = () if force_result_synthesis else request_tools
+            required_tool = None
+            if required_action is not None:
+                mapping = _tool_name_mapping(step.tools)
+                round_tools = tuple(tool for tool in round_tools if mapping.get(tool.name) == required_action)
+                if len(round_tools) != 1:
+                    _fail("required engineering capability is unavailable")
+                required_tool = round_tools[0].name
             round_required_capabilities = set(required_capabilities)
             if force_result_synthesis:
                 round_required_capabilities.discard(ModelCapability.TOOL_CALLING)
@@ -7593,6 +7617,13 @@ class CrewDispatchRuntime:
                     round_index=_round,
                     max_bytes=workspace_metadata_budget,
                 ))
+            if required_action is not None:
+                request_messages.append(ModelMessage(role="system", content=(
+                    "ENGINEERING_REQUIRED_ACTION: Request the selected " + required_action
+                    + " capability next, with its declared arguments. This is an actual project "
+                    "prerequisite, not a request to describe shell commands or claim checks passed. "
+                    "Permissions, approvals and execution budgets remain unchanged."
+                )))
             request = ModelRequest(
                 logical_model=logical_model,
                 messages=self._response_contract_messages(
@@ -7612,6 +7643,7 @@ class CrewDispatchRuntime:
                 max_output_tokens=round_output_tokens,
                 response_schema=response_schema,
                 tools=round_tools,
+                required_tool=required_tool,
                 allow_fallback=incomplete_recovery_model is None,
                 native_tool_continuation=(run_state.native_tool_continuation
                                           and _is_incremental_workspace_contract_step(step)),
@@ -7741,11 +7773,16 @@ class CrewDispatchRuntime:
                 max_output_bytes=content_limits.output_bytes,
             )
             assert response is not None
+            if required_action is not None and (
+                not response.tool_calls or any(call.name != required_action for call in response.tool_calls)
+            ):
+                _fail("model did not request the required engineering capability")
             if not response.tool_calls:
                 if step.engineering_delivery_contract_version == 1:
                     delivered = engineering_delivery_ready(
                         step_id=step.id, actor=step.agent, attempt=model_attempt,
                         round_index=_round, states=tool_ledger.states, artifacts=tool_ledger.artifacts,
+                        require_write=step.engineering_action_version != 1,
                     )
                 elif step.workspace_maintenance_contract_version == 1:
                     from agent_hub.runtime.crew.workspace_maintenance_delivery import (
@@ -7799,6 +7836,7 @@ class CrewDispatchRuntime:
                         and _round < active_round_limit
                     ):
                         delivery_correction_progress.add(delivery_progress)
+                        completion_proposed = step.engineering_action_version == 1
                         if meaningful_progress:
                             stall_corrected = True
                         if run_state.native_tool_continuation and response.native_assistant is not None:
@@ -7843,6 +7881,7 @@ class CrewDispatchRuntime:
                 if step.final_synthesizer:
                     completion = _reconcile_final_attachment_completion(completion, evidence)
                 return completion
+            completion_proposed = False
             if force_result_synthesis:
                 round_limit_completion = _project_scale_tool_round_limit_structured_completion(
                     step,
@@ -8028,6 +8067,9 @@ class CrewDispatchRuntime:
                 semantic_artifact = (
                     None
                     if generated_file_result is not None or (
+                        step.engineering_action_version == 1
+                        and tool_call.name in {"project.inspect", "project.verify"}
+                    ) or (
                         workspace_continuation
                         and (tool_call.name in {"workspace.read", "workspace.list"}
                              or (context_refresh and tool_call.name == "workspace_read"))
@@ -9084,11 +9126,12 @@ class CrewDispatchRuntime:
             "allow_fallback": request.allow_fallback,
             "max_output_tokens": request.max_output_tokens,
             "response_schema": schema,
+            **({"required_tool": request.required_tool} if request.required_tool is not None else {}),
             **({"native_tool_continuation": True} if request.native_tool_continuation else {}),
             **({"tools": tuple({
                 "name": tool.name, "description": tool.description,
                 "parameters": _mutable_json(tool.parameters),
-            } for tool in request.tools)} if request.native_tool_continuation else {}),
+            } for tool in request.tools)} if request.native_tool_continuation or request.required_tool is not None else {}),
         }
         try:
             encoded = json.dumps(
