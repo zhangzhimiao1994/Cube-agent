@@ -42,10 +42,17 @@ from agent_hub.models.failure_receipt import (
     _valid_usage,
 )
 from agent_hub.models.litellm_client import (
+    ModelNegotiatedCancellation,
+    ModelNegotiatedClientError,
+    ModelNegotiatedResponseError,
+    ModelNegotiationExhausted,
     ModelResponseCancelled,
     ModelResponseError,
     ModelTransportError,
     safe_model_client_error,
+)
+from agent_hub.models.litellm_client import (
+    is_model_negotiation_exhausted as _is_transport_negotiation_exhausted,
 )
 from agent_hub.models.registry import ModelRegistry, NoCapableDeployment
 from agent_hub.models.types import (
@@ -201,6 +208,10 @@ class ModelGatewayError(RuntimeError):
     """Stable, redacted failure at the model gateway boundary."""
 
 
+class GatewayNegotiatedClientError(ModelGatewayError):
+    """Unknown negotiated outcome, with no automatic continuation."""
+
+
 class GatewayRejectedOutput(ModelGatewayError):
     """Rejected model output with selected provenance, not a completion."""
 
@@ -222,6 +233,16 @@ class GatewayRejectedOutput(ModelGatewayError):
         self.fallback_from_logical_model = fallback_from_logical_model
         self.fallback_reason = fallback_reason
         self.attempted_logical_models = attempted_logical_models
+
+
+class GatewayNegotiatedRejectedOutput(GatewayRejectedOutput):
+    """Received rejection retains its accounting and negotiation stop boundary."""
+
+
+def is_model_negotiation_exhausted(error: BaseException) -> bool:
+    return _is_transport_negotiation_exhausted(error) or type(error) in {
+        GatewayNegotiatedClientError, GatewayNegotiatedRejectedOutput,
+    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -379,6 +400,7 @@ class _GatewayFailureTracking:
     deployment: Deployment
     ordinal: int = 0
     recorded: bool = False
+    negotiation_exhausted: bool = False
 
     def enter(self) -> None:
         self.history.entered_count += 1
@@ -478,6 +500,8 @@ def _utc_now() -> datetime:
 
 
 def _retryable_model_failure(error: BaseException) -> bool:
+    if is_model_negotiation_exhausted(error):
+        return False
     if isinstance(error, ModelResponseError | GatewayRejectedOutput):
         return False
     if isinstance(error, ModelTransportError):
@@ -867,6 +891,7 @@ class ModelGateway:
                 raise self._rejected_output(
                     selected, selected_request, error.evidence, fallback_from_logical_model,
                     fallback_reason, attempted_logical_models,
+                    negotiation_exhausted=is_model_negotiation_exhausted(error),
                 ) from None
             except (ModelTransportError, ModelGatewayError) as error:
                 if not _retryable_model_failure(error):
@@ -1269,9 +1294,11 @@ class ModelGateway:
         self, selected: Deployment, request: ModelRequest,
         evidence: RejectedOutputEvidence | None, fallback_from_logical_model: str | None,
         fallback_reason: str | None, attempted_logical_models: Sequence[str],
+        *, negotiation_exhausted: bool = False,
     ) -> GatewayRejectedOutput:
         fallback_used = selected.logical_model != request.logical_model
-        return GatewayRejectedOutput(
+        error_type = GatewayNegotiatedRejectedOutput if negotiation_exhausted else GatewayRejectedOutput
+        return error_type(
             evidence=evidence,
             deployment_id=selected.id,
             logical_model=selected.logical_model,
@@ -1720,7 +1747,10 @@ class ModelGateway:
                     if history is not None:
                         history.mark_incomplete(ScopeIncompletePhase.OUTER_DEADLINE,
                                                 ScopeIncompleteReason.DEADLINE_EXHAUSTED)
-                    primary_error = ModelTransportError(
+                    error_type = (ModelNegotiationExhausted
+                                  if failure_tracking is not None and failure_tracking.negotiation_exhausted
+                                  else ModelTransportError)
+                    primary_error = error_type(
                         "model request deadline exhausted", status_code=408
                     )
                     should_record = True
@@ -1883,6 +1913,20 @@ class ModelGateway:
             if failure_tracking is not None:
                 failure_tracking.enter()
             outcome = await self._transport.complete(deployment, request, api_key)
+        except ModelNegotiatedCancellation as error:
+            if failure_tracking is not None:
+                failure_tracking.negotiation_exhausted = True
+                failure_tracking.history.mark_incomplete(ScopeIncompletePhase.CANCELLATION,
+                                                         ScopeIncompleteReason.CANCELLED)
+            if error.receipt is not None:
+                outcome = _SafeTransportFailure(ModelResponseCancelled(receipt=error.receipt))
+            else:
+                raise
+        except ModelNegotiatedClientError:
+            if failure_tracking is not None:
+                failure_tracking.history.mark_incomplete(ScopeIncompletePhase.UNKNOWN_ADAPTER,
+                                                         ScopeIncompleteReason.UNKNOWN_FAILURE)
+            outcome = _SafeTransportFailure(GatewayNegotiatedClientError("model client internal failure"))
         except ModelResponseCancelled as error:
             # A task-cancelled state/gather can discard a CancelledError subclass's receipt.
             if failure_tracking is not None:
@@ -1900,7 +1944,9 @@ class ModelGateway:
             if failure_tracking is not None:
                 failure_tracking.history.mark_incomplete(ScopeIncompletePhase.TRANSPORT,
                                                          ScopeIncompleteReason.REJECTED_OUTPUT)
-            outcome = _SafeTransportFailure(ModelResponseError(
+            response_error_type = (ModelNegotiatedResponseError
+                          if type(error) is ModelNegotiatedResponseError else ModelResponseError)
+            outcome = _SafeTransportFailure(response_error_type(
                 "model response rejected", status_code=error.status_code, evidence=error.evidence,
             ))
             error.__traceback__ = None
@@ -1916,8 +1962,10 @@ class ModelGateway:
                 error.status_code,
                 type(error).__name__,
             )
+            error_type = (ModelNegotiationExhausted if type(error) is ModelNegotiationExhausted
+                          else ModelTransportError)
             outcome = _SafeTransportFailure(
-                ModelTransportError("model transport failed", status_code=error.status_code)
+                error_type("model transport failed", status_code=error.status_code)
             )
             error.__traceback__ = None
             del error

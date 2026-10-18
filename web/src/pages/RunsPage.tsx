@@ -2,6 +2,7 @@ import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tansta
 import { Fragment, FormEvent, type ReactNode, useEffect, useId, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { Link, useLocation, useNavigate } from "react-router-dom";
+import { z } from "zod";
 
 import { ApiError, api, formatApiError, type AttachmentUpload, type Conversation, type ConversationMetadata, type ConversationQueueItem, type ModelDeployment, type ProjectWorkspace, type RunDetail, type RunListItem, type Skill, type SkillArchiveUpload, type SubmittedRun, type WebPreview, type WorkspaceDirectoryList, type WorkspaceFileList } from "../api/client";
 import { APP_BRAND_NAME } from "../app/brand";
@@ -5966,7 +5967,128 @@ type ConversationProjectOption = {
   label: string;
   workspacePath: string;
   legacyWorkspaceCount: number;
+  createdAt?: string | null;
+  updatedAt?: string | null;
 };
+
+export function conversationProjectOptions(
+  workspaces: readonly ProjectWorkspace[],
+  current: readonly ConversationMetadata[],
+  archived: readonly ConversationMetadata[],
+): ConversationProjectOption[] {
+  const projects = new Map<string, ConversationProjectOption>();
+  for (const project of workspaces) {
+    projects.set(project.project_id, {
+      id: project.project_id,
+      label: project.label,
+      workspacePath: project.workspace_path,
+      legacyWorkspaceCount: project.legacy_workspace_count,
+      createdAt: project.created_at ?? null,
+      updatedAt: project.updated_at ?? null,
+    });
+  }
+  for (const conversation of [...current, ...archived]) {
+    const id = conversation.project_id?.trim();
+    if (!id || projects.has(id)) continue;
+    projects.set(id, {
+      id,
+      label: conversation.project_label?.trim() || (id === "default" ? "默认项目" : id),
+      workspacePath: conversation.workspace_path?.trim() || "main",
+      legacyWorkspaceCount: 1,
+      createdAt: null,
+      updatedAt: null,
+    });
+  }
+  return [...projects.values()].sort((left, right) => left.label.localeCompare(right.label, "zh-CN"));
+}
+
+export type ProjectSort = "updated-desc" | "updated-asc" | "created-desc" | "created-asc";
+
+const PROJECT_TIMESTAMP_SCHEMA = z.iso.datetime({ offset: true });
+
+function projectTimestamp(value: string | null | undefined): number | null {
+  if (!PROJECT_TIMESTAMP_SCHEMA.safeParse(value).success) return null;
+  const timestamp = Date.parse(value!);
+  return Number.isFinite(timestamp) ? timestamp : null;
+}
+
+export function sortProjectOverview(
+  projects: readonly ConversationProjectOption[],
+  sort: ProjectSort = "updated-desc",
+): ConversationProjectOption[] {
+  const field = sort.startsWith("created-") ? "createdAt" : "updatedAt";
+  const direction = sort.endsWith("asc") ? 1 : -1;
+  return projects.map((project) => ({ project, timestamp: projectTimestamp(project[field]) }))
+    .sort((left, right) => {
+      if (left.timestamp === null && right.timestamp !== null) return 1;
+      if (left.timestamp !== null && right.timestamp === null) return -1;
+      if (left.timestamp !== null && right.timestamp !== null && left.timestamp !== right.timestamp) {
+        return (left.timestamp - right.timestamp) * direction;
+      }
+      return left.project.id < right.project.id ? -1 : left.project.id > right.project.id ? 1 : 0;
+    })
+    .map(({ project }) => project);
+}
+
+function ProjectTimestamp({ label, value }: { label: string; value: string | null | undefined }) {
+  const timestamp = projectTimestamp(value);
+  const date = timestamp === null ? null : new Date(timestamp);
+  return (
+    <span className="conversation-project-time">
+      {label}：{date ? (
+        <time dateTime={value!} title={date.toLocaleString("zh-CN", { timeZoneName: "short" })}>
+          {date.toLocaleString("zh-CN")}
+        </time>
+      ) : "未知"}
+    </span>
+  );
+}
+
+export function ProjectOverview({
+  projects,
+  sort = "updated-desc",
+  onSortChange,
+  onSelect,
+  onNewConversation,
+}: {
+  projects: readonly ConversationProjectOption[];
+  sort?: ProjectSort;
+  onSortChange: (sort: ProjectSort) => void;
+  onSelect: (project: ConversationProjectOption) => void;
+  onNewConversation: (project: ConversationProjectOption) => void;
+}) {
+  const sortedProjects = useMemo(() => sortProjectOverview(projects, sort), [projects, sort]);
+  return (
+    <>
+      <label className="conversation-project-sort">
+        项目排序
+        <select value={sort} onChange={(event) => onSortChange(event.target.value as ProjectSort)}>
+          <option value="updated-desc">修改时间：从新到旧</option>
+          <option value="updated-asc">修改时间：从旧到新</option>
+          <option value="created-desc">创建时间：从新到旧</option>
+          <option value="created-asc">创建时间：从旧到新</option>
+        </select>
+      </label>
+      <div className="conversation-projects" aria-label="项目列表">
+        {sortedProjects.map((project) => (
+          <article key={project.id} className="conversation-project">
+            <button type="button" className="conversation-project-select"
+              aria-label={`进入项目 ${project.label}`} onClick={() => onSelect(project)}>
+              <strong>{project.label}</strong>
+              <code>{project.workspacePath}</code>
+              <ProjectTimestamp label="创建" value={project.createdAt} />
+              <ProjectTimestamp label="修改" value={project.updatedAt} />
+            </button>
+            <button type="button" className="conversation-project-new"
+              aria-label={`在${project.label}中新建会话`} onClick={() => onNewConversation(project)}>
+              +
+            </button>
+          </article>
+        ))}
+      </div>
+    </>
+  );
+}
 
 type ConversationManagerView = "current" | "archived";
 
@@ -6625,28 +6747,10 @@ export function RunsPage() {
     queryKey: ["project-workspaces"],
     queryFn: () => api.projectWorkspaces(),
   });
-  const conversationProjects = useMemo(() => {
-    const projects = new Map<string, ConversationProjectOption>();
-    for (const project of projectWorkspaces.data ?? []) {
-      projects.set(project.project_id, {
-        id: project.project_id,
-        label: project.label,
-        workspacePath: project.workspace_path,
-        legacyWorkspaceCount: project.legacy_workspace_count,
-      });
-    }
-    for (const conversation of [...(conversations.data ?? []), ...(archivedConversations.data ?? [])]) {
-      const id = conversation.project_id?.trim();
-      if (!id || projects.has(id)) continue;
-      projects.set(id, {
-        id,
-        label: conversation.project_label?.trim() || (id === "default" ? "默认项目" : id),
-        workspacePath: conversation.workspace_path?.trim() || "main",
-        legacyWorkspaceCount: 1,
-      });
-    }
-    return [...projects.values()].sort((left, right) => left.label.localeCompare(right.label, "zh-CN"));
-  }, [archivedConversations.data, conversations.data, projectWorkspaces.data]);
+  const conversationProjects = useMemo(() => conversationProjectOptions(
+    projectWorkspaces.data ?? [], conversations.data ?? [], archivedConversations.data ?? [],
+  ), [archivedConversations.data, conversations.data, projectWorkspaces.data]);
+  const [projectSort, setProjectSort] = useState<ProjectSort>("updated-desc");
   const [message, setMessage] = useState("");
   const [editingQueueItemId, setEditingQueueItemId] = useState<string | null>(null);
   const [editingQueueMessage, setEditingQueueMessage] = useState("");
@@ -8587,31 +8691,13 @@ export function RunsPage() {
             </div>
           </div>
           {showProjectOverview ? (
-            <div className="conversation-projects" aria-label="项目列表">
-              {conversationProjects.map((project) => (
-                <article key={project.id} className="conversation-project">
-                <button
-                  type="button"
-                  className="conversation-project-select"
-                  aria-label={`进入项目 ${project.label}`}
-                  onClick={() => {
-                    setManagedProjectId(project.id);
-                  }}
-                >
-                  <strong>{project.label}</strong>
-                  <code>{project.workspacePath}</code>
-                </button>
-                <button
-                  type="button"
-                  className="conversation-project-new"
-                  aria-label={`在${project.label}中新建会话`}
-                  onClick={() => startNewConversationForProject(project)}
-                >
-                  +
-                </button>
-                </article>
-              ))}
-            </div>
+            <ProjectOverview
+              projects={conversationProjects}
+              sort={projectSort}
+              onSortChange={setProjectSort}
+              onSelect={(project) => setManagedProjectId(project.id)}
+              onNewConversation={startNewConversationForProject}
+            />
           ) : activeManagedProject ? (
             <section
               className="conversation-project-detail"

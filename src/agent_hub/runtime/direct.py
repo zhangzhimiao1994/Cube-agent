@@ -23,9 +23,13 @@ from agent_hub.models.gateway import (
     GatewayCompletion,
     GatewayRejectedOutput,
     ModelGatewayError,
+    is_model_negotiation_exhausted,
     preserve_gateway_scope_diagnostic,
 )
-from agent_hub.models.litellm_client import ModelResponseError, ModelTransportError
+from agent_hub.models.litellm_client import (
+    ModelResponseError,
+    ModelTransportError,
+)
 from agent_hub.models.types import (
     ModelCapability,
     ModelMessage,
@@ -709,6 +713,8 @@ def _requires_incremental_workspace_delivery(bundle: Mapping[str, object]) -> bo
 
 
 def _retryable_gateway_failure(error: BaseException) -> bool:
+    if is_model_negotiation_exhausted(error):
+        return False
     if isinstance(error, ModelResponseError | GatewayRejectedOutput):
         return False
     if isinstance(error, CapacityUnavailable):

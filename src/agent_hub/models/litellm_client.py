@@ -14,6 +14,7 @@ from openai import (
     APIStatusError,
     AsyncOpenAI,
     AsyncStream,
+    BadRequestError,
 )
 
 from agent_hub.models.failure_receipt import _valid_usage
@@ -126,6 +127,10 @@ class ModelClientError(RuntimeError):
     """Stable, non-network failure without internal exception details."""
 
 
+class ModelNegotiationExhausted(ModelTransportError):
+    """A rejected-parameter negotiation failed; no further automatic transport fallback."""
+
+
 class ModelResponseError(ModelTransportError):
     """Stable error for an invalid provider response contract."""
 
@@ -158,8 +163,32 @@ class ModelResponseCancelled(asyncio.CancelledError):
         return "ModelResponseCancelled('model response cancelled')"
 
 
+class ModelNegotiatedResponseError(ModelResponseError):
+    """Received, rejected output after the one permitted negotiation."""
+
+
+class ModelNegotiatedClientError(ModelClientError):
+    """Unknown client outcome after negotiation; never a replay permission."""
+
+
+class ModelNegotiatedCancellation(asyncio.CancelledError):
+    """Native cancellation observation used only to preserve a deadline stop."""
+
+    def __init__(self, receipt: ModelResponse | RejectedOutputEvidence | None = None) -> None:
+        super().__init__("model parameter negotiation cancelled")
+        self.receipt = receipt
+
+
+def is_model_negotiation_exhausted(error: BaseException) -> bool:
+    return type(error) in {
+        ModelNegotiationExhausted, ModelNegotiatedResponseError,
+        ModelNegotiatedClientError, ModelNegotiatedCancellation,
+    }
+
+
 def _safe_response_error(error: ModelResponseError) -> ModelResponseError:
-    return ModelResponseError(
+    error_type = ModelNegotiatedResponseError if type(error) is ModelNegotiatedResponseError else ModelResponseError
+    return error_type(
         "model response rejected", status_code=error.status_code, evidence=error.evidence,
     )
 
@@ -167,6 +196,18 @@ def _safe_response_error(error: ModelResponseError) -> ModelResponseError:
 class _CancelledOutcome:
     def __init__(self, receipt: ModelResponse | RejectedOutputEvidence | None = None) -> None:
         self.receipt = receipt
+
+
+class _NegotiatedOutcome:
+    def __init__(self, outcome: ModelResponse | Exception | _CancelledOutcome) -> None:
+        if isinstance(outcome, ModelResponseError):
+            outcome = ModelNegotiatedResponseError("model response rejected",
+                status_code=outcome.status_code, evidence=outcome.evidence)
+        elif isinstance(outcome, ModelTransportError):
+            outcome = ModelNegotiationExhausted("model parameter negotiation failed", status_code=outcome.status_code)
+        elif isinstance(outcome, ModelClientError):
+            outcome = ModelNegotiatedClientError("model client internal failure")
+        self.outcome = outcome
 
 
 def _cancelled_outcome(outcome: object) -> _CancelledOutcome:
@@ -543,6 +584,8 @@ def safe_model_client_error(
     sensitive_values: Sequence[str],
 ) -> ModelTransportError | ModelClientError:
     """Classify provider failures without retaining raw exception text or context."""
+    if type(error) is ModelNegotiatedClientError:
+        return ModelNegotiatedClientError("model client internal failure")
     if isinstance(error, ModelResponseError):
         return _safe_response_error(error)
     if isinstance(error, APIResponseValidationError):
@@ -571,7 +614,8 @@ def safe_model_client_error(
     safe_status = status if isinstance(status, int) and not isinstance(status, bool) else None
     if safe_status is not None and not 100 <= safe_status <= 599:
         safe_status = None
-    return ModelTransportError(
+    error_type = ModelNegotiationExhausted if type(error) is ModelNegotiationExhausted else ModelTransportError
+    return error_type(
         f"model transport failed for deployment {deployment_id!r}{suffix}",
         status_code=safe_status,
     )
@@ -787,6 +831,9 @@ class LiteLLMClient:
             outcome = await self._complete_outcome(deployment, request, api_key)
         except Exception as error:  # noqa: BLE001 - include client construction and retry setup
             outcome = safe_model_client_error(deployment.id, error, _sensitive_values(request, api_key))
+        negotiated = isinstance(outcome, _NegotiatedOutcome)
+        if isinstance(outcome, _NegotiatedOutcome):
+            outcome = outcome.outcome
         if isinstance(outcome, ModelResponse) and request.required_tool is not None and (
             not outcome.tool_calls
             or any(call.name != request.required_tool for call in outcome.tool_calls)
@@ -795,7 +842,8 @@ class LiteLLMClient:
             usage_status: RejectedUsageStatus = (
                 "known" if _valid_usage(usage) else "missing" if usage is None else "invalid"
             )
-            outcome = ModelResponseError(
+            error_type = ModelNegotiatedResponseError if negotiated else ModelResponseError
+            outcome = error_type(
                 "model response rejected",
                 evidence=RejectedOutputEvidence(
                     final_text=None, usage=usage if usage_status == "known" else None,
@@ -804,6 +852,8 @@ class LiteLLMClient:
             )
         del deployment, request, api_key
         if isinstance(outcome, _CancelledOutcome):
+            if negotiated:
+                raise ModelNegotiatedCancellation(outcome.receipt)
             if outcome.receipt is not None:
                 raise ModelResponseCancelled(receipt=outcome.receipt)
             raise asyncio.CancelledError
@@ -839,7 +889,7 @@ class LiteLLMClient:
         deployment: Deployment,
         request: ModelRequest,
         api_key: str,
-    ) -> ModelResponse | Exception | _CancelledOutcome:
+    ) -> ModelResponse | Exception | _CancelledOutcome | _NegotiatedOutcome:
         validation_error = _validate_transport_request(deployment, request, api_key)
         if validation_error is not None:
             return validation_error
@@ -849,11 +899,13 @@ class LiteLLMClient:
             return await self._responses_outcome(deployment, request, api_key)
 
         sensitive_values = _sensitive_values(request, api_key)
+        negotiation_deadline = asyncio.get_running_loop().time() + request.timeout_seconds
         client: _OpenAIClient | None = None
         parsed: ModelResponse | None = None
         create_kwargs: dict[str, object] | None = None
         response: object | None = None
         safe_failure: ModelTransportError | ModelClientError | None = None
+        negotiated = False
         try:
             client = self._client_factory(
                 api_key=api_key,
@@ -875,6 +927,25 @@ class LiteLLMClient:
             safe_failure = _safe_response_error(error)
         except Exception as error:  # noqa: BLE001 - redact every SDK/network failure
             if (
+                client is not None
+                and create_kwargs is not None
+                and _should_negotiate_auto_tool_choice(error, request, create_kwargs)
+                and (negotiation_remaining := negotiation_deadline - asyncio.get_running_loop().time()) > 0
+            ):
+                negotiated = True
+                negotiated_kwargs = {**create_kwargs, "tool_choice": "auto", "timeout": negotiation_remaining}
+                try:
+                    response = await client.chat.completions.create(**negotiated_kwargs)
+                    parsed = _parse_response(response, deployment.id, sensitive_values,
+                                             native_tool_continuation=request.native_tool_continuation)
+                except asyncio.CancelledError:
+                    await _close_ignoring_failures(client)
+                    return _NegotiatedOutcome(_CANCELLED)
+                except ModelResponseError as retry_error:
+                    safe_failure = _safe_response_error(retry_error)
+                except Exception as retry_error:  # noqa: BLE001 - consume once; never chain negotiations.
+                    safe_failure = safe_model_client_error(deployment.id, retry_error, sensitive_values)
+            elif (
                 client is not None
                 and create_kwargs is not None
                 and _should_retry_with_legacy_max_tokens(error)
@@ -930,16 +1001,18 @@ class LiteLLMClient:
             if client is not None:
                 close_error = await _close_received_client(client.close, request.timeout_seconds)
                 if isinstance(close_error, asyncio.CancelledError):
-                    return _cancelled_outcome(safe_failure)
-            return safe_failure
+                    cancelled_failure = _cancelled_outcome(safe_failure)
+                    return _NegotiatedOutcome(cancelled_failure) if negotiated else cancelled_failure
+            return _NegotiatedOutcome(safe_failure) if negotiated else safe_failure
         if client is None or parsed is None:  # pragma: no cover - defensive invariant
             return ModelClientError("model client internal failure")
 
         close_error = await _close_received_client(client.close, request.timeout_seconds)
         if isinstance(close_error, asyncio.CancelledError):
-            return _cancelled_outcome(parsed)
+            cancelled_response = _cancelled_outcome(parsed)
+            return _NegotiatedOutcome(cancelled_response) if negotiated else cancelled_response
         # Cleanup failure cannot discard an already received response or its usage.
-        return parsed
+        return _NegotiatedOutcome(parsed) if negotiated else parsed
 
     async def _responses_outcome(
         self,
@@ -1255,6 +1328,24 @@ def _messages_endpoint_usage(usage: object) -> TokenUsage | None:
         )
     except (TypeError, ValueError):
         raise ModelResponseError("model response rejected") from None
+
+
+def _should_negotiate_auto_tool_choice(
+    error: Exception, request: ModelRequest, kwargs: Mapping[str, object],
+) -> bool:
+    # Match the complete structured rejection, not echoed prompt words or adapter text.
+    if (type(error) is not BadRequestError or error.status_code != 400
+            or request.required_tool is None
+            or kwargs.get("tool_choice") != {
+                "type": "function", "function": {"name": request.required_tool},
+            }):
+        return False
+    body = error.body
+    if type(body) is not dict:
+        return False
+    message = body.get("message")
+    rejection = "The tool_choice parameter does not support being set to required or object in thinking mode"
+    return type(message) is str and message in (rejection, rejection + ".")
 
 
 def _should_retry_with_legacy_max_tokens(error: Exception) -> bool:

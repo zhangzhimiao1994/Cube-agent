@@ -532,7 +532,11 @@ class HybridRuntime:
                 else gateway_scope_failure_payload(error)
             )
             partial_reason = (
-                None if isinstance(error, _ChildModelScopeError)
+                None if (
+                    isinstance(error, _ChildModelScopeError)
+                    or runtime_failure_diagnostic_from_reason(failure_reason).get("error_code")
+                    == "model.request_negotiation_exhausted"
+                )
                 else _partial_hybrid_completion_reason(artifacts, failure_reason)
             )
             if partial_reason is not None:
@@ -656,6 +660,8 @@ class HybridRuntime:
             if not (
                 allow_gateway_failure
                 and reason.startswith("hybrid discuss failed: model gateway failed")
+                and runtime_failure_diagnostic_from_reason(reason).get("error_code")
+                != "model.request_negotiation_exhausted"
             ):
                 raise
             self._active_child = None

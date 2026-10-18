@@ -1126,6 +1126,28 @@ async def test_hybrid_runtime_skips_failed_preflight_discussion_and_runs_dispatc
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("status_suffix", ["", " (status=503)", " (status=400)"])
+async def test_hybrid_preflight_does_not_dispatch_after_negotiation_exhaustion(status_suffix: str) -> None:
+    dispatch = MultiArtifactRuntime(TaskMode.DISPATCH, ())
+    runtime = HybridRuntime(
+        dispatch,
+        FailingRuntime(
+            TaskMode.DISCUSS,
+            "model gateway failed: model parameter negotiation exhausted" + status_suffix,
+        ),
+        UnusedRuntime(TaskMode.DIRECT, "unused"),
+        plan=HybridPlan(upgrade=HybridUpgrade.DISCUSS_DISPATCH_DISCUSS),
+    )
+    events = [event async for event in runtime.run(TaskContext(
+        run_id=uuid4(), tenant_id=uuid4(), mode=TaskMode.HYBRID,
+        request="build a large project", artifacts=(artifact("conversation_history", "original request"),),
+    ))]
+    assert dispatch.contexts == []
+    assert events[-1].kind is EventKind.RUNTIME_FAILED
+    assert not any(event.kind is EventKind.RUNTIME_COMPLETED for event in events)
+
+
+@pytest.mark.asyncio
 async def test_hybrid_runtime_completes_partial_when_synthesis_gateway_fails() -> None:
     run_id = uuid4()
     dispatch_output = artifact("planner", "dispatch result")

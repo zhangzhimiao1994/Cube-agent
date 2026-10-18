@@ -1,14 +1,19 @@
 import { readFileSync } from "node:fs";
 
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { useState } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { api, WebPreviewSchema, type RunDetail } from "../api/client";
+import { api, WebPreviewSchema, type ProjectWorkspace, type RunDetail } from "../api/client";
 import {
   agentInlineSummary,
   ConversationCheckpointNav,
   ConversationManagerTabs,
+  ProjectOverview,
+  conversationProjectOptions,
+  sortProjectOverview,
+  type ProjectSort,
   conversationManagerMetadata,
   conversationManagerSearchState,
   conversationUsageSummary,
@@ -191,6 +196,132 @@ describe("conversation manager views", () => {
     expect(screen.getByRole("tab", { name: "已归档 2" }).getAttribute("aria-selected")).toBe(
       "true",
     );
+  });
+});
+
+describe("project overview", () => {
+  const workspaces: ProjectWorkspace[] = [
+    {
+      project_id: "alpha", label: "Alpha", workspace_path: "main", legacy_workspace_count: 1,
+      created_at: "2026-10-01T00:00:00Z", updated_at: "2026-10-17T00:00:00Z",
+    },
+    {
+      project_id: "beta", label: "Beta", workspace_path: "main", legacy_workspace_count: 1,
+      created_at: "2026-10-10T00:00:00Z", updated_at: "2026-10-18T00:00:00Z",
+    },
+    {
+      project_id: "gamma", label: "Gamma", workspace_path: "main", legacy_workspace_count: 1,
+      created_at: "2026-10-05T00:00:00Z", updated_at: "2026-10-16T00:00:00Z",
+    },
+  ];
+
+  it("maps only project DTO timestamps and keeps shared project options in name order", () => {
+    const options = conversationProjectOptions([...workspaces].reverse(), [{
+      conversation_id: "legacy-conversation", title: "Legacy conversation", project_id: "legacy",
+      project_label: "Legacy", workspace_path: "archive", created_at: "2020-01-01T00:00:00Z",
+      updated_at: "2026-10-18T12:00:00Z",
+    }], []);
+
+    expect(options.map((project) => project.id)).toEqual(["alpha", "beta", "gamma", "legacy"]);
+    expect(options[0]).toMatchObject({
+      createdAt: "2026-10-01T00:00:00Z", updatedAt: "2026-10-17T00:00:00Z",
+    });
+    expect(options[3]).toMatchObject({ createdAt: null, updatedAt: null });
+  });
+
+  it("does not fill missing project timestamps from current or archived conversations", () => {
+    const conversation = {
+      conversation_id: "conversation-with-date", title: "Conversation", project_id: "alpha",
+      created_at: "2020-01-01T00:00:00Z", updated_at: "2026-10-18T12:00:00Z",
+    };
+    const options = conversationProjectOptions([
+      { ...workspaces[0], created_at: null, updated_at: undefined },
+    ], [conversation], [{ ...conversation, project_id: "archived-project" }]);
+
+    expect(options.map((project) => [project.id, project.createdAt, project.updatedAt])).toEqual([
+      ["alpha", null, null], ["archived-project", null, null],
+    ]);
+  });
+
+  it.each([
+    ["updated-desc", ["beta", "alpha", "gamma"]],
+    ["updated-asc", ["gamma", "alpha", "beta"]],
+    ["created-desc", ["beta", "gamma", "alpha"]],
+    ["created-asc", ["alpha", "gamma", "beta"]],
+  ] as const)("sorts the overview by %s without changing shared options", (sort, expected) => {
+    const options = conversationProjectOptions(workspaces, [], []);
+    Object.freeze(options);
+    expect(sortProjectOverview(options, sort).map((project) => project.id)).toEqual(expected);
+    expect(options.map((project) => project.id)).toEqual(["alpha", "beta", "gamma"]);
+  });
+
+  it("defaults to most recently modified projects", () => {
+    expect(sortProjectOverview(conversationProjectOptions(workspaces, [], [])).map((project) => project.id))
+      .toEqual(["beta", "alpha", "gamma"]);
+  });
+
+  it.each(["created-asc", "created-desc", "updated-asc", "updated-desc"] as const)(
+    "puts missing, invalid and timezone-less timestamps last for %s with stable project IDs",
+    (sort) => {
+      const invalidDates = [null, undefined, "", "not-a-date", "2026-10-18T12:00:00",
+        "2026-10-18", "2026-02-30T12:00:00Z", "2026-10-18T12:00:00+25:00"];
+      const projects = [
+        ...invalidDates.map((value, index) => ({
+          id: `unknown-${index}`, label: "Unknown", workspacePath: "main", legacyWorkspaceCount: 1,
+          createdAt: value, updatedAt: value,
+        })).reverse(),
+        { id: "valid-b", label: "B", workspacePath: "main", legacyWorkspaceCount: 1,
+          createdAt: "2026-10-18T08:00:00+08:00", updatedAt: "2026-10-18T08:00:00+08:00" },
+        { id: "valid-a", label: "Z", workspacePath: "main", legacyWorkspaceCount: 1,
+          createdAt: "2026-10-18T00:00:00Z", updatedAt: "2026-10-18T00:00:00Z" },
+      ];
+      expect(sortProjectOverview(projects, sort).map((project) => project.id)).toEqual([
+        "valid-a", "valid-b", "unknown-0", "unknown-1", "unknown-2", "unknown-3",
+        "unknown-4", "unknown-5", "unknown-6", "unknown-7",
+      ]);
+    },
+  );
+
+  it("renders both project timestamps and reorders the visible list through the select", async () => {
+    const user = userEvent.setup();
+    const projects = conversationProjectOptions(workspaces, [], []);
+    function Overview() {
+      const [sort, setSort] = useState<ProjectSort>();
+      return <ProjectOverview projects={projects} sort={sort} onSortChange={setSort}
+        onSelect={() => {}} onNewConversation={() => {}} />;
+    }
+    render(<Overview />);
+    const projectOrder = () => screen.getAllByRole("button", { name: /^进入项目 / })
+      .map((button) => button.getAttribute("aria-label"));
+    expect(projectOrder()).toEqual(["进入项目 Beta", "进入项目 Alpha", "进入项目 Gamma"]);
+    const alpha = screen.getByRole("button", { name: "进入项目 Alpha" });
+    expect(alpha.textContent).toContain("创建：");
+    expect(alpha.textContent).toContain("修改：");
+    expect(Array.from(alpha.querySelectorAll("time")).map((time) => time.dateTime)).toEqual([
+      "2026-10-01T00:00:00Z", "2026-10-17T00:00:00Z",
+    ]);
+    for (const [value, labels] of [
+      ["created-asc", ["Alpha", "Gamma", "Beta"]],
+      ["created-desc", ["Beta", "Gamma", "Alpha"]],
+      ["updated-asc", ["Gamma", "Alpha", "Beta"]],
+      ["updated-desc", ["Beta", "Alpha", "Gamma"]],
+    ] as const) {
+      await user.selectOptions(screen.getByRole("combobox", { name: "项目排序" }), value);
+      expect(projectOrder()).toEqual(labels.map((label) => `进入项目 ${label}`));
+    }
+  });
+
+  it("shows unknown project times instead of borrowing a valid timestamp from the other field", () => {
+    render(<ProjectOverview projects={conversationProjectOptions([
+      { ...workspaces[0], created_at: "2026-10-01T00:00:00", updated_at: null },
+      { ...workspaces[1], created_at: "invalid" },
+    ], [], [])} onSortChange={() => {}} onSelect={() => {}} onNewConversation={() => {}} />);
+    const alpha = screen.getByRole("button", { name: "进入项目 Alpha" });
+    expect(within(alpha).getByText("创建：未知")).toBeTruthy();
+    expect(within(alpha).getByText("修改：未知")).toBeTruthy();
+    expect(alpha.querySelectorAll("time")).toHaveLength(0);
+    expect(within(screen.getByRole("button", { name: "进入项目 Beta" })).getByText("创建：未知"))
+      .toBeTruthy();
   });
 });
 

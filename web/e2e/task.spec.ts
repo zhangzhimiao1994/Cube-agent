@@ -3,6 +3,8 @@ import { spawnSync } from "node:child_process";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 
+import type { ProjectWorkspace } from "../src/api/client";
+
 const runId = "22222222-2222-4222-8222-222222222222";
 const codingRunId = "33333333-3333-4333-8333-333333333333";
 const codingConversationId = "44444444-4444-4444-8444-444444444444";
@@ -250,6 +252,8 @@ async function mockCodingRunApi(
     largeWorkbench?: boolean;
     longWorkspacePreview?: boolean;
     multiTurnHistory?: boolean;
+    projectWorkspaces?: Pick<ProjectWorkspace,
+      "project_id" | "label" | "workspace_path" | "created_at" | "updated_at">[];
   } = {},
 ) {
   const finalArtifactId = "55555555-5555-4555-8555-555555555555";
@@ -264,7 +268,7 @@ async function mockCodingRunApi(
     longPreviewSentinel,
   ].join("\n");
   let detailRequests = 0;
-  const projectWorkspaces = [
+  const projectWorkspaces = (options.projectWorkspaces ?? [
     {
       project_id: "default",
       label: "默认项目",
@@ -272,7 +276,7 @@ async function mockCodingRunApi(
       created_at: "2026-08-31T00:00:00Z",
       updated_at: "2026-08-31T00:00:00Z",
     },
-  ];
+  ]).map((project) => ({ ...project }));
   const plannedRoles = options.largeWorkbench
     ? [
         {
@@ -707,6 +711,15 @@ async function mockCodingRunApi(
       });
       return;
     }
+    const projectFilesMatch = path.match(/^\/api\/v1\/workspaces\/projects\/([^/]+)\/sessions\/[^/]+\/files$/);
+    if (request.method() === "GET" && projectFilesMatch
+      && options.projectWorkspaces?.some((project) => project.project_id === projectFilesMatch[1])) {
+      await route.fulfill({ json: {
+        items: [],
+        bundle_download_url: `${path.slice(0, -"/files".length)}/bundle/download`,
+      } });
+      return;
+    }
     if (path === `/api/v1/workspaces/projects/default/sessions/${codingConversationId}/files/download`) {
       const requestedPath = new URL(request.url()).searchParams.get("path");
       if (requestedPath === "README.md") {
@@ -764,7 +777,36 @@ async function mockCodingRunApi(
 }
 
 test("project conversation and run settings dialogs stay separate and usable on desktop and mobile", async ({ page }, testInfo) => {
-  await mockCodingRunApi(page);
+  test.setTimeout(60_000);
+  const projectWorkspaces = [
+    { project_id: "default", label: "默认项目", workspace_path: "main",
+      created_at: "2026-08-31T00:00:00Z", updated_at: "2026-08-31T00:00:00Z" },
+    { project_id: "project-b", label: "验收项目 B", workspace_path: "integration",
+      created_at: "2026-10-01T00:00:00Z", updated_at: "2026-09-10T00:00:00Z" },
+    { project_id: "project-c", label: "验收项目 C 长名称与完整时间在移动端换行", workspace_path: "responsive-workspace",
+      created_at: "2026-09-15T00:00:00Z", updated_at: "2026-10-18T00:00:00Z" },
+    { project_id: "project-a", label: "验收项目 A", workspace_path: "application",
+      created_at: "2026-08-01T00:00:00Z", updated_at: "2026-10-18T08:00:00+08:00" },
+    { project_id: "unknown-null", label: "验收未知时间：空值", workspace_path: "main",
+      created_at: null, updated_at: null },
+    { project_id: "unknown-naive", label: "验收未知时间：无时区", workspace_path: "main",
+      created_at: "2026-10-20T12:00:00", updated_at: "2026-10-20T12:00:00" },
+    { project_id: "unknown-missing", label: "验收未知时间：缺失", workspace_path: "main" },
+    { project_id: "unknown-invalid", label: "验收未知时间：非法", workspace_path: "main",
+      created_at: "2026-02-30T00:00:00Z", updated_at: "not-a-date" },
+  ];
+  await mockCodingRunApi(page, { projectWorkspaces });
+  const browserErrors: string[] = [];
+  page.on("pageerror", (error) => browserErrors.push(error.message));
+  page.on("console", (message) => {
+    if (message.type() === "error" || message.type() === "warning") {
+      browserErrors.push(`${message.type()}: ${message.text()}`);
+    }
+  });
+  const unknownIds = ["unknown-invalid", "unknown-missing", "unknown-naive", "unknown-null"];
+  const defaultOrder = ["project-a", "project-c", "project-b", "default", ...unknownIds];
+  const labelsForIds = (ids: string[]) => ids.map((id) =>
+    `进入项目 ${projectWorkspaces.find((project) => project.project_id === id)!.label}`);
 
   for (const viewport of [
     { name: "desktop", width: 1280, height: 900 },
@@ -772,6 +814,9 @@ test("project conversation and run settings dialogs stay separate and usable on 
   ]) {
     await page.setViewportSize({ width: viewport.width, height: viewport.height });
     await page.goto("/");
+    await expect(page).toHaveURL("http://127.0.0.1:4173/");
+    await expect(page).toHaveTitle("魔方 agent");
+    await expect(page.locator("vite-error-overlay")).toHaveCount(0);
 
     const initialConversationDialog = page.getByRole("dialog", { name: "新建会话" });
     await expect(initialConversationDialog).toBeVisible();
@@ -787,7 +832,7 @@ test("project conversation and run settings dialogs stay separate and usable on 
       .toBeLessThanOrEqual(viewport.width + 1);
     const managerBounds = await manager.evaluate((element) => {
       const container = element.getBoundingClientRect();
-      const children = Array.from(element.querySelectorAll<HTMLElement>("button, input"));
+      const children = Array.from(element.querySelectorAll<HTMLElement>("button, input, select, time"));
       return {
         container: { left: container.left, right: container.right },
         viewportWidth: window.innerWidth,
@@ -806,6 +851,63 @@ test("project conversation and run settings dialogs stay separate and usable on 
     expect(managerBounds.container.left).toBeGreaterThanOrEqual(0);
     expect(managerBounds.container.right).toBeLessThanOrEqual(managerBounds.viewportWidth + 1);
     expect(managerBounds.escapedChildren).toEqual([]);
+    const overviewButtons = manager.getByRole("button", { name: /^进入项目 / });
+    const projectSort = manager.getByRole("combobox", { name: "项目排序" });
+    const assertProjectOrder = async (ids: string[]) => {
+      await expect(overviewButtons).toHaveCount(ids.length);
+      await expect.poll(() => overviewButtons.evaluateAll((buttons) =>
+        buttons.map((button) => button.getAttribute("aria-label")))).toEqual(labelsForIds(ids));
+    };
+    await expect(projectSort).toHaveValue("updated-desc");
+    await assertProjectOrder(defaultOrder);
+    for (const project of projectWorkspaces.slice(0, 4)) {
+      const button = manager.getByRole("button", { name: `进入项目 ${project.label}`, exact: true });
+      const times = button.locator("time");
+      await expect(times).toHaveCount(2);
+      for (const [index, value] of [project.created_at!, project.updated_at!].entries()) {
+        await expect(times.nth(index)).toHaveAttribute("datetime", value);
+        const localTime = await page.evaluate((timestamp) => new Date(timestamp).toLocaleString("zh-CN"), value);
+        await expect(times.nth(index)).toHaveText(localTime);
+      }
+      await expect(button.locator(".conversation-project-time").nth(0)).toContainText("创建：");
+      await expect(button.locator(".conversation-project-time").nth(1)).toContainText("修改：");
+    }
+    for (const id of unknownIds) {
+      const button = manager.getByRole("button", { name: labelsForIds([id])[0], exact: true });
+      await expect(button.locator(".conversation-project-time")).toHaveText(["创建：未知", "修改：未知"]);
+      await expect(button.locator("time")).toHaveCount(0);
+    }
+    const longProject = manager.getByRole("button", { name: `进入项目 ${projectWorkspaces[2].label}`, exact: true });
+    await longProject.scrollIntoViewIfNeeded();
+    const textLayout = await longProject.evaluate((button) => {
+      const bounds = button.getBoundingClientRect();
+      return Array.from(button.querySelectorAll<HTMLElement>("strong, code, .conversation-project-time, time"))
+        .map((element) => ({
+          text: element.textContent,
+          inside: element.getBoundingClientRect().left >= bounds.left - 1
+            && element.getBoundingClientRect().right <= bounds.right + 1,
+          fits: element.scrollWidth <= element.clientWidth + 1,
+        }));
+    });
+    expect(textLayout.every((element) => element.inside && element.fits), JSON.stringify(textLayout)).toBe(true);
+    await manager.evaluate((element) => { element.scrollTop = 0; });
+    await page.screenshot({ path: testInfo.outputPath(`project-overview-${viewport.name}.png`) });
+    await overviewButtons.last().scrollIntoViewIfNeeded();
+    await page.screenshot({ path: testInfo.outputPath(`project-times-unknown-${viewport.name}.png`) });
+    await projectSort.scrollIntoViewIfNeeded();
+    for (const [sort, ids] of [
+      ["created-asc", ["project-a", "default", "project-c", "project-b", ...unknownIds]],
+      ["created-desc", ["project-b", "project-c", "default", "project-a", ...unknownIds]],
+      ["updated-asc", ["default", "project-b", "project-a", "project-c", ...unknownIds]],
+      ["updated-desc", defaultOrder],
+    ] as const) {
+      await projectSort.selectOption(sort);
+      await assertProjectOrder([...ids]);
+      if (sort === "created-asc") {
+        await page.screenshot({ path: testInfo.outputPath(`project-sort-created-asc-${viewport.name}.png`) });
+      }
+    }
+    await projectSort.selectOption("created-asc");
     await expect(manager.getByRole("button", { name: "进入项目 默认项目" })).toBeVisible();
     await expect(manager.getByRole("tab", { name: /当前会话/ })).toHaveCount(0);
     await manager.getByRole("button", { name: "进入项目 默认项目" }).click();
@@ -814,6 +916,19 @@ test("project conversation and run settings dialogs stay separate and usable on 
     await expect(projectDetail.getByRole("tab", { name: /当前会话/ })).toBeVisible();
     await projectDetail.getByRole("button", { name: "返回项目列表" }).click();
     await expect(manager.getByRole("button", { name: "进入项目 默认项目" })).toBeVisible();
+    await expect(projectSort).toHaveValue("created-asc");
+    await assertProjectOrder(["project-a", "default", "project-c", "project-b", ...unknownIds]);
+    await longProject.click();
+    const longProjectDetail = manager.getByRole("region", { name: `项目详情 ${projectWorkspaces[2].label}` });
+    await expect(longProjectDetail).toBeVisible();
+    await longProjectDetail.getByRole("button", { name: "新建会话", exact: true }).click();
+    const selectedProjectDialog = page.getByRole("dialog", { name: "新建会话" });
+    await expect(selectedProjectDialog.getByLabel("所属项目")).toHaveValue("project-c");
+    await expect(selectedProjectDialog).toContainText("projects/project-c/sessions/responsive-workspace");
+    await page.keyboard.press("Escape");
+    await expect(selectedProjectDialog).toHaveCount(0);
+    await page.getByRole("button", { name: "打开项目与会话" }).click();
+    await expect(projectSort).toHaveValue("created-asc");
     await manager.getByRole("button", { name: "创建项目" }).click();
     const projectDialog = page.getByRole("dialog", { name: "新建项目工作区" });
     await expect(projectDialog).toBeVisible();
@@ -844,6 +959,7 @@ test("project conversation and run settings dialogs stay separate and usable on 
     await expect(conversationDialog).toBeVisible();
     await expect(conversationDialog.getByLabel("会话标题")).toBeVisible();
     await expect(conversationDialog.getByLabel("所属项目")).toHaveValue("default");
+    await expect(conversationDialog.getByLabel("所属项目").locator("option").first()).toHaveValue("default");
     await expect(conversationDialog.getByLabel("共享工作区名称")).toHaveCount(0);
     await page.keyboard.press("Escape");
     await expect(conversationDialog).toHaveCount(0);
@@ -881,6 +997,7 @@ test("project conversation and run settings dialogs stay separate and usable on 
     await page.locator(".composer-settings-backdrop").click({ position: { x: 5, y: 5 } });
     await expect(settingsDialog).toHaveCount(0);
     await expect.poll(() => page.evaluate(() => document.body.style.overflow)).toBe("");
+    expect(browserErrors).toEqual([]);
   }
 });
 

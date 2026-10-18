@@ -12,8 +12,15 @@ from agent_hub.models.capacity import (
     CapacityWaitTimeout,
     capacity_backend_diagnostic_payload,
 )
-from agent_hub.models.gateway import ModelGatewayError, get_gateway_scope_diagnostic
-from agent_hub.models.litellm_client import ModelResponseError, ModelTransportError
+from agent_hub.models.gateway import (
+    ModelGatewayError,
+    get_gateway_scope_diagnostic,
+    is_model_negotiation_exhausted,
+)
+from agent_hub.models.litellm_client import (
+    ModelResponseError,
+    ModelTransportError,
+)
 from agent_hub.models.registry import NoCapableDeployment
 
 MAX_FAILURE_REASON_LENGTH = 240
@@ -66,6 +73,10 @@ ORCHESTRATION_CHECKPOINT_FAILURE_REASON = (
 def safe_model_gateway_failure_reason(error: Exception) -> str | None:
     """Return a stable model-gateway diagnostic that is safe to show in the UI."""
 
+    if is_model_negotiation_exhausted(error):
+        reason = f"{GENERIC_MODEL_GATEWAY_FAILURE}: model parameter negotiation exhausted"
+        status = error.status_code if isinstance(error, ModelTransportError) else None
+        return reason if status is None else f"{reason} (status={status})"
     if isinstance(error, ModelTransportError):
         base = (
             "model response failed"
@@ -631,6 +642,19 @@ def _model_gateway_diagnostic(
     status_code: int | None,
 ) -> RuntimeFailureDiagnostic:
     lowered = reason.lower()
+    if re.search(
+        r"(?:^|: )model gateway failed: model parameter negotiation exhausted(?: \(status=[1-5][0-9]{2}\))?$",
+        lowered,
+    ):
+        return _base_diagnostic(
+            reason,
+            error_stage="model_provider",
+            error_category="parameter_negotiation",
+            error_code="model.request_negotiation_exhausted",
+            retryable=False,
+            suggested_action="模型参数兼容协商已用尽；保留真实失败与未知结果，核查协议配置后再创建新运行，不自动重发或切换模型。",
+            status_code=status_code,
+        )
     if "model response text is empty" in lowered or "model response is empty" in lowered:
         return _base_diagnostic(
             reason,
