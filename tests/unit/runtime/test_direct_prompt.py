@@ -215,7 +215,7 @@ async def test_direct_workspace_batches_correct_hidden_paths_without_policy_bypa
     tmp_path: Path, scenario: str,
 ) -> None:
     repeat_invalid = scenario == "repeated"
-    prior = {".gitignore": "dist\n", "package.json": "{}", "tsconfig.json": "{}",
+    prior = {".gitignore": "dist\n", "project.json": "{}", "tsconfig.json": "{}",
              "vitest.config.ts": "export {}"}
     invalid = {**prior, ".prettierrc": '{"semi":true}'}
     corrected = {"prettier.config.cjs": "module.exports = {semi: true};\n",

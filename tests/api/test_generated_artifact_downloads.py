@@ -1,6 +1,7 @@
 """Actual generated file envelopes through the persistent download service."""
 from __future__ import annotations
 
+import re
 import tempfile
 from pathlib import Path
 from typing import cast
@@ -9,6 +10,8 @@ from uuid import UUID, uuid4
 import pytest
 
 from agent_hub.api.routers.admin import PersistentAdminResourceService
+from agent_hub.api.routers.runs import download_run_artifact
+from agent_hub.auth.models import AuthenticatedPrincipal, Role
 from agent_hub.capabilities.runtime import RuntimeCapabilityGateway
 from agent_hub.files.generated import GeneratedFileStore
 from agent_hub.runtime.contracts import Artifact, JsonValue
@@ -73,6 +76,12 @@ async def test_generated_zip_download_resolves_only_matching_published_metadata(
             await service.download_run_artifact(run_id, outer_id, tenant_id=TENANT_ID)
         return
     download = await service.download_run_artifact(run_id, requested, tenant_id=TENANT_ID)
+    assert re.fullmatch(r"source-zip_\d{8}T\d{12}Z\.zip", download.filename)
+    assert download.filename == file["filename"] == metadata["filename"] == download.path.name
     assert download.mime_type == "application/zip"
     assert download.path.relative_to(tmp_path / "generated").as_posix() == metadata["storage_key"]
     assert download.path.read_bytes().startswith(b"PK\x03\x04")
+    response = await download_run_artifact(
+        run_id, requested, service, AuthenticatedPrincipal(ACTOR_ID, TENANT_ID, Role.OPERATOR),
+    )
+    assert response.headers["content-disposition"] == f'attachment; filename="{download.filename}"'

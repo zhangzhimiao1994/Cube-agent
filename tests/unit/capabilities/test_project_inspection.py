@@ -232,7 +232,10 @@ def test_shared_role_filter_exposes_inspection_only_with_scoped_reader(
         role, TaskContext(run_id=RUN, tenant_id=TENANT, mode=mode, request='Build project.'),
         capability_gateway=gateway,
     )
-    assert tools == (('workspace.read', 'project.inspect') if configured else ())
+    expected = ('workspace.read', 'project.inspect') if configured else ()
+    if configured and gateway.is_available(TENANT, 'project.verify'):
+        expected = (*expected, 'project.verify')
+    assert tools == expected
 
 
 @pytest.mark.parametrize('content', ['-\n' * 2000, '\n'.join(

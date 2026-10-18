@@ -39,7 +39,7 @@ async def processes() -> AsyncIterator[list[asyncio.subprocess.Process]]:
         if process.returncode is None:
             with contextlib.suppress(ProcessLookupError):
                 process.kill()
-        if process.stdin is not None:
+        if process.stdin is not None and not process.stdin.is_closing():
             process.stdin.transport.abort()
         await drain_and_reap_process(process)
 
@@ -50,6 +50,73 @@ def assert_reaped(
     assert len(processes) == 1
     assert processes[0].returncode is not None, "local launcher was not reaped"
     assert not asyncio.all_tasks() - existing_tasks, "subprocess tasks were left running"
+
+
+@pytest.mark.parametrize(
+    "trigger,backend_failure",
+    [("timeout", False), ("cancel", False), ("timeout", True), ("output", True), ("cancel", True)],
+)
+async def test_cleanup_after_stdin_disconnect_reaps_and_preserves_backend_error(
+    tmp_path: Path,
+    processes: list[asyncio.subprocess.Process],
+    monkeypatch: pytest.MonkeyPatch,
+    trigger: str,
+    backend_failure: bool,
+) -> None:
+    existing_tasks = asyncio.all_tasks()
+    started = asyncio.Event()
+    backend_error = OSError("backend cleanup could not be confirmed")
+
+    def process_started(process: asyncio.subprocess.Process) -> None:
+        processes.append(process)
+        assert process.stdin is not None
+        transport = process.stdin.transport
+        abort = transport.abort
+
+        def abort_open_pipe() -> None:
+            # Unix write-pipe abort is not idempotent after connection_lost.
+            if transport.is_closing():
+                raise AttributeError("'NoneType' object has no attribute '_remove_reader'")
+            abort()
+
+        if sys.platform != "linux":
+            monkeypatch.setattr(transport, "abort", abort_open_pipe)
+        started.set()
+
+    async def cleanup() -> None:
+        stdin = processes[0].stdin
+        assert stdin is not None
+        stdin.close()
+        await stdin.wait_closed()
+        if backend_failure:
+            raise backend_error
+
+    script = "import sys, time; "
+    if trigger == "output":
+        script += "sys.stdout.write('x' * 4096); sys.stdout.flush(); "
+    script += "time.sleep(30)"
+    task = asyncio.create_task(run_subprocess_with_limits(
+        (sys.executable, "-c", script),
+        invocation(tmp_path, output_limit=32),
+        stdin_payload=b"",
+        process_started=process_started,
+        on_forced_terminate=cleanup,
+    ))
+    await asyncio.wait_for(started.wait(), timeout=3)
+    if trigger == "cancel":
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError) as caught_cancel:
+            await asyncio.wait_for(task, timeout=4)
+        assert caught_cancel.value.__cause__ is (backend_error if backend_failure else None)
+    elif backend_failure:
+        with pytest.raises(OSError) as caught_backend:
+            await asyncio.wait_for(task, timeout=4)
+        assert caught_backend.value is backend_error
+        assert caught_backend.value.__cause__ is None
+    else:
+        result = await asyncio.wait_for(task, timeout=4)
+        assert result.timed_out is (trigger == "timeout")
+    assert_reaped(processes, existing_tasks)
 
 
 async def test_timeout_includes_blocked_stdin(

@@ -246,9 +246,14 @@ class RunServiceProtocol(Protocol):
 
 
 class GeneratedArtifactDownloadProtocol(Protocol):
-    path: Path
-    filename: str
-    mime_type: str
+    @property
+    def path(self) -> Path: ...
+
+    @property
+    def filename(self) -> str: ...
+
+    @property
+    def mime_type(self) -> str: ...
 
 
 class RunArtifactDownloadServiceProtocol(Protocol):

@@ -146,7 +146,8 @@ async def run_subprocess_with_limits(
         try:
             await force_terminate()
         finally:
-            if process.stdin is not None:
+            # Unix write-pipe abort is not idempotent after connection_lost.
+            if process.stdin is not None and not process.stdin.is_closing():
                 process.stdin.transport.abort()
             for task in io_tasks:
                 task.cancel()

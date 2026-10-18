@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from types import MappingProxyType
@@ -578,7 +579,7 @@ async def test_runtime_gateway_generates_docx_file_artifact(tmp_path: Path) -> N
 
     file_payload = result["file"]
     assert isinstance(file_payload, dict)
-    assert file_payload["filename"] == "delivery-plan.docx"
+    assert re.fullmatch(r"delivery-plan_\d{8}T\d{12}Z\.docx", file_payload["filename"])
     assert file_payload["mime_type"] == (
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
     )
@@ -590,7 +591,7 @@ async def test_runtime_gateway_generates_docx_file_artifact(tmp_path: Path) -> N
         / str(TENANT_ID)
         / str(RUN_ID)
         / str(result["artifact_id"])
-        / "delivery-plan.docx"
+        / file_payload["filename"]
     )
     assert stored_path.is_file()
 
@@ -616,7 +617,7 @@ async def test_runtime_gateway_generates_pptx_file_artifact(tmp_path: Path) -> N
 
     file_payload = result["file"]
     assert isinstance(file_payload, dict)
-    assert file_payload["filename"] == "launch-review.pptx"
+    assert re.fullmatch(r"launch-review_\d{8}T\d{12}Z\.pptx", file_payload["filename"])
     assert file_payload["mime_type"] == (
         "application/vnd.openxmlformats-officedocument.presentationml.presentation"
     )
@@ -628,7 +629,7 @@ async def test_runtime_gateway_generates_pptx_file_artifact(tmp_path: Path) -> N
         / str(TENANT_ID)
         / str(RUN_ID)
         / str(result["artifact_id"])
-        / "launch-review.pptx"
+        / file_payload["filename"]
     )
     assert stored_path.is_file()
 
@@ -671,6 +672,9 @@ async def test_runtime_gateway_generates_project_zip_final_artifact(tmp_path: Pa
             "files": {
                 "main.py": "print('hello world')\n",
                 "README.md": "# Hello World\n\nRun `python main.py`.\n",
+                "package.json": '{"name":"hello-world","main":"src/main.js"}',
+                "src/main.js": "import './style.css';\n",
+                "src/style.css": "body { color: black; }\n",
             },
         },
         idempotency_key="project_zip_1",
@@ -678,7 +682,7 @@ async def test_runtime_gateway_generates_project_zip_final_artifact(tmp_path: Pa
 
     file_payload = result["file"]
     assert isinstance(file_payload, dict)
-    assert file_payload["filename"] == "hello-world.zip"
+    assert re.fullmatch(r"hello-world_\d{8}T\d{12}Z\.zip", file_payload["filename"])
     assert file_payload["mime_type"] == "application/zip"
     assert result["presentation"] == "final_attachment"
     stored_path = (
@@ -686,12 +690,18 @@ async def test_runtime_gateway_generates_project_zip_final_artifact(tmp_path: Pa
         / str(TENANT_ID)
         / str(RUN_ID)
         / str(result["artifact_id"])
-        / "hello-world.zip"
+        / file_payload["filename"]
     )
     assert stored_path.is_file()
     with ZipFile(stored_path) as archive:
-        assert archive.namelist() == ["README.md", "main.py"]
+        assert archive.namelist() == [
+            "README.md", "main.py", "package.json", "src/main.js", "src/style.css"
+        ]
         assert archive.read("main.py") == b"print('hello world')\n"
+        assert archive.read("README.md") == b"# Hello World\n\nRun `python main.py`.\n"
+        assert archive.read("package.json") == b'{"name":"hello-world","main":"src/main.js"}'
+        assert archive.read("src/main.js") == b"import './style.css';\n"
+        assert archive.read("src/style.css") == b"body { color: black; }\n"
 
 
 async def test_runtime_gateway_copies_project_zip_sources_to_project_workspace(
@@ -822,7 +832,8 @@ async def test_runtime_gateway_builds_large_project_incrementally_in_workspace(
 
     assert bundle["presentation"] == "final_attachment"
     bundle_file = cast(Mapping[str, JsonValue], bundle["file"])
-    assert bundle_file["filename"] == "large-project.zip"
+    filename = cast(str, bundle_file["filename"])
+    assert re.fullmatch(r"large-project_\d{8}T\d{12}Z\.zip", filename)
     bundled_files = cast(tuple[JsonValue, ...], bundle["workspace_files"])
     assert len(bundled_files) == 9
     stored_path = (
@@ -830,7 +841,7 @@ async def test_runtime_gateway_builds_large_project_incrementally_in_workspace(
         / str(TENANT_ID)
         / str(RUN_ID)
         / str(bundle["artifact_id"])
-        / "large-project.zip"
+        / filename
     )
     with ZipFile(stored_path) as archive:
         assert len(archive.namelist()) == 9
@@ -1007,12 +1018,15 @@ async def test_runtime_gateway_accepts_common_project_zip_files_item_wrapper(
         idempotency_key="project_zip_wrapped_item",
     )
 
+    file_payload = cast(Mapping[str, JsonValue], result["file"])
+    filename = cast(str, file_payload["filename"])
+    assert re.fullmatch(r"mofang-hello-python_\d{8}T\d{12}Z\.zip", filename)
     stored_path = (
         generated_dir
         / str(TENANT_ID)
         / str(RUN_ID)
         / str(result["artifact_id"])
-        / "mofang-hello-python.zip"
+        / filename
     )
     assert stored_path.is_file()
     with ZipFile(stored_path) as archive:
@@ -1045,12 +1059,15 @@ async def test_runtime_gateway_accepts_common_project_zip_files_list(
         idempotency_key="project_zip_file_list",
     )
 
+    file_payload = cast(Mapping[str, JsonValue], result["file"])
+    filename = cast(str, file_payload["filename"])
+    assert re.fullmatch(r"mofang-hello_\d{8}T\d{12}Z\.zip", filename)
     stored_path = (
         generated_dir
         / str(TENANT_ID)
         / str(RUN_ID)
         / str(result["artifact_id"])
-        / "mofang-hello.zip"
+        / filename
     )
     assert stored_path.is_file()
     with ZipFile(stored_path) as archive:

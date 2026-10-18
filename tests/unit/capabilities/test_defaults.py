@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from pathlib import Path
 from typing import cast
@@ -947,7 +948,7 @@ async def test_default_runtime_capability_stack_wires_generated_artifact_store(
     assert result.status == "succeeded"
     file_payload = result.payload["file"]
     assert isinstance(file_payload, Mapping)
-    assert file_payload["filename"] == "delivery-plan.docx"
+    assert re.fullmatch(r"delivery-plan_\d{8}T\d{12}Z\.docx", cast(str, file_payload["filename"]))
     assert "storage_key" not in file_payload
     metadata = result.payload["metadata"]
     assert isinstance(metadata, Mapping)
@@ -986,7 +987,7 @@ async def test_default_runtime_stack_auto_reviews_replay_safe_generated_artifact
     assert result.status == "succeeded"
     file_payload = result.payload["file"]
     assert isinstance(file_payload, Mapping)
-    assert file_payload["filename"] == "hello-world.zip"
+    assert re.fullmatch(r"hello-world_\d{8}T\d{12}Z\.zip", cast(str, file_payload["filename"]))
 
 
 async def test_default_runtime_stack_can_use_ask_mode_for_generated_artifact_approval(

@@ -75,6 +75,10 @@ _HISTORY_TOKEN_SHARE = 0.5
 _MAX_DIRECT_OUTPUT_TOKENS = 8_192
 _MAX_MODEL_OUTPUT_TOKENS = 1_000_000
 _RUNTIME_TOKEN_ABSOLUTE_LIMIT = 10_000_000
+# Delivery evidence is embedded in both the event payload and its artifact envelope.
+_MAX_VERIFICATION_HISTORY_ATTEMPTS = 8
+_MAX_VERIFICATION_HISTORY_FILES = 16
+_MAX_VERIFICATION_HISTORY_CHECKS = 3
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _SAFE_ID = re.compile(r"^[a-z0-9][a-z0-9_-]{0,127}$")
 _AGENT_STANDARD_EVIDENCE_FILENAMES = frozenset(
@@ -312,6 +316,131 @@ def _workspace_source_digest(known_files: Mapping[str, str]) -> str:
     return hashlib.sha256(json.dumps(
         source_files, sort_keys=True, separators=(",", ":"),
     ).encode("utf-8")).hexdigest()
+
+
+def _verification_trace_diagnostic(diagnostic: Mapping[str, JsonValue]) -> Mapping[str, JsonValue]:
+    # Only metadata from the existing redacted diagnostic crosses into public trace evidence.
+    safe: dict[str, JsonValue] = {}
+    exit_code, timed_out = diagnostic.get("exit_code"), diagnostic.get("timed_out")
+    if exit_code is None or type(exit_code) is int:
+        safe["exit_code"] = exit_code
+    if type(timed_out) is bool:
+        safe["timed_out"] = timed_out
+    for stream in ("stdout_metadata", "stderr_metadata"):
+        metadata = diagnostic.get(stream)
+        if not isinstance(metadata, Mapping):
+            continue
+        selected: dict[str, JsonValue] = {}
+        for key in ("sanitized_bytes", "returned_bytes", "redacted_lines"):
+            value = metadata.get(key)
+            if type(value) is int and 0 <= value <= 2**63 - 1:
+                selected[key] = value
+        for key in ("truncated", "redacted"):
+            value = metadata.get(key)
+            if type(value) is bool:
+                selected[key] = value
+        digest = metadata.get("sha256")
+        if isinstance(digest, str) and _SHA256.fullmatch(digest):
+            selected["sha256"] = digest
+        safe[stream] = selected
+    return safe
+
+
+@dataclass(slots=True)
+class _WorkspaceVerificationTrace:
+    model_round: int = 0
+    attempt_count: int = 0
+    failed_attempt_count: int = 0
+    repair_observed: bool = False
+    truncated: bool = False
+    attempts: list[JsonValue] = field(default_factory=list)
+    final_receipt: Mapping[str, JsonValue] | None = None
+    _previous_files: dict[str, str] = field(default_factory=dict)
+    _failed_digest: str | None = None
+    _failed_attempt: int | None = None
+
+    def record(
+        self, result: HarnessToolCallResult, *, known_files: Mapping[str, str], attempt: int,
+    ) -> None:
+        # known_files proves acknowledged runtime writes, not the executor's actual source tree.
+        digest = _workspace_source_digest(known_files)
+        changed = [(path, content) for path, content in sorted(known_files.items())
+                   if path != "DELIVERY_MANIFEST.json" and self._previous_files.get(path) != content]
+        repairs_attempt = self._failed_attempt if self._failed_digest != digest else None
+        self.repair_observed = self.repair_observed or repairs_attempt is not None
+        entry: dict[str, JsonValue] = {
+            "attempt": attempt, "model_round": self.model_round, "call_id": result.call_id,
+            "status": "passed" if result.status == "succeeded" else "failed",
+            "runtime_written_files_sha256": digest,
+            "written_file_count": len(changed),
+            "written_files": tuple(
+                {"path_sha256": hashlib.sha256(path.encode("utf-8")).hexdigest(),
+                 "content_sha256": content}
+                for path, content in changed[:_MAX_VERIFICATION_HISTORY_FILES]
+            ),
+            "omitted_written_file_count": max(0, len(changed) - _MAX_VERIFICATION_HISTORY_FILES),
+            "repairs_attempt": repairs_attempt,
+        }
+        if result.status == "succeeded":
+            verification = cast(Mapping[str, JsonValue], result.payload["verification"])
+            receipt_digest = hashlib.sha256(json.dumps(
+                verification, default=dict, ensure_ascii=False, allow_nan=False,
+                sort_keys=True, separators=(",", ":"),
+            ).encode("utf-8")).hexdigest()
+            entry["source_sha256"] = verification["source_sha256"]
+            entry["receipt_sha256"] = receipt_digest
+            checks = cast(tuple[JsonValue, ...] | list[JsonValue], verification["checks"])
+            safe_checks: list[JsonValue] = []
+            for check in checks[:_MAX_VERIFICATION_HISTORY_CHECKS]:
+                if not isinstance(check, Mapping):
+                    continue
+                phase = check.get("phase")
+                safe_check: dict[str, JsonValue] = {
+                    "phase": phase if phase in ("install", "build", "test") else "execution",
+                }
+                status = check.get("status")
+                if status in ("passed", "failed", "not_run"):
+                    safe_check["status"] = status
+                diagnostic = check.get("execution_diagnostic")
+                if isinstance(diagnostic, Mapping):
+                    safe_check["execution_diagnostic"] = _verification_trace_diagnostic(diagnostic)
+                safe_checks.append(safe_check)
+            entry["checks"] = tuple(safe_checks)
+            entry["omitted_check_count"] = len(checks) - len(safe_checks)
+            self.truncated = self.truncated or len(checks) != len(safe_checks)
+            self.final_receipt = {
+                "attempt": attempt, "call_id": result.call_id,
+                "source_sha256": verification["source_sha256"], "receipt_sha256": receipt_digest,
+            }
+        else:
+            phase = {
+                "project install failed": "install", "project build failed": "build",
+                "project test failed": "test",
+            }.get(result.failure_reason or "", "execution")
+            entry["checks"] = ({
+                "phase": phase, "status": "failed",
+                "execution_diagnostic": _verification_trace_diagnostic(
+                    cast(Mapping[str, JsonValue], result.payload["execution_diagnostic"]),
+                ),
+            },)
+            self.failed_attempt_count += 1
+            self._failed_digest, self._failed_attempt = digest, attempt
+        self.attempt_count += 1
+        self._previous_files = dict(known_files)
+        self.attempts.append(entry)
+        if len(self.attempts) > _MAX_VERIFICATION_HISTORY_ATTEMPTS:
+            del self.attempts[1]
+        self.truncated = (self.truncated or len(changed) > _MAX_VERIFICATION_HISTORY_FILES
+                          or self.attempt_count > _MAX_VERIFICATION_HISTORY_ATTEMPTS)
+
+    def to_payload(self) -> Mapping[str, JsonValue]:
+        return {
+            "schema_version": 1, "owner": "direct_runtime",
+            "attempt_count": self.attempt_count, "failed_attempt_count": self.failed_attempt_count,
+            "repair_observed": self.repair_observed, "truncated": self.truncated,
+            "omitted_attempt_count": self.attempt_count - len(self.attempts),
+            "attempts": tuple(self.attempts), "final_receipt": self.final_receipt,
+        }
 
 
 class RuntimeBusy(RuntimeExecutionError):
@@ -1297,6 +1426,7 @@ class DirectRuntime:
         deadline: float,
         verification_attempt: int = 1,
         verification_required: bool | None = None,
+        verification_trace: _WorkspaceVerificationTrace | None = None,
     ) -> Mapping[str, JsonValue]:
         if self._cancel_requested:
             raise asyncio.CancelledError
@@ -1338,6 +1468,7 @@ class DirectRuntime:
         ):
             verification = await self._verify_workspace(
                 context, known_files=known_files, attempt=verification_attempt, deadline=deadline,
+                verification_trace=verification_trace,
             )
         result = await self._execute_workspace_capability(
             context,
@@ -1354,6 +1485,8 @@ class DirectRuntime:
             **result,
             "artifact_origin": "incremental_workspace_delivery",
             **({"verification": verification} if verification is not None else {}),
+            **({"verification_history": verification_trace.to_payload()}
+               if verification_trace is not None and verification is not None else {}),
         }
 
     def _project_verification_enabled(self, context: TaskContext) -> bool:
@@ -1370,6 +1503,7 @@ class DirectRuntime:
     async def _verify_workspace(
         self, context: TaskContext, *, known_files: Mapping[str, str], attempt: int,
         deadline: float,
+        verification_trace: _WorkspaceVerificationTrace | None = None,
     ) -> Mapping[str, JsonValue]:
         gateway = self._harness_tool_gateway
         if self._cancel_requested:
@@ -1436,6 +1570,8 @@ class DirectRuntime:
                 and isinstance(verification.get("checks"), tuple | list)
                 and bool(verification.get("checks"))
             ):
+                if verification_trace is not None:
+                    verification_trace.record(result, known_files=known_files, attempt=attempt)
                 return verification
             raise _WorkspaceVerificationError("not_passed") from None
         failure_code = _verification_gate_failure_code(result.failure_reason)
@@ -1455,6 +1591,8 @@ class DirectRuntime:
         ):
             raise _WorkspaceVerificationError("invalid_response") from None
         if timed_out or (type(exit_code) is int and exit_code != 0):
+            if verification_trace is not None:
+                verification_trace.record(result, known_files=known_files, attempt=attempt)
             raise _WorkspaceVerificationFailure(result)
         raise _WorkspaceVerificationError("outcome_unconfirmed") from None
 
@@ -1513,6 +1651,7 @@ class DirectRuntime:
         completed_batches = 0
         validation_failures: dict[str, int] = {}
         verification_enabled = self._project_verification_enabled(context)
+        verification_trace = _WorkspaceVerificationTrace() if verification_enabled else None
         verification_attempt = 0
         verification_failure: HarnessToolCallResult | None = None
         failed_source_digests: set[str] = set()
@@ -1528,6 +1667,8 @@ class DirectRuntime:
         )
         base_messages = request.messages
         while True:
+            if verification_trace is not None:
+                verification_trace.model_round += 1
             if self._cancel_requested:
                 raise asyncio.CancelledError
             budget_outcome = self._verified_budget_usage(
@@ -1605,6 +1746,7 @@ class DirectRuntime:
                         context, known_files=known_files, deadline=deadline,
                         verification_attempt=verification_attempt,
                         verification_required=verification_enabled,
+                        verification_trace=verification_trace,
                     )
                 except _WorkspaceVerificationFailure as error:
                     verification_failure = error.result

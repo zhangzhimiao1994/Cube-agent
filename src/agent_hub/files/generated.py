@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import shutil
 from dataclasses import asdict, dataclass
+from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from uuid import UUID
@@ -109,10 +110,14 @@ class GeneratedFileStore:
         filename: str,
         mime_type: str,
         data: bytes,
+        *,
+        timestamp_filename: bool = False,
     ) -> GeneratedFileMetadata:
         """Persist a generated file and return safe download metadata."""
 
         safe_filename = validate_generated_filename(filename, mime_type)
+        if timestamp_filename:
+            safe_filename = _timestamped_generated_filename(safe_filename)
 
         storage_key = f"{tenant_id}/{run_id}/{artifact_id}/{safe_filename}"
         output_path = self._path_for_storage_key(storage_key)
@@ -139,10 +144,13 @@ class GeneratedFileStore:
         source: Path,
         *,
         move: bool = False,
+        timestamp_filename: bool = False,
     ) -> GeneratedFileMetadata:
         """Persist an existing file without loading the complete payload into memory."""
 
         safe_filename = validate_generated_filename(filename, mime_type)
+        if timestamp_filename:
+            safe_filename = _timestamped_generated_filename(safe_filename)
         source_path = source.resolve(strict=True)
         if not source_path.is_file():
             raise ValueError("generated file source is not a file")
@@ -228,6 +236,16 @@ class GeneratedFileStore:
 
         safe_filename = _safe_filename(filename)
         return parsed_tenant_id, parsed_run_id, parsed_artifact_id, safe_filename
+
+
+def _timestamped_generated_filename(filename: str) -> str:
+    suffix = ".tar.gz" if filename.lower().endswith(".tar.gz") else Path(filename).suffix
+    suffix = filename[-len(suffix):]
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+    ending = f"_{stamp}{suffix}"
+    # Reserve space for the trusted timestamp within portable filesystem limits.
+    stem = filename[:-len(suffix)].encode("utf-8")[:255 - len(ending.encode("utf-8"))]
+    return safe_generated_filename(f"{stem.decode('utf-8', errors='ignore')}{ending}")
 
 
 def _sha256_file(path: Path) -> str:

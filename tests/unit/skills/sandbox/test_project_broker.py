@@ -533,14 +533,17 @@ async def test_cgroup_population_is_authoritative(
     assert bool(list((tmp_path / "runtime").iterdir())) == (not response.ok)
 
 
+@pytest.mark.parametrize("quiet", [True, False])
 async def test_hung_kill_helper_is_bounded_and_reaped_before_quiet_success(
     project: ModuleType,
     tmp_path: Path,
     systemd: Any,
     monkeypatch: pytest.MonkeyPatch,
+    quiet: bool,
 ) -> None:
     inv, broker = configured(project, tmp_path)
     systemd[1]["helper_delay"] = True
+    systemd[1]["quiet"] = quiet
     monkeypatch.setattr(project, "_CLEANUP_SECONDS", 1.5)
     response = await asyncio.wait_for(
         broker.handle_project(
@@ -549,8 +552,16 @@ async def test_hung_kill_helper_is_bounded_and_reaped_before_quiet_success(
         ),
         3,
     )
-    assert response.ok, response.error
-    assert list((tmp_path / "runtime").iterdir()) == []
+    assert response.ok is quiet, response.error
+    assert any(command[1] == "kill" for command in systemd[0])
+    assert any(command[1] == "show" for command in systemd[0])
+    stages = list((tmp_path / "runtime").iterdir())
+    if quiet:
+        assert stages == []
+    else:
+        assert response.error == "project_termination_cleanup_incomplete"
+        assert len(stages) == 1
+        assert json.loads((stages[0] / "execution.json").read_text())["state"] == "UNKNOWN"
 
 
 async def test_explicit_project_terminate_waits_for_running_job(

@@ -503,6 +503,7 @@ class RuntimeCapabilityGateway:
                 filename=filename,
                 mime_type=DOCX_MIME_TYPE,
                 data=output.read_bytes(),
+                timestamp_filename=True,
             )
         return _file_result(
             artifact_id=artifact_id,
@@ -543,6 +544,7 @@ class RuntimeCapabilityGateway:
                 filename=filename,
                 mime_type=PPTX_MIME_TYPE,
                 data=output.read_bytes(),
+                timestamp_filename=True,
             )
         return _file_result(
             artifact_id=artifact_id,
@@ -580,6 +582,7 @@ class RuntimeCapabilityGateway:
                 filename=filename,
                 mime_type=ZIP_MIME_TYPE,
                 data=output.read_bytes(),
+                timestamp_filename=True,
             )
         result = dict(
             _file_result(
@@ -760,6 +763,7 @@ class RuntimeCapabilityGateway:
                 mime_type=ZIP_MIME_TYPE,
                 source=bundle.path,
                 move=True,
+                timestamp_filename=True,
             )
         finally:
             bundle.path.unlink(missing_ok=True)

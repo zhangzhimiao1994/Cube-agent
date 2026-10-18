@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import sys
 from pathlib import Path
 
@@ -169,9 +170,11 @@ async def test_systemd_sandbox_routes_execution_through_privileged_broker(
 
 
 async def test_subprocess_runner_enforces_timeout_and_bounded_output() -> None:
+    processes: list[asyncio.subprocess.Process] = []
     slow = await run_subprocess_with_limits(
         (sys.executable, "-c", "import time; time.sleep(10)"),
         invocation(timeout_seconds=1, output_limit_bytes=32),
+        process_started=processes.append,
     )
     assert slow.timed_out is True
     assert slow.exit_code is None
@@ -185,10 +188,13 @@ async def test_subprocess_runner_enforces_timeout_and_bounded_output() -> None:
     noisy = await run_subprocess_with_limits(
         (sys.executable, "-c", "import sys; sys.stdout.write('x' * 100000); sys.stdout.flush()"),
         invocation(timeout_seconds=10, output_limit_bytes=32),
+        process_started=processes.append,
         on_forced_terminate=cleanup,
     )
     assert len(noisy.stdout.encode()) <= 32
     assert cleanup_calls == 1
+    assert len(processes) == 2
+    assert all(process.returncode is not None for process in processes)
 
 
 async def test_systemd_sandbox_routes_termination_through_privileged_broker(
