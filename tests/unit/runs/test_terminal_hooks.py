@@ -1246,6 +1246,7 @@ async def test_execute_notifies_terminal_hooks_after_completed_run() -> None:
                 "source": "evolution",
                 "evolution_run_id": "evolution_1",
                 "engineering_delivery_contract_version": 1,
+                "engineering_action_version": 1,
                 "runtime_token_soft_base_tokens": 1_000_000,
                 "runtime_token_absolute_tokens": 10_000_000,
                 "runtime_plan_token_budget": 10_000_000,
@@ -2969,6 +2970,7 @@ async def test_execute_backfills_terminal_hooks_once_for_terminal_run_after_cras
             "routing_decision": {
                 "source": "manual",
                 "engineering_delivery_contract_version": 1,
+                "engineering_action_version": 1,
                 "runtime_token_soft_base_tokens": 1_000_000,
                 "runtime_token_absolute_tokens": 10_000_000,
                 "runtime_plan_token_budget": 10_000_000,
