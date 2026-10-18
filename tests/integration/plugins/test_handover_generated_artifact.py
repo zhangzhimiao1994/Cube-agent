@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import re
 import tempfile
 import zipfile
 from collections.abc import Mapping
@@ -45,6 +46,7 @@ class GeneratedCase:
     shape: Shape
     published: Artifact
     file_id: UUID
+    file: Mapping[str, JsonValue]
 
 
 async def _publish(
@@ -136,25 +138,31 @@ async def _publish(
     assert file["artifact_id"] == result["artifact_id"] == metadata["artifact_id"] == str(file_id)
     assert "storage_key" not in file
     assert metadata["mime_type"] == file["mime_type"] == ZIP_MIME_TYPE
+    filename = metadata["filename"]
+    assert isinstance(filename, str)
+    assert re.fullmatch(r"plugin_[0-9]{8}T[0-9]{12}Z\.zip", filename)
+    assert file["filename"] == filename
+    assert file["download_url"] == metadata["download_url"] == (
+        f"/api/v1/runs/{run_id}/artifacts/{file_id}/download"
+    )
     assert metadata["storage_key"] == (
-        f"{c.sql.creator.tenant_id}/{storage_run_id or c.sql.run_id}/{file_id}/plugin.zip"
+        f"{c.sql.creator.tenant_id}/{run_id}/{file_id}/{filename}"
     )
     key = metadata["storage_key"]
     assert isinstance(key, str)
-    data = (
-        GeneratedFileStore(generated_root)
-        .resolve_for(
-            c.sql.creator.tenant_id,
-            run_id,
-            file_id,
-            key,
-        )
-        .read_bytes()
+    stored = GeneratedFileStore(generated_root).resolve_for(
+        c.sql.creator.tenant_id,
+        run_id,
+        file_id,
+        key,
     )
-    assert file["size_bytes"] == len(data) and file["sha256"] == hashlib.sha256(data).hexdigest()
+    assert stored.name == filename
+    data = stored.read_bytes()
+    assert file["size_bytes"] == metadata["size_bytes"] == len(data)
+    assert file["sha256"] == metadata["sha256"] == hashlib.sha256(data).hexdigest()
     with zipfile.ZipFile(io.BytesIO(data)) as zipped:
         assert {name: zipped.read(name) for name in zipped.namelist()} == files
-    return GeneratedCase(c, shape, published, file_id)
+    return GeneratedCase(c, shape, published, file_id, file)
 
 
 @pytest.fixture(params=["crew", "direct"])
@@ -248,6 +256,11 @@ async def test_ordinary_creator_downloads_the_published_source_zip(
     )
     assert response.status_code == 200
     assert response.headers["content-type"] == ZIP_MIME_TYPE
+    assert response.headers["content-disposition"] == (
+        f'attachment; filename="{case.file["filename"]}"'
+    )
+    assert int(response.headers["content-length"]) == len(response.content) == case.file["size_bytes"]
+    assert hashlib.sha256(response.content).hexdigest() == case.file["sha256"]
     with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
         assert {name: archive.read(name) for name in archive.namelist()} == {
             **sql_tests.MEMBERS,

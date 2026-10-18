@@ -661,6 +661,8 @@ async def test_runtime_gateway_generates_project_zip_final_artifact(tmp_path: Pa
         skill_store_dir=tmp_path / "skills",
         generated_artifact_dir=generated_dir,
     )
+    # Generic ZIP naming remains independent of the installed Node verifier.
+    gateway._project_executor_configured = True
 
     result = await gateway.execute(
         tenant_id=TENANT_ID,
@@ -672,7 +674,7 @@ async def test_runtime_gateway_generates_project_zip_final_artifact(tmp_path: Pa
             "files": {
                 "main.py": "print('hello world')\n",
                 "README.md": "# Hello World\n\nRun `python main.py`.\n",
-                "package.json": '{"name":"hello-world","main":"src/main.js"}',
+                "project.json": '{"name":"hello-world","main":"src/main.js"}',
                 "src/main.js": "import './style.css';\n",
                 "src/style.css": "body { color: black; }\n",
             },
@@ -695,11 +697,11 @@ async def test_runtime_gateway_generates_project_zip_final_artifact(tmp_path: Pa
     assert stored_path.is_file()
     with ZipFile(stored_path) as archive:
         assert archive.namelist() == [
-            "README.md", "main.py", "package.json", "src/main.js", "src/style.css"
+            "README.md", "main.py", "project.json", "src/main.js", "src/style.css"
         ]
         assert archive.read("main.py") == b"print('hello world')\n"
         assert archive.read("README.md") == b"# Hello World\n\nRun `python main.py`.\n"
-        assert archive.read("package.json") == b'{"name":"hello-world","main":"src/main.js"}'
+        assert archive.read("project.json") == b'{"name":"hello-world","main":"src/main.js"}'
         assert archive.read("src/main.js") == b"import './style.css';\n"
         assert archive.read("src/style.css") == b"body { color: black; }\n"
 
