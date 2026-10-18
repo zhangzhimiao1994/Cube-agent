@@ -33,6 +33,7 @@ from jsonschema.protocols import Validator  # type: ignore[import-untyped]
 from jsonschema.validators import validator_for  # type: ignore[import-untyped]
 
 from agent_hub.auth.models import Role
+from agent_hub.capabilities.project_verification import validated_project_failure_payload
 from agent_hub.capabilities.runtime import RuntimeCapabilityError
 from agent_hub.capabilities.tools.builtin_contracts import (
     builtin_tool_description,
@@ -1950,6 +1951,11 @@ def _parse_structured_output(
     if size > max_bytes:
         _fail(f"{prefix} exceeds output limit")
 
+    # Harness-only wrapper exception; bound the complete original before unwrapping.
+    fenced = re.fullmatch(r"[ \t\r\n]*```json\r?\n(.*)\r?\n```[ \t\r\n]*", text, re.DOTALL)
+    if fenced is not None:
+        text = fenced.group(1)
+
     def pairs(items: list[tuple[str, object]]) -> dict[str, object]:
         result: dict[str, object] = {}
         for key, value in items:
@@ -3014,7 +3020,15 @@ def _execution_failure_result(payload: object) -> Mapping[str, JsonValue] | None
             or re.fullmatch(r"[0-9a-f]{64}", metadata["sha256"]) is None
         ):
             return None
-    return {"status": "failed", "untrusted": True, "execution_diagnostic": diagnostic}
+    result: dict[str, JsonValue] = {
+        "status": "failed", "untrusted": True, "execution_diagnostic": diagnostic,
+    }
+    if "verification_failure" in payload:
+        report = validated_project_failure_payload(payload["verification_failure"], diagnostic=diagnostic)
+        if report is None:
+            return None
+        result["verification_failure"] = report
+    return result
 
 
 def _tool_result_requires_capability_approval(result: HarnessToolCallResult) -> bool:

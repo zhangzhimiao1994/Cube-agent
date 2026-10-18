@@ -413,6 +413,17 @@ class _WorkspaceVerificationTrace:
                 "source_sha256": verification["source_sha256"], "receipt_sha256": receipt_digest,
             }
         else:
+            failure_report = result.payload.get("verification_failure")
+            if (isinstance(failure_report, Mapping)
+                and failure_report.get("schema_version") == 1
+                and failure_report.get("status") == "failed"
+                and isinstance(failure_source := failure_report.get("source_sha256"), str)
+                and _SHA256.fullmatch(failure_source)):
+                entry["source_sha256"] = failure_source
+                entry["failure_receipt_sha256"] = hashlib.sha256(json.dumps(
+                    failure_report, default=dict, ensure_ascii=False, allow_nan=False,
+                    sort_keys=True, separators=(",", ":"),
+                ).encode("utf-8")).hexdigest()
             phase = {
                 "project install failed": "install", "project build failed": "build",
                 "project test failed": "test",

@@ -284,6 +284,7 @@ async def test_trace_records_real_install_build_test_failure_and_reverification_
     failed, passed = history["attempts"]
     assert failed["checks"][0]["phase"] == "test"
     assert failed["checks"][0]["execution_diagnostic"]["exit_code"] == 1
+    assert failed["source_sha256"] == executor.reports[0]["source_sha256"]
     assert [check["phase"] for check in passed["checks"]] == ["install", "build", "test"]
     assert all(check["status"] == "passed"
                and check["execution_diagnostic"]["exit_code"] == 0 for check in passed["checks"])

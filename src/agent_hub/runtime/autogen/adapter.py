@@ -51,6 +51,7 @@ from opentelemetry.trace import NoOpTracerProvider
 from pydantic import BaseModel, ConfigDict
 
 from agent_hub.auth.models import Role
+from agent_hub.capabilities.project_verification import validated_project_failure_payload
 from agent_hub.domain.runs import TaskMode
 from agent_hub.harness import HarnessToolGateway
 from agent_hub.harness.events import safe_tool_event_payload
@@ -1278,7 +1279,15 @@ def _execution_failure_result(payload: object) -> Mapping[str, JsonValue] | None
             or re.fullmatch(r"[0-9a-f]{64}", metadata["sha256"]) is None
         ):
             return None
-    return {"status": "failed", "untrusted": True, "execution_diagnostic": diagnostic}
+    result: dict[str, JsonValue] = {
+        "status": "failed", "untrusted": True, "execution_diagnostic": diagnostic,
+    }
+    if "verification_failure" in payload:
+        report = validated_project_failure_payload(payload["verification_failure"], diagnostic=diagnostic)
+        if report is None:
+            return None
+        result["verification_failure"] = report
+    return result
 
 
 class GatewayCapabilityTool(BaseTool[_DynamicToolArguments, _DynamicToolResult]):

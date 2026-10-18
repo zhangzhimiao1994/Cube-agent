@@ -9,6 +9,7 @@ from uuid import UUID
 from agent_hub.auth.models import Role
 from agent_hub.capabilities.execution_diagnostics import ExecutionDiagnostic
 from agent_hub.capabilities.gateway import CapabilityResult, CapabilityStatus
+from agent_hub.capabilities.project_verification import ProjectVerificationFailure
 from agent_hub.capabilities.runtime import RuntimeCapabilityError
 from agent_hub.capabilities.types import CapabilityRequest
 from agent_hub.harness.types import HarnessToolCallRequest, HarnessToolCallResult, JsonValue
@@ -247,9 +248,12 @@ class HarnessToolGateway:
                 )
         except RuntimeCapabilityError as error:
             diagnostic = error.execution_diagnostic
-            failure_payload: Mapping[str, JsonValue] | None = None
+            failure_payload: dict[str, JsonValue] | None = None
             if type(diagnostic) is ExecutionDiagnostic:
                 failure_payload = {"execution_diagnostic": diagnostic.to_payload()}
+                if (request.tool_name == "project.verify"
+                    and type(error.project_failure) is ProjectVerificationFailure):
+                    failure_payload["verification_failure"] = error.project_failure.to_payload()
             return self._failure(
                 request, _deterministic_failure_reason(error), payload=failure_payload,
             )

@@ -210,12 +210,14 @@ def _contains_sensitive_key(value: JsonValue) -> bool:
     return False
 
 
-def _safe_free_text(value: str, *, name: str, max_bytes: int) -> str:
+def _safe_free_text(value: str, *, name: str, max_bytes: int, allow_crlf: bool = False) -> str:
     if not value.strip() or len(value.encode("utf-8")) > max_bytes:
         raise ValueError(f"{name} must be nonblank and bounded")
     if unicodedata.normalize("NFC", value) != value:
         raise ValueError(f"{name} must use normalized Unicode")
-    for character in value:
+    # Validate paired Windows line endings without rewriting content-addressed text.
+    control_view = value.replace("\r\n", "\n") if allow_crlf else value
+    for character in control_view:
         category = unicodedata.category(character)
         if category == "Cf" or (category == "Cc" and character not in "\n\t"):
             raise ValueError(f"{name} contains unsafe control characters")
@@ -562,7 +564,7 @@ class Artifact(_RuntimeContractModel):
             text = self.content.get("text")
             if type(text) is not str:
                 raise ValueError("text artifacts require text content")
-            _safe_free_text(text, name="artifact text", max_bytes=_MAX_TEXT_BYTES)
+            _safe_free_text(text, name="artifact text", max_bytes=_MAX_TEXT_BYTES, allow_crlf=True)
         digest = self.recompute_content_sha256()
         if self.content_sha256 and self.content_sha256 != digest:
             raise ValueError("artifact content hash does not match content")

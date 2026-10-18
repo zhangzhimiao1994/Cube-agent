@@ -29,6 +29,7 @@ from agent_hub.capabilities.project_verification import (
     PROJECT_VERIFY_TOOL,
     ProjectExecutor,
     ProjectVerificationError,
+    ProjectVerificationFailure,
     ProjectVerificationService,
 )
 from agent_hub.capabilities.scoped_read import ScopedReadError, read_scoped_file
@@ -143,15 +144,23 @@ class RuntimeCapabilityError(RuntimeError):
 
     def __init__(
         self, *args: object, execution_diagnostic: ExecutionDiagnostic | None = None,
+        project_failure: ProjectVerificationFailure | None = None,
     ) -> None:
         if execution_diagnostic is not None and type(execution_diagnostic) is not ExecutionDiagnostic:
             raise TypeError("execution_diagnostic must be ExecutionDiagnostic")
+        if project_failure is not None and type(project_failure) is not ProjectVerificationFailure:
+            raise TypeError("project_failure must be ProjectVerificationFailure")
         super().__init__(*args)
         self._execution_diagnostic = execution_diagnostic
+        self._project_failure = project_failure
 
     @property
     def execution_diagnostic(self) -> ExecutionDiagnostic | None:
         return self._execution_diagnostic
+
+    @property
+    def project_failure(self) -> ProjectVerificationFailure | None:
+        return self._project_failure
 
 
 class CapabilityManifestSource(Protocol):
@@ -361,7 +370,8 @@ class RuntimeCapabilityGateway:
                     tenant_id=tenant_id, run_id=run_id, actor=actor,
                 )
             except ProjectVerificationError as error:
-                raise RuntimeCapabilityError(str(error), execution_diagnostic=error.diagnostic) from None
+                raise RuntimeCapabilityError(str(error), execution_diagnostic=error.diagnostic,
+                                             project_failure=error.project_failure) from None
         return await self._execute_skill(
             tenant_id=tenant_id,
             run_id=run_id,

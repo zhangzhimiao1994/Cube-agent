@@ -88,8 +88,22 @@ Use one strict parser/validator for initial and corrected worker/reviewer output
   new schema engine or fetch remote references. Invalid schema is configuration
   failure, not something the model should repair.
 - No defaults, coercion, extra-field stripping, guessed arrays, false/zero fill or
-  automatic fence/prose extraction. JSON whitespace/key order are not failures.
+  prose extraction. JSON whitespace/key order are not failures.
   JSON Schema alone is not a duplicate-key or nonfinite-number defense.
+- New bounded Harness compatibility exception to the previous fence rejection:
+  accept a single complete lowercase `json` triple-backtick fence covering the
+  entire response, with LF or CRLF after the opening tag and before the closing
+  fence. Only JSON whitespace (space, tab, CR, LF) may surround the fence. Check
+  the complete original UTF-8 byte limit before removing this wrapper, then apply
+  the same strict JSON/resource/schema validator to its entire body. Initial and
+  corrected worker/reviewer output and framework-raw comparison use this rule.
+  Mixed prose, multiple blocks, incomplete fences, other tags and untagged fences
+  remain invalid; do not search for objects or repair the body. Preserve original
+  raw text, usage, provenance and checkpoint/request identities. Historical
+  rejected receipts remain rejected ledger history and do not gain new calls or
+  charges on replay. This exception does not change native Responses gateway
+  rejection, schemas, prompts, fingerprints, the shared single correction or
+  fail-closed unknown/reviewer semantics.
 
 Schema-valid output is still a model assertion, not proof of business correctness,
 file reads, tests, approvals or capability verification.

@@ -6,6 +6,7 @@ import json
 import math
 import re
 from collections.abc import Awaitable, Mapping
+from dataclasses import dataclass
 from inspect import isawaitable
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, cast
@@ -15,7 +16,7 @@ from agent_hub.capabilities.approvals import capability_approval_scope
 from agent_hub.capabilities.execution_diagnostics import ExecutionDiagnostic
 from agent_hub.capabilities.scoped_read import authorized_workspace_scope
 from agent_hub.capabilities.types import CapabilityRequest
-from agent_hub.runtime.contracts import JsonValue
+from agent_hub.runtime.contracts import JsonValue, _freeze_object
 from agent_hub.skills.sandbox.base import SkillResult
 
 if TYPE_CHECKING:
@@ -26,10 +27,97 @@ PROJECT_VERIFY_RESOURCE = "workspace/current/project-verification"
 _SHA = re.compile(r"[a-f0-9]{64}")
 
 
+@dataclass(frozen=True, slots=True)
+class ProjectVerificationFailure:
+    """Validated failed execution metadata, not a successful delivery receipt."""
+
+    report: Mapping[str, JsonValue]
+
+    def __post_init__(self) -> None:
+        report = _freeze_object(self.report, name="project verification failure")
+        source = report.get("source_sha256")
+        if (set(report) != {"schema_version", "status", "source_sha256", "checks", "runtime"}
+            or type(report.get("schema_version")) is not int or report["schema_version"] != 1
+            or report.get("status") != "failed" or not isinstance(source, str)
+            or _SHA.fullmatch(source) is None):
+            raise ValueError("invalid project verification failure")
+        checks, runtime = report["checks"], report["runtime"]
+        if (not isinstance(checks, tuple) or len(checks) != 3
+            or not isinstance(runtime, Mapping) or set(runtime) - {"node", "npm"}
+            or any(not isinstance(value, str)
+                   or re.fullmatch(r"v?[0-9][A-Za-z0-9.+-]{0,63}", value) is None
+                   for value in runtime.values())):
+            raise ValueError("invalid project verification failure")
+        failed = False
+        for phase, check in zip(("install", "build", "test"), checks, strict=True):
+            if not isinstance(check, Mapping) or check.get("phase") != phase:
+                raise ValueError("invalid project verification failure")
+            status = check.get("status")
+            if status == "not_run":
+                if not failed or set(check) != {"phase", "status"}:
+                    raise ValueError("invalid project verification failure")
+                continue
+            diagnostic = check.get("execution_diagnostic")
+            if (failed or status not in {"passed", "failed"}
+                or set(check) != {"phase", "status", "execution_diagnostic"}
+                or not isinstance(diagnostic, Mapping)
+                or set(diagnostic) != {"schema_version", "backend", "exit_code", "timed_out",
+                                       "stdout_metadata", "stderr_metadata"}
+                or type(diagnostic["schema_version"]) is not int or diagnostic["schema_version"] != 1
+                or diagnostic["backend"] != "systemd"
+                or type(diagnostic["timed_out"]) is not bool
+                or (diagnostic["exit_code"] is not None and type(diagnostic["exit_code"]) is not int)):
+                raise ValueError("invalid project verification failure")
+            if ((status == "passed" and (diagnostic["exit_code"] != 0 or diagnostic["timed_out"]))
+                or (status == "failed" and not diagnostic["timed_out"]
+                    and diagnostic["exit_code"] in (None, 0))):
+                raise ValueError("invalid project verification failure")
+            for stream in ("stdout_metadata", "stderr_metadata"):
+                metadata = diagnostic[stream]
+                if (not isinstance(metadata, Mapping)
+                    or set(metadata) != {"sanitized_bytes", "returned_bytes", "sha256", "truncated",
+                                         "redacted", "redacted_lines"}
+                    or any(type(metadata[key]) is not int or not 0 <= cast(int, metadata[key]) <= 2**63 - 1
+                           for key in ("sanitized_bytes", "returned_bytes", "redacted_lines"))
+                    or cast(int, metadata["returned_bytes"]) > cast(int, metadata["sanitized_bytes"])
+                    or any(type(metadata[key]) is not bool for key in ("truncated", "redacted"))
+                    or not isinstance(metadata["sha256"], str)
+                    or _SHA.fullmatch(metadata["sha256"]) is None):
+                    raise ValueError("invalid project verification failure")
+            failed = status == "failed"
+        if not failed:
+            raise ValueError("invalid project verification failure")
+        object.__setattr__(self, "report", report)
+
+    def to_payload(self) -> Mapping[str, JsonValue]:
+        return self.report
+
+
+def validated_project_failure_payload(
+    value: object, *, diagnostic: Mapping[str, JsonValue],
+) -> Mapping[str, JsonValue] | None:
+    """Validate persisted failure metadata and bind it to its process diagnostic."""
+    if not isinstance(value, Mapping):
+        return None
+    try:
+        report = ProjectVerificationFailure(value).to_payload()
+        checks = cast(tuple[Mapping[str, JsonValue], ...], report["checks"])
+        failed = next(check for check in checks if check["status"] == "failed")
+        if failed["execution_diagnostic"] != {
+            key: item for key, item in diagnostic.items() if key not in {"stdout", "stderr"}
+        }:
+            return None
+        return report
+    except (ValueError, TypeError, RecursionError):
+        return None
+
+
 class ProjectVerificationError(RuntimeError):
-    def __init__(self, message: str, diagnostic: ExecutionDiagnostic | None = None) -> None:
+    def __init__(self, message: str, diagnostic: ExecutionDiagnostic | None = None, *,
+                 project_failure: ProjectVerificationFailure | None = None) -> None:
         super().__init__(message)
         self.diagnostic = diagnostic
+        self.project_failure = project_failure
 
 
 class ProjectExecutor(Protocol):
@@ -106,13 +194,17 @@ class ProjectVerificationService:
         invocation = await self._invocation(tenant_id, run_id, actor)
         try:
             before = await project_source_fingerprint(self.root, invocation)
-            result = await (self.executor or ProjectSystemdSandbox()).run(invocation)
+            try:
+                result = await (self.executor or ProjectSystemdSandbox()).run(invocation)
+            except Exception:  # noqa: BLE001 - executor exceptions are never trusted observations.
+                # Only our decoded, source-checked report can create process evidence.
+                raise ProjectVerificationError("project execution backend is unavailable") from None
             if result.exit_code != 0 or result.timed_out:
                 raise ProjectVerificationError("project execution outcome is not confirmed")
-            receipt = _validate_report(result.stdout, expected_source=before)
             current = await project_source_fingerprint(self.root, invocation)
             if current != before:
                 raise ProjectVerificationError("project source changed during verification")
+            receipt = _validate_report(result.stdout, expected_source=before)
         except ProjectVerificationError:
             raise
         except Exception:  # noqa: BLE001 - backend failures are not trusted process evidence.
@@ -169,6 +261,11 @@ def _validate_report(text: str, *, expected_source: str) -> Mapping[str, JsonVal
             }, strict=True)
             if status not in {"passed", "failed", "not_run"}:
                 raise ValueError
+            if report.get("status") == "failed" and (
+                (failure is None and status == "not_run")
+                or (failure is not None and status != "not_run")
+            ):
+                raise ValueError
             if status == "not_run":
                 if (observed.exit_code is not None or observed.timed_out
                     or observed.stdout or observed.stderr):
@@ -185,7 +282,32 @@ def _validate_report(text: str, *, expected_source: str) -> Mapping[str, JsonVal
                     raise ValueError
                 failure = (phase, diagnostic)
         if report.get("status") == "failed" and failure is not None:
-            raise ProjectVerificationError(f"project {failure[0]} failed", failure[1])
+            safe_failure_checks: list[JsonValue] = []
+            for item in safe_checks:
+                check = cast(Mapping[str, JsonValue], item)
+                safe_check = dict(check)
+                diagnostic_payload = check.get("execution_diagnostic")
+                if isinstance(diagnostic_payload, Mapping):
+                    safe_check["execution_diagnostic"] = {
+                        key: value for key, value in diagnostic_payload.items()
+                        if key not in {"stdout", "stderr"}
+                    }
+                safe_failure_checks.append(safe_check)
+            failure_runtime: dict[str, JsonValue] = {}
+            for name in ("node", "npm"):
+                if name not in runtime:
+                    continue
+                value = runtime[name]
+                if (not isinstance(value, str)
+                    or re.fullmatch(r"v?[0-9][A-Za-z0-9.+-]{0,63}", value) is None):
+                    raise ValueError
+                failure_runtime[name] = value
+            observation = ProjectVerificationFailure({
+                "schema_version": 1, "status": "failed", "source_sha256": expected_source,
+                "checks": tuple(safe_failure_checks), "runtime": failure_runtime,
+            })
+            raise ProjectVerificationError(f"project {failure[0]} failed", failure[1],
+                                           project_failure=observation)
         if report.get("status") == "blocked":
             raise ProjectVerificationError("project verification blocked by execution prerequisites")
         if report.get("status") != "passed" or any(
