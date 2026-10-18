@@ -100,7 +100,75 @@ def test_provider_profiles_are_derived_only_from_real_configured_deployments() -
     assert openai.supports_long_running_tasks is True
     assert openai.supports_parallel_tool_calls is True
     assert "workspace_write" in openai.sandbox_modes
-    assert "workspace_write" not in deepseek.sandbox_modes
+    assert "workspace_write" in deepseek.sandbox_modes
+    assert deepseek.supports_parallel_tool_calls is False
+    assert deepseek.supports_long_running_tasks is False
+
+
+@pytest.mark.parametrize("provider", ["deepseek", "qwen", "anthropic", "local", "openai"])
+@pytest.mark.parametrize("capabilities", [{"text", "tool_calling"}, {"text"}, {"tool_calling"}])
+def test_configured_tools_select_host_workspace_sandbox_independent_of_provider(
+    provider: str, capabilities: set[str]
+) -> None:
+    config = PlatformConfig(
+        models={
+            "main": LogicalModelDefinition(
+                deployments=[DeploymentDefinition(
+                    provider=provider,
+                    model="coder",
+                    credential_ref="model-key",
+                    quota_scope_id="model-account",
+                    capabilities=capabilities,
+                )],
+            )
+        },
+        agents=[],
+    )
+    profile = provider_profiles_from_config(config)[0]
+    if capabilities != {"text", "tool_calling"}:
+        assert "workspace_write" not in profile.sandbox_modes
+        if "text" in capabilities:
+            scheduler = harness_scheduler_from_config(config)
+            assert scheduler is not None
+            with pytest.raises(HarnessSchedulingError):
+                scheduler.select(
+                    tenant_id=TENANT_ID,
+                    mode=TaskMode.DIRECT,
+                    requirements=HarnessTaskRequirements(
+                        required_capabilities=frozenset({"text", "tool_calling"}),
+                        required_sandbox_mode="workspace_write",
+                    ),
+                    policy=HarnessPolicy(),
+                    hermes_hint=None,
+                )
+        else:
+            assert harness_scheduler_from_config(config) is None
+        return
+
+    scheduler = harness_scheduler_from_config(config)
+    assert scheduler is not None
+    decision = scheduler.select(
+        tenant_id=TENANT_ID,
+        mode=TaskMode.DIRECT,
+        requirements=HarnessTaskRequirements(
+            required_capabilities=frozenset({"text", "tool_calling"}),
+            required_sandbox_mode="workspace_write",
+            needs_reasoning=True,
+            needs_streamed_tool_calls=True,
+            needs_parallel_tool_calls=True,
+            needs_long_running=True,
+        ),
+        policy=HarnessPolicy(),
+        hermes_hint=None,
+    )
+    assert decision.selected_provider == provider
+    assert decision.selected_logical_model == "main"
+    assert "sandbox_mode:workspace_write" in decision.capability_reasons
+    if provider == "deepseek":
+        assert profile.supports_parallel_tool_calls is False
+        assert profile.supports_long_running_tasks is False
+        assert "supports_parallel_tool_calls" not in decision.capability_reasons
+        assert "supports_long_running_tasks" not in decision.capability_reasons
 
 
 def test_multimodal_generation_profile_does_not_gain_reasoning_strengths() -> None:
@@ -136,6 +204,7 @@ def test_messages_endpoint_profile_does_not_expose_tool_calling() -> None:
     assert profiles[0].capabilities == frozenset({"text"})
     assert profiles[0].supports_streamed_tool_call_delta is False
     assert profiles[0].supports_parallel_tool_calls is False
+    assert "workspace_write" not in profiles[0].sandbox_modes
     scheduler = harness_scheduler_from_config(config)
     assert scheduler is not None
     with pytest.raises(

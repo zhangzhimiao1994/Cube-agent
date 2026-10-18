@@ -6,7 +6,9 @@ from uuid import UUID, uuid4
 import pytest
 
 from agent_hub.auth.models import Role
+from agent_hub.config.schema import DeploymentDefinition, LogicalModelDefinition, PlatformConfig
 from agent_hub.domain.runs import RunStatus, TaskMode
+from agent_hub.harness.config import harness_scheduler_from_config
 from agent_hub.harness.scheduler import CapabilityAwareHarnessScheduler, HarnessSchedulingError
 from agent_hub.harness.types import (
     HarnessDecision,
@@ -816,6 +818,93 @@ async def test_vibe_coding_submit_rejects_when_harness_cannot_schedule() -> None
 
     assert repository.created == []
     assert queue.enqueued == []
+
+
+@pytest.mark.parametrize("provider", ["deepseek", "qwen"])
+@pytest.mark.parametrize("execution_backend", ["systemd", "docker"])
+@pytest.mark.parametrize("tool_calling", [True, False])
+async def test_vibe_workspace_submit_uses_host_tools_and_preserves_operator_scope(
+    provider: str, execution_backend: str, tool_calling: bool
+) -> None:
+    config = PlatformConfig(
+        models={
+            "main": LogicalModelDefinition(
+                deployments=[DeploymentDefinition(
+                    provider=provider,
+                    model="coder",
+                    credential_ref="model-key",
+                    quota_scope_id="model-account",
+                    capabilities={"text", "tool_calling"} if tool_calling else {"text"},
+                )],
+            )
+        },
+        agents=[],
+    )
+    scheduler = harness_scheduler_from_config(config)
+    assert scheduler is not None
+    repository = RecordingRepository()
+    queue = RecordingQueue()
+    service = RunService(
+        repository,  # type: ignore[arg-type]
+        runtime_registry=RuntimeRegistry((UnavailableRuntime(TaskMode.DIRECT),)),
+        router=None,
+        task_queue=queue,
+        harness_scheduler=scheduler,
+    )
+    permissions = ("workspace.read", "workspace.write", "network.read", "command.run")
+    submission = service.submit(
+        tenant_id=TENANT_ID,
+        actor_id=ACTOR_ID,
+        actor_role=Role.OPERATOR,
+        message="Build a small Node.js billing module in this new project workspace.",
+        mode=TaskMode.DIRECT,
+        conversation_id="conv-host-workspace",
+        project_id="foundation-new",
+        workspace_session_id="journey-new",
+        direct_model="main",
+        allowed_models=("main",),
+        sandbox_profile="workspace_write",
+        execution_backend=execution_backend,
+        requested_permissions=permissions,
+        runtime_timeout_seconds=900,
+        allow_scale_mode_upgrade=False,
+        vibe_coding=True,
+        skip_evolution_proposal=True,
+    )
+    if not tool_calling:
+        with pytest.raises(VibeCodingUnavailable, match="Vibe Coding requires"):
+            await submission
+        assert repository.created == []
+        assert queue.enqueued == []
+        return
+
+    submitted = await submission
+    assert submitted.status is RunStatus.QUEUED
+    assert submitted.mode is TaskMode.DIRECT
+    assert submitted.project_id == "foundation-new"
+    assert submitted.workspace_session_path == "projects/foundation-new/sessions/journey-new"
+    assert submitted.requested_permissions == permissions
+    created = repository.created[0]
+    assert created["actor_id"] == ACTOR_ID
+    assert created["actor_role"] is Role.OPERATOR
+    assert created["enqueue"] is True
+    routing = created["routing_decision"]
+    assert isinstance(routing, dict)
+    assert routing["execution_backend"] == execution_backend
+    assert routing["sandbox_profile"] == "workspace_write"
+    assert routing["sandbox_permission_policy"] == "ask_on_escalation"
+    assert routing["requested_permissions"] == list(permissions)
+    assert routing["requested_mode"] == "direct"
+    assert routing["effective_mode"] == "direct"
+    assert "harness_unavailable" not in routing
+    decision = routing["harness_decision"]
+    assert isinstance(decision, dict)
+    assert decision["selected_provider"] == provider
+    assert decision["selected_logical_model"] == "main"
+    assert "sandbox_mode:workspace_write" in decision["capability_reasons"]
+    if provider == "deepseek":
+        assert "supports_parallel_tool_calls" not in decision["capability_reasons"]
+        assert "supports_long_running_tasks" not in decision["capability_reasons"]
 
 
 async def test_vibe_coding_submit_rejects_when_harness_scheduler_is_missing() -> None:
