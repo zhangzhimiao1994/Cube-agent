@@ -1491,9 +1491,15 @@ async def test_worker_lease_heartbeat_lost_uses_run_scoped_runtime_cancel() -> N
 
 
 @pytest.mark.asyncio
-async def test_execute_forwards_persisted_actor_identity_to_runtime_context() -> None:
+@pytest.mark.parametrize('driver_uuid',[False,True])
+async def test_execute_forwards_persisted_actor_identity_to_runtime_context(driver_uuid: bool) -> None:
     repository = ExecutableFakeRepository(routing_decision={"source": "manual"})
     repository.row.actor_role = Role.OPERATOR.value
+    if driver_uuid:
+        from asyncpg.pgproto.pgproto import UUID as DriverUUID
+
+        repository.row.actor_id = DriverUUID(str(repository.row.actor_id))
+        repository.row.tenant_id = DriverUUID(str(repository.row.tenant_id))
     runtime = ContextRecordingRuntime()
     service = RunService(
         repository,  # type: ignore[arg-type]
@@ -1507,6 +1513,8 @@ async def test_execute_forwards_persisted_actor_identity_to_runtime_context() ->
     assert submitted.status is RunStatus.COMPLETED
     assert len(runtime.contexts) == 1
     assert runtime.contexts[0].actor_id == ACTOR_ID
+    assert type(runtime.contexts[0].actor_id) is UUID
+    assert type(runtime.contexts[0].tenant_id) is UUID
     assert runtime.contexts[0].actor_role is Role.OPERATOR
 
 

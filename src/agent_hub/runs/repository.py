@@ -42,6 +42,18 @@ from agent_hub.runtime.failure_reason import (
     runtime_failure_diagnostic_from_reason,
 )
 
+
+def _database_uuid(value: UUID) -> UUID:
+    # asyncpg's UUID subclass must not cross strict runtime identity boundaries.
+    if not isinstance(value, UUID):
+        raise TypeError('database identity must be a UUID')
+    return value if type(value) is UUID else UUID(str(value))
+
+
+def _optional_database_uuid(value: UUID | None) -> UUID | None:
+    return None if value is None else _database_uuid(value)
+
+
 _RECOVERY_REPLAYABLE_EVENT_KINDS = frozenset(
     {
         EventKind.APPROVAL_REQUESTED.value,
@@ -2194,9 +2206,9 @@ class RunRepository:
     @staticmethod
     def _record(row: RunRow) -> RunRecord:
         return RunRecord(
-            id=row.id,
-            tenant_id=row.tenant_id,
-            actor_id=row.actor_id,
+            id=_database_uuid(row.id),
+            tenant_id=_database_uuid(row.tenant_id),
+            actor_id=_optional_database_uuid(row.actor_id),
             actor_role=None if row.actor_role is None else Role(row.actor_role),
             request=row.request,
             mode=None if row.mode is None else TaskMode(row.mode),
@@ -2204,9 +2216,9 @@ class RunRepository:
             version=row.version,
             created_at=row.created_at,
             routing_decision=None if row.routing_decision is None else dict(row.routing_decision),
-            blocked_by_run_id=getattr(row, "blocked_by_run_id", None),
+            blocked_by_run_id=_optional_database_uuid(getattr(row, 'blocked_by_run_id', None)),
             worker_id=getattr(row, "worker_id", None),
-            worker_lease_token=getattr(row, "worker_lease_token", None),
+            worker_lease_token=_optional_database_uuid(getattr(row, 'worker_lease_token', None)),
             worker_lease_expires_at=getattr(row, "worker_lease_expires_at", None),
             worker_heartbeat_at=getattr(row, "worker_heartbeat_at", None),
         )

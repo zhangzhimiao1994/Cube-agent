@@ -199,7 +199,8 @@ async def test_forged_admission_receipt_does_not_grant_tools():
 
 
 @pytest.mark.parametrize('mode',[TaskMode.DIRECT,TaskMode.DISPATCH,TaskMode.DISCUSS,TaskMode.HYBRID])
-async def test_worker_persists_admission_before_releasing_waiting_execution(mode,monkeypatch):
+@pytest.mark.parametrize('driver_uuid',[False,True])
+async def test_worker_persists_admission_before_releasing_waiting_execution(mode,monkeypatch,driver_uuid):
     from agent_hub.domain.runs import RunStatus
     from agent_hub.runs.service import RunService
     from agent_hub.runtime.registry import RuntimeRegistry
@@ -210,6 +211,11 @@ async def test_worker_persists_admission_before_releasing_waiting_execution(mode
     repository.row.mode=mode.value
     repository.row.actor_role=Role.OPERATOR.value
     repository.row.routing_decision=dict(context(mode).routing_decision)
+    if driver_uuid:
+        from asyncpg.pgproto.pgproto import UUID as DriverUUID
+
+        repository.row.actor_id=DriverUUID(str(repository.row.actor_id))
+        repository.row.tenant_id=DriverUUID(str(repository.row.tenant_id))
     class Pending(Authorizer):
         async def authorize(self,tenant_id,request,**kwargs):
             repository.begin_approval()

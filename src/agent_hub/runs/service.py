@@ -1822,8 +1822,9 @@ class RunService:
                 claimed_record = claimed
             else:
                 row, checkpoint = claimed
-                tenant_id = row.tenant_id
-                actor_id = row.actor_id
+                persisted_identity = RunRepository._record(row)
+                tenant_id = persisted_identity.tenant_id
+                actor_id = persisted_identity.actor_id
                 actor_role = _actor_role_from_row(row)
                 assert row.mode is not None
                 mode = TaskMode(row.mode)
