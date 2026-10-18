@@ -92,6 +92,54 @@ class HarnessToolGateway:
         self._require_actor_identity = require_actor_identity
         self._raise_backend_errors = raise_backend_errors
 
+    async def authorize(
+        self,
+        tenant_id: UUID,
+        request: HarnessToolCallRequest,
+        *,
+        user_id: UUID | None = None,
+        role: Role | None = None,
+    ) -> HarnessToolCallResult:
+        """Admit static engineering scopes without executing a tool or caching authority."""
+        if not isinstance(request, HarnessToolCallRequest):
+            raise TypeError("request must be HarnessToolCallRequest")
+        if request.tool_name not in {"workspace.write_text", "project.verify", "workspace.bundle"}:
+            return self._failure(request, "tool permission mapping unavailable")
+        policy_mapping_failure = _builtin_policy_mapping_failure(request)
+        if policy_mapping_failure is not None:
+            return self._failure(request, policy_mapping_failure)
+        sandbox_failure = _workspace_write_sandbox_failure(request)
+        if sandbox_failure is not None:
+            return self._failure(request, sandbox_failure)
+        if _uses_external_envelope(request):
+            return self._failure(request, "tool permission mapping unavailable")
+        if request.approval_required and self._policy_gateway is None:
+            return self._failure(request, "approval required")
+        if type(user_id) is not UUID or not isinstance(role, Role) or self._policy_gateway is None:
+            return self._failure(request, "capability identity unavailable")
+        try:
+            failure = await self._authorize(tenant_id, request, user_id=user_id, role=role)
+        except Exception as error:  # noqa: BLE001 - admission never exposes policy internals
+            error.__traceback__ = None
+            error.__context__ = None
+            error.__cause__ = None
+            return self._failure(request, "capability authorization unavailable")
+        if failure is not None:
+            return failure
+        try:
+            available = self._backend.is_available(tenant_id, request.tool_name) is True
+        except Exception as error:  # noqa: BLE001 - discovery cannot grant execution authority
+            error.__traceback__ = None
+            error.__context__ = None
+            error.__cause__ = None
+            available = False
+        if not available:
+            return self._failure(request, "tool unavailable")
+        return HarnessToolCallResult(
+            call_id=request.call_id, tool_name=request.tool_name, status="succeeded",
+            payload={"authorized": True},
+        )
+
     async def invoke(
         self,
         tenant_id: UUID,

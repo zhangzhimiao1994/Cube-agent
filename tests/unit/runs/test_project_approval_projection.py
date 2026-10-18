@@ -75,6 +75,7 @@ def _resolve(run: RunRow, approval: RunApprovalRow, status: str) -> None:
 @pytest.mark.parametrize("parts", [
     ("file", "write", "workspace/current"),
     ("command", "run", "workspace/current/project-verification"),
+    ("file", "create", "workspace/bundle"),
 ])
 def test_project_scope_projects_only_authoritative_six_fields(
     project_approval: tuple[RunRow, RunApprovalRow], status: str,
@@ -104,24 +105,29 @@ def test_project_scope_projects_only_authoritative_six_fields(
 
 
 @pytest.mark.parametrize("status", ["pending", "approved"])
+@pytest.mark.parametrize("parts", [
+    ("file", "write", "workspace/current"),
+    ("file", "create", "workspace/bundle"),
+])
 @pytest.mark.parametrize("mutation", [
     "tenant", "user", "run", "capability", "operation", "resource", "suffix",
     "prefix", "missing", "none", "dict", "list", "number", "no_actor",
 ])
 def test_unproven_scope_keeps_original_minimal_binding(
     project_approval: tuple[RunRow, RunApprovalRow], mutation: str, status: str,
+    parts: tuple[str, str, str],
 ) -> None:
     run, approval = project_approval
-    scope: Any = _scope(run, "file", "write", "workspace/current")
+    scope: Any = _scope(run, *parts)
     if mutation in {"tenant", "user", "run"}:
         value = {"tenant": run.tenant_id, "user": run.actor_id, "run": run.id}[mutation]
         scope = scope.replace(f"{mutation}={value}", f"{mutation}={uuid4()}")
     elif mutation == "capability":
         scope = scope.replace("capability=file", "capability=command")
     elif mutation == "operation":
-        scope = scope.replace("operation=write", "operation=read")
+        scope = scope.replace(f"operation={parts[1]}", "operation=read")
     elif mutation == "resource":
-        scope = scope.replace("resource=workspace/current", "resource=workspace/other")
+        scope = scope.replace(f"resource={parts[2]}", "resource=workspace/other")
     elif mutation == "suffix":
         scope += ":token=PRIVATE-TOKEN"
     elif mutation == "prefix":

@@ -382,6 +382,12 @@ def capability_approval_scope(request: CapabilityRequest) -> str | None:
     ):
         return _run_capability_scope(request, normalized_resource)
     if (
+        request.capability == "file"
+        and request.operation == "create"
+        and normalized_resource == "workspace/bundle"
+    ):
+        return _run_capability_scope(request, normalized_resource)
+    if (
         request.capability != "file"
         or request.operation != "create"
         or normalized_resource is None

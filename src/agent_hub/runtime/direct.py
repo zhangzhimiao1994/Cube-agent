@@ -13,6 +13,7 @@ from dataclasses import dataclass, field, replace
 from typing import Never, Protocol, cast
 from uuid import UUID, uuid4
 
+from agent_hub.capabilities.runtime import RuntimeCapabilityError
 from agent_hub.domain.runs import TaskMode
 from agent_hub.files.workspace import WORKSPACE_METADATA_DOTFILES
 from agent_hub.harness.types import HarnessToolCallRequest, HarnessToolCallResult
@@ -257,9 +258,51 @@ class _WorkspaceDeliveryValidationError(RuntimeExecutionError):
         self.failure_code = failure_code
 
 
-class _WorkspaceVerificationFailure(RuntimeExecutionError):
+_VERIFICATION_GATE_FAILURE_CODES = {
+    "tool unavailable": "tool_unavailable",
+    "capability denied": "capability_denied",
+    "capability requires approval": "approval_required",
+    "approval required": "approval_required",
+    "project dependency installation approval required": "approval_required",
+    "capability identity unavailable": "identity_unavailable",
+    "tool permission mapping unavailable": "permission_mapping_unavailable",
+    "workspace write requires workspace_write sandbox": "sandbox_denied",
+    "project verification scope is not authorized": "scope_denied",
+    "project execution backend is unavailable": "backend_unavailable",
+    "project execution backend is unsupported": "backend_unsupported",
+    "project source changed during verification": "source_changed",
+    "project verification blocked by execution prerequisites": "blocked_prerequisites",
+    "project execution report is invalid": "malformed_report",
+    "project execution outcome is not confirmed": "outcome_unconfirmed",
+    "tool execution failed": "tool_failed",
+}
+_VERIFICATION_PROCESS_FAILURE_REASONS = frozenset({
+    "project install failed", "project build failed", "project test failed", "skill execution failed",
+})
+_VERIFICATION_FAILURE_CODES = frozenset(_VERIFICATION_GATE_FAILURE_CODES.values()) | {
+    "failed", "invalid_response", "truncated_response", "not_passed", "timeout", "execution_failed",
+}
+
+
+def _verification_gate_failure_code(reason: object) -> str:
+    # Gateway reasons may contain backend/project text; only exact constants are diagnostics.
+    if type(reason) is str:
+        return _VERIFICATION_GATE_FAILURE_CODES.get(reason, "failed")
+    return "failed"
+
+
+class _WorkspaceVerificationError(RuntimeExecutionError):
+    def __init__(self, failure_code: str) -> None:
+        self.failure_code = failure_code if failure_code in _VERIFICATION_FAILURE_CODES else "failed"
+        reason = "project verification failed"
+        if self.failure_code != "failed":
+            reason += ": " + self.failure_code.replace("_", " ")
+        super().__init__(reason)
+
+
+class _WorkspaceVerificationFailure(_WorkspaceVerificationError):
     def __init__(self, result: HarnessToolCallResult) -> None:
-        super().__init__("project verification failed")
+        super().__init__("execution_failed")
         self.result = result
 
 
@@ -1335,6 +1378,7 @@ class DirectRuntime:
         if gateway is None or remaining_seconds <= 0:
             _raise_execution_error("project verification budget is exhausted")
         result: HarnessToolCallResult | None = None
+        failure_code: str | None = None
         try:
             request = HarnessToolCallRequest(
                 run_id=context.run_id, actor="main_agent", tool_name="project.verify",
@@ -1359,17 +1403,24 @@ class DirectRuntime:
         except asyncio.CancelledError:
             raise
         except Exception as error:  # noqa: BLE001 - preserve the redacted tool boundary
+            failure_code = "timeout" if isinstance(error, TimeoutError) else "failed"
+            if isinstance(error, RuntimeCapabilityError) and len(error.args) == 1:
+                failure_code = _verification_gate_failure_code(error.args[0])
             error.__traceback__ = None
             error.__context__ = None
             error.__cause__ = None
             del error
         if self._cancel_requested:
             raise asyncio.CancelledError
+        if failure_code is not None:
+            raise _WorkspaceVerificationError(failure_code) from None
         if (
-            not isinstance(result, HarnessToolCallResult) or result.truncated
+            not isinstance(result, HarnessToolCallResult)
             or result.call_id != request.call_id or result.tool_name != "project.verify"
         ):
-            _raise_execution_error("project verification failed")
+            raise _WorkspaceVerificationError("invalid_response") from None
+        if result.truncated:
+            raise _WorkspaceVerificationError("truncated_response") from None
         verification = result.payload.get("verification")
         if result.status == "succeeded":
             source_sha256 = (
@@ -1386,14 +1437,26 @@ class DirectRuntime:
                 and bool(verification.get("checks"))
             ):
                 return verification
-            _raise_execution_error("project verification did not pass")
+            raise _WorkspaceVerificationError("not_passed") from None
+        failure_code = _verification_gate_failure_code(result.failure_reason)
+        if result.failure_reason not in _VERIFICATION_PROCESS_FAILURE_REASONS:
+            raise _WorkspaceVerificationError(failure_code) from None
         diagnostic = result.payload.get("execution_diagnostic")
-        if isinstance(diagnostic, Mapping) and diagnostic.get("schema_version") == 1:
-            exit_code = diagnostic.get("exit_code")
-            timed_out = diagnostic.get("timed_out")
-            if (timed_out is True or (type(exit_code) is int and exit_code != 0)):
-                raise _WorkspaceVerificationFailure(result)
-        _raise_execution_error("project verification failed")
+        if diagnostic is None:
+            raise _WorkspaceVerificationError("outcome_unconfirmed") from None
+        if not isinstance(diagnostic, Mapping):
+            raise _WorkspaceVerificationError("invalid_response") from None
+        exit_code, timed_out = diagnostic.get("exit_code"), diagnostic.get("timed_out")
+        if (
+            type(diagnostic.get("schema_version")) is not int
+            or diagnostic.get("schema_version") != 1
+            or type(timed_out) is not bool
+            or (exit_code is not None and type(exit_code) is not int)
+        ):
+            raise _WorkspaceVerificationError("invalid_response") from None
+        if timed_out or (type(exit_code) is int and exit_code != 0):
+            raise _WorkspaceVerificationFailure(result)
+        raise _WorkspaceVerificationError("outcome_unconfirmed") from None
 
     async def _deliver_workspace_batches(
         self,

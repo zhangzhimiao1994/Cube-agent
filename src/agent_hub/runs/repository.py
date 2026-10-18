@@ -2595,6 +2595,7 @@ def _public_plugin_approval_events(
             for capability, operation, resource in (
                 ("file", "write", "workspace/current"),
                 ("command", "run", "workspace/current/project-verification"),
+                ("file", "create", "workspace/bundle"),
             ):
                 scope = (
                     f"capability-scope:v1:tenant={run.tenant_id}:user={run.actor_id}:"

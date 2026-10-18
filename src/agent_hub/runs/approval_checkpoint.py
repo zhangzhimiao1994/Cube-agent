@@ -18,6 +18,10 @@ def checkpoint_waits_for_approval(
             return False
         # to_payload thaws the contract's immutable mappings for strict JSON validation.
         checkpoint = RuntimeCheckpoint.from_payload(checkpoint.to_payload())
+        if checkpoint.runtime_type == 'engineering_admission':
+            from agent_hub.runtime.engineering_admission import admission_checkpoint_valid
+
+            return admission_checkpoint_valid(checkpoint, approval_id)
         if checkpoint.runtime_type == "hybrid":
             if (
                 checkpoint.runtime_version not in {"2", "3"}

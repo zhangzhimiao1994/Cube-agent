@@ -64,6 +64,7 @@ from agent_hub.runtime.contracts import (
 from agent_hub.runtime.crew.adapter import CrewDispatchRuntime
 from agent_hub.runtime.crew.plan import AgentSpec, DispatchPlan, DispatchStep
 from agent_hub.runtime.direct import DirectRuntime
+from agent_hub.runtime.engineering_admission import with_engineering_admission
 from agent_hub.runtime.hermes_context import runtime_memory_context_text
 from agent_hub.runtime.hybrid import HybridRuntime
 from agent_hub.runtime.project_preflight_context import project_preflight_context_text
@@ -855,6 +856,8 @@ class ConfigBackedDirectRuntime:
             runtime = await self._runtime_for(context)
         except HarnessModelSelectionError:
             runtime = UnavailableRuntime(TaskMode.DIRECT, reason="harness_model_unavailable")
+        if not isinstance(runtime, UnavailableRuntime):
+            runtime = with_engineering_admission(runtime, self._harness_tool_gateway, context)
         checkpoint = self._pending_checkpoints.pop(context.run_id, None)
         if checkpoint is not None:
             await runtime.restore_checkpoint(checkpoint)
@@ -953,6 +956,8 @@ class ConfigBackedDispatchRuntime:
             runtime = await self._runtime_for(context)
         except HarnessModelSelectionError:
             runtime = UnavailableRuntime(TaskMode.DISPATCH, reason="harness_model_unavailable")
+        if not isinstance(runtime, UnavailableRuntime):
+            runtime = with_engineering_admission(runtime, self._harness_tool_gateway, context)
         checkpoint = self._pending_checkpoints.pop(context.run_id, None)
         if checkpoint is not None:
             await runtime.restore_checkpoint(checkpoint)
@@ -1151,6 +1156,8 @@ class ConfigBackedDiscussionRuntime:
             runtime = await self._runtime_for(context)
         except HarnessModelSelectionError:
             runtime = UnavailableRuntime(TaskMode.DISCUSS, reason="harness_model_unavailable")
+        if not isinstance(runtime, UnavailableRuntime):
+            runtime = with_engineering_admission(runtime, self._harness_tool_gateway, context)
         checkpoint = self._pending_checkpoints.pop(context.run_id, None)
         if checkpoint is not None:
             await runtime.restore_checkpoint(checkpoint)
@@ -1327,6 +1334,8 @@ class ConfigBackedHybridRuntime:
             runtime = await self._runtime_for(context)
         except HarnessModelSelectionError:
             runtime = UnavailableRuntime(TaskMode.HYBRID, reason="harness_model_unavailable")
+        if not isinstance(runtime, UnavailableRuntime):
+            runtime = with_engineering_admission(runtime, self._harness_tool_gateway, context)
         checkpoint = self._pending_checkpoints.pop(context.run_id, None)
         if checkpoint is not None:
             await runtime.restore_checkpoint(checkpoint)
