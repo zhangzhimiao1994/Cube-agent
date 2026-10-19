@@ -9,6 +9,7 @@ from uuid import UUID
 from agent_hub.auth.models import Role
 from agent_hub.capabilities.execution_diagnostics import ExecutionDiagnostic
 from agent_hub.capabilities.gateway import CapabilityResult, CapabilityStatus
+from agent_hub.capabilities.project_prerequisites import ProjectPrerequisiteObservation
 from agent_hub.capabilities.project_verification import ProjectVerificationFailure
 from agent_hub.capabilities.runtime import RuntimeCapabilityError
 from agent_hub.capabilities.types import CapabilityRequest
@@ -254,6 +255,10 @@ class HarnessToolGateway:
                 if (request.tool_name == "project.verify"
                     and type(error.project_failure) is ProjectVerificationFailure):
                     failure_payload["verification_failure"] = error.project_failure.to_payload()
+            elif (request.tool_name == "project.verify"
+                  and type(error.project_prerequisite) is ProjectPrerequisiteObservation
+                  and error.project_failure is None):
+                failure_payload = {"verification_blocked": error.project_prerequisite.to_payload()}
             return self._failure(
                 request, _deterministic_failure_reason(error), payload=failure_payload,
             )

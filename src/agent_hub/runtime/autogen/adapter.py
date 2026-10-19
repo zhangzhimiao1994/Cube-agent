@@ -98,6 +98,7 @@ from agent_hub.runtime.failure_reason import (
 )
 from agent_hub.runtime.generated_file_recovery import reusable_generated_file_result
 from agent_hub.runtime.hermes_context import runtime_memory_context_text
+from agent_hub.runtime.project_prerequisite_feedback import project_prerequisite_feedback
 from agent_hub.runtime.self_repair_context import self_repair_context_text
 
 _ID = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,127}$")
@@ -518,7 +519,7 @@ class _DiscussionDurability:
             result = artifact.content.get("result")
             if not isinstance(result, Mapping):
                 raise RuntimeExecutionError("durable capability result is invalid")
-            if status == "failed" and _execution_failure_result(result) != result:
+            if status == "failed" and _execution_failure_result(result, tool_name=name) != result:
                 raise RuntimeExecutionError("durable capability failure evidence is invalid")
             self._tool_cursor += 1
             return result, idempotency_key
@@ -1293,10 +1294,14 @@ class _ExecutionObservationError(RuntimeError):
         ))
 
 
-def _execution_failure_result(payload: object) -> Mapping[str, JsonValue] | None:
+def _execution_failure_result(
+    payload: object, *, tool_name: object = None,
+) -> Mapping[str, JsonValue] | None:
     """Accept only the bounded F01 receipt supplied by the trusted tool gateway."""
     if not isinstance(payload, Mapping) or "approval_id" in payload:
         return None
+    if "verification_blocked" in payload:
+        return project_prerequisite_feedback(payload, tool_name=tool_name)
     diagnostic = payload.get("execution_diagnostic")
     if not isinstance(diagnostic, Mapping) or set(diagnostic) != {
         "schema_version", "backend", "exit_code", "timed_out", "stdout", "stderr",
@@ -1490,7 +1495,7 @@ class GatewayCapabilityTool(BaseTool[_DynamicToolArguments, _DynamicToolResult])
             )
         )
         if replayed is not None:
-            failed = _execution_failure_result(replayed) == replayed
+            failed = _execution_failure_result(replayed, tool_name=self.name) == replayed
             artifact = next((
                 item for item in self._durability.artifacts
                 if item.producer == self._actor
@@ -1599,7 +1604,7 @@ class GatewayCapabilityTool(BaseTool[_DynamicToolArguments, _DynamicToolResult])
             raise RuntimeExecutionError("capability outcome is uncertain") from None
         if tool_result.status != "succeeded":
             execution_failure = (
-                _execution_failure_result(tool_result.payload)
+                _execution_failure_result(tool_result.payload, tool_name=self.name)
                 if tool_result.call_id == tool_request.call_id
                 and tool_result.tool_name == self.name and not tool_result.truncated
                 else None
@@ -2519,7 +2524,9 @@ class AutoGenDiscussionRuntime:
                         event.kind is EventKind.TOOL_FAILED and (
                             not any(
                                 str(artifact.id) == event.payload.get("artifact_id")
-                                and _execution_failure_result(artifact.content.get("result")) is not None
+                                and _execution_failure_result(
+                                    artifact.content.get("result"), tool_name=event.tool_name,
+                                ) is not None
                                 for artifact in durability.artifacts
                             )
                         )
@@ -3243,6 +3250,25 @@ class AutoGenDiscussionRuntime:
             for artifact in artifacts
         ):
             raise RuntimeExecutionError("runtime checkpoint artifacts are invalid")
+        by_id = {str(artifact.id): artifact for artifact in artifacts}
+        allowed_by_actor = {participant.id: participant.allowed_tools for participant in self._plan.participants}
+        for entry in cast(tuple[Mapping[str, JsonValue], ...], checkpoint.state["tool_ledger"]):
+            if entry.get("status") != "failed":
+                continue
+            artifact = by_id.get(cast(str, entry.get("artifact_id")))
+            result = None if artifact is None else artifact.content.get("result")
+            # Validate all retained failures before a model can skip their replayed calls.
+            if (
+                artifact is None or artifact.type != "tool_result"
+                or artifact.producer != entry.get("actor")
+                or entry.get("name") not in allowed_by_actor.get(artifact.producer, ())
+                or artifact.content_sha256 != entry.get("artifact_sha256")
+                or artifact.content.get("tool_name") != entry.get("name")
+                or artifact.content.get("arguments_sha256") != entry.get("arguments_hash")
+                or not isinstance(result, Mapping)
+                or _execution_failure_result(result, tool_name=entry.get("name")) != result
+            ):
+                raise RuntimeExecutionError("durable capability failure evidence is invalid")
         return artifacts
 
     @staticmethod

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 
+from agent_hub.capabilities.project_prerequisites import validated_project_prerequisite_payload
 from agent_hub.models.capacity import (
     CapacityBackendError,
     CapacityConfigurationError,
@@ -125,6 +126,18 @@ def safe_runtime_failure_diagnostic(
     """Return a redacted, structured diagnostic payload for failed runs."""
 
     reason = safe_runtime_failure_reason(error, fallback=fallback)
+    prerequisite = validated_project_prerequisite_payload(
+        getattr(error, "project_prerequisite_payload", None),
+    )
+    if prerequisite is not None:
+        return _base_diagnostic(
+            reason,
+            error_stage="project_prerequisite",
+            error_category=str(prerequisite["category"]),
+            error_code="project.prerequisite." + str(prerequisite["reason"]),
+            retryable=False,
+            suggested_action="项目执行环境尚未就绪；应先修复环境或完成受控安装，再验证原项目，不要盲目修改源码或重放旧运行。",
+        )
     status_code = error.status_code if isinstance(error, ModelTransportError) else None
     return {**runtime_failure_diagnostic_from_reason(reason, status_code=status_code),
             **gateway_scope_failure_payload(error)}

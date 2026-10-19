@@ -25,6 +25,7 @@ from agent_hub.capabilities.project_inspection import (
     ProjectInspectionError,
     inspect_project,
 )
+from agent_hub.capabilities.project_prerequisites import ProjectPrerequisiteObservation
 from agent_hub.capabilities.project_verification import (
     PROJECT_VERIFY_TOOL,
     ProjectExecutor,
@@ -145,14 +146,21 @@ class RuntimeCapabilityError(RuntimeError):
     def __init__(
         self, *args: object, execution_diagnostic: ExecutionDiagnostic | None = None,
         project_failure: ProjectVerificationFailure | None = None,
+        project_prerequisite: ProjectPrerequisiteObservation | None = None,
     ) -> None:
         if execution_diagnostic is not None and type(execution_diagnostic) is not ExecutionDiagnostic:
             raise TypeError("execution_diagnostic must be ExecutionDiagnostic")
         if project_failure is not None and type(project_failure) is not ProjectVerificationFailure:
             raise TypeError("project_failure must be ProjectVerificationFailure")
+        if project_prerequisite is not None and (
+            type(project_prerequisite) is not ProjectPrerequisiteObservation
+            or execution_diagnostic is not None or project_failure is not None
+        ):
+            raise TypeError("project prerequisite must be a separate typed blocked observation")
         super().__init__(*args)
         self._execution_diagnostic = execution_diagnostic
         self._project_failure = project_failure
+        self._project_prerequisite = project_prerequisite
 
     @property
     def execution_diagnostic(self) -> ExecutionDiagnostic | None:
@@ -161,6 +169,10 @@ class RuntimeCapabilityError(RuntimeError):
     @property
     def project_failure(self) -> ProjectVerificationFailure | None:
         return self._project_failure
+
+    @property
+    def project_prerequisite(self) -> ProjectPrerequisiteObservation | None:
+        return self._project_prerequisite
 
 
 class CapabilityManifestSource(Protocol):
@@ -381,7 +393,8 @@ class RuntimeCapabilityGateway:
                 return result
             except ProjectVerificationError as error:
                 raise RuntimeCapabilityError(str(error), execution_diagnostic=error.diagnostic,
-                                             project_failure=error.project_failure) from None
+                                             project_failure=error.project_failure,
+                                             project_prerequisite=error.project_prerequisite) from None
         return await self._execute_skill(
             tenant_id=tenant_id,
             run_id=run_id,

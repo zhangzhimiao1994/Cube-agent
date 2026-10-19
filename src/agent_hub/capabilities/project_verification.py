@@ -14,6 +14,10 @@ from uuid import UUID, uuid4
 
 from agent_hub.capabilities.approvals import capability_approval_scope
 from agent_hub.capabilities.execution_diagnostics import ExecutionDiagnostic
+from agent_hub.capabilities.project_prerequisites import (
+    ProjectPrerequisiteObservation,
+    validate_project_prerequisite_report,
+)
 from agent_hub.capabilities.scoped_read import authorized_workspace_scope
 from agent_hub.capabilities.types import CapabilityRequest
 from agent_hub.runtime.contracts import JsonValue, _freeze_object
@@ -114,10 +118,17 @@ def validated_project_failure_payload(
 
 class ProjectVerificationError(RuntimeError):
     def __init__(self, message: str, diagnostic: ExecutionDiagnostic | None = None, *,
-                 project_failure: ProjectVerificationFailure | None = None) -> None:
+                 project_failure: ProjectVerificationFailure | None = None,
+                 project_prerequisite: ProjectPrerequisiteObservation | None = None) -> None:
+        if project_prerequisite is not None and (
+            type(project_prerequisite) is not ProjectPrerequisiteObservation
+            or diagnostic is not None or project_failure is not None
+        ):
+            raise TypeError("project prerequisite must be a separate typed blocked observation")
         super().__init__(message)
         self.diagnostic = diagnostic
         self.project_failure = project_failure
+        self.project_prerequisite = project_prerequisite
 
 
 class ProjectExecutor(Protocol):
@@ -246,6 +257,10 @@ def _validate_report(text: str, *, expected_source: str) -> Mapping[str, JsonVal
         if (report.get("source_sha256") != expected_source
             or _SHA.fullmatch(expected_source) is None):
             raise ValueError
+        if report.get("status") == "blocked":
+            prerequisite = validate_project_prerequisite_report(report, expected_source)
+            raise ProjectVerificationError("project verification blocked by execution prerequisites",
+                                           project_prerequisite=prerequisite)
         checks = report.get("checks")
         runtime = report.get("runtime")
         if not isinstance(checks, list) or len(checks) != 3 or not isinstance(runtime, dict):
@@ -308,8 +323,6 @@ def _validate_report(text: str, *, expected_source: str) -> Mapping[str, JsonVal
             })
             raise ProjectVerificationError(f"project {failure[0]} failed", failure[1],
                                            project_failure=observation)
-        if report.get("status") == "blocked":
-            raise ProjectVerificationError("project verification blocked by execution prerequisites")
         if report.get("status") != "passed" or any(
             check["status"] != "passed" for check in checks
         ):

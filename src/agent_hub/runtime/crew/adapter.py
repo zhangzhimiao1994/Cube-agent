@@ -117,6 +117,7 @@ from agent_hub.runtime.failure_reason import (
     runtime_failure_diagnostic_from_reason,
     safe_runtime_failure_reason,
 )
+from agent_hub.runtime.project_prerequisite_feedback import project_prerequisite_feedback
 
 if TYPE_CHECKING:
     from agent_hub.runtime.provider_continuation import ProviderContinuationRepository
@@ -2993,10 +2994,14 @@ def _deterministic_capability_failure_reason(error: RuntimeCapabilityError) -> s
     return _truncate_prompt_text(reason, max_bytes=512)
 
 
-def _execution_failure_result(payload: object) -> Mapping[str, JsonValue] | None:
+def _execution_failure_result(
+    payload: object, *, tool_name: object = None,
+) -> Mapping[str, JsonValue] | None:
     """Accept only the bounded F01 receipt supplied by the trusted tool gateway."""
     if not isinstance(payload, Mapping) or "approval_id" in payload:
         return None
+    if "verification_blocked" in payload:
+        return project_prerequisite_feedback(payload, tool_name=tool_name)
     diagnostic = payload.get("execution_diagnostic")
     if not isinstance(diagnostic, Mapping) or set(diagnostic) != {
         "schema_version", "backend", "exit_code", "timed_out", "stdout", "stderr",
@@ -8122,7 +8127,7 @@ class CrewDispatchRuntime:
                         and existing.get("artifact_id") is not None):
                     artifact = tool_ledger.artifacts.get(idempotency_key)
                     result = artifact.content.get("result") if artifact is not None else None
-                    if _execution_failure_result(result) is None:
+                    if _execution_failure_result(result, tool_name=tool_call.name) is None:
                         _fail("capability execution failed")
                     evidence.append(cast(Artifact, artifact))
                     results.append({"name": tool_call.name, "result": _mutable_json(result)})
@@ -8586,7 +8591,7 @@ class CrewDispatchRuntime:
                         )
                         raise RuntimeExecutionError("capability execution failed") from None
                     execution_failure = (
-                        _execution_failure_result(tool_result.payload)
+                        _execution_failure_result(tool_result.payload, tool_name=tool_call.name)
                         if tool_result.call_id == tool_request.call_id
                         and tool_result.tool_name == tool_call.name and not tool_result.truncated
                         else None
@@ -8983,7 +8988,7 @@ class CrewDispatchRuntime:
                         "the previous model response "
                         + (
                             "returned results with their own status. "
-                            if any(_execution_failure_result(item.get("result")) is not None
+                            if any(_execution_failure_result(item.get("result"), tool_name=item.get("name")) is not None
                                    for item in results)
                             else "completed successfully. "
                         )
@@ -12092,7 +12097,7 @@ class CrewDispatchRuntime:
                 result = artifact.content.get("result")
                 if state["status"] == "failed" and (
                     not isinstance(result, Mapping)
-                    or _execution_failure_result(result) != result
+                    or _execution_failure_result(result, tool_name=state["name"]) != result
                     or artifact.content.get("tool_name") != state["name"]
                     or artifact.content.get("arguments_sha256") != state["arguments_sha256"]
                 ):

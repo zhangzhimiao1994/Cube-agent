@@ -53,6 +53,7 @@ from agent_hub.runtime.hermes_context import runtime_memory_context_text
 from agent_hub.runtime.instruction_context import model_request_sha256
 from agent_hub.runtime.model_scope import ModelScopeTracker
 from agent_hub.runtime.project_preflight_context import project_preflight_context_text
+from agent_hub.runtime.project_prerequisite_feedback import project_prerequisite_feedback
 from agent_hub.runtime.project_scale_artifact import (
     HarnessToolInvoker,
     is_project_scale_artifact_request,
@@ -313,6 +314,12 @@ class _WorkspaceVerificationFailure(_WorkspaceVerificationError):
     def __init__(self, result: HarnessToolCallResult) -> None:
         super().__init__("execution_failed")
         self.result = result
+
+
+class _WorkspacePrerequisiteBlocked(_WorkspaceVerificationError):
+    def __init__(self, payload: Mapping[str, JsonValue]) -> None:
+        super().__init__("blocked_prerequisites")
+        self.project_prerequisite_payload = payload
 
 
 def _workspace_source_digest(known_files: Mapping[str, str]) -> str:
@@ -1596,6 +1603,13 @@ class DirectRuntime:
                 return verification
             raise _WorkspaceVerificationError("not_passed") from None
         failure_code = _verification_gate_failure_code(result.failure_reason)
+        if "verification_blocked" in result.payload:
+            feedback = project_prerequisite_feedback(result.payload, tool_name=result.tool_name)
+            report = None if feedback is None else feedback.get("verification_blocked")
+            if (result.status == "failed" and isinstance(report, Mapping)
+                    and result.failure_reason == "project verification blocked by execution prerequisites"):
+                raise _WorkspacePrerequisiteBlocked(report) from None
+            raise _WorkspaceVerificationError("invalid_response") from None
         if result.failure_reason not in _VERIFICATION_PROCESS_FAILURE_REASONS:
             raise _WorkspaceVerificationError(failure_code) from None
         diagnostic = result.payload.get("execution_diagnostic")
