@@ -374,6 +374,7 @@ async def test_resigned_checkpoint_rejects_wrong_tool_and_mixed_authority_observ
 @pytest.mark.parametrize("defect", [
     "producer_binding", "arguments_binding", "unprivileged_actor", "wrong_ledger_tool",
     "malformed_report", "failed_tail", "terminal_shortcut",
+    "missing_arguments_pair", "invalid_arguments_pair",
 ])
 async def test_autogen_hydration_checks_every_failed_row_before_any_provider_request(
     defect: str, monkeypatch: pytest.MonkeyPatch,
@@ -399,6 +400,11 @@ async def test_autogen_hydration_checks_every_failed_row_before_any_provider_req
         content["tool_name"] = row["name"] = "workspace.read"
     elif defect == "malformed_report":
         content["result"]["verification_blocked"]["status"] = "passed"
+    elif defect == "missing_arguments_pair":
+        del content["arguments_sha256"]
+        del row["arguments_hash"]
+    elif defect == "invalid_arguments_pair":
+        content["arguments_sha256"] = row["arguments_hash"] = "not-a-digest"
     else:
         content["result"]["execution_diagnostic"] = {}
     changed = Artifact(id=uuid4(), type=original.type, producer=producer,
@@ -412,7 +418,7 @@ async def test_autogen_hydration_checks_every_failed_row_before_any_provider_req
         del registry[str(original.id)]
     row.update(artifact_id=str(changed.id), artifact_sha256=changed.content_sha256)
     row["idempotency_key"] = hashlib.sha256(
-        f"{ctx.run_id}:{row['actor']}:{row['position']}:{row['name']}:{row['arguments_hash']}".encode(),
+        f"{ctx.run_id}:{row['actor']}:{row['position']}:{row['name']}:{row.get('arguments_hash')}".encode(),
     ).hexdigest()
     registry[str(changed.id)] = changed.content_sha256
     if defect == "terminal_shortcut":

@@ -3257,6 +3257,7 @@ class AutoGenDiscussionRuntime:
                 continue
             artifact = by_id.get(cast(str, entry.get("artifact_id")))
             result = None if artifact is None else artifact.content.get("result")
+            arguments_hash = entry.get("arguments_hash")
             # Validate all retained failures before a model can skip their replayed calls.
             if (
                 artifact is None or artifact.type != "tool_result"
@@ -3264,7 +3265,9 @@ class AutoGenDiscussionRuntime:
                 or entry.get("name") not in allowed_by_actor.get(artifact.producer, ())
                 or artifact.content_sha256 != entry.get("artifact_sha256")
                 or artifact.content.get("tool_name") != entry.get("name")
-                or artifact.content.get("arguments_sha256") != entry.get("arguments_hash")
+                or type(arguments_hash) is not str
+                or re.fullmatch(r"[0-9a-f]{64}", arguments_hash) is None
+                or artifact.content.get("arguments_sha256") != arguments_hash
                 or not isinstance(result, Mapping)
                 or _execution_failure_result(result, tool_name=entry.get("name")) != result
             ):
