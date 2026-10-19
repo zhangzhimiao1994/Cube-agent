@@ -59,6 +59,7 @@ def test_worker_runtime_stack_uses_configured_artifacts_and_sql_approval_validat
     class FakeRuntimeStack:
         runtime_gateway = object()
         harness_tool_gateway = object()
+        project_input_preparer = object()
 
     class FakePostgresArtifactRepository:
         def __init__(self, session_factory: object) -> None:
@@ -122,12 +123,17 @@ def test_worker_runtime_stack_uses_configured_artifacts_and_sql_approval_validat
     monkeypatch.setattr(worker, "_evolution_terminal_hooks", lambda **kwargs: ())
     monkeypatch.setattr(worker, "PostgresArtifactRepository", FakePostgresArtifactRepository, raising=False)
     monkeypatch.setattr(worker, "configured_runtime_registry", fake_configured_runtime_registry)
-    monkeypatch.setattr(worker, "RunService", lambda *args, **kwargs: object())
+    def fake_run_service(*args: object, **kwargs: object) -> object:
+        captured['run_service'] = kwargs
+        return object()
+
+    monkeypatch.setattr(worker, "RunService", fake_run_service)
     monkeypatch.setattr(worker, "RuntimeMcpService", FakeMcpService)
     monkeypatch.setattr(worker, "RuntimePluginService", FakePluginService)
     monkeypatch.setattr(worker, "build_runtime_capability_stack", fake_build_runtime_capability_stack)
 
     resources = worker.build_worker_service(cast(Settings, FakeSettings()))
+    assert cast(dict[str, object], captured['run_service'])['project_input_preparer'] is FakeRuntimeStack.project_input_preparer
 
     runtime_stack = captured["runtime_stack"]
     mcp_service = captured["mcp_service"]
@@ -237,6 +243,7 @@ def test_worker_runtime_stack_reads_tool_approval_settings_for_target_tenant(
     class FakeRuntimeStack:
         runtime_gateway = object()
         harness_tool_gateway = object()
+        project_input_preparer = None
 
     def fake_build_runtime_capability_stack(**kwargs: object) -> FakeRuntimeStack:
         captured["runtime_stack"] = kwargs
@@ -320,6 +327,7 @@ def test_worker_registers_enabled_plugin_package_subprocess_adapters(
     class FakeRuntimeStack:
         runtime_gateway = object()
         harness_tool_gateway = object()
+        project_input_preparer = None
 
     def fake_build_plugin_package_subprocess_adapters(**kwargs: object) -> dict[str, object]:
         captured["plugin_package_adapter_kwargs"] = kwargs

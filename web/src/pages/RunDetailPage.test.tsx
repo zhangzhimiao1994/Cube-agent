@@ -79,11 +79,12 @@ it("keeps mobile nested process drawers anchored while only details scroll", () 
 it("keeps nested process detail modals full-width and readable on mobile", () => {
   const stylesCss = readFileSync("src/styles.css", "utf8");
   const source = readFileSync("src/pages/RunDetailPage.tsx", "utf8");
+  const sharedSource = readFileSync("src/components/OutputContent.tsx", "utf8");
 
-  expect(source).toContain("aria-expanded={expanded}");
-  expect(source).toContain("aria-controls={contentId}");
-  expect(source).toContain("contentRef.current?.focus()");
-  expect(source).toContain("tabIndex={0}");
+  expect(sharedSource).toContain("aria-expanded={expanded}");
+  expect(sharedSource).toContain("aria-controls={contentId}");
+  expect(sharedSource).toContain("contentRef.current?.focus()");
+  expect(sharedSource).toContain("tabIndex={0}");
   expect(source).toContain("shouldCollapse={presentation.shouldCollapse}");
 
   expect(stylesCss).toMatch(
@@ -120,7 +121,7 @@ it("keeps nested process detail modals full-width and readable on mobile", () =>
     /\.bounded-text-block::after\s*{[^}]*border:\s*1px solid var\(--bounded-text-border\);[^}]*inset:\s*0;[^}]*pointer-events:\s*none;[^}]*position:\s*absolute;/,
   );
   expect(stylesCss).toMatch(
-    /\.process-detail-modal:has\(\.bounded-text-block\.is-expanded\) dl > dd:has\(> \.bounded-text-block\.is-expanded\)\s*{[^}]*display:\s*block;[^}]*flex:\s*1 1 auto;[^}]*overflow:\s*hidden;/,
+    /\.process-detail-modal:has\(\.bounded-text-block\.is-expanded\) dl > dd:has\(\.bounded-text-block\.is-expanded\)\s*{[^}]*display:\s*block;[^}]*flex:\s*1 1 auto;[^}]*overflow:\s*hidden;/,
   );
   expect(stylesCss).toMatch(
     /\.process-detail-modal dd\s*{[\s\S]*overflow-x:\s*auto;[\s\S]*overflow-wrap:\s*normal;[\s\S]*word-break:\s*normal;/,
@@ -130,6 +131,19 @@ it("keeps nested process detail modals full-width and readable on mobile", () =>
   );
   expect(stylesCss).toMatch(
     /@media \(max-width: 640px\)[\s\S]*\.process-detail-modal\s*{[\s\S]*height:\s*calc\(100dvh - env\(safe-area-inset-top\)\);[\s\S]*max-height:\s*calc\(100dvh - env\(safe-area-inset-top\)\);[\s\S]*width:\s*100vw;/,
+  );
+});
+
+it("constrains every nested output expansion ancestor and preserves the reading toolbar", () => {
+  const stylesCss = readFileSync("src/styles.css", "utf8");
+  expect(stylesCss).toMatch(
+    /\.process-detail-modal :is\(\.output-content, \.output-list\):has\(\.bounded-text-block\.is-expanded\)\s*{[^}]*display:\s*flex;[^}]*flex:\s*1 1 auto;[^}]*height:\s*100%;[^}]*min-height:\s*0;[^}]*overflow:\s*hidden;/,
+  );
+  expect(stylesCss).toMatch(
+    /\.process-detail-modal :is\(\.output-content, \.output-list\):has\(\.bounded-text-block\.is-expanded\) > :not\(\.is-expanded\):not\(:has\(\.bounded-text-block\.is-expanded\)\)\s*{[^}]*display:\s*none;/,
+  );
+  expect(stylesCss).toMatch(
+    /\.process-detail-modal \.bounded-text-block\.is-expanded > \.bounded-text-block-header\s*{[^}]*flex:\s*0 0 auto;/,
   );
 });
 
@@ -534,6 +548,43 @@ describe("RunDetailPage", () => {
     expect(document.body.style.overflow).toBe("");
     expect(document.body.style.touchAction).not.toBe("none");
     expect(document.documentElement.style.overflow).toBe("");
+  });
+
+  it("uses shared mixed output in detail sheets and Markdown file previews", async () => {
+    const user = userEvent.setup();
+    const copy = vi.spyOn(navigator.clipboard, "writeText").mockResolvedValue();
+    const code = Array.from({ length: 21 }, (_, index) => `  line ${index}: <tag>\\n  `).join("\n");
+    const text = `开始\n\n| | 说明 |\n|---|---|\n| a\\|b | first<br>second |\n\n~~~c++\n${code}\n~~~\n\n结束\n\n<script>alert(1)</script>`;
+    const artifact = { ...runDetail.artifacts[0], text };
+    const spy = vi.spyOn(api, "run").mockResolvedValue({ ...runDetail, artifacts: [artifact],
+      events: [{ ...runDetail.events[0], artifact }],
+    });
+    try {
+      render(<TestApp initialPath={`/runs/${runId}`} />);
+      const summary = await screen.findByLabelText("Agent 集群动作");
+      await user.click(within(summary).getByRole("button", { name: /Agent 工作席/ }));
+      const drawer = await screen.findByRole("dialog", { name: "Agent 工作席详情" });
+      await user.click(within(drawer).getByRole("button", { name: /SUMMARY_SHOULD_BE_COMPACTED_BEFORE_DRA/ }));
+      await user.click(within(drawer).getByRole("button", { name: /产物/ }));
+      const detail = await screen.findByRole("dialog", { name: "产物详情" });
+      expect(within(detail).getByRole("cell", { name: "a|b" })).toBeTruthy();
+      expect(within(detail).getByRole("cell", { name: "first second" }).querySelector("br")).toBeTruthy();
+      const pre = within(detail).getByLabelText("c++完整内容");
+      await user.click(within(detail).getByRole("button", { name: /^展开$/ }));
+      expect(document.activeElement).toBe(pre);
+      expect(pre.closest(".bounded-text-block")?.classList.contains("is-expanded")).toBe(true);
+      await user.click(within(detail).getByRole("button", { name: "复制 c++ 代码" }));
+      await waitFor(() => expect(copy).toHaveBeenCalledWith(code));
+      expect(detail.querySelectorAll("script,img,iframe")).toHaveLength(0);
+      await user.click(within(detail).getByRole("button", { name: "关闭" }));
+      await user.click(within(drawer).getByRole("button", { name: "返回调度动作" }));
+      await user.click(within(drawer).getByRole("button", { name: "动作与文件" }));
+      const workspace = within(drawer).getByRole("region", { name: "动作与文件工作区" });
+      await user.click(within(workspace).getByRole("button", { name: "预览文件 final-script.md" }));
+      const preview = within(workspace).getByRole("region", { name: "关联文件预览" });
+      expect(within(preview).getByRole("table")).toBeTruthy();
+      expect(within(preview).getByLabelText("c++完整内容").textContent).toBe(code);
+    } finally { spy.mockRestore(); }
   });
 
   it("keeps the agent workbench as one entry point and opens dispatch details on click", async () => {

@@ -1610,6 +1610,7 @@ def create_app(
                     application.state.runtime_capability_gateway = (
                         runtime_capability_stack.runtime_gateway
                     )
+                    application.state.project_input_preparer = runtime_capability_stack.project_input_preparer
                     active_runtime_registry = configured_runtime_registry(
                         config_service=ConfigService(active_sessions),
                         secret_service=active_secret_service,
@@ -1667,6 +1668,7 @@ def create_app(
 
                 application.state.run_service = RunService(
                     RunRepository(active_sessions),
+                    project_input_preparer=getattr(application.state, 'project_input_preparer', None),
                     instruction_context_loader=InstructionContextLoader(
                         repository=RunRepository(active_sessions),
                         project_root=configured.project_workspace_dir,

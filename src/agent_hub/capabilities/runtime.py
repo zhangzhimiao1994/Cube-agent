@@ -9,17 +9,23 @@ import shutil
 import sys
 import tempfile
 import zipfile
+from collections import OrderedDict
 from collections.abc import Awaitable, Mapping
 from inspect import isawaitable
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import Protocol, cast
+from typing import TYPE_CHECKING, Protocol, cast
 from uuid import UUID, uuid4
+
+if TYPE_CHECKING:
+    from agent_hub.harness.tool_gateway import HarnessToolGateway
+    from agent_hub.runs.project_inputs import OriginalProjectPreparer
 
 from agent_hub.capabilities.execution_diagnostics import ExecutionDiagnostic
 from agent_hub.capabilities.manifest import (
     is_safe_manifest_name,
     project_capability_manifest_item,
 )
+from agent_hub.capabilities.project_contracts import ManagedProjectInput, ProjectCheckContract
 from agent_hub.capabilities.project_inspection import (
     PROJECT_INSPECT_TOOL,
     ProjectInspectionError,
@@ -33,7 +39,11 @@ from agent_hub.capabilities.project_verification import (
     ProjectVerificationFailure,
     ProjectVerificationService,
 )
-from agent_hub.capabilities.scoped_read import ScopedReadError, read_scoped_file
+from agent_hub.capabilities.scoped_read import (
+    ScopedReadError,
+    authorized_workspace_scope,
+    read_scoped_file,
+)
 from agent_hub.capabilities.tools.builtin_contracts import (
     builtin_tool_description,
     builtin_tool_input_schema,
@@ -240,6 +250,20 @@ class RuntimeCapabilityGateway:
             if project_workspace_dir is not None else None
         )
         self._project_delivery_receipts: dict[tuple[UUID, UUID], tuple[str, str]] = {}
+        self._project_contract_cache: OrderedDict[tuple[UUID, UUID, str], tuple[ProjectCheckContract, int]] = OrderedDict()
+        self._project_contract_cache_bytes = 0
+
+    def original_project_preparer(self, authorizer: HarnessToolGateway) -> OriginalProjectPreparer | None:
+        from agent_hub.runs.project_inputs import OriginalProjectPreparer
+        from agent_hub.runs.repository import RunRepository
+
+        if (self._project_workspace_dir is None or self._project_verification is None
+                or self._run_repository is None or not self._project_executor_configured):
+            return None
+        return OriginalProjectPreparer(
+            root=self._project_workspace_dir, repository=cast(RunRepository, self._run_repository),
+            authorizer=authorizer, verifier=self._project_verification,
+        )
 
     def is_replay_safe(self, name: str) -> bool:
         normalized_name = _normalize_tool_name(name)
@@ -350,8 +374,12 @@ class RuntimeCapabilityGateway:
         if normalized_name == _PPTX_TOOL:
             return self._execute_generate_pptx(tenant_id, run_id, arguments)
         if normalized_name == _PROJECT_PREFLIGHT_TOOL:
+            if await self._original_project_contract(tenant_id, run_id) is not None:
+                raise RuntimeCapabilityError('original project contract requires scoped workspace operations')
             return self._execute_project_preflight(tenant_id, arguments)
         if normalized_name == _PROJECT_ZIP_TOOL:
+            if await self._original_project_contract(tenant_id, run_id) is not None:
+                raise RuntimeCapabilityError('original project contract requires scoped workspace operations')
             return self._execute_generate_project_zip(tenant_id, run_id, arguments)
         if normalized_name == _WORKSPACE_WRITE_TOOL:
             return await self._execute_workspace_write_text(tenant_id, run_id, arguments)
@@ -640,6 +668,9 @@ class RuntimeCapabilityGateway:
         project_id, session_id = await self._project_workspace_scope(tenant_id, run_id)
         path = _required_string(arguments, "path")
         content = _required_string(arguments, "content")
+        contract = await self._original_project_contract(tenant_id, run_id)
+        if contract is not None and path != 'DELIVERY_MANIFEST.json' and not contract.is_editable(path):
+            raise RuntimeCapabilityError('original project checks are protected from modification')
         try:
             metadata = store.write_bytes(
                 tenant_id=tenant_id,
@@ -691,6 +722,9 @@ class RuntimeCapabilityGateway:
             raise RuntimeCapabilityError("workspace prune requires keep_paths")
         if any(not isinstance(path, str) for path in raw_paths):
             raise RuntimeCapabilityError("workspace prune keep_paths must be strings")
+        contract = await self._original_project_contract(tenant_id, run_id)
+        if contract is not None and not set(contract.protected_files).issubset(raw_paths):
+            raise RuntimeCapabilityError('original project checks are protected from deletion')
         try:
             removed = store.prune_files(
                 tenant_id,
@@ -714,12 +748,17 @@ class RuntimeCapabilityGateway:
         store = self._require_project_workspace_store()
         generated_store = self._require_generated_file_store()
         project_id, session_id = await self._project_workspace_scope(tenant_id, run_id)
+        original_contract = await self._original_project_contract(tenant_id, run_id)
+        if original_contract is not None and (
+            not self._project_executor_configured or self._project_verification is None
+        ):
+            raise RuntimeCapabilityError('project execution backend is unavailable')
         title = _optional_string(arguments, "title") or "Project Workspace"
         verified_source: str | None = None
         delivery_receipt = self._project_delivery_receipts.get((tenant_id, run_id))
         if self._project_executor_configured and self._project_verification is not None:
             files = store.list_files(tenant_id, project_id, session_id)
-            if delivery_receipt is not None or any(item.path == "package.json" for item in files):
+            if original_contract is not None or delivery_receipt is not None or any(item.path == "package.json" for item in files):
                 try:
                     verified_source = await self._project_verification.require_current_receipt(tenant_id, run_id)
                 except ProjectVerificationError as error:
@@ -760,6 +799,10 @@ class RuntimeCapabilityGateway:
             # The receipt was issued by verify(), and _bundle_workspace checked the actual ZIP bytes.
             result["verification_source_sha256"] = verified_source
             result["verification_receipt_sha256"] = delivery_receipt[1]
+            if original_contract is not None and self._project_verification is not None:
+                binding = self._project_verification.original_receipt_binding(tenant_id, run_id)
+                if binding is not None:
+                    result['original_check_contract'] = binding
         return result
 
     @staticmethod
@@ -810,6 +853,71 @@ class RuntimeCapabilityGateway:
             except OSError:
                 pass
         return metadata, bundle.files
+
+    async def _original_project_contract(
+        self, tenant_id: UUID, run_id: UUID,
+    ) -> ProjectCheckContract | None:
+        from agent_hub.capabilities.project_baselines import (
+            ProjectBaselineReference,
+            ProjectBaselineStore,
+        )
+
+        getter = getattr(self._run_repository, 'get', None)
+        if not callable(getter):
+            return None
+        try:
+            record = getter(tenant_id, run_id)
+            if isawaitable(record):
+                record = await record
+            route = getattr(record, 'routing_decision', None)
+            if not isinstance(route, Mapping):
+                return None
+            if ('project_input_contract_version' not in route and route.get('project_input') is None):
+                return None
+            version = route.get('project_input_contract_version')
+            if type(version) is not int or version != 1 or self._project_workspace_dir is None:
+                raise ValueError
+            selection = ManagedProjectInput.from_payload(route.get('project_input'))
+            project, session = authorized_workspace_scope(record, tenant_id=tenant_id, run_id=run_id)
+            state = route.get('project_input_preparation')
+            if (not isinstance(state, Mapping) or type(state.get('schema_version')) is not int
+                    or state['schema_version'] != 1 or state.get('phase') != 'observed'):
+                raise ValueError
+            reference = ProjectBaselineReference.from_payload(state.get('reference'))
+            key = (tenant_id, run_id, reference.contract_sha256)
+            cached = self._project_contract_cache.get(key)
+            if cached is not None:
+                contract = cached[0]
+                self._project_contract_cache.move_to_end(key)
+            else:
+                from agent_hub.skills.sandbox.project import ProjectInvocation
+
+                invocation = ProjectInvocation(
+                    execution_id='original_contract_guard', tenant_id=tenant_id, run_id=run_id,
+                    project_id=project, session_id=session, sandbox_profile='workspace_write',
+                    timeout_seconds=1,
+                )
+                stored = await asyncio.to_thread(
+                    ProjectBaselineStore(self._project_workspace_dir).load, invocation, reference,
+                )
+                contract = stored.contract
+                # Eviction only costs a read-only revalidation; it cannot lose authority or evidence.
+                cost = len(json.dumps(contract.to_payload(), sort_keys=True).encode('utf-8'))
+                limit = 32 * 1024**2
+                while self._project_contract_cache and self._project_contract_cache_bytes + cost > limit:
+                    _, (_, removed) = self._project_contract_cache.popitem(last=False)
+                    self._project_contract_cache_bytes -= removed
+                if cost <= limit:
+                    self._project_contract_cache[key] = (contract, cost)
+                    self._project_contract_cache_bytes += cost
+            if ((contract.tenant_id, contract.run_id, contract.project_id, contract.session_id)
+                    != (tenant_id, run_id, project, session)
+                    or contract.input_source_sha256 != reference.input_source_sha256
+                    or contract.editable_paths != selection.editable_paths):
+                raise ValueError
+            return contract
+        except Exception:  # noqa: BLE001 - a model cannot erase incomplete or changed original-check state.
+            raise RuntimeCapabilityError('original project contract is unavailable or changed') from None
 
     async def _project_workspace_scope(
         self,

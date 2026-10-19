@@ -1,10 +1,11 @@
-import { Fragment, useEffect, useId, useRef, useState } from "react";
+import { Fragment, useEffect, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { createPortal } from "react-dom";
 import { Link, useParams } from "react-router-dom";
 
 import { api, formatApiError, type RunDetail } from "../api/client";
 import { PluginHandoverPanel } from "../components/PluginHandoverPanel";
+import { BoundedTextBlock, OutputContent, hasStructuredOutput, isMarkdownOutputFile, outputFileLanguage } from "../components/OutputContent";
 import {
   ArtifactFileCard,
   artifactFileName,
@@ -2758,8 +2759,8 @@ function detailProcessValuePresentation(row: DetailProcessRow): DetailProcessVal
       kind: "code",
       label,
       copyLabel: `复制 ${label} 内容`,
-      text: trimmed,
-      shouldCollapse: trimmed.length > 1200 || trimmed.split("\n").length > 18,
+      text: row.value,
+      shouldCollapse: row.value.length > 1200 || row.value.split("\n").length > 18,
     };
   }
   return {
@@ -2771,86 +2772,16 @@ function detailProcessValuePresentation(row: DetailProcessRow): DetailProcessVal
   };
 }
 
-function copyDetailTextToClipboard(text: string) {
-  if (navigator.clipboard?.writeText) {
-    return navigator.clipboard.writeText(text);
-  }
-  return Promise.reject(new Error("clipboard unavailable"));
-}
-
-function DetailBoundedTextBlock({
-  copyAriaLabel,
-  label,
-  text,
-  shouldCollapse: shouldCollapseOverride,
-  collapseLabel = "展开",
-  expandLabel = "收起",
-}: {
-  copyAriaLabel: string;
-  label: string;
-  text: string;
-  shouldCollapse?: boolean;
-  collapseLabel?: string;
-  expandLabel?: string;
-}) {
-  const [expanded, setExpanded] = useState(false);
-  const [copied, setCopied] = useState(false);
-  const contentId = useId();
-  const contentRef = useRef<HTMLPreElement>(null);
-  const shouldCollapse = shouldCollapseOverride ?? (text.length > 1200 || text.split("\n").length > 18);
-  useEffect(() => {
-    if (expanded) contentRef.current?.focus();
-  }, [expanded]);
-  return (
-    <div
-      className={`bounded-text-block${shouldCollapse && !expanded ? " is-collapsed" : ""}${shouldCollapse && expanded ? " is-expanded" : ""}`}
-    >
-      <div className="bounded-text-block-header">
-        <span>{label}</span>
-        <div>
-          {shouldCollapse ? (
-            <button
-              type="button"
-              className="text-button"
-              aria-expanded={expanded}
-              aria-controls={contentId}
-              onClick={() => setExpanded((current) => !current)}
-            >
-              {expanded ? expandLabel : collapseLabel}
-            </button>
-          ) : null}
-          <button
-            type="button"
-            className="text-button"
-            aria-label={copied ? `已${copyAriaLabel}` : copyAriaLabel}
-            onClick={() => {
-              void copyDetailTextToClipboard(text)
-                .then(() => {
-                  setCopied(true);
-                  window.setTimeout(() => setCopied(false), 1600);
-                })
-                .catch(() => undefined);
-            }}
-          >
-            {copied ? "已复制" : "复制"}
-          </button>
-        </div>
-      </div>
-      <pre id={contentId} ref={contentRef} tabIndex={0} aria-label={`${label}完整内容`}>
-        {text}
-      </pre>
-    </div>
-  );
-}
 
 function DetailProcessValueBlock({ row }: { row: DetailProcessRow }) {
+  if (hasStructuredOutput(row.value)) return <OutputContent text={row.value} title={row.label} />;
   const presentation = detailProcessValuePresentation(row);
   if (presentation.kind === "plain" && !presentation.shouldCollapse) {
     return <span>{presentation.text}</span>;
   }
   if (presentation.kind === "plain") {
     return (
-      <DetailBoundedTextBlock
+      <BoundedTextBlock
         copyAriaLabel={presentation.copyLabel}
         label={row.label}
         text={presentation.text}
@@ -2861,9 +2792,10 @@ function DetailProcessValueBlock({ row }: { row: DetailProcessRow }) {
     );
   }
   return (
-    <DetailBoundedTextBlock
+    <BoundedTextBlock
       copyAriaLabel={presentation.copyLabel}
       label={presentation.label}
+      language={presentation.label}
       text={presentation.text}
       shouldCollapse={presentation.shouldCollapse}
     />
@@ -3113,7 +3045,10 @@ function DetailWorkbenchFilePreview({
           srcDoc={detailSandboxedHtmlDocument(previewText)}
         />
       ) : canPreview ? (
-        <pre className="agent-workbench-file-code">{loading ? "正在读取文件预览..." : detailSourcePreviewText(previewText) || "暂无可预览内容"}</pre>
+        <OutputContent title={file.filename} text={loading ? "正在读取文件预览..." : detailSourcePreviewText(previewText) || "暂无可预览内容"}
+          format={isMarkdownOutputFile(file.filename, file.mimeType ?? "") ? "markdown" : "code"}
+          language={outputFileLanguage(file.filename, file.mimeType ?? "")}
+          copyAriaLabel={`复制 ${file.filename}${(previewText?.length ?? 0) > 8000 ? " 预览" : " 内容"}`} />
       ) : (
         <p className="agent-workbench-compressed-note">该文件不适合直接预览，请下载查看。</p>
       )}

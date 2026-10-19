@@ -2101,6 +2101,7 @@ article:hover {
 
 .composer-settings-dialog input,
 .composer-settings-dialog select,
+.composer-settings-dialog textarea,
 .composer-settings-dialog .conversation-workspace-summary,
 .composer-settings-dialog .mode-help,
 .composer-settings-dialog .run-settings-panel {
@@ -4487,17 +4488,33 @@ article:hover {
   display: none;
 }
 
-.process-detail-modal:has(.bounded-text-block.is-expanded) dl > dt:has(+ dd > .bounded-text-block.is-expanded) {
+.process-detail-modal:has(.bounded-text-block.is-expanded) dl > dt:has(+ dd .bounded-text-block.is-expanded) {
   display: block;
   flex: 0 0 auto;
   margin-bottom: 0.42rem;
 }
 
-.process-detail-modal:has(.bounded-text-block.is-expanded) dl > dd:has(> .bounded-text-block.is-expanded) {
+.process-detail-modal:has(.bounded-text-block.is-expanded) dl > dd:has(.bounded-text-block.is-expanded) {
   display: block;
   flex: 1 1 auto;
   min-height: 0;
   overflow: hidden;
+}
+
+.process-detail-modal :is(.output-content, .output-list):has(.bounded-text-block.is-expanded) {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  gap: 0;
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
+  margin: 0;
+  padding: 0;
+}
+
+.process-detail-modal :is(.output-content, .output-list):has(.bounded-text-block.is-expanded) > :not(.is-expanded):not(:has(.bounded-text-block.is-expanded)) {
+  display: none;
 }
 
 .bounded-text-block {
@@ -4590,13 +4607,26 @@ article:hover {
   max-height: 12rem;
 }
 
+.bounded-text-block pre code {
+  background: none;
+  color: inherit;
+  font: inherit;
+  padding: 0;
+  white-space: inherit;
+}
+
 .bounded-text-block.is-expanded pre {
   max-height: none;
 }
 
 .process-detail-modal .bounded-text-block.is-expanded {
+  flex: 1 1 auto;
   height: 100%;
   min-height: 0;
+}
+
+.process-detail-modal .bounded-text-block.is-expanded > .bounded-text-block-header {
+  flex: 0 0 auto;
 }
 
 .process-detail-modal .bounded-text-block.is-expanded pre {
@@ -8706,6 +8736,30 @@ article:hover {
   overflow-wrap: anywhere;
 }
 
+.output-content,
+.output-list {
+  max-width: 100%;
+  min-width: 0;
+}
+
+.output-content {
+  display: grid;
+  gap: 0.75rem;
+}
+
+.output-list {
+  display: grid;
+  gap: 0.5rem;
+  margin: 0;
+  padding-left: 1.4rem;
+}
+
+.output-quote {
+  border-left: 2px solid var(--line);
+  margin: 0;
+  padding-left: 0.75rem;
+}
+
 .message-body p {
   max-width: 100%;
   min-width: 0;
@@ -8717,27 +8771,40 @@ article:hover {
 
 .message-table-wrap {
   max-width: 100%;
+  min-width: 0;
   overflow-x: auto;
-  border: 1px solid rgba(148, 163, 184, 0.32);
-  border-radius: 8px;
-  background: rgba(15, 23, 42, 0.28);
+  overscroll-behavior-x: contain;
+  border: 1px solid #dce1e8;
+  border-radius: 4px;
+  background: #ffffff;
 }
 
 .message-table {
-  width: 100%;
-  min-width: 360px;
+  width: max(100%, calc(var(--output-column-count) * 12rem));
+  table-layout: fixed;
   border-collapse: collapse;
-  font-size: 0.92rem;
+  border: 0;
+  border-radius: 0;
+  background: #ffffff;
+  color: #263445;
+  font-size: 0.86rem;
   line-height: 1.5;
+}
+
+.message-table col {
+  width: 12rem;
 }
 
 .message-table th,
 .message-table td {
   padding: 0.55rem 0.7rem;
-  border-right: 1px solid rgba(148, 163, 184, 0.24);
-  border-bottom: 1px solid rgba(148, 163, 184, 0.24);
+  border-right: 1px solid #e3e7ed;
+  border-bottom: 1px solid #e3e7ed;
   text-align: left;
   vertical-align: top;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+  word-break: normal;
 }
 
 .message-table th:last-child,
@@ -8750,15 +8817,21 @@ article:hover {
 }
 
 .message-table th {
-  color: #e5faff;
-  font-weight: 800;
-  background: rgba(20, 184, 166, 0.13);
+  color: #25364c;
+  font-size: inherit;
+  font-weight: 650;
+  letter-spacing: 0;
+  text-transform: none;
+  background: #f0f3f7;
+}
+
+.message-table tbody tr:hover {
+  background: #f8faff;
 }
 
 @media (max-width: 640px) {
   .message-table {
-    min-width: 320px;
-    font-size: 0.86rem;
+    font-size: 0.82rem;
   }
 
   .message-table th,

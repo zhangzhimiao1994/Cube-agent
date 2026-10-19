@@ -16,6 +16,38 @@ PNG_MIME = "image/png"
 ZIP_MIME = "application/zip"
 
 
+@pytest.mark.parametrize("method", ["bytes", "copy", "move"])
+def test_long_artifact_paths_preserve_timestamp_and_scoped_download(
+    tmp_path: Path, method: str,
+) -> None:
+    root = tmp_path / ("workspace-" + "a" * 100) / "generated"
+    store = GeneratedFileStore(root)
+    tenant_id, run_id, artifact_id = uuid4(), uuid4(), uuid4()
+    data = b"PK\x03\x04long-path-artifact"
+    source = tmp_path / "source.zip"
+    source.write_bytes(data)
+    if method == "bytes":
+        metadata = store.store_bytes(
+            tenant_id, run_id, artifact_id, "verified-project.zip", ZIP_MIME, data,
+            timestamp_filename=True,
+        )
+    else:
+        metadata = store.store_path(
+            tenant_id, run_id, artifact_id, "verified-project.zip", ZIP_MIME, source,
+            move=method == "move", timestamp_filename=True,
+        )
+    assert len(str(root / metadata.storage_key)) > 260
+    assert metadata.filename.startswith("verified-project_")
+    assert metadata.sha256 == sha256(data).hexdigest()
+    assert store.resolve_for(tenant_id, run_id, artifact_id, metadata.storage_key).read_bytes() == data
+    assert source.exists() is (method != "move")
+    with pytest.raises(ValueError, match="context"):
+        store.resolve_for(uuid4(), run_id, artifact_id, metadata.storage_key)
+    store.delete_run(tenant_id, run_id)
+    with pytest.raises(FileNotFoundError):
+        store.resolve(metadata.storage_key)
+
+
 @pytest.mark.parametrize("method", ["store_bytes", "store_path"])
 @pytest.mark.parametrize(
     ("filename", "mime_type", "expected"),

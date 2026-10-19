@@ -1,5 +1,5 @@
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Fragment, FormEvent, type ReactNode, useEffect, useId, useMemo, useRef, useState } from "react";
+import { Fragment, FormEvent, type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { Link, useLocation, useNavigate } from "react-router-dom";
 import { z } from "zod";
@@ -7,6 +7,7 @@ import { z } from "zod";
 import { ApiError, api, formatApiError, type AttachmentUpload, type Conversation, type ConversationMetadata, type ConversationQueueItem, type ModelDeployment, type ProjectWorkspace, type RunDetail, type RunListItem, type Skill, type SkillArchiveUpload, type SubmittedRun, type WebPreview, type WorkspaceDirectoryList, type WorkspaceFileList } from "../api/client";
 import { APP_BRAND_NAME } from "../app/brand";
 import { PreviewFrame } from "../preview/PreviewFrame";
+import { BoundedTextBlock, OutputContent, copyOutputText as copyTextToClipboard, hasStructuredOutput, isMarkdownOutputFile, outputFileLanguage } from "../components/OutputContent";
 import {
   ArtifactFileCard,
   artifactFileName,
@@ -1210,8 +1211,8 @@ export function processDetailValuePresentation(row: { label: string; value: stri
       kind: "code",
       label,
       copyLabel: `复制 ${label} 内容`,
-      text: trimmed,
-      shouldCollapse: trimmed.length > 1200 || trimmed.split("\n").length > 18,
+      text: row.value,
+      shouldCollapse: row.value.length > 1200 || row.value.split("\n").length > 18,
     };
   }
   return {
@@ -4042,7 +4043,10 @@ export function WorkbenchFilePreview({
           srcDoc={sandboxedHtmlDocument(previewText)}
         />
       ) : canPreview ? (
-        <pre className="agent-workbench-file-code">{loading ? "正在读取文件预览..." : sourcePreviewText(previewText) || "暂无可预览内容"}</pre>
+        <OutputContent title={file.filename} text={loading ? "正在读取文件预览..." : sourcePreviewText(previewText) || "暂无可预览内容"}
+          format={isMarkdownOutputFile(file.filename, file.mimeType ?? "") ? "markdown" : "code"}
+          language={outputFileLanguage(file.filename, file.mimeType ?? "")}
+          copyAriaLabel={`复制 ${file.filename}${(previewText?.length ?? 0) > 8000 ? " 预览" : " 内容"}`} />
       ) : (
         <p className="agent-workbench-compressed-note">该文件不适合直接预览，请下载查看。</p>
       )}
@@ -5748,72 +5752,9 @@ function processDetailGroupSummary(group: ProcessDetailGroup) {
   return conciseProcessText(presentation.text, `${group.rows.length} 项摘要`);
 }
 
-function BoundedTextBlock({
-  copyAriaLabel,
-  label,
-  text,
-  shouldCollapse: shouldCollapseOverride,
-  collapseLabel = "展开",
-  expandLabel = "收起",
-}: {
-  copyAriaLabel: string;
-  label: string;
-  text: string;
-  shouldCollapse?: boolean;
-  collapseLabel?: string;
-  expandLabel?: string;
-}) {
-  const [expanded, setExpanded] = useState(false);
-  const [copied, setCopied] = useState(false);
-  const contentId = useId();
-  const contentRef = useRef<HTMLPreElement>(null);
-  const shouldCollapse = shouldCollapseOverride ?? (text.length > 1200 || text.split("\n").length > 18);
-  useEffect(() => {
-    if (expanded) contentRef.current?.focus();
-  }, [expanded]);
-  return (
-    <div
-      className={`bounded-text-block${shouldCollapse && !expanded ? " is-collapsed" : ""}${shouldCollapse && expanded ? " is-expanded" : ""}`}
-    >
-      <div className="bounded-text-block-header">
-        <span>{label}</span>
-        <div>
-          {shouldCollapse ? (
-            <button
-              type="button"
-              className="text-button"
-              aria-expanded={expanded}
-              aria-controls={contentId}
-              onClick={() => setExpanded((current) => !current)}
-            >
-              {expanded ? expandLabel : collapseLabel}
-            </button>
-          ) : null}
-          <button
-            type="button"
-            className="text-button"
-            aria-label={copied ? `已${copyAriaLabel}` : copyAriaLabel}
-            onClick={() => {
-              void copyTextToClipboard(text)
-                .then(() => {
-                  setCopied(true);
-                  window.setTimeout(() => setCopied(false), 1600);
-                })
-                .catch(() => undefined);
-            }}
-          >
-            {copied ? "已复制" : "复制"}
-          </button>
-        </div>
-      </div>
-      <pre id={contentId} ref={contentRef} tabIndex={0} aria-label={`${label}完整内容`}>
-        {text}
-      </pre>
-    </div>
-  );
-}
 
 function ProcessDetailValueBlock({ row }: { row: { label: string; value: string } }) {
+  if (hasStructuredOutput(row.value)) return <OutputContent text={row.value} title={row.label} />;
   const presentation = processDetailValuePresentation(row);
   if (presentation.kind === "plain" && !presentation.shouldCollapse) {
     return <span>{presentation.text}</span>;
@@ -5834,6 +5775,7 @@ function ProcessDetailValueBlock({ row }: { row: { label: string; value: string 
     <BoundedTextBlock
       copyAriaLabel={presentation.copyLabel}
       label={presentation.label}
+      language={presentation.label}
       text={presentation.text}
       shouldCollapse={presentation.shouldCollapse}
     />
@@ -6545,168 +6487,8 @@ function RenameConversationDialog({
   );
 }
 
-type MessageBodyBlock =
-  | { kind: "paragraph"; text: string }
-  | { kind: "code"; language: string; text: string }
-  | { kind: "table"; headers: string[]; rows: string[][] };
-
-function markdownMessageBlocks(text: string): MessageBodyBlock[] {
-  const lines = text.replace(/\r\n/g, "\n").split("\n");
-  const blocks: MessageBodyBlock[] = [];
-  let paragraph: string[] = [];
-  let index = 0;
-
-  function flushParagraph() {
-    const value = paragraph.join("\n").trim();
-    if (value) blocks.push({ kind: "paragraph", text: value });
-    paragraph = [];
-  }
-
-  while (index < lines.length) {
-    const fenceMatch = lines[index].match(/^```\s*([A-Za-z0-9_-]+)?\s*$/);
-    if (fenceMatch) {
-      flushParagraph();
-      const language = fenceMatch[1]?.trim() || "text";
-      index += 1;
-      const codeLines: string[] = [];
-      while (index < lines.length && !/^```\s*$/.test(lines[index])) {
-        codeLines.push(lines[index]);
-        index += 1;
-      }
-      if (index < lines.length) index += 1;
-      blocks.push({ kind: "code", language, text: codeLines.join("\n") });
-      continue;
-    }
-    if (isMarkdownTableStart(lines, index)) {
-      flushParagraph();
-      const headers = markdownTableCells(lines[index]);
-      index += 2;
-      const rows: string[][] = [];
-      while (index < lines.length && markdownTableCells(lines[index]).length >= headers.length && lines[index].includes("|")) {
-        rows.push(markdownTableCells(lines[index]).slice(0, headers.length));
-        index += 1;
-      }
-      if (headers.length > 0 && rows.length > 0) {
-        blocks.push({ kind: "table", headers, rows });
-        continue;
-      }
-    }
-    paragraph.push(lines[index]);
-    index += 1;
-  }
-  flushParagraph();
-  return blocks;
-}
-
-function isMarkdownTableStart(lines: string[], index: number) {
-  if (index + 1 >= lines.length) return false;
-  const header = markdownTableCells(lines[index]);
-  const separator = markdownTableCells(lines[index + 1]);
-  if (header.length < 2 || separator.length !== header.length) return false;
-  return separator.every((cell) => /^:?-{2,}:?$/.test(cell.trim()));
-}
-
-function markdownTableCells(line: string) {
-  const trimmed = line.trim();
-  if (!trimmed.includes("|")) return [];
-  const body = trimmed.startsWith("|") ? trimmed.slice(1) : trimmed;
-  const normalized = body.endsWith("|") ? body.slice(0, -1) : body;
-  return normalized.split("|").map((cell) => cell.replace(/\\\|/g, "|").trim());
-}
-
-function copyTextToClipboard(text: string) {
-  if (navigator.clipboard?.writeText) {
-    return navigator.clipboard.writeText(text);
-  }
-  return Promise.reject(new Error("clipboard unavailable"));
-}
-
-function CollapsibleMessageParagraph({ text }: { text: string }) {
-  const [expanded, setExpanded] = useState(false);
-  const [copied, setCopied] = useState(false);
-  const lines = text.split("\n");
-  const shouldCollapse = text.length > 900 || lines.length > 12;
-  const preview = lines.slice(0, 10).join("\n");
-  const displayText = shouldCollapse && !expanded
-    ? `${preview.slice(0, 900)}${text.length > 900 || lines.length > 10 ? "\n..." : ""}`
-    : text;
-  const copyable = shouldCollapse || text.length > 240 || lines.length > 4;
-  return (
-    <div className={`message-paragraph${shouldCollapse ? " is-collapsible" : ""}`}>
-      {copyable ? (
-        <div className="message-paragraph-tools" aria-label="消息文本工具">
-          {shouldCollapse ? (
-            <button type="button" className="message-expand-button" onClick={() => setExpanded((current) => !current)}>
-              {expanded ? "收起" : "展开全文"}
-            </button>
-          ) : null}
-          <button
-            type="button"
-            className="message-expand-button"
-            onClick={() => {
-              void copyTextToClipboard(text).then(() => {
-                setCopied(true);
-                window.setTimeout(() => setCopied(false), 1600);
-              }).catch(() => undefined);
-            }}
-          >
-            {copied ? "已复制" : "复制全文"}
-          </button>
-        </div>
-      ) : null}
-      <p>{displayText}</p>
-    </div>
-  );
-}
-
 export function MessageBody({ text, title }: { text: string; title: string }) {
-  const blocks = markdownMessageBlocks(text);
-  if (blocks.length === 0) return null;
-  let tableIndex = 0;
-  return (
-    <div className="message-body">
-      {blocks.map((block, index) => {
-        if (block.kind === "paragraph") {
-          return <CollapsibleMessageParagraph key={`paragraph-${index}`} text={block.text} />;
-        }
-        if (block.kind === "code") {
-          return (
-            <BoundedTextBlock
-              key={`code-${index}`}
-              copyAriaLabel={`复制 ${block.language} 代码`}
-              label={block.language}
-              text={block.text}
-            />
-          );
-        }
-        tableIndex += 1;
-        return (
-          <div className="message-table-wrap" key={`table-${index}`}>
-            <table aria-label={`${title}表格 ${tableIndex}`} className="message-table">
-              <thead>
-                <tr>
-                  {block.headers.map((header, headerIndex) => (
-                    <th key={`${header}-${headerIndex}`} scope="col">
-                      {header}
-                    </th>
-                  ))}
-                </tr>
-              </thead>
-              <tbody>
-                {block.rows.map((row, rowIndex) => (
-                  <tr key={`row-${rowIndex}`}>
-                    {block.headers.map((_header, cellIndex) => (
-                      <td key={`cell-${rowIndex}-${cellIndex}`}>{row[cellIndex] ?? ""}</td>
-                    ))}
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        );
-      })}
-    </div>
-  );
+  return <OutputContent text={text} title={title} />;
 }
 export function RunsPage() {
   const queryClient = useQueryClient();
@@ -6765,6 +6547,10 @@ export function RunsPage() {
   const [sandboxProfile, setSandboxProfile] = useState<SandboxProfile>("workspace_write");
   const [executionBackend, setExecutionBackend] = useState<ExecutionBackendId>("systemd");
   const [runWorkspacePath, setRunWorkspacePath] = useState("");
+  const [projectInputAuthorization, setProjectInputAuthorization] = useState<{
+    scopeKey: string;
+    paths: string;
+  } | null>(null);
   const [referenceConversationId, setReferenceConversationId] = useState("");
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   const [selectedConversationIds, setSelectedConversationIds] = useState<string[]>([]);
@@ -6946,6 +6732,17 @@ export function RunsPage() {
   const activeWorkspaceSessionId =
     activeConversation.data?.workspace_path?.trim() || listedConversationMetadata?.workspace_path?.trim() || activeConversationId;
   const selectedRunWorkspaceSessionId = runWorkspacePath.trim() || activeWorkspaceSessionId;
+  const projectInputScopeKey = JSON.stringify([
+    projectId, activeWorkspaceProjectId, activeWorkspaceSessionId,
+    selectedRunWorkspaceSessionId, activeConversationId,
+  ]);
+  const managedWorkspaceInput = projectInputAuthorization?.scopeKey === projectInputScopeKey;
+  useEffect(() => {
+    setProjectInputAuthorization(null);
+  }, [projectInputScopeKey]);
+  const editablePaths = managedWorkspaceInput
+    ? projectInputAuthorization.paths.split(/\r?\n/).map((path) => path.trim()).filter(Boolean)
+    : [];
   const inspectedRunWorkspaceSessionId =
     selectedRun.data && runConversationId(selectedRun.data) === activeConversationId
       ? selectedRun.data.explicit_details.workspace_session_id?.trim()
@@ -7287,6 +7084,7 @@ export function RunsPage() {
 
   const createRun = useMutation({
     mutationFn: async (override?: RunSubmissionOverride) => {
+      const projectInput = projectInputForSubmission();
       const runMessage = (override?.message ?? message).trim();
       let conversationMetadata = activeConversation.data ?? listedConversationMetadata;
       if (!conversationMetadata?.created_at) {
@@ -7309,6 +7107,7 @@ export function RunsPage() {
         }
       }
       return api.createRun({
+        ...projectInput,
         message: runMessage,
         mode: "auto",
         reference_workflow_id: workflowId || null,
@@ -7456,11 +7255,13 @@ export function RunsPage() {
   });
 
   const queueMessage = useMutation({
+    onMutate: () => ({ scopeKey: projectInputScopeKey, authorization: projectInputAuthorization }),
     mutationFn: (queuedMessage: string) =>
       api.queueConversationMessage(
         activeConversationId,
         `queue-${Date.now()}-${Math.random().toString(16).slice(2)}`,
         {
+          ...projectInputForSubmission(),
           message: queuedMessage,
           mode: "auto",
           reference_conversation_id: referenceConversationId.trim() || null,
@@ -7481,8 +7282,14 @@ export function RunsPage() {
       setSubmitNotice("消息已排队，将在当前任务结束后执行。");
       await queryClient.invalidateQueries({ queryKey: ["conversation-queue", activeConversationId] });
     },
-    onError: (error, queuedMessage) => {
+    onError: (error, queuedMessage, submitted) => {
       if (error instanceof ApiError && error.code === "conversation_not_active") {
+        if (submitted && (
+          submitted.scopeKey !== projectInputScopeKey || submitted.authorization !== projectInputAuthorization
+        )) {
+          setSubmitNotice("工作区授权已变更，请重新发送消息。");
+          return;
+        }
         createRun.mutate({ message: queuedMessage, mode: "auto" });
       }
     },
@@ -8192,6 +7999,10 @@ export function RunsPage() {
       });
       return;
     }
+    if (projectInputError) {
+      setSubmitNotice(projectInputError);
+      return;
+    }
     if (canStopLatestRun) {
       queueMessage.mutate(trimmed);
       return;
@@ -8481,6 +8292,33 @@ export function RunsPage() {
   const selectedSandboxLabel = displaySandboxProfile(sandboxProfile);
   const availableExecutionBackends = executionBackends.data?.filter((backend) => backend.available) ?? [];
   const selectedExecutionBackend = executionBackends.data?.find((item) => item.id === executionBackend);
+  const inputConversation = activeConversation.data ?? listedConversationMetadata;
+  const projectInputError = !managedWorkspaceInput
+    ? null
+    : !inputConversation?.created_at ||
+        inputConversation.conversation_id !== activeConversationId ||
+        !inputConversation.project_id?.trim() || !inputConversation.workspace_path?.trim()
+      ? "请先选择具体项目和会话工作区。"
+      : selectedRunWorkspaceSessionId !== inputConversation.workspace_path.trim()
+        ? "当前工作区输入必须使用当前会话工作区。"
+        : executionBackend !== "systemd" || !selectedExecutionBackend?.available ||
+            !selectedExecutionBackend.supported_sandbox_profiles.includes("workspace_write") ||
+            sandboxProfile !== "workspace_write"
+          ? "当前工作区输入需要可用的 systemd 执行环境和项目写入权限。"
+          : editablePaths.length === 0
+            ? "请填写允许修改路径。"
+            : null;
+
+  function projectInputForSubmission() {
+    if (projectInputError) throw new Error(projectInputError);
+    return managedWorkspaceInput ? {
+      project_input: {
+        schema_version: 1 as const,
+        kind: "managed_workspace" as const,
+        editable_paths: editablePaths,
+      },
+    } : {};
+  }
   const configuredExecutionBackend = executionBackends.data?.find(
     (backend) => backend.id === settings.data?.default_execution_backend,
   );
@@ -9014,6 +8852,42 @@ export function RunsPage() {
           <details className="run-settings-panel" aria-label="本次运行设置">
             <summary aria-label="展开或收起本次运行设置">详细设置</summary>
             <div className="chat-config-strip" aria-label="本次对话运行设置">
+            <div className="sandbox-settings" aria-label="输入来源">
+              <span className="field-label">输入来源</span>
+              <div className="sandbox-choice-row" role="group" aria-label="选择本次运行输入来源">
+                <button
+                  type="button"
+                  className={`sandbox-choice${!managedWorkspaceInput ? " selected" : ""}`}
+                  aria-pressed={!managedWorkspaceInput}
+                  onClick={() => setProjectInputAuthorization(null)}
+                >
+                  <strong>新建</strong>
+                </button>
+                <button
+                  type="button"
+                  className={`sandbox-choice${managedWorkspaceInput ? " selected" : ""}`}
+                  aria-pressed={managedWorkspaceInput}
+                  onClick={() => {
+                    if (!managedWorkspaceInput) setProjectInputAuthorization({ scopeKey: projectInputScopeKey, paths: "" });
+                  }}
+                >
+                  <strong>当前工作区</strong>
+                </button>
+              </div>
+              {managedWorkspaceInput ? (
+                <label htmlFor="project-input-editable-paths">
+                  允许修改路径（每行一项）
+                  <textarea
+                    id="project-input-editable-paths"
+                    rows={4}
+                    value={projectInputAuthorization.paths}
+                    aria-invalid={editablePaths.length === 0}
+                    onChange={(event) => setProjectInputAuthorization({ scopeKey: projectInputScopeKey, paths: event.target.value })}
+                  />
+                </label>
+              ) : null}
+              {projectInputError ? <p className="form-error" role="alert">{projectInputError}</p> : null}
+            </div>
             <label htmlFor="run-workflow">
               参考方案
               <select
@@ -9827,15 +9701,16 @@ export function RunsPage() {
                   disabled={
                     createRun.isPending ||
                     queueMessage.isPending ||
+                    Boolean(projectInputError) ||
                     message.trim().length === 0 ||
                     currentConversationArchived
                   }
                   title={
-                    modeSelection
+                    projectInputError ?? (modeSelection
                       ? "确认运行模式"
                       : canStopLatestRun
                         ? "当前任务完成后执行这条消息"
-                        : "发送消息"
+                        : "发送消息")
                   }
                 >
                   {queueMessage.isPending

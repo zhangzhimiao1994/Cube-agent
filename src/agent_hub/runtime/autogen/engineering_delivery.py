@@ -24,6 +24,10 @@ from agent_hub.runtime.contracts import (
 from agent_hub.runtime.crew.engineering_delivery import _successful_source
 from agent_hub.runtime.crew.workspace_maintenance_delivery import _file_metadata
 from agent_hub.runtime.engineering_actions import EngineeringProgress
+from agent_hub.runtime.original_project_progress import (
+    original_contract_binding_matches,
+    original_failure_observed,
+)
 
 _READ_ONLY = frozenset({"read_context", "project.inspect", "workspace.read", "workspace_read",
                         "workspace.list", "workspace.search"})
@@ -126,6 +130,7 @@ def engineering_delivery_required(
 def engineering_delivery_ready(
     *, run_id: UUID, tool_entries: Sequence[Mapping[str, JsonValue]],
     artifacts: Sequence[Artifact], allowed_tools: Mapping[str, Sequence[str]], require_write: bool = True,
+    context: TaskContext | None = None,
 ) -> bool:
     """Inspect only persisted outcomes; no model, filesystem, tool or replay effects.
 
@@ -184,6 +189,8 @@ def engineering_delivery_ready(
             verified, ready = None, False
         elif name == "project.verify":
             source = _successful_source(result)
+            if source is not None and not original_contract_binding_matches(context, result, source):
+                source = None
             receipt_sha = hashlib.sha256(json.dumps(
                 result.get("verification"), default=dict, sort_keys=True,
                 separators=(",", ":"), ensure_ascii=True,
@@ -193,6 +200,7 @@ def engineering_delivery_ready(
         elif name == "workspace.bundle":
             ready = False
             if (verified is None or result.get("verification_source_sha256") != verified[0]
+                or not original_contract_binding_matches(context, result, verified[0])
                 or result.get("verification_receipt_sha256") != verified[1]
                 or result.get("presentation") != "final_attachment"):
                 continue
@@ -230,6 +238,7 @@ def engineering_progress(
     """Interpret scoped native outcomes only. A model's text is never evidence."""
     by_id = {str(item.id): item for item in artifacts}
     inspected = existing = has_writes = seen = current = failed_current = False
+    seen = failed_current = original_failure_observed(context)
     known: dict[str, tuple[str, str, int]] = {}
     used: set[str] = set()
     uncertain = len(by_id) != len(artifacts)
@@ -302,13 +311,14 @@ def engineering_progress(
             known[item[0]] = item
         elif name == "project.verify":
             seen = True
-            current = _successful_source(result) is not None
+            source = _successful_source(result)
+            current = source is not None and original_contract_binding_matches(context, result, source)
             failed_current = not current
         elif name not in _READ_ONLY | {"workspace.bundle"}:
             current = False
     bundle = not uncertain and engineering_delivery_ready(
         run_id=context.run_id, tool_entries=tool_entries, artifacts=artifacts,
-        allowed_tools=allowed_tools, require_write=not existing,
+        allowed_tools=allowed_tools, require_write=not existing, context=context,
     )
     return EngineeringProgress(
         inspected=inspected, existing_project=existing, has_writes=has_writes,

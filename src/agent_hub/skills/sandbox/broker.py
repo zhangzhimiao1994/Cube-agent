@@ -29,6 +29,7 @@ from agent_hub.skills.sandbox.base import (
     validate_execution_id,
 )
 from agent_hub.skills.sandbox.project import (
+    ContractProjectBrokerRequest,
     ProjectBrokerRequest,
     ProjectExecutionBroker,
     ProjectTerminateRequest,
@@ -318,7 +319,7 @@ class SkillBroker:
         self._project_broker = ProjectExecutionBroker(policy, self._execution_slots)
 
     async def handle_project(
-        self, request: ProjectBrokerRequest | ProjectTerminateRequest, *, peer_uid: int,
+        self, request: ProjectBrokerRequest | ContractProjectBrokerRequest | ProjectTerminateRequest, *, peer_uid: int,
     ) -> BrokerResponse:
         return await self._project_broker.handle(request, peer_uid=peer_uid)
 
@@ -529,14 +530,18 @@ async def _serve_client(
         peer_uid = _peer_uid(writer)
         payload = await _read_frame(reader, _MAX_REQUEST_BYTES)
         envelope = json.loads(payload)
-        if isinstance(envelope, dict) and type(envelope.get("version")) is int and envelope["version"] == 2:
+        if isinstance(envelope, dict) and type(envelope.get("version")) is int and envelope["version"] in {2, 3}:
             is_project = True
             if envelope.get("action") == "terminate_project":
-                project_request: ProjectBrokerRequest | ProjectTerminateRequest = (
+                project_request: ProjectBrokerRequest | ContractProjectBrokerRequest | ProjectTerminateRequest = (
                     ProjectTerminateRequest.model_validate_json(payload, strict=True)
                 )
             else:
-                project_request = ProjectBrokerRequest.model_validate_json(payload, strict=True)
+                project_request = (
+                    ContractProjectBrokerRequest.model_validate_json(payload, strict=True)
+                    if envelope["version"] == 3
+                    else ProjectBrokerRequest.model_validate_json(payload, strict=True)
+                )
             response = await broker.handle_project(project_request, peer_uid=peer_uid)
         else:
             request = BrokerRequest.model_validate_json(payload, strict=True)

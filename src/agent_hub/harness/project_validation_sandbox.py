@@ -85,7 +85,12 @@ function inspect(pkg, legacy = false) {
   }
 }
 inspect(JSON.parse(fs.readFileSync('package.json', 'utf8')));
-if (fs.existsSync('node_modules')) reject('pre-existing node_modules');
+if (fs.existsSync('node_modules')) {
+  const modules = fs.lstatSync('node_modules');
+  if (process.env.AGENT_HUB_CONTRACT_EMPTY_NODE_MODULES !== '1'
+      || !modules.isDirectory() || modules.isSymbolicLink()
+      || fs.readdirSync('node_modules').length) reject('pre-existing node_modules');
+}
 for (const filename of ['npm-shrinkwrap.json', 'package-lock.json']) {
   if (!fs.existsSync(filename)) continue;
   const lock = JSON.parse(fs.readFileSync(filename, 'utf8'));
@@ -218,6 +223,24 @@ def generated_command(
         inner, cwd=cwd,
         shared_network=shared_network, config=config,
     )
+
+
+def generated_contract_install_command(
+    *, cwd: Path, config: Mapping[str, str], has_lock: bool,
+) -> list[str]:
+    """Trusted readonly-source recipe; only an owned empty dependency mount is reusable."""
+    if type(has_lock) is not bool:
+        raise ValueError('contract installation requires an explicit lock observation')
+    binary = '/opt/validator/node/bin/npm' if _NODE_HOME.is_dir() else '/usr/bin/npm'
+    node = '/opt/validator/node/bin/node' if _NODE_HOME.is_dir() else '/usr/bin/node'
+    args = ('ci', '--ignore-scripts', '--no-audit', '--no-fund') if has_lock else (
+        'install', '--ignore-scripts', '--no-audit', '--no-fund', '--package-lock=false',
+    )
+    command = sandbox_command((node, '-e', _INSTALL_GUARD, binary, *args), cwd=cwd,
+                              shared_network=True, config=config)
+    separator = command.index('--')
+    command[separator:separator] = ['--setenv', 'AGENT_HUB_CONTRACT_EMPTY_NODE_MODULES', '1']
+    return command
 
 
 def validate_requirements(root: Path, scale: str, timeout_seconds: float) -> tuple[str, ...]:

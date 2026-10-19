@@ -14,7 +14,7 @@ import zipfile
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path, PurePosixPath
-from typing import Annotated, Literal, Protocol, cast
+from typing import Annotated, Literal, Protocol, TypedDict, cast
 from urllib.parse import unquote
 from uuid import UUID, uuid4
 
@@ -26,6 +26,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from agent_hub.api.dependencies import require_permission
 from agent_hub.api.errors import PublicAPIError, error_responses
 from agent_hub.auth.models import AuthenticatedPrincipal, Role
+from agent_hub.capabilities.project_contracts import ManagedProjectInput
 from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.execution_backends import execution_backend_unavailable_reason
 from agent_hub.runs.conversation_queue import (
@@ -103,6 +104,7 @@ class RunServiceProtocol(Protocol):
         project_id: str | None = None,
         project_label: str | None = None,
         workspace_session_id: str | None = None,
+        project_input: ManagedProjectInput | None = None,
         sandbox_profile: str | None = None,
         execution_backend: str = "systemd",
         requested_permissions: tuple[str, ...] = (),
@@ -266,6 +268,32 @@ class RunArtifactDownloadServiceProtocol(Protocol):
     ) -> GeneratedArtifactDownloadProtocol: ...
 
 
+class ManagedProjectInputRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid', frozen=True, strict=True)
+
+    schema_version: Literal[1] = 1
+    kind: Literal['managed_workspace'] = 'managed_workspace'
+    editable_paths: tuple[str, ...] = Field(min_length=1, max_length=128)
+
+    @model_validator(mode='before')
+    @classmethod
+    def validate_domain(cls, value: object) -> object:
+        domain = ManagedProjectInput.from_payload(value)
+        return {'schema_version': domain.schema_version, 'kind': domain.kind,
+                'editable_paths': domain.editable_paths}
+
+    def to_domain(self) -> ManagedProjectInput:
+        return ManagedProjectInput.from_payload(self.model_dump(mode='json'))
+
+
+class _ProjectInputOptions(TypedDict, total=False):
+    project_input: ManagedProjectInput
+
+
+def _project_input_options(body: CreateRunRequest) -> _ProjectInputOptions:
+    return {} if body.project_input is None else {'project_input': body.project_input.to_domain()}
+
+
 class CreateRunRequest(BaseModel):
     message: str = Field(min_length=1, max_length=65_536)
     mode: TaskMode = TaskMode.AUTO
@@ -293,6 +321,7 @@ class CreateRunRequest(BaseModel):
     project_id: str | None = Field(default=None, max_length=128)
     project_label: str | None = Field(default=None, max_length=80)
     workspace_session_id: str | None = Field(default=None, max_length=128)
+    project_input: ManagedProjectInputRequest | None = None
     sandbox_profile: Literal["none", "read_only", "restricted", "workspace_write"] = (
         "workspace_write"
     )
@@ -1261,6 +1290,7 @@ async def create_run(
             requested_permissions=body.requested_permissions,
             runtime_timeout_seconds=body.runtime_timeout_seconds,
             idempotency_key=idempotency_key,
+            **_project_input_options(body),
         )
     except VibeCodingUnavailable as error:
         reason = str(error)
@@ -1343,11 +1373,14 @@ async def queue_conversation_message(
             execution_backend=execution_backend,
             requested_permissions=body.requested_permissions,
             runtime_timeout_seconds=body.runtime_timeout_seconds,
+            **_project_input_options(body),
         )
     except (ConversationQueueConflict, ConversationQueueNotFound) as error:
         raise _queue_error(error) from error
     except ConversationArchived as error:
         raise PublicAPIError(409, "conversation_archived", str(error)) from error
+    except VibeCodingUnavailable as error:
+        raise PublicAPIError(409, "vibe_coding_unavailable", str(error), details={"reason": str(error)}) from error
     except ValueError as error:
         raise PublicAPIError(422, "request_validation", str(error)) from error
     await _record_queue_audit(request, principal, action="enqueue", item=item)

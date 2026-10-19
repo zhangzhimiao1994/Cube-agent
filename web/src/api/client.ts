@@ -714,6 +714,12 @@ const SubmittedRunSchema = z.object({
 
 export type SubmittedRun = z.infer<typeof SubmittedRunSchema>;
 
+export type ManagedWorkspaceProjectInput = {
+  schema_version: 1;
+  kind: "managed_workspace";
+  editable_paths: string[];
+};
+
 const ConversationQueueItemSchema = z.object({
   id: z.string(),
   conversation_id: z.string(),
@@ -2722,6 +2728,7 @@ export const api = {
     attachment_ids?: string[];
     vibe_coding?: boolean;
     skip_evolution_proposal?: boolean;
+    project_input?: ManagedWorkspaceProjectInput;
   }): Promise<SubmittedRun> {
     return request(
       "/api/v1/runs",
@@ -2743,6 +2750,7 @@ export const api = {
       sandbox_profile?: "none" | "read_only" | "restricted" | "workspace_write";
       execution_backend?: "systemd" | "docker" | "ssh" | "modal" | "daytona" | "vercel";
       requested_permissions?: string[];
+      project_input?: ManagedWorkspaceProjectInput;
     },
   ): Promise<ConversationQueueItem> {
     return request(

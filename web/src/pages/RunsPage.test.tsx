@@ -920,6 +920,29 @@ describe("WorkbenchFilePreview", () => {
     vi.restoreAllMocks();
   });
 
+  it.each(["README.md", "example.ts"])("uses safe shared output for %s file previews", async (filename) => {
+    const user = userEvent.setup();
+    const copy = vi.spyOn(navigator.clipboard, "writeText").mockResolvedValue();
+    const source = filename.endsWith(".md")
+      ? "正文\n\n| | 状态 |\n|---|---|\n| a\\|b | first<br>second |\n\n~~~c++\n  exact <tag>\\n  \n~~~\n\n<script>alert(1)</script>"
+      : "  const source = '<script>not executable</script>';\\n  \n";
+    const { container } = render(<WorkbenchFilePreview file={{ id: filename, title: filename, filename, path: filename,
+      kind: "workspace_file", operation: "读取文件", mimeType: null, size: "1 KB", sha256: null, text: source, source: null,
+    }} onOpenSource={vi.fn()} />);
+    if (filename.endsWith(".md")) {
+      expect(screen.getByRole("cell", { name: "a|b" })).toBeTruthy();
+      expect(screen.getByRole("cell", { name: "first second" }).querySelector("br")).toBeTruthy();
+      expect(screen.getByLabelText("c++完整内容").textContent).toBe("  exact <tag>\\n  ");
+      await user.click(screen.getByRole("button", { name: "复制 c++ 代码" }));
+      expect(copy).toHaveBeenCalledWith("  exact <tag>\\n  ");
+    } else {
+      expect(screen.getByLabelText("typescript完整内容").querySelector("code")?.textContent).toBe(source);
+      await user.click(screen.getByRole("button", { name: `复制 ${filename} 内容` }));
+      expect(copy).toHaveBeenCalledWith(source);
+    }
+    expect(container.querySelectorAll("script,iframe,img")).toHaveLength(0);
+  });
+
   it("switches a complete HTML artifact from source to a restricted live preview", async () => {
     const user = userEvent.setup();
     const trailingMarker = "HTML_AFTER_SOURCE_PREVIEW_LIMIT";
@@ -1532,12 +1555,13 @@ describe("agentInlineSummary", () => {
   it("opens process detail expansions as full reading sheets instead of cramped cards", () => {
     const stylesCss = readFileSync("src/styles.css", "utf8");
     const source = readFileSync("src/pages/RunsPage.tsx", "utf8");
+    const sharedSource = readFileSync("src/components/OutputContent.tsx", "utf8");
 
-    expect(source).toContain('shouldCollapse && expanded ? " is-expanded"');
-    expect(source).toContain("aria-expanded={expanded}");
-    expect(source).toContain("aria-controls={contentId}");
-    expect(source).toContain("contentRef.current?.focus()");
-    expect(source).toContain("tabIndex={0}");
+    expect(sharedSource).toContain('shouldCollapse && expanded ? " is-expanded"');
+    expect(sharedSource).toContain("aria-expanded={expanded}");
+    expect(sharedSource).toContain("aria-controls={contentId}");
+    expect(sharedSource).toContain("contentRef.current?.focus()");
+    expect(sharedSource).toContain("tabIndex={0}");
     expect(source).toContain("shouldCollapse={presentation.shouldCollapse}");
     expect(stylesCss).toMatch(
       /\.process-detail-modal\s*{[\s\S]*height:\s*min\(96dvh,\s*1040px\);[\s\S]*width:\s*min\(98vw,\s*1280px\);/,
@@ -1552,7 +1576,7 @@ describe("agentInlineSummary", () => {
       /\.process-detail-modal:has\(\.bounded-text-block\.is-expanded\) dl\s*{[^}]*display:\s*flex;[^}]*flex-direction:\s*column;[^}]*overflow:\s*hidden;/,
     );
     expect(stylesCss).toMatch(
-      /\.process-detail-modal:has\(\.bounded-text-block\.is-expanded\) dl > dd:has\(> \.bounded-text-block\.is-expanded\)\s*{[^}]*display:\s*block;[^}]*flex:\s*1 1 auto;[^}]*min-height:\s*0;[^}]*overflow:\s*hidden;/,
+      /\.process-detail-modal:has\(\.bounded-text-block\.is-expanded\) dl > dd:has\(\.bounded-text-block\.is-expanded\)\s*{[^}]*display:\s*block;[^}]*flex:\s*1 1 auto;[^}]*min-height:\s*0;[^}]*overflow:\s*hidden;/,
     );
     expect(stylesCss).toMatch(
       /\.process-detail-modal \.bounded-text-block\.is-expanded\s*{[^}]*height:\s*100%;[^}]*min-height:\s*0;/,

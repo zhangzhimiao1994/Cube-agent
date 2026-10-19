@@ -351,6 +351,7 @@ def build_worker_service(
     )
     service = RunService(
         run_repository,
+        project_input_preparer=runtime_capability_stack.project_input_preparer,
         instruction_context_loader=InstructionContextLoader(
             repository=run_repository, project_root=settings.project_workspace_dir,
         ),

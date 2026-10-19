@@ -22,6 +22,7 @@ import sys
 import threading
 import time
 from collections.abc import Mapping, Sequence
+from functools import cache
 from pathlib import Path
 from typing import Any, NamedTuple, NoReturn
 
@@ -32,6 +33,8 @@ _BWRAP = Path("/usr/bin/bwrap")
 _INSTALL = ("npm", "install", "--ignore-scripts", "--no-audit", "--no-fund")
 _PHASES = ("install", "build", "test")
 _LOCKS = ("npm-shrinkwrap.json", "package-lock.json")
+_CONTRACT_LIMIT = 4 * 1024 * 1024
+_CONTRACT_OUTPUTS = ("node_modules", "dist", "build")
 
 
 class Blocked(RuntimeError):
@@ -78,7 +81,9 @@ def _kill_process(process: subprocess.Popen[bytes]) -> None:
             pass
 
 
-def _run_bounded(command: Sequence[str], *, cwd: Path, deadline: float) -> ProcessResult:
+def _run_bounded(
+    command: Sequence[str], *, cwd: Path, deadline: float, pass_fds: tuple[int, ...] = (),
+) -> ProcessResult:
     """Drain both pipes concurrently, killing on deadline or excess output.
 
     The queue and saved prefixes are bounded independently. Killing the bwrap
@@ -98,6 +103,7 @@ def _run_bounded(command: Sequence[str], *, cwd: Path, deadline: float) -> Proce
         stderr=subprocess.PIPE,
         bufsize=0,
         start_new_session=sys.platform != "win32",
+        pass_fds=pass_fds,
     )
     events: queue.Queue[tuple[int, bytes | None]] = queue.Queue(maxsize=8)
     stopped = threading.Event()
@@ -306,6 +312,132 @@ def _load_sandbox() -> dict[str, Any]:
     return runpy.run_path(str(source))
 
 
+@cache
+def _load_contract_mounts() -> dict[str, Any]:
+    return runpy.run_path(str(Path(__file__).with_name("project_contract_mounts.py")))
+
+
+class _ContractExecution(NamedTuple):
+    payload: dict[str, Any]
+    contract_sha256: str
+    protected_sha256: str
+    original_input: Path
+    source_sha256: str
+    output_budget_bytes: int
+    output_file_limit: int
+
+    def arguments(self, work_root: Path) -> dict[str, Any]:
+        return {
+            "contract_payload": self.payload,
+            "expected_contract_sha256": self.protected_sha256,
+            "original_root": self.original_input,
+            "work_root": work_root,
+            "expected_source_sha256": self.source_sha256,
+            "ephemeral_dirs": _CONTRACT_OUTPUTS,
+            "ephemeral_budget_bytes": self.output_budget_bytes,
+            "ephemeral_file_limit": self.output_file_limit,
+        }
+
+
+def _file_identity(info: os.stat_result) -> tuple[int, ...]:
+    base = (info.st_dev, info.st_ino, info.st_mode, info.st_nlink, info.st_size, info.st_mtime_ns)
+    # Windows lstat/fstat creation-time metadata can differ. It never executes
+    # contract mounts; Linux retains the full change-time race check.
+    return base if sys.platform == "win32" else (*base, info.st_ctime_ns)
+
+
+def _read_check_contract(path: Path, expected_sha256: str, deadline: float) -> dict[str, Any]:
+    """Bind broker-owned JSON to the shared canonical contract digest."""
+    try:
+        if (not path.is_absolute() or ".." in path.parts
+                or str(path.resolve(strict=True)) != str(path)
+                or re.fullmatch(r"[a-f0-9]{64}", expected_sha256) is None):
+            raise ValueError
+        _safe_directory(path.parent)
+        ancestors = {parent: _file_identity(parent.lstat())[:3] for parent in path.parents}
+        before = path.lstat()
+        if (_is_link(before) or not stat.S_ISREG(before.st_mode) or before.st_nlink != 1
+                or before.st_mode & 0o222 or before.st_size > _CONTRACT_LIMIT):
+            raise ValueError
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+                             | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0))
+        try:
+            opened = os.fstat(descriptor)
+            if _file_identity(opened) != _file_identity(before):
+                raise ValueError
+            chunks: list[bytes] = []
+            count = 0
+            while True:
+                _remaining(deadline)
+                data = os.read(descriptor, min(65536, before.st_size - count + 1))
+                if not data:
+                    break
+                count += len(data)
+                if count > before.st_size:
+                    raise ValueError
+                chunks.append(data)
+            if (count != before.st_size
+                    or _file_identity(os.fstat(descriptor)) != _file_identity(opened)
+                    or _file_identity(path.lstat()) != _file_identity(before)):
+                raise ValueError
+        finally:
+            os.close(descriptor)
+        _safe_directory(path.parent)
+        if any(_file_identity(parent.lstat())[:3] != identity for parent, identity in ancestors.items()):
+            raise ValueError
+        raw = b"".join(chunks)
+
+        def strict_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+            result: dict[str, Any] = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError
+                result[key] = value
+            return result
+
+        def reject_constant(value: str) -> NoReturn:
+            raise ValueError
+
+        payload = json.loads(raw.decode("utf-8"), object_pairs_hook=strict_object,
+                             parse_constant=reject_constant)
+        source = Path(__file__).resolve().parents[2] / "capabilities/project_contracts.py"
+        contract = runpy.run_path(str(source))["ProjectCheckContract"].from_payload(payload)
+        if contract.protected_sha256 != expected_sha256:
+            raise ValueError
+        result: dict[str, Any] = contract.to_payload()
+        return result
+    except (OSError, ValueError, TypeError, RecursionError):
+        raise Blocked("invalid_check_contract") from None
+
+
+def _contract_command(
+    command: Sequence[str], *, work_root: Path, deadline: float, contract: _ContractExecution,
+) -> ProcessResult:
+    support = _load_contract_mounts()
+    try:
+        with support["build_contract_mounts"](command, **contract.arguments(work_root)) as plan:
+            _remaining(deadline)
+            return _run_bounded(plan.argv, cwd=work_root, deadline=deadline, pass_fds=plan.pass_fds)
+    except support["ContractMountError"]:
+        raise Blocked("project_contract_mounts_rejected") from None
+
+
+def _prepare_contract_work(contract: _ContractExecution, work_root: Path) -> None:
+    support = _load_contract_mounts()
+    try:
+        arguments = contract.arguments(work_root)
+        support["validate_contract_work"](**{**arguments, "ephemeral_dirs": ()})
+        for name in _CONTRACT_OUTPUTS:
+            # Even an empty input directory is source, not an owned output.
+            if (work_root / name).exists() or (work_root / name).is_symlink():
+                raise Blocked("project_contract_mounts_rejected")
+        for name in _CONTRACT_OUTPUTS:
+            (work_root / name).mkdir(mode=0o700)
+        support["validate_contract_work"](**arguments)
+    except support["ContractMountError"]:
+        raise Blocked("project_contract_mounts_rejected") from None
+
+
 def _backend_reason(sandbox: Mapping[str, Any]) -> str | None:
     if sys.platform != "linux":
         return "linux_required"
@@ -330,11 +462,18 @@ def _backend_reason(sandbox: Mapping[str, Any]) -> str | None:
     return None
 
 
-def _phase_command(sandbox: Mapping[str, Any], phase: str, work_root: Path) -> list[str]:
+def _phase_command(
+    sandbox: Mapping[str, Any], phase: str, work_root: Path, *, original_contract: bool = False,
+) -> list[str]:
     if phase not in _PHASES:
         raise InfrastructureError("invalid_phase")
     command = _INSTALL if phase == "install" else ("npm", "run", phase)
-    result: list[str] = sandbox["generated_command"](command, cwd=work_root, config={})
+    result: list[str]
+    if original_contract and phase == 'install':
+        result = sandbox['generated_contract_install_command'](cwd=work_root, config={},
+            has_lock=any((work_root / filename).is_file() for filename in _LOCKS))
+    else:
+        result = sandbox["generated_command"](command, cwd=work_root, config={})
     if phase == "install":
         separator = result.index("--")
         result[separator:separator] = ["--setenv", "NPM_CONFIG_ENGINE_STRICT", "true"]
@@ -412,12 +551,17 @@ def _probe_runtime(
     work_root: Path,
     deadline: float,
     runtime: dict[str, str],
+    contract: _ContractExecution | None = None,
 ) -> None:
     for name in ("node", "npm"):
         _remaining(deadline)
         command = sandbox["generated_command"]((name, "--version"), cwd=work_root, config={})
         try:
-            result = _run_bounded(command, cwd=work_root, deadline=deadline)
+            if contract is None:
+                result = _run_bounded(command, cwd=work_root, deadline=deadline)
+            else:
+                result = _contract_command(command, work_root=work_root, deadline=deadline,
+                                           contract=contract)
         except OSError:
             raise Blocked(name + "_probe_unavailable") from None
         pattern = (
@@ -475,6 +619,11 @@ def run_project(
     timeout: float,
     *,
     install_allowed: bool = False,
+    check_contract: Path | None = None,
+    original_input: Path | None = None,
+    expected_contract_sha256: str | None = None,
+    workspace_limit_bytes: int = 512 * 1024**2,
+    file_limit: int = 10000,
 ) -> dict[str, Any]:
     report = _empty_report()
     if not math.isfinite(timeout) or timeout <= 0:
@@ -483,16 +632,48 @@ def run_project(
     command_deadline = deadline - min(1.0, timeout / 10)
     owned_work = False
     try:
+        contract_payload = None
+        contract: _ContractExecution | None = None
+        opt_in = (check_contract is not None, original_input is not None,
+                  expected_contract_sha256 is not None)
+        if any(opt_in):
+            if (not all(opt_in) or not isinstance(check_contract, Path)
+                    or not isinstance(original_input, Path) or type(expected_contract_sha256) is not str):
+                raise Blocked("invalid_check_contract")
+            if (type(workspace_limit_bytes) is not int or not 1 <= workspace_limit_bytes <= 2 * 1024**3
+                    or type(file_limit) is not int or not 1 <= file_limit <= 100000):
+                raise Blocked('invalid_contract_resource_allocation')
+            contract_payload = _read_check_contract(check_contract, expected_contract_sha256,
+                                                   command_deadline)
         # Never clean a caller's pre-existing nonempty directory on rejection.
         _prepare_work(input_root, work_root)
         owned_work = True
         report["source_sha256"] = _copy_snapshot(input_root, work_root, command_deadline)
+        if contract_payload is not None:
+            assert original_input is not None and expected_contract_sha256 is not None
+            source_bytes = sum((Path(directory) / name).stat().st_size
+                for directory, _, names in os.walk(work_root) for name in names)
+            output_budget = workspace_limit_bytes - source_bytes
+            if output_budget <= 0:
+                raise Blocked('work_quota_exceeded')
+            contract = _ContractExecution(contract_payload, expected_contract_sha256,
+                                          contract_payload["protected_sha256"], original_input,
+                                          report["source_sha256"], output_budget,
+                                          min(100000, file_limit * 10))
+            _prepare_contract_work(contract, work_root)
+            report["original_check_contract"] = {
+                "schema_version": 1, "contract_sha256": contract.contract_sha256,
+                "protected_sha256": contract.protected_sha256,
+            }
         _manifest(work_root, command_deadline)
         sandbox = _load_sandbox()
         reason = _backend_reason(sandbox)
         if reason:
             raise Blocked(reason)
-        _probe_runtime(sandbox, work_root, command_deadline, report["runtime"])
+        if contract is None:
+            _probe_runtime(sandbox, work_root, command_deadline, report["runtime"])
+        else:
+            _probe_runtime(sandbox, work_root, command_deadline, report["runtime"], contract)
         if not install_allowed:
             raise Blocked("install_authorization_required")
         original_locks = _locks(work_root, command_deadline)
@@ -500,8 +681,14 @@ def run_project(
             _remaining(command_deadline)
             phase = check["phase"]
             try:
-                command = _phase_command(sandbox, phase, work_root)
-                result = _run_bounded(command, cwd=work_root, deadline=command_deadline)
+                command = _phase_command(sandbox, phase, work_root, original_contract=True) if contract is not None else (
+                    _phase_command(sandbox, phase, work_root)
+                )
+                if contract is None:
+                    result = _run_bounded(command, cwd=work_root, deadline=command_deadline)
+                else:
+                    result = _contract_command(command, work_root=work_root,
+                                               deadline=command_deadline, contract=contract)
             except OSError:
                 raise Blocked("phase_launch_unavailable") from None
             check.update(
@@ -584,13 +771,27 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.add_argument("--work", type=Path, required=True)
         parser.add_argument("--timeout", type=float, required=True)
         parser.add_argument("--install-allowed", action="store_true")
+        parser.add_argument("--check-contract", type=Path)
+        parser.add_argument("--original-input", type=Path)
+        parser.add_argument("--expected-contract-sha256")
+        parser.add_argument('--workspace-limit-bytes', type=int, default=512 * 1024**2)
+        parser.add_argument('--file-limit', type=int, default=10000)
         args = parser.parse_args(argv)
+        flags = (args.check_contract is not None, args.original_input is not None,
+                 args.expected_contract_sha256 is not None)
+        if any(flags) and not all(flags):
+            raise InfrastructureError("invalid_arguments")
         if not math.isfinite(args.timeout) or args.timeout <= 0:
             raise InfrastructureError("invalid_timeout")
         remaining = args.timeout - (time.monotonic() - started)
         if remaining <= 0:
             raise InfrastructureError("invalid_timeout")
-        report = run_project(args.input, args.work, remaining, install_allowed=args.install_allowed)
+        options = ({"check_contract": args.check_contract, "original_input": args.original_input,
+                    "expected_contract_sha256": args.expected_contract_sha256,
+                    'workspace_limit_bytes': args.workspace_limit_bytes,
+                    'file_limit': args.file_limit} if all(flags) else {})
+        report = run_project(args.input, args.work, remaining, install_allowed=args.install_allowed,
+                             **options)
         sys.stdout.buffer.write(_encode_report(report) + b"\n")
         return 0
     except Exception:  # noqa: BLE001 - CLI boundary must not print exception values/tracebacks.

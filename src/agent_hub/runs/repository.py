@@ -7,7 +7,7 @@ import binascii
 import hashlib
 import json
 import re
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -53,6 +53,25 @@ def _database_uuid(value: UUID) -> UUID:
 
 def _optional_database_uuid(value: UUID | None) -> UUID | None:
     return None if value is None else _database_uuid(value)
+
+
+def _pre_model_original_capture(route: Mapping[str, object]) -> bool:
+    from agent_hub.capabilities.project_baselines import ProjectBaselineReference
+    from agent_hub.capabilities.project_contracts import ManagedProjectInput
+
+    state = route.get('project_input_preparation')
+    if (type(route.get('project_input_contract_version')) is not int
+            or route.get('project_input_contract_version') != 1
+            or not isinstance(state, Mapping) or set(state) != {'schema_version', 'phase', 'reference'}
+            or type(state.get('schema_version')) is not int or state['schema_version'] != 1
+            or state['phase'] != 'captured'):
+        return False
+    try:
+        ProjectBaselineReference.from_payload(state['reference'])
+        ManagedProjectInput.from_payload(route.get('project_input'))
+    except (ValueError, TypeError):
+        return False
+    return True
 
 
 _RECOVERY_REPLAYABLE_EVENT_KINDS = frozenset(
@@ -1354,6 +1373,11 @@ class RunRepository:
             if RunStatus(row.status) is not RunStatus.RUNNING:
                 raise RunConflict("run is not running")
             approval_worker_token = row.worker_lease_token
+            # Captured input has no native command or model side effect yet. Its
+            # durable original reference resumes admission, not a runtime checkpoint.
+            checkpoint_required = approval_worker_token is not None and not _pre_model_original_capture(
+                routing_decision
+            )
             row.status = RunStatus.WAITING_APPROVAL.value
             self.clear_worker_lease(row)
             row.routing_decision = {
@@ -1361,9 +1385,9 @@ class RunRepository:
                 "approval_kind": "capability_tool",
                 "approval_id": approval_id,
                 "approval_fingerprint": approval_fingerprint,
-                "approval_checkpoint_required": approval_worker_token is not None,
+                "approval_checkpoint_required": checkpoint_required,
                 **({"approval_checkpoint_worker_token": str(approval_worker_token)}
-                   if approval_worker_token is not None else {}),
+                   if checkpoint_required else {}),
                 "reason": "capability requires approval",
                 **({"approval_scope": approval_scope} if approval_scope else {}),
             }

@@ -25,6 +25,7 @@ from agent_hub.capabilities.policy import CapabilityPolicy, CapabilityRule, norm
 from agent_hub.capabilities.runtime import CapabilityManifestProvider, RuntimeCapabilityGateway
 from agent_hub.capabilities.types import CapabilityRequest, PolicyEffect
 from agent_hub.harness.tool_gateway import HarnessToolGateway, McpToolBackend, PluginToolBackend
+from agent_hub.runtime.contracts import TaskContext
 
 ToolApprovalPolicyGetter = Callable[[UUID], Awaitable[bool]]
 ToolApprovalModeGetter = Callable[[UUID], Awaitable[str]]
@@ -39,6 +40,7 @@ class RuntimeCapabilityStack:
     runtime_gateway: RuntimeCapabilityGateway
     policy_gateway: DefaultRuntimeCapabilityPolicyGateway
     harness_tool_gateway: HarnessToolGateway
+    project_input_preparer: Callable[[TaskContext], Awaitable[TaskContext]] | None = None
 
 
 class DefaultRuntimeCapabilityPolicyGateway:
@@ -373,6 +375,7 @@ def build_runtime_capability_stack(
         runtime_gateway=runtime_gateway,
         policy_gateway=policy_gateway,
         harness_tool_gateway=harness_tool_gateway,
+        project_input_preparer=runtime_gateway.original_project_preparer(harness_tool_gateway),
     )
 
 

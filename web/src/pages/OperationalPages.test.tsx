@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import userEvent from "@testing-library/user-event";
@@ -3292,6 +3294,28 @@ describe("operational management pages", () => {
     expect(within(table).getByRole("cell", { name: "深度分析" })).not.toBeNull();
     expect(within(table).getByRole("cell", { name: "实时下单" })).not.toBeNull();
     expect(within(stream).getByText("请按这个边界使用。")).not.toBeNull();
+  });
+
+  it("renders shared mixed tables and exact copyable code through the real conversation output", async () => {
+    const user = userEvent.setup();
+    const copy = vi.spyOn(navigator.clipboard, "writeText").mockResolvedValue();
+    const code = "  const raw = '<script>inert</script>';\\n  ";
+    visibleRunDetail = { ...runDetail, artifacts: [{ id: "mixed-output", kind: "markdown", title: "回复",
+      text: `开始\n\n| | 说明 |\n|---|---|\n| a\\|b | first<br>second |\n\n~~~typescript\n${code}\n~~~\n\n结束`,
+    }] };
+    visibleConversationRuns = [visibleRunDetail];
+    render(<TestApp initialPath="/" />);
+    await screen.findByRole("heading", { name: "对话" });
+    await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
+    const stream = screen.getByRole("region", { name: "主对话内容" });
+    expect(within(stream).getByRole("cell", { name: "a|b" })).toBeTruthy();
+    expect(within(stream).getByRole("cell", { name: "first second" }).querySelector("br")).toBeTruthy();
+    expect(within(stream).getByLabelText("typescript完整内容").textContent).toBe(code);
+    await user.click(within(stream).getByRole("button", { name: "复制 typescript 代码" }));
+    await waitFor(() => expect(copy).toHaveBeenCalledWith(code));
+    expect(stream.querySelectorAll("script,img,iframe")).toHaveLength(0);
+    expect(within(stream).getByText("开始")).toBeTruthy();
+    expect(within(stream).getByText("结束")).toBeTruthy();
   });
   it("does not show internal decision-review artifacts as the final assistant reply", async () => {
     visibleRunDetail = {
@@ -7274,6 +7298,250 @@ describe("operational management pages", () => {
     await waitFor(() => expect(requests.filter((request) => request.path === "/api/v1/runs")).toHaveLength(2));
     expect(requests.filter((request) => request.path === "/api/v1/runs").at(-1)).toMatchObject({
       body: { workspace_session_id: "conv-previous", execution_backend: "systemd" },
+    });
+  });
+
+  describe("explicit managed workspace input", () => {
+    async function configureInput(user: ReturnType<typeof userEvent.setup>, paths?: string) {
+      await openRunConfig(user);
+      await expandRunConfigDetails(user);
+      await user.click(screen.getByRole("button", { name: "当前工作区" }));
+      const input = screen.getByLabelText("允许修改路径（每行一项）");
+      expect((input as HTMLTextAreaElement).value).toBe("");
+      if (paths) await user.type(input, paths);
+    }
+
+    async function closeAndSend(user: ReturnType<typeof userEvent.setup>, busy = false) {
+      await user.click(screen.getByRole("button", { name: "关闭运行设置" }));
+      await user.type(screen.getByPlaceholderText(/输入消息/), "修改已有项目");
+      await user.click(screen.getByRole("button", { name: busy ? "排队" : "发送" }));
+    }
+
+    const submittedRequests = () => requests.filter((request) => request.method === "POST" &&
+      (request.path === "/api/v1/runs" || request.path.endsWith("/queue")));
+
+    it("keeps the managed path textarea readable like other run settings inputs", async () => {
+      const stylesheet = document.createElement("style");
+      stylesheet.textContent = readFileSync("src/styles.css", "utf8");
+      document.head.append(stylesheet);
+      try {
+        const user = userEvent.setup();
+        render(<TestApp initialPath="/?conversation=conv-previous" />);
+        await screen.findByText("会话：短视频脚本方案");
+        await configureInput(user);
+        const textarea = screen.getByLabelText("允许修改路径（每行一项）");
+        const reference = getComputedStyle(screen.getByLabelText("参考方案"));
+        const expectReadable = () => {
+          const style = getComputedStyle(textarea);
+          expect(style.backgroundColor).toBe(reference.backgroundColor);
+          expect(style.color).toBe(reference.color);
+        };
+        expectReadable();
+        await user.type(textarea, "web/components/Widget.tsx");
+        expectReadable();
+        await user.tab();
+        expectReadable();
+      } finally {
+        stylesheet.remove();
+      }
+    });
+
+    it.each([false, true])("blocks a mismatched managed workspace without changing legacy overrides (busy=%s)", async (busy) => {
+      if (busy) {
+        visibleRunListItems = [runListItem];
+        visibleConversationRuns = [runDetail];
+        visibleRunDetail = runDetail;
+      }
+      const user = userEvent.setup();
+      const view = render(<TestApp initialPath="/?conversation=conv-previous" />);
+      await screen.findByText("会话：短视频脚本方案");
+      await openRunConfig(user);
+      await expandRunConfigDetails(user);
+      await user.click(screen.getByRole("button", { name: "选择本次工作目录" }));
+      const picker = await screen.findByRole("dialog", { name: "选择本次工作目录" });
+      await user.click(within(picker).getByRole("button", { name: "选择目录 scratch" }));
+      await user.click(screen.getByRole("button", { name: "当前工作区" }));
+      await user.type(screen.getByLabelText("允许修改路径（每行一项）"), "web/components/Widget.tsx");
+      expect(screen.getByRole("alert").textContent).toBe("当前工作区输入必须使用当前会话工作区。");
+      await user.click(screen.getByRole("button", { name: "关闭运行设置" }));
+      await user.type(screen.getByPlaceholderText(/输入消息/), "只修改已选工作区");
+      expect((screen.getByRole("button", { name: busy ? "排队" : "发送" }) as HTMLButtonElement).disabled).toBe(true);
+      fireEvent.submit(view.container.querySelector(".chat-composer") as HTMLFormElement);
+      expect(submittedRequests()).toHaveLength(0);
+
+      await openRunConfig(user);
+      await expandRunConfigDetails(user);
+      await user.click(screen.getByRole("button", { name: "新建" }));
+      await user.click(screen.getByRole("button", { name: "关闭运行设置" }));
+      await user.click(screen.getByRole("button", { name: busy ? "排队" : "发送" }));
+      await waitFor(() => expect(submittedRequests()).toHaveLength(1));
+      expect(submittedRequests()[0].body).toMatchObject({ workspace_session_id: "scratch" });
+      expect(submittedRequests()[0].body).not.toHaveProperty("project_input");
+    });
+
+    it.each([false, true])("sends only explicitly entered paths through the real request (busy=%s)", async (busy) => {
+      if (busy) {
+        visibleRunListItems = [runListItem];
+        visibleConversationRuns = [runDetail];
+        visibleRunDetail = runDetail;
+      }
+      const user = userEvent.setup();
+      render(<TestApp initialPath="/?conversation=conv-previous" />);
+      await screen.findByText("会话：短视频脚本方案");
+      await configureInput(user, "web/components\nlib/feature.ts");
+      await closeAndSend(user, busy);
+
+      await waitFor(() => expect(submittedRequests()).toHaveLength(1));
+      expect(submittedRequests()[0]).toMatchObject({
+        path: busy ? "/api/v1/admin/conversations/conv-previous/queue" : "/api/v1/runs",
+        body: {
+          project_id: "default", workspace_session_id: "conv-previous",
+          sandbox_profile: "workspace_write", execution_backend: "systemd",
+          project_input: { schema_version: 1, kind: "managed_workspace", editable_paths: ["web/components", "lib/feature.ts"] },
+        },
+      });
+    });
+
+    it.each([false, true])("omits project_input for legacy requests even when the prompt asks for source edits (busy=%s)", async (busy) => {
+      if (busy) {
+        visibleRunListItems = [runListItem];
+        visibleConversationRuns = [runDetail];
+        visibleRunDetail = runDetail;
+      }
+      const user = userEvent.setup();
+      render(<TestApp initialPath="/?conversation=conv-previous" />);
+      await screen.findByText("会话：短视频脚本方案");
+      await user.type(screen.getByPlaceholderText(/输入消息/), "修改当前工作区 src 的所有文件");
+      await user.click(screen.getByRole("button", { name: busy ? "排队" : "发送" }));
+      await waitFor(() => expect(submittedRequests()).toHaveLength(1));
+      expect(submittedRequests()[0].body).not.toHaveProperty("project_input");
+    });
+
+    it.each(["empty", "docker", "read_only", "unavailable", "missing_project", "missing_session"].flatMap((invalid) =>
+      [false, true].map((busy) => [invalid, busy] as const),
+    ))("blocks managed workspace submission with %s (busy=%s)", async (invalid, busy) => {
+      if (busy) {
+        visibleRunListItems = [runListItem];
+        visibleConversationRuns = [runDetail];
+        visibleRunDetail = runDetail;
+      }
+      if (invalid === "unavailable") visibleExecutionBackends = executionBackends.map((item) => ({ ...item, available: false }));
+      if (invalid === "missing_project") visibleConversationMetadata = { ...visibleConversationMetadata, project_id: "" };
+      if (invalid === "missing_session") visibleConversationMetadata = { ...visibleConversationMetadata, workspace_path: "" };
+      const user = userEvent.setup();
+      const view = render(<TestApp initialPath="/?conversation=conv-previous" />);
+      await screen.findByText("会话：短视频脚本方案");
+      await configureInput(user, invalid === "empty" ? "   \n  " : "web/components");
+      if (invalid === "docker") await user.selectOptions(screen.getByLabelText("执行环境"), "docker");
+      if (invalid === "read_only") await user.click(screen.getByRole("button", { name: /只读/ }));
+      await user.click(screen.getByRole("button", { name: "关闭运行设置" }));
+      await user.type(screen.getByPlaceholderText(/输入消息/), "修改项目");
+      expect((screen.getByRole("button", { name: busy ? "排队" : "发送" }) as HTMLButtonElement).disabled).toBe(true);
+      fireEvent.submit(view.container.querySelector(".chat-composer") as HTMLFormElement);
+      expect(submittedRequests()).toHaveLength(0);
+    });
+
+    it("clears paths when switching back to new input and preserves legacy behavior", async () => {
+      const user = userEvent.setup();
+      render(<TestApp initialPath="/?conversation=conv-previous" />);
+      await screen.findByText("会话：短视频脚本方案");
+      await configureInput(user, "web/components");
+      await user.click(screen.getByRole("button", { name: "新建" }));
+      await user.click(screen.getByRole("button", { name: "当前工作区" }));
+      expect((screen.getByLabelText("允许修改路径（每行一项）") as HTMLTextAreaElement).value).toBe("");
+      await user.click(screen.getByRole("button", { name: "新建" }));
+      await closeAndSend(user);
+      await waitFor(() => expect(submittedRequests()).toHaveLength(1));
+      expect(submittedRequests()[0].body).not.toHaveProperty("project_input");
+    });
+
+    it("resets authorization when selecting another workspace and does not restore it on return", async () => {
+      const user = userEvent.setup();
+      render(<TestApp initialPath="/?conversation=conv-previous" />);
+      await screen.findByText("会话：短视频脚本方案");
+      await configureInput(user, "web/components");
+      for (const directory of ["scratch", "conv-previous"]) {
+        await user.click(screen.getByRole("button", { name: "选择本次工作目录" }));
+        const picker = await screen.findByRole("dialog", { name: "选择本次工作目录" });
+        await user.click(within(picker).getByRole("button", { name: `选择目录 ${directory}` }));
+        expect(screen.getByRole("button", { name: "新建" }).getAttribute("aria-pressed")).toBe("true");
+        expect(screen.queryByLabelText("允许修改路径（每行一项）")).toBeNull();
+      }
+      await closeAndSend(user);
+      await waitFor(() => expect(submittedRequests()).toHaveLength(1));
+      expect(submittedRequests()[0].body).not.toHaveProperty("project_input");
+    });
+
+    it.each(["session", "project"])("resets authorization when switching %s through the real setup UI", async (scope) => {
+      const user = userEvent.setup();
+      render(<TestApp initialPath="/?conversation=conv-previous" />);
+      await screen.findByText("会话：短视频脚本方案");
+      await configureInput(user, "web/components");
+      await user.click(screen.getByRole("button", { name: "关闭运行设置" }));
+      if (scope === "project") {
+        const project = await openNewProjectDialog(user);
+        await user.type(within(project).getByLabelText("项目 ID"), "another-project");
+        await user.type(within(project).getByLabelText("项目名称"), "另一个项目");
+        await user.click(within(project).getByRole("button", { name: "创建项目" }));
+      } else {
+        await openNewConversationDialog(user);
+      }
+      const conversation = await screen.findByRole("dialog", { name: "新建会话" });
+      await user.click(within(conversation).getByRole("button", { name: "创建会话" }));
+      await openRunConfig(user);
+      await expandRunConfigDetails(user);
+      expect(screen.getByRole("button", { name: "新建" }).getAttribute("aria-pressed")).toBe("true");
+      expect(screen.queryByLabelText("允许修改路径（每行一项）")).toBeNull();
+      await closeAndSend(user);
+      await waitFor(() => expect(submittedRequests()).toHaveLength(1));
+      expect(submittedRequests()[0].body).not.toHaveProperty("project_input");
+    });
+
+    it.each(["retry", "cancel"])("does not broaden explicitly entered paths after %s", async (action) => {
+      if (action === "cancel") {
+        visibleRunListItems = [runListItem];
+        visibleConversationRuns = [runDetail];
+        visibleRunDetail = runDetail;
+      }
+      const user = userEvent.setup();
+      render(<TestApp initialPath="/?conversation=conv-previous" />);
+      await screen.findByText("会话：短视频脚本方案");
+      await configureInput(user, "web/components/Widget.tsx");
+      await user.click(screen.getByRole("button", { name: "关闭运行设置" }));
+      if (action === "cancel") {
+        await user.click(screen.getByRole("button", { name: "停止生成" }));
+        await waitFor(() => expect(screen.queryByRole("button", { name: "停止生成" })).toBeNull());
+      }
+      await user.type(screen.getByPlaceholderText(/输入消息/), action === "retry" ? "/retry" : "继续修改");
+      await user.click(screen.getByRole("button", { name: "发送" }));
+      await waitFor(() => expect(submittedRequests()).toHaveLength(1));
+      expect(submittedRequests()[0].body).toMatchObject({
+        project_input: { editable_paths: ["web/components/Widget.tsx"] },
+      });
+    });
+
+    it("does not replay a rejected queue request with a different workspace authorization", async () => {
+      visibleRunListItems = [runListItem];
+      visibleConversationRuns = [runDetail];
+      visibleRunDetail = runDetail;
+      let resolveQueue!: (response: Response) => void;
+      const pending = new Promise<Response>((resolve) => { resolveQueue = resolve; });
+      const originalFetch = vi.mocked(fetch).getMockImplementation()!;
+      vi.mocked(fetch).mockImplementation((input, init) => {
+        if (String(input).endsWith("/conv-previous/queue") && init?.method === "POST") return pending;
+        return originalFetch(input, init);
+      });
+      const user = userEvent.setup();
+      render(<TestApp initialPath="/?conversation=conv-previous" />);
+      await screen.findByText("会话：短视频脚本方案");
+      await configureInput(user, "web/components/Widget.tsx");
+      await closeAndSend(user, true);
+      await openRunConfig(user);
+      await expandRunConfigDetails(user);
+      await user.click(screen.getByRole("button", { name: "新建" }));
+      resolveQueue(jsonResponse({ error: { code: "conversation_not_active", message: "not active" } }, { status: 409 }));
+      await screen.findByText("工作区授权已变更，请重新发送消息。");
+      expect(requests.some((request) => request.path === "/api/v1/runs" && request.method === "POST")).toBe(false);
     });
   });
 

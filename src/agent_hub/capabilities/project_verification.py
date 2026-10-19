@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import json
 import math
 import re
@@ -22,8 +24,13 @@ from agent_hub.capabilities.scoped_read import authorized_workspace_scope
 from agent_hub.capabilities.types import CapabilityRequest
 from agent_hub.runtime.contracts import JsonValue, _freeze_object
 from agent_hub.skills.sandbox.base import SkillResult
+from agent_hub.subprocess_cleanup import ProcessCleanupIncomplete
 
 if TYPE_CHECKING:
+    from agent_hub.capabilities.project_baselines import (
+        ProjectBaselineReference,
+        StoredProjectBaseline,
+    )
     from agent_hub.skills.sandbox.project import ProjectInvocation
 
 PROJECT_VERIFY_TOOL = "project.verify"
@@ -131,8 +138,118 @@ class ProjectVerificationError(RuntimeError):
         self.project_prerequisite = project_prerequisite
 
 
+def _validate_original_diagnostic(value: object) -> None:
+    if (not isinstance(value, Mapping)
+            or set(value) != {'schema_version', 'backend', 'exit_code', 'timed_out',
+                              'stdout', 'stderr', 'stdout_metadata', 'stderr_metadata'}
+            or type(value['schema_version']) is not int or value['schema_version'] != 1
+            or value['backend'] != 'systemd' or type(value['timed_out']) is not bool
+            or (value['exit_code'] is not None and type(value['exit_code']) is not int)
+            or (value['exit_code'] is None and not value['timed_out'])):
+        raise ValueError('invalid original process diagnostic')
+    for stream in ('stdout', 'stderr'):
+        text, metadata = value[stream], value[f'{stream}_metadata']
+        if (not isinstance(text, str) or len(text.encode('utf-8')) > 4096
+                or not isinstance(metadata, Mapping)
+                or set(metadata) != {'sanitized_bytes', 'returned_bytes', 'sha256', 'truncated',
+                                     'redacted', 'redacted_lines'}
+                or any(type(metadata[key]) is not int or not 0 <= metadata[key] <= 2**63 - 1
+                       for key in ('sanitized_bytes', 'returned_bytes', 'redacted_lines'))
+                or metadata['returned_bytes'] != len(text.encode('utf-8'))
+                or metadata['sanitized_bytes'] < metadata['returned_bytes']
+                or any(type(metadata[key]) is not bool for key in ('truncated', 'redacted'))
+                or metadata['redacted'] != (metadata['redacted_lines'] > 0)
+                or not isinstance(metadata['sha256'], str)
+                or _SHA.fullmatch(metadata['sha256']) is None):
+            raise ValueError('invalid original process diagnostic')
+        if metadata['truncated'] and (
+            metadata['sanitized_bytes'] <= 4096 or not text.endswith('\n[truncated]')
+            or metadata['returned_bytes'] < 4093
+        ):
+            raise ValueError('invalid original process diagnostic')
+        if not metadata['truncated'] and (
+            metadata['sanitized_bytes'] != metadata['returned_bytes']
+            or metadata['sha256'] != hashlib.sha256(text.encode('utf-8')).hexdigest()
+        ):
+            raise ValueError('invalid original process diagnostic')
+
+
+def validated_original_observation(
+    value: object, *, expected_source: str, expected_contract: str,
+) -> Mapping[str, JsonValue]:
+    """Decode trusted persisted metadata; never create an observation from model text."""
+    try:
+        item = _freeze_object(value, name='original project observation')
+        failed = item.get('status') == 'failed'
+        binding = item.get('original_check_contract')
+        verification = item.get('verification')
+        if (set(item) != {'schema_version', 'status', 'verification', 'original_check_contract'}
+                | ({'execution_diagnostic'} if failed else set())
+                or type(item.get('schema_version')) is not int or item['schema_version'] != 1
+                or item.get('status') not in {'passed', 'failed'}
+                or not isinstance(binding, Mapping)
+                or type(binding.get('schema_version')) is not int
+                or binding != {'schema_version': 1, 'contract_sha256': expected_contract,
+                               'protected_sha256': expected_contract}
+                or not isinstance(verification, Mapping)
+                or verification.get('source_sha256') != expected_source
+                or verification.get('status') != item['status']):
+            raise ValueError
+        if failed:
+            diagnostic = item.get('execution_diagnostic')
+            _validate_original_diagnostic(diagnostic)
+            if (not isinstance(diagnostic, Mapping)
+                    or validated_project_failure_payload(verification, diagnostic=diagnostic) is None):
+                raise ValueError
+        else:
+            if (set(verification) != {'schema_version', 'status', 'source_sha256', 'checks', 'runtime'}
+                    or type(verification.get('schema_version')) is not int or verification['schema_version'] != 1
+                    or not isinstance(verification.get('checks'), tuple)
+                    or len(cast(tuple[JsonValue, ...], verification['checks'])) != 3):
+                raise ValueError
+            # Re-use the native decoder to check completed phase structure. The original
+            # metadata hash remains unchanged; bounded diagnostic text is not re-hashed.
+            checks: list[dict[str, object]] = []
+            for phase, check in zip(('install', 'build', 'test'),
+                                    cast(tuple[JsonValue, ...], verification['checks']), strict=True):
+                if (not isinstance(check, Mapping) or set(check) != {'phase', 'status', 'execution_diagnostic'}
+                        or check.get('phase') != phase or check.get('status') != 'passed'
+                        or not isinstance(check.get('execution_diagnostic'), Mapping)):
+                    raise ValueError
+                diagnostic = cast(Mapping[str, JsonValue], check['execution_diagnostic'])
+                _validate_original_diagnostic(diagnostic)
+                if (type(diagnostic.get('schema_version')) is not int or diagnostic['schema_version'] != 1
+                        or diagnostic.get('backend') != 'systemd'
+                        or type(diagnostic.get('exit_code')) is not int or diagnostic['exit_code'] != 0
+                        or diagnostic.get('timed_out') is not False):
+                    raise ValueError
+                checks.append({'phase': phase, 'status': 'passed',
+                    **{key: diagnostic.get(key) for key in ('exit_code', 'timed_out', 'stdout', 'stderr')}})
+            _validate_report(json.dumps({'schema_version': 1, 'status': 'passed', 'source_sha256': expected_source,
+                'runtime': verification.get('runtime'), 'checks': checks}, default=dict),
+                expected_source=expected_source)
+        return item
+    except Exception:  # noqa: BLE001 - malformed persisted observation has no repair or replay authority.
+        raise ProjectVerificationError('original project observation is unavailable or changed') from None
+
+
 class ProjectExecutor(Protocol):
     async def run(self, invocation: ProjectInvocation) -> SkillResult: ...
+
+
+@dataclass(frozen=True, slots=True)
+class _OriginalScope:
+    stored: StoredProjectBaseline
+    observation_sha256: str | None
+
+    def binding(self, source: str) -> Mapping[str, JsonValue]:
+        if self.observation_sha256 is None:
+            raise ProjectVerificationError('original project observation is unavailable or changed')
+        return {'schema_version': 1, 'contract_sha256': self.stored.contract.protected_sha256,
+                'protected_sha256': self.stored.contract.protected_sha256,
+                'baseline_envelope_sha256': self.stored.reference.contract_sha256,
+                'baseline_source_sha256': self.stored.reference.input_source_sha256,
+                'baseline_observation_sha256': self.observation_sha256, 'candidate_source_sha256': source}
 
 
 class ProjectVerificationService:
@@ -141,6 +258,130 @@ class ProjectVerificationService:
         self.repository = repository
         self.executor = executor
         self._receipts: dict[tuple[UUID, UUID], tuple[ProjectInvocation, str]] = {}
+        self._original_receipts: dict[tuple[UUID, UUID], Mapping[str, JsonValue]] = {}
+
+    async def _original_scope(
+        self, invocation: ProjectInvocation, *, reference: ProjectBaselineReference | None = None,
+        original: bool = False,
+    ) -> _OriginalScope | None:
+        from agent_hub.capabilities.project_baselines import (
+            ProjectBaselineReference,
+            ProjectBaselineStore,
+        )
+        from agent_hub.capabilities.project_contracts import ManagedProjectInput
+
+        try:
+            getter = getattr(self.repository, 'get', None)
+            if not callable(getter):
+                raise TypeError
+            record = await getter(invocation.tenant_id, invocation.run_id)
+            project, session = authorized_workspace_scope(
+                record, tenant_id=invocation.tenant_id, run_id=invocation.run_id,
+            )
+            route = record.routing_decision
+            if ('project_input_contract_version' not in route and 'project_input' not in route
+                    and reference is None):
+                return None
+            selection = ManagedProjectInput.from_payload(route.get('project_input'))
+            state = route.get('project_input_preparation')
+            if (type(route.get('project_input_contract_version')) is not int
+                    or route['project_input_contract_version'] != 1
+                    or (project, session) != (invocation.project_id, invocation.session_id)
+                    or not isinstance(state, Mapping)
+                    or type(state.get('schema_version')) is not int or state['schema_version'] != 1
+                    or state.get('phase') != ('executing' if original else 'observed')):
+                raise ValueError
+            trusted_reference = ProjectBaselineReference.from_payload(state.get('reference'))
+            if reference is not None and reference != trusted_reference:
+                raise ValueError
+            loaded = await asyncio.to_thread(ProjectBaselineStore(self.root).load, invocation, trusted_reference)
+            if loaded.contract.editable_paths != selection.editable_paths:
+                raise ValueError
+            observation_sha: str | None = None
+            if original:
+                if (set(state) != {'schema_version', 'phase', 'reference', 'execution_id'}
+                        or state['execution_id'] != invocation.execution_id):
+                    raise ValueError
+            else:
+                observed = validated_original_observation(
+                    state.get('observation'), expected_source=trusted_reference.input_source_sha256,
+                    expected_contract=loaded.contract.protected_sha256,
+                )
+                observation_sha = hashlib.sha256(json.dumps(observed, default=dict, ensure_ascii=True,
+                    sort_keys=True, separators=(',', ':')).encode('ascii')).hexdigest()
+                if state.get('observation_sha256') != observation_sha:
+                    raise ValueError
+            return _OriginalScope(loaded, observation_sha)
+        except Exception:  # noqa: BLE001 - no project data or alternate scope can replace the original.
+            raise ProjectVerificationError('original project contract is unavailable or changed') from None
+
+    async def _run_original_contract(
+        self, invocation: ProjectInvocation, stored: StoredProjectBaseline, *, original: bool,
+    ) -> Mapping[str, JsonValue]:
+        from agent_hub.skills.sandbox.project import (
+            ContractProjectInvocation,
+            ProjectSystemdSandbox,
+            project_source_fingerprint,
+            project_source_manifest,
+        )
+
+        try:
+            files = await project_source_manifest(self.root, invocation)
+            stored.contract.require_current(files)
+            before = await project_source_fingerprint(self.root, invocation)
+            if original and before != stored.reference.input_source_sha256:
+                raise ValueError
+        except Exception:  # noqa: BLE001 - unreadable or unsafe source is never executed.
+            raise ProjectVerificationError('original project checks or source changed before execution') from None
+        scoped = ContractProjectInvocation.model_validate({
+            **invocation.model_dump(), 'source_kind': 'original' if original else 'candidate',
+            'original_reference': stored.reference.to_payload(),
+        }, strict=True)
+        try:
+            result = await (self.executor or ProjectSystemdSandbox()).run(scoped)
+            if result.exit_code != 0 or result.timed_out:
+                raise ProjectVerificationError('project execution outcome is not confirmed')
+            if await project_source_fingerprint(self.root, invocation) != before:
+                raise ProjectVerificationError('project source changed during verification')
+            # The native runner seals every candidate byte, not just conventional tests/**.
+            report = json.loads(result.stdout, object_pairs_hook=_strict_object)
+            binding: dict[str, JsonValue] = {
+                'schema_version': 1, 'contract_sha256': stored.contract.protected_sha256,
+                'protected_sha256': stored.contract.protected_sha256,
+            }
+            native_binding = report.get('original_check_contract') if isinstance(report, dict) else None
+            if (not isinstance(native_binding, dict) or type(native_binding.get('schema_version')) is not int
+                    or native_binding != binding):
+                raise ProjectVerificationError('original project contract execution is not confirmed')
+            try:
+                receipt = _validate_report(result.stdout, expected_source=before)
+            except ProjectVerificationError as error:
+                if not original or error.project_failure is None or error.diagnostic is None:
+                    raise
+                return {'schema_version': 1, 'status': 'failed',
+                        'verification': error.project_failure.to_payload(),
+                        'execution_diagnostic': error.diagnostic.to_payload(),
+                        'original_check_contract': binding}
+            return {'schema_version': 1, 'status': 'passed', 'verification': receipt,
+                    'original_check_contract': binding}
+        except (ProjectVerificationError, ProcessCleanupIncomplete):
+            raise
+        except Exception:  # noqa: BLE001 - unexpected executor output cannot become a native observation.
+            raise ProjectVerificationError('original project contract execution is not confirmed') from None
+
+    async def observe_original(
+        self, *, tenant_id: UUID, run_id: UUID, actor: str, reference: ProjectBaselineReference,
+        execution_id: str, timeout_seconds: float,
+    ) -> Mapping[str, JsonValue]:
+        invocation = await self._invocation(tenant_id, run_id, actor)
+        invocation = invocation.model_copy(update={
+            'execution_id': execution_id,
+            'timeout_seconds': min(invocation.timeout_seconds, max(1, math.ceil(timeout_seconds))),
+        })
+        stored = await self._original_scope(invocation, reference=reference, original=True)
+        if stored is None:
+            raise ProjectVerificationError('original project contract is unavailable or changed')
+        return await self._run_original_contract(invocation, stored.stored, original=True)
 
     async def _invocation(
         self, tenant_id: UUID, run_id: UUID, actor: str,
@@ -202,7 +443,18 @@ class ProjectVerificationService:
 
         key = (tenant_id, run_id)
         self._receipts.pop(key, None)
+        self._original_receipts.pop(key, None)
         invocation = await self._invocation(tenant_id, run_id, actor)
+        stored = await self._original_scope(invocation)
+        if stored is not None:
+            contract_result = await self._run_original_contract(invocation, stored.stored, original=False)
+            receipt = cast(Mapping[str, JsonValue], contract_result['verification'])
+            source = cast(str, receipt['source_sha256'])
+            binding = stored.binding(source)
+            self._receipts[key] = (invocation, source)
+            self._original_receipts[key] = binding
+            return {'verification': receipt, 'original_check_contract': binding,
+                    'summary': 'Original checks preserved; dependencies, build and tests verified in isolation.'}
         try:
             before = await project_source_fingerprint(self.root, invocation)
             try:
@@ -230,11 +482,23 @@ class ProjectVerificationService:
         if record is not None:
             invocation, expected = record
             try:
+                original = await self._original_scope(invocation)
+                if original is not None:
+                    from agent_hub.skills.sandbox.project import project_source_manifest
+
+                    original.stored.contract.require_current(await project_source_manifest(self.root, invocation))
+                    if self._original_receipts.get((tenant_id, run_id)) != original.binding(expected):
+                        raise ValueError
+                elif (tenant_id, run_id) in self._original_receipts:
+                    raise ValueError
                 if await project_source_fingerprint(self.root, invocation) == expected:
                     return expected
             except Exception:  # noqa: BLE001 - a stale/unreadable source cannot be delivered as verified.
                 self._receipts.pop((tenant_id, run_id), None)
         raise ProjectVerificationError("project verification required before delivery")
+
+    def original_receipt_binding(self, tenant_id: UUID, run_id: UUID) -> Mapping[str, JsonValue] | None:
+        return self._original_receipts.get((tenant_id, run_id))
 
 
 def _strict_object(pairs: list[tuple[str, object]]) -> dict[str, object]:

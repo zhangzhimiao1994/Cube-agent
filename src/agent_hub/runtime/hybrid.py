@@ -31,6 +31,7 @@ from agent_hub.runtime.contracts import (
     RuntimeCheckpoint,
     TaskContext,
 )
+from agent_hub.runtime.direct import _original_project_terminal_artifact_matches
 from agent_hub.runtime.failure_reason import (
     gateway_scope_failure_payload,
     runtime_failure_diagnostic_from_reason,
@@ -82,6 +83,10 @@ class RuntimeBusy(RuntimeExecutionError):
 
 class _ChildModelScopeError(RuntimeExecutionError):
     """Scope integrity failures must not become partial delivery successes."""
+
+
+class _OriginalProjectReplayError(RuntimeExecutionError):
+    """Unbound recovered deliveries cannot become partial completion either."""
 
 
 class ChildRuntime(Protocol):
@@ -199,6 +204,12 @@ class HybridRuntime:
         last_child_progress_fingerprint: str | None = None
         restored_child_checkpoint: RuntimeCheckpoint | None = None
         model_scope = _ModelScopeBoundary()
+        original_terminal_replay = (
+            self._restored is not None and self._restored.state.get("terminal") is True
+            and any(key in context.routing_decision for key in (
+                "project_input_contract_version", "project_input",
+            ))
+        )
         try:
             restored = self._restored
             if restored is not None:
@@ -206,6 +217,22 @@ class HybridRuntime:
                 if context.checkpoint is None or context.checkpoint.id != restored.id:
                     raise RuntimeExecutionError("runtime checkpoint mismatch")
                 restored_artifacts = await self._hydrate_checkpoint(restored, context)
+                if original_terminal_replay:
+                    deliveries = tuple(artifact for artifact in restored_artifacts
+                        if artifact.type == "tool_result" and (
+                            "workspace_delivery" in artifact.content
+                            or artifact.content.get("tool_name") == "workspace.bundle"
+                            or isinstance(artifact.content.get("result"), Mapping)
+                            and cast(Mapping[str, JsonValue], artifact.content["result"]).get("presentation")
+                            == "final_attachment"
+                        ))
+                    # The registry is an unordered canonical map, not a causal ledger.
+                    # No valid entry may mask another unbound recovered delivery.
+                    if not deliveries or not all(
+                        _original_project_terminal_artifact_matches(context, artifact)
+                        for artifact in deliveries
+                    ):
+                        raise _OriginalProjectReplayError("original project terminal checkpoint proof is invalid")
                 for artifact in restored_artifacts:
                     if artifact.id not in known:
                         artifacts.append(artifact)
@@ -533,7 +560,8 @@ class HybridRuntime:
             )
             partial_reason = (
                 None if (
-                    isinstance(error, _ChildModelScopeError)
+                    original_terminal_replay
+                    or isinstance(error, _ChildModelScopeError | _OriginalProjectReplayError)
                     or runtime_failure_diagnostic_from_reason(failure_reason).get("error_code")
                     == "model.request_negotiation_exhausted"
                 )

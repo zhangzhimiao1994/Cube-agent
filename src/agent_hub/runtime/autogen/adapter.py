@@ -2127,6 +2127,7 @@ class AutoGenDiscussionRuntime:
             return (progress is None or (progress.inspected and not progress.uncertain)) and engineering_delivery_ready(
                 run_id=context.run_id, tool_entries=durability.tool_entries,
                 artifacts=durability.artifacts, allowed_tools=allowed_tools,
+                context=context,
                 require_write=not (progress is not None and progress.existing_project),
             )
 
@@ -2180,6 +2181,7 @@ class AutoGenDiscussionRuntime:
                     if engineering and not engineering_delivery_ready(
                         run_id=context.run_id, tool_entries=self._restored_ledger(restored, "tool_ledger"),
                         artifacts=ledger_artifacts, allowed_tools=allowed_tools,
+                        context=context,
                         require_write=not (progress is not None and progress.existing_project),
                     ):
                         raise RuntimeExecutionError("engineering_delivery_missing")

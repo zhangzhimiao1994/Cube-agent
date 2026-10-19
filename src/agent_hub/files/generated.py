@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
@@ -151,7 +152,7 @@ class GeneratedFileStore:
         safe_filename = validate_generated_filename(filename, mime_type)
         if timestamp_filename:
             safe_filename = _timestamped_generated_filename(safe_filename)
-        source_path = source.resolve(strict=True)
+        source_path = _native_io_path(source.absolute()).resolve(strict=True)
         if not source_path.is_file():
             raise ValueError("generated file source is not a file")
 
@@ -204,6 +205,7 @@ class GeneratedFileStore:
         run_path = (self._root / str(tenant_id) / str(run_id)).resolve()
         if not run_path.is_relative_to(self._root):
             raise ValueError("run path escapes generated artifact root")
+        run_path = _native_io_path(run_path)
         if not run_path.exists():
             return
         if not run_path.is_dir():
@@ -217,7 +219,7 @@ class GeneratedFileStore:
         ).resolve()
         if not candidate.is_relative_to(self._root):
             raise ValueError("storage_key escapes generated artifact root")
-        return candidate
+        return _native_io_path(candidate)
 
     def _parse_storage_key(self, storage_key: str) -> tuple[UUID, UUID, UUID, str]:
         parts = PurePosixPath(storage_key).parts
@@ -236,6 +238,16 @@ class GeneratedFileStore:
 
         safe_filename = _safe_filename(filename)
         return parsed_tenant_id, parsed_run_id, parsed_artifact_id, safe_filename
+
+
+def _native_io_path(path: Path) -> Path:
+    # Keep scope checks on canonical paths; opt into Win32 long paths only for I/O.
+    value = str(path)
+    if os.name != "nt" or value.startswith("\\\\?\\") or len(value) < 248:
+        return path
+    if value.startswith("\\\\"):
+        return Path("\\\\?\\UNC\\" + value[2:])
+    return Path("\\\\?\\" + value)
 
 
 def _timestamped_generated_filename(filename: str) -> str:

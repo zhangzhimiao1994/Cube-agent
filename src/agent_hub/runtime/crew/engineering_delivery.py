@@ -14,6 +14,10 @@ from agent_hub.runtime.crew.workspace_maintenance_delivery import (
     maintenance_delivery_ready,
 )
 from agent_hub.runtime.engineering_actions import EngineeringProgress
+from agent_hub.runtime.original_project_progress import (
+    original_contract_binding_matches,
+    original_failure_observed,
+)
 
 Position = tuple[int, int, int]
 
@@ -35,6 +39,7 @@ def engineering_action_progress(
         if position[:2] < (attempt, round_index):
             rows.append((position, key, row))
     inspected = existing = wrote = seen = verified = failed = False
+    seen = failed = original_failure_observed(context)
     known: dict[str, tuple[str, str, int]] = {}
     for _, key, row in sorted(rows):
         name, status = row.get('name'), row.get('status')
@@ -80,7 +85,9 @@ def engineering_action_progress(
             known[item[0]] = item
         elif name == 'project.verify':
             seen = True
-            verified = status == 'succeeded' and _successful_source(result) is not None
+            source = _successful_source(result)
+            verified = (status == 'succeeded' and source is not None
+                        and original_contract_binding_matches(context, result, source))
             failed = status == 'failed' and result.get('status') == 'failed'
             if not verified and not failed:
                 return uncertain
@@ -88,7 +95,7 @@ def engineering_action_progress(
         verification_seen=seen, verification_current=verified, verification_failed_current=failed,
         completion_proposed=completion_proposed, recovering=recovering,
         bundle_current=engineering_delivery_ready(step_id=step_id, actor=actor, states=states,
-            artifacts=artifacts, attempt=attempt, round_index=round_index, require_write=False))
+            artifacts=artifacts, attempt=attempt, round_index=round_index, require_write=False, context=context))
 
 
 def _trusted_result(key: str, row: Mapping[str, JsonValue], actor: str,
@@ -131,6 +138,7 @@ def engineering_delivery_ready(
     artifacts: Mapping[str, Artifact],
     attempt: int | None = None, round_index: int | None = None,
     require_write: bool = True,
+    context: TaskContext | None = None,
 ) -> bool:
     """Require trusted write -> successful verify -> matching current final bundle.
 
@@ -186,6 +194,8 @@ def engineering_delivery_ready(
                 verified, ready = None, False
             elif name == "project.verify":
                 source = _successful_source(result)
+                if source is not None and not original_contract_binding_matches(context, result, source):
+                    source = None
                 digest = hashlib.sha256(json.dumps(
                     result.get("verification"), default=dict, sort_keys=True,
                     separators=(",", ":"), ensure_ascii=True,
@@ -194,6 +204,7 @@ def engineering_delivery_ready(
                 ready = False
             else:
                 ready = (verified is not None and verified[0] < position
+                         and original_contract_binding_matches(context, result, verified[1])
                          and result.get("verification_source_sha256") == verified[1]
                          and result.get("verification_receipt_sha256") == verified[2]
                          and maintenance_delivery_ready(

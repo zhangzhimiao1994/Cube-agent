@@ -4280,6 +4280,7 @@ class CrewDispatchRuntime:
                             and not engineering_delivery_ready(
                                 step_id=restored_step.id, actor=restored_step.agent,
                                 states=tool_ledger.states, artifacts=tool_ledger.artifacts,
+                                context=context,
                                 require_write=restored_step.engineering_action_version != 1,
                             )):
                         _fail("engineering delivery evidence is missing from completed checkpoint")
@@ -5124,6 +5125,7 @@ class CrewDispatchRuntime:
                         and not engineering_delivery_ready(
                             step_id=step.id, actor=step.agent, states=tool_ledger.states,
                             artifacts=tool_ledger.artifacts,
+                            context=context,
                             require_write=step.engineering_action_version != 1,
                         )):
                     _fail("engineering delivery requires trusted write, verification and current bundle")
@@ -7792,6 +7794,7 @@ class CrewDispatchRuntime:
                     delivered = engineering_delivery_ready(
                         step_id=step.id, actor=step.agent, attempt=model_attempt,
                         round_index=_round, states=tool_ledger.states, artifacts=tool_ledger.artifacts,
+                        context=context,
                         require_write=step.engineering_action_version != 1,
                     )
                 elif step.workspace_maintenance_contract_version == 1:

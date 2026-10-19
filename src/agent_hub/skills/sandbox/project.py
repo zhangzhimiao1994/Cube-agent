@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from agent_hub.capabilities import scoped_read
 from agent_hub.files.workspace import WORKSPACE_METADATA_DOTFILES, project_private_entry
@@ -64,6 +64,44 @@ class ProjectBrokerRequest(BaseModel):
     version: Literal[2] = 2
     action: Literal["run_project"] = "run_project"
     invocation: ProjectInvocation
+
+
+class OriginalProjectReference(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+
+    schema_version: Literal[1] = 1
+    contract_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    input_source_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    file_count: int = Field(ge=1, le=100000)
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def strict_version(cls, value: object) -> object:
+        if type(value) is not int:
+            raise ValueError("original project reference version must be an integer")
+        return value
+
+
+class ContractProjectInvocation(ProjectInvocation):
+    original_reference: OriginalProjectReference
+    source_kind: Literal["original", "candidate"]
+
+
+class ContractProjectBrokerRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+
+    version: Literal[3] = 3
+    action: Literal["run_project"] = "run_project"
+    invocation: ContractProjectInvocation
+
+
+def _source_invocation(invocation: ProjectInvocation) -> ProjectInvocation:
+    if type(invocation) is ContractProjectInvocation:
+        invocation = ContractProjectInvocation.model_validate(invocation.model_dump(), strict=True)
+        return ProjectInvocation.model_validate(
+            {name: getattr(invocation, name) for name in ProjectInvocation.model_fields}, strict=True,
+        )
+    return ProjectInvocation.model_validate(invocation.model_dump(), strict=True)
 
 
 class ProjectTerminateRequest(BaseModel):
@@ -118,11 +156,12 @@ async def snapshot_project_source(
     invocation: ProjectInvocation,
     *,
     destination: Path | None = None,
+    _manifest: dict[str, str] | None = None,
 ) -> str:
     """Hash deliverable files; optionally write the same bytes into a new owned directory."""
     try:
         # Validate even model_copy/model_construct callers before touching source paths.
-        invocation = ProjectInvocation.model_validate(invocation.model_dump(), strict=True)
+        invocation = _source_invocation(invocation)
         source, scope = _scope(root, invocation)
         if destination is not None:
             destination.mkdir(mode=0o700)
@@ -181,6 +220,8 @@ async def snapshot_project_source(
             for directory_name, _, _ in os.walk(destination, topdown=False):
                 Path(directory_name).chmod(0o555)
         manifest = json.dumps(hashes, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+        if _manifest is not None:
+            _manifest.update(hashes)
         return hashlib.sha256(manifest.encode("ascii")).hexdigest()
     except (OSError, ValueError, RuntimeError):
         raise RuntimeError("project source unavailable or unsafe or limits exceeded") from None
@@ -190,10 +231,20 @@ async def project_source_fingerprint(root: Path, invocation: ProjectInvocation) 
     return await snapshot_project_source(root, invocation, destination=None)
 
 
+async def project_source_manifest(root: Path, invocation: ProjectInvocation) -> dict[str, str]:
+    files: dict[str, str] = {}
+    await snapshot_project_source(root, invocation, _manifest=files)
+    return files
+
+
 def build_project_systemd_command(
     invocation: ProjectInvocation,
     policy: BrokerPolicy,
     snapshot: Path,
+    *,
+    contract_path: Path | None = None,
+    original_snapshot: Path | None = None,
+    contract_sha256: str | None = None,
 ) -> tuple[str, ...]:
     from agent_hub.skills.sandbox.broker import _systemd_path
 
@@ -209,7 +260,17 @@ def build_project_systemd_command(
             for character in value
         )
 
-    properties = (
+    contract_enabled = (contract_path, original_snapshot, contract_sha256)
+    if any(item is not None for item in contract_enabled) and (
+        not all(item is not None for item in contract_enabled)
+        or type(invocation) is not ContractProjectInvocation
+        or type(contract_sha256) is not str or len(contract_sha256) != 64
+        or any(char not in "0123456789abcdef" for char in contract_sha256)
+    ):
+        raise ValueError("original project contract command is incomplete")
+    if type(invocation) is ContractProjectInvocation and not all(item is not None for item in contract_enabled):
+        raise ValueError("original project contract command is incomplete")
+    properties: tuple[str, ...] = (
         "DynamicUser=yes",
         f"SupplementaryGroups={policy.service_group}",
         "UMask=0077",
@@ -239,6 +300,11 @@ def build_project_systemd_command(
         f"BindReadOnlyPaths={escaped(snapshot)}:{_INPUT}",
         "InaccessiblePaths=/var/lib/agent-hub",
     )
+    if contract_path is not None and original_snapshot is not None:
+        properties += (
+            f"BindReadOnlyPaths={escaped(contract_path)}:/run/agent-hub-project-contract.json",
+            f"BindReadOnlyPaths={escaped(original_snapshot)}:/run/agent-hub-project-original",
+        )
     command = [
         policy.systemd_run,
         "--wait",
@@ -273,6 +339,12 @@ def build_project_systemd_command(
     )
     if invocation.install_allowed:
         command.append("--install-allowed")
+    if contract_sha256 is not None:
+        command.extend(("--check-contract", "/run/agent-hub-project-contract.json",
+                        "--original-input", "/run/agent-hub-project-original",
+                        "--expected-contract-sha256", contract_sha256,
+                        '--workspace-limit-bytes', str(invocation.workspace_limit_bytes),
+                        '--file-limit', str(invocation.file_limit)))
     return tuple(command)
 
 
@@ -339,7 +411,7 @@ class ProjectExecutionBroker:
 
     async def handle(
         self,
-        request: ProjectBrokerRequest | ProjectTerminateRequest,
+        request: ProjectBrokerRequest | ContractProjectBrokerRequest | ProjectTerminateRequest,
         *,
         peer_uid: int,
     ) -> BrokerResponse:
@@ -353,6 +425,8 @@ class ProjectExecutionBroker:
             request_type = (
                 ProjectTerminateRequest
                 if isinstance(request, ProjectTerminateRequest)
+                else ContractProjectBrokerRequest
+                if isinstance(request, ContractProjectBrokerRequest)
                 else ProjectBrokerRequest
             )
             request = request_type.model_validate(request.model_dump(), strict=True)
@@ -385,12 +459,45 @@ class ProjectExecutionBroker:
                     job.stage.chmod(0o700)
                     self._metadata(job, "STAGED")
                     snapshot = job.stage / "snapshot"
-                    digest = await snapshot_project_source(
-                        self.policy.project_workspace_root,
-                        invocation,
-                        destination=snapshot,
+                    contract_fields: dict[str, Any] = {}
+                    if isinstance(request, ContractProjectBrokerRequest):
+                        from agent_hub.capabilities.project_baselines import (
+                            ProjectBaselineReference,
+                        )
+                        from agent_hub.skills.sandbox.project_contract_broker import (
+                            stage_original_contract,
+                        )
+
+                        stored = await asyncio.to_thread(
+                            stage_original_contract,
+                            workspace_root=self.policy.project_workspace_root,
+                            invocation=_source_invocation(invocation),
+                            reference=ProjectBaselineReference.from_payload(
+                                request.invocation.original_reference.model_dump(),
+                            ), stage=job.stage, allowed_uid=self.policy.allowed_uid,
+                        )
+                        if request.invocation.source_kind == "original":
+                            snapshot = stored.snapshot
+                            digest = stored.reference.input_source_sha256
+                        else:
+                            files: dict[str, str] = {}
+                            digest = await snapshot_project_source(
+                                self.policy.project_workspace_root, invocation,
+                                destination=snapshot, _manifest=files,
+                            )
+                            stored.contract.require_current(files)
+                        contract_fields = {
+                            "contract_path": job.stage / "check_contract.json",
+                            "original_snapshot": stored.snapshot,
+                            "contract_sha256": stored.contract.protected_sha256,
+                        }
+                    else:
+                        digest = await snapshot_project_source(
+                            self.policy.project_workspace_root, invocation, destination=snapshot,
+                        )
+                    command = build_project_systemd_command(
+                        invocation, self.policy, snapshot, **contract_fields,
                     )
-                    command = build_project_systemd_command(invocation, self.policy, snapshot)
                     remaining = deadline - asyncio.get_running_loop().time()
                     if remaining <= 0:
                         raise TimeoutError
@@ -402,7 +509,10 @@ class ProjectExecutionBroker:
                         process_started=lambda process: setattr(job, "process", process),
                         on_forced_terminate=lambda: self._cleanup(job),
                     )
-                self._validate_result(result, digest)
+                if contract_fields:
+                    self._validate_result(result, digest, expected_contract_sha256=contract_fields['contract_sha256'])
+                else:
+                    self._validate_result(result, digest)
                 return BrokerResponse(ok=True, result=result)
             finally:
                 try:
@@ -445,7 +555,9 @@ class ProjectExecutionBroker:
         temporary.replace(job.stage / "execution.json")
 
     @staticmethod
-    def _validate_result(result: SkillResult, digest: str) -> None:
+    def _validate_result(
+        result: SkillResult, digest: str, *, expected_contract_sha256: str | None = None,
+    ) -> None:
         if result.exit_code != 0 or result.timed_out:
             return
         try:
@@ -462,6 +574,12 @@ class ProjectExecutionBroker:
                 raise ValueError
         except (ValueError, TypeError):
             raise RuntimeError("project_runner_invalid_report") from None
+        if expected_contract_sha256 is not None:
+            binding = report.get('original_check_contract')
+            if (not isinstance(binding, dict) or type(binding.get('schema_version')) is not int
+                    or binding != {'schema_version': 1, 'contract_sha256': expected_contract_sha256,
+                                   'protected_sha256': expected_contract_sha256}):
+                raise RuntimeError('project_runner_invalid_contract_report')
 
     async def _cleanup(self, job: _Execution) -> None:
         if job.cleanup is None:
@@ -579,7 +697,7 @@ class ProjectExecutionBroker:
 
 
 async def request_project_broker(
-    request: ProjectBrokerRequest | ProjectTerminateRequest,
+    request: ProjectBrokerRequest | ContractProjectBrokerRequest | ProjectTerminateRequest,
     *,
     socket_path: Path = Path("/run/agent-hub/skill-broker.sock"),
 ) -> BrokerResponse:
@@ -618,10 +736,14 @@ class ProjectSystemdSandbox:
         try:
             async with asyncio.timeout(invocation.timeout_seconds + _CLEANUP_SECONDS + 3):
                 response = await request_project_broker(
-                    ProjectBrokerRequest(invocation=invocation),
+                    ContractProjectBrokerRequest(invocation=invocation)
+                    if isinstance(invocation, ContractProjectInvocation)
+                    else ProjectBrokerRequest(invocation=invocation),
                     socket_path=self.socket_path,
                 )
             if not response.ok or response.result is None:
+                if not response.ok and response.error == "project_termination_cleanup_incomplete":
+                    raise ProcessCleanupIncomplete("project_termination_cleanup_incomplete")
                 raise OSError(response.error or "project broker rejected execution")
             return response.result
         except (asyncio.CancelledError, TimeoutError):

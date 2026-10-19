@@ -16,6 +16,7 @@ from typing import Literal, Protocol, cast
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from agent_hub.auth.models import Role
+from agent_hub.capabilities.project_contracts import ManagedProjectInput
 from agent_hub.context.builder import ContextBuildInput, estimate_tokens
 from agent_hub.context.compaction import ContextCompactor
 from agent_hub.domain.runs import RunStatus, TaskMode
@@ -67,6 +68,7 @@ from agent_hub.runtime.contracts import (
     RunEvent,
     RuntimeCheckpoint,
     TaskContext,
+    _freeze_object,
 )
 from agent_hub.runtime.failure_reason import (
     runtime_failure_diagnostic_from_reason,
@@ -76,6 +78,7 @@ from agent_hub.runtime.instruction_context import InstructionContextLoader
 from agent_hub.runtime.progress import artifact_progress_key
 from agent_hub.runtime.registry import RuntimeRegistry
 from agent_hub.runtime.streams import closing_runtime_events
+from agent_hub.subprocess_cleanup import ProcessCleanupIncomplete
 
 _LOGGER = logging.getLogger(__name__)
 _AUTO_RESOLVE_MAX_SINGLE_COST_USD = Decimal("0.50")
@@ -534,12 +537,14 @@ class RunService:
         conversation_repository: ConversationRepositoryProtocol | None = None,
         conversation_queue_repository: ConversationQueueRepository | None = None,
         conversation_preview_stopper: Callable[[UUID, str], Awaitable[None]] | None = None,
+        project_input_preparer: Callable[[TaskContext], Awaitable[TaskContext]] | None = None,
     ) -> None:
         self._repository = repository
         self._instruction_context_loader = instruction_context_loader
         self._conversation_repository = conversation_repository
         self._conversation_queue_repository = conversation_queue_repository
         self._conversation_preview_stopper = conversation_preview_stopper
+        self._project_input_preparer = project_input_preparer
         self._runtime_registry = runtime_registry
         self._router = router
         self._queue = task_queue
@@ -584,6 +589,7 @@ class RunService:
         project_id: str | None = None,
         project_label: str | None = None,
         workspace_session_id: str | None = None,
+        project_input: ManagedProjectInput | None = None,
         sandbox_profile: str | None = None,
         execution_backend: str = "systemd",
         requested_permissions: tuple[str, ...] = (),
@@ -618,6 +624,11 @@ class RunService:
         if conversation is not None:
             if conversation.archived_at is not None:
                 raise ConversationArchived("archived conversation cannot accept new runs")
+            if project_input is not None and (
+                project_id not in {None, conversation.project_id}
+                or workspace_session_id not in {None, conversation.workspace_path}
+            ):
+                raise ValueError('original project input must match the persisted conversation workspace')
             project_id = conversation.project_id
             project_label = conversation.project_label
             workspace_session_id = conversation.workspace_path
@@ -630,6 +641,18 @@ class RunService:
             requested_permissions=requested_permissions,
         )
         resolved_execution_backend = normalize_execution_backend(execution_backend)
+        if project_input is not None:
+            if self._project_input_preparer is None:
+                raise VibeCodingUnavailable('original project preparation is unavailable')
+            if type(project_input) is not ManagedProjectInput:
+                raise ValueError('project_input must be a validated managed project selection')
+            project_input = ManagedProjectInput.from_payload(project_input.to_payload())
+            if (not project_id or not workspace_session_id or workspace.sandbox_profile != 'workspace_write'
+                    or resolved_execution_backend != 'systemd'
+                    or not {'workspace.read', 'workspace.write', 'command.run'}.issubset(
+                        workspace.requested_permissions,
+                    )):
+                raise ValueError('original project input requires an explicit writable project and execution scope')
         operator_selection: dict[str, object] = {
             "requested_mode": requested_mode.value,
             "role_planning_intent_version": 2,
@@ -653,6 +676,13 @@ class RunService:
             "execution_backend": resolved_execution_backend,
         }
         project_delivery = _project_delivery_assessment(message)
+        if project_input is not None:
+            operator_selection['project_input_contract_version'] = 1
+            operator_selection['project_input'] = project_input.to_payload()
+            project_delivery = {
+                **(project_delivery or {}), 'project_delivery': 'workspace',
+                'artifact_strategy': 'workspace_bundle',
+            }
         if project_delivery is not None:
             operator_selection.update(project_delivery)
             if (
@@ -1802,6 +1832,74 @@ class RunService:
     async def _enqueue_outbox_run(self, run_id: UUID, idempotency_key: str) -> None:
         await self._queue.enqueue_run(run_id, idempotency_key=idempotency_key)
 
+    async def _prepare_original_project_context(self, context: TaskContext) -> TaskContext:
+        failure = "original project preparation is unavailable or changed"
+        route = context.routing_decision
+        if (
+            type(route.get("project_input_contract_version")) is not int
+            or route.get("project_input_contract_version") != 1
+            or self._project_input_preparer is None
+        ):
+            raise RuntimeError(failure)
+        ManagedProjectInput.from_payload(route.get("project_input"))
+
+        async def current_route() -> dict[str, object]:
+            async with await self._repository.run_transaction() as session, session.begin():
+                locked = await self._repository.get_for_update(session, context.run_id)
+                if (
+                    locked.tenant_id != context.tenant_id
+                    or RunStatus(locked.status) is not RunStatus.RUNNING
+                    or locked.worker_id != self._worker_id
+                    or locked.worker_lease_token != context.execution_token
+                    or locked.worker_lease_expires_at is None
+                    or locked.worker_lease_expires_at <= datetime.now(UTC)
+                ):
+                    raise RunConflict(failure)
+                return dict(locked.routing_decision or {})
+
+        before = await current_route()
+        started = asyncio.get_running_loop().time()
+        async with asyncio.timeout(context.timeout_seconds):
+            prepared = await self._project_input_preparer(context)
+        # model_copy is not validation; revalidate internal and public fields before use.
+        if type(prepared) is not TaskContext:
+            raise RuntimeError(failure)
+        prepared = prepared.validated_internal_clone()
+        for name in TaskContext.model_fields:
+            if name not in {"artifacts", "routing_decision"} and (
+                getattr(prepared, name) != getattr(context, name)
+            ):
+                raise RuntimeError(failure)
+        if prepared.artifacts[:len(context.artifacts)] != context.artifacts:
+            raise RuntimeError(failure)
+        state = prepared.routing_decision.get("project_input_preparation")
+        if (
+            not isinstance(state, Mapping)
+            or type(state.get("schema_version")) is not int
+            or state.get("schema_version") != 1
+            or state.get("phase") != "observed"
+            or {
+                key: value for key, value in prepared.routing_decision.items()
+                if key != "project_input_preparation"
+            } != {
+                key: value for key, value in route.items()
+                if key != "project_input_preparation"
+            }
+        ):
+            raise RuntimeError(failure)
+        after = await current_route()
+        if (
+            {key: value for key, value in before.items() if key != "project_input_preparation"}
+            != {key: value for key, value in after.items() if key != "project_input_preparation"}
+            or not isinstance(after.get("project_input_preparation"), Mapping)
+            or _freeze_object(after["project_input_preparation"], name="original project preparation") != state
+        ):
+            raise RuntimeError(failure)
+        remaining = context.timeout_seconds - (asyncio.get_running_loop().time() - started)
+        if remaining <= 0:
+            raise TimeoutError(failure)
+        return prepared.model_copy(update={"timeout_seconds": remaining}).validated_internal_clone()
+
     async def execute(
         self,
         run_id: UUID,
@@ -1885,6 +1983,7 @@ class RunService:
         lease_lost = False
         runtime_cancel_failed = False
         runtime_cancel: Callable[[], Awaitable[None]] | None = None
+        project_preparation_task: asyncio.Task[TaskContext] | None = None
         heartbeat_stop = asyncio.Event()
         heartbeat_task: asyncio.Task[None] | None = None
         approval_drain = _ApprovalCheckpointDrain(worker_lease_token)
@@ -2054,7 +2153,24 @@ class RunService:
                         run_id=run_id,
                         event=_event_at_sequence(started_event, run_id=run_id, sequence=sequence),
                     )
-            runtime_cancel = _runtime_cancel_for_run(runtime, run_id, worker_lease_token)
+            cancel_model_runtime = _runtime_cancel_for_run(runtime, run_id, worker_lease_token)
+
+            async def cancel_active_execution() -> None:
+                nonlocal runtime_cancel_failed
+                if project_preparation_task is not None:
+                    previous_failure = runtime_cancel_failed
+                    runtime_cancel_failed = True
+                    if not project_preparation_task.done():
+                        project_preparation_task.cancel()
+                    outcomes = await asyncio.gather(project_preparation_task, return_exceptions=True)
+                    if any(isinstance(outcome, BaseException)
+                           and not isinstance(outcome, asyncio.CancelledError) for outcome in outcomes):
+                        raise RuntimeError('original project execution cleanup is not confirmed') from None
+                    runtime_cancel_failed = previous_failure
+                    return
+                await cancel_model_runtime()
+
+            runtime_cancel = cancel_active_execution
             heartbeat_task = asyncio.create_task(
                 self._heartbeat_worker_lease(
                     tenant_id=tenant_id,
@@ -2066,6 +2182,58 @@ class RunService:
                 )
             )
             try:
+                if (
+                    "project_input" in context.routing_decision
+                    or "project_input_contract_version" in context.routing_decision
+                ):
+                    try:
+                        project_preparation_task = asyncio.create_task(
+                            self._prepare_original_project_context(context)
+                        )
+                        context = await project_preparation_task
+                    except asyncio.CancelledError:
+                        current = await self._repository.get(tenant_id, run_id)
+                        if (current.status is RunStatus.RUNNING
+                                and current.worker_id == self._worker_id
+                                and current.worker_lease_token == worker_lease_token):
+                            raise
+                        # The heartbeat owns cancellation cleanup. Await its outcome before
+                        # advertising quiescence or releasing a still-uncertain execution.
+                        heartbeat_stop.set()
+                        await self._await_worker_lease_heartbeat(heartbeat_task)
+                        current = await self._repository.get(tenant_id, run_id)
+                        if (current.worker_id == self._worker_id
+                                and current.worker_lease_token == worker_lease_token):
+                            try:
+                                if runtime_cancel_failed:
+                                    current = await self._repository.mark_worker_execution_exited(
+                                        tenant_id, run_id, worker_id=self._worker_id,
+                                        worker_lease_token=worker_lease_token, exited_at=datetime.now(UTC),
+                                    )
+                                else:
+                                    current = await self._repository.release_worker_execution(
+                                        tenant_id, run_id, worker_id=self._worker_id,
+                                        worker_lease_token=worker_lease_token,
+                                    )
+                            except RunConflict:
+                                current = await self._repository.get(tenant_id, run_id)
+                        return _submitted(current)
+                    except RunConflict:
+                        current = await self._repository.get(tenant_id, run_id)
+                        if (
+                            current.worker_id == self._worker_id
+                            and current.worker_lease_token == worker_lease_token
+                        ):
+                            try:
+                                current = await self._repository.release_worker_execution(
+                                    tenant_id, run_id, worker_id=self._worker_id,
+                                    worker_lease_token=worker_lease_token,
+                                )
+                            except RunConflict:
+                                current = await self._repository.get(tenant_id, run_id)
+                        return _submitted(current)
+                    project_preparation_task = None
+                    runtime_routing_decision = dict(context.routing_decision)
                 runtime_events = _adaptive_runtime_events(
                     runtime,
                     context,
@@ -2216,6 +2384,8 @@ class RunService:
                     return _submitted(released_record)
             terminal = released_record.status
         except Exception as error:
+            if isinstance(error, ProcessCleanupIncomplete):
+                runtime_cancel_failed = True
             _LOGGER.exception(
                 "run_execute_failed run_id=%s error_type=%s",
                 run_id,
