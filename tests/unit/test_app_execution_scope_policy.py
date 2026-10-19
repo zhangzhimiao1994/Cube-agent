@@ -16,6 +16,7 @@ from tests.unit.test_app_wiring import (
     FakeRedis,
     StubAuthService,
     StubConfigService,
+    StubProjectInputPreparer,
     StubRateLimiter,
     valid_settings,
 )
@@ -24,6 +25,8 @@ from tests.unit.test_app_wiring import (
 def _application(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Any, dict[str, Any]]:
     assert "execution_scope_policy_file" in Settings.model_fields
     captured: dict[str, Any] = {}
+    preparer = StubProjectInputPreparer()
+    captured["project_input_preparer"] = preparer
 
     class Runtime:
         async def reload(self, tenant_id: Any = None) -> None:
@@ -49,7 +52,8 @@ def _application(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Any, 
     monkeypatch.setattr(
         app_module,
         "build_runtime_capability_stack",
-        lambda **kwargs: SimpleNamespace(runtime_gateway=object(), harness_tool_gateway=object()),
+        lambda **kwargs: SimpleNamespace(runtime_gateway=object(), harness_tool_gateway=object(),
+                                        project_input_preparer=preparer),
     )
     app = create_app(
         settings=valid_settings(
@@ -92,6 +96,8 @@ def test_operator_policy_file_is_loaded_and_wired_into_real_app_lifespan(
     app, captured = _application(tmp_path, monkeypatch)
     with TestClient(app):
         assert app.state.execution_scope_policy_status == "loaded"
+        assert app.state.project_input_preparer is captured["project_input_preparer"]
+        assert app.state.run_service._project_input_preparer is captured["project_input_preparer"]
     assert loaded[0][0] == tmp_path / "scope.json"
     assert app.state.settings.plugin_package_store_dir in loaded[0][1]
     assert loaded[0][2] is app.state.capability_installer_service._environment_manager
@@ -107,6 +113,8 @@ def test_missing_configured_policy_is_fail_closed_without_breaking_login(
     with TestClient(app) as client:
         assert client.get("/health/live").status_code == 200
         assert app.state.execution_scope_policy_status == "unavailable"
+        assert app.state.project_input_preparer is captured["project_input_preparer"]
+        assert app.state.run_service._project_input_preparer is captured["project_input_preparer"]
     selector = captured["plugin"]["adapter_factory"]
     assert (
         callable(selector)

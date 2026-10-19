@@ -17,6 +17,7 @@ from tests.unit.test_app_wiring import (
     FakeRedis,
     StubAuthService,
     StubConfigService,
+    StubProjectInputPreparer,
     StubRateLimiter,
     valid_settings,
 )
@@ -28,6 +29,7 @@ def test_app_lifespan_passes_both_trusted_scope_selectors(
     assert "plugin_adapter_factory" in inspect.signature(create_app).parameters
     assert "mcp_client_factory" in inspect.signature(create_app).parameters
     captured: dict[str, Any] = {}
+    preparer = StubProjectInputPreparer()
 
     class RuntimeService:
         async def reload(self, tenant_id: UUID | None = None) -> None:
@@ -59,7 +61,8 @@ def test_app_lifespan_passes_both_trusted_scope_selectors(
     monkeypatch.setattr(
         app_module,
         "build_runtime_capability_stack",
-        lambda **kwargs: SimpleNamespace(runtime_gateway=object(), harness_tool_gateway=object()),
+        lambda **kwargs: SimpleNamespace(runtime_gateway=object(), harness_tool_gateway=object(),
+                                        project_input_preparer=preparer),
     )
     application = create_app(
         settings=valid_settings(
@@ -79,7 +82,8 @@ def test_app_lifespan_passes_both_trusted_scope_selectors(
         mcp_client_factory=mcp_factory,
     )
     with TestClient(application):
-        pass
+        assert application.state.project_input_preparer is preparer
+        assert application.state.run_service._project_input_preparer is preparer
     assert captured["plugin"]["adapter_factory"] is plugin_factory
     assert captured["mcp"]["client_factory"] is mcp_factory
     assert "adapters" in captured["plugin"]

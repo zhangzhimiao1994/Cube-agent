@@ -71,6 +71,11 @@ class StubRateLimiter:
     pass
 
 
+class StubProjectInputPreparer:
+    async def __call__(self, context: TaskContext) -> TaskContext:
+        raise AssertionError("lifespan wiring must not execute project preparation")
+
+
 class StubConfigService:
     async def get_current(self, tenant_id: UUID) -> None:
         assert tenant_id == TENANT_ID
@@ -620,6 +625,7 @@ def test_create_app_wires_runtime_mcp_and_plugin_manifest_sources(
     class FakeRuntimeStack:
         runtime_gateway = object()
         harness_tool_gateway = object()
+        project_input_preparer = StubProjectInputPreparer()
 
     class FakePostgresArtifactRepository:
         def __init__(self, session_factory: object) -> None:
@@ -671,7 +677,8 @@ def test_create_app_wires_runtime_mcp_and_plugin_manifest_sources(
     )
 
     with TestClient(application):
-        pass
+        assert application.state.project_input_preparer is FakeRuntimeStack.project_input_preparer
+        assert application.state.run_service._project_input_preparer is FakeRuntimeStack.project_input_preparer
 
     runtime_kwargs = captured["runtime_stack_kwargs"]
     assert isinstance(runtime_kwargs, dict)
@@ -717,6 +724,7 @@ def test_create_app_registers_enabled_plugin_package_subprocess_adapters(
     class FakeRuntimeStack:
         runtime_gateway = object()
         harness_tool_gateway = object()
+        project_input_preparer = StubProjectInputPreparer()
 
     async def fake_build_runtime_mcp_service(**kwargs: object) -> FakeRuntimeService:
         del kwargs
@@ -777,7 +785,8 @@ def test_create_app_registers_enabled_plugin_package_subprocess_adapters(
     )
 
     with TestClient(application):
-        pass
+        assert application.state.project_input_preparer is FakeRuntimeStack.project_input_preparer
+        assert application.state.run_service._project_input_preparer is FakeRuntimeStack.project_input_preparer
 
     plugin_kwargs = cast(dict[str, object], captured["plugin_service_kwargs"])
     adapters = cast(dict[str, Any], plugin_kwargs["adapters"])
@@ -900,6 +909,7 @@ def test_create_app_publishes_runtime_invalidation_after_admin_reload(
     class FakeRuntimeStack:
         runtime_gateway = object()
         harness_tool_gateway = object()
+        project_input_preparer = StubProjectInputPreparer()
 
     async def fake_build_runtime_mcp_service(**kwargs: object) -> FakeMcpService:
         del kwargs
@@ -939,6 +949,8 @@ def test_create_app_publishes_runtime_invalidation_after_admin_reload(
     )
 
     with TestClient(application):
+        assert application.state.project_input_preparer is FakeRuntimeStack.project_input_preparer
+        assert application.state.run_service._project_input_preparer is FakeRuntimeStack.project_input_preparer
         asyncio.run(application.state.reload_mcp_runtime_config(OTHER_TENANT_ID))
         asyncio.run(application.state.reload_plugin_runtime_config(OTHER_TENANT_ID))
         asyncio.run(application.state.reload_plugin_runtime_config_strict(OTHER_TENANT_ID))
@@ -1063,6 +1075,7 @@ def test_create_app_reads_tool_approval_settings_for_target_tenant(
     class FakeRuntimeStack:
         runtime_gateway = object()
         harness_tool_gateway = object()
+        project_input_preparer = StubProjectInputPreparer()
 
     async def fake_build_runtime_mcp_service(**kwargs: object) -> FakeRuntimeService:
         return FakeRuntimeService()
@@ -1100,7 +1113,8 @@ def test_create_app_reads_tool_approval_settings_for_target_tenant(
     )
 
     with TestClient(application):
-        pass
+        assert application.state.project_input_preparer is FakeRuntimeStack.project_input_preparer
+        assert application.state.run_service._project_input_preparer is FakeRuntimeStack.project_input_preparer
 
     runtime_kwargs = cast(dict[str, object], captured["runtime_stack_kwargs"])
     require_approval = cast(Any, runtime_kwargs["require_approval_for_tools"])

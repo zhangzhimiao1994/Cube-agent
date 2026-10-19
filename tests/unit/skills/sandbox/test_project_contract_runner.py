@@ -8,6 +8,7 @@ import json
 import os
 import runpy
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -412,13 +413,24 @@ def test_runner_real_mount_context_keeps_sealed_fds_until_reap_and_then_closes(
               pass_fds: tuple[int, ...] = ()) -> Any:
         assert deadline > time.monotonic() and pass_fds
         descriptors.extend(pass_fds)
+        source_fds: list[int] = []
+        output_fds: list[int] = []
         for fd in pass_fds:
-            assert fcntl.fcntl(fd, 1034) & 15 == 15
+            if stat.S_ISREG(os.fstat(fd).st_mode):
+                assert fcntl.fcntl(fd, 1034) & 15 == 15
+                source_fds.append(fd)
+            else:
+                assert stat.S_ISDIR(os.fstat(fd).st_mode)
+                output_fds.append(fd)
+        assert len(source_fds) == 4 and len(output_fds) == 3
         separator = command.index("--")
         prefix = command[:separator]
         assert prefix.count("--ro-bind-data") == 4
         assert "--remount-ro" in prefix
         assert prefix.count("--bind") == 3
+        assert {prefix[index + 1] for index, value in enumerate(prefix) if value == "--bind"} == {
+            f"/proc/self/fd/{fd}" for fd in output_fds
+        }
         assert str(cwd) not in prefix
         assert all("/workspace/" + name in prefix for name in ("node_modules", "dist", "build"))
         if "--unshare-net" not in prefix:
@@ -429,6 +441,9 @@ def test_runner_real_mount_context_keeps_sealed_fds_until_reap_and_then_closes(
         if raise_during_child:
             raise runner.InfrastructureError("process_reap_failed")
         tail = command[separator + 1:]
+        assert tail[:5] == ("/usr/bin/python3", "-I", "-S", "-B", "-c")
+        assert tail[6] == ",".join(map(str, pass_fds))
+        tail = tail[7:]
         output = ("v22.12.0" if Path(tail[0]).name == "node" else "10.9.0") if tail[-1] == "--version" else "ok"
         return runner.ProcessResult(0, False, False, output, "")
 

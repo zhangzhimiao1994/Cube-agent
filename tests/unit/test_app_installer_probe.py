@@ -31,9 +31,11 @@ def test_configured_policy_binds_installer_cli_probe_in_lifespan(
 
     monkeypatch.setattr(app_module, "build_scoped_cli_probe", build, raising=False)
     monkeypatch.setattr(app_module, "CapabilityEnvironmentManager", manager)
-    application, _ = _application(tmp_path, monkeypatch)
+    application, scope = _application(tmp_path, monkeypatch)
     with TestClient(application):
         assert captured[0].get("cli_probe") is probe
+        assert application.state.project_input_preparer is scope["project_input_preparer"]
+        assert application.state.run_service._project_input_preparer is scope["project_input_preparer"]
     assert selected[0][0] == tmp_path / "scope.json"
     assert application.state.settings.capability_environment_root_dir in selected[0][1]
     assert application.state.settings.plugin_package_store_dir in selected[0][1]
