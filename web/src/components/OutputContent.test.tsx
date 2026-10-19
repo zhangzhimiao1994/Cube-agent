@@ -2,7 +2,7 @@ import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { OutputContent } from "./OutputContent";
+import { BoundedTextBlock, OutputContent, outputFileLanguage } from "./OutputContent";
 
 const originalExecCommand = Object.getOwnPropertyDescriptor(document, "execCommand");
 afterEach(() => {
@@ -12,6 +12,59 @@ afterEach(() => {
 });
 
 describe("shared output rendering", () => {
+  it("renders a highlighted read-only editor toolbar without changing raw copy bytes", async () => {
+    const user = userEvent.setup();
+    const copy = vi.spyOn(navigator.clipboard, "writeText").mockResolvedValue();
+    const source = '  const message = "<script>inert</script>\\n";  \n';
+    render(<OutputContent title="回复" format="code" language="javascript" text={source} />);
+    const pre = screen.getByLabelText("javascript完整内容");
+    const block = pre.closest(".bounded-text-block")!;
+    expect(block.classList.contains("code-block-editor")).toBe(true);
+    expect(pre.querySelector(".hljs-keyword")?.textContent).toBe("const");
+    expect(pre.querySelector("code")?.textContent).toBe(source);
+    const wrap = within(block as HTMLElement).getByRole("button", { name: "换行" });
+    expect(wrap.getAttribute("aria-pressed")).toBe("false");
+    expect(wrap.getAttribute("title")).toBe("自动换行");
+    expect(wrap.querySelector("svg")).toBeTruthy();
+    await user.click(wrap);
+    expect(within(block as HTMLElement).getByRole("button", { name: "不换行" }).getAttribute("aria-pressed")).toBe("true");
+    expect(block.classList.contains("is-wrapped")).toBe(true);
+    const expand = within(block as HTMLElement).getByRole("button", { name: "展开" });
+    expect(expand.querySelector("svg")).toBeTruthy();
+    await user.click(expand);
+    expect(block.classList.contains("is-expanded")).toBe(true);
+    expect(document.activeElement).toBe(pre);
+    const copyButton = within(block as HTMLElement).getByRole("button", { name: "复制 javascript 代码" });
+    expect(copyButton.querySelector("svg")).toBeTruthy();
+    await user.click(copyButton);
+    await waitFor(() => expect(copy).toHaveBeenCalledWith(source));
+    expect(within(block as HTMLElement).getByRole("button", { name: "已复制 javascript 代码" }).querySelector("svg")).toBeTruthy();
+    await user.click(within(block as HTMLElement).getByRole("button", { name: "收起" }));
+    expect(block.classList.contains("is-expanded")).toBe(false);
+    expect(pre.textContent).toBe(source);
+  });
+
+  it("keeps wrapping local to each block and preserves non-code bounded text", async () => {
+    const user = userEvent.setup();
+    render(<><OutputContent title="回复" text={'```python\nprint(1)\n```\n\n```sql\nSELECT 1;\n```'} />
+      <BoundedTextBlock label="日志" text="plain output" copyAriaLabel="复制日志" /></>);
+    const first = screen.getByLabelText("python完整内容").closest(".bounded-text-block")!;
+    const second = screen.getByLabelText("sql完整内容").closest(".bounded-text-block")!;
+    await user.click(within(first as HTMLElement).getByRole("button", { name: "换行" }));
+    expect(first.classList.contains("is-wrapped")).toBe(true);
+    expect(second.classList.contains("is-wrapped")).toBe(false);
+    const plain = screen.getByLabelText("日志完整内容").closest(".bounded-text-block")!;
+    expect(plain.classList.contains("code-block-editor")).toBe(false);
+    expect(within(plain as HTMLElement).queryByRole("button", { name: "换行" })).toBeNull();
+  });
+
+  it("recognizes PowerShell workspace extensions without changing unknown file fallbacks", () => {
+    expect(outputFileLanguage("script.PS1")).toBe("powershell");
+    expect(outputFileLanguage("module.psm1")).toBe("powershell");
+    expect(outputFileLanguage("manifest.psd1")).toBe("powershell");
+    expect(outputFileLanguage("unknown.xyz")).toBe("text");
+  });
+
   it("recognizes indented c++ and tilde fences as separate semantic code blocks", () => {
     const { container } = render(<OutputContent title="回复" text={
       "前文\n\n  ```c++\n  int main() {}\n  ```\n\n~~~css\n.card { display: grid; }\n~~~\n\n后文"
@@ -153,7 +206,7 @@ describe("shared output rendering", () => {
     const { container } = render(<OutputContent title="回复" text={
       `${attack}\n\n[x](javascript:alert(1)) ![remote](https://outside.invalid/p.png)\n\n| A | B |\n|---|---|\n| <br onclick="alert(1)"> | <svg onload="alert(1)"> |\n\n\`\`\`html\n${attack}\n\`\`\``
     } />);
-    expect(container.querySelectorAll("script,img,iframe,svg,a")).toHaveLength(0);
+    expect(container.querySelectorAll("script,img,iframe,a,svg:not(.lucide)")).toHaveLength(0);
     expect(screen.getByLabelText("html完整内容").querySelector("code")?.textContent).toBe(attack);
     expect(container.textContent).toContain('onclick="alert(1)"');
     expect(container.textContent).toContain("javascript:alert(1)");

@@ -4298,8 +4298,10 @@ article:hover {
 }
 
 .run-process-detail dl {
+  align-items: start;
   display: grid;
   gap: 0.35rem 0.65rem;
+  grid-auto-rows: max-content;
   grid-template-columns: minmax(6.5rem, max-content) minmax(0, 1fr);
   margin: 0.55rem 0 0;
   min-width: 0;
@@ -4444,9 +4446,11 @@ article:hover {
 
 .process-detail-modal dl {
   align-content: start;
+  align-items: start;
   display: grid;
   flex: 1 1 auto;
   gap: 0.42rem;
+  grid-auto-rows: max-content;
   grid-template-columns: minmax(7rem, 0.28fr) minmax(0, 1fr);
   margin: 0;
   min-height: 0;
@@ -4470,9 +4474,10 @@ article:hover {
   line-height: 1.48;
   margin: 0;
   max-width: 100%;
+  min-height: 1.5em;
   min-width: 0;
-  overflow-x: auto;
-  overflow-wrap: normal;
+  overflow: visible;
+  overflow-wrap: anywhere;
   white-space: pre-wrap;
   word-break: normal;
 }
@@ -7878,8 +7883,8 @@ article:hover {
     font-size: 0.9rem;
     line-height: 1.55;
     margin: 0;
-    overflow-x: auto;
-    overflow-wrap: normal;
+    overflow: visible;
+    overflow-wrap: anywhere;
   }
 
   .process-detail-modal .bounded-text-block.is-expanded {

@@ -1,5 +1,8 @@
 import { lexer, type Token, type Tokens } from "marked";
+import { Check, Copy, Maximize2, Minimize2, WrapText } from "lucide-react";
 import { Fragment, type CSSProperties, type ReactNode, useEffect, useId, useMemo, useRef, useState } from "react";
+
+import { CodeContent } from "./CodeContent";
 
 function copyWithSelection(text: string) {
   const focused = document.activeElement;
@@ -83,6 +86,7 @@ export function BoundedTextBlock({
   expandLabel?: string;
 }) {
   const [expanded, setExpanded] = useState(false);
+  const [wrapped, setWrapped] = useState(false);
   const { copied, failed, copy } = useCopyFeedback(text);
   const contentId = useId();
   const contentRef = useRef<HTMLPreElement>(null);
@@ -91,25 +95,30 @@ export function BoundedTextBlock({
     if (expanded) contentRef.current?.focus();
   }, [expanded]);
   return (
-    <div className={`bounded-text-block${shouldCollapse && !expanded ? " is-collapsed" : ""}${shouldCollapse && expanded ? " is-expanded" : ""}`}>
+    <div className={`bounded-text-block${language ? ` code-block-editor${wrapped ? " is-wrapped" : ""}${!shouldCollapse && expanded ? " is-expanded" : ""}` : ""}${shouldCollapse && !expanded ? " is-collapsed" : ""}${shouldCollapse && expanded ? " is-expanded" : ""}`}>
       <div className="bounded-text-block-header">
         <span>{label}</span>
-        <div>
-          {shouldCollapse ? (
-            <button type="button" className="text-button" aria-expanded={expanded} aria-controls={contentId}
+        <div className={language ? "code-block-toolbar" : undefined} role={language ? "toolbar" : undefined} aria-label={language ? `${label}代码工具` : undefined}>
+          {language ? <button type="button" className="code-tool-button" aria-label={wrapped ? "不换行" : "换行"}
+            title={wrapped ? "关闭自动换行" : "自动换行"} aria-pressed={wrapped} aria-controls={contentId}
+            onClick={() => setWrapped((current) => !current)}><WrapText size={16} aria-hidden="true" /></button> : null}
+          {shouldCollapse || language ? (
+            <button type="button" className={language ? "code-tool-button" : "text-button"} aria-expanded={expanded} aria-controls={contentId}
+              aria-label={expanded ? expandLabel : collapseLabel} title={expanded ? expandLabel : collapseLabel}
               onClick={() => setExpanded((current) => !current)}>
-              {expanded ? expandLabel : collapseLabel}
+              {language ? (expanded ? <Minimize2 size={16} aria-hidden="true" /> : <Maximize2 size={16} aria-hidden="true" />) : (expanded ? expandLabel : collapseLabel)}
             </button>
           ) : null}
-          <button type="button" className="text-button" aria-label={copied ? `已${copyAriaLabel}` : copyAriaLabel}
+          <button type="button" className={language ? "code-tool-button" : "text-button"} aria-label={copied ? `已${copyAriaLabel}` : copyAriaLabel}
+            title={copied ? "已复制" : copyAriaLabel}
             onClick={() => { void copy(); }}>
-            {copied ? "已复制" : "复制"}
+            {language ? (copied ? <Check size={16} aria-hidden="true" /> : <Copy size={16} aria-hidden="true" />) : (copied ? "已复制" : "复制")}
           </button>
           {failed ? <span role="status">复制失败</span> : null}
         </div>
       </div>
       <pre id={contentId} ref={contentRef} tabIndex={0} aria-label={`${label}完整内容`}>
-        {language ? <code data-language={language}>{text}</code> : text}
+        {language ? <CodeContent text={text} language={language} /> : text}
       </pre>
     </div>
   );
@@ -182,6 +191,7 @@ export function outputFileLanguage(filename: string, mime = "") {
     js: "javascript", jsx: "jsx", ts: "typescript", tsx: "tsx", py: "python", sh: "bash",
     yml: "yaml", yaml: "yaml", json: "json", html: "html", htm: "html", css: "css",
     sql: "sql", toml: "toml", xml: "xml", cpp: "c++", c: "c", cs: "c#", rs: "rust", go: "go",
+    ps1: "powershell", psm1: "powershell", psd1: "powershell",
   };
   return languages[extension] ?? (mime.includes("json") ? "json" : "text");
 }

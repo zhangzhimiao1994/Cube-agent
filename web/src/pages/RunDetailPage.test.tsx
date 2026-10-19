@@ -124,7 +124,7 @@ it("keeps nested process detail modals full-width and readable on mobile", () =>
     /\.process-detail-modal:has\(\.bounded-text-block\.is-expanded\) dl > dd:has\(\.bounded-text-block\.is-expanded\)\s*{[^}]*display:\s*block;[^}]*flex:\s*1 1 auto;[^}]*overflow:\s*hidden;/,
   );
   expect(stylesCss).toMatch(
-    /\.process-detail-modal dd\s*{[\s\S]*overflow-x:\s*auto;[\s\S]*overflow-wrap:\s*normal;[\s\S]*word-break:\s*normal;/,
+    /\.process-detail-modal dd\s*{[^}]*min-height:\s*1\.5em;[^}]*overflow:\s*visible;[^}]*overflow-wrap:\s*anywhere;[^}]*word-break:\s*normal;/,
   );
   expect(stylesCss).toMatch(
     /@media \(max-width: 640px\)[\s\S]*\.process-detail-modal-backdrop\s*{[\s\S]*align-items:\s*stretch;[\s\S]*padding:\s*env\(safe-area-inset-top\) 0 0;/,
@@ -154,7 +154,7 @@ it("lays out process detail modal fields as readable label-value rows", () => {
     /\.process-detail-modal dl\s*{[\s\S]*grid-template-columns:\s*minmax\(7rem,\s*0\.28fr\)\s+minmax\(0,\s*1fr\);/,
   );
   expect(stylesCss).toMatch(
-    /\.process-detail-modal dd\s*{[\s\S]*overflow-x:\s*auto;[\s\S]*overflow-wrap:\s*normal;[\s\S]*white-space:\s*pre-wrap;/,
+    /\.process-detail-modal dd\s*{[^}]*overflow:\s*visible;[^}]*overflow-wrap:\s*anywhere;[^}]*white-space:\s*pre-wrap;/,
   );
   expect(stylesCss).toMatch(
     /@media \(max-width: 640px\)[\s\S]*\.process-detail-modal dl\s*{[\s\S]*grid-template-columns:\s*minmax\(0,\s*1fr\);/,

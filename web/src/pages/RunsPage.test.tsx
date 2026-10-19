@@ -1036,7 +1036,7 @@ describe("WorkbenchFilePreview", () => {
       />,
     );
 
-    expect(screen.getByText(/<!doctype html>/)).not.toBeNull();
+    expect(screen.getByLabelText("html完整内容").textContent).toContain("<!doctype html>");
     expect(screen.queryByRole("button", { name: "运行预览" })).toBeNull();
   });
 

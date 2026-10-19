@@ -2964,7 +2964,7 @@ describe("operational management pages", () => {
     expect(within(fileWindow).getAllByText("创建文件").length).toBeGreaterThan(0);
     await user.click(within(fileWindow).getByRole("button", { name: /src\/app\.py/ }));
     const filePreview = within(workbench).getByRole("region", { name: "关联文件预览" });
-    expect(await within(filePreview).findByText("print('hello from workspace')")).not.toBeNull();
+    expect((await within(filePreview).findByLabelText("python完整内容")).textContent).toBe("print('hello from workspace')\n");
     expect(within(filePreview).getByRole("button", { name: "下载 app.py" })).not.toBeNull();
   });
 
@@ -3022,7 +3022,7 @@ describe("operational management pages", () => {
     const filePreview = within(actionWorkspace).getByRole("region", { name: "关联文件预览" });
     expect(within(workbench).getByRole("button", { name: "动作与文件" }).getAttribute("aria-pressed")).toBe("true");
     expect(within(filePreview).getByLabelText("app.py预览")).not.toBeNull();
-    expect(await within(filePreview).findByText("print('hello from workspace')")).not.toBeNull();
+    expect((await within(filePreview).findByLabelText("python完整内容")).textContent).toBe("print('hello from workspace')\n");
   });
 
   it("shows safe command and workspace path summaries for action rows without downloadable files", async () => {
