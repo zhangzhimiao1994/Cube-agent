@@ -310,7 +310,7 @@ def one_step_plan(*, tools: tuple[str, ...] = ()) -> DispatchPlan:
     )
 
 
-def chain_plan(step_count: int, *, review: bool = False) -> DispatchPlan:
+def chain_plan(step_count: int, *, review: bool = False, step_timeout: float = 1.0) -> DispatchPlan:
     agents = [
         AgentSpec(
             id="writer",
@@ -334,7 +334,7 @@ def chain_plan(step_count: int, *, review: bool = False) -> DispatchPlan:
                 reviewer_retries=1 if review else 0,
                 final_synthesizer=index == step_count - 1,
                 token_budget=100,
-                timeout_seconds=1,
+                timeout_seconds=step_timeout,
             )
             for index in range(step_count)
         ),
@@ -3184,7 +3184,8 @@ async def test_repository_recovers_more_than_64_review_retry_artifacts() -> None
         )
     ]
     repository = InMemoryArtifactRepository()
-    dispatch_plan = chain_plan(step_count, review=True)
+    # This exercises persisted artifact recovery, not scheduler latency/deadlines.
+    dispatch_plan = chain_plan(step_count, review=True, step_timeout=30)
     first = make_runtime(
         FakeGateway(reviews=reviews),
         dispatch_plan,
