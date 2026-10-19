@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import re
 
-from agent_hub.capabilities.project_prerequisites import validated_project_prerequisite_payload
+from agent_hub.capabilities.project_prerequisites import (
+    project_prerequisite_reason_category,
+    validated_project_prerequisite_payload,
+)
 from agent_hub.models.capacity import (
     CapacityBackendError,
     CapacityConfigurationError,
@@ -37,6 +40,10 @@ _CREWAI_STEP_TIMEOUT = re.compile(
 _HYBRID_CHILD_FAILURE = re.compile(
     r"^hybrid (?P<mode>direct|dispatch|discuss) failed: (?P<reason>.+)$",
     re.IGNORECASE,
+)
+_PREREQUISITE_FAILURE = re.compile(
+    r"(?:hybrid (?P<mode>direct|dispatch|discuss) failed: )?"
+    r"project prerequisite blocked: (?P<reason>[a-z0-9_]{1,64})"
 )
 GENERIC_MODEL_GATEWAY_FAILURE = "model gateway failed"
 LEGACY_GENERIC_FAILURES = frozenset(
@@ -108,11 +115,40 @@ def safe_model_gateway_failure_reason(error: Exception) -> str | None:
     return None
 
 
+def _prerequisite_failure_parts(reason: str) -> tuple[str, str, str | None] | None:
+    match = _PREREQUISITE_FAILURE.fullmatch(reason)
+    if match is None:
+        return None
+    category = project_prerequisite_reason_category(match["reason"])
+    return None if category is None else (match["reason"], category, match["mode"])
+
+
+def is_public_project_prerequisite_text(value: object) -> bool:
+    """Recognize finite diagnostic literals, never free text or secret field names."""
+    if type(value) is not str:
+        return False
+    if project_prerequisite_reason_category(value) is not None:
+        return True
+    code_prefix = "project.prerequisite."
+    if value.startswith(code_prefix):
+        return project_prerequisite_reason_category(value[len(code_prefix):]) is not None
+    return _prerequisite_failure_parts(value) is not None
+
+
 def safe_runtime_failure_reason(error: Exception, *, fallback: str = "runtime_failed") -> str:
     gateway_reason = safe_model_gateway_failure_reason(error)
     if gateway_reason is not None:
         return gateway_reason
+    prerequisite = validated_project_prerequisite_payload(
+        getattr(error, "project_prerequisite_payload", None),
+    )
+    if prerequisite is not None:
+        return "project prerequisite blocked: " + str(prerequisite["reason"])
     reason = normalize_failure_reason(str(error))
+    if _prerequisite_failure_parts(reason) is not None:
+        # Only finite diagnostic codes may cross Hybrid's string boundary.
+        # No arbitrary authorization text or execution authority is preserved.
+        return reason
     if not is_safe_failure_reason(reason):
         return fallback
     return reason[:MAX_FAILURE_REASON_LENGTH]
@@ -126,18 +162,6 @@ def safe_runtime_failure_diagnostic(
     """Return a redacted, structured diagnostic payload for failed runs."""
 
     reason = safe_runtime_failure_reason(error, fallback=fallback)
-    prerequisite = validated_project_prerequisite_payload(
-        getattr(error, "project_prerequisite_payload", None),
-    )
-    if prerequisite is not None:
-        return _base_diagnostic(
-            reason,
-            error_stage="project_prerequisite",
-            error_category=str(prerequisite["category"]),
-            error_code="project.prerequisite." + str(prerequisite["reason"]),
-            retryable=False,
-            suggested_action="项目执行环境尚未就绪；应先修复环境或完成受控安装，再验证原项目，不要盲目修改源码或重放旧运行。",
-        )
     status_code = error.status_code if isinstance(error, ModelTransportError) else None
     return {**runtime_failure_diagnostic_from_reason(reason, status_code=status_code),
             **gateway_scope_failure_payload(error)}
@@ -165,6 +189,20 @@ def runtime_failure_diagnostic_from_reason(
     """Classify an already-redacted failure reason into UI/operator hints."""
 
     normalized = normalize_failure_reason(reason or "") or "runtime_failed"
+    prerequisite = _prerequisite_failure_parts(normalized)
+    if prerequisite is not None:
+        prerequisite_reason, prerequisite_category, child_mode = prerequisite
+        diagnostic = _base_diagnostic(
+            normalized,
+            error_stage="project_prerequisite",
+            error_category=prerequisite_category,
+            error_code="project.prerequisite." + prerequisite_reason,
+            retryable=False,
+            suggested_action="项目执行环境尚未就绪；应先修复环境或完成受控安装，再验证原项目，不要盲目修改源码或重放旧运行。",
+        )
+        if child_mode is not None:
+            diagnostic["hybrid_child_mode"] = child_mode
+        return diagnostic
     admission = re.fullmatch(
         r'engineering permission gate failed: (denied|gate_unavailable|identity_unavailable|tool_unavailable|invalid_approval_receipt|approval_unavailable|invalid_result|unclassified)',
         normalized,
@@ -913,6 +951,7 @@ __all__ = [
     "SENSITIVE_FAILURE_REASON",
     "gateway_scope_failure_payload",
     "is_legacy_generic_failure_reason",
+    "is_public_project_prerequisite_text",
     "is_safe_failure_reason",
     "normalize_failure_reason",
     "runtime_failure_diagnostic_from_reason",

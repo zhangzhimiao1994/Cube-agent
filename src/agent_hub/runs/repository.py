@@ -39,6 +39,7 @@ from agent_hub.runs.self_repair import repair_context_from_proposal
 from agent_hub.runtime.contracts import Artifact, EventKind, RunEvent, RuntimeCheckpoint
 from agent_hub.runtime.failure_reason import (
     RECOVERY_BLOCKED_FAILURE_REASON,
+    is_public_project_prerequisite_text,
     runtime_failure_diagnostic_from_reason,
 )
 
@@ -2737,7 +2738,8 @@ def _sanitize_public_json(value: object, *, project_artifacts: bool = False) -> 
         }
     if isinstance(value, list):
         return [_sanitize_public_json(item, project_artifacts=project_artifacts) for item in value]
-    if type(value) is str and _SENSITIVE_PUBLIC_TEXT.search(value):
+    if (type(value) is str and _SENSITIVE_PUBLIC_TEXT.search(value)
+        and not is_public_project_prerequisite_text(value)):
         return "[redacted]"
     return value
 

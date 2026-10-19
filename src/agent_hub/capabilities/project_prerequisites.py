@@ -276,3 +276,10 @@ def validated_project_prerequisite_payload(value: object) -> Mapping[str, JsonVa
         return _payload(value)
     except (ValueError, TypeError, RecursionError):
         return None
+
+
+def project_prerequisite_reason_category(reason: object) -> ProjectPrerequisiteCategory | None:
+    """Classify an exact public reason; this grants no execution or install authority."""
+    if type(reason) is not str:
+        return None
+    return _CATEGORIES.get(cast(ProjectPrerequisiteReason, reason))

@@ -1268,6 +1268,8 @@ def _partial_hybrid_completion_reason(
     artifacts: list[Artifact],
     failure_reason: str,
 ) -> str | None:
+    if runtime_failure_diagnostic_from_reason(failure_reason).get("error_stage") == "project_prerequisite":
+        return None
     delivery_artifacts = [artifact for artifact in artifacts if artifact.type != "model_attempt"]
     if not delivery_artifacts:
         return None
