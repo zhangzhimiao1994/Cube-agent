@@ -604,11 +604,9 @@ class ProjectExecutionBroker:
                 await self._kill_and_confirm(job)
             job.quiet = True
             if job.stage is not None:
-                # Only the broker's private copy is made writable for removal.
-                for directory, _, files in os.walk(job.stage):
-                    Path(directory).chmod(0o700)
-                    for filename in files:
-                        (Path(directory) / filename).chmod(0o600)
+                from agent_hub.skills.sandbox.project_cleanup import make_private_stage_writable
+
+                make_private_stage_writable(job.stage)
                 shutil.rmtree(job.stage)
         except BaseException:  # noqa: BLE001 - preserve UNKNOWN on every cleanup failure
             job.quiet = False

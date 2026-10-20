@@ -429,7 +429,7 @@ def configured(project: ModuleType, tmp_path: Path) -> tuple[Any, Any]:
     root = tmp_path / "workspaces"
     source_tree(root, inv)
     runtime = tmp_path / "runtime"
-    runtime.mkdir()
+    runtime.mkdir(mode=0o700)
     broker = SkillBroker(BrokerPolicy(project_workspace_root=root,
         runtime_root=tmp_path / 'skill-runtime', project_runtime_root=runtime))
     return inv, broker
@@ -842,7 +842,7 @@ async def test_v3_socket_uses_separate_private_project_runtime_for_original_stag
     from agent_hub.skills.sandbox import project_contract_broker
 
     runtime = tmp_path / 'service-runtime'
-    runtime.mkdir()
+    runtime.mkdir(mode=0o700)
     policy = BrokerPolicy(runtime_root=tmp_path / 'service-runtime', project_runtime_root=runtime,
         project_workspace_root=tmp_path / 'workspaces')
     broker = SkillBroker(policy)
@@ -877,7 +877,7 @@ async def test_project_runtime_move_keeps_legacy_unknown_stages_nonreplayable(
 ) -> None:
     monkeypatch.setattr(project, '_systemd_supported', lambda: True)
     runtime, legacy = tmp_path / 'private', tmp_path / 'legacy'
-    runtime.mkdir()
+    runtime.mkdir(mode=0o700)
     retained = legacy / 'project_1-retained'
     retained.mkdir(parents=True)
     marker = retained / 'execution.json'

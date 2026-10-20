@@ -135,7 +135,7 @@ async def test_wrong_peer_cannot_read_config_create_stage_or_claim_execution(
 @pytest.fixture
 def configured(api: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
     stage = tmp_path / "stages"
-    stage.mkdir()
+    stage.mkdir(mode=0o700)
     policy = replace(
         BrokerPolicy(), runtime_root=tmp_path / "legacy", python_project_runtime_root=stage
     )
