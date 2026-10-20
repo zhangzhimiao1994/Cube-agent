@@ -171,6 +171,101 @@ def _rename_noreplace(source: int, name: str, target: int, filename: str) -> Non
         raise OSError(code, "wheel publication rename failed")
 
 
+def _link_unnamed(descriptor: int, target: int, filename: str) -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    link = getattr(libc, "linkat", None)
+    if link is None:
+        raise OSError(errno.ENOSYS, "linkat unavailable")
+    link.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_int)
+    link.restype = ctypes.c_int
+    # Follow only our own proc FD. AT_EMPTY_PATH would require CAP_DAC_READ_SEARCH.
+    if link(-100, f"/proc/self/fd/{descriptor}".encode("ascii"), target,
+            os.fsencode(filename), 1024) != 0:
+        raise OSError(ctypes.get_errno(), "wheel publication link failed")
+
+
+def _publish_unnamed(
+    cache: int, observed: list[_Observed], entry: WheelDownload, data: bytes, deadline: float,
+) -> tuple[Literal["published", "reused"], tuple[int, ...]]:
+    """EXDEV-only alternative: no cache directory entry exists before final linkat."""
+    if sys.platform != "linux":
+        raise PythonInputPublishError("python_input_publish_root_linux_required")
+    _check_roots(observed, deadline)
+    flag = getattr(os, "O_TMPFILE", None)
+    if type(flag) is not int or flag <= 0:
+        raise PythonInputPublishError("python_input_publish_tmpfile_unavailable")
+    descriptor = os.open(".", os.O_RDWR | flag | os.O_NOFOLLOW | os.O_CLOEXEC,
+                         0o600, dir_fd=cache)
+    linking = published = False
+    try:
+        info = os.fstat(descriptor)
+        identity = _stamp(info)[:2]
+        _need(stat.S_ISREG(info.st_mode) and info.st_uid == info.st_gid == 0
+              and info.st_dev == os.fstat(cache).st_dev and info.st_nlink == 0)
+        os.fchmod(descriptor, 0o600)
+        remaining = memoryview(data)
+        while remaining:
+            _deadline(deadline)
+            count = os.write(descriptor, remaining[:65536])
+            _need(0 < count <= len(remaining), "python_input_publish_io_error")
+            remaining = remaining[count:]
+        os.fsync(descriptor)
+        os.fchmod(descriptor, 0o444)
+        os.fsync(descriptor)
+        before = os.fstat(descriptor)
+        prepared = _stamp(before, full=True)
+        _need(prepared[:2] == identity and before.st_nlink == 0
+              and before.st_uid == before.st_gid == 0 and stat.S_IMODE(before.st_mode) == 0o444
+              and before.st_size == entry.size_bytes)
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            _deadline(deadline)
+            chunk = os.read(descriptor, min(65536, entry.size_bytes + 1 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            _need(total <= entry.size_bytes)
+        _validate(entry, b"".join(chunks), deadline)
+        _check_roots(observed, deadline)
+        _need(_stamp(os.fstat(descriptor), full=True) == prepared)
+        linking = True
+        try:
+            _link_unnamed(descriptor, cache, entry.filename)
+        except OSError as error:
+            if error.errno not in _LINK_REJECTED:
+                raise
+            # A known rejected syscall must leave this inode entirely unnamed.
+            _need(_stamp(os.fstat(descriptor), full=True) == prepared)
+            linking = False
+            if error.errno != errno.EEXIST:
+                raise PythonInputPublishError("python_input_publish_link_rejected") from None
+            existing = _verified(cache, entry.filename, entry, deadline)
+            _need(existing is not None)
+            _check_roots(observed, deadline)
+            assert existing is not None
+            _check_file(cache, entry.filename, existing)
+            return "reused", existing
+        published = True
+        os.fsync(descriptor)
+        os.fsync(cache)
+        final = _verified(cache, entry.filename, entry, deadline)
+        _need(final is not None and final[:2] == identity
+              and _stamp(os.fstat(descriptor), full=True) == final)
+        _check_roots(observed, deadline)
+        assert final is not None
+        _check_file(cache, entry.filename, final)
+        return "published", final
+    except BaseException:
+        if linking or published:
+            raise ProcessCleanupIncomplete("python_input_publish_cleanup_incomplete") from None
+        raise
+    finally:
+        _close(descriptor)
+
+
 def _temp_identity(parent: int, name: str, descriptor: int,
                    identity: tuple[int, ...]) -> None:
     info = os.fstat(descriptor)
@@ -191,6 +286,8 @@ def _discard_temp(parent: int, name: str, descriptor: int, identity: tuple[int, 
 # These errno results guarantee rename did not publish. All others retain evidence.
 _RENAME_REJECTED = {errno.EEXIST, errno.EXDEV, errno.ENOSYS, errno.EACCES, errno.EPERM,
                     errno.ENOSPC, errno.EDQUOT, errno.EROFS, errno.ENOENT, errno.EINVAL}
+_LINK_REJECTED = _RENAME_REJECTED | {errno.EOPNOTSUPP, errno.EMLINK, errno.ENOTDIR,
+                                   errno.ELOOP, errno.ENAMETOOLONG}
 _CREATE_REJECTED = _RENAME_REJECTED | {errno.ENOTDIR, errno.ELOOP, errno.ENAMETOOLONG,
                                      errno.EMFILE, errno.ENFILE}
 
@@ -265,6 +362,14 @@ def publish_verified_wheel(
                     if error.errno not in _RENAME_REJECTED:
                         raise
                     rename_started = False
+                    if error.errno == errno.EXDEV:
+                        outcome, linked_identity = _publish_unnamed(cache, observed, entry, data, deadline)
+                        renamed = outcome == "published"  # Publication fence also covers linkat.
+                        _discard_temp(staging, *temp)
+                        temp = None
+                        _check_roots(observed, deadline)
+                        _check_file(cache, entry.filename, linked_identity)
+                        return outcome
                     if error.errno != errno.EEXIST:
                         raise PythonInputPublishError("python_input_publish_rename_rejected") from None
                     existing = _verified(cache, entry.filename, entry, deadline)
@@ -285,8 +390,9 @@ def publish_verified_wheel(
                 assert final is not None
                 _check_file(cache, entry.filename, final)
                 return "published"
-            except BaseException:
-                if renamed or rename_started or temp_open_started:
+            except BaseException as error:
+                if (isinstance(error, ProcessCleanupIncomplete)
+                        or renamed or rename_started or temp_open_started):
                     raise ProcessCleanupIncomplete("python_input_publish_cleanup_incomplete") from None
                 if temp is not None:
                     try:

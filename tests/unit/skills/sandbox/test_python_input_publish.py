@@ -74,6 +74,7 @@ class FileSystem:
     O_NOFOLLOW = 1 << 21
     O_CLOEXEC = 1 << 22
     O_NONBLOCK = 1 << 23
+    O_TMPFILE = (1 << 24) | O_DIRECTORY
 
     def __init__(self) -> None:
         self.nodes: dict[str, Node] = {}
@@ -87,6 +88,12 @@ class FileSystem:
         self.rename_hook: Any = None
         self.fsync_hook: Any = None
         self.fstat_hook: Any = None
+        self.tmpfile_supported = False
+        self.tmpfile_error: int | None = None
+        self.unnamed: list[Node] = []
+        self.link_error: int | None = None
+        self.after_link_error = False
+        self.link_hook: Any = None
         for name in ("/", "/private", str(CACHE), str(STAGING)):
             self.add(name, stat.S_IFDIR | 0o700)
 
@@ -105,6 +112,17 @@ class FileSystem:
     def open(self, name: str, flags: int, mode: int = 0o777,
              *, dir_fd: int | None = None) -> int:
         path = self.path(name, dir_fd)
+        if flags & self.O_TMPFILE == self.O_TMPFILE:
+            if not self.tmpfile_supported or self.tmpfile_error:
+                raise OSError(self.tmpfile_error or errno.EOPNOTSUPP, "unnamed unavailable")
+            assert path == str(CACHE) and not flags & os.O_EXCL
+            node = Node(1000 + len(self.unnamed), stat.S_IFREG | mode,
+                        nlink=0, dev=self.nodes[path].dev)
+            self.unnamed.append(node)
+            fd = max(self.fds, default=10) + 1
+            self.fds[fd] = (node, path + "/<unnamed>", 0)
+            self.events.append(("tmpfile", path))
+            return fd
         if flags & os.O_CREAT:
             if path in self.nodes:
                 raise FileExistsError(errno.EEXIST, "exists")
@@ -200,6 +218,23 @@ class FileSystem:
         if self.after_rename_error:
             raise OSError(errno.EIO, "result unknown")
 
+    def link_unnamed(self, descriptor: int, target: int, filename: str) -> None:
+        node = self.fds[descriptor][0]
+        path = self.path(filename, target)
+        self.events.append(("link", path))
+        assert node.nlink == 0 and stat.S_IMODE(node.mode) == 0o444
+        assert node.data == RAW and not any(value is node for value in self.nodes.values())
+        if self.link_hook:
+            self.link_hook(node, path)
+        if self.link_error:
+            raise OSError(self.link_error, "link rejected")
+        if path in self.nodes:
+            raise FileExistsError(errno.EEXIST, "no clobber")
+        self.nodes[path] = node
+        node.nlink = 1
+        if self.after_link_error:
+            raise OSError(errno.EIO, "link outcome unknown")
+
 
 @pytest.fixture
 def fs(api: Any, monkeypatch: pytest.MonkeyPatch) -> FileSystem:
@@ -214,6 +249,227 @@ def fs(api: Any, monkeypatch: pytest.MonkeyPatch) -> FileSystem:
 def publish(api: Any, entry: Any = None, **kwargs: Any) -> str:
     return cast(str, api.publish_verified_wheel(CACHE, STAGING, entry or Entry(), RAW,
                                                deadline=kwargs.pop("deadline", 200.0), **kwargs))
+
+
+@pytest.fixture
+def exdev(api: Any, fs: FileSystem, monkeypatch: pytest.MonkeyPatch) -> FileSystem:
+    fs.rename_error = errno.EXDEV
+    fs.tmpfile_supported = True
+    monkeypatch.setattr(api, "_link_unnamed", fs.link_unnamed, raising=False)
+    return fs
+
+
+def test_exdev_only_uses_anonymous_cache_fd_and_atomic_final_link(api: Any, exdev: FileSystem) -> None:
+    assert publish(api) == "published"
+    final = exdev.nodes[str(CACHE) + "/" + FILENAME]
+    assert final is exdev.unnamed[0] and final.nlink == 1 and final.data == RAW
+    assert stat.S_IMODE(final.mode) == 0o444 and final.uid == final.gid == 0
+    assert exdev.events.count(("tmpfile", str(CACHE))) == 1
+    assert exdev.events.count(("link", str(CACHE) + "/" + FILENAME)) == 1
+    assert not any(kind == "create" and path.startswith(str(CACHE) + "/")
+                   for kind, path in exdev.events)
+    assert not any(path.startswith(str(STAGING) + "/") for path in exdev.nodes)
+    assert exdev.events.index(("rename", str(CACHE) + "/" + FILENAME)) < exdev.events.index(("tmpfile", str(CACHE)))
+    assert not exdev.fds
+    assert publish(api) == "reused" and len(exdev.unnamed) == 1
+
+
+@pytest.mark.parametrize("error", [None, errno.ENOSYS, errno.EACCES, errno.ENOSPC, errno.EIO])
+def test_non_exdev_never_tries_anonymous_fallback(api: Any, exdev: FileSystem, error: int | None) -> None:
+    exdev.rename_error = error
+    if error is None:
+        assert publish(api) == "published"
+    else:
+        expected = ProcessCleanupIncomplete if error == errno.EIO else api.PythonInputPublishError
+        with pytest.raises(expected):
+            publish(api)
+    assert not exdev.unnamed and not any(kind == "link" for kind, _ in exdev.events)
+
+
+@pytest.mark.parametrize("error", [errno.EOPNOTSUPP, errno.ENOSYS, errno.EACCES, errno.ENOSPC])
+def test_exdev_with_unavailable_tmpfile_never_creates_named_cache_temp(
+    api: Any, exdev: FileSystem, error: int,
+) -> None:
+    exdev.tmpfile_error = error
+    with pytest.raises(api.PythonInputPublishError):
+        publish(api)
+    assert not exdev.unnamed and not exdev.fds
+    assert not any(path.startswith(str(CACHE) + "/") for path in exdev.nodes)
+    assert not any(".wheel-publish-" in path for path in exdev.nodes)
+
+
+@pytest.mark.parametrize("same", [False, True])
+def test_exdev_link_eexist_measures_existing_bytes_and_never_clobbers(
+    api: Any, exdev: FileSystem, same: bool,
+) -> None:
+    def arrive(node: Node, path: str) -> None:
+        exdev.add(path, stat.S_IFREG | 0o444, RAW if same else b"other wheel")
+    exdev.link_hook = arrive
+    if same:
+        assert publish(api) == "reused"
+    else:
+        with pytest.raises(api.PythonInputPublishError):
+            publish(api)
+    assert exdev.nodes[str(CACHE) + "/" + FILENAME].data == (RAW if same else b"other wheel")
+    assert exdev.unnamed[0].nlink == 0 and not exdev.fds
+    assert not any(".wheel-publish-" in path for path in exdev.nodes)
+
+
+@pytest.mark.parametrize("field,value", [("mode", stat.S_IFREG | 0o644), ("nlink", 2),
+    ("uid", 1000), ("mode", stat.S_IFLNK | 0o777)])
+def test_exdev_link_eexist_does_not_reuse_unsafe_target(api: Any, exdev: FileSystem,
+                                                     field: str, value: int) -> None:
+    def arrive(node: Node, path: str) -> None:
+        existing = exdev.add(path, stat.S_IFREG | 0o444, RAW)
+        setattr(existing, field, value)
+    exdev.link_hook = arrive
+    with pytest.raises(api.PythonInputPublishError):
+        publish(api)
+    assert getattr(exdev.nodes[str(CACHE) + "/" + FILENAME], field) == value
+    assert exdev.unnamed[0].nlink == 0 and not exdev.fds
+
+
+@pytest.mark.parametrize("after", [False, True])
+def test_exdev_unknown_link_result_preserves_staged_evidence_and_any_final(
+    api: Any, exdev: FileSystem, after: bool,
+) -> None:
+    exdev.link_error = None if after else errno.EIO
+    exdev.after_link_error = after
+    with pytest.raises(ProcessCleanupIncomplete):
+        publish(api)
+    assert not any(kind == "unlink" for kind, _ in exdev.events)
+    assert any(".wheel-publish-" in path and node.data == RAW for path, node in exdev.nodes.items())
+    assert (str(CACHE) + "/" + FILENAME in exdev.nodes) is after
+    assert not exdev.fds
+
+
+@pytest.mark.parametrize("error", [errno.EPERM, errno.ENOSYS, errno.EXDEV, errno.ENOSPC])
+def test_exdev_known_link_rejection_closes_unnamed_and_cleans_only_owned_stage(
+    api: Any, exdev: FileSystem, error: int,
+) -> None:
+    exdev.link_error = error
+    exdev.add(str(STAGING) + "/unrelated", stat.S_IFREG | 0o600, b"keep")
+    with pytest.raises(api.PythonInputPublishError):
+        publish(api)
+    assert exdev.unnamed[0].nlink == 0 and not exdev.fds
+    assert exdev.nodes[str(STAGING) + "/unrelated"].data == b"keep"
+    assert not any(".wheel-publish-" in path for path in exdev.nodes)
+    assert str(CACHE) + "/" + FILENAME not in exdev.nodes
+
+
+def test_exdev_post_link_fsync_uncertainty_keeps_final_and_stage(api: Any, exdev: FileSystem) -> None:
+    exdev.fail_cache_fsync = True
+    with pytest.raises(ProcessCleanupIncomplete):
+        publish(api)
+    assert exdev.nodes[str(CACHE) + "/" + FILENAME].data == RAW
+    assert any(".wheel-publish-" in path for path in exdev.nodes)
+    assert not any(kind == "unlink" for kind, _ in exdev.events)
+
+
+def test_exdev_post_link_audit_failure_keeps_final_and_stage(api: Any, exdev: FileSystem) -> None:
+    def change_root(node: Node, path: str) -> None:
+        exdev.nodes[str(STAGING)].mode = stat.S_IFDIR | 0o755
+    exdev.link_hook = change_root
+    with pytest.raises(ProcessCleanupIncomplete):
+        publish(api)
+    assert exdev.nodes[str(CACHE) + "/" + FILENAME].data == RAW
+    assert any(".wheel-publish-" in path for path in exdev.nodes)
+
+
+def test_exdev_copy_is_remeasured_before_any_link(api: Any, exdev: FileSystem) -> None:
+    def corrupt(node: Node, path: str) -> None:
+        if "<unnamed>" in path and stat.S_IMODE(node.mode) == 0o444:
+            node.data = b"x" * len(RAW)
+    exdev.fsync_hook = corrupt
+    with pytest.raises(api.PythonInputPublishError):
+        publish(api)
+    assert not any(kind == "link" for kind, _ in exdev.events)
+    assert not any(".wheel-publish-" in path for path in exdev.nodes)
+
+
+def test_exdev_actual_copy_passes_static_validator_again(
+    api: Any, exdev: FileSystem, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checked = []
+    def validate(entry: Any, data: bytes) -> None:
+        checked.append(data)
+        if len(checked) == 2:
+            raise ValueError("private metadata invalid on revalidation")
+    monkeypatch.setattr(sys.modules["agent_hub.skills.sandbox.python_input_fetch"],
+                        "validate_wheel_bytes", validate)
+    with pytest.raises(api.PythonInputPublishError, match="invalid_wheel"):
+        publish(api)
+    assert checked == [RAW, RAW] and not any(kind == "link" for kind, _ in exdev.events)
+
+
+def test_exdev_successful_link_then_stage_cleanup_failure_is_uncertain(api: Any, exdev: FileSystem) -> None:
+    exdev.fail_unlink = True
+    with pytest.raises(ProcessCleanupIncomplete):
+        publish(api)
+    assert exdev.nodes[str(CACHE) + "/" + FILENAME].data == RAW
+    assert any(".wheel-publish-" in path for path in exdev.nodes)
+
+
+def test_linkat_uses_proc_fd_follow_not_empty_path_or_new_capability(
+    api: Any, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[Any] = []
+    def link(*args: Any) -> int:
+        calls.append(args)
+        return 0
+    monkeypatch.setattr(api.ctypes, "CDLL", lambda *a, **k: SimpleNamespace(linkat=link))
+    implementation = getattr(api, "_link_unnamed", None)
+    assert callable(implementation), "proc-fd atomic publisher is missing"
+    implementation(42, 20, FILENAME)
+    assert calls == [(-100, b"/proc/self/fd/42", 20, FILENAME.encode(), 1024)]
+
+
+@pytest.mark.parametrize("when", ["copy", "link", "post_link"])
+def test_exdev_cancellation_is_known_only_before_link_starts(
+    api: Any, exdev: FileSystem, monkeypatch: pytest.MonkeyPatch, when: str,
+) -> None:
+    def copy_cancel(node: Node, path: str) -> None:
+        if "<unnamed>" in path:
+            raise asyncio.CancelledError()
+    def link_cancel(node: Node, path: str) -> None:
+        raise asyncio.CancelledError()
+    if when == "copy":
+        exdev.fsync_hook = copy_cancel
+    elif when == "link":
+        exdev.link_hook = link_cancel
+    else:
+        def post_cancel(node: Node, path: str) -> None:
+            if path == str(CACHE):
+                raise asyncio.CancelledError()
+        exdev.fsync_hook = post_cancel
+    expected = asyncio.CancelledError if when == "copy" else ProcessCleanupIncomplete
+    with pytest.raises(expected):
+        publish(api)
+    staged = any(".wheel-publish-" in path for path in exdev.nodes)
+    assert staged is (when != "copy") and not exdev.fds
+    assert (str(CACHE) + "/" + FILENAME in exdev.nodes) is (when == "post_link")
+
+
+@pytest.mark.parametrize("mutation", ["hash", "mode", "hardlink"])
+def test_exdev_final_integrity_failure_never_deletes_published_evidence(
+    api: Any, exdev: FileSystem, mutation: str,
+) -> None:
+    def corrupt(node: Node, path: str) -> None:
+        if path != str(CACHE):
+            return
+        final = exdev.nodes[str(CACHE) + "/" + FILENAME]
+        if mutation == "hash":
+            final.data = b"x" * len(RAW)
+        elif mutation == "mode":
+            final.mode = stat.S_IFREG | 0o644
+        else:
+            final.nlink = 2
+    exdev.fsync_hook = corrupt
+    with pytest.raises(ProcessCleanupIncomplete):
+        publish(api)
+    assert str(CACHE) + "/" + FILENAME in exdev.nodes
+    assert any(".wheel-publish-" in path for path in exdev.nodes)
+    assert not any(kind == "unlink" for kind, _ in exdev.events)
 
 
 def test_publishes_readonly_bytes_outside_flat_cache_then_reuses(api: Any, fs: FileSystem) -> None:
