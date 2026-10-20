@@ -230,10 +230,13 @@ class _RecoveryBlockingRepository(RunRepository):
         *,
         run_id: UUID,
         minimum_event_sequence: int = 0,
+        pre_model_original_capture: bool = False,
     ) -> bool:
         del session
         assert run_id == self.run_id
         return self.blocked_after_sequence > 1 and not (
+            pre_model_original_capture and self.blocked_after_kind == 'context.loaded'
+        ) and not (
             self.blocked_after_sequence <= minimum_event_sequence
             and _is_self_repair_recovery_baseline_event_kind(self.blocked_after_kind)
         )

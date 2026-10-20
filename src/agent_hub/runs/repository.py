@@ -1269,6 +1269,7 @@ class RunRepository:
         *,
         run_id: UUID,
         minimum_event_sequence: int = 0,
+        pre_model_original_capture: bool = False,
     ) -> bool:
         checkpoint_sequence = (
             await session.scalar(
@@ -1285,7 +1286,10 @@ class RunRepository:
         latest_event_sequence = await session.scalar(
             select(func.max(RunEventRow.sequence)).where(
                 RunEventRow.run_id == run_id,
-                ~RunEventRow.kind.in_(_RECOVERY_REPLAYABLE_EVENT_KINDS),
+                ~RunEventRow.kind.in_(
+                    _RECOVERY_REPLAYABLE_EVENT_KINDS | {'context.loaded'}
+                    if pre_model_original_capture else _RECOVERY_REPLAYABLE_EVENT_KINDS
+                ),
                 ~self_repair_baseline_event,
             )
         )
@@ -1337,10 +1341,18 @@ class RunRepository:
                 or not checkpoint_waits_for_approval(checkpoint, approval_id)
             ):
                 raise RunConflict("capability approval is waiting for a durable recovery checkpoint")
+        # Loading guidance is read-only. Ignore it only for the durable captured
+        # original, never injected prompts or runtime/tool events without proof.
+        original_capture = (
+            routing_decision.get('approval_checkpoint_required') is False
+            and _pre_model_original_capture(routing_decision)
+        )
+        recovery_options = {'pre_model_original_capture': True} if original_capture else {}
         if await self._recovery_blocked_after_checkpoint(
             session,
             run_id=row.id,
             minimum_event_sequence=_self_repair_recovery_baseline_sequence(routing_decision),
+            **recovery_options,
         ):
             raise RunConflict("capability approval is waiting for a durable recovery checkpoint")
 
@@ -1445,7 +1457,9 @@ class RunRepository:
                 raise RunConflict("run is waiting for a different approval")
             if (
                 status is RunStatus.RUNNING
-                and routing_decision.get("approval_checkpoint_required") is True
+                and (routing_decision.get("approval_checkpoint_required") is True
+                     or (routing_decision.get("approval_checkpoint_required") is False
+                         and _pre_model_original_capture(routing_decision)))
             ):
                 await self._require_capability_approval_checkpoint(
                     session, row, routing_decision, approval_id=approval_id,
