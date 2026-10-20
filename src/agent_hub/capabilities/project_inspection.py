@@ -59,6 +59,7 @@ async def inspect_project(
     issues: list[JsonValue] = []
     operations: dict[str, JsonValue] = {"build": "unknown", "test": "unknown"}
     declarations = 0
+    python_manifest: bytes | None = None
     for filename in (*_MANIFESTS, *_LOCKS):
         parts = (str(tenant_id), "projects", project, "sessions", session, filename)
         item: dict[str, JsonValue] = {"path": filename, "status": "absent", "sha256": None}
@@ -91,6 +92,8 @@ async def inspect_project(
                 item["status"] = "invalid"
                 issues.append({"path": filename, "reason": "manifest_invalid"})
             else:
+                if filename == "pyproject.toml":
+                    python_manifest = data
                 declarations += 1
                 dependencies.extend(new_dependencies)
                 runtimes.extend(new_runtimes)
@@ -98,6 +101,17 @@ async def inspect_project(
                 issues.extend({"path": filename, "reason": reason}
                               for reason in dict.fromkeys(new_issues))
         observations.append(item)
+    python_recipe: Mapping[str, JsonValue] | None = None
+    if python_manifest is not None and _explicit_python_recipe(python_manifest):
+        python_recipe, lock_observation, recipe_issue = _inspect_python_recipe(
+            project_root, (str(tenant_id), "projects", project, "sessions", session), python_manifest,
+        )
+        observations.append(lock_observation)
+        if recipe_issue is None:
+            operations.update({"build": "declared", "test": "declared"})
+        else:
+            operations.update({"build": "unknown", "test": "unknown"})
+            issues.append({"path": "requirements.lock", "reason": recipe_issue})
     dependency_count = len(dependencies)
     visible_dependencies: list[JsonValue] = []
     remaining = _DEPENDENCY_RESPONSE_BYTES
@@ -110,7 +124,7 @@ async def inspect_project(
     dependencies_truncated = len(visible_dependencies) != dependency_count
     if dependencies_truncated:
         issues.append({"path": "project", "reason": "dependency_observation_truncated"})
-    return {
+    result: dict[str, JsonValue] = {
         "schema_version": 1,
         "scope": {"tenant_id": str(tenant_id), "run_id": str(run_id),
                   "project_id": project, "workspace_session_id": session},
@@ -124,6 +138,44 @@ async def inspect_project(
         ),
         "summary": "Project manifests inspected without running project code; environment not probed.",
     }
+    if python_recipe is not None:
+        result["python_recipe"] = python_recipe
+    return result
+
+
+def _explicit_python_recipe(manifest: bytes) -> bool:
+    document = tomllib.loads(manifest.decode("utf-8-sig"))
+    tools = document.get("tool", {})
+    agent = tools.get("agent-hub", {}) if isinstance(tools, dict) else {}
+    return isinstance(agent, dict) and "python-project" in agent
+
+
+def _inspect_python_recipe(
+    root: Path, parts: tuple[str, ...], manifest: bytes,
+) -> tuple[Mapping[str, JsonValue], Mapping[str, JsonValue], str | None]:
+    from agent_hub.capabilities.python_project_recipe import parse_python_project_declaration
+
+    observed: dict[str, JsonValue] = {"path": "requirements.lock", "status": "absent", "sha256": None}
+    unavailable: Mapping[str, JsonValue] = {"status": "unavailable"}
+    try:
+        raw = _read_no_links(root, (*parts, "requirements.lock"), max_bytes=_MAX_BYTES)
+    except FileNotFoundError:
+        return unavailable, observed, "python_recipe_inputs_unavailable"
+    except (OSError, ValueError, RuntimeError):
+        observed["status"] = "unavailable"
+        return unavailable, observed, "python_recipe_inputs_unavailable"
+    observed["observed_bytes"] = min(len(raw), _MAX_BYTES)
+    if len(raw) > _MAX_BYTES:
+        observed["status"] = "too_large"
+        return unavailable, observed, "python_recipe_inputs_unavailable"
+    observed.update({"status": "observed", "sha256": sha256(raw).hexdigest()})
+    try:
+        declaration = parse_python_project_declaration(manifest, raw,
+            max_control_bytes=2 * _MAX_BYTES, max_requirements=128)
+    except (ValueError, TypeError, RecursionError):
+        return unavailable, observed, "python_recipe_inputs_invalid"
+    # Declared operations are advisory; no source hooks or runtime probes ran.
+    return {"kind": declaration.kind, "status": "declared"}, observed, None
 
 
 def _parse_manifest(

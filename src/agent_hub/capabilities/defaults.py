@@ -22,9 +22,18 @@ from agent_hub.capabilities.gateway import (
     CapabilityStatus,
 )
 from agent_hub.capabilities.policy import CapabilityPolicy, CapabilityRule, normalize_resource
+from agent_hub.capabilities.python_project_lifecycle import (
+    PythonProjectTerminalHook,
+    build_python_project_terminal_hook,
+)
 from agent_hub.capabilities.runtime import CapabilityManifestProvider, RuntimeCapabilityGateway
 from agent_hub.capabilities.types import CapabilityRequest, PolicyEffect
-from agent_hub.harness.tool_gateway import HarnessToolGateway, McpToolBackend, PluginToolBackend
+from agent_hub.harness.tool_gateway import (
+    HarnessToolGateway,
+    McpToolBackend,
+    PluginToolBackend,
+    _python_recipe_authorization,
+)
 from agent_hub.runtime.contracts import TaskContext
 
 ToolApprovalPolicyGetter = Callable[[UUID], Awaitable[bool]]
@@ -41,6 +50,7 @@ class RuntimeCapabilityStack:
     policy_gateway: DefaultRuntimeCapabilityPolicyGateway
     harness_tool_gateway: HarnessToolGateway
     project_input_preparer: Callable[[TaskContext], Awaitable[TaskContext]] | None = None
+    project_cache_cleanup_hook: PythonProjectTerminalHook | None = None
 
 
 class DefaultRuntimeCapabilityPolicyGateway:
@@ -305,7 +315,8 @@ async def _project_verification_effect(
             and resource is not None and (resource == "workspace/current/project-verification"
                 or resource.startswith("workspace/current/project-verification/"))):
         return None
-    if request.resource != "workspace/current/project-verification":
+    python_resource = resource.startswith("workspace/current/project-verification/python/")
+    if request.resource != "workspace/current/project-verification" and not python_resource:
         return PolicyEffect.DENY
     try:
         from agent_hub.capabilities.scoped_read import authorized_workspace_scope
@@ -314,7 +325,7 @@ async def _project_verification_effect(
         if not callable(getter):
             return PolicyEffect.DENY
         record = await getter(request.tenant_id, request.run_id)
-        authorized_workspace_scope(record, tenant_id=request.tenant_id, run_id=request.run_id)
+        project_id, session_id = authorized_workspace_scope(record, tenant_id=request.tenant_id, run_id=request.run_id)
         routing = getattr(record, "routing_decision", None)
         if not isinstance(routing, Mapping):
             return PolicyEffect.DENY
@@ -322,9 +333,48 @@ async def _project_verification_effect(
         if (routing.get("sandbox_profile") not in {"restricted", "workspace_write"}
             or not isinstance(permissions, (list, tuple)) or "command.run" not in permissions):
             return PolicyEffect.DENY
+        preparation = routing.get("project_input_preparation")
+        python_preparation = isinstance(preparation, Mapping) and (
+            "python_recipe" in preparation or preparation.get("schema_version") == 2)
+        if python_resource:
+            return _python_project_verification_effect(request, record, routing, preparation,
+                project_id=project_id, session_id=session_id)
+        if python_preparation:
+            return PolicyEffect.DENY
         return PolicyEffect.ALLOW if "network.read" in permissions else PolicyEffect.REQUIRE_APPROVAL
     except Exception:  # noqa: BLE001 - missing authority cannot enable project execution.
         return PolicyEffect.DENY
+
+
+def _python_project_verification_effect(
+    request: CapabilityRequest, record: object, routing: Mapping[str, object], preparation: object,
+    *, project_id: str, session_id: str,
+) -> PolicyEffect:
+    from agent_hub.capabilities.project_baselines import ProjectBaselineReference
+    from agent_hub.capabilities.project_contracts import ManagedProjectInput
+
+    _python_recipe_authorization(request, expected=request)
+    if (getattr(record, "actor_id", None) != request.user_id
+        or routing.get("execution_backend", "systemd") != "systemd"
+        or type(routing.get("project_input_contract_version")) is not int
+        or routing.get("project_input_contract_version") != 1
+        or not isinstance(preparation, Mapping)
+        or type(preparation.get("schema_version")) is not int
+        or preparation.get("schema_version") != 2
+        or preparation.get("phase") not in {"captured", "executing", "observed"}):
+        return PolicyEffect.DENY
+    ManagedProjectInput.from_payload(routing.get("project_input"))
+    ProjectBaselineReference.from_payload(preparation.get("reference"))
+    marker = preparation.get("python_recipe")
+    if (not isinstance(marker, Mapping)
+        or set(marker) != {"schema_version", "recipe_sha256", "environment_input_sha256"}
+        or type(marker.get("schema_version")) is not int or marker["schema_version"] != 1
+        or request.arguments != {**dict(marker), "project_id": project_id,
+                                 "workspace_session_id": session_id}):
+        return PolicyEffect.DENY
+    # Installation is an exact run/user/recipe approval even when network.read
+    # or broad generated-tool policy is allowed. Reviewer approvals are audited.
+    return PolicyEffect.REQUIRE_APPROVAL
 
 
 def build_runtime_capability_stack(
@@ -376,6 +426,9 @@ def build_runtime_capability_stack(
         policy_gateway=policy_gateway,
         harness_tool_gateway=harness_tool_gateway,
         project_input_preparer=runtime_gateway.original_project_preparer(harness_tool_gateway),
+        project_cache_cleanup_hook=build_python_project_terminal_hook(
+            run_repository, getattr(runtime_gateway, "_project_verification", None),
+        ),
     )
 
 

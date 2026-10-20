@@ -17,6 +17,14 @@ from agent_hub.runtime.engineering_actions import EngineeringProgress
 from agent_hub.runtime.original_project_progress import (
     original_contract_binding_matches,
     original_failure_observed,
+    python_project_inspection_declared,
+)
+from agent_hub.runtime.python_project_history import (
+    python_failure_current,
+    python_history_selected,
+    python_initial_files,
+    python_productive_change,
+    python_success_source,
 )
 
 Position = tuple[int, int, int]
@@ -40,7 +48,8 @@ def engineering_action_progress(
             rows.append((position, key, row))
     inspected = existing = wrote = seen = verified = failed = False
     seen = failed = original_failure_observed(context)
-    known: dict[str, tuple[str, str, int]] = {}
+    python = python_history_selected(context)
+    known: dict[str, tuple[str, str, int]] = python_initial_files(context) if python else {}
     for _, key, row in sorted(rows):
         name, status = row.get('name'), row.get('status')
         if status in {'prepared', 'running', 'uncertain', 'UNKNOWN'}:
@@ -70,8 +79,9 @@ def engineering_action_progress(
             if not wrote and isinstance(manifests, tuple | list) and isinstance(operations, Mapping):
                 existing = (isinstance(issues, tuple | list) and not issues
                     and operations.get('build') == 'declared' and operations.get('test') == 'declared'
-                    and any(isinstance(item, Mapping) and item.get('path') == 'package.json'
-                            and item.get('status') == 'observed' for item in manifests))
+                    and (any(isinstance(item, Mapping) and item.get('path') == 'package.json'
+                             and item.get('status') == 'observed' for item in manifests)
+                         or python_project_inspection_declared(result)))
         elif name == 'workspace.write_text' and status == 'succeeded':
             files = result.get('workspace_files')
             item = (_file_metadata(files[0]) if isinstance(files, tuple | list) and len(files) == 1
@@ -80,15 +90,16 @@ def engineering_action_progress(
                 return uncertain
             wrote = True
             verified = False
-            if known.get(item[0]) != item:
+            if python_productive_change(context, item, known) if python else known.get(item[0]) != item:
                 failed = False
             known[item[0]] = item
         elif name == 'project.verify':
             seen = True
-            source = _successful_source(result)
+            source = _successful_source(result, context=context)
             verified = (status == 'succeeded' and source is not None
                         and original_contract_binding_matches(context, result, source))
-            failed = status == 'failed' and result.get('status') == 'failed'
+            failed = (status == 'failed' and (python_failure_current(context, result) if python
+                                             else result.get('status') == 'failed'))
             if not verified and not failed:
                 return uncertain
     return EngineeringProgress(inspected=inspected, existing_project=existing, has_writes=wrote,
@@ -112,7 +123,9 @@ def _trusted_result(key: str, row: Mapping[str, JsonValue], actor: str,
     return value if isinstance(value, Mapping) else None
 
 
-def _successful_source(result: Mapping[str, JsonValue]) -> str | None:
+def _successful_source(result: Mapping[str, JsonValue], *, context: TaskContext | None = None) -> str | None:
+    if context is not None and python_history_selected(context):
+        return python_success_source(context, result)
     receipt = result.get("verification")
     if (not isinstance(receipt, Mapping) or type(receipt.get("schema_version")) is not int
         or receipt.get("schema_version") != 1 or receipt.get("status") != "passed"):
@@ -193,7 +206,7 @@ def engineering_delivery_ready(
                 wrote = True
                 verified, ready = None, False
             elif name == "project.verify":
-                source = _successful_source(result)
+                source = _successful_source(result, context=context)
                 if source is not None and not original_contract_binding_matches(context, result, source):
                     source = None
                 digest = hashlib.sha256(json.dumps(

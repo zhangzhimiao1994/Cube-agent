@@ -7,18 +7,29 @@ import hashlib
 import json
 from collections.abc import Mapping
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import cast
-from uuid import NAMESPACE_URL, UUID, uuid5
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from agent_hub.auth.models import Role
-from agent_hub.capabilities.project_baselines import ProjectBaselineReference, ProjectBaselineStore
+from agent_hub.capabilities.project_baselines import (
+    ProjectBaselineReference,
+    ProjectBaselineStore,
+    StoredProjectBaseline,
+)
 from agent_hub.capabilities.project_contracts import ManagedProjectInput
 from agent_hub.capabilities.project_verification import (
     ProjectVerificationService,
     validated_original_observation,
 )
-from agent_hub.capabilities.scoped_read import authorized_workspace_scope
+from agent_hub.capabilities.python_project_inputs import PythonProjectInputs
+from agent_hub.capabilities.python_project_service import (
+    PythonOriginalContext,
+    load_python_original_inputs,
+    python_original_invocation,
+    python_recipe_marker,
+)
+from agent_hub.capabilities.scoped_read import _read_no_links, authorized_workspace_scope
 from agent_hub.domain.runs import RunStatus
 from agent_hub.harness.tool_gateway import HarnessToolGateway
 from agent_hub.harness.types import HarnessToolCallRequest
@@ -35,6 +46,71 @@ _SCOPE_KEYS = ('project_id', 'workspace_session_id', 'sandbox_profile', 'request
 def _encoded(value: object) -> bytes:
     return json.dumps(value, default=dict, sort_keys=True, separators=(',', ':'),
                       ensure_ascii=True, allow_nan=False).encode('ascii')
+
+
+def python_original_source_index(
+    stored: StoredProjectBaseline, *, source_limit_bytes: int,
+) -> Mapping[str, JsonValue]:
+    """Hash the captured baseline, independently of the bounded prompt projection."""
+    paths = sorted(path for path in stored.source_files if path.endswith('.py'))
+    if len(paths) > 256:
+        raise ValueError('python_project_history_budget_exceeded')
+    if type(source_limit_bytes) is not int or not 1 <= source_limit_bytes <= 500 * 1024**2:
+        raise ValueError('python_project_history_budget_exceeded')
+    rows: list[JsonValue] = []
+    remaining = source_limit_bytes
+    try:
+        for path in paths:
+            raw = _read_no_links(stored.snapshot, PurePosixPath(path).parts, max_bytes=remaining)
+            if len(raw) > remaining:
+                raise ValueError
+            remaining -= len(raw)
+            captured = stored.source_files[path]
+            if captured not in {hashlib.sha256(tag + raw).hexdigest() for tag in (b'f\0', b'x\0')}:
+                raise ValueError
+            rows.append({'path': path, 'sha256': hashlib.sha256(raw).hexdigest(),
+                         'size_bytes': len(raw), 'source_file_sha256': captured})
+    except (OSError, ValueError, RuntimeError):
+        raise RuntimeError(_FAILURE) from None
+    return _freeze_object({'schema_version': 1, 'source_sha256': stored.reference.input_source_sha256,
+        'editable_files': tuple(scope for scope in stored.contract.editable_paths if scope in stored.source_files),
+        'files': tuple(rows)}, name='Python baseline source index')
+
+
+def python_original_context_metadata(context: PythonOriginalContext) -> Mapping[str, JsonValue]:
+    """Project trusted service history, never derive expected hashes from tool output.
+
+    The invocation is a historical validation expectation, not execution input
+    or installation authority. No raw logs, source bytes or host paths are copied.
+    """
+    try:
+        if (type(context) is not PythonOriginalContext
+                or context.inputs.contract != context.stored.contract
+                or context.inputs.original_reference != context.stored.reference):
+            raise ValueError
+        validated_original_observation(context.observation,
+            expected_source=context.stored.reference.input_source_sha256,
+            expected_contract=context.stored.contract.protected_sha256,
+            expected_python_inputs=context.inputs, expected_python_invocation=context.invocation)
+        reference = context.environment_reference
+        reference_payload = None if reference is None else reference.model_dump(mode='json')
+        if context.observation.get('environment_reference') != reference_payload:
+            raise ValueError
+        return _freeze_object({
+            'schema_version': 1, 'kind': 'python_original_context',
+            'inputs': context.inputs.to_payload(),
+            'invocation': context.invocation.model_dump(mode='json'),
+            'original_reference': context.stored.reference.to_payload(),
+            'environment_reference': reference_payload,
+            'expected_execution_id': context.invocation.execution_id,
+            'expected_source_sha256': context.stored.reference.input_source_sha256,
+            'expected_contract_sha256': context.stored.contract.protected_sha256,
+            'expected_recipe_sha256': context.inputs.sha256,
+            'expected_environment_input_sha256': context.inputs.environment_input_sha256,
+            'expected_environment_sha256': None if reference is None else reference.environment_sha256,
+        }, name='trusted Python original context')
+    except Exception:  # noqa: BLE001 - invalid history cannot replace independent expectations.
+        raise RuntimeError(_FAILURE) from None
 
 
 class OriginalProjectPreparer:
@@ -112,12 +188,37 @@ class OriginalProjectPreparer:
                 'reference': cast(Mapping[str, JsonValue], reference.to_payload()),
             })
         if (not isinstance(state, Mapping) or type(state.get('schema_version')) is not int
-                or state.get('schema_version') != 1 or state.get('phase') not in {'captured', 'observed'}):
+                or state.get('schema_version') not in {1, 2} or state.get('phase') not in {'captured', 'observed'}):
             raise RuntimeError(_FAILURE)
         reference = ProjectBaselineReference.from_payload(state.get('reference'))
         stored = await asyncio.to_thread(store.load, invocation, reference)
         if stored.contract.editable_paths != selection.editable_paths:
             raise RuntimeError(_FAILURE)
+        python_inputs: PythonProjectInputs | None = None
+        if state['schema_version'] == 1 and state['phase'] == 'captured' and 'pyproject.toml' in stored.source_files:
+            probe_invocation = ProjectInvocation.model_validate({
+                **invocation.model_dump(), 'execution_id': 'python_probe_' + uuid4().hex,
+                'install_allowed': False,
+            }, strict=True)
+            python_inputs = await self.verifier.prepare_python_original(invocation=probe_invocation, reference=reference)
+            if python_inputs is not None:
+                state = await self._state(context, expected=state, replace={
+                    **state, 'schema_version': 2, 'python_recipe': python_recipe_marker(python_inputs),
+                })
+                assert state is not None
+        if state['schema_version'] == 2:
+            python_inputs = await asyncio.to_thread(load_python_original_inputs, self.root,
+                invocation, reference, state.get('python_recipe'))
+
+        def validate_observation(value: object) -> Mapping[str, JsonValue]:
+            # This is a historical validation expectation, not installation authority.
+            expected_invocation = None if python_inputs is None else python_original_invocation(
+                invocation.model_copy(update={'install_allowed': True}), python_inputs)
+            return validated_original_observation(value,
+                expected_source=reference.input_source_sha256,
+                expected_contract=stored.contract.protected_sha256,
+                expected_python_inputs=python_inputs, expected_python_invocation=expected_invocation)
+
         if state['phase'] == 'captured':
             request = HarnessToolCallRequest(
                 run_id=context.run_id, actor='main_agent', tool_name='project.verify', arguments={},
@@ -139,10 +240,7 @@ class OriginalProjectPreparer:
                 execution_id=invocation.execution_id,
                 timeout_seconds=context.timeout_seconds - (asyncio.get_running_loop().time() - started),
             )
-            observation = validated_original_observation(
-                observation, expected_source=reference.input_source_sha256,
-                expected_contract=stored.contract.protected_sha256,
-            )
+            observation = validate_observation(observation)
             state = await self._state(context, expected=state, replace={
                 **(state or {}), 'phase': 'observed', 'observation': observation,
                 'observation_sha256': hashlib.sha256(_encoded(observation)).hexdigest(),
@@ -156,13 +254,14 @@ class OriginalProjectPreparer:
                 or cast(Mapping[str, JsonValue], saved_observation['verification']).get('source_sha256')
                     != reference.input_source_sha256):
             raise RuntimeError(_FAILURE)
-        saved_observation = validated_original_observation(
-            saved_observation, expected_source=reference.input_source_sha256,
-            expected_contract=stored.contract.protected_sha256,
-        )
+        saved_observation = validate_observation(saved_observation)
         source_context = await asyncio.to_thread(
             original_source_context, stored, byte_budget=min(96_000, max(4096, context.token_budget)),
         )
+        source_index: Mapping[str, JsonValue] = {}
+        if python_inputs is not None:
+            source_index = {'python_source_index': await asyncio.to_thread(
+                python_original_source_index, stored, source_limit_bytes=invocation.source_limit_bytes)}
         artifact = Artifact(
             id=uuid5(NAMESPACE_URL, f'original-project:{context.tenant_id}:{context.run_id}:'
                      f'{state["observation_sha256"]}'),
@@ -171,10 +270,29 @@ class OriginalProjectPreparer:
                      'protected_sha256': stored.contract.protected_sha256,
                      'editable_paths': selection.editable_paths, 'observation': saved_observation,
                      'source_context': cast(Mapping[str, JsonValue], source_context),
+                     **source_index,
                      'summary': 'Existing user project. Inspect its source with read_context; repair only '
                                 'explicit editable paths. Original checks and configuration must remain unchanged. '
                                 'Re-run project.verify after repair, then deliver with workspace.bundle.'})
+        artifacts = (*context.artifacts, artifact)
+        history_route: Mapping[str, JsonValue] = {}
+        if python_inputs is not None:
+            from agent_hub.runtime.python_project_history import HISTORY_KEY, build_python_history
+
+            trusted = await self.verifier.python_original_context(context.tenant_id, context.run_id)
+            if (trusted is None or trusted.inputs != python_inputs or trusted.stored.reference != reference
+                    or trusted.observation != saved_observation or await self._state(context) != state):
+                raise RuntimeError(_FAILURE)
+            metadata = Artifact(
+                id=uuid5(NAMESPACE_URL, f'original-python-context:{context.tenant_id}:{context.run_id}:'
+                         f'{python_inputs.sha256}:{state["observation_sha256"]}'),
+                type='original_python_project_context', producer='original_project_preparer',
+                content=python_original_context_metadata(trusted),
+                source_ids=(str(artifact.id),),
+            )
+            artifacts = (*artifacts, metadata)
+            history_route = {HISTORY_KEY: build_python_history(trusted, artifact)}
         return context.model_copy(update={
-            'routing_decision': {**route, 'project_input_preparation': state},
-            'artifacts': (*context.artifacts, artifact),
+            'routing_decision': {**route, 'project_input_preparation': state, **history_route},
+            'artifacts': artifacts,
         }).validated_internal_clone()

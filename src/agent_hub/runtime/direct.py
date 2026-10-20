@@ -326,7 +326,14 @@ class _WorkspacePrerequisiteBlocked(_WorkspaceVerificationError):
         self.project_prerequisite_payload = payload
 
 
-def _workspace_source_digest(known_files: Mapping[str, str]) -> str:
+def _workspace_source_digest(known_files: Mapping[str, str], context: TaskContext | None = None) -> str:
+    from agent_hub.runtime.python_project_history import (
+        python_history_selected,
+        python_retry_digest,
+    )
+
+    if context is not None and python_history_selected(context):
+        return python_retry_digest(context, known_files)
     source_files = {path: digest for path, digest in known_files.items()
                     if path != "DELIVERY_MANIFEST.json"}
     return hashlib.sha256(json.dumps(
@@ -364,6 +371,7 @@ def _verification_trace_diagnostic(diagnostic: Mapping[str, JsonValue]) -> Mappi
 
 @dataclass(slots=True)
 class _WorkspaceVerificationTrace:
+    context: TaskContext | None = field(default=None, kw_only=True, repr=False)
     model_round: int = 0
     attempt_count: int = 0
     failed_attempt_count: int = 0
@@ -379,9 +387,19 @@ class _WorkspaceVerificationTrace:
         self, result: HarnessToolCallResult, *, known_files: Mapping[str, str], attempt: int,
     ) -> None:
         # known_files proves acknowledged runtime writes, not the executor's actual source tree.
-        digest = _workspace_source_digest(known_files)
+        digest = _workspace_source_digest(known_files, self.context)
         changed = [(path, content) for path, content in sorted(known_files.items())
                    if path != "DELIVERY_MANIFEST.json" and self._previous_files.get(path) != content]
+        from agent_hub.runtime.python_project_history import (
+            python_history_selected,
+            python_productive_change,
+        )
+
+        python = self.context is not None and python_history_selected(self.context)
+        if python and self.context is not None:
+            previous = {path: (path, content, 0) for path, content in self._previous_files.items()}
+            changed = [(path, content) for path, content in changed
+                       if python_productive_change(self.context, (path, content, 0), previous)]
         repairs_attempt = self._failed_attempt if self._failed_digest != digest else None
         self.repair_observed = self.repair_observed or repairs_attempt is not None
         entry: dict[str, JsonValue] = {
@@ -429,9 +447,9 @@ class _WorkspaceVerificationTrace:
                 "source_sha256": verification["source_sha256"], "receipt_sha256": receipt_digest,
             }
         else:
-            failure_report = result.payload.get("verification_failure")
+            failure_report = result.payload.get("python_verification_failure" if python else "verification_failure")
             if (isinstance(failure_report, Mapping)
-                and failure_report.get("schema_version") == 1
+                and failure_report.get("schema_version") == (2 if python else 1)
                 and failure_report.get("status") == "failed"
                 and isinstance(failure_source := failure_report.get("source_sha256"), str)
                 and _SHA256.fullmatch(failure_source)):
@@ -699,8 +717,15 @@ def _original_project_terminal_artifact_matches(
         return False
     if direct_delivery:
         receipt = delivery.get("verification")
+        from agent_hub.runtime.python_project_history import (
+            python_history_selected,
+            python_success_source,
+        )
+
+        python = python_history_selected(context)
         if (not isinstance(receipt, Mapping) or type(receipt.get("schema_version")) is not int
-                or receipt.get("schema_version") != 1 or receipt.get("status") != "passed"
+                or (python_success_source(context, delivery) != source if python
+                    else receipt.get("schema_version") != 1 or receipt.get("status") != "passed")
                 or receipt.get("source_sha256") != source
                 or receipt_sha != hashlib.sha256(json.dumps(receipt, default=dict,
                     ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("ascii")).hexdigest()):
@@ -1558,12 +1583,14 @@ class DirectRuntime:
             deadline=deadline,
         )
         verification: Mapping[str, JsonValue] | None = None
+        verification_evidence: dict[str, JsonValue] = {}
         if _original_project_policy(context) or verification_required is True or (
             verification_required is None and self._project_verification_enabled(context)
         ):
             verification = await self._verify_workspace(
                 context, known_files=known_files, attempt=verification_attempt, deadline=deadline,
                 verification_trace=verification_trace,
+                verification_evidence=verification_evidence,
             )
         result = await self._execute_workspace_capability(
             context,
@@ -1583,8 +1610,16 @@ class DirectRuntime:
             and (verification is None or verification.get("source_sha256") != bundle_source)
         ):
             raise _WorkspaceVerificationError("invalid_response") from None
+        from agent_hub.runtime.python_project_history import python_history_selected
+
+        if python_history_selected(context) and verification is not None:
+            receipt_sha = hashlib.sha256(json.dumps(verification, default=dict, ensure_ascii=True,
+                sort_keys=True, separators=(",", ":")).encode("ascii")).hexdigest()
+            if result.get("verification_receipt_sha256") != receipt_sha:
+                raise _WorkspaceVerificationError("invalid_response") from None
         return {
             **result,
+            **verification_evidence,
             "artifact_origin": "incremental_workspace_delivery",
             **({"verification": verification} if verification is not None else {}),
             **({"verification_history": verification_trace.to_payload()}
@@ -1664,6 +1699,7 @@ class DirectRuntime:
         self, context: TaskContext, *, known_files: Mapping[str, str], attempt: int,
         deadline: float,
         verification_trace: _WorkspaceVerificationTrace | None = None,
+        verification_evidence: dict[str, JsonValue] | None = None,
     ) -> Mapping[str, JsonValue]:
         gateway = self._harness_tool_gateway
         if self._cancel_requested:
@@ -1679,7 +1715,7 @@ class DirectRuntime:
                 arguments={}, approval_required=False,
                 sandbox=cast(str, context.routing_decision.get("sandbox_profile", "none")),
                 idempotency_key=(f"direct-verify-{context.run_id.hex}-"
-                                 f"{_workspace_source_digest(known_files)}-{attempt}"),
+                                 f"{_workspace_source_digest(known_files, context)}-{attempt}"),
             )
             task = asyncio.create_task(gateway.invoke(
                 context.tenant_id, request, user_id=context.actor_id, role=context.actor_role,
@@ -1716,7 +1752,22 @@ class DirectRuntime:
         if result.truncated:
             raise _WorkspaceVerificationError("truncated_response") from None
         verification = result.payload.get("verification")
+        from agent_hub.runtime.python_project_history import (
+            python_failure_current,
+            python_history_selected,
+            python_success_source,
+        )
+
+        python = python_history_selected(context)
         if result.status == "succeeded":
+            if python:
+                if python_success_source(context, result.payload) is None or not isinstance(verification, Mapping):
+                    raise _WorkspaceVerificationError("not_passed") from None
+                if verification_trace is not None:
+                    verification_trace.record(result, known_files=known_files, attempt=attempt)
+                if verification_evidence is not None and "python_environment_reference" in result.payload:
+                    verification_evidence["python_environment_reference"] = result.payload["python_environment_reference"]
+                return verification
             source_sha256 = (
                 verification.get("source_sha256") if isinstance(verification, Mapping) else None
             )
@@ -1743,6 +1794,12 @@ class DirectRuntime:
                     and result.failure_reason == "project verification blocked by execution prerequisites"):
                 raise _WorkspacePrerequisiteBlocked(report) from None
             raise _WorkspaceVerificationError("invalid_response") from None
+        if python:
+            if result.status != "failed" or not python_failure_current(context, result.payload):
+                raise _WorkspaceVerificationError("outcome_unconfirmed") from None
+            if verification_trace is not None:
+                verification_trace.record(result, known_files=known_files, attempt=attempt)
+            raise _WorkspaceVerificationFailure(result)
         if result.failure_reason not in _VERIFICATION_PROCESS_FAILURE_REASONS:
             raise _WorkspaceVerificationError(failure_code) from None
         diagnostic = result.payload.get("execution_diagnostic")
@@ -1820,10 +1877,17 @@ class DirectRuntime:
         validation_failures: dict[str, int] = {}
         original_policy = _original_project_policy(context)
         verification_enabled = original_policy or self._project_verification_enabled(context)
-        verification_trace = _WorkspaceVerificationTrace() if verification_enabled else None
+        verification_trace = _WorkspaceVerificationTrace(context=context) if verification_enabled else None
         verification_attempt = 0
         verification_failure: HarnessToolCallResult | None = None
         failed_source_digests: set[str] = set()
+        from agent_hub.runtime.python_project_history import (
+            python_history_selected,
+            python_original_failed,
+        )
+
+        if python_history_selected(context) and python_original_failed(context):
+            failed_source_digests.add(_workspace_source_digest(known_files, context))
         workspace_contents: dict[str, str] = {}
         initial_token_limit = context.token_budget
         active_token_limit = _workspace_delivery_token_limit(
@@ -1918,7 +1982,7 @@ class DirectRuntime:
                 summaries.append(batch.summary)
             if batch.complete and validation_code is None:
                 if verification_enabled:
-                    source_digest = _workspace_source_digest(known_files)
+                    source_digest = _workspace_source_digest(known_files, context)
                     if source_digest in failed_source_digests:
                         _raise_execution_error("workspace verification repair made no progress")
                     verification_attempt += 1
@@ -1931,7 +1995,7 @@ class DirectRuntime:
                     )
                 except _WorkspaceVerificationFailure as error:
                     verification_failure = error.result
-                    failed_source_digests.add(_workspace_source_digest(known_files))
+                    failed_source_digests.add(_workspace_source_digest(known_files, context))
                     error.__traceback__ = None
                     error.__context__ = None
                     error.__cause__ = None

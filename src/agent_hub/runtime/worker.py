@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from agent_hub.api.routers import admin
 from agent_hub.capabilities.defaults import build_runtime_capability_stack
+from agent_hub.capabilities.python_project_lifecycle import PythonProjectTerminalHook
 from agent_hub.capabilities.tools.registry import CompositeCapabilityManifestSource
 from agent_hub.config.service import ConfigService
 from agent_hub.db.session import Database, build_database
@@ -170,6 +171,7 @@ class WorkerResources:
     queue: LocalRunQueue
     runtime_mcp_service: RuntimeMcpService
     runtime_plugin_service: RuntimePluginService
+    project_cache_cleanup_hook: PythonProjectTerminalHook | None = None
 
 
 async def run_worker_loop(
@@ -370,14 +372,16 @@ def build_worker_service(
         runtime_memory_recall=PersistentRuntimeMemoryRecall(database.session_factory),
         runtime_timeout_seconds=settings.runtime_timeout_seconds,
         runtime_token_budget=settings.runtime_token_budget,
-        terminal_run_hooks=_evolution_terminal_hooks(
+        terminal_run_hooks=(*_evolution_terminal_hooks(
             config_service=config_service,
             secret_service=secret_service,
             tenant_id=settings.bootstrap_tenant_id,
             run_repository=run_repository,
             session_factory=database.session_factory,
             skill_store_dir=settings.skill_store_dir,
-        ),
+        ), *(() if getattr(runtime_capability_stack, "project_cache_cleanup_hook", None) is None else (
+            runtime_capability_stack.project_cache_cleanup_hook,
+        ))),
     )
     return WorkerResources(
         database=database,
@@ -386,6 +390,7 @@ def build_worker_service(
         queue=queue,
         runtime_mcp_service=runtime_mcp_service,
         runtime_plugin_service=runtime_plugin_service,
+        project_cache_cleanup_hook=getattr(runtime_capability_stack, "project_cache_cleanup_hook", None),
     )
 
 
@@ -421,6 +426,7 @@ async def _run() -> None:
 
     resources = build_worker_service(get_settings())
     invalidation_task: asyncio.Task[object] | None = None
+    cache_cleanup_task: asyncio.Task[object] | None = None
     try:
         await resources.runtime_mcp_service.start()
         await resources.runtime_plugin_service.start()
@@ -434,6 +440,10 @@ async def _run() -> None:
                 )
             ),
         )
+        if resources.project_cache_cleanup_hook is not None:
+            cache_cleanup_task = cast(asyncio.Task[object], asyncio.create_task(
+                resources.project_cache_cleanup_hook.retry_loop(stop),
+            ))
         await run_worker_loop(
             resources.service,
             resources.queue,
@@ -442,6 +452,7 @@ async def _run() -> None:
             plugin_runtime=resources.runtime_plugin_service,
         )
     finally:
+        await _cancel_background_task(cache_cleanup_task)
         await _cancel_background_task(invalidation_task)
         await resources.redis_client.aclose()
         await resources.database.dispose()

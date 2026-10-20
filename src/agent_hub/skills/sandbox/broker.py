@@ -18,7 +18,7 @@ import uuid
 import zipfile
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, model_validator
 
@@ -34,6 +34,15 @@ from agent_hub.skills.sandbox.project import (
     ProjectExecutionBroker,
     ProjectTerminateRequest,
 )
+
+if TYPE_CHECKING:
+    from agent_hub.skills.sandbox.python_project_protocol import (
+        PythonProjectBrokerRequest,
+        PythonProjectBrokerResponse,
+        PythonProjectInspectEnvironmentRequest,
+        PythonProjectProbeRequest,
+        PythonProjectReleaseEnvironmentRequest,
+    )
 
 BROKER_SOCKET_PATH = Path("/run/agent-hub/skill-broker.sock")
 _PROTOCOL_VERSION: Literal[1] = 1
@@ -116,6 +125,7 @@ class BrokerPolicy:
     docker: str = "/usr/bin/docker"
     runtime_root: Path = Path("/run/agent-hub")
     project_runtime_root: Path = Path("/run/agent-hub-project")
+    python_project_runtime_root: Path = Path("/var/lib/agent-hub-python-project-stages")
     read_only_roots: tuple[Path, ...] = (
         Path("/var/lib/agent-hub/attachments"),
         Path("/var/lib/agent-hub/workspaces"),
@@ -319,13 +329,21 @@ class SkillBroker:
         self._execution_slots = asyncio.Semaphore(8)
         self._project_broker = ProjectExecutionBroker(
             replace(policy, runtime_root=policy.project_runtime_root), self._execution_slots,
-            retained_runtime_roots=(policy.runtime_root,),
+            retained_runtime_roots=(policy.runtime_root, policy.python_project_runtime_root),
         )
 
     async def handle_project(
         self, request: ProjectBrokerRequest | ContractProjectBrokerRequest | ProjectTerminateRequest, *, peer_uid: int,
     ) -> BrokerResponse:
         return await self._project_broker.handle(request, peer_uid=peer_uid)
+
+    async def handle_python_project(
+        self, request: PythonProjectBrokerRequest | PythonProjectProbeRequest | PythonProjectInspectEnvironmentRequest | PythonProjectReleaseEnvironmentRequest,
+        *, peer_uid: int,
+    ) -> PythonProjectBrokerResponse:
+        from agent_hub.skills.sandbox.python_project_broker import handle_python_project
+
+        return await handle_python_project(self._project_broker, request, peer_uid=peer_uid)
 
     async def handle(self, request: BrokerRequest, *, peer_uid: int) -> BrokerResponse:
         try:
@@ -529,12 +547,36 @@ async def _serve_client(
     writer: asyncio.StreamWriter,
     broker: SystemdBroker,
 ) -> None:
+    from agent_hub.skills.sandbox.python_project_protocol import (
+        PythonProjectBrokerRequest,
+        PythonProjectBrokerResponse,
+        PythonProjectInspectEnvironmentRequest,
+        PythonProjectProbeRequest,
+        PythonProjectReleaseEnvironmentRequest,
+    )
+
     is_project = False
+    python_request: PythonProjectBrokerRequest | PythonProjectProbeRequest | PythonProjectInspectEnvironmentRequest | PythonProjectReleaseEnvironmentRequest | None = None
+    response: BrokerResponse | PythonProjectBrokerResponse
     try:
         peer_uid = _peer_uid(writer)
         payload = await _read_frame(reader, _MAX_REQUEST_BYTES)
         envelope = json.loads(payload)
-        if isinstance(envelope, dict) and type(envelope.get("version")) is int and envelope["version"] in {2, 3}:
+        if isinstance(envelope, dict) and type(envelope.get("version")) is int and envelope["version"] == 4:
+            is_project = True
+            action = envelope.get("action")
+            if action == "run_python_project":
+                python_request = PythonProjectBrokerRequest.model_validate_json(payload, strict=True)
+            elif action == "probe_python_project":
+                python_request = PythonProjectProbeRequest.model_validate_json(payload, strict=True)
+            elif action == "inspect_python_project_environment":
+                python_request = PythonProjectInspectEnvironmentRequest.model_validate_json(payload, strict=True)
+            elif action == "release_python_project_environment":
+                python_request = PythonProjectReleaseEnvironmentRequest.model_validate_json(payload, strict=True)
+            else:
+                raise BrokerRequestError("invalid Python broker action")
+            response = await broker.handle_python_project(python_request, peer_uid=peer_uid)
+        elif isinstance(envelope, dict) and type(envelope.get("version")) is int and envelope["version"] in {2, 3}:
             is_project = True
             if envelope.get("action") == "terminate_project":
                 project_request: ProjectBrokerRequest | ContractProjectBrokerRequest | ProjectTerminateRequest = (
@@ -555,7 +597,12 @@ async def _serve_client(
             writer.close()
             await writer.wait_closed()
             raise
-        response = BrokerResponse(ok=False, error="project execution cancelled")
+        response = (
+            PythonProjectBrokerResponse(action=python_request.action,
+                execution_id=python_request.invocation.execution_id, ok=False,
+                error="python_project_execution_unavailable")
+            if python_request is not None else BrokerResponse(ok=False, error="project execution cancelled")
+        )
     except (BrokerRequestError, OSError, ValueError) as error:
         response = BrokerResponse(ok=False, error=str(error))
     try:

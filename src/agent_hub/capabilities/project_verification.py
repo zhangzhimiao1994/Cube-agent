@@ -31,7 +31,14 @@ if TYPE_CHECKING:
         ProjectBaselineReference,
         StoredProjectBaseline,
     )
+    from agent_hub.capabilities.python_project_inputs import PythonProjectInputs
+    from agent_hub.capabilities.python_project_reports import PythonProjectFailure
+    from agent_hub.capabilities.python_project_service import (
+        PythonOriginalContext,
+        PythonProjectExecutor,
+    )
     from agent_hub.skills.sandbox.project import ProjectInvocation
+    from agent_hub.skills.sandbox.python_project_protocol import PythonProjectInvocation
 
 PROJECT_VERIFY_TOOL = "project.verify"
 PROJECT_VERIFY_RESOURCE = "workspace/current/project-verification"
@@ -126,7 +133,14 @@ def validated_project_failure_payload(
 class ProjectVerificationError(RuntimeError):
     def __init__(self, message: str, diagnostic: ExecutionDiagnostic | None = None, *,
                  project_failure: ProjectVerificationFailure | None = None,
-                 project_prerequisite: ProjectPrerequisiteObservation | None = None) -> None:
+                 project_prerequisite: ProjectPrerequisiteObservation | None = None,
+                 python_project_failure: PythonProjectFailure | None = None) -> None:
+        if python_project_failure is not None:
+            from agent_hub.capabilities.python_project_reports import PythonProjectFailure
+            if (type(python_project_failure) is not PythonProjectFailure
+                    or project_failure is not None or project_prerequisite is not None
+                    or diagnostic is not python_project_failure.diagnostic):
+                raise TypeError('Python failure must remain separate from Node observations')
         if project_prerequisite is not None and (
             type(project_prerequisite) is not ProjectPrerequisiteObservation
             or diagnostic is not None or project_failure is not None
@@ -136,9 +150,10 @@ class ProjectVerificationError(RuntimeError):
         self.diagnostic = diagnostic
         self.project_failure = project_failure
         self.project_prerequisite = project_prerequisite
+        self.python_project_failure = python_project_failure
 
 
-def _validate_original_diagnostic(value: object) -> None:
+def _validate_original_diagnostic(value: object, *, retain_tail: bool = False) -> None:
     if (not isinstance(value, Mapping)
             or set(value) != {'schema_version', 'backend', 'exit_code', 'timed_out',
                               'stdout', 'stderr', 'stdout_metadata', 'stderr_metadata'}
@@ -163,7 +178,9 @@ def _validate_original_diagnostic(value: object) -> None:
                 or _SHA.fullmatch(metadata['sha256']) is None):
             raise ValueError('invalid original process diagnostic')
         if metadata['truncated'] and (
-            metadata['sanitized_bytes'] <= 4096 or not text.endswith('\n[truncated]')
+            metadata['sanitized_bytes'] <= 4096
+            or not (text.endswith('\n[truncated]')
+                    or retain_tail and '\n[truncated]\n' in text)
             or metadata['returned_bytes'] < 4093
         ):
             raise ValueError('invalid original process diagnostic')
@@ -176,8 +193,19 @@ def _validate_original_diagnostic(value: object) -> None:
 
 def validated_original_observation(
     value: object, *, expected_source: str, expected_contract: str,
+    expected_python_inputs: PythonProjectInputs | None = None,
+    expected_python_invocation: PythonProjectInvocation | None = None,
 ) -> Mapping[str, JsonValue]:
     """Decode trusted persisted metadata; never create an observation from model text."""
+    if expected_python_inputs is not None or expected_python_invocation is not None:
+        from agent_hub.capabilities.python_project_service import (
+            validate_python_original_observation,
+        )
+        if expected_python_inputs is None or expected_python_invocation is None:
+            raise ProjectVerificationError('original project observation is unavailable or changed')
+        return validate_python_original_observation(value, inputs=expected_python_inputs,
+            invocation=expected_python_invocation, expected_source=expected_source,
+            expected_contract=expected_contract)
     try:
         item = _freeze_object(value, name='original project observation')
         failed = item.get('status') == 'failed'
@@ -253,12 +281,26 @@ class _OriginalScope:
 
 
 class ProjectVerificationService:
-    def __init__(self, *, root: Path, repository: object, executor: ProjectExecutor | None) -> None:
+    def __init__(self, *, root: Path, repository: object, executor: ProjectExecutor | None,
+                 python_executor: PythonProjectExecutor | None = None) -> None:
+        from agent_hub.capabilities.python_project_service import PythonProjectService
         self.root = root
         self.repository = repository
         self.executor = executor
         self._receipts: dict[tuple[UUID, UUID], tuple[ProjectInvocation, str]] = {}
         self._original_receipts: dict[tuple[UUID, UUID], Mapping[str, JsonValue]] = {}
+        self._python = PythonProjectService(self, python_executor)
+
+    async def authorization_request(self, request: CapabilityRequest) -> CapabilityRequest | None:
+        return await self._python.authorization_request(request)
+
+    async def prepare_python_original(
+        self, *, invocation: ProjectInvocation, reference: ProjectBaselineReference,
+    ) -> PythonProjectInputs | None:
+        return await self._python.prepare(invocation, reference)
+
+    async def python_original_context(self, tenant_id: UUID, run_id: UUID) -> PythonOriginalContext | None:
+        return await self._python.original_context(tenant_id, run_id)
 
     async def _original_scope(
         self, invocation: ProjectInvocation, *, reference: ProjectBaselineReference | None = None,
@@ -373,6 +415,11 @@ class ProjectVerificationService:
         self, *, tenant_id: UUID, run_id: UUID, actor: str, reference: ProjectBaselineReference,
         execution_id: str, timeout_seconds: float,
     ) -> Mapping[str, JsonValue]:
+        python = await self._python.select(tenant_id, run_id, actor, phases=('executing',))
+        if python is not None:
+            await self._python._approval(python, actor)
+            return await self._python.observe_original(python, actor=actor, reference=reference,
+                execution_id=execution_id, timeout_seconds=timeout_seconds)
         invocation = await self._invocation(tenant_id, run_id, actor)
         invocation = invocation.model_copy(update={
             'execution_id': execution_id,
@@ -388,6 +435,11 @@ class ProjectVerificationService:
     ) -> ProjectInvocation:
         from agent_hub.skills.sandbox.project import ProjectInvocation
 
+        python = await self._python.select(tenant_id, run_id, actor,
+                                          phases=('captured', 'executing', 'observed'))
+        if python is not None:
+            await self._python._approval(python, actor)
+            return python.invocation
         try:
             getter = getattr(self.repository, "get", None)
             if not callable(getter):
@@ -444,6 +496,10 @@ class ProjectVerificationService:
         key = (tenant_id, run_id)
         self._receipts.pop(key, None)
         self._original_receipts.pop(key, None)
+        self._python.receipts.pop(key, None)
+        python = await self._python.select(tenant_id, run_id, actor)
+        if python is not None:
+            return await self._python.verify(python, actor)
         invocation = await self._invocation(tenant_id, run_id, actor)
         stored = await self._original_scope(invocation)
         if stored is not None:
@@ -478,6 +534,8 @@ class ProjectVerificationService:
     async def require_current_receipt(self, tenant_id: UUID, run_id: UUID) -> str:
         from agent_hub.skills.sandbox.project import project_source_fingerprint
 
+        if (tenant_id, run_id) in self._python.receipts:
+            return await self._python.require_current(tenant_id, run_id)
         record = self._receipts.get((tenant_id, run_id))
         if record is not None:
             invocation, expected = record

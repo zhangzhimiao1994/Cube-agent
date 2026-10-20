@@ -1873,17 +1873,27 @@ class RunService:
         if prepared.artifacts[:len(context.artifacts)] != context.artifacts:
             raise RuntimeError(failure)
         state = prepared.routing_decision.get("project_input_preparation")
+        python_preparation = (
+            isinstance(state, Mapping)
+            and type(state.get("schema_version")) is int
+            and state.get("schema_version") == 2
+        )
+        derived_keys = {"project_input_preparation"}
+        if python_preparation:
+            from agent_hub.runs.python_preparation import validate_python_preparation
+            validate_python_preparation(prepared)
+            derived_keys.add("python_project_history")
         if (
             not isinstance(state, Mapping)
             or type(state.get("schema_version")) is not int
-            or state.get("schema_version") != 1
+            or state.get("schema_version") != (2 if python_preparation else 1)
             or state.get("phase") != "observed"
             or {
                 key: value for key, value in prepared.routing_decision.items()
-                if key != "project_input_preparation"
+                if key not in derived_keys
             } != {
                 key: value for key, value in route.items()
-                if key != "project_input_preparation"
+                if key not in derived_keys
             }
         ):
             raise RuntimeError(failure)

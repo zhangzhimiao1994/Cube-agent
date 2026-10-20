@@ -255,6 +255,12 @@ class HarnessToolGateway:
                 if (request.tool_name == "project.verify"
                     and type(error.project_failure) is ProjectVerificationFailure):
                     failure_payload["verification_failure"] = error.project_failure.to_payload()
+                if request.tool_name == "project.verify" and error.python_project_failure is not None:
+                    failure_payload["python_verification_failure"] = error.python_project_failure.to_payload()
+                    reference = error.python_project_failure.environment_reference
+                    failure_payload["python_environment_reference"] = (
+                        None if reference is None else reference.model_dump(mode="json")
+                    )
             elif (request.tool_name == "project.verify"
                   and type(error.project_prerequisite) is ProjectPrerequisiteObservation
                   and error.project_failure is None):
@@ -291,10 +297,24 @@ class HarnessToolGateway:
             return None
         if self._policy_gateway is None:
             return None
-        decision = await self._policy_gateway.invoke(
-            _capability_request(tenant_id, user_id, request, capability_parts=capability_parts),
-            role=role,
-        )
+        admission = _capability_request(tenant_id, user_id, request, capability_parts=capability_parts)
+        if request.tool_name == "project.verify" and capability_parts is None:
+            resolver = getattr(self._backend, "project_verification_authorization", None)
+            if callable(resolver):
+                if request.arguments:
+                    return self._failure(request, "project.verify takes no arguments")
+                # Only trusted backend scope can specialize a grant. An explicit
+                # None preserves Node behavior; exceptions NEVER fall back.
+                try:
+                    selected = await resolver(admission)
+                    if selected is not None:
+                        admission = _python_recipe_authorization(selected, expected=admission)
+                except Exception as error:  # noqa: BLE001 - no private recipe error or fallback grant.
+                    error.__traceback__ = None
+                    error.__context__ = None
+                    error.__cause__ = None
+                    return self._failure(request, "capability authorization unavailable")
+        decision = await self._policy_gateway.invoke(admission, role=role)
         if decision.status is CapabilityStatus.ALLOWED:
             return None
         payload: Mapping[str, JsonValue] = {}
@@ -366,6 +386,28 @@ class HarnessToolGateway:
                 )
                 return "external tool tenant preparation failed"
         return None
+
+
+def _python_recipe_authorization(selected: object, *, expected: CapabilityRequest) -> CapabilityRequest:
+    if type(selected) is not CapabilityRequest:
+        raise ValueError("project verification authorization unavailable")
+    selected = CapabilityRequest.model_validate(selected.model_dump(), strict=True)
+    fields = ("tenant_id", "user_id", "run_id", "agent_id", "idempotency_key")
+    match = re.fullmatch(r"workspace/current/project-verification/python/([a-f0-9]{64})", selected.resource)
+    arguments = selected.arguments
+    if (any(getattr(selected, field) != getattr(expected, field) for field in fields)
+        or (selected.capability, selected.operation) != ("command", "run") or match is None
+        or set(arguments) != {"schema_version", "recipe_sha256", "environment_input_sha256",
+                              "project_id", "workspace_session_id"}
+        or type(arguments["schema_version"]) is not int or arguments["schema_version"] != 1
+        or arguments["recipe_sha256"] != match.group(1)
+        or type(arguments["environment_input_sha256"]) is not str
+        or re.fullmatch(r"[a-f0-9]{64}", arguments["environment_input_sha256"]) is None
+        or any(type(value) is not str
+               or re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", value) is None
+               for value in (arguments["project_id"], arguments["workspace_session_id"]))):
+        raise ValueError("project verification authorization unavailable")
+    return selected
 
 
 def _capability_request(

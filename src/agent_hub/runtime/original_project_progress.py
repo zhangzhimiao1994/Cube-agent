@@ -8,9 +8,41 @@ import re
 from collections.abc import Mapping
 
 from agent_hub.runtime.contracts import JsonValue, TaskContext
+from agent_hub.runtime.python_project_history import (
+    python_binding_matches,
+    python_history_selected,
+    python_original_failed,
+)
+
+
+def python_project_inspection_declared(result: Mapping[str, JsonValue]) -> bool:
+    """Advisory prompt state only, never validator selection or delivery credit."""
+    advisory = result.get('python_recipe')
+    if (not isinstance(advisory, Mapping)
+            or advisory != {'kind': 'python_offline_wheel_v1', 'status': 'declared'}):
+        return False
+    manifests = result.get('manifests')
+    if not isinstance(manifests, tuple | list):
+        return False
+    observed: set[str] = set()
+    for item in manifests:
+        if not isinstance(item, Mapping):
+            continue
+        path = item.get('path')
+        if not isinstance(path, str) or path not in {'pyproject.toml', 'requirements.lock'}:
+            continue
+        digest, size = item.get('sha256'), item.get('observed_bytes')
+        if (path in observed or item.get('status') != 'observed'
+                or type(digest) is not str or re.fullmatch('[a-f0-9]{64}', digest) is None
+                or type(size) is not int or not 0 < size < 2**63):
+            return False
+        observed.add(path)
+    return observed == {'pyproject.toml', 'requirements.lock'}
 
 
 def original_failure_observed(context: TaskContext) -> bool:
+    if python_history_selected(context):
+        return python_original_failed(context)
     route = context.routing_decision
     if (type(route.get('project_input_contract_version')) is not int
             or route.get('project_input_contract_version') != 1):
@@ -51,6 +83,8 @@ def original_contract_binding_matches(
 ) -> bool:
     if context is None:
         return True
+    if python_history_selected(context):
+        return python_binding_matches(context, result, source)
     route = context.routing_decision
     if 'project_input_contract_version' not in route and 'project_input' not in route:
         return True

@@ -3000,6 +3000,10 @@ def _execution_failure_result(
     """Accept only the bounded F01 receipt supplied by the trusted tool gateway."""
     if not isinstance(payload, Mapping) or "approval_id" in payload:
         return None
+    if "python_verification_failure" in payload:
+        from agent_hub.runtime.python_project_history import python_failure_feedback
+
+        return python_failure_feedback(payload, tool_name=tool_name)
     if "verification_blocked" in payload:
         return project_prerequisite_feedback(payload, tool_name=tool_name)
     diagnostic = payload.get("execution_diagnostic")

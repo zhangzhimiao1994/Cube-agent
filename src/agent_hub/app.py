@@ -1611,6 +1611,7 @@ def create_app(
                         runtime_capability_stack.runtime_gateway
                     )
                     application.state.project_input_preparer = runtime_capability_stack.project_input_preparer
+                    application.state.project_cache_cleanup_hook = getattr(runtime_capability_stack, "project_cache_cleanup_hook", None)
                     active_runtime_registry = configured_runtime_registry(
                         config_service=ConfigService(active_sessions),
                         secret_service=active_secret_service,
@@ -1669,6 +1670,8 @@ def create_app(
                 application.state.run_service = RunService(
                     RunRepository(active_sessions),
                     project_input_preparer=getattr(application.state, 'project_input_preparer', None),
+                    terminal_run_hooks=(() if getattr(application.state, 'project_cache_cleanup_hook', None) is None
+                        else (application.state.project_cache_cleanup_hook,)),
                     instruction_context_loader=InstructionContextLoader(
                         repository=RunRepository(active_sessions),
                         project_root=configured.project_workspace_dir,

@@ -52,7 +52,7 @@ def _detection_view(value: str, *, strip_ansi: bool = True) -> str:
     )
 
 
-def _capture_output(value: str) -> _OutputEvidence:
+def _capture_output(value: str, *, retain_tail: bool = False) -> _OutputEvidence:
     safe_lines: list[str] = []
     redacted_lines = 0
     # Split only at LF so other control characters cannot split a sensitive key before detection.
@@ -92,7 +92,16 @@ def _capture_output(value: str) -> _OutputEvidence:
             safe_lines.append(line)
     sanitized = "".join(safe_lines).encode("utf-8", errors="replace")
     truncated = len(sanitized) > _OUTPUT_LIMIT_BYTES
-    if truncated:
+    if truncated and retain_tail:
+        marker = _TRUNCATION_MARKER + "\n"
+        available = _OUTPUT_LIMIT_BYTES - len(marker.encode("utf-8"))
+        head = sanitized[:(available + 1) // 2].decode("utf-8", errors="ignore")
+        # Give UTF-8 prefix slack to the suffix so only its boundary can lose
+        # up to three bytes. Metadata still hashes the entire sanitized stream.
+        tail_limit = available - len(head.encode("utf-8"))
+        tail = sanitized[-tail_limit:].decode("utf-8", errors="ignore")
+        text = head + marker + tail
+    elif truncated:
         prefix_limit = _OUTPUT_LIMIT_BYTES - len(_TRUNCATION_MARKER.encode("utf-8"))
         text = sanitized[:prefix_limit].decode("utf-8", errors="ignore") + _TRUNCATION_MARKER
     else:
@@ -112,12 +121,15 @@ class ExecutionDiagnostic:
 
     backend: str
     result: InitVar[SkillResult]
+    retain_tail: InitVar[bool] = False
     exit_code: int | None = field(init=False)
     timed_out: bool = field(init=False)
     _stdout: _OutputEvidence = field(init=False, repr=False)
     _stderr: _OutputEvidence = field(init=False, repr=False)
 
-    def __post_init__(self, result: SkillResult) -> None:
+    def __post_init__(self, result: SkillResult, retain_tail: bool) -> None:
+        if type(retain_tail) is not bool:
+            raise TypeError("execution diagnostic tail selection must be boolean")
         if type(result) is not SkillResult:
             raise TypeError("execution diagnostic requires a SkillResult")
         if result.exit_code is None and not result.timed_out:
@@ -133,8 +145,8 @@ class ExecutionDiagnostic:
         object.__setattr__(self, "backend", backend)
         object.__setattr__(self, "exit_code", result.exit_code)
         object.__setattr__(self, "timed_out", result.timed_out)
-        object.__setattr__(self, "_stdout", _capture_output(result.stdout))
-        object.__setattr__(self, "_stderr", _capture_output(result.stderr))
+        object.__setattr__(self, "_stdout", _capture_output(result.stdout, retain_tail=retain_tail))
+        object.__setattr__(self, "_stderr", _capture_output(result.stderr, retain_tail=retain_tail))
 
     def to_payload(self) -> Mapping[str, JsonValue]:
         return {

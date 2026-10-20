@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Protocol, cast
 from uuid import UUID, uuid4
 
 if TYPE_CHECKING:
+    from agent_hub.capabilities.python_project_reports import PythonProjectFailure
     from agent_hub.harness.tool_gateway import HarnessToolGateway
     from agent_hub.runs.project_inputs import OriginalProjectPreparer
 
@@ -57,6 +58,7 @@ from agent_hub.capabilities.tools.project_zip import (
     PROJECT_ZIP_TOOL_NAME,
 )
 from agent_hub.capabilities.tools.registry import ToolRegistry
+from agent_hub.capabilities.types import CapabilityRequest
 from agent_hub.documents.docx import DocxBlueprint, build_docx
 from agent_hub.documents.pptx import PptxBlueprint, build_pptx
 from agent_hub.files.generated import (
@@ -157,20 +159,32 @@ class RuntimeCapabilityError(RuntimeError):
         self, *args: object, execution_diagnostic: ExecutionDiagnostic | None = None,
         project_failure: ProjectVerificationFailure | None = None,
         project_prerequisite: ProjectPrerequisiteObservation | None = None,
+        python_project_failure: PythonProjectFailure | None = None,
     ) -> None:
+        from agent_hub.capabilities.python_project_reports import PythonProjectFailure
+
         if execution_diagnostic is not None and type(execution_diagnostic) is not ExecutionDiagnostic:
             raise TypeError("execution_diagnostic must be ExecutionDiagnostic")
         if project_failure is not None and type(project_failure) is not ProjectVerificationFailure:
             raise TypeError("project_failure must be ProjectVerificationFailure")
+        if python_project_failure is not None and (
+            type(python_project_failure) is not PythonProjectFailure
+            or execution_diagnostic is None
+            or python_project_failure.diagnostic is not execution_diagnostic
+            or project_failure is not None
+        ):
+            raise TypeError("python failure must retain its separate native diagnostic")
         if project_prerequisite is not None and (
             type(project_prerequisite) is not ProjectPrerequisiteObservation
             or execution_diagnostic is not None or project_failure is not None
+            or python_project_failure is not None
         ):
             raise TypeError("project prerequisite must be a separate typed blocked observation")
         super().__init__(*args)
         self._execution_diagnostic = execution_diagnostic
         self._project_failure = project_failure
         self._project_prerequisite = project_prerequisite
+        self._python_project_failure = python_project_failure
 
     @property
     def execution_diagnostic(self) -> ExecutionDiagnostic | None:
@@ -183,6 +197,10 @@ class RuntimeCapabilityError(RuntimeError):
     @property
     def project_prerequisite(self) -> ProjectPrerequisiteObservation | None:
         return self._project_prerequisite
+
+    @property
+    def python_project_failure(self) -> PythonProjectFailure | None:
+        return self._python_project_failure
 
 
 class CapabilityManifestSource(Protocol):
@@ -276,6 +294,13 @@ class RuntimeCapabilityGateway:
             self._tenant_id,
             normalized_name,
         )
+
+    async def project_verification_authorization(
+        self, request: CapabilityRequest,
+    ) -> CapabilityRequest | None:
+        if self._project_verification is None:
+            return None
+        return await self._project_verification.authorization_request(request)
 
     def is_available(self, tenant_id: UUID, name: str) -> bool:
         normalized_name = _normalize_tool_name(name)
@@ -422,6 +447,7 @@ class RuntimeCapabilityGateway:
             except ProjectVerificationError as error:
                 raise RuntimeCapabilityError(str(error), execution_diagnostic=error.diagnostic,
                                              project_failure=error.project_failure,
+                                             python_project_failure=error.python_project_failure,
                                              project_prerequisite=error.project_prerequisite) from None
         return await self._execute_skill(
             tenant_id=tenant_id,
@@ -624,9 +650,9 @@ class RuntimeCapabilityGateway:
         store = self._require_generated_file_store()
         title = _required_string(arguments, "title")
         files = _project_files(arguments)
-        if self._project_executor_configured and "package.json" in files:
+        if self._project_executor_configured and {"package.json", "pyproject.toml"}.intersection(files):
             raise RuntimeCapabilityError(
-                "Node project delivery requires workspace.write_text, project.verify and workspace.bundle"
+                "Node/Python project delivery requires workspace.write_text, project.verify and workspace.bundle"
             )
         workspace_files = self._copy_project_files_to_workspace(tenant_id, arguments, files)
         filename = _filename(arguments, title=title, extension=".zip")
@@ -758,7 +784,9 @@ class RuntimeCapabilityGateway:
         delivery_receipt = self._project_delivery_receipts.get((tenant_id, run_id))
         if self._project_executor_configured and self._project_verification is not None:
             files = store.list_files(tenant_id, project_id, session_id)
-            if original_contract is not None or delivery_receipt is not None or any(item.path == "package.json" for item in files):
+            if original_contract is not None or delivery_receipt is not None or any(
+                item.path in {"package.json", "pyproject.toml"} for item in files
+            ):
                 try:
                     verified_source = await self._project_verification.require_current_receipt(tenant_id, run_id)
                 except ProjectVerificationError as error:
@@ -880,6 +908,19 @@ class RuntimeCapabilityGateway:
             selection = ManagedProjectInput.from_payload(route.get('project_input'))
             project, session = authorized_workspace_scope(record, tenant_id=tenant_id, run_id=run_id)
             state = route.get('project_input_preparation')
+            if (isinstance(state, Mapping) and type(state.get('schema_version')) is int
+                    and state['schema_version'] == 2):
+                if self._project_verification is None:
+                    raise ValueError
+                python_context = await self._project_verification.python_original_context(tenant_id, run_id)
+                if python_context is None:
+                    raise ValueError
+                contract = python_context.stored.contract
+                if ((contract.tenant_id, contract.run_id, contract.project_id, contract.session_id)
+                        != (tenant_id, run_id, project, session)
+                        or contract.editable_paths != selection.editable_paths):
+                    raise ValueError
+                return contract
             if (not isinstance(state, Mapping) or type(state.get('schema_version')) is not int
                     or state['schema_version'] != 1 or state.get('phase') != 'observed'):
                 raise ValueError

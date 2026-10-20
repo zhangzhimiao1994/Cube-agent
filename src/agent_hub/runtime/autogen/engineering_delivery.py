@@ -27,6 +27,13 @@ from agent_hub.runtime.engineering_actions import EngineeringProgress
 from agent_hub.runtime.original_project_progress import (
     original_contract_binding_matches,
     original_failure_observed,
+    python_project_inspection_declared,
+)
+from agent_hub.runtime.python_project_history import (
+    python_failure_current,
+    python_history_selected,
+    python_initial_files,
+    python_productive_change,
 )
 
 _READ_ONLY = frozenset({"read_context", "project.inspect", "workspace.read", "workspace_read",
@@ -188,7 +195,7 @@ def engineering_delivery_ready(
             writes[item[0]] = item
             verified, ready = None, False
         elif name == "project.verify":
-            source = _successful_source(result)
+            source = _successful_source(result, context=context)
             if source is not None and not original_contract_binding_matches(context, result, source):
                 source = None
             receipt_sha = hashlib.sha256(json.dumps(
@@ -239,7 +246,8 @@ def engineering_progress(
     by_id = {str(item.id): item for item in artifacts}
     inspected = existing = has_writes = seen = current = failed_current = False
     seen = failed_current = original_failure_observed(context)
-    known: dict[str, tuple[str, str, int]] = {}
+    python = python_history_selected(context)
+    known: dict[str, tuple[str, str, int]] = python_initial_files(context) if python else {}
     used: set[str] = set()
     uncertain = len(by_id) != len(artifacts)
     for position, row in enumerate(tool_entries):
@@ -267,6 +275,9 @@ def engineering_progress(
             break
         if status == "failed":
             if name != "project.verify":
+                uncertain = True
+                break
+            if python and not python_failure_current(context, result):
                 uncertain = True
                 break
             seen, current, failed_current = True, False, True
@@ -297,7 +308,7 @@ def engineering_progress(
                 existing = (isinstance(operations, Mapping)
                             and operations.get("build") == operations.get("test") == "declared"
                             and isinstance(issues, tuple | list) and not issues
-                            and observed_package)
+                            and (observed_package or python_project_inspection_declared(result)))
         elif name == "workspace.write_text":
             files = result.get("workspace_files")
             item = _file_metadata(files[0]) if isinstance(files, tuple | list) and len(files) == 1 else _file_metadata(result)
@@ -306,14 +317,17 @@ def engineering_progress(
                 break
             has_writes = True
             current = False
-            if known.get(item[0]) != item:
+            if python_productive_change(context, item, known) if python else known.get(item[0]) != item:
                 failed_current = False
             known[item[0]] = item
         elif name == "project.verify":
             seen = True
-            source = _successful_source(result)
+            source = _successful_source(result, context=context)
             current = source is not None and original_contract_binding_matches(context, result, source)
-            failed_current = not current
+            failed_current = not current and not python
+            if python and not current:
+                uncertain = True
+                break
         elif name not in _READ_ONLY | {"workspace.bundle"}:
             current = False
     bundle = not uncertain and engineering_delivery_ready(
