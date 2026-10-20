@@ -11,7 +11,7 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import cast
+from typing import TypedDict, cast
 from uuid import UUID, uuid4
 
 from sqlalchemy import Select, and_, delete, func, or_, select, update
@@ -55,6 +55,10 @@ def _optional_database_uuid(value: UUID | None) -> UUID | None:
     return None if value is None else _database_uuid(value)
 
 
+class _PythonApprovalOptions(TypedDict, total=False):
+    python_binding: dict[str, object]
+
+
 def _pre_model_original_capture(route: Mapping[str, object]) -> bool:
     from agent_hub.capabilities.project_baselines import ProjectBaselineReference
     from agent_hub.capabilities.project_contracts import ManagedProjectInput
@@ -62,9 +66,19 @@ def _pre_model_original_capture(route: Mapping[str, object]) -> bool:
     state = route.get('project_input_preparation')
     if (type(route.get('project_input_contract_version')) is not int
             or route.get('project_input_contract_version') != 1
-            or not isinstance(state, Mapping) or set(state) != {'schema_version', 'phase', 'reference'}
-            or type(state.get('schema_version')) is not int or state['schema_version'] != 1
-            or state['phase'] != 'captured'):
+            or not isinstance(state, Mapping)
+            or type(state.get('schema_version')) is not int or state['schema_version'] not in {1, 2}
+            or state.get('phase') != 'captured'):
+        return False
+    expected_keys = {'schema_version', 'phase', 'reference'}
+    if state['schema_version'] == 2:
+        expected_keys.add('python_recipe')
+        selection = route.get('project_input')
+        if (_python_recipe_marker(state.get('python_recipe')) is None
+                or not isinstance(selection, Mapping)
+                or set(selection) != {'schema_version', 'kind', 'editable_paths'}):
+            return False
+    if set(state) != expected_keys:
         return False
     try:
         ProjectBaselineReference.from_payload(state['reference'])
@@ -72,6 +86,72 @@ def _pre_model_original_capture(route: Mapping[str, object]) -> bool:
     except (ValueError, TypeError):
         return False
     return True
+
+
+def _python_recipe_marker(value: object) -> dict[str, object] | None:
+    if (not isinstance(value, Mapping)
+            or set(value) != {'schema_version', 'recipe_sha256', 'environment_input_sha256'}
+            or type(value.get('schema_version')) is not int or value['schema_version'] != 1
+            or any(type(value.get(key)) is not str
+                   or re.fullmatch(r'[a-f0-9]{64}', value[key]) is None
+                   for key in ('recipe_sha256', 'environment_input_sha256'))):
+        return None
+    return dict(value)
+
+
+def _python_project_approval_binding(run: RunRow, approval_scope: object) -> dict[str, object] | None:
+    from agent_hub.capabilities.project_baselines import ProjectBaselineReference
+    from agent_hub.capabilities.project_contracts import ManagedProjectInput
+    from agent_hub.capabilities.scoped_read import ScopedReadError, authorized_workspace_scope
+
+    route = run.routing_decision or {}
+    state = route.get('project_input_preparation')
+    if (not isinstance(run.actor_id, UUID)
+            or type(route.get('project_input_contract_version')) is not int
+            or route['project_input_contract_version'] != 1
+            or not isinstance(state, Mapping)
+            or type(state.get('schema_version')) is not int or state['schema_version'] != 2
+            or type(state.get('phase')) is not str
+            or state.get('phase') not in {'captured', 'executing', 'observed'}):
+        return None
+    keys = {'schema_version', 'phase', 'reference', 'python_recipe'}
+    if state['phase'] in {'executing', 'observed'}:
+        keys.add('execution_id')
+        if state.get('execution_id') != 'original_' + run.id.hex:
+            return None
+    if state['phase'] == 'observed':
+        keys.update({'observation', 'observation_sha256'})
+        if (not isinstance(state.get('observation'), Mapping)
+                or type(state.get('observation_sha256')) is not str
+                or re.fullmatch(r'[a-f0-9]{64}', state['observation_sha256']) is None):
+            return None
+    selection = route.get('project_input')
+    marker = _python_recipe_marker(state.get('python_recipe'))
+    if (set(state) != keys or marker is None
+            or not isinstance(selection, Mapping)
+            or set(selection) != {'schema_version', 'kind', 'editable_paths'}
+            or route.get('sandbox_profile') != 'workspace_write'
+            or route.get('execution_backend', 'systemd') != 'systemd'):
+        return None
+    try:
+        ProjectBaselineReference.from_payload(state['reference'])
+        ManagedProjectInput.from_payload(selection)
+        project, workspace_session = authorized_workspace_scope(
+            run, tenant_id=run.tenant_id, run_id=run.id,
+        )
+    except (ValueError, TypeError, ScopedReadError):
+        return None
+    permissions = route.get('requested_permissions')
+    if not isinstance(permissions, (list, tuple)) or not {'command.run', 'workspace.write'}.issubset(permissions):
+        return None
+    resource = 'workspace/current/project-verification/python/' + cast(str, marker['recipe_sha256'])
+    expected_scope = (
+        f'capability-scope:v1:tenant={run.tenant_id}:user={run.actor_id}:run={run.id}:'
+        f'capability=command:operation=run:resource={resource}'
+    )
+    if type(approval_scope) is not str or approval_scope != expected_scope:
+        return None
+    return {**marker, 'project_id': project, 'workspace_session_id': workspace_session}
 
 
 _RECOVERY_REPLAYABLE_EVENT_KINDS = frozenset(
@@ -1346,6 +1426,10 @@ class RunRepository:
         original_capture = (
             routing_decision.get('approval_checkpoint_required') is False
             and _pre_model_original_capture(routing_decision)
+            and (
+                cast(Mapping[str, object], routing_decision['project_input_preparation'])['schema_version'] == 1
+                or _python_project_approval_binding(row, routing_decision.get('approval_scope')) is not None
+            )
         )
         recovery_options = {'pre_model_original_capture': True} if original_capture else {}
         if await self._recovery_blocked_after_checkpoint(
@@ -1385,11 +1469,20 @@ class RunRepository:
             if RunStatus(row.status) is not RunStatus.RUNNING:
                 raise RunConflict("run is not running")
             approval_worker_token = row.worker_lease_token
+            python_binding = (
+                _python_project_approval_binding(row, approval_scope)
+                if plugin_identity is None else None
+            )
             # Captured input has no native command or model side effect yet. Its
             # durable original reference resumes admission, not a runtime checkpoint.
-            checkpoint_required = approval_worker_token is not None and not _pre_model_original_capture(
-                routing_decision
+            original_capture = _pre_model_original_capture(routing_decision) and (
+                cast(Mapping[str, object], routing_decision['project_input_preparation'])['schema_version'] == 1
+                or python_binding is not None
             )
+            checkpoint_required = approval_worker_token is not None and not original_capture
+            python_options: _PythonApprovalOptions = {}
+            if python_binding is not None:
+                python_options['python_binding'] = python_binding
             row.status = RunStatus.WAITING_APPROVAL.value
             self.clear_worker_lease(row)
             row.routing_decision = {
@@ -1419,6 +1512,7 @@ class RunRepository:
                      "run_id": str(row.id), "version": row.version}
                     if plugin_identity is not None else None
                 ),
+                **python_options,
             )
             await session.flush()
             return self._record(row)
@@ -2356,6 +2450,7 @@ class RunRepository:
         approval_scope: str | None = None,
         status: str,
         public_binding: dict[str, object] | None = None,
+        python_binding: dict[str, object] | None = None,
         request_version: int | None = None,
         resolution_version: int | None = None,
     ) -> None:
@@ -2366,6 +2461,7 @@ class RunRepository:
             "status": status,
             **({"approval_scope": approval_scope} if approval_scope else {}),
             **({"public_binding": public_binding} if public_binding is not None else {}),
+            **({'python_binding': python_binding} if python_binding is not None else {}),
         }
         if request_version is not None:
             payload["public_request"] = {
@@ -2642,7 +2738,21 @@ def _public_plugin_approval_events(
         ):
             raise RunConflict("pending capability approval evidence is stale")
         public_binding = dict(binding)
-        if "public_binding" not in approval.payload and isinstance(run.actor_id, UUID):
+        python_binding = None
+        if 'public_binding' not in approval.payload and 'python_binding' in approval.payload:
+            expected_python = _python_project_approval_binding(run, approval.payload.get('approval_scope'))
+            stored_python = approval.payload['python_binding']
+            if (expected_python is not None and type(stored_python) is dict
+                    and type(stored_python.get('schema_version')) is int
+                    and stored_python == expected_python):
+                python_binding = expected_python
+                public_binding.update({
+                    'capability': 'command', 'operation': 'run',
+                    'resource': 'workspace/current/project-verification/python/'
+                    + cast(str, python_binding['recipe_sha256']),
+                    'approval_scope': approval.payload['approval_scope'],
+                })
+        elif "public_binding" not in approval.payload and isinstance(run.actor_id, UUID):
             for capability, operation, resource in (
                 ("file", "write", "workspace/current"),
                 ("command", "run", "workspace/current/project-verification"),

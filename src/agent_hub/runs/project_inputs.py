@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import re
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
@@ -34,13 +35,57 @@ from agent_hub.domain.runs import RunStatus
 from agent_hub.harness.tool_gateway import HarnessToolGateway
 from agent_hub.harness.types import HarnessToolCallRequest
 from agent_hub.runs.project_source_context import original_source_context
-from agent_hub.runs.repository import RunConflict, RunRepository
+from agent_hub.runs.repository import (
+    RunConflict,
+    RunRecord,
+    RunRepository,
+    _pre_model_original_capture,
+)
 from agent_hub.runtime.contracts import Artifact, JsonValue, TaskContext, _freeze_object
 from agent_hub.skills.sandbox.project import ProjectInvocation
 
 _FAILURE = 'original project preparation is unavailable or changed'
 _SCOPE_KEYS = ('project_id', 'workspace_session_id', 'sandbox_profile', 'requested_permissions',
                'execution_backend', 'project_input_contract_version', 'project_input')
+
+
+class OriginalProjectApprovalPending(RuntimeError):
+    """Captured inputs are durable; no model or project command has started."""
+
+    def __init__(self, approval_id: str, preparation: Mapping[str, JsonValue]) -> None:
+        super().__init__('original project preparation authorization pending')
+        if re.fullmatch(r'approval_[a-zA-Z0-9_-]{1,100}', approval_id) is None:
+            raise ValueError(_FAILURE)
+        self.approval_id = approval_id
+        self.preparation = _freeze_object(preparation, name='original project approval capture')
+
+    def matches(self, record: RunRecord, context: TaskContext) -> bool:
+        route = record.routing_decision
+        if (record.tenant_id != context.tenant_id or record.id != context.run_id
+                or record.actor_id != context.actor_id or record.actor_role is not context.actor_role
+                or record.mode is not context.mode or record.request != context.request
+                or record.status is not RunStatus.WAITING_APPROVAL or not isinstance(route, Mapping)
+                or not _pre_model_original_capture(route)
+                or any(getattr(record, name) is not None for name in (
+                    'worker_id', 'worker_lease_token', 'worker_lease_expires_at', 'worker_heartbeat_at'))
+                or route.get('approval_kind') != 'capability_tool'
+                or route.get('approval_id') != self.approval_id
+                or route.get('approval_checkpoint_required') is not False
+                or _freeze_object(route['project_input_preparation'], name='original project approval capture')
+                    != self.preparation
+                or _freeze_object({key: route.get(key) for key in _SCOPE_KEYS}, name='original scope')
+                    != _freeze_object({key: context.routing_decision.get(key) for key in _SCOPE_KEYS},
+                                      name='original scope')):
+            return False
+        resource = 'workspace/current/project-verification'
+        if self.preparation['schema_version'] == 2:
+            marker = cast(Mapping[str, JsonValue], self.preparation['python_recipe'])
+            resource += '/python/' + cast(str, marker['recipe_sha256'])
+        expected_scope = (
+            f'capability-scope:v1:tenant={record.tenant_id}:user={record.actor_id}:run={record.id}:'
+            f'capability=command:operation=run:resource={resource}'
+        )
+        return route.get('approval_scope') == expected_scope
 
 
 def _encoded(value: object) -> bytes:
@@ -228,6 +273,12 @@ class OriginalProjectPreparer:
             allowed = await self.authorizer.authorize(
                 context.tenant_id, request, user_id=context.actor_id, role=context.actor_role,
             )
+            if (allowed.status == 'failed' and not allowed.truncated
+                    and allowed.call_id == request.call_id and allowed.tool_name == request.tool_name
+                    and allowed.failure_reason == 'capability requires approval'
+                    and set(allowed.payload) == {'approval_id'}
+                    and isinstance(allowed.payload['approval_id'], str)):
+                raise OriginalProjectApprovalPending(allowed.payload['approval_id'], state)
             if (allowed.status != 'succeeded' or allowed.truncated
                     or allowed.call_id != request.call_id or allowed.tool_name != request.tool_name
                     or allowed.payload.get('authorized') is not True):

@@ -47,6 +47,7 @@ from agent_hub.runs.conversation_queue import (
 )
 from agent_hub.runs.conversations import ConversationArchived, ConversationRecord
 from agent_hub.runs.observer import ObserverDecision, ObserverPolicy, RunMonitor
+from agent_hub.runs.project_inputs import OriginalProjectApprovalPending
 from agent_hub.runs.repository import (
     RunAlreadyActive,
     RunConflict,
@@ -2201,6 +2202,18 @@ class RunService:
                             self._prepare_original_project_context(context)
                         )
                         context = await project_preparation_task
+                    except OriginalProjectApprovalPending as pending:
+                        current = await self._repository.get(tenant_id, run_id)
+                        if (current.status is not RunStatus.WAITING_APPROVAL and (
+                                current.worker_id != self._worker_id
+                                or current.worker_lease_token != worker_lease_token)):
+                            # A fast approval/rejection may already have handed ownership away.
+                            project_preparation_task = None
+                            return _submitted(current)
+                        if not pending.matches(current, context):
+                            raise RuntimeError('original project approval binding changed') from None
+                        project_preparation_task = None
+                        return _submitted(current)
                     except asyncio.CancelledError:
                         current = await self._repository.get(tenant_id, run_id)
                         if (current.status is RunStatus.RUNNING
