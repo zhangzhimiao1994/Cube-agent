@@ -46,6 +46,8 @@ async def test_only_pre_model_captured_input_can_wait_without_runtime_checkpoint
     ('captured', 'tool.started', False), ('captured', 'tool.completed', False),
     ('captured', 'artifact.created', False), ('captured', 'runtime.failed', False),
     ('observed', None, False), ('executing', None, False), ('missing', None, False),
+    ('invalid_reference', None, False), ('invalid_version', None, False),
+    ('missing_required', None, False), ('required_true', None, False),
 ])
 @pytest.mark.parametrize('entrypoint', ['enqueue', 'resolve'])
 async def test_original_admission_readiness_and_approval_use_real_recovery_query(
@@ -60,12 +62,26 @@ async def test_original_admission_readiness_and_approval_use_real_recovery_query
         'approval_kind': 'capability_tool', 'approval_id': 'approval-native',
         'approval_fingerprint': 'fingerprint-native', 'approval_checkpoint_required': False,
     }
+    if phase in {'invalid_reference', 'invalid_version', 'missing_required', 'required_true'}:
+        preparation = cast(dict[str, Any], route['project_input_preparation'])
+        preparation['phase'] = 'captured'
+        if phase == 'invalid_reference':
+            preparation['reference']['contract_sha256'] = 'invalid'
+        elif phase == 'invalid_version':
+            route['project_input_contract_version'] = True
+        elif phase == 'missing_required':
+            route.pop('approval_checkpoint_required')
+        else:
+            route['approval_checkpoint_required'] = True
     row = _RecoveryBlockingRepository(status=RunStatus.WAITING_APPROVAL,
         routing_decision=route, blocked_after_sequence=0).row
     engine = create_engine('sqlite:///:memory:')
     added: list[object] = []
     with engine.connect() as connection:
-        connection.execute(text('CREATE TABLE agent_hub_run_checkpoints (run_id CHAR(32), sequence INTEGER)'))
+        connection.execute(text('CREATE TABLE agent_hub_run_checkpoints ('
+            'run_id CHAR(32), sequence INTEGER, id CHAR(32), tenant_id CHAR(32), '
+            'runtime_type TEXT, runtime_version TEXT, mode TEXT, state TEXT, '
+            'state_sha256 TEXT, payload TEXT, created_at TEXT)'))
         connection.execute(text('CREATE TABLE agent_hub_run_events (run_id CHAR(32), sequence INTEGER, kind TEXT)'))
         tail = [(1, 'context.loaded'), (2, 'harness.started')]
         if extra is not None:
@@ -115,7 +131,7 @@ async def test_original_admission_readiness_and_approval_use_real_recovery_query
             result = await approve()
             assert result.status is (RunStatus.QUEUED if entrypoint == 'enqueue' else RunStatus.RUNNING)
             assert len(added) == (1 if entrypoint == 'enqueue' else 0) and len(upserts) == 1
-        elif entrypoint == 'enqueue' or phase == 'captured':
+        elif entrypoint == 'enqueue' or phase in {'captured', 'required_true'}:
             before = deepcopy((row.status, row.version, row.routing_decision))
             with pytest.raises(RunConflict):
                 await approve()
