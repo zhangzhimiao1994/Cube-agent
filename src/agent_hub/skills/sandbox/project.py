@@ -396,18 +396,30 @@ def _systemd_supported() -> bool:
     return sys.platform == "linux"
 
 
+def _private_project_runtime(path: Path) -> None:
+    from agent_hub.skills.sandbox.project_contract_broker import _root
+
+    try:
+        with contextlib.ExitStack() as stack:
+            _root(path, 0, stack, [], stage=True)
+    except (OSError, ValueError, RuntimeError):
+        raise RuntimeError('project_private_runtime_unavailable') from None
+
+
 class ProjectExecutionBroker:
-    def __init__(self, policy: BrokerPolicy, slots: asyncio.Semaphore | None = None) -> None:
+    def __init__(self, policy: BrokerPolicy, slots: asyncio.Semaphore | None = None,
+                 *, retained_runtime_roots: tuple[Path, ...] = ()) -> None:
         self.policy = policy
+        self.retained_runtime_roots = retained_runtime_roots
         self.slots = slots if slots is not None else asyncio.Semaphore(8)
         self.executions: dict[str, _Execution] = {}
         self._cancelled_ids: set[str] = set()
 
     def _retained(self, execution_id: str) -> bool:
-        return self.policy.runtime_root.exists() and any(
+        return any(root.exists() and any(
             path.parent.name.rsplit("-", 1)[0] == execution_id
-            for path in self.policy.runtime_root.glob(f"{execution_id}-*/execution.json")
-        )
+            for path in root.glob(f"{execution_id}-*/execution.json")
+        ) for root in (self.policy.runtime_root, *self.retained_runtime_roots))
 
     async def handle(
         self,
@@ -449,7 +461,7 @@ class ProjectExecutionBroker:
                 async with asyncio.timeout_at(deadline):
                     await self.slots.acquire()
                     job.slot_acquired = True
-                    _directory(self.policy.runtime_root)
+                    _private_project_runtime(self.policy.runtime_root)
                     job.stage = Path(
                         tempfile.mkdtemp(
                             prefix=f"{invocation.execution_id}-",

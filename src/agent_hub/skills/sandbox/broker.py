@@ -16,7 +16,7 @@ import tempfile
 import textwrap
 import uuid
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Literal, cast
 
@@ -115,6 +115,7 @@ class BrokerPolicy:
     systemctl: str = "/usr/bin/systemctl"
     docker: str = "/usr/bin/docker"
     runtime_root: Path = Path("/run/agent-hub")
+    project_runtime_root: Path = Path("/run/agent-hub-project")
     read_only_roots: tuple[Path, ...] = (
         Path("/var/lib/agent-hub/attachments"),
         Path("/var/lib/agent-hub/workspaces"),
@@ -316,7 +317,10 @@ class SkillBroker:
         self._policy = policy
         self._processes: dict[str, asyncio.subprocess.Process] = {}
         self._execution_slots = asyncio.Semaphore(8)
-        self._project_broker = ProjectExecutionBroker(policy, self._execution_slots)
+        self._project_broker = ProjectExecutionBroker(
+            replace(policy, runtime_root=policy.project_runtime_root), self._execution_slots,
+            retained_runtime_roots=(policy.runtime_root,),
+        )
 
     async def handle_project(
         self, request: ProjectBrokerRequest | ContractProjectBrokerRequest | ProjectTerminateRequest, *, peer_uid: int,

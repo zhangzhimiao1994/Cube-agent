@@ -22,14 +22,29 @@ from agent_hub.skills.sandbox.broker import BrokerPolicy, BrokerRequest, SkillBr
 
 
 @pytest.fixture
-def project() -> ModuleType:
+def project(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
     name = "agent_hub.skills.sandbox.project"
     assert importlib.util.find_spec(name) is not None, "project execution layer is missing"
-    return importlib.import_module(name)
+    module = importlib.import_module(name)
+    # These protocol/lifecycle tests use user-owned temp dirs. Ownership and
+    # rename denial are checked separately with real Linux root/service UIDs.
+    monkeypatch.setattr(module, '_private_project_runtime', module._directory, raising=False)
+    return module
 
 
 def test_project_execution_layer_exists() -> None:
     assert importlib.util.find_spec("agent_hub.skills.sandbox.project") is not None
+
+
+def test_default_project_runtime_has_root_private_native_provisioning() -> None:
+    policy = BrokerPolicy()
+    assert policy.project_runtime_root == Path('/run/agent-hub-project')
+    assert policy.project_runtime_root != policy.runtime_root
+    root = Path(__file__).resolve().parents[4]
+    declarations = (root / 'deploy/native/agent-hub.tmpfiles').read_text().splitlines()
+    assert 'd /run/agent-hub-project 0700 root root -' in declarations
+    unit = (root / 'deploy/native/systemd/agent-hub-skill-broker.service').read_text()
+    assert 'ReadWritePaths=/run/agent-hub /run/agent-hub-project\n' in unit
 
 
 def invocation(project: ModuleType, **changes: Any) -> Any:
@@ -415,7 +430,8 @@ def configured(project: ModuleType, tmp_path: Path) -> tuple[Any, Any]:
     source_tree(root, inv)
     runtime = tmp_path / "runtime"
     runtime.mkdir()
-    broker = SkillBroker(BrokerPolicy(project_workspace_root=root, runtime_root=runtime))
+    broker = SkillBroker(BrokerPolicy(project_workspace_root=root,
+        runtime_root=tmp_path / 'skill-runtime', project_runtime_root=runtime))
     return inv, broker
 
 
@@ -817,3 +833,57 @@ async def test_serve_client_dispatches_only_explicit_v2_and_closes_cancelled_run
     response = json.loads(writer.data[4:])
     assert not response["ok"]
     assert writer.closed
+
+
+async def test_v3_socket_uses_separate_private_project_runtime_for_original_staging(
+    project: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agent_hub.skills.sandbox import broker as module
+    from agent_hub.skills.sandbox import project_contract_broker
+
+    runtime = tmp_path / 'service-runtime'
+    runtime.mkdir()
+    policy = BrokerPolicy(runtime_root=tmp_path / 'service-runtime', project_runtime_root=runtime,
+        project_workspace_root=tmp_path / 'workspaces')
+    broker = SkillBroker(policy)
+    inv = project.ContractProjectInvocation.model_validate({
+        **invocation(project).model_dump(), 'source_kind': 'original',
+        'original_reference': {'schema_version': 1, 'contract_sha256': 'a' * 64,
+            'input_source_sha256': 'b' * 64, 'file_count': 2},
+    }, strict=True)
+    calls: list[Path] = []
+
+    def stage(*args: object, **kwargs: Any) -> Any:
+        assert kwargs['stage'].parent == policy.project_runtime_root
+        assert kwargs['allowed_uid'] == policy.allowed_uid
+        calls.append(kwargs['stage'].parent)
+        raise RuntimeError('trusted_runtime_forwarded')
+
+    monkeypatch.setattr(project_contract_broker, 'stage_original_contract', stage)
+    monkeypatch.setattr(project, '_systemd_supported', lambda: True)
+    monkeypatch.setattr(module, '_peer_uid', lambda writer: policy.allowed_uid)
+    reader, writer = asyncio.StreamReader(), FrameWriter()
+    body = project.ContractProjectBrokerRequest(invocation=inv).model_dump_json().encode()
+    reader.feed_data(len(body).to_bytes(4) + body)
+    reader.feed_eof()
+    await module._serve_client(reader, cast(asyncio.StreamWriter, writer), broker)
+    assert calls == [runtime]
+    assert json.loads(writer.data[4:]) == {'ok': False, 'error': 'trusted_runtime_forwarded', 'result': None}
+    assert writer.closed and list(runtime.iterdir()) == []
+
+
+async def test_project_runtime_move_keeps_legacy_unknown_stages_nonreplayable(
+    project: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(project, '_systemd_supported', lambda: True)
+    runtime, legacy = tmp_path / 'private', tmp_path / 'legacy'
+    runtime.mkdir()
+    retained = legacy / 'project_1-retained'
+    retained.mkdir(parents=True)
+    marker = retained / 'execution.json'
+    marker.write_bytes(b'{"state":"UNKNOWN"}')
+    before = marker.read_bytes()
+    broker = SkillBroker(BrokerPolicy(runtime_root=legacy, project_runtime_root=runtime))
+    result = await broker.handle_project(project.ProjectBrokerRequest(invocation=invocation(project)), peer_uid=10001)
+    assert result.ok is False and result.error == 'duplicate project execution_id: retained stage'
+    assert marker.read_bytes() == before and list(runtime.iterdir()) == []
