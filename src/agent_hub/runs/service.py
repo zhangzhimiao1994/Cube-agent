@@ -47,7 +47,6 @@ from agent_hub.runs.conversation_queue import (
 )
 from agent_hub.runs.conversations import ConversationArchived, ConversationRecord
 from agent_hub.runs.observer import ObserverDecision, ObserverPolicy, RunMonitor
-from agent_hub.runs.project_inputs import OriginalProjectApprovalPending
 from agent_hub.runs.repository import (
     RunAlreadyActive,
     RunConflict,
@@ -2197,6 +2196,8 @@ class RunService:
                     "project_input" in context.routing_decision
                     or "project_input_contract_version" in context.routing_decision
                 ):
+                    from agent_hub.runs.project_inputs import OriginalProjectApprovalPending
+
                     try:
                         project_preparation_task = asyncio.create_task(
                             self._prepare_original_project_context(context)
