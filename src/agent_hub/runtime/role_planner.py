@@ -972,6 +972,23 @@ _ROLE_TRIGGER_KEYWORDS: Mapping[str, tuple[str, ...]] = MappingProxyType(
 )
 
 
+_SOFTWARE_CONTENT_ROLE_INTENT: Mapping[str, re.Pattern[str]] = MappingProxyType({
+    'copywriter': re.compile(
+        r'\b(?:write|draft|generate|create|produce|compose|craft|rewrite)\b[^.;!?\n]{0,80}'
+        r'\b(?:(?:marketing|sales|ad|advertising|website|homepage|ui)\s+copy|'
+        r'(?:video|advertising|marketing|ad)\s+script|screenplay|slogan)\b|'
+        r'(?:编写|撰写|生成|制作|创作|改写|写)[^。；！？\n]{0,40}(?:文案|口播|广告脚本|营销脚本|短剧脚本|短视频脚本)',
+        re.IGNORECASE,
+    ),
+    'content_editor': re.compile(
+        r'\b(?:edit|copyedit|proofread|polish|rewrite|revise)\b[^.;!?\n]{0,80}'
+        r'\b(?:copy|text|article|content|prose|documentation|readme|grammar)\b|'
+        r'(?:润色|校对|改写|编辑)[^。；！？\n]{0,40}(?:文案|文章|口播|文稿)',
+        re.IGNORECASE,
+    ),
+})
+
+
 def _role_matches_task(spec: _RoleSpec, request: RolePlanningRequest) -> bool:
     role_id, role, _purpose, mission, must_answer, _tools, _forbidden, skills, _schema = spec
     requested = set(request.requested_skills)
@@ -980,6 +997,12 @@ def _role_matches_task(spec: _RoleSpec, request: RolePlanningRequest) -> bool:
     if requested and requested.intersection(skills):
         return True
     task = request.task.casefold()
+    # In software tasks, script/copy/edit/prompt are also programming terms.
+    # Explicit skills above and unambiguous content requests remain discoverable.
+    if TaskProfile.SOFTWARE in request.profiles and role_id in _SOFTWARE_CONTENT_ROLE_INTENT:
+        terms = (role_id.replace('_', ' '), role, *(skill for skill in skills if skill != 'editing'))
+        return (any(_task_contains_keyword(task, keyword) for keyword in terms)
+            or _SOFTWARE_CONTENT_ROLE_INTENT[role_id].search(task) is not None)
     haystack = " ".join(
         (role_id, role, mission, " ".join(must_answer), " ".join(skills))
     ).casefold()
