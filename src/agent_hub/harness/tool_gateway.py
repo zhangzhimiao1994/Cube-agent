@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import re
 from collections.abc import Mapping
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 from uuid import UUID
 
 from agent_hub.auth.models import Role
@@ -14,6 +14,9 @@ from agent_hub.capabilities.project_verification import ProjectVerificationFailu
 from agent_hub.capabilities.runtime import RuntimeCapabilityError
 from agent_hub.capabilities.types import CapabilityRequest
 from agent_hub.harness.types import HarnessToolCallRequest, HarnessToolCallResult, JsonValue
+
+if TYPE_CHECKING:
+    from agent_hub.skills.sandbox.python_input_supply_protocol import PythonInputSupplyPlan
 
 type MutableJson = None | bool | int | float | str | list["MutableJson"] | dict[str, "MutableJson"]
 
@@ -142,6 +145,34 @@ class HarnessToolGateway:
             payload={"authorized": True},
         )
 
+    async def authorize_project_inputs(
+        self, tenant_id: UUID, request: HarnessToolCallRequest, *, user_id: UUID,
+        role: Role, plan: PythonInputSupplyPlan,
+    ) -> HarnessToolCallResult:
+        """Trusted pre-model admission only; intentionally not a model tool."""
+        from agent_hub.capabilities.python_input_preparation import input_supply_request
+
+        if (request.tool_name != 'project.prepare_inputs' or request.actor != 'main_agent'
+                or request.arguments or request.sandbox != 'workspace_write'
+                or _uses_external_envelope(request)):
+            return self._failure(request, 'tool permission mapping unavailable')
+        if type(user_id) is not UUID or not isinstance(role, Role) or self._policy_gateway is None:
+            return self._failure(request, 'capability identity unavailable')
+        try:
+            admission = input_supply_request(plan, user_id=user_id, idempotency_key=request.idempotency_key)
+            if admission.tenant_id != tenant_id or admission.run_id != request.run_id:
+                return self._failure(request, 'capability denied')
+            result = await self._policy_gateway.invoke(admission, role=role)
+        except Exception:  # noqa: BLE001 - no private plan/catalog errors in public admission.
+            return self._failure(request, 'capability authorization unavailable')
+        if result.status is CapabilityStatus.ALLOWED:
+            return HarnessToolCallResult(call_id=request.call_id, tool_name=request.tool_name,
+                status='succeeded', payload={'authorized': True})
+        payload: Mapping[str, JsonValue] = {}
+        if result.status is CapabilityStatus.WAITING_APPROVAL and result.approval_id is not None:
+            payload = {'approval_id': result.approval_id}
+        return self._failure(request, result.reason or _capability_failure_reason(result.status), payload=payload)
+
     async def invoke(
         self,
         tenant_id: UUID,
@@ -152,6 +183,8 @@ class HarnessToolGateway:
     ) -> HarnessToolCallResult:
         if not isinstance(request, HarnessToolCallRequest):
             raise TypeError("request must be HarnessToolCallRequest")
+        if request.tool_name == 'project.prepare_inputs':
+            return self._failure(request, 'tool permission mapping unavailable')
         policy_mapping_failure = _builtin_policy_mapping_failure(request)
         if policy_mapping_failure is not None:
             return self._failure(request, policy_mapping_failure)

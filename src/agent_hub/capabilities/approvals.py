@@ -378,7 +378,8 @@ def capability_approval_scope(request: CapabilityRequest) -> str | None:
     if (
         request.capability == "command" and request.operation == "run"
         and normalized_resource is not None
-        and re.fullmatch(r"workspace/current/project-verification/python/[a-f0-9]{64}", normalized_resource)
+        and re.fullmatch(r"workspace/current/(?:project-verification|project-inputs)/python/[a-f0-9]{64}",
+                         normalized_resource)
     ):
         return _run_capability_scope(request, normalized_resource)
     if (

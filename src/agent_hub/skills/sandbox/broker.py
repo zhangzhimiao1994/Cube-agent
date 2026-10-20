@@ -36,6 +36,10 @@ from agent_hub.skills.sandbox.project import (
 )
 
 if TYPE_CHECKING:
+    from agent_hub.skills.sandbox.python_input_supply_protocol import (
+        PythonInputSupplyRequest,
+        PythonInputSupplyResponse,
+    )
     from agent_hub.skills.sandbox.python_project_protocol import (
         PythonProjectBrokerRequest,
         PythonProjectBrokerResponse,
@@ -345,6 +349,13 @@ class SkillBroker:
 
         return await handle_python_project(self._project_broker, request, peer_uid=peer_uid)
 
+    async def handle_input_supply(
+        self, request: PythonInputSupplyRequest, *, peer_uid: int,
+    ) -> PythonInputSupplyResponse:
+        from agent_hub.skills.sandbox.python_input_supply_broker import handle_input_supply
+
+        return await handle_input_supply(self._project_broker, request, peer_uid=peer_uid)
+
     async def handle(self, request: BrokerRequest, *, peer_uid: int) -> BrokerResponse:
         try:
             validated = validate_broker_request(request, peer_uid=peer_uid, policy=self._policy)
@@ -547,6 +558,10 @@ async def _serve_client(
     writer: asyncio.StreamWriter,
     broker: SystemdBroker,
 ) -> None:
+    from agent_hub.skills.sandbox.python_input_supply_protocol import (
+        PythonInputSupplyRequest,
+        PythonInputSupplyResponse,
+    )
     from agent_hub.skills.sandbox.python_project_protocol import (
         PythonProjectBrokerRequest,
         PythonProjectBrokerResponse,
@@ -556,13 +571,25 @@ async def _serve_client(
     )
 
     is_project = False
+    is_supply = False
+    supply_request: PythonInputSupplyRequest | None = None
     python_request: PythonProjectBrokerRequest | PythonProjectProbeRequest | PythonProjectInspectEnvironmentRequest | PythonProjectReleaseEnvironmentRequest | None = None
-    response: BrokerResponse | PythonProjectBrokerResponse
+    response: BrokerResponse | PythonProjectBrokerResponse | PythonInputSupplyResponse
     try:
         peer_uid = _peer_uid(writer)
         payload = await _read_frame(reader, _MAX_REQUEST_BYTES)
         envelope = json.loads(payload)
-        if isinstance(envelope, dict) and type(envelope.get("version")) is int and envelope["version"] == 4:
+        if isinstance(envelope, dict) and (
+            type(envelope.get("version")) is int and envelope["version"] == 5
+            or isinstance(envelope.get("action"), str) and envelope["action"] in {
+                "plan_python_project_inputs", "supply_python_project_inputs",
+                "inspect_python_project_input_supply",
+            }
+        ):
+            is_project = is_supply = True
+            supply_request = PythonInputSupplyRequest.model_validate_json(payload, strict=True)
+            response = await broker.handle_input_supply(supply_request, peer_uid=peer_uid)
+        elif isinstance(envelope, dict) and type(envelope.get("version")) is int and envelope["version"] == 4:
             is_project = True
             action = envelope.get("action")
             if action == "run_python_project":
@@ -598,13 +625,23 @@ async def _serve_client(
             await writer.wait_closed()
             raise
         response = (
+            PythonInputSupplyResponse(action=supply_request.action,
+                execution_id=supply_request.invocation.execution_id, ok=False,
+                error="input_supply_unavailable")
+            if supply_request is not None else
             PythonProjectBrokerResponse(action=python_request.action,
                 execution_id=python_request.invocation.execution_id, ok=False,
                 error="python_project_execution_unavailable")
             if python_request is not None else BrokerResponse(ok=False, error="project execution cancelled")
         )
     except (BrokerRequestError, OSError, ValueError) as error:
-        response = BrokerResponse(ok=False, error=str(error))
+        if supply_request is not None:
+            response = PythonInputSupplyResponse(action=supply_request.action,
+                execution_id=supply_request.invocation.execution_id, ok=False,
+                error="input_supply_unavailable")
+        else:
+            response = BrokerResponse(ok=False,
+                error="input_supply_request_invalid" if is_supply else str(error))
     try:
         await _write_frame(writer, response.model_dump_json().encode("utf-8"))
     finally:

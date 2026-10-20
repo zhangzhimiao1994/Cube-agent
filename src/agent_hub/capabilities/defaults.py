@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol, cast
 from uuid import UUID
@@ -79,7 +80,9 @@ class DefaultRuntimeCapabilityPolicyGateway:
     ) -> CapabilityResult:
         approval_required = await self._tool_approval_required(request.tenant_id)
         extra_rules = self._extra_policy_rules(request)
-        project_effect = await _project_verification_effect(self._run_repository, request)
+        project_effect = await _project_input_supply_effect(self._run_repository, request, role=role)
+        if project_effect is None:
+            project_effect = await _project_verification_effect(self._run_repository, request)
         if project_effect in {PolicyEffect.DENY, PolicyEffect.REQUIRE_APPROVAL}:
             extra_rules = (*extra_rules, CapabilityRule(
                 tenant_id=request.tenant_id, role=role, agent_id=request.agent_id,
@@ -343,6 +346,34 @@ async def _project_verification_effect(
             return PolicyEffect.DENY
         return PolicyEffect.ALLOW if "network.read" in permissions else PolicyEffect.REQUIRE_APPROVAL
     except Exception:  # noqa: BLE001 - missing authority cannot enable project execution.
+        return PolicyEffect.DENY
+
+
+async def _project_input_supply_effect(
+    repository: object, request: CapabilityRequest, *, role: Role,
+) -> PolicyEffect | None:
+    if not request.resource.startswith('workspace/current/project-inputs'):
+        return None
+    try:
+        from agent_hub.capabilities.python_input_preparation import input_supply_binding
+        from agent_hub.domain.runs import RunStatus
+
+        getter = getattr(repository, 'get', None)
+        if not callable(getter):
+            return PolicyEffect.DENY
+        record = await getter(request.tenant_id, request.run_id)
+        expected = input_supply_binding(record, planned=True)
+        expiry = getattr(record, 'worker_lease_expires_at', None)
+        actual_role = getattr(record, 'actor_role', None)
+        if (not isinstance(actual_role, str) or Role(actual_role) is not role
+                or getattr(record, 'status', None) is not RunStatus.RUNNING
+                or not getattr(record, 'worker_id', None)
+                or getattr(record, 'worker_lease_token', None) is None
+                or not isinstance(expiry, datetime) or expiry <= datetime.now(UTC)
+                or request.model_copy(update={'idempotency_key': expected.idempotency_key}) != expected):
+            return PolicyEffect.DENY
+        return PolicyEffect.REQUIRE_APPROVAL
+    except Exception:  # noqa: BLE001 - malformed/missing DB authority never becomes a supply grant.
         return PolicyEffect.DENY
 
 

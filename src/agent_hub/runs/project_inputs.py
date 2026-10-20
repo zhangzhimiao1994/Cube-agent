@@ -9,7 +9,7 @@ import re
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
-from typing import cast
+from typing import TYPE_CHECKING, cast
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from agent_hub.auth.models import Role
@@ -44,6 +44,9 @@ from agent_hub.runs.repository import (
 from agent_hub.runtime.contracts import Artifact, JsonValue, TaskContext, _freeze_object
 from agent_hub.skills.sandbox.project import ProjectInvocation
 
+if TYPE_CHECKING:
+    from agent_hub.capabilities.python_input_preparation import InputSupplyClient
+
 _FAILURE = 'original project preparation is unavailable or changed'
 _SCOPE_KEYS = ('project_id', 'workspace_session_id', 'sandbox_profile', 'requested_permissions',
                'execution_backend', 'project_input_contract_version', 'project_input')
@@ -52,12 +55,15 @@ _SCOPE_KEYS = ('project_id', 'workspace_session_id', 'sandbox_profile', 'request
 class OriginalProjectApprovalPending(RuntimeError):
     """Captured inputs are durable; no model or project command has started."""
 
-    def __init__(self, approval_id: str, preparation: Mapping[str, JsonValue]) -> None:
+    def __init__(self, approval_id: str, preparation: Mapping[str, JsonValue], *,
+                 supply_binding: Mapping[str, JsonValue] | None = None) -> None:
         super().__init__('original project preparation authorization pending')
         if re.fullmatch(r'approval_[a-zA-Z0-9_-]{1,100}', approval_id) is None:
             raise ValueError(_FAILURE)
         self.approval_id = approval_id
         self.preparation = _freeze_object(preparation, name='original project approval capture')
+        self.supply_binding = None if supply_binding is None else _freeze_object(
+            supply_binding, name='original input supply approval')
 
     def matches(self, record: RunRecord, context: TaskContext) -> bool:
         route = record.routing_decision
@@ -78,7 +84,17 @@ class OriginalProjectApprovalPending(RuntimeError):
                                       name='original scope')):
             return False
         resource = 'workspace/current/project-verification'
-        if self.preparation['schema_version'] == 2:
+        if self.supply_binding is not None:
+            try:
+                from agent_hub.capabilities.python_input_preparation import input_supply_binding
+
+                if (_freeze_object(route.get('python_input_supply'), name='input supply state')
+                        != self.supply_binding):
+                    return False
+                resource = input_supply_binding(record, planned=True).resource
+            except (ValueError, TypeError, RuntimeError):
+                return False
+        elif self.preparation['schema_version'] == 2:
             marker = cast(Mapping[str, JsonValue], self.preparation['python_recipe'])
             resource += '/python/' + cast(str, marker['recipe_sha256'])
         expected_scope = (
@@ -160,13 +176,17 @@ def python_original_context_metadata(context: PythonOriginalContext) -> Mapping[
 
 class OriginalProjectPreparer:
     def __init__(self, *, root: Path, repository: RunRepository,
-                 authorizer: HarnessToolGateway, verifier: ProjectVerificationService) -> None:
+                 authorizer: HarnessToolGateway, verifier: ProjectVerificationService,
+                 input_supply: InputSupplyClient | None = None) -> None:
         self.root, self.repository = root, repository
         self.authorizer, self.verifier = authorizer, verifier
+        self.input_supply = input_supply
 
     async def _state(
         self, context: TaskContext, *, expected: Mapping[str, JsonValue] | None = None,
         replace: Mapping[str, JsonValue] | None = None,
+        supply: bool = False, preparation: Mapping[str, JsonValue] | None = None,
+        supply_binding: Mapping[str, JsonValue] | None = None,
     ) -> Mapping[str, JsonValue] | None:
         async with await self.repository.run_transaction() as session, session.begin():
             row = await self.repository.get_for_update(session, context.run_id)
@@ -193,16 +213,28 @@ class OriginalProjectPreparer:
                         cast(tuple[str, ...], route['requested_permissions']))
                     or not project or not session_id):
                 raise RuntimeError(_FAILURE)
-            state = route.get('project_input_preparation')
+            if (supply and route.get('project_input_preparation') != preparation
+                    or supply_binding is not None and route.get('python_input_supply') != supply_binding):
+                raise RunConflict(_FAILURE)
+            key = 'python_input_supply' if supply else 'project_input_preparation'
+            state = route.get(key)
             if state is not None and not isinstance(state, Mapping):
                 raise RuntimeError(_FAILURE)
+            if supply and state is not None:
+                from agent_hub.capabilities.python_input_preparation import input_supply_binding
+
+                input_supply_binding(record)
             if replace is not None:
                 if state != expected:
                     raise RunConflict(_FAILURE)
                 replacement = _freeze_object(replace, name='original project preparation')
+                if supply:
+                    from agent_hub.capabilities.python_input_preparation import supply_state_plan
+
+                    supply_state_plan(replacement)
                 row.routing_decision = {
                     **(record.routing_decision or {}),
-                    'project_input_preparation': json.loads(_encoded(replacement)),
+                    key: json.loads(_encoded(replacement)),
                 }
                 row.version += 1
                 return replacement
@@ -240,20 +272,94 @@ class OriginalProjectPreparer:
         if stored.contract.editable_paths != selection.editable_paths:
             raise RuntimeError(_FAILURE)
         python_inputs: PythonProjectInputs | None = None
+        supply_state = await self._state(context, supply=True, preparation=state)
         if state['schema_version'] == 1 and state['phase'] == 'captured' and 'pyproject.toml' in stored.source_files:
+            # Local imports preserve cold entry ordering; these are trusted pre-model APIs.
+            from agent_hub.capabilities.project_verification import ProjectVerificationError
+            from agent_hub.capabilities.python_input_preparation import supply_python_inputs
+            from agent_hub.skills.sandbox.python_project_protocol import (
+                PythonProjectProbeInvocation,
+            )
+
             probe_invocation = ProjectInvocation.model_validate({
                 **invocation.model_dump(), 'execution_id': 'python_probe_' + uuid4().hex,
                 'install_allowed': False,
             }, strict=True)
-            python_inputs = await self.verifier.prepare_python_original(invocation=probe_invocation, reference=reference)
+            missing = supply_state is not None
+            if supply_state is None:
+                try:
+                    python_inputs = await self.verifier.prepare_python_original(
+                        invocation=probe_invocation, reference=reference)
+                except ProjectVerificationError as error:
+                    if type(error) is not ProjectVerificationError or str(error) != 'python_project_wheel_missing':
+                        raise
+                    missing = True
+            if python_inputs is None and missing:
+                captured_state = state
+
+                async def state_io(*, expected: Mapping[str, JsonValue] | None = None,
+                                   replace: Mapping[str, JsonValue] | None = None) -> Mapping[str, JsonValue] | None:
+                    return await self._state(context, expected=expected, replace=replace,
+                                             supply=True, preparation=captured_state)
+
+                async def authorize_inputs(plan: object, binding: Mapping[str, JsonValue]) -> None:
+                    from agent_hub.skills.sandbox.python_input_supply_protocol import (
+                        PythonInputSupplyPlan,
+                    )
+
+                    assert type(plan) is PythonInputSupplyPlan
+                    request = HarnessToolCallRequest(run_id=context.run_id, actor='main_agent',
+                        tool_name='project.prepare_inputs', arguments={}, approval_required=True,
+                        sandbox='workspace_write', idempotency_key='input-supply-' + plan.sha256)
+                    assert context.actor_id is not None and context.actor_role is not None
+                    allowed = await self.authorizer.authorize_project_inputs(context.tenant_id,
+                        request, user_id=context.actor_id, role=context.actor_role, plan=plan)
+                    if (allowed.status == 'failed' and not allowed.truncated
+                            and allowed.call_id == request.call_id and allowed.tool_name == request.tool_name
+                            and allowed.failure_reason == 'capability requires approval'
+                            and set(allowed.payload) == {'approval_id'}
+                            and isinstance(allowed.payload['approval_id'], str)):
+                        raise OriginalProjectApprovalPending(allowed.payload['approval_id'], captured_state,
+                                                             supply_binding=binding)
+                    if (allowed.status != 'succeeded' or allowed.truncated
+                            or allowed.call_id != request.call_id or allowed.tool_name != request.tool_name
+                            or allowed.payload != {'authorized': True}):
+                        raise RuntimeError('original project preparation authorization required or denied')
+
+                if self.input_supply is None:
+                    from agent_hub.skills.sandbox.python_input_supply_client import (
+                        PythonInputSupplySandbox,
+                    )
+
+                    self.input_supply = PythonInputSupplySandbox()
+                supply_state = await supply_python_inputs(client=self.input_supply,
+                    invocation=PythonProjectProbeInvocation.model_validate({**probe_invocation.model_dump(),
+                        'original_reference': reference.to_payload()}, strict=True), stored=stored,
+                    state_io=state_io, authorize=authorize_inputs, deadline=started + context.timeout_seconds)
+                probe_invocation = ProjectInvocation.model_validate({**probe_invocation.model_dump(),
+                    'execution_id': 'python_probe_' + uuid4().hex}, strict=True)
+                python_inputs = await self.verifier.prepare_python_original(
+                    invocation=probe_invocation, reference=reference)
+                if await state_io() != supply_state or python_inputs is None:
+                    raise RuntimeError(_FAILURE)
             if python_inputs is not None:
+                if supply_state is not None:
+                    from agent_hub.capabilities.python_input_preparation import (
+                        require_supplied_recipe,
+                    )
+
+                    require_supplied_recipe(supply_state, python_inputs)
                 state = await self._state(context, expected=state, replace={
                     **state, 'schema_version': 2, 'python_recipe': python_recipe_marker(python_inputs),
-                })
+                }, supply_binding=supply_state)
                 assert state is not None
         if state['schema_version'] == 2:
             python_inputs = await asyncio.to_thread(load_python_original_inputs, self.root,
                 invocation, reference, state.get('python_recipe'))
+        if supply_state is not None and python_inputs is not None:
+            from agent_hub.capabilities.python_input_preparation import require_supplied_recipe
+
+            require_supplied_recipe(supply_state, python_inputs)
 
         def validate_observation(value: object) -> Mapping[str, JsonValue]:
             # This is a historical validation expectation, not installation authority.
@@ -285,7 +391,7 @@ class OriginalProjectPreparer:
                 raise RuntimeError('original project preparation authorization required or denied')
             state = await self._state(context, expected=state, replace={
                 **state, 'phase': 'executing', 'execution_id': invocation.execution_id,
-            })
+            }, supply_binding=supply_state)
             observation = await self.verifier.observe_original(
                 tenant_id=context.tenant_id, run_id=context.run_id, actor='main_agent', reference=reference,
                 execution_id=invocation.execution_id,
@@ -295,7 +401,7 @@ class OriginalProjectPreparer:
             state = await self._state(context, expected=state, replace={
                 **(state or {}), 'phase': 'observed', 'observation': observation,
                 'observation_sha256': hashlib.sha256(_encoded(observation)).hexdigest(),
-            })
+            }, supply_binding=supply_state)
         assert state is not None
         saved_observation = state.get('observation')
         if (not isinstance(saved_observation, Mapping)
@@ -326,6 +432,18 @@ class OriginalProjectPreparer:
                                 'explicit editable paths. Original checks and configuration must remain unchanged. '
                                 'Re-run project.verify after repair, then deliver with workspace.bundle.'})
         artifacts = (*context.artifacts, artifact)
+        if supply_state is not None:
+            from agent_hub.capabilities.python_input_preparation import supply_state_plan
+
+            supply_state_plan(supply_state)
+            if supply_state.get('phase') != 'supplied':
+                raise RuntimeError(_FAILURE)
+            artifacts = (*artifacts, Artifact(
+                id=uuid5(NAMESPACE_URL, f'python-input-supply:{context.tenant_id}:{context.run_id}:'
+                         f'{supply_state["plan_sha256"]}'), type='python_project_input_supply',
+                producer='original_project_preparer', content={
+                    'schema_version': 1, 'kind': 'published_inputs_not_installation',
+                    'plan_sha256': supply_state['plan_sha256'], 'receipt': supply_state['receipt']}))
         history_route: Mapping[str, JsonValue] = {}
         if python_inputs is not None:
             from agent_hub.runtime.python_project_history import HISTORY_KEY, build_python_history
@@ -344,6 +462,7 @@ class OriginalProjectPreparer:
             artifacts = (*artifacts, metadata)
             history_route = {HISTORY_KEY: build_python_history(trusted, artifact)}
         return context.model_copy(update={
-            'routing_decision': {**route, 'project_input_preparation': state, **history_route},
+            'routing_decision': {**route, 'project_input_preparation': state, **history_route,
+                                **({'python_input_supply': supply_state} if supply_state is not None else {})},
             'artifacts': artifacts,
         }).validated_internal_clone()

@@ -57,6 +57,7 @@ def _optional_database_uuid(value: UUID | None) -> UUID | None:
 
 class _PythonApprovalOptions(TypedDict, total=False):
     python_binding: dict[str, object]
+    python_input_binding: dict[str, object]
 
 
 def _pre_model_original_capture(route: Mapping[str, object]) -> bool:
@@ -152,6 +153,23 @@ def _python_project_approval_binding(run: RunRow, approval_scope: object) -> dic
     if type(approval_scope) is not str or approval_scope != expected_scope:
         return None
     return {**marker, 'project_id': project, 'workspace_session_id': workspace_session}
+
+
+def _python_input_supply_approval_binding(run: RunRow, approval_scope: object) -> dict[str, object] | None:
+    if (type(approval_scope) is not str
+            or ':capability=command:operation=run:resource=workspace/current/project-inputs/python/'
+                not in approval_scope):
+        return None
+    try:
+        from agent_hub.capabilities.approvals import capability_approval_scope
+        from agent_hub.capabilities.python_input_preparation import input_supply_binding
+
+        request = input_supply_binding(run)
+        if capability_approval_scope(request) != approval_scope:
+            return None
+        return request.arguments
+    except (ValueError, TypeError, RuntimeError, LookupError):
+        return None
 
 
 _RECOVERY_REPLAYABLE_EVENT_KINDS = frozenset(
@@ -1483,6 +1501,12 @@ class RunRepository:
             python_options: _PythonApprovalOptions = {}
             if python_binding is not None:
                 python_options['python_binding'] = python_binding
+            input_binding = (
+                _python_input_supply_approval_binding(row, approval_scope)
+                if plugin_identity is None else None
+            )
+            if input_binding is not None:
+                python_options['python_input_binding'] = input_binding
             row.status = RunStatus.WAITING_APPROVAL.value
             self.clear_worker_lease(row)
             row.routing_decision = {
@@ -2451,6 +2475,7 @@ class RunRepository:
         status: str,
         public_binding: dict[str, object] | None = None,
         python_binding: dict[str, object] | None = None,
+        python_input_binding: dict[str, object] | None = None,
         request_version: int | None = None,
         resolution_version: int | None = None,
     ) -> None:
@@ -2462,6 +2487,7 @@ class RunRepository:
             **({"approval_scope": approval_scope} if approval_scope else {}),
             **({"public_binding": public_binding} if public_binding is not None else {}),
             **({'python_binding': python_binding} if python_binding is not None else {}),
+            **({'python_input_binding': python_input_binding} if python_input_binding is not None else {}),
         }
         if request_version is not None:
             payload["public_request"] = {
@@ -2739,7 +2765,16 @@ def _public_plugin_approval_events(
             raise RunConflict("pending capability approval evidence is stale")
         public_binding = dict(binding)
         python_binding = None
-        if 'public_binding' not in approval.payload and 'python_binding' in approval.payload:
+        if 'public_binding' not in approval.payload and 'python_input_binding' in approval.payload:
+            expected_supply = _python_input_supply_approval_binding(run, approval.payload.get('approval_scope'))
+            stored_supply = approval.payload['python_input_binding']
+            if expected_supply is not None and type(stored_supply) is dict and stored_supply == expected_supply:
+                public_binding.update({
+                    'capability': 'command', 'operation': 'run',
+                    'resource': 'workspace/current/project-inputs/python/' + cast(str, expected_supply['plan_sha256']),
+                    'approval_scope': approval.payload['approval_scope'],
+                })
+        elif 'public_binding' not in approval.payload and 'python_binding' in approval.payload:
             expected_python = _python_project_approval_binding(run, approval.payload.get('approval_scope'))
             stored_python = approval.payload['python_binding']
             if (expected_python is not None and type(stored_python) is dict
