@@ -48,6 +48,20 @@ def test_fetch_unit_has_no_project_cache_secret_or_broker_access():
     assert "PrivateNetwork=yes" not in command
     assert "agent_hub.skills.sandbox.python_input_fetch" in command and "--worker-batch" in command
     masked = next(item for item in command if item.startswith("InaccessiblePaths="))
-    for target in ("/var", "/run", "/etc/agent-hub", "/var/lib/workspaces", "/var/lib/wheels", "/var/lib/environments"):
-        assert target in masked.split("=", 1)[1].split()
+    assert masked == "InaccessiblePaths=/etc/agent-hub"
+    filesystems = next(item for item in command if item.startswith("TemporaryFileSystem="))
+    assert "/run:rw,nosuid,nodev,noexec,size=1048576,mode=0755" in filesystems
+    assert "/var:ro,nosuid,nodev,noexec,size=1048576" in filesystems
+    assert "/tmp:rw,nosuid,nodev,noexec,size=8388608" in filesystems
+    assert "PrivateTmp=no" in command and "BindReadOnlyPaths=/etc/resolv.conf" in command
     assert "-i" in command and "-I" in command and "-B" in command
+
+
+def test_fetch_still_masks_a_project_outside_empty_runtime_filesystems():
+    policy, config, supply = settings()
+    policy.project_workspace_root = Path("/srv/private-projects")
+    config.wheel_root = Path("/mnt/private-wheels")
+    command = build_fetch_command(invocation(), policy, configuration=config, supply=supply)
+    masked = next(item for item in command if item.startswith("InaccessiblePaths="))
+    assert set(masked.split("=", 1)[1].split()) == {
+        "/etc/agent-hub", "/srv/private-projects", "/mnt/private-wheels"}

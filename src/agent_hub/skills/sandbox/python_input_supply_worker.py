@@ -50,13 +50,19 @@ def build_fetch_command(
     invocation: PythonProjectProbeInvocation, policy: BrokerPolicy, *,
     configuration: RootConfig, supply: RootSupplyConfig,
 ) -> tuple[str, ...]:
-    masked = tuple(dict.fromkeys((Path("/var"), Path("/run"), Path("/etc/agent-hub"),
+    hidden_roots = (Path("/var"), Path("/run"), Path("/tmp"))
+    masked = tuple(p for p in dict.fromkeys((Path("/etc/agent-hub"),
         policy.project_workspace_root, configuration.environment_root,
-        configuration.wheel_root, supply.state_root)))
+        configuration.wheel_root, supply.state_root))
+        if not any(p.is_relative_to(root) for root in hidden_roots))
     properties = (
         "DynamicUser=yes", "SupplementaryGroups=" + policy.service_group,
         "UMask=0077", "NoNewPrivileges=yes", "ProtectSystem=strict", "ProtectHome=yes",
-        "PrivateTmp=yes", "PrivateDevices=yes", "ProtectProc=invisible", "ProcSubset=pid",
+        "PrivateTmp=no", "PrivateDevices=yes", "ProtectProc=invisible", "ProcSubset=pid",
+        # Empty filesystems hide host data without conflicting nested inaccessible mounts.
+        ("TemporaryFileSystem=/run:rw,nosuid,nodev,noexec,size=1048576,mode=0755 "
+         "/var:ro,nosuid,nodev,noexec,size=1048576 /tmp:rw,nosuid,nodev,noexec,size=8388608"),
+        "BindReadOnlyPaths=/etc/resolv.conf",
         "CapabilityBoundingSet=", "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK",
         "InaccessiblePaths=" + " ".join(_escaped(p) for p in masked),
         "ProtectKernelModules=yes", "ProtectKernelTunables=yes", "ProtectControlGroups=yes",
