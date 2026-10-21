@@ -12,6 +12,7 @@ from agent_hub.capabilities.tools.workspace_read import (
     read_tool_description,
     read_tool_input_schema,
 )
+from agent_hub.models.types import ToolDefinition
 
 
 def _contracts() -> ModuleType:
@@ -26,6 +27,17 @@ def _validator(name: str) -> Draft202012Validator:
     schema = json.loads(json.dumps(schema))
     Draft202012Validator.check_schema(schema)
     return Draft202012Validator(schema)
+
+
+@pytest.mark.parametrize('name', ['project.verify', 'project.inspect', 'calculator.evaluate', 'http.read',
+    'project.generate_zip', 'document.generate_docx', 'presentation.generate_pptx'])
+def test_builtin_descriptions_fit_real_model_tool_wire_contract(name: str) -> None:
+    contract = _contracts()
+    description = contract.builtin_tool_description(name)
+    parameters = contract.builtin_tool_input_schema(name)
+    assert isinstance(description, str) and parameters is not None
+    definition = ToolDefinition(name=name.replace('.', '_'), description=description, parameters=parameters)
+    assert definition.description == description
 
 
 @pytest.mark.parametrize(

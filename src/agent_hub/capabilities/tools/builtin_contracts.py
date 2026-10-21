@@ -53,17 +53,15 @@ def builtin_tool_description(name: str) -> str | None:
         return read_description
     if name == "project.verify":
         return (
-            "Install declared project dependencies under approved source/network policy, then "
-            "run build and test in an isolated disposable workspace. Takes no arguments. "
-            "Failed checks return evidence to diagnose and repair; rerun after changing source. "
-            "Requires command and dependency-install authorization; never claim delivery before success. "
-            "For a new generated project first write ACCEPTANCE.json: schema_version=1, stack=node or python, "
-            "editable_paths (implementation only), test_files, criteria=[{id:AC-001,description,tests:[exact test names]}]. "
-            "Use real node:test leaf titles for Node, or unittest IDs such as test_app.Case.test_feature for Python. "
-            "All declared acceptance tests must actually pass; skip/todo/echo are not success. "
-            "The first verification freezes the criteria and tests: repair implementations, never rewrite frozen standards. "
-            "Python uses project.inspect's actual python_build_profile catalog, src package layout, pinned pyproject.toml "
-            "and hashed requirements.lock; never invent wheel hashes or treat configured_not_probed as installed."
+            "Install approved dependencies, then build and test in isolation. No arguments. "
+            "Requires command/install authorization. Diagnose failures, repair source, then rerun before delivery. "
+            "New projects first write ACCEPTANCE.json: schema_version=1, stack=node|python, implementation-only "
+            "editable_paths, test_files, criteria=[{id:AC-001,description,tests:[exact test IDs]}]. "
+            "Use node:test leaf titles or unittest IDs such as test_app.Case.test_feature. "
+            "Every named test must pass; skip/todo/echo are not success. First verification freezes standards, "
+            "tests and controls; repair implementation without weakening them. "
+            "Python: inspect the actual python_build_profile catalog, use src layout, pinned pyproject.toml and "
+            "hashed requirements.lock. Never invent wheel hashes or treat configured_not_probed as installed."
         )
     if name == "project.inspect":
         return (
