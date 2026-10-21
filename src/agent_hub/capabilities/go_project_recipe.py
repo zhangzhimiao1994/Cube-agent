@@ -10,13 +10,14 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Literal, Self, cast
 
 from agent_hub.capabilities.project_stack_contracts import (
     GoDeclarationReason,
     ProjectStackContractError,
+    project_relative_path,
     validate_project_files,
 )
 
@@ -55,6 +56,28 @@ def _module_path(value: object) -> str:
           and all(part not in {".", ".."} and not part.startswith(".")
                   and not part.endswith(".") for part in path.split("/")))
     return path
+
+
+def validate_go_source_paths(paths: Sequence[str]) -> None:
+    """The same closed source-kind policy for originals and repaired candidates.
+
+    This is not Go build discovery. Even inactive native files/workspaces remain
+    unsupported by the first stdlib-only profile; callers must measure all paths.
+    """
+    _need(not isinstance(paths, (str, bytes)))
+    for value in paths:
+        try:
+            path = project_relative_path(value)
+        except ProjectStackContractError:
+            raise GoProjectRecipeError("go_declaration_invalid") from None
+        name = path.rsplit("/", 1)[-1]
+        folded = name.casefold()
+        _need(folded not in {"go.work", "go.work.sum"}, "go_workspace_unsupported")
+        if folded in {"go.mod", "go.sum"}:
+            _need(name == folded)
+            _need(path == name, "go_multiple_modules_unsupported")
+        _need("vendor" not in path.casefold().split("/"), "go_external_modules_unsupported")
+        _need(not folded.endswith(_NATIVE_SUFFIXES), "go_native_source_unsupported")
 
 
 def _go_string(token: str) -> str:
@@ -299,15 +322,7 @@ def parse_go_project_declaration(
             source_size += len(data)
     _need(control_size <= max_control_bytes and source_size <= max_source_bytes,
           "go_declaration_limit")
-    for path, data in snapshot.items():
-        name = path.rsplit("/", 1)[-1]
-        folded = name.casefold()
-        _need(folded not in {"go.work", "go.work.sum"}, "go_workspace_unsupported")
-        if folded in {"go.mod", "go.sum"}:
-            _need(name == folded)
-            _need(path == name, "go_multiple_modules_unsupported")
-        _need("vendor" not in path.casefold().split("/"), "go_external_modules_unsupported")
-        _need(not folded.endswith(_NATIVE_SUFFIXES), "go_native_source_unsupported")
+    validate_go_source_paths(tuple(snapshot))
     _need("go.mod" in snapshot, "go_manifest_missing")
     manifest = snapshot["go.mod"]
     _need(bool(manifest))

@@ -97,6 +97,29 @@ def test_native_helper_captures_patched_candidate_but_keeps_original_checks(proj
     assert view.ephemeral_dirs == ()
 
 
+def test_trusted_source_budgets_are_explicit_not_fixed_global_thresholds(project: dict[str, Any]) -> None:
+    module = helper()
+    actual = sum(file.stat().st_size for file in project["original"].rglob("*") if file.is_file())
+    for options in ({"source_file_limit": 3}, {"source_byte_limit": actual - 1}):
+        with pytest.raises(module.ContractMountError):
+            module.validate_contract_work(**arguments(project), **options)
+    view = module.validate_contract_work(**arguments(project), source_file_limit=4,
+        source_byte_limit=actual, source_timeout_seconds=30)
+    assert len(view.readonly_paths) == 4
+
+
+@pytest.mark.parametrize("options", [
+    {"source_file_limit": True}, {"source_file_limit": 0}, {"source_byte_limit": 0},
+    {"source_byte_limit": True}, {"source_timeout_seconds": float("nan")},
+    {"source_timeout_seconds": float("inf")}, {"source_timeout_seconds": 0},
+    {"source_timeout_seconds": True}, {"source_timeout_seconds": 10**1000},
+])
+def test_bad_trusted_source_budgets_fail_closed(project: dict[str, Any], options: dict[str, Any]) -> None:
+    module = helper()
+    with pytest.raises(module.ContractMountError):
+        module.validate_contract_work(**arguments(project), **options)
+
+
 def test_native_helper_and_shared_validator_load_without_application_imports(
     project: dict[str, Any], monkeypatch: pytest.MonkeyPatch,
 ) -> None:
