@@ -841,6 +841,7 @@ def test_skill_broker_can_prepare_probes_in_service_owned_runtime_without_broad_
     }
 
     assert runtime_directories["/run/agent-hub"] == ["0750", "agent-hub", "agent-hub"]
+    assert runtime_directories["/run/agent-hub-project"] == ["0700", "root", "root"]
     assert service["User"] == "root"
     assert service["Group"] == "root"
     assert service["SupplementaryGroups"] == "agent-hub"
@@ -848,7 +849,13 @@ def test_skill_broker_can_prepare_probes_in_service_owned_runtime_without_broad_
     assert not service.get("AmbientCapabilities", "").strip()
     assert service["NoNewPrivileges"] == "yes"
     assert service["ProtectSystem"] == "strict"
-    assert service["ReadWritePaths"].split() == ["/run/agent-hub"]
+    assert service["ReadWritePaths"].split() == ["/run/agent-hub", "/run/agent-hub-project"]
+    for name in ("api", "worker"):
+        peer_unit = read(f"deploy/native/systemd/agent-hub-{name}.service")
+        assert peer_unit.count("ReadWritePaths=") == 1
+        peer = configparser.ConfigParser(interpolation=None, strict=False)
+        peer.read_string(peer_unit)
+        assert "/run/agent-hub-project" not in peer["Service"]["ReadWritePaths"].split()
 
 
 def test_native_upgrade_restarts_every_release_bound_process_after_switch() -> None:
