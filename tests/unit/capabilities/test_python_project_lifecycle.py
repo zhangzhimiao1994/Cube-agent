@@ -176,6 +176,64 @@ async def test_failed_callback_cannot_request_completed_cleanup() -> None:
     assert await invoke(Session(), callback_status=RunStatus.FAILED) == []
 
 
+async def test_new_cancelled_run_releases_only_its_exact_durable_environment() -> None:
+    session = Session()
+    session.row.status = 'cancelled'
+    session.row.routing_decision['python_project_cancel_cleanup_version'] = 1
+    assert await invoke(session, callback_status=RunStatus.CANCELLED) == ['context', 'release']
+    assert session.row.version == 2
+    assert session.row.routing_decision['python_project_cache_release']['schema_version'] == 1
+    assert session.queries[0]._for_update_arg is not None
+
+
+@pytest.mark.parametrize('version', [None, True, False, '1', 1.0, 0, 2])
+async def test_legacy_or_invalid_cancelled_policy_keeps_environment(version: object) -> None:
+    session = Session()
+    session.row.status = 'cancelled'
+    if version is not None:
+        session.row.routing_decision['python_project_cancel_cleanup_version'] = version
+    assert await invoke(session, callback_status=RunStatus.CANCELLED) == []
+
+
+@pytest.mark.parametrize('field', [
+    'self_repair_decision_token_hash', 'self_repair_context', 'self_repair_proposal',
+    'self_repair_recovery_baseline_sequence', 'self_repair_accepted',
+])
+async def test_cancelled_repair_lineage_is_retained(field: str) -> None:
+    session = Session()
+    session.row.status = 'cancelled'
+    session.row.routing_decision.update(python_project_cancel_cleanup_version=1)
+    session.row.routing_decision[field] = 'retained'
+    assert await invoke(session, callback_status=RunStatus.CANCELLED) == []
+
+
+async def test_cancelled_self_repair_source_without_other_lineage_is_retained() -> None:
+    session = Session()
+    session.row.status = 'cancelled'
+    session.row.routing_decision.update(python_project_cancel_cleanup_version=1, source='self_repair')
+    assert await invoke(session, callback_status=RunStatus.CANCELLED) == []
+
+
+@pytest.mark.parametrize('change', ['lease', 'approval', 'unknown', 'missing_checkpoint', 'failed', 'callback_only'])
+async def test_cancelled_cleanup_preserves_existing_lifecycle_fences(change: str) -> None:
+    session = Session()
+    session.row.status = 'cancelled'
+    session.row.routing_decision['python_project_cancel_cleanup_version'] = 1
+    if change == 'lease':
+        session.row.worker_lease_token = UUID(int=99)
+    elif change == 'approval':
+        session.approval = UUID(int=98)
+    elif change == 'unknown':
+        session.checkpoints = [{'phase': 'UNKNOWN'}]
+    elif change == 'missing_checkpoint':
+        session.checkpoints = []
+    elif change == 'failed':
+        session.row.status = 'failed'
+    else:
+        session.row.routing_decision.pop('python_project_cancel_cleanup_version')
+    assert await invoke(session, callback_status=RunStatus.CANCELLED) == []
+
+
 async def test_successful_cleanup_is_durable_and_notified_marker_does_not_prevent_retry() -> None:
     session = Session()
     session.row.routing_decision["terminal_hook_notified"] = True
@@ -187,9 +245,11 @@ async def test_successful_cleanup_is_durable_and_notified_marker_does_not_preven
 
 
 @pytest.mark.parametrize("candidate_install", [False, True])
+@pytest.mark.parametrize('terminal_status', [RunStatus.COMPLETED, RunStatus.CANCELLED])
 async def test_hook_uses_restarted_real_service_durable_refs_without_reexecution(
     tmp_path: Any,
     candidate_install: bool,
+    terminal_status: RunStatus,
 ) -> None:
     from agent_hub.capabilities.approvals import capability_approval_scope
     from agent_hub.capabilities.project_verification import ProjectVerificationService
@@ -217,6 +277,9 @@ async def test_hook_uses_restarted_real_service_durable_refs_without_reexecution
     session = Session()
     session.row.id, session.row.tenant_id = inv.run_id, inv.tenant_id
     session.row.routing_decision = repository.record.routing_decision
+    session.row.status = terminal_status.value
+    if terminal_status is RunStatus.CANCELLED:
+        session.row.routing_decision['python_project_cancel_cleanup_version'] = 1
     before = (len(native.calls), len(native.probes), len(native.inspections))
     releases = []
 
@@ -235,7 +298,7 @@ async def test_hook_uses_restarted_real_service_durable_refs_without_reexecution
         tenant_id=inv.tenant_id,
         run_id=inv.run_id,
         actor_id=None,
-        status=RunStatus.COMPLETED,
+        status=terminal_status,
         mode=None,
         routing_decision={},
     )
@@ -244,7 +307,10 @@ async def test_hook_uses_restarted_real_service_durable_refs_without_reexecution
     assert before == (len(native.calls), len(native.probes), len(native.inspections))
 
 
-async def test_retry_scan_reenters_db_gate_after_failure_and_marks_only_typed_success() -> None:
+@pytest.mark.parametrize('terminal_status', [RunStatus.COMPLETED, RunStatus.CANCELLED])
+async def test_retry_scan_reenters_db_gate_after_failure_and_marks_only_typed_success(
+    terminal_status: RunStatus,
+) -> None:
     from agent_hub.capabilities.python_project_lifecycle import PythonProjectTerminalHook
 
     class RetrySession(Session):
@@ -268,6 +334,9 @@ async def test_retry_scan_reenters_db_gate_after_failure_and_marks_only_typed_su
             return await super().scalars(query)
 
     session = RetrySession()
+    session.row.status = terminal_status.value
+    if terminal_status is RunStatus.CANCELLED:
+        session.row.routing_decision['python_project_cancel_cleanup_version'] = 1
     attempts = []
 
     class Repository:

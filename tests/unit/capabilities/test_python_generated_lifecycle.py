@@ -68,10 +68,14 @@ async def invoke(hook: Any, *, status: RunStatus = RunStatus.COMPLETED) -> None:
         status=status, mode=None, routing_decision={'terminal': True})
 
 
-async def test_completed_generated_python_releases_exact_durable_reference_only() -> None:
+@pytest.mark.parametrize('status', [RunStatus.COMPLETED, RunStatus.CANCELLED])
+async def test_completed_generated_python_releases_exact_durable_reference_only(status: RunStatus) -> None:
     session = generated_session()
+    session.row.status = status.value
+    if status is RunStatus.CANCELLED:
+        session.row.routing_decision['python_project_cancel_cleanup_version'] = 1
     hook, calls = hook_for(session)
-    await invoke(hook)
+    await invoke(hook, status=status)
     assert len(calls) == 2 and calls[0] == 'generated-context'
     assert calls[1].startswith('python_release_')
     assert session.row.routing_decision['python_project_cache_release']['environment_reference'] == reference().model_dump(mode='json')
@@ -89,19 +93,27 @@ async def test_failed_cancelled_waiting_paused_and_other_noncompleted_generated_
 
 
 @pytest.mark.parametrize('field', ['worker_id', 'worker_lease_token', 'worker_lease_expires_at', 'worker_heartbeat_at'])
-async def test_generated_worker_not_yet_quiet_is_retained(field: str) -> None:
+@pytest.mark.parametrize('status', [RunStatus.COMPLETED, RunStatus.CANCELLED])
+async def test_generated_worker_not_yet_quiet_is_retained(field: str, status: RunStatus) -> None:
     session = generated_session()
+    session.row.status = status.value
+    if status is RunStatus.CANCELLED:
+        session.row.routing_decision['python_project_cancel_cleanup_version'] = 1
     setattr(session.row, field, 'present')
     hook, calls = hook_for(session)
-    await invoke(hook)
+    await invoke(hook, status=status)
     assert calls == []
 
 
 @pytest.mark.parametrize('defect', ['pending-approval', 'unknown', 'executing', 'inflight', 'partial', 'no-checkpoint',
     'invalid-checkpoint', 'captured', 'wrong-version', 'node', 'mixed-original', 'partial-descriptor',
     'no-refs', 'ambiguous', 'wrong-ref', 'wrong-recipe', 'wrong-project'])
-async def test_generated_partial_uncertain_or_mismatched_evidence_cannot_release(defect: str) -> None:
+@pytest.mark.parametrize('status', [RunStatus.COMPLETED, RunStatus.CANCELLED])
+async def test_generated_partial_uncertain_or_mismatched_evidence_cannot_release(defect: str, status: RunStatus) -> None:
     session = generated_session()
+    session.row.status = status.value
+    if status is RunStatus.CANCELLED:
+        session.row.routing_decision['python_project_cancel_cleanup_version'] = 1
     state = session.row.routing_decision['generated_project_preparation']
     refs: tuple[Any, ...] | None = None
     if defect == 'pending-approval':
@@ -134,12 +146,13 @@ async def test_generated_partial_uncertain_or_mismatched_evidence_cannot_release
     else:
         session.row.routing_decision['project_id'] = 'different'
     hook, calls = hook_for(session, refs=refs)
-    await invoke(hook)
+    await invoke(hook, status=status)
     assert not [entry for entry in calls if entry != 'generated-context']
     assert 'python_project_cache_release' not in session.row.routing_decision
 
 
-async def test_generated_retry_query_ors_new_route_and_reenters_locked_gate_after_lost_reply() -> None:
+@pytest.mark.parametrize('status', [RunStatus.COMPLETED, RunStatus.CANCELLED])
+async def test_generated_retry_query_ors_new_route_and_reenters_locked_gate_after_lost_reply(status: RunStatus) -> None:
     class RetrySession(Session):
         async def scalar(self, query: Any) -> Any:
             self.queries.append(query)
@@ -162,6 +175,9 @@ async def test_generated_retry_query_ors_new_route_and_reenters_locked_gate_afte
 
     session = RetrySession()
     session.row = generated_session().row
+    session.row.status = status.value
+    if status is RunStatus.CANCELLED:
+        session.row.routing_decision['python_project_cancel_cleanup_version'] = 1
     session.row.routing_decision['terminal_hook_notified'] = True
     hook, calls = hook_for(session, fail_once=True)
     assert await hook.retry_completed() == 1
@@ -172,3 +188,21 @@ async def test_generated_retry_query_ors_new_route_and_reenters_locked_gate_afte
     assert len(executions) == len(set(executions)) == 2
     assert session.row.version == 2
     assert await hook.retry_completed() == 0
+
+
+async def test_cancelled_root_cleanup_uncertain_does_not_mark_released() -> None:
+    from agent_hub.subprocess_cleanup import ProcessCleanupIncomplete
+
+    session = generated_session()
+    session.row.status = 'cancelled'
+    session.row.routing_decision['python_project_cancel_cleanup_version'] = 1
+    hook, calls = hook_for(session)
+
+    async def incomplete(*args: Any, **kwargs: Any) -> Any:
+        raise ProcessCleanupIncomplete('python_project_cleanup_incomplete')
+
+    hook.executor.release_completed = incomplete
+    with pytest.raises(ProcessCleanupIncomplete):
+        await invoke(hook, status=RunStatus.CANCELLED)
+    assert 'python_project_cache_release' not in session.row.routing_decision
+    assert session.row.version == 1 and calls == ['generated-context']

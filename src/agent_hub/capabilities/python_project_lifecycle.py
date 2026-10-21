@@ -1,4 +1,4 @@
-"""Trusted completed-run cache cleanup, independent of model tool arguments."""
+"""Trusted terminal cache cleanup, independent of model tool arguments."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from collections.abc import Mapping
 from typing import TYPE_CHECKING, Protocol
 from uuid import UUID, uuid4
 
-from sqlalchemy import or_, select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from agent_hub.capabilities.project_verification import ProjectVerificationService
@@ -30,6 +30,7 @@ if TYPE_CHECKING:
 
 _LOGGER = logging.getLogger(__name__)
 _RELEASE_MARKER = "python_project_cache_release"
+_CANCEL_VERSION = 'python_project_cancel_cleanup_version'
 
 
 class _Repository(Protocol):
@@ -135,7 +136,7 @@ class PythonProjectTerminalHook:
         mode: TaskMode | None,
         routing_decision: dict[str, object],
     ) -> None:
-        if status is not RunStatus.COMPLETED:
+        if status is not RunStatus.COMPLETED and status is not RunStatus.CANCELLED:
             return
         async with await self.repository.run_transaction() as session, session.begin():
             # Retain the run lock through the RPC, fencing worker/approval writers
@@ -151,7 +152,7 @@ class PythonProjectTerminalHook:
             if (
                 row is None
                 or (row.tenant_id, row.id, row.status)
-                != (tenant_id, run_id, RunStatus.COMPLETED.value)
+                != (tenant_id, run_id, status.value)
                 or any(
                     value is not None
                     for value in (
@@ -165,6 +166,12 @@ class PythonProjectTerminalHook:
                 return
             route = row.routing_decision
             if not isinstance(route, dict) or _RELEASE_MARKER in route or _uncertain(route):
+                return
+            if status is RunStatus.CANCELLED and (
+                type(route.get(_CANCEL_VERSION)) is not int or route[_CANCEL_VERSION] != 1
+                or route.get('source') == 'self_repair'
+                or any(not isinstance(key, str) or key.startswith('self_repair_') for key in route)
+            ):
                 return
             generated = ('generated_project_contract_version' in route
                          or 'generated_project_preparation' in route)
@@ -272,7 +279,7 @@ class PythonProjectTerminalHook:
             row.version += 1
 
     async def retry_completed(self, limit: int = 8) -> int:
-        """Retry new Python completions independently of RunService's once marker.
+        """Retry eligible terminal cleanup independently of RunService's once marker.
 
         The cursor is pagination only. Every candidate re-enters the locked DB
         gate; neither a remembered ID nor this query authorizes cache release.
@@ -282,7 +289,11 @@ class PythonProjectTerminalHook:
         query = (
             select(RunRow)
             .where(
-                RunRow.status == RunStatus.COMPLETED.value,
+                or_(
+                    RunRow.status == RunStatus.COMPLETED.value,
+                    and_(RunRow.status == RunStatus.CANCELLED.value,
+                         RunRow.routing_decision.contains({_CANCEL_VERSION: 1})),
+                ),
                 or_(
                     RunRow.routing_decision.contains(
                         {"project_input_preparation": {"schema_version": 2, "phase": "observed"}}
@@ -302,16 +313,16 @@ class PythonProjectTerminalHook:
             query = query.where(RunRow.id > self._retry_cursor)
         async with await self.repository.run_transaction() as session:
             rows = (await session.scalars(query)).all()
-            candidates = tuple((row.tenant_id, row.id) for row in rows)
+            candidates = tuple((row.tenant_id, row.id, RunStatus(row.status)) for row in rows)
         if not candidates:
             self._retry_cursor = None
-        for tenant_id, run_id in candidates:
+        for tenant_id, run_id, status in candidates:
             try:
                 await self(
                     tenant_id=tenant_id,
                     run_id=run_id,
                     actor_id=None,
-                    status=RunStatus.COMPLETED,
+                    status=status,
                     mode=None,
                     routing_decision={},
                 )

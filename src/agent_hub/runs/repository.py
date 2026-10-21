@@ -1476,6 +1476,8 @@ class RunRepository:
                 raise RunConflict("run cannot be paused from its current state")
             if status is RunStatus.CANCELLED and current is RunStatus.CANCELLED:
                 raise RunConflict("run state conflict")
+            if status is RunStatus.CANCELLED and isinstance(row.routing_decision, dict):
+                row.routing_decision = {**row.routing_decision, 'python_project_cancel_cleanup_version': 1}
             row.status = status.value
             row.version += 1
             await session.flush()
