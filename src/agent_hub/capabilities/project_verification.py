@@ -20,6 +20,10 @@ from agent_hub.capabilities.project_prerequisites import (
     ProjectPrerequisiteObservation,
     validate_project_prerequisite_report,
 )
+from agent_hub.capabilities.project_stack_admission import (
+    UnsupportedProjectStack,
+    require_supported_project_paths,
+)
 from agent_hub.capabilities.scoped_read import authorized_workspace_scope
 from agent_hub.capabilities.types import CapabilityRequest
 from agent_hub.runtime.contracts import JsonValue, _freeze_object
@@ -304,7 +308,26 @@ class ProjectVerificationService:
         self._python_generated = PythonGeneratedProjectService(self, self.generated, python_executor)
         self._generated_receipts: dict[tuple[UUID, UUID], _GeneratedReceipt] = {}
 
+    async def _require_supported_source(self, tenant_id: UUID, run_id: UUID) -> None:
+        from agent_hub.files.workspace import ProjectWorkspaceStore
+
+        try:
+            getter = getattr(self.repository, 'get', None)
+            if not callable(getter):
+                raise TypeError
+            record = await getter(tenant_id, run_id)
+            project, session = authorized_workspace_scope(record, tenant_id=tenant_id, run_id=run_id)
+            files = await asyncio.to_thread(
+                ProjectWorkspaceStore(self.root).list_files, tenant_id, project, session,
+            )
+            require_supported_project_paths(tuple(item.path for item in files))
+        except UnsupportedProjectStack:
+            raise ProjectVerificationError('project stack execution is unsupported') from None
+        except Exception:  # noqa: BLE001 - path and repository details stay private.
+            raise ProjectVerificationError('project stack discovery is unavailable') from None
+
     async def authorization_request(self, request: CapabilityRequest) -> CapabilityRequest | None:
+        await self._require_supported_source(request.tenant_id, request.run_id)
         generated = await self.generated.prepare(request.tenant_id, request.run_id, request.agent_id,
                                                  user_id=request.user_id)
         if generated is not None:
@@ -316,6 +339,7 @@ class ProjectVerificationService:
     async def prepare_python_original(
         self, *, invocation: ProjectInvocation, reference: ProjectBaselineReference,
     ) -> PythonProjectInputs | None:
+        await self._require_supported_source(invocation.tenant_id, invocation.run_id)
         return await self._python.prepare(invocation, reference)
 
     async def python_original_context(self, tenant_id: UUID, run_id: UUID) -> PythonOriginalContext | None:
@@ -436,6 +460,7 @@ class ProjectVerificationService:
         self, *, tenant_id: UUID, run_id: UUID, actor: str, reference: ProjectBaselineReference,
         execution_id: str, timeout_seconds: float,
     ) -> Mapping[str, JsonValue]:
+        await self._require_supported_source(tenant_id, run_id)
         python = await self._python.select(tenant_id, run_id, actor, phases=('executing',))
         if python is not None:
             await self._python._approval(python, actor)
@@ -456,6 +481,7 @@ class ProjectVerificationService:
     ) -> ProjectInvocation:
         from agent_hub.skills.sandbox.project import ProjectInvocation
 
+        await self._require_supported_source(tenant_id, run_id)
         python = await self._python.select(tenant_id, run_id, actor,
                                           phases=('captured', 'executing', 'observed'))
         if python is not None:
@@ -529,6 +555,7 @@ class ProjectVerificationService:
         if not callable(getter):
             raise ProjectVerificationError('project verification scope is not authorized')
         record = await getter(tenant_id, run_id)
+        await self._require_supported_source(tenant_id, run_id)
         if generated_selected(record):
             authority = generated_authority(record, tenant_id, run_id)
             context = await self.generated.prepare(tenant_id, run_id, actor, user_id=authority.user_id)

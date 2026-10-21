@@ -713,6 +713,12 @@ class RuntimeCapabilityGateway:
         store = self._require_generated_file_store()
         title = _required_string(arguments, "title")
         files = _project_files(arguments)
+        from agent_hub.capabilities.project_stack_admission import require_supported_project_paths
+
+        try:
+            require_supported_project_paths(tuple(files))
+        except ValueError as error:
+            raise RuntimeCapabilityError(str(error)) from None
         if self._project_executor_configured and {"package.json", "pyproject.toml"}.intersection(files):
             raise RuntimeCapabilityError(
                 "Node/Python project delivery requires workspace.write_text, project.verify and workspace.bundle"
@@ -837,6 +843,13 @@ class RuntimeCapabilityGateway:
         store = self._require_project_workspace_store()
         generated_store = self._require_generated_file_store()
         project_id, session_id = await self._project_workspace_scope(tenant_id, run_id)
+        from agent_hub.capabilities.project_stack_admission import require_supported_project_paths
+
+        files = store.list_files(tenant_id, project_id, session_id)
+        try:
+            require_supported_project_paths(tuple(item.path for item in files))
+        except ValueError as error:
+            raise RuntimeCapabilityError(str(error)) from None
         original_contract = await self._original_project_contract(tenant_id, run_id)
         if original_contract is not None and (
             not self._project_executor_configured or self._project_verification is None
@@ -846,18 +859,17 @@ class RuntimeCapabilityGateway:
         verified_source: str | None = None
         delivery_receipt = self._project_delivery_receipts.get((tenant_id, run_id))
         generated_binding = self._generated_delivery_bindings.get((tenant_id, run_id))
-        if self._project_executor_configured and self._project_verification is not None:
-            files = store.list_files(tenant_id, project_id, session_id)
-            if original_contract is not None or delivery_receipt is not None or any(
+        if (self._project_executor_configured and self._project_verification is not None
+            and (original_contract is not None or delivery_receipt is not None or any(
                 item.path in {"package.json", "pyproject.toml"} for item in files
-            ):
-                try:
-                    verified_source = await self._project_verification.require_current_receipt(tenant_id, run_id)
-                except ProjectVerificationError as error:
-                    if generated_binding is not None:
-                        self._project_delivery_receipts.pop((tenant_id, run_id), None)
-                        self._generated_delivery_bindings.pop((tenant_id, run_id), None)
-                    raise RuntimeCapabilityError(str(error)) from None
+            ))):
+            try:
+                verified_source = await self._project_verification.require_current_receipt(tenant_id, run_id)
+            except ProjectVerificationError as error:
+                if generated_binding is not None:
+                    self._project_delivery_receipts.pop((tenant_id, run_id), None)
+                    self._generated_delivery_bindings.pop((tenant_id, run_id), None)
+                raise RuntimeCapabilityError(str(error)) from None
         filename = _filename(arguments, title=title, extension=".zip")
         try:
             artifact_id = uuid4()

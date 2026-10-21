@@ -11,10 +11,12 @@ from pathlib import Path
 from typing import Protocol, cast
 from uuid import UUID
 
+from agent_hub.capabilities.project_stack_admission import additional_stack_discovery
 from agent_hub.capabilities.scoped_read import (
     _read_no_links,
     authorized_workspace_scope,
 )
+from agent_hub.files.workspace import ProjectWorkspaceStore
 from agent_hub.runtime.contracts import JsonValue
 
 PROJECT_INSPECT_TOOL = "project.inspect"
@@ -140,6 +142,20 @@ async def inspect_project(
     }
     if python_recipe is not None:
         result["python_recipe"] = python_recipe
+    try:
+        files = ProjectWorkspaceStore(project_root).list_files(tenant_id, project, session)
+        discovery = additional_stack_discovery(tuple(item.path for item in files))
+    except (OSError, ValueError, RuntimeError):
+        issues.append({'path': 'project', 'reason': 'stack_discovery_unavailable'})
+        result['issues'] = tuple(issues)
+        result['install_plan_state'] = 'blocked'
+    else:
+        if discovery is not None:
+            result['stack_discovery'] = discovery
+            issues.append({'path': 'project', 'reason': 'stack_execution_unsupported'})
+            result['issues'] = tuple(issues)
+            result['operations'] = {'build': 'unknown', 'test': 'unknown'}
+            result['install_plan_state'] = 'blocked'
     return result
 
 
