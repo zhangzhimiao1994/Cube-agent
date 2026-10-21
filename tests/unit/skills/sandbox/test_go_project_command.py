@@ -75,6 +75,23 @@ def test_hardening_and_quota_properties_match_python_outer_policy(api: Any, call
     assert not any(value.startswith('Environment=') for value in props)
 
 
+@pytest.mark.parametrize('workspace', [64 * 1024**2, 512 * 1024**2, 2 * 1024**3])
+def test_small_source_does_not_starve_four_private_compiler_caches_of_inodes(
+    api: Any, call: Any, workspace: int,
+) -> None:
+    inv = call.model_copy(update={'workspace_limit_bytes': workspace, 'file_limit': 128})
+    props = properties(api.build_go_project_systemd_command(inv, BrokerPolicy(), **locations()))
+    quota = next(prop for prop in props if prop.startswith('TemporaryFileSystem='))
+    assert f'size={workspace},nr_inodes={workspace // 4096},mode=1777' in quota
+    assert workspace // 4096 > 4 * 256
+
+
+def test_inode_budget_still_accounts_for_large_source_file_allocations(api: Any, call: Any) -> None:
+    inv = call.model_copy(update={'workspace_limit_bytes': 64 * 1024**2, 'file_limit': 100000})
+    props = properties(api.build_go_project_systemd_command(inv, BrokerPolicy(), **locations()))
+    assert any('nr_inodes=1000000,mode=1777' in prop for prop in props)
+
+
 def test_bootstrap_imports_only_fixed_trusted_code_and_ignores_host_environment(api: Any, call: Any) -> None:
     args = api.build_go_project_systemd_command(call, BrokerPolicy(), **locations())
     start = args.index('/usr/bin/env')

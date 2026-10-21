@@ -33,6 +33,9 @@ def build_go_project_systemd_command(
     invocation = GoProjectInvocation.model_validate_json(
         invocation.model_dump_json(warnings='error'), strict=True,
     )
+    # Compiler caches contain many entries even for tiny source trees. Bound
+    # metadata from both source allocation and the admitted work-byte budget.
+    inode_budget = max(invocation.file_limit * 10, invocation.workspace_limit_bytes // 4096)
     binds = ((snapshot, 'source'), (original, 'original'), (plan, 'plan.json'),
              (toolchain_root, 'sdk'), (policy.source_path, 'trusted-source'))
     properties = [
@@ -60,7 +63,7 @@ def build_go_project_systemd_command(
         f'CPUQuota={invocation.cpu_quota_percent}%',
         f'RuntimeMaxSec={invocation.timeout_seconds}s',
         (f'TemporaryFileSystem=/run/agent-hub-go-work:rw,nosuid,nodev,'
-         f'size={invocation.workspace_limit_bytes},nr_inodes={invocation.file_limit * 10},mode=1777'),
+         f'size={invocation.workspace_limit_bytes},nr_inodes={inode_budget},mode=1777'),
         'InaccessiblePaths=/var/lib/agent-hub',
     ]
     properties.extend(
