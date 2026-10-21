@@ -208,6 +208,7 @@ class HybridRuntime:
             self._restored is not None and self._restored.state.get("terminal") is True
             and any(key in context.routing_decision for key in (
                 "project_input_contract_version", "project_input",
+                "generated_project_contract_version", "generated_project_preparation",
             ))
         )
         try:

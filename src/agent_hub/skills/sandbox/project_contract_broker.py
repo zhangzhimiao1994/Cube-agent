@@ -7,12 +7,19 @@ import json
 import os
 import stat
 import sys
+from collections.abc import Mapping
 from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
-from agent_hub.capabilities.project_baselines import ProjectBaselineReference, StoredProjectBaseline
+from agent_hub.capabilities.project_baselines import (
+    ProjectBaselineReference,
+    ProjectBaselineStore,
+    StoredProjectBaseline,
+    _generated_metadata,
+    _validate_generated_snapshot,
+)
 from agent_hub.capabilities.project_contracts import (
     ManagedProjectInput,
     ProjectCheckContract,
@@ -20,6 +27,9 @@ from agent_hub.capabilities.project_contracts import (
     build_project_check_contract,
 )
 from agent_hub.skills.sandbox.project import ProjectInvocation
+
+if TYPE_CHECKING:
+    from agent_hub.runtime.contracts import JsonValue
 
 _CONTROL_LIMIT = 32 * 1024**2
 _ERROR = 'project original contract staging unavailable or unsafe'
@@ -53,13 +63,28 @@ def _object(pairs: list[tuple[str, object]]) -> dict[str, object]:
 def _decode_original(
     raw: bytes, intent_raw: bytes, invocation: ProjectInvocation, reference: ProjectBaselineReference,
 ) -> tuple[ProjectCheckContract, dict[str, str]]:
+    contract, files, metadata = _decode_baseline(raw, intent_raw, invocation, reference)
+    _need(metadata is None)
+    return contract, files
+
+
+def _decode_baseline(
+    raw: bytes, intent_raw: bytes, invocation: ProjectInvocation, reference: ProjectBaselineReference,
+) -> tuple[ProjectCheckContract, dict[str, str], Mapping[str, JsonValue] | None]:
     _need(len(raw) <= _CONTROL_LIMIT and len(intent_raw) <= _CONTROL_LIMIT)
     _need(hashlib.sha256(raw).hexdigest() == reference.contract_sha256)
     value: object = json.loads(raw, object_pairs_hook=_object)
     _need(type(value) is dict)
     envelope = cast(dict[str, object], value)
-    _need(envelope.keys() == {'schema_version', 'contract', 'source_files'}
-          and type(envelope['schema_version']) is int and envelope['schema_version'] == 1)
+    _need(type(envelope.get('schema_version')) is int)
+    metadata = None
+    if envelope['schema_version'] == 1:
+        _need(envelope.keys() == {'schema_version', 'contract', 'source_files'})
+    else:
+        _need(envelope['schema_version'] == 2 and envelope.keys()
+              == {'schema_version', 'purpose', 'generated_metadata', 'contract', 'source_files'}
+              and type(envelope['purpose']) is str and envelope['purpose'] == 'generated_acceptance')
+        metadata = _generated_metadata(envelope['generated_metadata'])
     _need(_encoded(envelope) == raw)
     contract = ProjectCheckContract.from_payload(envelope['contract'])
     _need((contract.tenant_id, contract.run_id, contract.project_id, contract.session_id)
@@ -73,14 +98,17 @@ def _decode_original(
     _need(rebuilt.to_payload() == contract.to_payload()
           and len(files) == reference.file_count <= invocation.file_limit)
     intent: object = json.loads(intent_raw, object_pairs_hook=_object)
-    expected_intent = {
-        'schema_version': 1, 'state': 'reserved', 'tenant_id': str(invocation.tenant_id),
-        'run_id': str(invocation.run_id), 'project_id': invocation.project_id,
-        'session_id': invocation.session_id,
-        'project_input': ManagedProjectInput(contract.editable_paths).to_payload(),
-    }
+    if metadata is None:
+        expected_intent = {
+            'schema_version': 1, 'state': 'reserved', 'tenant_id': str(invocation.tenant_id),
+            'run_id': str(invocation.run_id), 'project_id': invocation.project_id,
+            'session_id': invocation.session_id,
+            'project_input': ManagedProjectInput(contract.editable_paths).to_payload(),
+        }
+    else:
+        expected_intent = ProjectBaselineStore._generated_intent(invocation, contract.editable_paths, dict(metadata))
     _need(intent == expected_intent and _encoded(expected_intent) == intent_raw)
-    return contract, dict(files)
+    return contract, dict(files), metadata
 
 
 def _stamp(info: os.stat_result, *, full: bool) -> tuple[int, ...]:
@@ -256,11 +284,13 @@ def stage_original_contract(
     workspace_root: Path, invocation: ProjectInvocation, reference: ProjectBaselineReference,
     stage: Path, allowed_uid: int,
 ) -> StoredProjectBaseline:
-    """Copy a service-owned original into a root-owned broker stage, never execute it.
+    """Copy a service-owned frozen baseline into a Root stage, never execute it.
 
     runner.expected_contract_sha256 is contract.protected_sha256, NOT the
     reference.contract_sha256 (the separate baseline envelope's byte digest).
     The caller authenticates the run/reference and owns stage cleanup on failure.
+    Generated metadata is preserved; callers must reject original execution of
+    generated captures because this base invocation has no source_kind field.
     """
     try:
         _need(type(allowed_uid) is int and 0 < allowed_uid < 2**32 - 1)
@@ -286,7 +316,7 @@ def stage_original_contract(
                 controls = _open_directory(controls, name, allowed_uid, stack, observed, mode=0o700)
             raw = _read_control(controls, 'baseline.json', allowed_uid, observed)
             intent = _read_control(controls, 'capture-intent.json', allowed_uid, observed)
-            contract, expected = _decode_original(raw, intent, invocation, reference)
+            contract, expected, metadata = _decode_baseline(raw, intent, invocation, reference)
             container = _open_directory(controls, 'snapshot', allowed_uid, stack, observed, mode=0o700)
             source = _open_directory(container, 'source', allowed_uid, stack, observed, mode=0o555, full=True)
             os.mkdir('original_snapshot', 0o700, dir_fd=target)
@@ -297,6 +327,8 @@ def stage_original_contract(
                                        True, copied))
             _need(files == expected and len(files) == reference.file_count
                   and hashlib.sha256(_encoded(files)).hexdigest() == reference.input_source_sha256)
+            if metadata is not None:
+                _validate_generated_snapshot(stage / 'original_snapshot', invocation, contract, files, metadata)
             for entry in observed:
                 entry.check()
             descriptor = os.open('check_contract.json', _WRITE_FLAGS, 0o600, dir_fd=target)
@@ -310,6 +342,6 @@ def stage_original_contract(
             os.fsync(target)
             for entry in observed:
                 entry.check()
-            return StoredProjectBaseline(reference, contract, stage / 'original_snapshot', files)
+            return StoredProjectBaseline(reference, contract, stage / 'original_snapshot', files, metadata)
     except Exception:  # noqa: BLE001 - no source, private input or host path crosses this boundary.
         raise ProjectContractStageError(_ERROR) from None

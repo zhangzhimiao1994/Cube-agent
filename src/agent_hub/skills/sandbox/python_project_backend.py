@@ -22,7 +22,7 @@ from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any, Literal, Never
+from typing import Any, Literal, Never, cast
 
 from agent_hub.capabilities.project_baselines import ProjectBaselineReference, StoredProjectBaseline
 from agent_hub.capabilities.python_project_input_store import _capture
@@ -647,12 +647,14 @@ def _report(
     inputs: PythonProjectInputs,
     digest: str,
     reused: PythonEnvironmentReference | None,
+    *, generated_manifest_sha256: str | None = None,
 ) -> dict[str, Any]:
     try:
         _need(len(raw.encode("utf-8")) <= python_native_report_limit(invocation.output_limit_bytes))
         payload: object = json.loads(raw, object_pairs_hook=_object)
         _need(type(payload) is dict)
         assert isinstance(payload, dict)
+        extra = {"generated_test_execution"} if "generated_test_execution" in payload else set()
         _need(
             set(payload)
             == {
@@ -672,7 +674,7 @@ def _report(
                 "test_count",
                 "exported_environment",
                 "dependency_install",
-            }
+            } | extra
         )
         _need(
             type(payload["schema_version"]) is int
@@ -768,6 +770,19 @@ def _report(
             if test
             else payload["test_count"] is None
         )
+        proof = test.get("generated_test_execution") if test is not None else None
+        _need(bool(extra) == (proof is not None))
+        if proof is not None:
+            from agent_hub.skills.sandbox.python_project_phase import (
+                validate_generated_python_test_execution,
+            )
+
+            validated = validate_generated_python_test_execution(payload["generated_test_execution"])
+            _need(passed and generated_manifest_sha256 is not None
+                  and validated == validate_generated_python_test_execution(proof)
+                  and validated["manifest_sha256"] == generated_manifest_sha256)
+        elif passed:
+            _need(generated_manifest_sha256 is None)
         return payload
     except (ValueError, TypeError, KeyError, OverflowError, AttributeError):
         raise PythonProjectBackendError("python_project_execution_unavailable") from None
@@ -1007,6 +1022,8 @@ def _prepared(
         stage=stage,
         allowed_uid=policy.allowed_uid,
     )
+    _need(prepared.original.generated_metadata is None or request.invocation.source_kind == 'candidate',
+          'python_project_recipe_unavailable')
     actual = _measured_inputs(prepared.original, request.invocation, config, deadline)
     _need(actual == prepared.inputs, "python_project_recipe_unavailable")
     return prepared
@@ -1116,6 +1133,8 @@ def _run(
             inputs=prepared.inputs.to_payload(),
             source_sha256=digest,
             reused_environment=reused,
+            generated_manifest_sha256=(cast(str, prepared.original.generated_metadata["manifest_sha256"])
+                if prepared.original.generated_metadata is not None else None),
         )
         plan_path = _write_plan(plan, roots.stage_fd, stage)
         export = _make_export(roots.stage_fd, stage)
@@ -1152,7 +1171,8 @@ def _run(
         _native()
         _check(deadline)
         _need(not process.timed_out and process.exit_code == 0 and not process.stdout_truncated)
-        payload = _report(process.stdout, invocation, prepared.inputs, digest, reused)
+        payload = _report(process.stdout, invocation, prepared.inputs, digest, reused,
+            generated_manifest_sha256=plan.generated_manifest_sha256)
         verify_staged_python_wheels(
             wheels, prepared.inputs.wheels, limits=wheel_limits, deadline=deadline
         )

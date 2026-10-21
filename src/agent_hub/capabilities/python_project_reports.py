@@ -27,6 +27,9 @@ from agent_hub.capabilities.python_project_inputs import (
 from agent_hub.capabilities.python_project_receipts import _metadata, validate_python_passed_receipt
 from agent_hub.runtime.contracts import JsonValue, _freeze_object
 from agent_hub.skills.sandbox.base import SkillResult
+from agent_hub.skills.sandbox.python_project_phase import (
+    validate_generated_python_test_execution as validate_generated_python_test_execution,  # noqa: PLC0414 - public re-export.
+)
 from agent_hub.skills.sandbox.python_project_process import (
     PYTHON_PHASE_OUTPUT_WITHHELD,
     python_native_report_limit,
@@ -394,7 +397,8 @@ def _phase_detail(
             _object(detail, base | {"wheel"})
             _wheel(detail["wheel"])
         else:
-            _object(detail, base | {"test_count", "import"})
+            extra = {"generated_test_execution"} if "generated_test_execution" in detail else set()
+            _object(detail, base | {"test_count", "import"} | extra)
             _integer(detail["test_count"], minimum=1)
             _need(
                 detail["import"]
@@ -403,6 +407,9 @@ def _phase_detail(
                     "origin": import_module.replace(".", "/") + "/__init__.py",
                 }
             )
+            if extra:
+                proof = validate_generated_python_test_execution(detail["generated_test_execution"])
+                _need(proof["count"] == detail["test_count"])
         return detail
     except _INVALID:
         return None
@@ -497,7 +504,9 @@ def decode_python_project_report(
         report_limit = python_native_report_limit(invocation.output_limit_bytes)
         capture_limit = python_phase_capture_limit(invocation.output_limit_bytes)
         _text(result.stderr, report_limit)
-        raw = _object(_load(result.stdout, report_limit), _RAW_FIELDS)
+        loaded = _load(result.stdout, report_limit)
+        extra = {"generated_test_execution"} if "generated_test_execution" in loaded else set()
+        raw = _object(loaded, _RAW_FIELDS | extra)
         _need(raw["evidence"] == "native_process_only" and raw["status"] in ("passed", "failed"))
         status = "passed" if raw["status"] == "passed" else "failed"
         _identity(raw, status=status)
@@ -509,6 +518,7 @@ def decode_python_project_report(
         safe_checks: list[JsonValue] = []
         wheel: JsonValue = None
         test_count: JsonValue = None
+        generated_test_execution: Mapping[str, object] | None = None
         failure_diagnostic = None
         for index, item in enumerate(checks):
             phase = _PHASES[index]
@@ -529,8 +539,14 @@ def decode_python_project_report(
                 wheel = detail["wheel"]
             if detail is not None and phase == "test":
                 test_count = detail["test_count"]
+                if "generated_test_execution" in detail:
+                    generated_test_execution = validate_generated_python_test_execution(detail["generated_test_execution"])
         _need(status != "passed" or len(checks) == 3)
         _need(raw["wheel"] == wheel and raw["test_count"] == test_count)
+        _need(bool(extra) == (generated_test_execution is not None))
+        if extra:
+            _need(status == "passed" and validate_generated_python_test_execution(
+                raw["generated_test_execution"]) == generated_test_execution)
         # Equality alone would accept bools as integers in untrusted JSON.
         if raw["wheel"] is not None:
             _wheel(raw["wheel"])

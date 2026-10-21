@@ -1,4 +1,4 @@
-"""Immutable scoped original inputs; capture is not execution or repair evidence."""
+"""Immutable original/generated captures; storage is not execution authority."""
 
 from __future__ import annotations
 
@@ -15,11 +15,13 @@ from contextlib import ExitStack, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import cast
+from typing import TYPE_CHECKING, cast
+from uuid import UUID
 
 from agent_hub.capabilities.project_contracts import (
     ManagedProjectInput,
     ProjectCheckContract,
+    _editables,
     build_project_check_contract,
 )
 from agent_hub.capability_installer.python_attestation import _identity, read_control
@@ -32,13 +34,16 @@ from agent_hub.skills.sandbox.project import (
     snapshot_project_source,
 )
 
+if TYPE_CHECKING:
+    from agent_hub.runtime.contracts import JsonValue
+
 _NAMESPACE = '.project-contracts'
 _CONTROL_LIMIT = 32 * 1024**2
 _SHA = re.compile('[a-f0-9]{64}')
 
 
 class ProjectBaselineError(RuntimeError):
-    """An original cannot be captured, re-created or trusted from this reference."""
+    """A baseline cannot be captured, re-created or trusted from this reference."""
 
 
 def _encoded(value: object) -> bytes:
@@ -57,6 +62,20 @@ def _object(pairs: list[tuple[str, object]]) -> dict[str, object]:
 
 def _fingerprint(files: Mapping[str, str]) -> str:
     return hashlib.sha256(_encoded(files)).hexdigest()
+
+
+def _generated_metadata(value: object) -> Mapping[str, JsonValue]:
+    keys = {'schema_version', 'purpose', 'capture_phase', 'user_id', 'request_sha256', 'manifest_sha256'}
+    if not isinstance(value, Mapping) or len(value) != len(keys) or set(value) != keys:
+        raise ValueError('invalid generated capture metadata')
+    item = dict(value)
+    if (type(item['schema_version']) is not int or item['schema_version'] != 1
+            or any(type(item[key]) is not str for key in keys - {'schema_version'})
+            or item['purpose'] != 'generated_acceptance' or item['capture_phase'] != 'post_model'
+            or any(_SHA.fullmatch(item[key]) is None for key in ('request_sha256', 'manifest_sha256'))
+            or str(UUID(item['user_id'])) != item['user_id']):
+        raise ValueError('invalid generated capture metadata')
+    return MappingProxyType(cast('dict[str, JsonValue]', item))
 
 
 def _stamp(info: os.stat_result) -> tuple[int, ...]:
@@ -157,12 +176,37 @@ class StoredProjectBaseline:
     contract: ProjectCheckContract
     snapshot: Path
     source_files: Mapping[str, str]
+    generated_metadata: Mapping[str, JsonValue] | None = None
 
     def __post_init__(self) -> None:
         files = dict(self.source_files)
         if len(files) != self.reference.file_count or _fingerprint(files) != self.reference.input_source_sha256:
             raise ValueError('invalid original source manifest')
         object.__setattr__(self, 'source_files', MappingProxyType(files))
+        if self.generated_metadata is not None:
+            object.__setattr__(self, 'generated_metadata', _generated_metadata(self.generated_metadata))
+
+
+def _validate_generated_snapshot(
+    snapshot: Path, invocation: ProjectInvocation, contract: ProjectCheckContract,
+    files: Mapping[str, str], metadata: Mapping[str, JsonValue],
+) -> None:
+    from agent_hub.capabilities.project_acceptance import parse_acceptance_manifest
+
+    path = snapshot / 'ACCEPTANCE.json'
+    before = path.lstat()
+    _snapshot_permissions(path, before)
+    raw, receipt = read_control(path, max_bytes=min(_CONTROL_LIMIT, invocation.source_limit_bytes))
+    tag = b'x\0' if before.st_mode & 0o111 else b'f\0'
+    if (_identity(before) != receipt['identity'] or _stamp(path.lstat()) != _stamp(before)
+            or files.get('ACCEPTANCE.json') != hashlib.sha256(tag + raw).hexdigest()
+            or hashlib.sha256(raw).hexdigest() != metadata['manifest_sha256']):
+        raise ValueError('generated manifest changed')
+    manifest = parse_acceptance_manifest(raw)
+    required = {'ACCEPTANCE.json', *manifest.test_files}
+    if (manifest.editable_paths != contract.editable_paths or not required <= files.keys()
+            or not required <= contract.protected_files.keys()):
+        raise ValueError('generated acceptance files are unavailable or editable')
 
 
 def _snapshot_files(snapshot: Path, invocation: ProjectInvocation) -> dict[str, str]:
@@ -290,6 +334,17 @@ class ProjectBaselineStore:
         }
 
     @staticmethod
+    def _generated_intent(
+        invocation: ProjectInvocation, editable_paths: tuple[str, ...], metadata: Mapping[str, JsonValue],
+    ) -> dict[str, object]:
+        return {
+            'schema_version': 2, 'purpose': 'generated_acceptance', 'state': 'reserved',
+            'tenant_id': str(invocation.tenant_id), 'run_id': str(invocation.run_id),
+            'project_id': invocation.project_id, 'session_id': invocation.session_id,
+            'editable_paths': list(editable_paths), 'generated_metadata': metadata,
+        }
+
+    @staticmethod
     def _remove_partial(controls: _Directory, owned: _Directory) -> None:
         controls.check()
         owned.check()
@@ -363,50 +418,78 @@ class ProjectBaselineStore:
             if type(project_input) is not ManagedProjectInput:
                 raise ValueError('baseline selection must be typed')
             project_input = ManagedProjectInput.from_payload(project_input.to_payload())
-            with ExitStack() as stack:
-                controls = self._controls(invocation, stack, create=True)
-                try:
-                    self._write_once(controls, 'capture-intent.json', _encoded(self._intent(invocation, project_input)))
-                except FileExistsError:
-                    raise ProjectBaselineError('project baseline already reserved; never recapture') from None
-                owned = None
-                try:
-                    # Reserve space before copying; only this exclusive container is cleanup-owned.
-                    if shutil.disk_usage(self.root).free <= invocation.source_limit_bytes + _CONTROL_LIMIT:
-                        raise ProjectBaselineError('project baseline storage quota unavailable')
-                    controls.check()
-                    if controls.fd is None:
-                        (controls.path / 'snapshot').mkdir()
-                    else:
-                        os.mkdir('snapshot', mode=0o700, dir_fd=controls.fd)
-                    owned = _Directory(controls.path / 'snapshot', private=True)
-                    stack.callback(owned.close)
-                    controls.sync()
-                    snapshot = owned.path / 'source'
-                    digest = await snapshot_project_source(self.root, invocation, destination=snapshot)
-                    _seal_snapshot_acl(owned, snapshot)
-                    files = await _scan_snapshot(snapshot, invocation)
-                    if (not files or digest != _fingerprint(files)
-                            or digest != await project_source_fingerprint(self.root, invocation)):
-                        raise ProjectBaselineError('project input changed during capture')
-                    contract = build_project_check_contract(
-                        tenant_id=invocation.tenant_id, run_id=invocation.run_id,
-                        project_id=invocation.project_id, session_id=invocation.session_id,
-                        input_source_sha256=digest, editable_paths=project_input.editable_paths,
-                        source_files=files,
-                    )
-                    body = _encoded({'schema_version': 1, 'contract': contract.to_payload(),
-                                     'source_files': files})
-                    self._write_once(controls, 'baseline.json', body)
-                    controls.check()
-                    return ProjectBaselineReference(hashlib.sha256(body).hexdigest(), digest, len(files))
-                except BaseException as error:
-                    self._capture_failed(controls, owned, error)
-                    raise
+            return await self._capture(invocation, project_input.editable_paths,
+                                       self._intent(invocation, project_input))
         except ProjectBaselineError:
             raise
         except Exception:  # noqa: BLE001 - never expose source/host paths or re-capture an uncertain original.
             raise ProjectBaselineError('project original baseline unavailable or unsafe') from None
+
+    async def capture_generated_once(
+        self, invocation: ProjectInvocation, *, editable_paths: tuple[str, ...], metadata: Mapping[str, JsonValue],
+    ) -> ProjectBaselineReference:
+        """Freeze post-model criteria; caller owns user/run/lease authorization."""
+        try:
+            invocation = self._invocation(invocation)
+            paths = _editables(editable_paths)
+            generated = _generated_metadata(metadata)
+            return await self._capture(invocation, paths, self._generated_intent(invocation, paths, generated),
+                                       generated_metadata=generated)
+        except ProjectBaselineError:
+            raise
+        except Exception:  # noqa: BLE001 - no source/host paths or authority inferred from model edit paths.
+            raise ProjectBaselineError('generated project baseline unavailable or unsafe') from None
+
+    async def _capture(
+        self, invocation: ProjectInvocation, editable_paths: tuple[str, ...], intent: Mapping[str, object],
+        *, generated_metadata: Mapping[str, JsonValue] | None = None,
+    ) -> ProjectBaselineReference:
+        with ExitStack() as stack:
+            controls = self._controls(invocation, stack, create=True)
+            try:
+                self._write_once(controls, 'capture-intent.json', _encoded(intent))
+            except FileExistsError:
+                raise ProjectBaselineError('project baseline already reserved; never recapture') from None
+            owned = None
+            try:
+                # Reserve space before copying; only this exclusive container is cleanup-owned.
+                if shutil.disk_usage(self.root).free <= invocation.source_limit_bytes + _CONTROL_LIMIT:
+                    raise ProjectBaselineError('project baseline storage quota unavailable')
+                controls.check()
+                if controls.fd is None:
+                    (controls.path / 'snapshot').mkdir()
+                else:
+                    os.mkdir('snapshot', mode=0o700, dir_fd=controls.fd)
+                owned = _Directory(controls.path / 'snapshot', private=True)
+                stack.callback(owned.close)
+                controls.sync()
+                snapshot = owned.path / 'source'
+                digest = await snapshot_project_source(self.root, invocation, destination=snapshot)
+                _seal_snapshot_acl(owned, snapshot)
+                files = await _scan_snapshot(snapshot, invocation)
+                if (not files or digest != _fingerprint(files)
+                        or digest != await project_source_fingerprint(self.root, invocation)):
+                    raise ProjectBaselineError('project input changed during capture')
+                contract = build_project_check_contract(
+                    tenant_id=invocation.tenant_id, run_id=invocation.run_id,
+                    project_id=invocation.project_id, session_id=invocation.session_id,
+                    input_source_sha256=digest, editable_paths=editable_paths, source_files=files,
+                )
+                payload: dict[str, object] = {'schema_version': 1, 'contract': contract.to_payload(),
+                                              'source_files': files}
+                if generated_metadata is not None:
+                    _validate_generated_snapshot(snapshot, invocation, contract, files, generated_metadata)
+                    if digest != await project_source_fingerprint(self.root, invocation):
+                        raise ProjectBaselineError('project input changed during capture')
+                    payload.update(schema_version=2, purpose='generated_acceptance',
+                                   generated_metadata=generated_metadata)
+                body = _encoded(payload)
+                self._write_once(controls, 'baseline.json', body)
+                controls.check()
+                return ProjectBaselineReference(hashlib.sha256(body).hexdigest(), digest, len(files))
+            except BaseException as error:
+                self._capture_failed(controls, owned, error)
+                raise
 
     def load(self, invocation: ProjectInvocation, reference: ProjectBaselineReference) -> StoredProjectBaseline:
         try:
@@ -420,14 +503,25 @@ class ProjectBaselineStore:
                 if hashlib.sha256(raw).hexdigest() != reference.contract_sha256:
                     raise ValueError
                 value = json.loads(raw, object_pairs_hook=_object)
-                if (type(value) is not dict or set(value) != {'schema_version', 'contract', 'source_files'}
-                        or type(value['schema_version']) is not int or value['schema_version'] != 1):
+                if type(value) is not dict or type(value.get('schema_version')) is not int:
+                    raise ValueError
+                metadata = None
+                if value['schema_version'] == 1:
+                    if set(value) != {'schema_version', 'contract', 'source_files'}:
+                        raise ValueError
+                elif value['schema_version'] == 2:
+                    if (set(value) != {'schema_version', 'purpose', 'generated_metadata', 'contract', 'source_files'}
+                            or type(value['purpose']) is not str or value['purpose'] != 'generated_acceptance'
+                            or _encoded(value) != raw):
+                        raise ValueError
+                    metadata = _generated_metadata(value['generated_metadata'])
+                else:
                     raise ValueError
                 contract = ProjectCheckContract.from_payload(value['contract'])
                 intent_raw = controls.read('capture-intent.json', _CONTROL_LIMIT)
                 intent = json.loads(intent_raw, object_pairs_hook=_object)
-                project_input = ManagedProjectInput(contract.editable_paths)
-                expected_intent = self._intent(invocation, project_input)
+                expected_intent = (self._intent(invocation, ManagedProjectInput(contract.editable_paths))
+                                   if metadata is None else self._generated_intent(invocation, contract.editable_paths, metadata))
                 if intent != expected_intent or _encoded(expected_intent) != intent_raw:
                     raise ValueError
                 if ((contract.tenant_id, contract.run_id, contract.project_id, contract.session_id)
@@ -448,7 +542,9 @@ class ProjectBaselineStore:
                 )
                 if rebuilt.to_payload() != contract.to_payload():
                     raise ValueError
+                if metadata is not None:
+                    _validate_generated_snapshot(snapshot, invocation, contract, files, metadata)
                 controls.check()
-                return StoredProjectBaseline(reference, contract, snapshot, files)
+                return StoredProjectBaseline(reference, contract, snapshot, files, metadata)
         except Exception:  # noqa: BLE001 - a missing/tampered reference never authorizes a replacement baseline.
             raise ProjectBaselineError('project original baseline unavailable or unsafe') from None

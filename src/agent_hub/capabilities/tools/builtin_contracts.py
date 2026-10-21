@@ -56,13 +56,25 @@ def builtin_tool_description(name: str) -> str | None:
             "Install declared project dependencies under approved source/network policy, then "
             "run build and test in an isolated disposable workspace. Takes no arguments. "
             "Failed checks return evidence to diagnose and repair; rerun after changing source. "
-            "Requires command and dependency-install authorization; never claim delivery before success."
+            "Requires command and dependency-install authorization; never claim delivery before success. "
+            "For a new generated project first write ACCEPTANCE.json: schema_version=1, stack=node or python, "
+            "editable_paths (implementation only), test_files, criteria=[{id:AC-001,description,tests:[exact test names]}]. "
+            "Use real node:test leaf titles for Node, or unittest IDs such as test_app.Case.test_feature for Python. "
+            "All declared acceptance tests must actually pass; skip/todo/echo are not success. "
+            "The first verification freezes the criteria and tests: repair implementations, never rewrite frozen standards. "
+            "Python uses project.inspect's actual python_build_profile catalog, src package layout, pinned pyproject.toml "
+            "and hashed requirements.lock; never invent wheel hashes or treat configured_not_probed as installed."
         )
     if name == "project.inspect":
         return (
             "Inspect current run's project manifests, declared dependencies, runtime constraints "
             "and build/test script presence without executing code. Takes no arguments. "
-            "Does not install dependencies or prove execution environment readiness."
+            "Does not install dependencies or prove execution environment readiness. "
+            "python_build_profile reports the Root-configured interpreter and pinned artifact candidates, without "
+            "granting installation. For python_offline_wheel_v1 use setuptools.build_meta, src package-dir, "
+            "[tool.setuptools.packages.find] where=[src], and [tool.agent-hub.python-project] "
+            "recipe=python_offline_wheel_v1, import-module=<actual package>, test-directory=tests. "
+            "Select needed direct/transitive dependency pins from the actual catalog and write their SHA lock entries."
         )
     if name in {"calculator.evaluate", "calculator", "calculator_evaluate"}:
         return "Evaluate a calculator expression supplied as the required nonblank expression string."

@@ -5910,6 +5910,10 @@ class CrewDispatchRuntime:
             message_limit=active_limits.interaction_message_limit,
         )
         plugin_guidance = plugin_package_generation_guidance(context.request)
+        from agent_hub.runtime.generated_project_guidance import generated_project_guidance
+        generated_guidance = generated_project_guidance(context)
+        if generated_guidance:
+            plugin_guidance = '\n\n'.join(item for item in (plugin_guidance, generated_guidance) if item)
         if plugin_guidance:
             # A framework continuation may already carry our exact system message.
             messages = tuple(

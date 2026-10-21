@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import re
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Protocol, cast
 from uuid import UUID
 
 from agent_hub.auth.models import Role
@@ -123,7 +123,7 @@ class HarnessToolGateway:
         if type(user_id) is not UUID or not isinstance(role, Role) or self._policy_gateway is None:
             return self._failure(request, "capability identity unavailable")
         try:
-            failure = await self._authorize(tenant_id, request, user_id=user_id, role=role)
+            failure = await self._authorize(tenant_id, request, user_id=user_id, role=role, static_only=True)
         except Exception as error:  # noqa: BLE001 - admission never exposes policy internals
             error.__traceback__ = None
             error.__context__ = None
@@ -244,6 +244,9 @@ class HarnessToolGateway:
         )
         if authorization_failure is not None:
             return authorization_failure
+        from agent_hub.capabilities.python_generated_service import (
+            PythonGeneratedRecipeApprovalRequired,
+        )
         try:
             if mcp_backend is not None:
                 if type(user_id) is not UUID:
@@ -280,6 +283,20 @@ class HarnessToolGateway:
                     arguments=request.arguments,
                     idempotency_key=request.idempotency_key,
                 )
+        except PythonGeneratedRecipeApprovalRequired as error:
+            if (request.tool_name != 'project.verify' or self._policy_gateway is None
+                    or type(user_id) is not UUID or not isinstance(role, Role)):
+                return self._failure(request, 'capability authorization unavailable')
+            try:
+                expected = _capability_request(tenant_id, user_id, request)
+                selected = error.approval_request.model_copy(update={'idempotency_key': expected.idempotency_key})
+                selected = _python_recipe_authorization(selected, expected=expected)
+                decision = await self._policy_gateway.invoke(selected, role=role)
+            except Exception:  # noqa: BLE001 - only a scope-bound independent approval can follow supply.
+                return self._failure(request, 'capability authorization unavailable')
+            payload = ({'approval_id': decision.approval_id}
+                       if decision.status is CapabilityStatus.WAITING_APPROVAL and decision.approval_id is not None else {})
+            return self._failure(request, decision.reason or 'python_project_install_approval_required', payload=payload)
         except RuntimeCapabilityError as error:
             diagnostic = error.execution_diagnostic
             failure_payload: dict[str, JsonValue] | None = None
@@ -323,6 +340,7 @@ class HarnessToolGateway:
         user_id: UUID | None,
         role: Role | None,
         capability_parts: tuple[str, str, str] | None = None,
+        static_only: bool = False,
     ) -> HarnessToolCallResult | None:
         if type(user_id) is not UUID or not isinstance(role, Role):
             if self._policy_gateway is not None or self._require_actor_identity:
@@ -332,7 +350,9 @@ class HarnessToolGateway:
             return None
         admission = _capability_request(tenant_id, user_id, request, capability_parts=capability_parts)
         if request.tool_name == "project.verify" and capability_parts is None:
-            resolver = getattr(self._backend, "project_verification_authorization", None)
+            resolver = getattr(self._backend, "project_verification_static_authorization", None) if static_only else None
+            if not callable(resolver):
+                resolver = getattr(self._backend, "project_verification_authorization", None)
             if callable(resolver):
                 if request.arguments:
                     return self._failure(request, "project.verify takes no arguments")
@@ -341,12 +361,13 @@ class HarnessToolGateway:
                 try:
                     selected = await resolver(admission)
                     if selected is not None:
-                        admission = _python_recipe_authorization(selected, expected=admission)
+                        admission = _project_verification_authorization(selected, expected=admission)
                 except Exception as error:  # noqa: BLE001 - no private recipe error or fallback grant.
+                    reason = _project_authorization_failure_reason(error)
                     error.__traceback__ = None
                     error.__context__ = None
                     error.__cause__ = None
-                    return self._failure(request, "capability authorization unavailable")
+                    return self._failure(request, reason)
         decision = await self._policy_gateway.invoke(admission, role=role)
         if decision.status is CapabilityStatus.ALLOWED:
             return None
@@ -419,6 +440,58 @@ class HarnessToolGateway:
                 )
                 return "external tool tenant preparation failed"
         return None
+
+
+def _project_authorization_failure_reason(error: Exception) -> str:
+    from typing import get_args
+
+    from agent_hub.capabilities.generated_project_service import GeneratedProjectError
+    from agent_hub.capabilities.project_verification import ProjectVerificationError
+    from agent_hub.skills.sandbox.python_input_supply_protocol import SupplyError
+    from agent_hub.skills.sandbox.python_project_protocol import PythonProjectBrokerError
+
+    # A syntactically safe prefix is not a finite code: it can still carry a
+    # project-controlled token. Keep diagnostics independent of exception text.
+    allowed = {*get_args(PythonProjectBrokerError), *get_args(SupplyError),
+        'python_project_systemd_linux_unsupported', 'python_project_recipe_invalid',
+        'python_project_recipe_unsupported', 'python_project_lock_invalid',
+        'python_project_declaration_limit', 'python_project_response_invalid',
+        'python_project_install_approval_required', 'input_supply_approval_required',
+        'generated_python_project_unavailable', 'generated_acceptance_scope_changed',
+        'generated_acceptance_state_invalid', 'generated_acceptance_persistence_unavailable',
+        'generated_acceptance_unknown_no_recapture', 'generated_acceptance_unavailable_or_changed',
+        'generated_acceptance_manifest_required', 'generated_acceptance_scaffold_incomplete',
+        'generated_acceptance_python_declaration_invalid', 'generated_acceptance_node_declaration_invalid',
+        'generated_acceptance_test_execution_invalid'}
+    code = str(error)
+    if isinstance(error, (GeneratedProjectError, ProjectVerificationError)) and code in allowed:
+        return code
+    return 'capability authorization unavailable'
+
+
+def _project_verification_authorization(selected: object, *, expected: CapabilityRequest) -> CapabilityRequest:
+    if type(selected) is not CapabilityRequest or not selected.resource.startswith('workspace/current/project-inputs/'):
+        return _python_recipe_authorization(selected, expected=expected)
+    from agent_hub.capabilities.project_baselines import ProjectBaselineReference
+
+    selected = CapabilityRequest.model_validate(selected.model_dump(), strict=True)
+    match = re.fullmatch(r'workspace/current/project-inputs/python/([a-f0-9]{64})', selected.resource)
+    args = selected.arguments
+    if (any(getattr(selected, name) != getattr(expected, name)
+            for name in ('tenant_id', 'user_id', 'run_id', 'agent_id', 'idempotency_key'))
+            or (selected.capability, selected.operation) != ('command', 'run') or match is None
+            or set(args) != {'schema_version', 'plan_sha256', 'original_reference', 'project_id',
+                             'workspace_session_id', 'catalog_sha256', 'declaration_sha256',
+                             'manifest_sha256', 'lock_sha256'}
+            or type(args['schema_version']) is not int or args['schema_version'] != 1
+            or args['plan_sha256'] != match.group(1)
+            or any(type(args[name]) is not str or re.fullmatch(r'[a-f0-9]{64}', cast(str, args[name])) is None
+                   for name in ('catalog_sha256', 'declaration_sha256', 'manifest_sha256', 'lock_sha256'))
+            or any(type(args[name]) is not str or re.fullmatch(r'[a-z0-9][a-z0-9_-]{0,63}', cast(str, args[name])) is None
+                   for name in ('project_id', 'workspace_session_id'))):
+        raise ValueError('project verification authorization unavailable')
+    ProjectBaselineReference.from_payload(args['original_reference'])
+    return selected
 
 
 def _python_recipe_authorization(selected: object, *, expected: CapabilityRequest) -> CapabilityRequest:

@@ -24,6 +24,11 @@ from agent_hub.runtime.contracts import (
 from agent_hub.runtime.crew.engineering_delivery import _successful_source
 from agent_hub.runtime.crew.workspace_maintenance_delivery import _file_metadata
 from agent_hub.runtime.engineering_actions import EngineeringProgress
+from agent_hub.runtime.generated_project_history import (
+    generated_delivery_matches,
+    generated_failure_current,
+    generated_history_selected,
+)
 from agent_hub.runtime.original_project_progress import (
     original_contract_binding_matches,
     original_failure_observed,
@@ -149,6 +154,7 @@ def engineering_delivery_ready(
         return False
     writes: dict[str, tuple[str, str, int]] = {}
     verified: tuple[str, str] | None = None
+    verified_result: Mapping[str, JsonValue] = {}
     ready = False
     used: set[str] = set()
     for position, row in enumerate(tool_entries):
@@ -203,10 +209,13 @@ def engineering_delivery_ready(
                 separators=(",", ":"), ensure_ascii=True,
             ).encode("ascii")).hexdigest()
             verified = (source, receipt_sha) if source is not None and (writes or not require_write) else None
+            verified_result = result
             ready = False
         elif name == "workspace.bundle":
             ready = False
             if (verified is None or result.get("verification_source_sha256") != verified[0]
+                or generated_history_selected(context) and (
+                    context is None or not generated_delivery_matches(context, verified_result, result))
                 or not original_contract_binding_matches(context, result, verified[0])
                 or result.get("verification_receipt_sha256") != verified[1]
                 or result.get("presentation") != "final_attachment"):
@@ -277,7 +286,8 @@ def engineering_progress(
             if name != "project.verify":
                 uncertain = True
                 break
-            if python and not python_failure_current(context, result):
+            if (generated_history_selected(context) and not generated_failure_current(context, result)
+                    or python and not python_failure_current(context, result)):
                 uncertain = True
                 break
             seen, current, failed_current = True, False, True
@@ -324,8 +334,8 @@ def engineering_progress(
             seen = True
             source = _successful_source(result, context=context)
             current = source is not None and original_contract_binding_matches(context, result, source)
-            failed_current = not current and not python
-            if python and not current:
+            failed_current = not current and not python and not generated_history_selected(context)
+            if (python or generated_history_selected(context)) and not current:
                 uncertain = True
                 break
         elif name not in _READ_ONLY | {"workspace.bundle"}:

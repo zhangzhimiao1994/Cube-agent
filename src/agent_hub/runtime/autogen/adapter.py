@@ -97,6 +97,7 @@ from agent_hub.runtime.failure_reason import (
     safe_runtime_failure_reason,
 )
 from agent_hub.runtime.generated_file_recovery import reusable_generated_file_result
+from agent_hub.runtime.generated_project_guidance import generated_project_guidance
 from agent_hub.runtime.hermes_context import runtime_memory_context_text
 from agent_hub.runtime.project_prerequisite_feedback import project_prerequisite_feedback
 from agent_hub.runtime.self_repair_context import self_repair_context_text
@@ -2416,6 +2417,7 @@ class AutoGenDiscussionRuntime:
                             f"Role: {participant.role}. Goal: {participant.goal}. "
                             "Return only explicit conclusions and citations. Never reveal hidden reasoning. "
                             "Use [CONSENSUS] to vote, or [COMPLETE] only for a finished answer."
+                            + (' ' + generated_project_guidance(context) if engineering else '')
                             + (" Engineering delivery is required: use workspace.write_text to implement; "
                                "project.verify must pass install, build and test after the last change; "
                                "then workspace.bundle must deliver the current verified files. "

@@ -8,6 +8,10 @@ import re
 from collections.abc import Mapping
 
 from agent_hub.runtime.contracts import JsonValue, TaskContext
+from agent_hub.runtime.generated_project_history import (
+    generated_binding_matches,
+    generated_history_selected,
+)
 from agent_hub.runtime.python_project_history import (
     python_binding_matches,
     python_history_selected,
@@ -41,6 +45,8 @@ def python_project_inspection_declared(result: Mapping[str, JsonValue]) -> bool:
 
 
 def original_failure_observed(context: TaskContext) -> bool:
+    if generated_history_selected(context):
+        return False
     if python_history_selected(context):
         return python_original_failed(context)
     route = context.routing_decision
@@ -81,6 +87,11 @@ def original_failure_observed(context: TaskContext) -> bool:
 def original_contract_binding_matches(
     context: TaskContext | None, result: Mapping[str, JsonValue], source: str,
 ) -> bool:
+    if generated_history_selected(context):
+        assert context is not None
+        return generated_binding_matches(context, result, source)
+    if 'generated_project_acceptance' in result:
+        return False
     if context is None:
         return True
     if python_history_selected(context):

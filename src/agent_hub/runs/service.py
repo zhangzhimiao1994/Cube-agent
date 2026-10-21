@@ -676,6 +676,11 @@ class RunService:
             "execution_backend": resolved_execution_backend,
         }
         project_delivery = _project_delivery_assessment(message)
+        if (project_input is None and resolved_execution_backend == 'systemd'
+                and workspace.sandbox_profile == 'workspace_write'
+                and {'workspace.read', 'workspace.write', 'command.run'}.issubset(
+                    workspace.requested_permissions)):
+            operator_selection['generated_project_contract_version'] = 1
         if project_input is not None:
             operator_selection['project_input_contract_version'] = 1
             operator_selection['project_input'] = project_input.to_payload()

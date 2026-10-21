@@ -7,6 +7,7 @@ Only the existing trusted harness constructs commands with network authority.
 from __future__ import annotations
 
 import argparse
+import builtins
 import errno
 import hashlib
 import json
@@ -21,6 +22,7 @@ import subprocess
 import sys
 import threading
 import time
+import types
 from collections.abc import Mapping, Sequence
 from functools import cache
 from pathlib import Path
@@ -317,6 +319,34 @@ def _load_contract_mounts() -> dict[str, Any]:
     return runpy.run_path(str(Path(__file__).with_name("project_contract_mounts.py")))
 
 
+@cache
+def _load_generated_acceptance() -> dict[str, Any]:
+    # Resolve the pure parser's one shared dependency without importing the app,
+    # changing sys.path, or allowing a project-local module to satisfy the import.
+    root = Path(__file__).resolve().parents[2]
+    contracts = types.ModuleType("trusted_generated_project_contracts")
+    contracts.__dict__.update(runpy.run_path(str(root / "capabilities/project_contracts.py")))
+
+    def trusted_import(name: str, *args: Any, **kwargs: Any) -> Any:
+        if name == "agent_hub.capabilities.project_contracts":
+            return contracts
+        return builtins.__import__(name, *args, **kwargs)
+
+    return runpy.run_path(str(root / "capabilities/project_acceptance.py"),
+        init_globals={"__builtins__": {**vars(builtins), "__import__": trusted_import}})
+
+
+@cache
+def _load_node_acceptance() -> dict[str, Any]:
+    return runpy.run_path(str(Path(__file__).with_name("project_acceptance_node.py")))
+
+
+class _GeneratedExecution(NamedTuple):
+    manifest_sha256: str
+    test_files: tuple[str, ...]
+    test_ids: tuple[str, ...]
+
+
 class _ContractExecution(NamedTuple):
     payload: dict[str, Any]
     contract_sha256: str
@@ -408,6 +438,66 @@ def _read_check_contract(path: Path, expected_sha256: str, deadline: float) -> d
         return result
     except (OSError, ValueError, TypeError, RecursionError):
         raise Blocked("invalid_check_contract") from None
+
+
+def _read_generated_acceptance(
+    work_root: Path, expected_sha256: str, contract: _ContractExecution, deadline: float,
+) -> _GeneratedExecution:
+    path = work_root / "ACCEPTANCE.json"
+    try:
+        _safe_directory(path.parent)
+        ancestors = {parent: _file_identity(parent.lstat())[:3] for parent in path.parents}
+        before = path.lstat()
+        if (_is_link(before) or not stat.S_ISREG(before.st_mode) or before.st_nlink != 1
+                or not 0 < before.st_size <= 128 * 1024):
+            raise ValueError
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+                             | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0))
+        try:
+            opened = os.fstat(descriptor)
+            if _file_identity(opened) != _file_identity(before):
+                raise ValueError
+            raw = bytearray()
+            while True:
+                _remaining(deadline)
+                chunk = os.read(descriptor, min(65536, before.st_size - len(raw) + 1))
+                if not chunk:
+                    break
+                raw.extend(chunk)
+                if len(raw) > before.st_size:
+                    raise ValueError
+            if (len(raw) != before.st_size
+                    or _file_identity(os.fstat(descriptor)) != _file_identity(opened)
+                    or _file_identity(path.lstat()) != _file_identity(before)):
+                raise ValueError
+        finally:
+            os.close(descriptor)
+        _safe_directory(path.parent)
+        if any(_file_identity(parent.lstat())[:3] != identity for parent, identity in ancestors.items()):
+            raise ValueError
+        if hashlib.sha256(raw).hexdigest() != expected_sha256:
+            raise ValueError
+        manifest = _load_generated_acceptance()["parse_acceptance_manifest"](bytes(raw))
+        protected = contract.payload["protected_files"]
+        tagged = hashlib.sha256((b"x\0" if opened.st_mode & 0o111 else b"f\0") + raw).hexdigest()
+        if (manifest.stack != "node" or protected.get("ACCEPTANCE.json") != tagged
+                or not set(manifest.test_files).issubset(protected)
+                or tuple(manifest.editable_paths) != tuple(contract.payload["editable_paths"])):
+            raise ValueError
+        return _GeneratedExecution(expected_sha256, manifest.test_files, manifest.test_ids)
+    except (OSError, ValueError, TypeError, UnicodeError, RecursionError):
+        raise Blocked("generated_acceptance_manifest_invalid") from None
+
+
+def _generated_test_result(result: ProcessResult, generated: _GeneratedExecution) -> tuple[ProcessResult, dict[str, Any] | None]:
+    try:
+        proof = _load_node_acceptance()["validate_node_acceptance_output"](
+            result.stdout, generated.test_ids, result.exit_code, result.timed_out, result.output_limited)
+        return result, {**proof, "manifest_sha256": generated.manifest_sha256}
+    except ValueError:
+        return ProcessResult(result.exit_code if result.exit_code not in (0, None) else 86,
+                             result.timed_out, result.output_limited, result.stdout,
+                             "generated_acceptance_test_evidence_invalid"), None
 
 
 def _contract_command(
@@ -622,6 +712,7 @@ def run_project(
     check_contract: Path | None = None,
     original_input: Path | None = None,
     expected_contract_sha256: str | None = None,
+    generated_manifest_sha256: str | None = None,
     workspace_limit_bytes: int = 512 * 1024**2,
     file_limit: int = 10000,
 ) -> dict[str, Any]:
@@ -636,6 +727,11 @@ def run_project(
         contract: _ContractExecution | None = None
         opt_in = (check_contract is not None, original_input is not None,
                   expected_contract_sha256 is not None)
+        if generated_manifest_sha256 is not None and (
+            not all(opt_in) or type(generated_manifest_sha256) is not str
+            or re.fullmatch(r"[a-f0-9]{64}", generated_manifest_sha256) is None
+        ):
+            raise Blocked("generated_acceptance_manifest_invalid")
         if any(opt_in):
             if (not all(opt_in) or not isinstance(check_contract, Path)
                     or not isinstance(original_input, Path) or type(expected_contract_sha256) is not str):
@@ -665,6 +761,11 @@ def run_project(
                 "schema_version": 1, "contract_sha256": contract.contract_sha256,
                 "protected_sha256": contract.protected_sha256,
             }
+        generated = None
+        if generated_manifest_sha256 is not None:
+            assert contract is not None
+            generated = _read_generated_acceptance(work_root, generated_manifest_sha256,
+                                                    contract, command_deadline)
         _manifest(work_root, command_deadline)
         sandbox = _load_sandbox()
         reason = _backend_reason(sandbox)
@@ -681,9 +782,14 @@ def run_project(
             _remaining(command_deadline)
             phase = check["phase"]
             try:
-                command = _phase_command(sandbox, phase, work_root, original_contract=True) if contract is not None else (
-                    _phase_command(sandbox, phase, work_root)
-                )
+                if phase == "test" and generated is not None:
+                    inner = _load_node_acceptance()["node_acceptance_command"](
+                        generated.test_files, generated.test_ids)
+                    command = sandbox["generated_command"](inner, cwd=work_root, config={})
+                else:
+                    command = _phase_command(sandbox, phase, work_root, original_contract=True) if contract is not None else (
+                        _phase_command(sandbox, phase, work_root)
+                    )
                 if contract is None:
                     result = _run_bounded(command, cwd=work_root, deadline=command_deadline)
                 else:
@@ -691,6 +797,10 @@ def run_project(
                                                deadline=command_deadline, contract=contract)
             except OSError:
                 raise Blocked("phase_launch_unavailable") from None
+            if phase == "test" and generated is not None:
+                result, proof = _generated_test_result(result, generated)
+                if proof is not None:
+                    report["generated_test_execution"] = proof
             check.update(
                 status="passed"
                 if result.exit_code == 0 and not result.timed_out and not result.output_limited
@@ -774,12 +884,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.add_argument("--check-contract", type=Path)
         parser.add_argument("--original-input", type=Path)
         parser.add_argument("--expected-contract-sha256")
+        parser.add_argument("--generated-manifest-sha256")
         parser.add_argument('--workspace-limit-bytes', type=int, default=512 * 1024**2)
         parser.add_argument('--file-limit', type=int, default=10000)
         args = parser.parse_args(argv)
         flags = (args.check_contract is not None, args.original_input is not None,
                  args.expected_contract_sha256 is not None)
         if any(flags) and not all(flags):
+            raise InfrastructureError("invalid_arguments")
+        if args.generated_manifest_sha256 is not None and not all(flags):
             raise InfrastructureError("invalid_arguments")
         if not math.isfinite(args.timeout) or args.timeout <= 0:
             raise InfrastructureError("invalid_timeout")
@@ -790,6 +903,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "expected_contract_sha256": args.expected_contract_sha256,
                     'workspace_limit_bytes': args.workspace_limit_bytes,
                     'file_limit': args.file_limit} if all(flags) else {})
+        if args.generated_manifest_sha256 is not None:
+            options["generated_manifest_sha256"] = args.generated_manifest_sha256
         report = run_project(args.input, args.work, remaining, install_allowed=args.install_allowed,
                              **options)
         sys.stdout.buffer.write(_encode_report(report) + b"\n")

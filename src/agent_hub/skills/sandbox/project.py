@@ -245,6 +245,7 @@ def build_project_systemd_command(
     contract_path: Path | None = None,
     original_snapshot: Path | None = None,
     contract_sha256: str | None = None,
+    generated_manifest_sha256: str | None = None,
 ) -> tuple[str, ...]:
     from agent_hub.skills.sandbox.broker import _systemd_path
 
@@ -270,6 +271,13 @@ def build_project_systemd_command(
         raise ValueError("original project contract command is incomplete")
     if type(invocation) is ContractProjectInvocation and not all(item is not None for item in contract_enabled):
         raise ValueError("original project contract command is incomplete")
+    if generated_manifest_sha256 is not None and (
+        type(generated_manifest_sha256) is not str or len(generated_manifest_sha256) != 64
+        or any(char not in "0123456789abcdef" for char in generated_manifest_sha256)
+        or not all(item is not None for item in contract_enabled)
+        or type(invocation) is not ContractProjectInvocation or invocation.source_kind != "candidate"
+    ):
+        raise ValueError("generated acceptance requires a protected candidate contract")
     properties: tuple[str, ...] = (
         "DynamicUser=yes",
         f"SupplementaryGroups={policy.service_group}",
@@ -345,6 +353,8 @@ def build_project_systemd_command(
                         "--expected-contract-sha256", contract_sha256,
                         '--workspace-limit-bytes', str(invocation.workspace_limit_bytes),
                         '--file-limit', str(invocation.file_limit)))
+    if generated_manifest_sha256 is not None:
+        command.extend(("--generated-manifest-sha256", generated_manifest_sha256))
     return tuple(command)
 
 
@@ -488,6 +498,13 @@ class ProjectExecutionBroker:
                                 request.invocation.original_reference.model_dump(),
                             ), stage=job.stage, allowed_uid=self.policy.allowed_uid,
                         )
+                        generated_metadata = getattr(stored, "generated_metadata", None)
+                        if generated_metadata is not None:
+                            from agent_hub.capabilities.project_baselines import _generated_metadata
+
+                            generated_metadata = _generated_metadata(generated_metadata)
+                            if request.invocation.source_kind != "candidate":
+                                raise RuntimeError("generated_acceptance_original_credit_forbidden")
                         if request.invocation.source_kind == "original":
                             snapshot = stored.snapshot
                             digest = stored.reference.input_source_sha256
@@ -503,6 +520,8 @@ class ProjectExecutionBroker:
                             "original_snapshot": stored.snapshot,
                             "contract_sha256": stored.contract.protected_sha256,
                         }
+                        if generated_metadata is not None:
+                            contract_fields["generated_manifest_sha256"] = generated_metadata["manifest_sha256"]
                     else:
                         digest = await snapshot_project_source(
                             self.policy.project_workspace_root, invocation, destination=snapshot,

@@ -86,6 +86,7 @@ from agent_hub.skills.sandbox.base import (
 from agent_hub.skills.sandbox.docker import DockerSkillSandbox
 from agent_hub.skills.sandbox.remote import configured_remote_skill_sandboxes
 from agent_hub.skills.sandbox.systemd import SystemdSkillSandbox
+from agent_hub.subprocess_cleanup import ProcessCleanupIncomplete
 
 _SAFE_CAPABILITY_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]{0,127}$")
 _DOCX_TOOL = "document.generate_docx"
@@ -268,6 +269,7 @@ class RuntimeCapabilityGateway:
             if project_workspace_dir is not None else None
         )
         self._project_delivery_receipts: dict[tuple[UUID, UUID], tuple[str, str]] = {}
+        self._generated_delivery_bindings: dict[tuple[UUID, UUID], Mapping[str, JsonValue]] = {}
         self._project_contract_cache: OrderedDict[tuple[UUID, UUID, str], tuple[ProjectCheckContract, int]] = OrderedDict()
         self._project_contract_cache_bytes = 0
 
@@ -301,6 +303,21 @@ class RuntimeCapabilityGateway:
         if self._project_verification is None:
             return None
         return await self._project_verification.authorization_request(request)
+
+    async def project_verification_static_authorization(
+        self, request: CapabilityRequest,
+    ) -> CapabilityRequest | None:
+        getter = getattr(self._run_repository, 'get', None)
+        if callable(getter):
+            record = await getter(request.tenant_id, request.run_id)
+            routing = getattr(record, 'routing_decision', None)
+            if isinstance(routing, Mapping) and 'generated_project_contract_version' in routing:
+                if (type(routing['generated_project_contract_version']) is not int
+                        or routing['generated_project_contract_version'] != 1
+                        or 'project_input' in routing or 'project_input_contract_version' in routing):
+                    raise RuntimeCapabilityError('generated project contract is invalid')
+                return None
+        return await self.project_verification_authorization(request)
 
     def is_available(self, tenant_id: UUID, name: str) -> bool:
         normalized_name = _normalize_tool_name(name)
@@ -420,18 +437,25 @@ class RuntimeCapabilityGateway:
             if self._project_workspace_dir is None:
                 raise RuntimeCapabilityError("project inspection scope unavailable")
             try:
-                return await inspect_project(
+                observation = dict(await inspect_project(
                     repository=self._run_repository, tenant_id=tenant_id, run_id=run_id,
                     project_root=self._project_workspace_dir,
-                )
+                ))
+                observation['python_build_profile'] = await self._python_build_profile(tenant_id, run_id)
+                return observation
             except ProjectInspectionError as error:
                 raise RuntimeCapabilityError(str(error)) from None
         if normalized_name == PROJECT_VERIFY_TOOL:
+            from agent_hub.capabilities.generated_project_service import GeneratedProjectError
+            from agent_hub.capabilities.python_generated_service import (
+                PythonGeneratedRecipeApprovalRequired,
+            )
             if arguments:
                 raise RuntimeCapabilityError("project.verify takes no arguments")
             if self._project_verification is None or not self._project_executor_configured:
                 raise RuntimeCapabilityError("project execution backend is unavailable")
             self._project_delivery_receipts.pop((tenant_id, run_id), None)
+            self._generated_delivery_bindings.pop((tenant_id, run_id), None)
             try:
                 result = await self._project_verification.verify(
                     tenant_id=tenant_id, run_id=run_id, actor=actor,
@@ -443,7 +467,14 @@ class RuntimeCapabilityGateway:
                 self._project_delivery_receipts[(tenant_id, run_id)] = (
                     cast(str, receipt["source_sha256"]), receipt_digest,
                 )
+                generated_binding = result.get('generated_project_acceptance')
+                if isinstance(generated_binding, Mapping):
+                    self._generated_delivery_bindings[(tenant_id, run_id)] = generated_binding
                 return result
+            except PythonGeneratedRecipeApprovalRequired:
+                raise
+            except GeneratedProjectError as error:
+                raise RuntimeCapabilityError(str(error)) from None
             except ProjectVerificationError as error:
                 raise RuntimeCapabilityError(str(error), execution_diagnostic=error.diagnostic,
                                              project_failure=error.project_failure,
@@ -457,6 +488,33 @@ class RuntimeCapabilityGateway:
             arguments=arguments,
             idempotency_key=idempotency_key,
         )
+
+    async def _python_build_profile(self, tenant_id: UUID, run_id: UUID) -> Mapping[str, JsonValue]:
+        from agent_hub.skills.sandbox.project import ProjectInvocation
+        from agent_hub.skills.sandbox.python_project_profile import PythonProjectProfileSandbox
+
+        getter = getattr(self._run_repository, 'get', None)
+        if not callable(getter):
+            return {'status': 'unavailable'}
+        record = await getter(tenant_id, run_id)
+        project, session = authorized_workspace_scope(record, tenant_id=tenant_id, run_id=run_id)
+        invocation = ProjectInvocation(execution_id='python_profile_' + uuid4().hex, tenant_id=tenant_id,
+            run_id=run_id, project_id=project, session_id=session, sandbox_profile='restricted',
+            install_allowed=False, timeout_seconds=15)
+        try:
+            result = await PythonProjectProfileSandbox().inspect(invocation)
+        except (ValueError, OSError, TimeoutError):
+            return {'status': 'unavailable', 'readiness': 'not_probed'}
+        if not result.ok or result.profile is None:
+            return {'status': 'unavailable', 'readiness': 'not_probed', 'reason': result.error}
+        return {
+            **cast(Mapping[str, JsonValue], result.profile.model_dump(mode='json')),
+            'recipe': 'python_offline_wheel_v1', 'build_backend': 'setuptools.build_meta',
+            'requires_python': '>=3.12,<3.13', 'build_requirement_names': ('setuptools', 'wheel'),
+            'source_directory': 'src', 'test_directory': 'tests', 'test_runner': 'unittest',
+            'lock_format': 'name==version --hash=sha256:actual-catalog-digest',
+            'catalog_usage': 'Declared candidates only; select needed direct and transitive dependencies. Not an installation receipt.',
+        }
 
     def _execute_calculator(self, arguments: Mapping[str, JsonValue]) -> Mapping[str, JsonValue]:
         expression = arguments.get("expression")
@@ -782,6 +840,7 @@ class RuntimeCapabilityGateway:
         title = _optional_string(arguments, "title") or "Project Workspace"
         verified_source: str | None = None
         delivery_receipt = self._project_delivery_receipts.get((tenant_id, run_id))
+        generated_binding = self._generated_delivery_bindings.get((tenant_id, run_id))
         if self._project_executor_configured and self._project_verification is not None:
             files = store.list_files(tenant_id, project_id, session_id)
             if original_contract is not None or delivery_receipt is not None or any(
@@ -790,6 +849,9 @@ class RuntimeCapabilityGateway:
                 try:
                     verified_source = await self._project_verification.require_current_receipt(tenant_id, run_id)
                 except ProjectVerificationError as error:
+                    if generated_binding is not None:
+                        self._project_delivery_receipts.pop((tenant_id, run_id), None)
+                        self._generated_delivery_bindings.pop((tenant_id, run_id), None)
                     raise RuntimeCapabilityError(str(error)) from None
         filename = _filename(arguments, title=title, extension=".zip")
         try:
@@ -808,6 +870,22 @@ class RuntimeCapabilityGateway:
             )
         except (OSError, ValueError) as error:
             raise RuntimeCapabilityError(str(error)) from None
+        if generated_binding is not None:
+            try:
+                assert self._project_verification is not None
+                current_source = await self._project_verification.require_current_receipt(tenant_id, run_id)
+                if (current_source != verified_source
+                        or self._project_delivery_receipts.get((tenant_id, run_id)) != delivery_receipt
+                        or self._generated_delivery_bindings.get((tenant_id, run_id)) != generated_binding):
+                    raise ProjectVerificationError('project verification required before delivery')
+            except (asyncio.CancelledError, ProcessCleanupIncomplete):
+                self._project_delivery_receipts.pop((tenant_id, run_id), None)
+                self._generated_delivery_bindings.pop((tenant_id, run_id), None)
+                raise
+            except Exception:  # noqa: BLE001 - never return stale generated artifact evidence.
+                self._project_delivery_receipts.pop((tenant_id, run_id), None)
+                self._generated_delivery_bindings.pop((tenant_id, run_id), None)
+                raise RuntimeCapabilityError('project verification required before delivery') from None
         result = dict(
             _file_result(
                 artifact_id=artifact_id,
@@ -827,6 +905,8 @@ class RuntimeCapabilityGateway:
             # The receipt was issued by verify(), and _bundle_workspace checked the actual ZIP bytes.
             result["verification_source_sha256"] = verified_source
             result["verification_receipt_sha256"] = delivery_receipt[1]
+            if generated_binding is not None:
+                result['generated_project_acceptance'] = generated_binding
             if original_contract is not None and self._project_verification is not None:
                 binding = self._project_verification.original_receipt_binding(tenant_id, run_id)
                 if binding is not None:
@@ -900,6 +980,11 @@ class RuntimeCapabilityGateway:
             route = getattr(record, 'routing_decision', None)
             if not isinstance(route, Mapping):
                 return None
+            if 'generated_project_contract_version' in route or 'generated_project_preparation' in route:
+                if self._project_verification is None:
+                    raise ValueError
+                generated = await self._project_verification.generated.load(tenant_id, run_id, 'main_agent')
+                return None if generated is None else generated.stored.contract
             if ('project_input_contract_version' not in route and route.get('project_input') is None):
                 return None
             version = route.get('project_input_contract_version')

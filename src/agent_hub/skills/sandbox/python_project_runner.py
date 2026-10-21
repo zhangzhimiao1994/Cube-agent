@@ -31,6 +31,7 @@ from agent_hub.skills.sandbox.python_project_environment import (
     observe_python_project_environment,
 )
 from agent_hub.skills.sandbox.python_project_mounts import build_python_phase_mounts
+from agent_hub.skills.sandbox.python_project_phase import validate_generated_python_test_execution
 from agent_hub.skills.sandbox.python_project_process import (
     PythonPhaseProcessResult,
     python_phase_capture_limit,
@@ -78,11 +79,13 @@ class PythonProjectRunnerPlan(BaseModel):
     inputs: dict[str, object]
     source_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
     reused_environment: PythonEnvironmentReference | None = None
+    generated_manifest_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
 
     @model_validator(mode="after")
     def bound_plan(self) -> Self:
         prepared = PythonProjectInputs.from_payload(self.inputs)
         invocation = self.invocation
+        _need(self.generated_manifest_sha256 is None or invocation.source_kind == "candidate")
         _need(
             (
                 prepared.contract.tenant_id,
@@ -130,7 +133,17 @@ def python_phase_detail(
     if result.exit_code != 0 or result.timed_out or result.stdout_truncated:
         return None
     try:
-        item: object = json.loads(result.stdout)
+        def pairs(rows: list[tuple[str, object]]) -> dict[str, object]:
+            unique: dict[str, object] = {}
+            for key, value in rows:
+                _need(key not in unique)
+                unique[key] = value
+            return unique
+
+        def constant(_: str) -> object:
+            raise ValueError("python_project_runner_rejected")
+
+        item: object = json.loads(result.stdout, object_pairs_hook=pairs, parse_constant=constant)
         _need(type(item) is dict)
         assert isinstance(item, dict)
         base = {"status", "phase", "evidence"}
@@ -158,8 +171,9 @@ def python_phase_detail(
                 and 0 < wheel["size"] <= 2**63 - 1
             )
         elif phase == "test":
+            extra = {"generated_test_execution"} if "generated_test_execution" in item else set()
             _need(
-                set(item) == base | {"test_count", "import"}
+                set(item) == base | {"test_count", "import"} | extra
                 and type(item["test_count"]) is int
                 and 0 < item["test_count"] <= 2**63 - 1
                 and item["import"]
@@ -168,6 +182,10 @@ def python_phase_detail(
                     "origin": import_module.replace(".", "/") + "/__init__.py",
                 }
             )
+            if extra:
+                proof = validate_generated_python_test_execution(item["generated_test_execution"])
+                _need(proof["count"] == item["test_count"])
+                item["generated_test_execution"] = dict(proof)
         else:
             return None
         return item
@@ -304,6 +322,7 @@ def run_python_project(plan: PythonProjectRunnerPlan) -> dict[str, Any]:
     checks: list[dict[str, Any]] = []
     wheel = None
     test_count = None
+    generated_test_execution = None
     phases = ("check_environment" if initial is not None else "install", "build", "test")
     for phase in phases:
         with build_python_phase_mounts(
@@ -317,8 +336,11 @@ def run_python_project(plan: PythonProjectRunnerPlan) -> dict[str, Any]:
             import_module=inputs.declaration.import_module,
             contract_arguments=arguments,
         ) as mounts:
+            command = mounts.argv
+            if phase == "test" and plan.generated_manifest_sha256 is not None:
+                command = (*command, "--generated-manifest-sha256", plan.generated_manifest_sha256)
             result = run_python_phase(
-                mounts.argv,
+                command,
                 cwd=source,
                 deadline=deadline,
                 capture_limit_bytes=python_phase_capture_limit(invocation.output_limit_bytes),
@@ -360,6 +382,10 @@ def run_python_project(plan: PythonProjectRunnerPlan) -> dict[str, Any]:
             wheel = _wheel_actual(output, detail["wheel"], deadline=deadline)
         elif phase == "test":
             test_count = detail["test_count"]
+            generated_test_execution = detail.get("generated_test_execution")
+            _need((generated_test_execution is not None) == (plan.generated_manifest_sha256 is not None))
+            if generated_test_execution is not None:
+                _need(generated_test_execution["manifest_sha256"] == plan.generated_manifest_sha256)
     validate_contract_work(**arguments)
     exported = False
     if initial is not None:
@@ -407,6 +433,8 @@ def run_python_project(plan: PythonProjectRunnerPlan) -> dict[str, Any]:
             if plan.reused_environment is not None
             else invocation.execution_id,
         },
+        **({"generated_test_execution": generated_test_execution}
+           if generated_test_execution is not None else {}),
     }
 
 

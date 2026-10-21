@@ -36,7 +36,7 @@ from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.runs.approval_checkpoint import checkpoint_waits_for_approval
 from agent_hub.runs.context_evidence import CONTEXT_EVENT_KINDS, context_event_projection
 from agent_hub.runs.self_repair import repair_context_from_proposal
-from agent_hub.runtime.contracts import Artifact, EventKind, RunEvent, RuntimeCheckpoint
+from agent_hub.runtime.contracts import Artifact, EventKind, JsonValue, RunEvent, RuntimeCheckpoint
 from agent_hub.runtime.failure_reason import (
     RECOVERY_BLOCKED_FAILURE_REASON,
     is_public_project_prerequisite_text,
@@ -60,12 +60,18 @@ class _PythonApprovalOptions(TypedDict, total=False):
     python_input_binding: dict[str, object]
 
 
+def _has_generated_preparation(route: Mapping[str, object]) -> bool:
+    # Even malformed or mixed markers must not acquire original-input credit.
+    return bool({'generated_project_contract_version', 'generated_project_preparation'} & route.keys())
+
+
 def _pre_model_original_capture(route: Mapping[str, object]) -> bool:
     from agent_hub.capabilities.project_baselines import ProjectBaselineReference
     from agent_hub.capabilities.project_contracts import ManagedProjectInput
 
     state = route.get('project_input_preparation')
-    if (type(route.get('project_input_contract_version')) is not int
+    if (_has_generated_preparation(route)
+            or type(route.get('project_input_contract_version')) is not int
             or route.get('project_input_contract_version') != 1
             or not isinstance(state, Mapping)
             or type(state.get('schema_version')) is not int or state['schema_version'] not in {1, 2}
@@ -106,6 +112,8 @@ def _python_project_approval_binding(run: RunRow, approval_scope: object) -> dic
     from agent_hub.capabilities.scoped_read import ScopedReadError, authorized_workspace_scope
 
     route = run.routing_decision or {}
+    if 'generated_project_contract_version' in route or 'generated_project_preparation' in route:
+        return _generated_python_approval_binding(run, approval_scope, supply=False)
     state = route.get('project_input_preparation')
     if (not isinstance(run.actor_id, UUID)
             or type(route.get('project_input_contract_version')) is not int
@@ -164,10 +172,31 @@ def _python_input_supply_approval_binding(run: RunRow, approval_scope: object) -
         from agent_hub.capabilities.approvals import capability_approval_scope
         from agent_hub.capabilities.python_input_preparation import input_supply_binding
 
+        route = run.routing_decision or {}
+        if 'generated_project_contract_version' in route or 'generated_project_preparation' in route:
+            return _generated_python_approval_binding(run, approval_scope, supply=True)
         request = input_supply_binding(run)
         if capability_approval_scope(request) != approval_scope:
             return None
         return request.arguments
+    except (ValueError, TypeError, RuntimeError, LookupError):
+        return None
+
+
+def _generated_python_approval_binding(run: RunRow, scope: object, *, supply: bool) -> dict[str, object] | None:
+    from agent_hub.capabilities.approvals import capability_approval_scope
+    from agent_hub.capabilities.python_generated_service import generated_python_approval_request
+
+    try:
+        state = (run.routing_decision or {}).get('generated_project_preparation')
+        if not isinstance(state, Mapping) or not isinstance(state.get('proposer_actor'), str):
+            return None
+        request = generated_python_approval_request(run, agent_id=state['proposer_actor'],
+            idempotency_key='generated-python-binding')
+        prefix = 'workspace/current/project-inputs/python/' if supply else 'workspace/current/project-verification/python/'
+        if request is None or not request.resource.startswith(prefix) or capability_approval_scope(request) != scope:
+            return None
+        return dict(request.arguments)
     except (ValueError, TypeError, RuntimeError, LookupError):
         return None
 
@@ -711,6 +740,39 @@ class RunRepository:
         if row is None:
             raise RunNotFound("run was not found")
         return row
+
+    async def compare_and_set_generated_preparation(
+        self, tenant_id: UUID, run_id: UUID, *, actor_id: UUID, actor_role: Role,
+        lease_token: UUID, request_sha256: str, project_id: str, session_id: str,
+        expected: Mapping[str, JsonValue] | None, replacement: Mapping[str, JsonValue],
+    ) -> RunRecord:
+        from agent_hub.capabilities.generated_project_service import (
+            STATE,
+            generated_authority,
+            validate_generated_preparation,
+            validate_generated_transition,
+        )
+
+        async with self._session_factory() as session, session.begin():
+            row = await session.scalar(self._run_select(tenant_id, run_id).with_for_update())
+            if row is None:
+                raise RunNotFound('run was not found')
+            record = self._record(row)
+            authority = generated_authority(record, tenant_id, run_id)
+            if (authority.user_id != actor_id or authority.role is not actor_role
+                    or authority.lease_token != lease_token or authority.request_sha256 != request_sha256
+                    or (authority.project_id, authority.session_id) != (project_id, session_id)):
+                raise RunConflict('generated_acceptance_scope_changed')
+            route = dict(record.routing_decision or {})
+            previous = route.get(STATE)
+            normalized = None if previous is None else validate_generated_preparation(previous)
+            if normalized != expected:
+                raise RunConflict('generated_acceptance_state_changed')
+            after = validate_generated_transition(previous, replacement)
+            row.routing_decision = {**route, STATE: json.loads(json.dumps(after, default=dict))}
+            row.version += 1
+            await session.flush()
+            return self._record(row)
 
     async def update_status(
         self,
@@ -1427,6 +1489,9 @@ class RunRepository:
         *,
         approval_id: str,
     ) -> None:
+        if (_has_generated_preparation(routing_decision)
+                and routing_decision.get('approval_checkpoint_required') is not True):
+            raise RunConflict("capability approval is waiting for a durable recovery checkpoint")
         if routing_decision.get("approval_checkpoint_required") is True:
             checkpoint = await self.latest_checkpoint(
                 session, tenant_id=row.tenant_id, run_id=row.id,
@@ -1497,7 +1562,8 @@ class RunRepository:
                 cast(Mapping[str, object], routing_decision['project_input_preparation'])['schema_version'] == 1
                 or python_binding is not None
             )
-            checkpoint_required = approval_worker_token is not None and not original_capture
+            checkpoint_required = _has_generated_preparation(routing_decision) or (
+                approval_worker_token is not None and not original_capture)
             python_options: _PythonApprovalOptions = {}
             if python_binding is not None:
                 python_options['python_binding'] = python_binding
@@ -1516,7 +1582,7 @@ class RunRepository:
                 "approval_fingerprint": approval_fingerprint,
                 "approval_checkpoint_required": checkpoint_required,
                 **({"approval_checkpoint_worker_token": str(approval_worker_token)}
-                   if checkpoint_required else {}),
+                   if checkpoint_required and approval_worker_token is not None else {}),
                 "reason": "capability requires approval",
                 **({"approval_scope": approval_scope} if approval_scope else {}),
             }
@@ -1575,7 +1641,8 @@ class RunRepository:
                 raise RunConflict("run is waiting for a different approval")
             if (
                 status is RunStatus.RUNNING
-                and (routing_decision.get("approval_checkpoint_required") is True
+                and (_has_generated_preparation(routing_decision)
+                     or routing_decision.get("approval_checkpoint_required") is True
                      or (routing_decision.get("approval_checkpoint_required") is False
                          and _pre_model_original_capture(routing_decision)))
             ):

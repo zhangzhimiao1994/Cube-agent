@@ -26,11 +26,13 @@ import shutil
 import stat
 import subprocess
 import sys
+import unicodedata
 import unittest
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager, redirect_stdout
-from pathlib import Path
-from typing import BinaryIO, Never, TypedDict, cast
+from pathlib import Path, PureWindowsPath
+from types import FunctionType, MappingProxyType
+from typing import Any, BinaryIO, Never, TypedDict, cast
 
 _RUNTIME = Path('/runtime')
 _ENVIRONMENT = Path('/environment')
@@ -38,6 +40,13 @@ _WHEELHOUSE = Path('/wheelhouse')
 _WORKSPACE = Path('/workspace')
 _OUTPUT = Path('/output')
 _PHASES = ('install', 'check_environment', 'build', 'test')
+_GENERATED = 'generated_test_execution'
+_MANIFEST_LIMIT = 128 * 1024
+_CONTROL_NAMES = frozenset(name.lower() for name in (
+    'ACCEPTANCE.json', 'package.json', 'npm-shrinkwrap.json', 'package-lock.json', 'pnpm-lock.yaml',
+    'yarn.lock', 'bun.lock', 'bun.lockb', 'pyproject.toml', 'requirements.txt', 'requirements.lock',
+    'uv.lock', 'poetry.lock', 'Pipfile', 'Pipfile.lock', 'setup.py', 'setup.cfg', 'pytest.ini',
+    'tox.ini', 'conftest.py', 'AGENTS.md', 'DELIVERY_MANIFEST.json'))
 
 
 class PhaseError(RuntimeError):
@@ -206,12 +215,279 @@ def _build() -> dict[str, object]:
     return {'wheel': metadata}
 
 
-def _test(module_name: str) -> dict[str, object]:
+def _unique(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        _need(key not in result)
+        result[key] = value
+    return result
+
+
+def _nonfinite(_: str) -> object:
+    raise PhaseError('phase_failed')
+
+
+def _encoded(value: object) -> bytes:
+    return json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(',', ':'),
+                      allow_nan=False).encode('ascii')
+
+
+def _test_id(value: object) -> str:
+    _need(type(value) is str)
+    name = cast(str, value)
+    parts = name.split('.')
+    _need(len(name) <= 512 and len(parts) >= 3 and unicodedata.normalize('NFC', name) == name
+          and all(part.isidentifier() and not keyword.iskeyword(part) for part in parts))
+    return name
+
+
+def validate_generated_python_test_execution(value: object) -> Mapping[str, object]:
+    """Validate a safe projection, not provenance, authorization or a raw report.
+
+    SHA binds the raw manifest SHA and sorted exact successful unittest IDs.
+    The phase is standalone stdlib; outer callers may independently reuse this.
+    """
+    try:
+        _need(isinstance(value, Mapping) and set(value) == {
+            'schema_version', 'manifest_sha256', 'count', 'names', 'test_evidence_sha256'})
+        item = cast(Mapping[str, object], value)
+        _need(type(item['schema_version']) is int and item['schema_version'] == 1
+              and type(item['count']) is int and 1 <= item['count'] <= 1000)
+        for key in ('manifest_sha256', 'test_evidence_sha256'):
+            _need(type(item[key]) is str and re.fullmatch(r'[a-f0-9]{64}', cast(str, item[key])))
+        _need(type(item['names']) in (list, tuple))
+        rows = cast(list[object] | tuple[object, ...], item['names'])
+        _need(1 <= len(rows) <= 1000)
+        names = tuple(_test_id(name) for name in rows)
+        _need(len(names) == item['count'] and tuple(sorted(names)) == names
+              and len({name.casefold() for name in names}) == len(names))
+        core = {'schema_version': 1, 'manifest_sha256': item['manifest_sha256'],
+                'count': len(names), 'names': names}
+        _need(hashlib.sha256(_encoded(core)).hexdigest() == item['test_evidence_sha256'])
+        return MappingProxyType({**core, 'test_evidence_sha256': item['test_evidence_sha256']})
+    except (ValueError, TypeError, KeyError, RecursionError, UnicodeError, PhaseError):
+        raise ValueError('generated_python_test_execution_invalid') from None
+
+
+def _acceptance_path(value: object) -> str:
+    _need(type(value) is str)
+    path = cast(str, value)
+    _need(0 < len(path) <= 1024)
+    for part in path.split('/'):
+        _need(re.fullmatch(r'[A-Za-z0-9_.-]{1,255}', part) and part not in {'.', '..'}
+              and not part.endswith('.') and not PureWindowsPath(part).is_reserved()
+              and part.lower() not in _CONTROL_NAMES)
+    return path
+
+
+def _generated_manifest(expected_sha256: str | None) -> tuple[str, tuple[str, ...], tuple[str, ...]] | None:
+    if expected_sha256 is None:
+        return None
+    _need(type(expected_sha256) is str and re.fullmatch(r'[a-f0-9]{64}', expected_sha256) is not None)
+    path = _WORKSPACE / 'ACCEPTANCE.json'
+    with _read_regular(path, sealed_input=True) as reader:
+        raw = reader.read(_MANIFEST_LIMIT + 1)
+    _need(0 < len(raw) <= _MANIFEST_LIMIT and hashlib.sha256(raw).hexdigest() == expected_sha256)
+    item = json.loads(raw.decode('utf-8'), object_pairs_hook=_unique, parse_constant=_nonfinite)
+    _need(type(item) is dict and set(item) == {'schema_version', 'stack', 'editable_paths', 'test_files', 'criteria'}
+          and type(item['schema_version']) is int and item['schema_version'] == 1 and item['stack'] == 'python')
+    paths: dict[str, tuple[str, ...]] = {}
+    spellings: dict[str, str] = {'acceptance.json': 'ACCEPTANCE.json'}
+    for key, limit in (('editable_paths', 128), ('test_files', 256)):
+        rows = item[key]
+        _need(type(rows) is list and 1 <= len(rows) <= limit)
+        normalized = tuple(_acceptance_path(row) for row in rows)
+        _need(len(set(normalized)) == len(normalized))
+        for name in normalized:
+            parts = name.split('/')
+            _need(not any('/'.join(parts[:end]) in normalized for end in range(1, len(parts))))
+            for end in range(1, len(parts) + 1):
+                prefix = '/'.join(parts[:end])
+                _need(prefix.lower() not in spellings or spellings[prefix.lower()] == prefix)
+                spellings[prefix.lower()] = prefix
+        paths[key] = normalized
+    for test in paths['test_files']:
+        parts = test.split('/')
+        _need(len(parts) >= 2 and parts[0] == 'tests'
+              and re.fullmatch(r'test[A-Za-z0-9_]*\.py', parts[-1])
+              and all(re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', part) for part in parts[1:-1])
+              and not any(test == edit or test.startswith(edit + '/') or edit.startswith(test + '/')
+                          for edit in paths['editable_paths']))
+        for end in range(1, len(parts)):
+            _directory(_WORKSPACE.joinpath(*parts[:end]))
+        _regular(_WORKSPACE / test, sealed_input=True)
+    criteria = item['criteria']
+    _need(type(criteria) is list and 1 <= len(criteria) <= 256)
+    ids: list[str] = []
+    names: list[str] = []
+    for row in criteria:
+        _need(type(row) is dict and set(row) == {'id', 'description', 'tests'}
+              and type(row['id']) is str and re.fullmatch(r'AC-[0-9]{3}', row['id'])
+              and row['id'] != 'AC-000')
+        description = row['description']
+        _need(type(description) is str and 0 < len(description) <= 2048
+              and description.strip() == description and unicodedata.normalize('NFC', description) == description
+              and not any(unicodedata.category(c).startswith('C') for c in description))
+        _need(type(row['tests']) is list and 1 <= len(row['tests']) <= 1000)
+        ids.append(row['id'])
+        names.extend(_test_id(name) for name in row['tests'])
+        _need(len(names) <= 1000)
+    _need(len(set(ids)) == len(ids) and len({name.casefold() for name in names}) == len(names))
+    return hashlib.sha256(raw).hexdigest(), tuple(sorted(paths['test_files'])), tuple(sorted(names))
+
+
+def _generated_collector(
+    files: tuple[str, ...], expected: tuple[str, ...],
+) -> Callable[[], int]:
+    # Capture before importing installed project code. This rejects simple
+    # framework/runner replacement, not arbitrary same-process reflection.
+    importlib.import_module('unittest.mock')  # Allow this standard lazy import before pinning unittest.
+    case_type, suite_type = unittest.TestCase, unittest.TestSuite
+    loader = unittest.TestLoader()
+    get_names, case_id = unittest.TestLoader.getTestCaseNames, unittest.TestCase.id
+    runner_type, run = unittest.TextTestRunner, unittest.TextTestRunner.run
+    result_type = unittest.TextTestResult
+    case_run = case_type.run
+    _need(isinstance(case_run, FunctionType))
+    assert isinstance(case_run, FunctionType)
+    get_frame, case_run_code = sys._getframe, case_run.__code__
+    successes: list[str] = []
+    starts: list[str] = []
+    stops: list[str] = []
+    rejected: list[bool] = []
+    active: list[unittest.TestCase] = []
+    class_snapshots: list[tuple[type[unittest.TestCase], tuple[object, ...]]] = []
+
+    def class_code(target: type[unittest.TestCase]) -> tuple[object, ...]:
+        return tuple((name, id(value), id(getattr(
+            value.__func__ if isinstance(value, (classmethod, staticmethod)) else value, '__code__', None)))
+            for name, value in vars(target).items()
+            if isinstance(value, (FunctionType, classmethod, staticmethod)))
+
+    class Result(unittest.TextTestResult):
+        def startTest(self, test: unittest.TestCase) -> None:
+            check()
+            _need(not active and not set(vars(test)) & set(core_methods))
+            active.append(test)
+            starts.append(case_id(test))
+            super().startTest(test)
+
+        def stopTest(self, test: unittest.TestCase) -> None:
+            check()
+            _need(len(active) == 1 and active[0] is test)
+            stops.append(case_id(test))
+            active.clear()
+            super().stopTest(test)
+
+        def addSuccess(self, test: unittest.TestCase) -> None:
+            check()
+            _need(len(active) == 1 and active[0] is test and get_frame(1).f_code is case_run_code)
+            successes.append(case_id(test))
+            super().addSuccess(test)
+
+        def addSkip(self, test: unittest.TestCase, reason: str) -> None:
+            rejected.append(True)
+            super().addSkip(test, reason)
+
+        def addExpectedFailure(self, test: unittest.TestCase, err: Any) -> None:
+            rejected.append(True)
+            super().addExpectedFailure(test, err)
+
+        def addFailure(self, test: unittest.TestCase, err: Any) -> None:
+            rejected.append(True)
+            super().addFailure(test, err)
+
+        def addError(self, test: unittest.TestCase, err: Any) -> None:
+            rejected.append(True)
+            super().addError(test, err)
+
+        def addSubTest(self, test: unittest.TestCase, subtest: unittest.TestCase, err: Any) -> None:
+            if err is not None:
+                rejected.append(True)
+            super().addSubTest(test, subtest, err)
+
+        def addUnexpectedSuccess(self, test: unittest.TestCase) -> None:
+            rejected.append(True)
+            super().addUnexpectedSuccess(test)
+
+    targets: tuple[object, ...] = (unittest, unittest.case, unittest.suite, unittest.loader,
+        unittest.runner, unittest.result, case_type, suite_type, unittest.TestResult,
+        result_type, unittest.TestLoader, runner_type, Result, vars(unittest.case)['_Outcome'], json, hashlib)
+
+    def fingerprint() -> tuple[object, ...]:
+        entries: list[object] = []
+        for target in targets:
+            members = vars(target)
+            entries.append(tuple((name, id(value), id(value.__code__) if isinstance(value, FunctionType) else 0)
+                                 for name, value in members.items() if name != '__warningregistry__'))
+        return tuple(entries)
+
+    snapshot = fingerprint()
+
+    def check() -> None:
+        _need(fingerprint() == snapshot)
+        for target, before in class_snapshots:
+            _need(class_code(target) == before)
+
+    core = ('run', '__call__', 'id', 'countTestCases', '_callSetUp', '_callTearDown',
+            '_callTestMethod', 'doCleanups', '_callCleanup', '__getattribute__')
+    core_methods = {name: getattr(case_type, name) for name in core}
+
+    def make_result(stream: Any, descriptions: bool, verbosity: int) -> unittest.TextTestResult[Any]:
+        return Result(stream, descriptions, verbosity)
+
+    def execute() -> int:
+        check()
+        cases: list[unittest.TestCase] = []
+        sys.path.insert(0, str(_WORKSPACE / 'tests'))
+        for file in files:
+            name = file.removeprefix('tests/').removesuffix('.py').replace('/', '.')
+            _need(name not in sys.modules)
+            module = importlib.import_module(name)
+            check()
+            _need(Path(cast(str, module.__file__)).resolve(strict=True) == _WORKSPACE / file
+                  and 'load_tests' not in vars(module))
+            for value in vars(module).values():
+                if not isinstance(value, type) or not issubclass(value, case_type) or value is case_type:
+                    continue
+                if value.__module__ != name:
+                    continue
+                _need(all(getattr(value, key) is method for key, method in core_methods.items()))
+                for method in get_names(loader, value):
+                    _need(len(cases) < len(expected))
+                    case = value(method)
+                    _need(type(case) is value and not set(vars(case)) & set(core)
+                          and case._testMethodName == method)
+                    cases.append(case)
+        actual = tuple(case_id(case) for case in cases)
+        _need(len(actual) == len(expected) and tuple(sorted(actual)) == expected)
+        observed_classes: set[type[unittest.TestCase]] = set()
+        for case in cases:
+            for cls in type(case).__mro__:
+                if cls in (case_type, object):
+                    break
+                if cls not in observed_classes:
+                    observed_classes.add(cls)
+                    class_snapshots.append((cls, class_code(cls)))
+        check()
+        result = run(runner_type(stream=sys.stderr, verbosity=1, resultclass=make_result), suite_type(cases))
+        check()
+        _need(not active and not rejected and len(starts) == len(stops) == len(successes) == len(expected)
+              and tuple(sorted(starts)) == tuple(sorted(stops)) == tuple(sorted(successes)) == expected
+              and result.testsRun == len(expected) and result.wasSuccessful()
+              and not result.skipped and not result.expectedFailures and not result.unexpectedSuccesses)
+        return len(expected)
+    return execute
+
+
+def _test(module_name: str, *, generated_manifest_sha256: str | None = None) -> dict[str, object]:
     _environment_interpreter()
     site = _OUTPUT / 'project-site'
     tests = _WORKSPACE / 'tests'
     _directory(site)
     _directory(tests)
+    generated = _generated_manifest(generated_manifest_sha256)
+    collect = None if generated is None else _generated_collector(generated[1], generated[2])
     previous = sys.path[:]
     try:
         parts = module_name.split('.')
@@ -225,16 +501,26 @@ def _test(module_name: str) -> dict[str, object]:
         resolved = Path(cast(str, origin)).resolve(strict=True)
         _need(resolved.is_relative_to(site))
         relative_origin = resolved.relative_to(site).as_posix()
-        suite = unittest.TestLoader().discover(start_dir=str(tests), pattern='test*.py',
-                                              top_level_dir=str(tests))
-        count = suite.countTestCases()
-        _need(count > 0)
-        result = unittest.TextTestRunner(stream=sys.stderr, verbosity=1).run(suite)
-        _need(result.testsRun == count and result.wasSuccessful())
+        if collect is not None:
+            count = collect()
+            _need(sys.modules.get(module_name) is imported)
+        else:
+            suite = unittest.TestLoader().discover(start_dir=str(tests), pattern='test*.py',
+                                                  top_level_dir=str(tests))
+            count = suite.countTestCases()
+            _need(count > 0)
+            result = unittest.TextTestRunner(stream=sys.stderr, verbosity=1).run(suite)
+            _need(result.testsRun == count and result.wasSuccessful())
+            count = result.testsRun
     finally:
         sys.path[:] = previous
-    return {'test_count': result.testsRun,
-            'import': {'module': module_name, 'origin': relative_origin}}
+    detail: dict[str, object] = {'test_count': count,
+        'import': {'module': module_name, 'origin': relative_origin}}
+    if generated is not None:
+        core = {'schema_version': 1, 'manifest_sha256': generated[0], 'count': count, 'names': generated[2]}
+        projection = {**core, 'test_evidence_sha256': hashlib.sha256(_encoded(core)).hexdigest()}
+        detail[_GENERATED] = dict(validate_generated_python_test_execution(projection))
+    return detail
 
 
 @contextmanager
@@ -258,11 +544,13 @@ def _phase_output() -> Iterator[None]:
                 os.close(saved)
 
 
-def run_phase(phase: str, *, import_module: str) -> dict[str, object]:
+def run_phase(phase: str, *, import_module: str,
+              generated_manifest_sha256: str | None = None) -> dict[str, object]:
     """Execute a fixed phase; callers must supply the real sandbox externally."""
     _isolation_guard()
     try:
         _selection(phase, import_module)
+        _need(generated_manifest_sha256 is None or phase == 'test')
         _mounts()
         sys.dont_write_bytecode = True
         with _phase_output():
@@ -275,7 +563,7 @@ def run_phase(phase: str, *, import_module: str) -> dict[str, object]:
             elif phase == 'build':
                 metadata = _build()
             else:
-                metadata = _test(import_module)
+                metadata = _test(import_module, generated_manifest_sha256=generated_manifest_sha256)
         return {'phase': phase, 'evidence': 'native_process_only', **metadata}
     except Exception:  # noqa: BLE001 - never expose backend/process exception text.
         raise PhaseError('phase_failed') from None
@@ -293,9 +581,11 @@ def main(argv: list[str] | None = None) -> int:
         parser = _Parser(add_help=False, allow_abbrev=False)
         parser.add_argument('phase', choices=_PHASES)
         parser.add_argument('--import-module', required=True)
+        parser.add_argument('--generated-manifest-sha256')
         args = parser.parse_args(argv)
         _selection(args.phase, args.import_module)
-        metadata = run_phase(args.phase, import_module=args.import_module)
+        metadata = run_phase(args.phase, import_module=args.import_module,
+            generated_manifest_sha256=args.generated_manifest_sha256)
     except (Exception, SystemExit, KeyboardInterrupt):  # noqa: BLE001 - CLI fails closed.
         print(json.dumps({'status': 'failed', 'error': 'phase_failed'}))
         return 1

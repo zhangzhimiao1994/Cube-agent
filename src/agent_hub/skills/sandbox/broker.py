@@ -40,6 +40,9 @@ if TYPE_CHECKING:
         PythonInputSupplyRequest,
         PythonInputSupplyResponse,
     )
+    from agent_hub.skills.sandbox.python_project_profile import (
+        PythonProjectProfileResponse,
+    )
     from agent_hub.skills.sandbox.python_project_protocol import (
         PythonProjectBrokerRequest,
         PythonProjectBrokerResponse,
@@ -562,6 +565,10 @@ async def _serve_client(
         PythonInputSupplyRequest,
         PythonInputSupplyResponse,
     )
+    from agent_hub.skills.sandbox.python_project_profile import (
+        PythonProjectProfileResponse,
+        dispatch_profile_request,
+    )
     from agent_hub.skills.sandbox.python_project_protocol import (
         PythonProjectBrokerRequest,
         PythonProjectBrokerResponse,
@@ -572,14 +579,23 @@ async def _serve_client(
 
     is_project = False
     is_supply = False
+    is_profile = False
     supply_request: PythonInputSupplyRequest | None = None
     python_request: PythonProjectBrokerRequest | PythonProjectProbeRequest | PythonProjectInspectEnvironmentRequest | PythonProjectReleaseEnvironmentRequest | None = None
-    response: BrokerResponse | PythonProjectBrokerResponse | PythonInputSupplyResponse
+    response: BrokerResponse | PythonProjectBrokerResponse | PythonInputSupplyResponse | PythonProjectProfileResponse
     try:
         peer_uid = _peer_uid(writer)
         payload = await _read_frame(reader, _MAX_REQUEST_BYTES)
         envelope = json.loads(payload)
         if isinstance(envelope, dict) and (
+            type(envelope.get('version')) is int and envelope['version'] == 6
+            or envelope.get('action') == 'inspect_python_project_profile'
+        ):
+            is_profile = True
+            if peer_uid != broker._policy.allowed_uid:
+                raise BrokerRequestError('caller uid is not authorized')
+            response = PythonProjectProfileResponse.model_validate_json(dispatch_profile_request(payload), strict=True)
+        elif isinstance(envelope, dict) and (
             type(envelope.get("version")) is int and envelope["version"] == 5
             or isinstance(envelope.get("action"), str) and envelope["action"] in {
                 "plan_python_project_inputs", "supply_python_project_inputs",
@@ -641,7 +657,8 @@ async def _serve_client(
                 error="input_supply_unavailable")
         else:
             response = BrokerResponse(ok=False,
-                error="input_supply_request_invalid" if is_supply else str(error))
+                error='python_project_profile_request_invalid' if is_profile else
+                    "input_supply_request_invalid" if is_supply else str(error))
     try:
         await _write_frame(writer, response.model_dump_json().encode("utf-8"))
     finally:

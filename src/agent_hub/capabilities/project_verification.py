@@ -27,6 +27,7 @@ from agent_hub.skills.sandbox.base import SkillResult
 from agent_hub.subprocess_cleanup import ProcessCleanupIncomplete
 
 if TYPE_CHECKING:
+    from agent_hub.capabilities.generated_project_service import GeneratedProjectContext
     from agent_hub.capabilities.project_baselines import (
         ProjectBaselineReference,
         StoredProjectBaseline,
@@ -280,9 +281,18 @@ class _OriginalScope:
                 'baseline_observation_sha256': self.observation_sha256, 'candidate_source_sha256': source}
 
 
+@dataclass(frozen=True, slots=True)
+class _GeneratedReceipt:
+    context: GeneratedProjectContext
+    source_sha256: str
+    actor: str
+
+
 class ProjectVerificationService:
     def __init__(self, *, root: Path, repository: object, executor: ProjectExecutor | None,
                  python_executor: PythonProjectExecutor | None = None) -> None:
+        from agent_hub.capabilities.generated_project_service import GeneratedProjectService
+        from agent_hub.capabilities.python_generated_service import PythonGeneratedProjectService
         from agent_hub.capabilities.python_project_service import PythonProjectService
         self.root = root
         self.repository = repository
@@ -290,8 +300,17 @@ class ProjectVerificationService:
         self._receipts: dict[tuple[UUID, UUID], tuple[ProjectInvocation, str]] = {}
         self._original_receipts: dict[tuple[UUID, UUID], Mapping[str, JsonValue]] = {}
         self._python = PythonProjectService(self, python_executor)
+        self.generated = GeneratedProjectService(root=root, repository=repository)
+        self._python_generated = PythonGeneratedProjectService(self, self.generated, python_executor)
+        self._generated_receipts: dict[tuple[UUID, UUID], _GeneratedReceipt] = {}
 
     async def authorization_request(self, request: CapabilityRequest) -> CapabilityRequest | None:
+        generated = await self.generated.prepare(request.tenant_id, request.run_id, request.agent_id,
+                                                 user_id=request.user_id)
+        if generated is not None:
+            if generated.envelope.manifest.stack == 'python':
+                return await self._python_generated.authorization_request(request, generated)
+            return None
         return await self._python.authorization_request(request)
 
     async def prepare_python_original(
@@ -405,7 +424,9 @@ class ProjectVerificationService:
                         'execution_diagnostic': error.diagnostic.to_payload(),
                         'original_check_contract': binding}
             return {'schema_version': 1, 'status': 'passed', 'verification': receipt,
-                    'original_check_contract': binding}
+                    'original_check_contract': binding,
+                    **({'generated_test_execution': report['generated_test_execution']}
+                       if stored.generated_metadata is not None and 'generated_test_execution' in report else {})}
         except (ProjectVerificationError, ProcessCleanupIncomplete):
             raise
         except Exception:  # noqa: BLE001 - unexpected executor output cannot become a native observation.
@@ -497,6 +518,40 @@ class ProjectVerificationService:
         self._receipts.pop(key, None)
         self._original_receipts.pop(key, None)
         self._python.receipts.pop(key, None)
+        self._generated_receipts.pop(key, None)
+        self._python_generated.receipts.pop(key, None)
+        from agent_hub.capabilities.generated_project_service import (
+            generated_authority,
+            generated_selected,
+            generated_verification_binding,
+        )
+        getter = getattr(self.repository, 'get', None)
+        if not callable(getter):
+            raise ProjectVerificationError('project verification scope is not authorized')
+        record = await getter(tenant_id, run_id)
+        if generated_selected(record):
+            authority = generated_authority(record, tenant_id, run_id)
+            context = await self.generated.prepare(tenant_id, run_id, actor, user_id=authority.user_id)
+            if context is None:
+                raise ProjectVerificationError('generated_acceptance_unavailable_or_changed')
+            if context.envelope.manifest.stack == 'python':
+                return await self._python_generated.verify(context, actor)
+            invocation = await self._invocation(tenant_id, run_id, actor)
+            await self._current_generated(context, actor)
+            generated_result = await self._run_original_contract(invocation, context.stored, original=False)
+            generated_receipt = dict(cast(Mapping[str, JsonValue], generated_result['verification']))
+            source = cast(str, generated_receipt['source_sha256'])
+            evidence = generated_result.get('generated_test_execution')
+            if not isinstance(evidence, Mapping):
+                raise ProjectVerificationError('generated_acceptance_test_evidence_missing')
+            binding = generated_verification_binding(context, source, evidence)
+            await self._invocation(tenant_id, run_id, actor)
+            await self._current_generated(context, actor)
+            generated_receipt['generated_acceptance_sha256'] = context.envelope.sha256
+            self._receipts[key] = (invocation, source)
+            self._generated_receipts[key] = _GeneratedReceipt(context, source, actor)
+            return {'verification': generated_receipt, 'generated_project_acceptance': binding,
+                    'summary': 'Generated acceptance criteria, dependencies, build and named tests verified in isolation.'}
         python = await self._python.select(tenant_id, run_id, actor)
         if python is not None:
             return await self._python.verify(python, actor)
@@ -531,9 +586,35 @@ class ProjectVerificationService:
         self._receipts[key] = (invocation, current)
         return {"verification": receipt, "summary": "Dependencies, build and tests verified in isolation."}
 
+    async def _current_generated(self, expected: GeneratedProjectContext, actor: str) -> None:
+        current = await self.generated.load(expected.authority.tenant_id, expected.authority.run_id, actor)
+        if (current is None or current.authority != expected.authority or current.state != expected.state
+                or current.envelope.sha256 != expected.envelope.sha256):
+            raise ProjectVerificationError('generated_acceptance_scope_changed')
+
     async def require_current_receipt(self, tenant_id: UUID, run_id: UUID) -> str:
         from agent_hub.skills.sandbox.project import project_source_fingerprint
 
+        if (tenant_id, run_id) in self._python_generated.receipts:
+            return await self._python_generated.require_current(tenant_id, run_id)
+        generated = self._generated_receipts.get((tenant_id, run_id))
+        if generated is not None:
+            try:
+                invocation = await self._invocation(tenant_id, run_id, generated.actor)
+                await self._current_generated(generated.context, generated.actor)
+                if await project_source_fingerprint(self.root, invocation) != generated.source_sha256:
+                    raise ValueError
+                await self._invocation(tenant_id, run_id, generated.actor)
+                await self._current_generated(generated.context, generated.actor)
+                return generated.source_sha256
+            except (asyncio.CancelledError, ProcessCleanupIncomplete):
+                self._generated_receipts.pop((tenant_id, run_id), None)
+                self._receipts.pop((tenant_id, run_id), None)
+                raise
+            except Exception:  # noqa: BLE001 - revoked or stale generated proof cannot authorize delivery.
+                self._generated_receipts.pop((tenant_id, run_id), None)
+                self._receipts.pop((tenant_id, run_id), None)
+                raise ProjectVerificationError('project verification required before delivery') from None
         if (tenant_id, run_id) in self._python.receipts:
             return await self._python.require_current(tenant_id, run_id)
         record = self._receipts.get((tenant_id, run_id))

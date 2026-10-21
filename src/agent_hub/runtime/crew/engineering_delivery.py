@@ -14,6 +14,12 @@ from agent_hub.runtime.crew.workspace_maintenance_delivery import (
     maintenance_delivery_ready,
 )
 from agent_hub.runtime.engineering_actions import EngineeringProgress
+from agent_hub.runtime.generated_project_history import (
+    generated_delivery_matches,
+    generated_failure_current,
+    generated_history_selected,
+    generated_success_source,
+)
 from agent_hub.runtime.original_project_progress import (
     original_contract_binding_matches,
     original_failure_observed,
@@ -98,7 +104,9 @@ def engineering_action_progress(
             source = _successful_source(result, context=context)
             verified = (status == 'succeeded' and source is not None
                         and original_contract_binding_matches(context, result, source))
-            failed = (status == 'failed' and (python_failure_current(context, result) if python
+            failed = (status == 'failed' and (generated_failure_current(context, result)
+                                             if generated_history_selected(context)
+                                             else python_failure_current(context, result) if python
                                              else result.get('status') == 'failed'))
             if not verified and not failed:
                 return uncertain
@@ -124,6 +132,11 @@ def _trusted_result(key: str, row: Mapping[str, JsonValue], actor: str,
 
 
 def _successful_source(result: Mapping[str, JsonValue], *, context: TaskContext | None = None) -> str | None:
+    if generated_history_selected(context):
+        assert context is not None
+        return generated_success_source(context, result)
+    if 'generated_project_acceptance' in result:
+        return None
     if context is not None and python_history_selected(context):
         return python_success_source(context, result)
     receipt = result.get("verification")
@@ -190,6 +203,7 @@ def engineering_delivery_ready(
         return False
     wrote = not require_write
     verified: tuple[Position, str, str] | None = None
+    verified_result: Mapping[str, JsonValue] = {}
     ready = False
     for position, key, row in sorted(rows):
         if key in superseded_bundles:
@@ -214,9 +228,12 @@ def engineering_delivery_ready(
                     separators=(",", ":"), ensure_ascii=True,
                 ).encode("ascii")).hexdigest()
                 verified = (position, source, digest) if source is not None and wrote else None
+                verified_result = result
                 ready = False
             else:
                 ready = (verified is not None and verified[0] < position
+                         and (not generated_history_selected(context)
+                              or context is not None and generated_delivery_matches(context, verified_result, result))
                          and original_contract_binding_matches(context, result, verified[1])
                          and result.get("verification_source_sha256") == verified[1]
                          and result.get("verification_receipt_sha256") == verified[2]
