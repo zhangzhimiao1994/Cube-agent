@@ -244,6 +244,7 @@ class HarnessToolGateway:
         )
         if authorization_failure is not None:
             return authorization_failure
+        from agent_hub.capabilities.generated_project_service import GeneratedProjectDraftRejected
         from agent_hub.capabilities.python_generated_service import (
             PythonGeneratedRecipeApprovalRequired,
         )
@@ -283,6 +284,11 @@ class HarnessToolGateway:
                     arguments=request.arguments,
                     idempotency_key=request.idempotency_key,
                 )
+        except GeneratedProjectDraftRejected as error:
+            draft = (_generated_draft_payload(error, tenant_id=tenant_id, user_id=user_id, request=request)
+                     if type(user_id) is UUID and isinstance(role, Role) else None)
+            return self._failure(request, 'generated project draft requires correction' if draft is not None
+                                 else 'capability authorization unavailable', payload=draft)
         except PythonGeneratedRecipeApprovalRequired as error:
             if (request.tool_name != 'project.verify' or self._policy_gateway is None
                     or type(user_id) is not UUID or not isinstance(role, Role)):
@@ -363,6 +369,10 @@ class HarnessToolGateway:
                     if selected is not None:
                         admission = _project_verification_authorization(selected, expected=admission)
                 except Exception as error:  # noqa: BLE001 - no private recipe error or fallback grant.
+                    draft = None if static_only else _generated_draft_payload(
+                        error, tenant_id=tenant_id, user_id=user_id, request=request)
+                    if draft is not None:
+                        return self._failure(request, 'generated project draft requires correction', payload=draft)
                     reason = _project_authorization_failure_reason(error)
                     error.__traceback__ = None
                     error.__context__ = None
@@ -440,6 +450,32 @@ class HarnessToolGateway:
                 )
                 return "external tool tenant preparation failed"
         return None
+
+
+def _generated_draft_payload(
+    error: Exception, *, tenant_id: UUID, user_id: UUID, request: HarnessToolCallRequest,
+) -> Mapping[str, JsonValue] | None:
+    import hashlib
+
+    from agent_hub.capabilities.generated_project_draft import (
+        GeneratedDraftRejection,
+        validated_generated_draft_payload,
+    )
+    from agent_hub.capabilities.generated_project_service import GeneratedProjectDraftRejected
+
+    observation = getattr(error, 'rejection', None)
+    if (type(error) is not GeneratedProjectDraftRejected or type(observation) is not GeneratedDraftRejection
+            or request.tool_name != 'project.verify' or request.arguments or request.sandbox != 'workspace_write'):
+        return None
+    try:
+        rejection = validated_generated_draft_payload(observation.to_payload())
+    except (ValueError, TypeError, KeyError, AttributeError, RecursionError, OverflowError):
+        return None
+    if (rejection is None or rejection['tenant_id'] != str(tenant_id) or rejection['run_id'] != str(request.run_id)
+            or rejection['user_id'] != str(user_id) or rejection['proposer_actor'] != request.actor):
+        return None
+    return {'generated_draft_rejection': rejection, 'call_id': request.call_id,
+        'arguments_sha256': hashlib.sha256(b'{}').hexdigest()}
 
 
 def _project_authorization_failure_reason(error: Exception) -> str:

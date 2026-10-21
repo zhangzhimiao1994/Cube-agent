@@ -96,6 +96,11 @@ from agent_hub.runtime.failure_reason import (
     safe_model_gateway_failure_reason,
     safe_runtime_failure_reason,
 )
+from agent_hub.runtime.generated_draft_feedback import (
+    REJECTION_REASON,
+    generated_draft_feedback,
+    generated_draft_history_feedback,
+)
 from agent_hub.runtime.generated_file_recovery import reusable_generated_file_result
 from agent_hub.runtime.generated_project_guidance import generated_project_guidance
 from agent_hub.runtime.hermes_context import runtime_memory_context_text
@@ -119,6 +124,7 @@ _MAX_SOURCE_ARTIFACT_TEXT_BYTES = 4_096
 _ARTIFACT_CLEANUP_GRACE_SECONDS = 0.5
 _AUTOGEN_STREAM_POLL_SECONDS = 1.0
 _AUTOGEN_SHUTDOWN_GRACE_SECONDS = 2.0
+_GENERATED_DRAFT_NO_PROGRESS = "generated draft correction made no progress"
 
 
 @dataclass(frozen=True, slots=True)
@@ -401,6 +407,8 @@ class _DiscussionDurability:
         *,
         tool_names: Mapping[str, str] | None = None,
     ) -> GatewayCompletion | None:
+        if self.failure_reason == _GENERATED_DRAFT_NO_PROGRESS:
+            raise RuntimeExecutionError(_GENERATED_DRAFT_NO_PROGRESS)
         await self._model_lock.acquire()
         request_hash = self.request_hash(request, tool_names=tool_names)
         try:
@@ -489,7 +497,10 @@ class _DiscussionDurability:
         name: str,
         arguments_hash: str,
         replay_safe: bool,
+        server_context: TaskContext | None = None,
     ) -> tuple[Mapping[str, JsonValue] | None, str]:
+        if self.failure_reason == _GENERATED_DRAFT_NO_PROGRESS:
+            raise RuntimeExecutionError(_GENERATED_DRAFT_NO_PROGRESS)
         position = self._tool_cursor
         idempotency_key = hashlib.sha256(
             f"{self._context_run_id}:{actor}:{position}:{name}:{arguments_hash}".encode()
@@ -507,7 +518,11 @@ class _DiscussionDurability:
                 raise RuntimeExecutionError("durable capability request mismatch")
             status = entry.get("status")
             if status == "running":
-                if not replay_safe:
+                generated_verify = (
+                    name == "project.verify" and server_context is not None
+                    and "generated_project_contract_version" in server_context.routing_decision
+                )
+                if not replay_safe or generated_verify:
                     self.failure_reason = "tool_outcome_uncertain"
                     self.failure_payload = {}
                     raise ToolOutcomeUncertain("capability outcome is uncertain")
@@ -520,7 +535,12 @@ class _DiscussionDurability:
             result = artifact.content.get("result")
             if not isinstance(result, Mapping):
                 raise RuntimeExecutionError("durable capability result is invalid")
-            if status == "failed" and _execution_failure_result(result, tool_name=name) != result:
+            draft = "generated_draft_rejection" in result
+            if draft and (status != "failed" or _generated_draft_artifact_feedback(
+                artifact, context=server_context, actor=actor,
+            ) != result):
+                raise RuntimeExecutionError("durable generated draft failure evidence is invalid")
+            if status == "failed" and not draft and _execution_failure_result(result, tool_name=name) != result:
                 raise RuntimeExecutionError("durable capability failure evidence is invalid")
             self._tool_cursor += 1
             return result, idempotency_key
@@ -706,7 +726,13 @@ def _tool_sandbox(
     *,
     sandbox_profile: str | None = None,
     arguments: Mapping[str, JsonValue] | None = None,
+    routing_decision: Mapping[str, JsonValue] | None = None,
 ) -> str:
+    if (name == 'project.verify' and routing_decision is not None
+            and type(routing_decision.get('generated_project_contract_version')) is int
+            and routing_decision.get('generated_project_contract_version') == 1
+            and _routing_sandbox_profile(routing_decision) == 'workspace_write'):
+        return 'workspace_write'
     if name in {"workspace.write_text", "workspace.bundle"}:
         return "workspace_write" if sandbox_profile == "workspace_write" else "restricted"
     if (
@@ -1299,7 +1325,7 @@ def _execution_failure_result(
     payload: object, *, tool_name: object = None,
 ) -> Mapping[str, JsonValue] | None:
     """Accept only the bounded F01 receipt supplied by the trusted tool gateway."""
-    if not isinstance(payload, Mapping) or "approval_id" in payload:
+    if not isinstance(payload, Mapping) or {"approval_id", "generated_draft_rejection"} & payload.keys():
         return None
     if "python_verification_failure" in payload:
         from agent_hub.runtime.python_project_history import python_failure_feedback
@@ -1349,6 +1375,81 @@ def _execution_failure_result(
             return None
         result["verification_failure"] = report
     return result
+
+
+def _generated_draft_artifact_feedback(
+    artifact: Artifact, *, context: TaskContext | None, actor: str,
+    call_id: str | None = None,
+) -> Mapping[str, JsonValue] | None:
+    """Rebind stored pre-capture data without promoting it to an execution receipt."""
+    content = artifact.content
+    result = content.get("result")
+    stored_call = content.get("call_id")
+    if (
+        context is None or artifact.type != "tool_result" or artifact.producer != actor
+        or artifact.recompute_content_sha256() != artifact.content_sha256
+        or set(content) != {"result", "tool_name", "arguments_sha256", "call_id"}
+        or content["tool_name"] != "project.verify"
+        or content["arguments_sha256"] != hashlib.sha256(b"{}").hexdigest()
+        or type(stored_call) is not str or (call_id is not None and stored_call != call_id)
+        or not isinstance(result, Mapping)
+        or set(result) != {"status", "untrusted", "generated_draft_rejection"}
+        or result["status"] != "failed" or result["untrusted"] is not True
+    ):
+        return None
+    try:
+        request = HarnessToolCallRequest(
+            run_id=context.run_id, actor=actor, tool_name="project.verify", arguments={},
+            sandbox="workspace_write", approval_required=True,
+            idempotency_key="historical-draft-observation", call_id=stored_call,
+        )
+        feedback = generated_draft_history_feedback(HarnessToolCallResult(
+            call_id=stored_call, tool_name="project.verify", status="failed",
+            failure_reason=REJECTION_REASON, payload={
+                "generated_draft_rejection": result["generated_draft_rejection"],
+                "call_id": stored_call, "arguments_sha256": content["arguments_sha256"],
+            },
+        ), context=context, request=request)
+    except (TypeError, ValueError):
+        return None
+    return feedback if feedback == result else None
+
+
+def _draft_observation_repeated(
+    artifact: Artifact, artifacts: Sequence[Artifact], *, context: TaskContext,
+) -> bool:
+    feedback = _generated_draft_artifact_feedback(artifact, context=context, actor=artifact.producer)
+    if feedback is None:
+        return False
+    rejection = cast(Mapping[str, JsonValue], feedback["generated_draft_rejection"])
+    for previous in artifacts:
+        if previous.id == artifact.id:
+            break
+        observed = _generated_draft_artifact_feedback(previous, context=context, actor=previous.producer)
+        if observed is not None and cast(Mapping[str, JsonValue], observed["generated_draft_rejection"])[
+            "observation_sha256"
+        ] == rejection["observation_sha256"]:
+            return True
+    return False
+
+
+def _recoverable_tool_failure(
+    event: RunEvent, *, context: TaskContext, artifacts: Sequence[Artifact],
+) -> bool:
+    for artifact in artifacts:
+        if (str(artifact.id) != event.payload.get("artifact_id")
+                or artifact.producer != event.actor
+                or artifact.content.get("tool_name") != event.tool_name):
+            continue
+        if _execution_failure_result(artifact.content.get("result"), tool_name=event.tool_name) is not None:
+            return True
+        return (
+            _generated_draft_artifact_feedback(
+                artifact, context=context, actor=event.actor, call_id=event.tool_call_id,
+            ) is not None
+            and not _draft_observation_repeated(artifact, artifacts, context=context)
+        )
+    return False
 
 
 class GatewayCapabilityTool(BaseTool[_DynamicToolArguments, _DynamicToolResult]):
@@ -1477,12 +1578,14 @@ class GatewayCapabilityTool(BaseTool[_DynamicToolArguments, _DynamicToolResult])
             self.name,
             sandbox_profile=self._sandbox_profile,
             arguments=cast(Mapping[str, JsonValue], arguments),
+            routing_decision=None if self._server_context is None else self._server_context.routing_decision,
         )
         replayed, idempotency_key = await self._durability.before_tool(
             actor=self._actor,
             name=self.name,
             arguments_hash=arguments_hash,
             replay_safe=replay_safe,
+            server_context=self._server_context,
         )
         self._records.append(
             _ToolRecord(
@@ -1500,7 +1603,8 @@ class GatewayCapabilityTool(BaseTool[_DynamicToolArguments, _DynamicToolResult])
             )
         )
         if replayed is not None:
-            failed = _execution_failure_result(replayed, tool_name=self.name) == replayed
+            draft = "generated_draft_rejection" in replayed
+            failed = draft or _execution_failure_result(replayed, tool_name=self.name) == replayed
             artifact = next((
                 item for item in self._durability.artifacts
                 if item.producer == self._actor
@@ -1510,6 +1614,10 @@ class GatewayCapabilityTool(BaseTool[_DynamicToolArguments, _DynamicToolResult])
             ), None) if failed else None
             if failed and artifact is None:
                 raise RuntimeExecutionError("durable capability failure evidence is unavailable")
+            if draft and (artifact is None or _generated_draft_artifact_feedback(
+                artifact, context=self._server_context, actor=self._actor, call_id=safe_call_id,
+            ) != replayed):
+                raise RuntimeExecutionError("durable generated draft failure evidence is invalid")
             artifact = artifact or Artifact(
                 id=uuid4(),
                 type="tool_result",
@@ -1538,6 +1646,11 @@ class GatewayCapabilityTool(BaseTool[_DynamicToolArguments, _DynamicToolResult])
                 )
             )
             if failed:
+                if (draft and self._server_context is not None
+                        and _draft_observation_repeated(artifact, self._durability.artifacts,
+                                                      context=self._server_context)):
+                    self._durability.failure_reason = _GENERATED_DRAFT_NO_PROGRESS
+                    raise RuntimeExecutionError(_GENERATED_DRAFT_NO_PROGRESS)
                 raise _ExecutionObservationError(replayed)
             return _DynamicToolResult(result=cast(dict[str, object], _mutable_json(replayed)))
         try:
@@ -1607,11 +1720,37 @@ class GatewayCapabilityTool(BaseTool[_DynamicToolArguments, _DynamicToolResult])
                 )
             )
             raise RuntimeExecutionError("capability outcome is uncertain") from None
-        if tool_result.status != "succeeded":
+        has_draft = "generated_draft_rejection" in tool_result.payload
+        draft_feedback = (
+            generated_draft_feedback(tool_result, context=self._server_context, request=tool_request)
+            if has_draft and self._server_context is not None else None
+        )
+        if draft_feedback is not None:
+            artifact = Artifact(
+                id=uuid4(), type="tool_result", producer=self._actor,
+                content={"result": draft_feedback, "tool_name": self.name,
+                         "arguments_sha256": arguments_hash, "call_id": safe_call_id},
+            )
+            await self._durability.fail_tool(artifact)
+            self._records.append(_ToolRecord(
+                EventKind.TOOL_FAILED, self._actor, safe_call_id, self.name,
+                payload=safe_tool_event_payload(
+                    name=self.name, status="failed", result=draft_feedback,
+                    artifact_id=str(artifact.id), replay_safe=replay_safe,
+                    failure_kind="capability_failed",
+                ), reason=REJECTION_REASON,
+            ))
+            assert self._server_context is not None
+            if _draft_observation_repeated(artifact, self._durability.artifacts, context=self._server_context):
+                self._durability.failure_reason = _GENERATED_DRAFT_NO_PROGRESS
+                raise RuntimeExecutionError(_GENERATED_DRAFT_NO_PROGRESS)
+            raise _ExecutionObservationError(draft_feedback)
+        if tool_result.status != "succeeded" or has_draft:
             execution_failure = (
                 _execution_failure_result(tool_result.payload, tool_name=self.name)
                 if tool_result.call_id == tool_request.call_id
                 and tool_result.tool_name == self.name and not tool_result.truncated
+                and not has_draft
                 else None
             )
             if execution_failure is not None:
@@ -2418,6 +2557,17 @@ class AutoGenDiscussionRuntime:
                             "Return only explicit conclusions and citations. Never reveal hidden reasoning. "
                             "Use [CONSENSUS] to vote, or [COMPLETE] only for a finished answer."
                             + (' ' + generated_project_guidance(context) if engineering else '')
+                            + (" A generated_project_draft_rejection with phase before_capture means "
+                               "capture and execution have not started and the draft is not frozen. "
+                               "Correct draft manifest/acceptance, scaffold, tests or dependency declarations "
+                               "using the finite issues and project.inspect data, then call project.verify "
+                               "again; every subsequent verify requires full validation and authorization. "
+                               "This failed observation is not a grant, verification pass or ZIP credit. "
+                               "The phase describes its recorded observation, not current state. Retained "
+                               "historical rejections cannot reopen acceptance or authorize another capture. "
+                               "After capture, only implementation repair is permitted; never weaken frozen tests."
+                               if type(context.routing_decision.get("generated_project_contract_version")) is int
+                               and context.routing_decision.get("generated_project_contract_version") == 1 else "")
                             + (" Engineering delivery is required: use workspace.write_text to implement; "
                                "project.verify must pass install, build and test after the last change; "
                                "then workspace.bundle must deliver the current verified files. "
@@ -2529,14 +2679,8 @@ class AutoGenDiscussionRuntime:
                     for event in drained_tool_events:
                         yield event
                     if any(
-                        event.kind is EventKind.TOOL_FAILED and (
-                            not any(
-                                str(artifact.id) == event.payload.get("artifact_id")
-                                and _execution_failure_result(
-                                    artifact.content.get("result"), tool_name=event.tool_name,
-                                ) is not None
-                                for artifact in durability.artifacts
-                            )
+                        event.kind is EventKind.TOOL_FAILED and not _recoverable_tool_failure(
+                            event, context=context, artifacts=durability.artifacts,
                         )
                         for event in drained_tool_events
                     ):
@@ -3260,12 +3404,20 @@ class AutoGenDiscussionRuntime:
             raise RuntimeExecutionError("runtime checkpoint artifacts are invalid")
         by_id = {str(artifact.id): artifact for artifact in artifacts}
         allowed_by_actor = {participant.id: participant.allowed_tools for participant in self._plan.participants}
+        draft_observations: set[str] = set()
         for entry in cast(tuple[Mapping[str, JsonValue], ...], checkpoint.state["tool_ledger"]):
-            if entry.get("status") != "failed":
-                continue
             artifact = by_id.get(cast(str, entry.get("artifact_id")))
             result = None if artifact is None else artifact.content.get("result")
+            draft = isinstance(result, Mapping) and "generated_draft_rejection" in result
+            if entry.get("status") != "failed":
+                if draft:
+                    raise RuntimeExecutionError("durable generated draft failure evidence is invalid")
+                continue
             arguments_hash = entry.get("arguments_hash")
+            draft_feedback = (
+                _generated_draft_artifact_feedback(artifact, context=context, actor=artifact.producer)
+                if draft and artifact is not None else None
+            )
             # Validate all retained failures before a model can skip their replayed calls.
             if (
                 artifact is None or artifact.type != "tool_result"
@@ -3277,9 +3429,16 @@ class AutoGenDiscussionRuntime:
                 or re.fullmatch(r"[0-9a-f]{64}", arguments_hash) is None
                 or artifact.content.get("arguments_sha256") != arguments_hash
                 or not isinstance(result, Mapping)
-                or _execution_failure_result(result, tool_name=entry.get("name")) != result
+                or (draft_feedback != result if draft else
+                    _execution_failure_result(result, tool_name=entry.get("name")) != result)
             ):
                 raise RuntimeExecutionError("durable capability failure evidence is invalid")
+            if draft_feedback is not None:
+                observation = cast(str, cast(Mapping[str, JsonValue], draft_feedback[
+                    "generated_draft_rejection"])["observation_sha256"])
+                if observation in draft_observations:
+                    raise RuntimeExecutionError("generated draft correction made no progress")
+                draft_observations.add(observation)
         return artifacts
 
     @staticmethod

@@ -12,12 +12,16 @@ from contextlib import ExitStack
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, NoReturn, cast
 from uuid import UUID, uuid4
 
 from agent_hub.auth.models import Role
+from agent_hub.capabilities.generated_project_draft import GeneratedDraftRejection
 from agent_hub.capabilities.project_acceptance import (
     GeneratedAcceptanceEnvelope,
+    _nonfinite,
+    _protected_control,
+    _unique,
     parse_acceptance_manifest,
 )
 from agent_hub.capabilities.project_baselines import (
@@ -25,8 +29,10 @@ from agent_hub.capabilities.project_baselines import (
     ProjectBaselineStore,
     StoredProjectBaseline,
 )
+from agent_hub.capabilities.project_contracts import _path
 from agent_hub.capabilities.scoped_read import _read_no_links, authorized_workspace_scope
 from agent_hub.domain.runs import RunStatus
+from agent_hub.plugins.handover_snapshots import _Directory
 from agent_hub.runtime.contracts import JsonValue, _freeze_object
 from agent_hub.skills.sandbox.project import ProjectInvocation, project_source_manifest
 
@@ -44,6 +50,17 @@ class GeneratedProjectError(RuntimeError):
     """Finite generated preparation failure; never raw project or host text."""
 
 
+class GeneratedProjectDraftRejected(GeneratedProjectError):
+    """A certain, uncaptured draft can be corrected without claiming execution."""
+
+    def __init__(self, rejection: GeneratedDraftRejection) -> None:
+        if type(rejection) is not GeneratedDraftRejection:
+            raise ValueError('invalid generated draft rejection')
+        rejection.to_payload()
+        self.rejection = rejection
+        super().__init__(rejection.reason)
+
+
 def _need(value: object, code: str = 'generated_acceptance_scope_changed') -> None:
     if not value:
         raise GeneratedProjectError(code)
@@ -57,6 +74,42 @@ def _encoded(value: object) -> bytes:
 def _uuid(value: object) -> UUID:
     _need(isinstance(value, UUID))
     return UUID(str(value))
+
+
+def _manifest_issues(raw: bytes) -> tuple[str, ...]:
+    """Classify only pure manifest failures; never return model text or paths."""
+    try:
+        item = json.loads(raw.decode('utf-8'), object_pairs_hook=_unique, parse_constant=_nonfinite)
+        if type(item) is not dict:
+            return ('manifest_invalid',)
+        issues = []
+        for field, issue, limit in (('editable_paths', 'protected_editable_paths', 128),
+                                     ('test_files', 'protected_test_files', 256)):
+            paths = item.get(field)
+            if (type(paths) is list and 0 < len(paths) <= limit
+                    and any(_protected_control(_path(path)) for path in paths)):
+                issues.append(issue)
+        return tuple(issues) or ('manifest_invalid',)
+    except (ValueError, TypeError, KeyError, RecursionError, OverflowError):
+        return ('manifest_invalid',)
+
+
+def _draft_route(record: object) -> None:
+    route = getattr(record, 'routing_decision', None)
+    _need(isinstance(route, Mapping) and STATE not in route)
+    pending = [(route, 0)]
+    remaining = 4096
+    while pending:
+        item, depth = pending.pop()
+        remaining -= 1
+        _need(remaining >= 0 and depth <= 32)
+        if isinstance(item, str):
+            _need(item.lower() not in {'unknown', 'uncertain', 'partial', 'outcome_uncertain',
+                'tool_outcome_uncertain', 'model_outcome_uncertain'})
+        elif isinstance(item, Mapping):
+            pending.extend((value, depth + 1) for value in item.values())
+        elif isinstance(item, (list, tuple)):
+            pending.extend((value, depth + 1) for value in item)
 
 
 def generated_selected(record: object) -> bool:
@@ -281,6 +334,57 @@ class GeneratedProjectService:
             controls = store._controls(invocation, stack, create=False)
             store._write_once(controls, _ENVELOPE, _encoded(envelope.to_payload()))
 
+    def _controls_absent(self, invocation: ProjectInvocation) -> None:
+        # Require the entire run namespace absent, including empty/partial controls.
+        # Descriptor-backed info is no-follow; errors other than ENOENT remain fatal.
+        with ExitStack() as stack:
+            parent = _Directory(self.root, private=False)
+            stack.callback(parent.close)
+            for name in ('.project-contracts', str(invocation.tenant_id), str(invocation.run_id)):
+                try:
+                    parent.info(name)
+                except FileNotFoundError:
+                    parent.check()
+                    return
+                child = _Directory(parent.path / name, private=True)
+                stack.callback(child.close)
+                parent.check()
+                parent = child
+            _need(False, 'generated_acceptance_unknown_no_recapture')
+
+    async def _draft_observation(self, invocation: ProjectInvocation) -> tuple[bytes | None, dict[str, str]]:
+        try:
+            raw: bytes | None = await asyncio.to_thread(self._manifest, invocation)
+        except FileNotFoundError:
+            raw = None
+        files = dict(await project_source_manifest(self.root, invocation))
+        if raw is None:
+            _need(_MANIFEST not in files)
+        else:
+            _need(files.get(_MANIFEST) in {hashlib.sha256(tag + raw).hexdigest() for tag in (b'f\0', b'x\0')})
+        return raw, files
+
+    async def _reject_draft(
+        self, authority: GeneratedAuthority, actor: str, observation: tuple[bytes | None, dict[str, str]],
+        reason: str, issues: tuple[str, ...],
+    ) -> NoReturn:
+        invocation = authority.invocation
+        await asyncio.to_thread(self._controls_absent, invocation)
+        _need(await self._draft_observation(invocation) == observation)
+        latest = await self._record(authority.tenant_id, authority.run_id)
+        _need(generated_authority(latest, authority.tenant_id, authority.run_id) == authority)
+        _draft_route(latest)
+        await asyncio.to_thread(self._controls_absent, invocation)
+        raw, files = observation
+        observation_sha = hashlib.sha256(_encoded({'schema_version': 1,
+            'manifest': {'missing': True} if raw is None else {'sha256': hashlib.sha256(raw).hexdigest()},
+            'source_files': files})).hexdigest()
+        raise GeneratedProjectDraftRejected(GeneratedDraftRejection(
+            tenant_id=str(authority.tenant_id), user_id=str(authority.user_id), run_id=str(authority.run_id),
+            project_id=authority.project_id, session_id=authority.session_id,
+            request_sha256=authority.request_sha256, proposer_actor=actor,
+            observation_sha256=observation_sha, reason=reason, issues=issues))
+
     async def load(self, tenant: UUID, run: UUID, actor: str, *, readonly: bool = False) -> GeneratedProjectContext | None:
         try:
             tenant, run = _uuid(tenant), _uuid(run)
@@ -337,20 +441,26 @@ class GeneratedProjectService:
                 return await self.load(tenant, run, actor)
             _need(type(actor) is str and re.fullmatch(r'[a-z0-9][a-z0-9_.-]{0,127}', actor) is not None)
             invocation = authority.invocation
+            observation = await self._draft_observation(invocation)
+            raw, files = observation
+            if raw is None:
+                await self._reject_draft(authority, actor, observation,
+                    'generated_acceptance_manifest_required', ('manifest_missing',))
             try:
-                raw = await asyncio.to_thread(self._manifest, invocation)
-            except FileNotFoundError:
-                raise GeneratedProjectError('generated_acceptance_manifest_required') from None
-            manifest = parse_acceptance_manifest(raw)
-            files = await project_source_manifest(self.root, invocation)
+                manifest = parse_acceptance_manifest(raw)
+            except ValueError:
+                await self._reject_draft(authority, actor, observation,
+                    'generated_acceptance_manifest_invalid', _manifest_issues(raw))
             required = {'package.json'} if manifest.stack == 'node' else {'pyproject.toml', 'requirements.lock'}
-            _need({*manifest.test_files, *required, _MANIFEST} <= files.keys(), 'generated_acceptance_scaffold_incomplete')
+            if not {*manifest.test_files, *required, _MANIFEST} <= files.keys():
+                await self._reject_draft(authority, actor, observation,
+                    'generated_acceptance_scaffold_incomplete', ('scaffold_incomplete',))
             parts = (str(tenant), 'projects', authority.project_id, 'sessions', authority.session_id)
             if manifest.stack == 'node':
                 from agent_hub.capabilities.project_inspection import _parse_node
+                data = await asyncio.to_thread(_read_no_links, self.root, (*parts, 'package.json'), max_bytes=1024**2)
+                _need(files['package.json'] in {hashlib.sha256(tag + data).hexdigest() for tag in (b'f\0', b'x\0')})
                 try:
-                    data = await asyncio.to_thread(_read_no_links, self.root, (*parts, 'package.json'), max_bytes=1024**2)
-                    _need(files['package.json'] in {hashlib.sha256(tag + data).hexdigest() for tag in (b'f\0', b'x\0')})
                     _, _, operations, issues = _parse_node(data.decode('utf-8-sig'))
                     package = json.loads(data)
                     if (issues or operations != {'build': 'declared', 'test': 'declared'}
@@ -358,20 +468,22 @@ class GeneratedProjectService:
                             or {'pnpm-lock.yaml', 'pnpm-workspace.yaml', 'yarn.lock'} & files.keys()):
                         raise ValueError
                 except (ValueError, TypeError, KeyError, RecursionError):
-                    raise GeneratedProjectError('generated_acceptance_node_declaration_invalid') from None
+                    await self._reject_draft(authority, actor, observation,
+                        'generated_acceptance_node_declaration_invalid', ('node_declaration_invalid',))
             if manifest.stack == 'python':
                 from agent_hub.capabilities.python_project_recipe import (
                     parse_python_project_declaration,
                 )
                 controls: list[bytes] = []
+                for name in ('pyproject.toml', 'requirements.lock'):
+                    data = await asyncio.to_thread(_read_no_links, self.root, (*parts, name), max_bytes=256 * 1024)
+                    _need(files[name] in {hashlib.sha256(tag + data).hexdigest() for tag in (b'f\0', b'x\0')})
+                    controls.append(data)
                 try:
-                    for name in ('pyproject.toml', 'requirements.lock'):
-                        data = await asyncio.to_thread(_read_no_links, self.root, (*parts, name), max_bytes=256 * 1024)
-                        _need(files[name] in {hashlib.sha256(tag + data).hexdigest() for tag in (b'f\0', b'x\0')})
-                        controls.append(data)
                     parse_python_project_declaration(*controls, max_control_bytes=256 * 1024, max_requirements=128)
                 except (ValueError, TypeError):
-                    raise GeneratedProjectError('generated_acceptance_python_declaration_invalid') from None
+                    await self._reject_draft(authority, actor, observation,
+                        'generated_acceptance_python_declaration_invalid', ('python_declaration_invalid',))
             state = validate_generated_preparation({'schema_version': 1, 'phase': 'capturing',
                 'user_id': str(authority.user_id), 'request_sha256': authority.request_sha256,
                 'proposer_actor': actor, 'stack': manifest.stack, 'manifest_sha256': manifest.sha256,

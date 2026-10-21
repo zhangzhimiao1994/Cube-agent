@@ -446,7 +446,10 @@ class RuntimeCapabilityGateway:
             except ProjectInspectionError as error:
                 raise RuntimeCapabilityError(str(error)) from None
         if normalized_name == PROJECT_VERIFY_TOOL:
-            from agent_hub.capabilities.generated_project_service import GeneratedProjectError
+            from agent_hub.capabilities.generated_project_service import (
+                GeneratedProjectDraftRejected,
+                GeneratedProjectError,
+            )
             from agent_hub.capabilities.python_generated_service import (
                 PythonGeneratedRecipeApprovalRequired,
             )
@@ -472,6 +475,8 @@ class RuntimeCapabilityGateway:
                     self._generated_delivery_bindings[(tenant_id, run_id)] = generated_binding
                 return result
             except PythonGeneratedRecipeApprovalRequired:
+                raise
+            except GeneratedProjectDraftRejected:
                 raise
             except GeneratedProjectError as error:
                 raise RuntimeCapabilityError(str(error)) from None
