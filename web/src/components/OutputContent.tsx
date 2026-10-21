@@ -1,6 +1,6 @@
 import { lexer, type Token, type Tokens } from "marked";
 import { Check, Copy, Maximize2, Minimize2, WrapText } from "lucide-react";
-import { Fragment, type CSSProperties, type ReactNode, useEffect, useId, useMemo, useRef, useState } from "react";
+import { createElement, Fragment, type CSSProperties, type ReactNode, useEffect, useId, useMemo, useRef, useState } from "react";
 
 import { CodeContent } from "./CodeContent";
 
@@ -124,9 +124,10 @@ export function BoundedTextBlock({
   );
 }
 
-function MessageParagraph({ text }: { text: string }) {
+function MessageParagraph({ text, children }: { text: string; children?: ReactNode }) {
   const [expanded, setExpanded] = useState(false);
   const { copied, failed, copy } = useCopyFeedback(text);
+  const contentId = useId();
   const lines = text.split("\n");
   const shouldCollapse = text.length > 900 || lines.length > 12;
   const preview = lines.slice(0, 10).join("\n");
@@ -134,11 +135,12 @@ function MessageParagraph({ text }: { text: string }) {
     ? `${preview.slice(0, 900)}${text.length > 900 || lines.length > 10 ? "\n..." : ""}` : text;
   const copyable = shouldCollapse || text.length > 240 || lines.length > 4;
   return (
-    <div className={`message-paragraph${shouldCollapse ? " is-collapsible" : ""}`}>
+    <div className={`message-paragraph${shouldCollapse ? " is-collapsible" : ""}${shouldCollapse && !expanded ? " is-collapsed" : ""}`}>
       {copyable ? (
         <div className="message-paragraph-tools" aria-label="消息文本工具">
           {shouldCollapse ? (
-            <button type="button" className="message-expand-button" onClick={() => setExpanded((current) => !current)}>
+            <button type="button" className="message-expand-button" aria-expanded={expanded} aria-controls={contentId}
+              onClick={() => setExpanded((current) => !current)}>
               {expanded ? "收起" : "展开全文"}
             </button>
           ) : null}
@@ -148,18 +150,21 @@ function MessageParagraph({ text }: { text: string }) {
           {failed ? <span role="status">复制失败</span> : null}
         </div>
       ) : null}
-      <p>{displayText}</p>
+      <p id={contentId} className={children !== undefined && shouldCollapse && !expanded ? "message-paragraph-preview" : undefined}>
+        {children ?? displayText}
+      </p>
     </div>
   );
 }
 
-function tableInline(tokens: Token[]): ReactNode {
+function outputInline(tokens: Token[], table = false): ReactNode {
   return tokens.map((token, index) => {
-    if (token.type === "br" || (token.type === "html" && /^<br\s*\/?\s*>$/i.test(token.raw))) return <br key={index} />;
+    if (token.type === "br" || (table && token.type === "html" && /^<br\s*\/?\s*>$/i.test(token.raw))) return <br key={index} />;
     if (token.type === "codespan") return <code key={index} className="output-inline-code">{token.text}</code>;
-    if (token.type === "strong") return <strong key={index}>{tableInline(token.tokens ?? [])}</strong>;
-    if (token.type === "em") return <em key={index}>{tableInline(token.tokens ?? [])}</em>;
-    if (token.type === "del") return <del key={index}>{tableInline(token.tokens ?? [])}</del>;
+    if (token.type === "strong") return <strong key={index}>{outputInline(token.tokens ?? [], table)}</strong>;
+    if (token.type === "em") return <em key={index}>{outputInline(token.tokens ?? [], table)}</em>;
+    if (token.type === "del") return <del key={index}>{outputInline(token.tokens ?? [], table)}</del>;
+    if (token.type === "text" && token.tokens) return <Fragment key={index}>{outputInline(token.tokens, table)}</Fragment>;
     // HTML and destinations remain text; only the exact table break token is interpreted.
     return <Fragment key={index}>{token.type === "text" || token.type === "escape" ? token.text : token.raw}</Fragment>;
   });
@@ -173,11 +178,11 @@ function OutputTable({ token, title, index }: { token: Tokens.Table; title: stri
         style={{ "--output-column-count": token.header.length } as CSSProperties}>
         <colgroup>{token.header.map((_, column) => <col key={column} />)}</colgroup>
         <thead><tr>{token.header.map((cell, column) => (
-          <th key={column} scope="col" style={{ textAlign: token.align[column] ?? "left" }}>{tableInline(cell.tokens)}</th>
+          <th key={column} scope="col" style={{ textAlign: token.align[column] ?? "left" }}>{outputInline(cell.tokens, true)}</th>
         ))}</tr></thead>
         <tbody>{token.rows.map((row, rowIndex) => (
           <tr key={rowIndex}>{token.header.map((_, column) => (
-            <td key={column} style={{ textAlign: token.align[column] ?? "left" }}>{tableInline(row[column]?.tokens ?? [])}</td>
+            <td key={column} style={{ textAlign: token.align[column] ?? "left" }}>{outputInline(row[column]?.tokens ?? [], true)}</td>
           ))}</tr>
         ))}</tbody>
       </table>
@@ -249,19 +254,27 @@ export function OutputContent({ text, title, format = "markdown", language = "te
     copyAriaLabel={copyAriaLabel ?? `复制 ${language} 代码`} />;
   if (format === "plain") return <MessageParagraph text={text} />;
   let tableIndex = 0;
-  function blocks(items: Token[]): ReactNode {
+  function blocks(items: Token[], listItem = false): ReactNode {
     return items.map((token, index) => {
       if (token.type === "space") return null;
+      if (token.type === "heading") return createElement(`h${token.depth}`, { key: index, className: "output-heading" }, outputInline(token.tokens ?? []));
+      if (token.type === "hr") return <hr key={index} className="output-rule" />;
+      if (token.type === "paragraph" || token.type === "text") {
+        const inline = token.tokens ?? [token];
+        if (listItem) return <p key={index}>{outputInline(inline)}</p>;
+        const formatted = inline.some((item) => item.type !== "text" && item.type !== "escape");
+        return <MessageParagraph key={index} text={token.raw}>{formatted ? outputInline(inline) : undefined}</MessageParagraph>;
+      }
       if (token.type === "code") {
         const codeLanguage = token.lang?.split(/\s+/, 1)[0] || "text";
         return <BoundedTextBlock key={index} label={codeLanguage} language={codeLanguage} text={token.text}
           copyAriaLabel={`复制 ${codeLanguage} 代码`} />;
       }
       if (token.type === "table") return <OutputTable key={index} token={token as Tokens.Table} title={title} index={++tableIndex} />;
-      if (token.type === "blockquote") return <blockquote key={index} className="output-content output-quote">{blocks(token.tokens ?? [])}</blockquote>;
+      if (token.type === "blockquote") return <blockquote key={index} className="output-content output-quote">{blocks(token.tokens ?? [], listItem)}</blockquote>;
       if (token.type === "list") {
         const list = token as Tokens.List;
-        const children = list.items.map((item, itemIndex) => <li key={itemIndex} className="output-content">{blocks(item.tokens)}</li>);
+        const children = list.items.map((item, itemIndex) => <li key={itemIndex} className="output-content">{blocks(item.tokens, true)}</li>);
         return list.ordered ? <ol key={index} className="output-list" start={typeof list.start === "number" ? list.start : undefined}>{children}</ol>
           : <ul key={index} className="output-list">{children}</ul>;
       }
