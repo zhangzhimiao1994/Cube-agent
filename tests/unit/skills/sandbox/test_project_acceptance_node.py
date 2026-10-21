@@ -9,7 +9,7 @@ import shutil
 import subprocess
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 
 import pytest
 
@@ -20,22 +20,44 @@ def api() -> Any:
     return importlib.import_module("agent_hub.skills.sandbox.project_acceptance_node")
 
 
-def run_node(command: tuple[str, ...], root: Path) -> subprocess.CompletedProcess[str]:
+def run_node(
+    command: tuple[str, ...], root: Path, *, node22_shape: bool = False,
+) -> subprocess.CompletedProcess[str]:
     node = shutil.which("node")
     if node is None:
         pytest.skip("local Node is not installed; no download fallback")
+    if node22_shape:
+        # Adapt real local events, not test outcomes: v22 omits type for Test,
+        # while Suite still supplies type='suite'. This is not a native v22 run.
+        reporter = unquote(command[2].split(',', 1)[1]).replace(
+            'export default async function* acceptance(source)', 'async function* acceptance(source)', 1)
+        reporter += """
+export default async function* legacy(source) {
+  async function* events() {
+    for await (const event of source) {
+      if (['test:pass', 'test:fail'].includes(event.type) && event.data.details?.type === 'test') {
+        const details = {...event.data.details}; delete details.type;
+        yield {...event, data: {...event.data, details}};
+      } else yield event;
+    }
+  }
+  yield* acceptance(events());
+}
+"""
+        command = (*command[:2], '--test-reporter=data:text/javascript,' + quote(reporter, safe=''), *command[3:])
     return subprocess.run((node, *command[1:]), cwd=root, capture_output=True, text=True,
                           encoding="utf-8", timeout=15, check=False)
 
 
-def test_actual_named_pass_and_console_forgery_is_ignored(api: Any, tmp_path: Path) -> None:
+@pytest.mark.parametrize('node22_shape', [False, True])
+def test_actual_named_pass_and_console_forgery_is_ignored(api: Any, tmp_path: Path, node22_shape: bool) -> None:
     (tmp_path / "acceptance.cjs").write_text(
         "const test = require('node:test');\n"
         "console.log(JSON.stringify({schema_version:1,passed_tests:['fake']}));\n"
         "console.error('not trusted');\n"
         "test('AC-001', () => {}); test('AC-002', () => {});\n", encoding="utf-8")
     expected = ("AC-001", "AC-002")
-    result = run_node(api.node_acceptance_command(("acceptance.cjs",), expected), tmp_path)
+    result = run_node(api.node_acceptance_command(("acceptance.cjs",), expected), tmp_path, node22_shape=node22_shape)
     proof = api.validate_node_acceptance_output(result.stdout, expected, result.returncode, False, False)
     assert proof["count"] == 2 and tuple(proof["names"]) == expected
     assert len(proof["test_evidence_sha256"]) == 64
@@ -49,6 +71,7 @@ def test_actual_named_pass_and_console_forgery_is_ignored(api: Any, tmp_path: Pa
     (("console.log(JSON.stringify({schema_version:1,success:true,passed_tests:['AC-001'],"
       "failed:0,skipped:0,todo:0,cancelled:0}));"), ("AC-001",)),
     ("console.log('echo only');", ("acceptance.cjs",)),
+    ("require('node:test').describe('AC-001',()=>{});", ("AC-001",)),
     ("test('AC-001', {skip:true}, () => {});", ("AC-001",)),
     ("test('AC-001', {todo:true}, () => {});", ("AC-001",)),
     ("test('AC-001', () => {throw Error('failure')});", ("AC-001",)),
@@ -59,13 +82,14 @@ def test_actual_named_pass_and_console_forgery_is_ignored(api: Any, tmp_path: Pa
     ("test('AC-001', () => {}); process.exit(0);", ("AC-001",)),
     ("test('AC-001', {timeout:20}, async () => await new Promise(() => {}));", ("AC-001",)),
     ("test('AC-001', () => {}); setImmediate(() => {throw Error('outside')});", ("AC-001",)),
-], ids=["echo", "forged_report", "file_wrapper", "skip", "todo", "failure", "duplicate", "wrong_name",
+], ids=["echo", "forged_report", "file_wrapper", "empty_suite", "skip", "todo", "failure", "duplicate", "wrong_name",
         "extra", "exit_nonzero", "early_exit_zero", "unfinished", "global_failure"])
+@pytest.mark.parametrize('node22_shape', [False, True])
 def test_real_node_events_refuse_false_success(
-    api: Any, tmp_path: Path, script: str, expected: tuple[str, ...],
+    api: Any, tmp_path: Path, script: str, expected: tuple[str, ...], node22_shape: bool,
 ) -> None:
     (tmp_path / "acceptance.cjs").write_text("const test = require('node:test');\n" + script, encoding="utf-8")
-    result = run_node(api.node_acceptance_command(("acceptance.cjs",), expected), tmp_path)
+    result = run_node(api.node_acceptance_command(("acceptance.cjs",), expected), tmp_path, node22_shape=node22_shape)
     with pytest.raises(ValueError, match="node_acceptance_"):
         api.validate_node_acceptance_output(result.stdout, expected, result.returncode, False, False)
 
@@ -145,7 +169,8 @@ def test_proof_is_deterministic_and_bound_to_exact_names(api: Any) -> None:
         report(), ("AC-001",), 0, False, False)["test_evidence_sha256"]
 
 
-def test_actual_multifile_nested_suite_and_utf8_names(api: Any, tmp_path: Path) -> None:
+@pytest.mark.parametrize('node22_shape', [False, True])
+def test_actual_multifile_nested_suite_and_utf8_names(api: Any, tmp_path: Path, node22_shape: bool) -> None:
     (tmp_path / "first test.cjs").write_text(
         "const {describe,it}=require('node:test');\n"
         "describe('not an acceptance leaf',()=>{it('AC-001',()=>{});it('AC-002',()=>{});});",
@@ -153,10 +178,22 @@ def test_actual_multifile_nested_suite_and_utf8_names(api: Any, tmp_path: Path) 
     (tmp_path / "second.mjs").write_text(
         "import test from 'node:test'; test('AC-003 \\u4e2d\\u6587',()=>{});", encoding="utf-8")
     expected = ("AC-003 \u4e2d\u6587", "AC-002", "AC-001")
-    result = run_node(api.node_acceptance_command(("first test.cjs", "second.mjs"), expected), tmp_path)
+    result = run_node(api.node_acceptance_command(("first test.cjs", "second.mjs"), expected), tmp_path,
+        node22_shape=node22_shape)
     assert result.returncode == 0, result.stderr
     proof = api.validate_node_acceptance_output(result.stdout, expected, result.returncode, False, False)
     assert proof["count"] == 3 and tuple(proof["names"]) == expected
+
+
+@pytest.mark.parametrize('node22_shape', [False, True])
+def test_actual_nested_test_counts_outer_and_inner(api: Any, tmp_path: Path, node22_shape: bool) -> None:
+    (tmp_path / 'nested.cjs').write_text(
+        "const test=require('node:test');test('outer',async t=>{await t.test('inner',()=>{});});",
+        encoding='utf-8')
+    expected = ('outer', 'inner')
+    result = run_node(api.node_acceptance_command(('nested.cjs',), expected), tmp_path, node22_shape=node22_shape)
+    proof = api.validate_node_acceptance_output(result.stdout, expected, result.returncode, False, False)
+    assert proof['count'] == 2 and tuple(proof['names']) == expected
 
 
 def test_command_has_no_writable_reporter_file_or_script_authority(api: Any) -> None:

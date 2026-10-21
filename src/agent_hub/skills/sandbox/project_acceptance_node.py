@@ -43,7 +43,10 @@ export default async function* acceptance(source) {
       if (skip) skipped = Math.min(skipped + 1, 1000000);
       if (pending) todo = Math.min(todo + 1, 1000000);
       if (d.details?.type === 'suite') continue;
-      if (d.details?.type !== 'test' || typeof d.name !== 'string' || !d.name.trim()
+      // v22 Test omits type; Suite explicitly sets 'suite' in both v22/v24.
+      if (!d.details || typeof d.details !== 'object'
+          || (d.details.type !== undefined && d.details.type !== 'test')
+          || typeof d.name !== 'string' || !d.name.trim()
           || Buffer.byteLength(d.name, 'utf8') > 512 || /[\x00-\x1f\x7f]/u.test(d.name)
           || typeof d.file !== 'string' || !Number.isInteger(d.line) || d.line < 1
           || !Number.isInteger(d.column) || d.column < 1 || seen.size >= 1000

@@ -26,14 +26,20 @@ def batch(files: Mapping[str, str]) -> str:
 
 
 @pytest.mark.parametrize('protected_attempt', [False, True])
+@pytest.mark.parametrize('evidence_invalid', [False, True])
 async def test_real_gateway_failed_verify_preserves_controls_and_allows_implementation_repair(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, protected_attempt: bool,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, protected_attempt: bool, evidence_invalid: bool,
 ) -> None:
     backend, repository = await configured(tmp_path)
     verifier = backend._project_verification
     assert verifier is not None and verifier.executor is not None
     native = verifier.executor
     reports: list[Mapping[str, Any]] = []
+    diagnostic_stdout = (json.dumps({'schema_version': 1, 'success': False, 'passed_tests': [],
+        'failed': 0, 'skipped': 0, 'todo': 0, 'cancelled': 0}, separators=(',', ':')) + '\n'
+        if evidence_invalid else '')
+    diagnostic_stderr = ('generated_acceptance_test_evidence_invalid' if evidence_invalid
+        else 'ActualFailure: expected total 12, got 0\n')
 
     class FailOnce:
         async def run(self, invocation: Any) -> SkillResult:
@@ -41,8 +47,8 @@ async def test_real_gateway_failed_verify_preserves_controls_and_allows_implemen
             raw = json.loads(result.stdout)
             if not reports:
                 raw['status'] = 'failed'
-                raw['checks'][-1].update(status='failed', exit_code=1,
-                    stderr='ActualFailure: expected total 12, got 0\n')
+                raw['checks'][-1].update(status='failed', exit_code=86 if evidence_invalid else 1,
+                    stdout=diagnostic_stdout, stderr=diagnostic_stderr)
                 raw.pop('generated_test_execution', None)
             reports.append(raw)
             return SkillResult(exit_code=0,
@@ -82,7 +88,9 @@ async def test_real_gateway_failed_verify_preserves_controls_and_allows_implemen
     assert len(failures) == 1
     failure = failures[0].content['result']
     assert isinstance(failure, Mapping) and 'verification_failure' in failure
-    assert 'ActualFailure: expected total 12, got 0' in json.dumps(failure, default=dict)
+    diagnostic = failure['execution_diagnostic']
+    assert isinstance(diagnostic, Mapping)
+    assert diagnostic['stdout'] == diagnostic_stdout and diagnostic['stderr'] == diagnostic_stderr
     failure_index = next(index for index, event in enumerate(events) if event.artifact == failures[0])
     assert sum(event.kind is EventKind.MODEL_STARTED for event in events[:failure_index]) == 1
     assert any(event.kind is EventKind.MODEL_STARTED for event in events[failure_index + 1:])
@@ -92,7 +100,15 @@ async def test_real_gateway_failed_verify_preserves_controls_and_allows_implemen
     assert (root / 'DELIVERY_MANIFEST.json').is_file()
     assert row.routing_decision['generated_project_preparation']['phase'] == 'captured'
     repair_prompt = '\n'.join(cast(str, item.content) for item in model.requests[-1].messages)
-    assert 'ActualFailure: expected total 12, got 0' in repair_prompt
+    encoded_evidence = repair_prompt.split('<UNTRUSTED_PROJECT_VERIFICATION_JSON>', 1)[1].split(
+        '</UNTRUSTED_PROJECT_VERIFICATION_JSON>', 1)[0]
+    prompt_result = json.loads(encoded_evidence)['tool_result']['payload']
+    assert prompt_result['execution_diagnostic']['stdout'] == diagnostic_stdout
+    assert prompt_result['execution_diagnostic']['stderr'] == diagnostic_stderr
+    # Check entries intentionally contain only metadata; the full bounded body
+    # must remain in the independent top-level diagnostic and reach the model.
+    check_diagnostic = prompt_result['verification_failure']['checks'][-1]['execution_diagnostic']
+    assert 'stdout' not in check_diagnostic and 'stderr' not in check_diagnostic
     if protected_attempt:
         assert 'protected_control' in repair_prompt and 'implementation' in repair_prompt
     checkpoint = await runtime.save_checkpoint()
