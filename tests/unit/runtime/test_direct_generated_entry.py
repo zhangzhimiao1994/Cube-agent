@@ -14,7 +14,13 @@ import pytest
 from agent_hub.harness.types import HarnessToolCallResult
 from agent_hub.models.gateway import GatewayCompletion
 from agent_hub.models.types import ModelRequest, ModelResponse, TokenUsage, ToolCall
-from agent_hub.runtime.contracts import EventKind, JsonValue, RuntimeCheckpoint, TaskContext
+from agent_hub.runtime.contracts import (
+    Artifact,
+    EventKind,
+    JsonValue,
+    RuntimeCheckpoint,
+    TaskContext,
+)
 from agent_hub.runtime.direct import DirectRunStream, DirectRuntime, RuntimeExecutionError
 from tests.unit.runtime.test_generated_project_history import evidence
 
@@ -262,7 +268,10 @@ async def test_unknown_transport_failure_has_no_automatic_generated_replay(tmp_p
 
 
 @pytest.mark.parametrize('corrected', [False, True])
-async def test_completed_generated_checkpoint_restores_without_model_or_tool_replay(tmp_path: Path, corrected: bool) -> None:
+@pytest.mark.parametrize('legacy_layout', [False, True])
+async def test_completed_generated_checkpoint_restores_without_model_or_tool_replay(
+    tmp_path: Path, corrected: bool, legacy_layout: bool,
+) -> None:
     context, verified, bundle = await evidence(tmp_path)
     harness = Harness(context, verified, bundle)
     model = Model(*((response('I will inspect.'),) if corrected else ()), response(batch()))
@@ -273,6 +282,23 @@ async def test_completed_generated_checkpoint_restores_without_model_or_tool_rep
     next_sequence = checkpoint.state['next_sequence']
     assert type(next_sequence) is int and next_sequence >= 7
     artifacts = tuple(event.artifact for event in events if event.artifact is not None)
+    if legacy_layout:
+        state: Any = json.loads(json.dumps(checkpoint.state, default=dict))
+        layout = state['generated_event_layout']
+        assert layout.pop('verification_failure_event_count') == 0
+        state['next_sequence'] = (6 + layout['context_injection_event_count']
+            + 2 * layout['model_call_count'] + layout['model_cost_event_count']
+            + state.get('model_scope_event_count', 0))
+        assert state['next_sequence'] == next_sequence
+        final = next(item for item in artifacts if str(item.id) == state['artifact_id'])
+        legacy_final = Artifact(id=final.id, version=final.version, type=final.type, producer=final.producer,
+            content={**final.content, 'generated_event_layout': layout}, source_ids=final.source_ids,
+            provenance=final.provenance)
+        state['artifact_sha256'] = legacy_final.content_sha256
+        artifacts = tuple(legacy_final if item.id == final.id else item for item in artifacts)
+        checkpoint = RuntimeCheckpoint(id=checkpoint.id, runtime_type=checkpoint.runtime_type,
+            runtime_version=checkpoint.runtime_version, run_id=context.run_id,
+            tenant_id=context.tenant_id, mode=context.mode, state=state)
     recovered_context = context.model_copy(update={'checkpoint': checkpoint, 'artifacts': artifacts})
     fresh_model = Model()
     fresh = DirectRuntime(fresh_model, logical_model='fixture', capability_gateway=harness,
@@ -283,8 +309,8 @@ async def test_completed_generated_checkpoint_restores_without_model_or_tool_rep
     assert len(replayed) == 1 and replayed[0].kind is EventKind.RUNTIME_COMPLETED
     assert not fresh_model.requests and tuple(harness.calls) == before
     # Even a self-consistent forged offset must match the durable delivery layout.
-    for defect in ('sequence', 'counts', 'missing', 'inspection'):
-        state: Any = json.loads(json.dumps(checkpoint.state, default=dict))
+    for defect in ('sequence', 'counts', 'missing', 'inspection', 'failure_bool', 'failure_nonzero', 'extra'):
+        state = json.loads(json.dumps(checkpoint.state, default=dict))
         if defect == 'sequence':
             state['next_sequence'] += 1
         elif defect == 'counts':
@@ -292,6 +318,12 @@ async def test_completed_generated_checkpoint_restores_without_model_or_tool_rep
             state['next_sequence'] += 2
         elif defect == 'inspection':
             state['generated_event_layout']['inspection_artifact_sha256'] = '0' * 64
+        elif defect == 'failure_bool':
+            state['generated_event_layout']['verification_failure_event_count'] = False
+        elif defect == 'failure_nonzero':
+            state['generated_event_layout']['verification_failure_event_count'] = 1
+        elif defect == 'extra':
+            state['generated_event_layout']['unknown_event_count'] = 0
         else:
             state.pop('generated_event_layout')
             state.pop('model_scope_event_count', None)
