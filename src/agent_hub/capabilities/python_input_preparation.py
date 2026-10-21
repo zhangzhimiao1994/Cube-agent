@@ -158,7 +158,8 @@ def input_supply_binding(record: object, *, planned: bool = False) -> Capability
             or planned and (preparation['schema_version'] != 1 or preparation['phase'] != 'captured')
             or preparation['schema_version'] == 2 and state['phase'] != 'supplied'):
         raise ValueError(_ERROR)
-    return input_supply_request(plan, user_id=cast(UUID, actor), idempotency_key='input-supply-binding')
+    # ORM rows can carry asyncpg's UUID subclass; strict capability IDs use UUID itself.
+    return input_supply_request(plan, user_id=UUID(str(actor)), idempotency_key='input-supply-binding')
 
 
 def validate_supply_declaration(

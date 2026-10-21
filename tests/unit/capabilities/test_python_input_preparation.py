@@ -231,6 +231,29 @@ async def test_supply_public_history_survives_recipe_observed(helper: Any, dao: 
     assert snapshot['public_request'] == dao.approvals[0].payload['public_request']
 
 
+async def test_real_postgres_uuid_type_keeps_supply_approval_details(helper: Any, dao: Any) -> None:
+    from asyncpg.pgproto.pgproto import UUID as DatabaseUUID
+
+    from agent_hub.runs.repository import _public_plugin_approval_events
+
+    plan = plan_for(dao.run)
+    prepare_route(dao.run, plan)
+    req = helper.input_supply_request(plan, user_id=dao.run.actor_id, idempotency_key='postgres-supply')
+    for key in ('tenant_id', 'id', 'actor_id'):
+        setattr(dao.run, key, DatabaseUUID(str(getattr(dao.run, key))))
+    assert isinstance(dao.run.actor_id, UUID) and type(dao.run.actor_id) is not UUID
+    await dao.repository.begin_capability_approval(dao.run.tenant_id, dao.run.id,
+        actor_id=dao.run.actor_id, approval_id='approval_postgres_supply',
+        approval_fingerprint='private', approval_scope=capability_approval_scope(req))
+    assert 'python_input_binding' in dao.approvals[0].payload
+    events = _public_plugin_approval_events(dao.approvals, dao.run)
+    assert events[0]['payload'] == {
+        'run_id': str(dao.run.id), 'version': dao.run.version,
+        'capability': 'command', 'operation': 'run', 'resource': req.resource,
+        'approval_scope': capability_approval_scope(req),
+    }
+
+
 def test_probe_is_no_install_data(helper: Any, dao: Any) -> None:
     plan = plan_for(dao.run)
     probe = PythonProjectProbeInvocation.model_validate({
