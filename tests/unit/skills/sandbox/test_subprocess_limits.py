@@ -52,6 +52,39 @@ def assert_reaped(
     assert not asyncio.all_tasks() - existing_tasks, "subprocess tasks were left running"
 
 
+@pytest.mark.parametrize("grace", [0, -1, True, None, "20", float("nan"), float("inf"), 10**1000],
+                         ids=["zero", "negative", "bool", "none", "string", "nan", "inf", "huge"])
+async def test_invalid_backend_cleanup_budget_never_launches(
+    tmp_path: Path, processes: list[asyncio.subprocess.Process], grace: object,
+) -> None:
+    with pytest.raises(ValueError, match="cleanup grace"):
+        await run_subprocess_with_limits((sys.executable, "-c", "pass"), invocation(tmp_path),
+            process_started=processes.append, termination_grace_seconds=grace)
+    assert not processes
+
+
+async def test_backend_can_supply_a_distinct_cleanup_budget(
+    tmp_path: Path, processes: list[asyncio.subprocess.Process], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = asyncio.wait_for
+    observed = []
+
+    async def wait_for(awaitable: object, timeout: float) -> object:
+        observed.append(timeout)
+        return await original(awaitable, timeout)
+
+    async def cleanup() -> None:
+        return None
+
+    monkeypatch.setattr(asyncio, "wait_for", wait_for)
+    result = await run_subprocess_with_limits((sys.executable, "-c", "import time; time.sleep(30)"),
+        invocation(tmp_path), stdin_payload=b"", process_started=processes.append,
+        on_forced_terminate=cleanup, termination_grace_seconds=20)
+    assert result.timed_out
+    assert 20 in observed
+    assert processes[0].returncode is not None
+
+
 @pytest.mark.parametrize(
     "trigger,backend_failure",
     [("timeout", False), ("cancel", False), ("timeout", True), ("output", True), ("cancel", True)],
@@ -422,11 +455,8 @@ async def test_output_is_drained_while_stdin_is_blocked(
 @pytest.mark.parametrize("trigger", ["timeout", "output", "cancel"])
 async def test_hung_backend_termination_has_a_bounded_cleanup_deadline(
     tmp_path: Path, processes: list[asyncio.subprocess.Process],
-    monkeypatch: pytest.MonkeyPatch, trigger: str,
+    trigger: str,
 ) -> None:
-    monkeypatch.setattr(
-        "agent_hub.skills.sandbox.base._TERMINATION_GRACE_SECONDS", 0.05, raising=False,
-    )
     existing_tasks = asyncio.all_tasks()
     entered, release, started = asyncio.Event(), asyncio.Event(), asyncio.Event()
 
@@ -445,6 +475,7 @@ async def test_hung_backend_termination_has_a_bounded_cleanup_deadline(
     task = asyncio.create_task(run_subprocess_with_limits(
         (sys.executable, "-c", script), invocation(tmp_path, output_limit=32),
         process_started=process_started, on_forced_terminate=cleanup,
+        termination_grace_seconds=0.05,
     ))
     try:
         await asyncio.wait_for(started.wait(), timeout=3)

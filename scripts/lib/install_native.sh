@@ -930,7 +930,12 @@ install_native_mode() {
     mkdir -p /run/agent-hub "$STATE_DIR" /var/log/agent-hub
     chown agent-hub:agent-hub /run/agent-hub "$STATE_DIR" /var/log/agent-hub 2>/dev/null || true
     chmod 0750 /run/agent-hub "$STATE_DIR" /var/log/agent-hub
-    install -d -o root -g root -m 0700 /run/agent-hub-preview
+    install -d -o root -g root -m 0700 \
+      /run/agent-hub-project /run/agent-hub-preview \
+      /var/lib/agent-hub-toolchain-stages \
+      /var/lib/agent-hub-toolchains \
+      /var/lib/agent-hub-toolchain-state \
+      /var/lib/agent-hub-python-project-stages
   fi
   install_native_plugin_sandbox_profile
   deploy_native_release

@@ -58,6 +58,7 @@ def _optional_database_uuid(value: UUID | None) -> UUID | None:
 class _PythonApprovalOptions(TypedDict, total=False):
     python_binding: dict[str, object]
     python_input_binding: dict[str, object]
+    toolchain_input_binding: dict[str, object]
 
 
 def _has_generated_preparation(route: Mapping[str, object]) -> bool:
@@ -181,6 +182,40 @@ def _python_input_supply_approval_binding(run: RunRow, approval_scope: object) -
         return request.arguments
     except (ValueError, TypeError, RuntimeError, LookupError):
         return None
+
+
+def _is_toolchain_supply_scope(scope: object) -> bool:
+    return isinstance(scope, str) and ':resource=workspace/current/project-inputs/toolchain/' in scope
+
+
+def _toolchain_supply_approval_binding(
+    run: RunRow, approval_scope: object, *, planned: bool = False,
+) -> dict[str, object] | None:
+    if not _is_toolchain_supply_scope(approval_scope):
+        return None
+    try:
+        from agent_hub.capabilities.approvals import capability_approval_scope
+        from agent_hub.capabilities.toolchain_preparation import toolchain_supply_binding
+
+        request = toolchain_supply_binding(run, planned=planned)
+        return request.arguments if approval_scope == capability_approval_scope(request) else None
+    except (ValueError, TypeError, RuntimeError, LookupError):
+        return None
+
+
+def _toolchain_approval_matches(run: RunRow, approval: RunApprovalRow) -> bool:
+    """Exact SDK binding is rederived from DB state, never a receipt or Python grant."""
+    payload = approval.payload
+    expected = _toolchain_supply_approval_binding(run, payload.get('approval_scope'))
+    stored = payload.get('toolchain_input_binding')
+    if expected is None or type(stored) is not dict or {
+        'python_binding', 'python_input_binding', 'public_binding',
+    } & payload.keys():
+        return False
+    try:
+        return json.dumps(stored, sort_keys=True, allow_nan=False) == json.dumps(expected, sort_keys=True)
+    except (ValueError, TypeError, RecursionError):
+        return False
 
 
 def _generated_python_approval_binding(run: RunRow, scope: object, *, supply: bool) -> dict[str, object] | None:
@@ -1554,6 +1589,14 @@ class RunRepository:
             if RunStatus(row.status) is not RunStatus.RUNNING:
                 raise RunConflict("run is not running")
             approval_worker_token = row.worker_lease_token
+            toolchain_binding = None
+            if _is_toolchain_supply_scope(approval_scope):
+                toolchain_binding = _toolchain_supply_approval_binding(row, approval_scope, planned=True)
+                if (plugin_identity is not None or toolchain_binding is None
+                        or actor_id is None or row.worker_id is None or approval_worker_token is None
+                        or row.worker_lease_expires_at is None
+                        or row.worker_lease_expires_at <= datetime.now(UTC)):
+                    raise RunConflict('toolchain approval binding is invalid or stale')
             python_binding = (
                 _python_project_approval_binding(row, approval_scope)
                 if plugin_identity is None else None
@@ -1575,6 +1618,8 @@ class RunRepository:
             )
             if input_binding is not None:
                 python_options['python_input_binding'] = input_binding
+            if toolchain_binding is not None:
+                python_options['toolchain_input_binding'] = toolchain_binding
             row.status = RunStatus.WAITING_APPROVAL.value
             self.clear_worker_lease(row)
             row.routing_decision = {
@@ -1722,10 +1767,17 @@ class RunRepository:
                     )
                 )
             ).all()
-            return any(
-                row.payload.get("approval_fingerprint") == approval_fingerprint
-                for row in rows
-            )
+            for row in rows:
+                if row.payload.get('approval_fingerprint') != approval_fingerprint:
+                    continue
+                if (_is_toolchain_supply_scope(row.payload.get('approval_scope'))
+                        or 'toolchain_input_binding' in row.payload):
+                    run = await session.scalar(self._run_select(tenant_id, run_id))
+                    if run is not None and _toolchain_approval_matches(run, row):
+                        return True
+                else:
+                    return True
+            return False
 
     async def is_capability_approval_scope_approved(
         self,
@@ -1743,7 +1795,16 @@ class RunRepository:
                     )
                 )
             ).all()
-            return any(row.payload.get("approval_scope") == approval_scope for row in rows)
+            for row in rows:
+                if row.payload.get('approval_scope') != approval_scope:
+                    continue
+                if _is_toolchain_supply_scope(approval_scope) or 'toolchain_input_binding' in row.payload:
+                    run = await session.scalar(self._run_select(tenant_id, run_id))
+                    if run is not None and _toolchain_approval_matches(run, row):
+                        return True
+                else:
+                    return True
+            return False
 
     @staticmethod
     async def _capability_approval_id_has_status(
@@ -2545,6 +2606,7 @@ class RunRepository:
         public_binding: dict[str, object] | None = None,
         python_binding: dict[str, object] | None = None,
         python_input_binding: dict[str, object] | None = None,
+        toolchain_input_binding: dict[str, object] | None = None,
         request_version: int | None = None,
         resolution_version: int | None = None,
     ) -> None:
@@ -2557,6 +2619,7 @@ class RunRepository:
             **({"public_binding": public_binding} if public_binding is not None else {}),
             **({'python_binding': python_binding} if python_binding is not None else {}),
             **({'python_input_binding': python_input_binding} if python_input_binding is not None else {}),
+            **({'toolchain_input_binding': toolchain_input_binding} if toolchain_input_binding is not None else {}),
         }
         if request_version is not None:
             payload["public_request"] = {
@@ -2834,7 +2897,15 @@ def _public_plugin_approval_events(
             raise RunConflict("pending capability approval evidence is stale")
         public_binding = dict(binding)
         python_binding = None
-        if 'public_binding' not in approval.payload and 'python_input_binding' in approval.payload:
+        if 'public_binding' not in approval.payload and 'toolchain_input_binding' in approval.payload:
+            if _toolchain_approval_matches(run, approval):
+                public_binding.update({
+                    'capability': 'command', 'operation': 'run',
+                    'resource': 'workspace/current/project-inputs/toolchain/'
+                    + cast(str, cast(dict[str, object], approval.payload['toolchain_input_binding'])['plan_sha256']),
+                    'approval_scope': approval.payload['approval_scope'],
+                })
+        elif 'public_binding' not in approval.payload and 'python_input_binding' in approval.payload:
             expected_supply = _python_input_supply_approval_binding(run, approval.payload.get('approval_scope'))
             stored_supply = approval.payload['python_input_binding']
             if expected_supply is not None and type(stored_supply) is dict and stored_supply == expected_supply:

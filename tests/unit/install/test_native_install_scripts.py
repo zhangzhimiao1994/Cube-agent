@@ -1,5 +1,9 @@
 import configparser
+import os
 import re
+import shlex
+import shutil
+import subprocess
 import tomllib
 from pathlib import Path
 
@@ -849,13 +853,95 @@ def test_skill_broker_can_prepare_probes_in_service_owned_runtime_without_broad_
     assert not service.get("AmbientCapabilities", "").strip()
     assert service["NoNewPrivileges"] == "yes"
     assert service["ProtectSystem"] == "strict"
-    assert service["ReadWritePaths"].split() == ["/run/agent-hub", "/run/agent-hub-project"]
+    assert service["ReadWritePaths"].split() == [
+        "/run/agent-hub",
+        "/run/agent-hub-project",
+        "/var/lib/agent-hub-toolchain-stages",
+    ]
     for name in ("api", "worker"):
         peer_unit = read(f"deploy/native/systemd/agent-hub-{name}.service")
         assert peer_unit.count("ReadWritePaths=") == 1
         peer = configparser.ConfigParser(interpolation=None, strict=False)
         peer.read_string(peer_unit)
-        assert "/run/agent-hub-project" not in peer["Service"]["ReadWritePaths"].split()
+        writable = [Path(path) for path in peer["Service"]["ReadWritePaths"].split()]
+        for private in (
+            "/run/agent-hub-project",
+            "/var/lib/agent-hub-toolchain-stages",
+            "/var/lib/agent-hub-toolchains",
+            "/var/lib/agent-hub-toolchain-state",
+            "/var/lib/agent-hub-python-project-stages",
+        ):
+            assert not any(Path(private).is_relative_to(path) for path in writable)
+
+
+def test_native_tmpfiles_creates_private_toolchain_and_admission_roots() -> None:
+    directories = {
+        fields[1]: fields[2:5]
+        for line in read("deploy/native/agent-hub.tmpfiles").splitlines()
+        if (fields := line.split()) and fields[0] == "d"
+    }
+    for path in (
+        "/var/lib/agent-hub-toolchain-stages",
+        "/var/lib/agent-hub-toolchains",
+        "/var/lib/agent-hub-toolchain-state",
+        "/var/lib/agent-hub-python-project-stages",
+    ):
+        assert directories.get(path) == ["0700", "root", "root"]
+
+
+def test_native_install_fallback_creates_private_toolchain_and_admission_roots() -> None:
+    script = read("scripts/lib/install_native.sh")
+    begin = script.index("  if command -v systemd-tmpfiles")
+    end = script.index("  install_native_plugin_sandbox_profile", begin)
+    bash = r"C:\Program Files\Git\bin\bash.exe" if os.name == "nt" else shutil.which("bash")
+    assert bash is not None, "Bash is required for offline native install tests"
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in {"BASH_ENV", "ENV", "SHELLOPTS", "BASHOPTS"}
+        and not key.startswith("BASH_FUNC_")
+    }
+    result = subprocess.run(
+        [bash, "--noprofile", "--norc", "-s"],
+        input=r"""
+set -euo pipefail
+STATE_DIR=/var/lib/agent-hub
+command() { return 1; }
+mkdir() { :; }
+chown() { :; }
+chmod() { :; }
+install() { printf 'install'; printf ' %s' "$@"; printf '\n'; }
+"""
+        + script[begin:end],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=10,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    directories: set[str] = set()
+    for line in result.stdout.splitlines():
+        args = shlex.split(line)
+        assert args[:8] == ["install", "-d", "-o", "root", "-g", "root", "-m", "0700"]
+        directories.update(args[8:])
+    assert directories == {
+        "/run/agent-hub-project",
+        "/run/agent-hub-preview",
+        "/var/lib/agent-hub-toolchain-stages",
+        "/var/lib/agent-hub-toolchains",
+        "/var/lib/agent-hub-toolchain-state",
+        "/var/lib/agent-hub-python-project-stages",
+    }
+
+
+def test_native_installer_does_not_activate_an_unpinned_toolchain_catalog() -> None:
+    installer = read("scripts/lib/install_native.sh")
+    unit = read("deploy/native/systemd/agent-hub-skill-broker.service")
+
+    assert "toolchains.json" not in installer
+    assert "toolchain_worker" not in installer + unit
+    assert "AGENT_HUB_TOOLCHAIN" not in installer + unit
 
 
 def test_native_upgrade_restarts_every_release_bound_process_after_switch() -> None:

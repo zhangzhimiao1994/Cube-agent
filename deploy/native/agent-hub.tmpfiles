@@ -1,6 +1,10 @@
 d /run/agent-hub 0750 agent-hub agent-hub -
 d /run/agent-hub-project 0700 root root -
 d /run/agent-hub-preview 0700 root root -
+d /var/lib/agent-hub-toolchain-stages 0700 root root -
+d /var/lib/agent-hub-toolchains 0700 root root -
+d /var/lib/agent-hub-toolchain-state 0700 root root -
+d /var/lib/agent-hub-python-project-stages 0700 root root -
 d /var/lib/agent-hub 0750 agent-hub agent-hub -
 d /var/lib/agent-hub/attachments 0750 agent-hub agent-hub -
 d /var/lib/agent-hub/skills 0750 agent-hub agent-hub -

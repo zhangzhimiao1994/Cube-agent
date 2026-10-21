@@ -215,19 +215,27 @@ def _rounded(size: int, block: int) -> int:
 
 
 def _required(artifact: ToolchainArtifact, roles: tuple[FilesystemRole, ...],
-              block: int, execution_bytes: int) -> int:
+              block: int, execution_bytes: int, source_limit_bytes: int = 0,
+              source_entry_limit: int = 0) -> int:
     # Round every possible entry, not just the sum of regular file bytes. Keep
     # both stage and published copies for EXDEV, plus metadata and execution.
     tree = (_rounded(artifact.unpacked_bytes_limit, block)
             + (artifact.archive_entries_limit + artifact.directory_entries_limit) * block)
-    demands = {"stage": _rounded(artifact.archive_bytes, block) + tree + _CONTROL_ALLOWANCE,
-               "runtime": tree + _CONTROL_ALLOWANCE,
+    source = source_copy_peak(source_limit_bytes, source_entry_limit, block)
+    demands = {"stage": _rounded(artifact.archive_bytes, block) + tree + _CONTROL_ALLOWANCE + source,
+               "runtime": _rounded(artifact.archive_bytes, block) + tree + _CONTROL_ALLOWANCE,
                "execution": _rounded(execution_bytes, block) + _CONTROL_ALLOWANCE,
                "state": 2 * _CONTROL_ALLOWANCE}
     total = sum(demands[role] for role in roles)
     if total > _MAX_INTEGER:
         raise ValueError("peak overflow")
     return total
+
+
+def source_copy_peak(source_limit_bytes: int, source_entry_limit: int, block: int) -> int:
+    # The existing baseline copier bounds all entries at 10 * file_limit.
+    # Include its 32MiB control envelope and round every possible entry.
+    return _rounded(source_limit_bytes, block) + source_entry_limit * block + 32 * _CONTROL_ALLOWANCE
 
 
 class ToolchainFilesystemPeak(_Strict):
@@ -250,11 +258,20 @@ class ToolchainSupplyPlan(_Strict):
     stage_root: str
     state_root: str
     execution_bytes: PositiveBytes
+    source_limit_bytes: int = Field(default=0, ge=0, le=500 * 1024**2)
+    source_entry_limit: int = Field(default=0, ge=0, le=1_000_000)
     filesystems: tuple[ToolchainFilesystemPeak, ...] = Field(min_length=1, max_length=4)
 
     @property
     def sha256(self) -> str:
-        return self.digest
+        # Observed free space is not work approved by the user. Every consumer
+        # must remeasure it under native admission rather than treating a saved
+        # observation as either fresh capacity or a reason to request approval.
+        approved = self.model_dump(mode="json", exclude={
+            "filesystems": {"__all__": {"available_bytes"}},
+        })
+        return hashlib.sha256(_encoded({"purpose": "toolchain_supply_approval_v1",
+                                        "plan": approved})).hexdigest()
 
     @field_validator("runtime_root", "stage_root", "state_root")
     @classmethod
@@ -274,7 +291,8 @@ class ToolchainSupplyPlan(_Strict):
         for peak in self.filesystems:
             if (peak.roles != tuple(sorted(set(peak.roles)))
                     or peak.required_bytes != _required(self.artifact, peak.roles,
-                                                       peak.allocation_unit, self.execution_bytes)
+                                                       peak.allocation_unit, self.execution_bytes,
+                                                       self.source_limit_bytes, self.source_entry_limit)
                     or peak.available_bytes - peak.required_bytes < peak.reserve_bytes):
                 raise ValueError("invalid peak")
         return self
@@ -283,6 +301,7 @@ class ToolchainSupplyPlan(_Strict):
 def plan_toolchain_supply(
     catalog: ToolchainCatalog, declaration: GoProjectDeclaration, scope: ToolchainPlanScope,
     spaces: tuple[FilesystemSpace, ...], *, execution_bytes: int,
+    source_limit_bytes: int = 0, source_entry_limit: int = 0,
 ) -> ToolchainSupplyPlan:
     """Plan all copies and future execution, grouping destinations by real device.
 
@@ -294,6 +313,9 @@ def plan_toolchain_supply(
         if (type(catalog) is not ToolchainCatalog or type(scope) is not ToolchainPlanScope
                 or type(spaces) is not tuple or len(spaces) != 4
                 or type(execution_bytes) is not int or not 0 < execution_bytes <= _MAX_INTEGER):
+            raise ValueError
+        if (type(source_limit_bytes) is not int or not 0 <= source_limit_bytes <= 500 * 1024**2
+                or type(source_entry_limit) is not int or not 0 <= source_entry_limit <= 1_000_000):
             raise ValueError
         catalog = ToolchainCatalog.from_json(catalog.to_json())
         scope = ToolchainPlanScope.from_json(scope.to_json())
@@ -308,7 +330,8 @@ def plan_toolchain_supply(
             if len({(s.available_bytes, s.allocation_unit) for s in same}) != 1:
                 raise ValueError
             roles = cast(tuple[FilesystemRole, ...], tuple(sorted(s.role for s in same)))
-            required = _required(artifact, roles, same[0].allocation_unit, execution_bytes)
+            required = _required(artifact, roles, same[0].allocation_unit, execution_bytes,
+                                 source_limit_bytes, source_entry_limit)
             if same[0].available_bytes - required < catalog.min_free_bytes:
                 raise ToolchainCatalogError("toolchain_capacity")
             peaks.append(ToolchainFilesystemPeak(device=device, roles=roles,
@@ -317,7 +340,8 @@ def plan_toolchain_supply(
         return ToolchainSupplyPlan(scope=scope, catalog_sha256=catalog.sha256,
             declaration_sha256=declaration.sha256, artifact=artifact, runtime_root=catalog.runtime_root,
             stage_root=catalog.stage_root, state_root=catalog.state_root,
-            execution_bytes=execution_bytes, filesystems=tuple(peaks))
+            execution_bytes=execution_bytes, source_limit_bytes=source_limit_bytes,
+            source_entry_limit=source_entry_limit, filesystems=tuple(peaks))
     except ToolchainCatalogError:
         raise
     except (ValueError, TypeError, AttributeError, OverflowError):

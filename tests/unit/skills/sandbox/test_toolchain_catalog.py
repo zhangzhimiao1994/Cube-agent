@@ -224,3 +224,37 @@ def test_implicit_directory_budget_is_independent_of_tar_header_count(api: Any) 
                                      execution_bytes=4096)
     runtime = next(p for p in plan.filesystems if p.device == 2)
     assert runtime.required_bytes >= 6000 * 4096 + 1000
+
+
+def test_live_free_space_changes_do_not_change_exact_approved_work(api: Any) -> None:
+    config = api.ToolchainCatalog.from_payload(catalog())
+    first = api.plan_toolchain_supply(config, declaration(), scope(api), spaces(api), execution_bytes=4096)
+    later = api.plan_toolchain_supply(config, declaration(), scope(api),
+        spaces(api, free=9 * 1024**3), execution_bytes=4096)
+    assert first.to_payload() != later.to_payload()
+    assert first.sha256 == later.sha256
+    # Capacity is still checked afresh; excluding this observation from identity
+    # is not permission to use the old free-space reading as an admission grant.
+    with pytest.raises(api.ToolchainCatalogError, match="toolchain_capacity"):
+        api.plan_toolchain_supply(config, declaration(), scope(api),
+            spaces(api, free=config.min_free_bytes), execution_bytes=4096)
+
+
+def test_runtime_peak_keeps_verified_archive_for_future_independent_measurement(api: Any) -> None:
+    entry = artifact() | {"archive_bytes": 100 * 1024**2}
+    config = api.ToolchainCatalog.from_payload(catalog() | {"artifacts": [entry]})
+    plan = api.plan_toolchain_supply(config, declaration(), scope(api), spaces(api, split=True),
+                                     execution_bytes=4096)
+    runtime = next(p for p in plan.filesystems if p.device == 2)
+    assert runtime.required_bytes >= entry["archive_bytes"] + entry["unpacked_bytes_limit"]
+
+
+def test_stage_peak_binds_full_source_copy_and_entry_allocation(api: Any) -> None:
+    config = api.ToolchainCatalog.from_payload(catalog())
+    first = api.plan_toolchain_supply(config, declaration(), scope(api), spaces(api),
+        execution_bytes=4096, source_limit_bytes=100 * 1024**2, source_entry_limit=1000)
+    second = api.plan_toolchain_supply(config, declaration(), scope(api), spaces(api),
+        execution_bytes=4096, source_limit_bytes=101 * 1024**2, source_entry_limit=1000)
+    assert second.sha256 != first.sha256
+    assert second.filesystems[0].required_bytes - first.filesystems[0].required_bytes == 1024**2
+    assert first.filesystems[0].required_bytes >= 132 * 1024**2 + 1000 * 4096

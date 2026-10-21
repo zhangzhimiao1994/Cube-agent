@@ -44,7 +44,8 @@ def test_default_project_runtime_has_root_private_native_provisioning() -> None:
     declarations = (root / 'deploy/native/agent-hub.tmpfiles').read_text().splitlines()
     assert 'd /run/agent-hub-project 0700 root root -' in declarations
     unit = (root / 'deploy/native/systemd/agent-hub-skill-broker.service').read_text()
-    assert 'ReadWritePaths=/run/agent-hub /run/agent-hub-project\n' in unit
+    assert ('ReadWritePaths=/run/agent-hub /run/agent-hub-project '
+            '/var/lib/agent-hub-toolchain-stages\n') in unit
 
 
 def invocation(project: ModuleType, **changes: Any) -> Any:
