@@ -75,6 +75,8 @@ for (const [device, viewport] of [
       });
       assert(expanded.height > viewport.height / 2 && expanded.fits && expanded.scrolled
         && expanded.end <= 2 && expanded.toolbar, `expanded reader clipped: ${JSON.stringify(expanded)}`);
+      assert(await pre.evaluate((el) => el.parentElement.getBoundingClientRect().width >= el.closest('dl').clientWidth - 2),
+        'expanded reader must fill the available sheet width');
       assert.deepEqual(errors, []);
     } finally { await context.close(); }
   });

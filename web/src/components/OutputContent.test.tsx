@@ -12,6 +12,56 @@ afterEach(() => {
 });
 
 describe("shared output rendering", () => {
+  it("renders Markdown heading levels, inline emphasis and separate paragraphs instead of source markers", () => {
+    const { container } = render(<OutputContent title="回复" text={
+      "# 调查结果\n\n第一段 **重点**、*说明*和 `config.json`。\n\n第二段。\n\n## 下一步\n\n### 验证\n\n---"
+    } />);
+    expect(screen.getByRole("heading", { level: 1, name: "调查结果" })).toBeTruthy();
+    expect(screen.getByRole("heading", { level: 2, name: "下一步" })).toBeTruthy();
+    expect(screen.getByRole("heading", { level: 3, name: "验证" })).toBeTruthy();
+    expect(container.querySelector("strong")?.textContent).toBe("重点");
+    expect(container.querySelector("em")?.textContent).toBe("说明");
+    expect(container.querySelector("p code")?.textContent).toBe("config.json");
+    expect(container.querySelectorAll("p")).toHaveLength(2);
+    expect(screen.getByRole("separator")).toBeTruthy();
+    expect(container.textContent).not.toContain("**");
+  });
+
+  it("preserves ordered starts, nested list structure and emphasized labels", () => {
+    const { container } = render(<OutputContent title="回复" text={
+      "3. **检查**\n   - 内层项目\n4. 完成"
+    } />);
+    expect(container.querySelector("ol")?.getAttribute("start")).toBe("3");
+    expect(container.querySelector("ol > li > ul > li")?.textContent).toContain("内层项目");
+    expect(container.querySelector("li strong")?.textContent).toBe("检查");
+  });
+
+  it("keeps long collapsed rich paragraphs semantic and copies the complete original Markdown", async () => {
+    const user = userEvent.setup();
+    const copy = vi.spyOn(navigator.clipboard, "writeText").mockResolvedValue();
+    const text = `**关键结论**与 \`settings.json\`：${"长回复正文需要保留一致的文字层级。".repeat(80)}末尾完整内容。`;
+    const { container } = render(<OutputContent title="回复" text={text} />);
+    expect(container.querySelector("p strong")?.textContent).toBe("关键结论");
+    expect(container.querySelector("p code")?.textContent).toBe("settings.json");
+    expect(container.querySelector("p")?.textContent).not.toContain("**");
+    expect(container.querySelector(".message-paragraph")?.classList.contains("is-collapsed")).toBe(true);
+    await user.click(screen.getByRole("button", { name: "展开全文" }));
+    expect(container.querySelector("p strong")?.textContent).toBe("关键结论");
+    expect(container.querySelector("p")?.textContent).toContain("末尾完整内容。");
+    await user.click(screen.getByRole("button", { name: "复制全文" }));
+    await waitFor(() => expect(copy).toHaveBeenCalledWith(text));
+  });
+
+  it("keeps multi-paragraph nested list text readable without repeated paragraph toolbars", () => {
+    const text = "- **检查**：" + "列表说明。".repeat(70) + "\n\n  第二段 `config.json`。\n\n  - 子项目\n\n    补充内容。";
+    const { container } = render(<OutputContent title="回复" text={text} />);
+    expect(container.querySelectorAll("li .message-paragraph-tools")).toHaveLength(0);
+    expect(container.querySelector("li strong")?.textContent).toBe("检查");
+    expect(container.querySelector("li code")?.textContent).toBe("config.json");
+    expect(container.textContent?.match(/第二段/g)).toHaveLength(1);
+    expect(container.textContent?.match(/补充内容/g)).toHaveLength(1);
+  });
+
   it("renders a highlighted read-only editor toolbar without changing raw copy bytes", async () => {
     const user = userEvent.setup();
     const copy = vi.spyOn(navigator.clipboard, "writeText").mockResolvedValue();

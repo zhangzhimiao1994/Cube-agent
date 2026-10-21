@@ -4483,6 +4483,7 @@ article:hover {
 }
 
 .process-detail-modal:has(.bounded-text-block.is-expanded) dl {
+  align-items: stretch;
   display: flex;
   flex-direction: column;
   overflow: hidden;
@@ -8739,6 +8740,30 @@ article:hover {
   max-width: 100%;
   min-width: 0;
   overflow-wrap: anywhere;
+  font-size: 1rem;
+  font-weight: 400;
+  letter-spacing: 0;
+  line-height: 1.75;
+  white-space: normal;
+  word-break: normal;
+}
+
+.chat-message.assistant {
+  width: min(100%, 48rem);
+  max-width: min(100%, 48rem);
+}
+
+.chat-message > .eyebrow {
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0;
+}
+
+.chat-message > h3 {
+  font-size: 0.875rem;
+  font-weight: 500;
+  line-height: 1.5;
+  margin: 0.2rem 0 1rem;
 }
 
 .output-content,
@@ -8749,20 +8774,74 @@ article:hover {
 
 .output-content {
   display: grid;
-  gap: 0.75rem;
+  gap: 0.875rem;
+  align-content: start;
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.message-body .output-heading {
+  color: inherit;
+  font-weight: 650;
+  letter-spacing: 0;
+  line-height: 1.4;
+  margin: 0.75rem 0 0;
+  overflow-wrap: anywhere;
+}
+
+.message-body > .output-heading:first-child {
+  margin-top: 0;
+}
+
+.message-body h1.output-heading { font-size: 1.5rem; }
+.message-body h2.output-heading { font-size: 1.25rem; }
+.message-body h3.output-heading { font-size: 1.125rem; }
+.message-body :is(h4, h5, h6).output-heading { font-size: 1rem; }
+
+.message-body strong { font-weight: 650; }
+
+.output-inline-code {
+  background: rgba(148, 163, 184, 0.14);
+  border: 1px solid rgba(148, 163, 184, 0.28);
+  border-radius: 4px;
+  color: inherit;
+  font-family: "Cascadia Code", "SFMono-Regular", Consolas, monospace;
+  font-size: 0.9em;
+  padding: 0.08em 0.3em;
+  overflow-wrap: anywhere;
+}
+
+.output-rule {
+  border: 0;
+  border-top: 1px solid var(--line);
+  margin: 0.25rem 0;
+  width: 100%;
 }
 
 .output-list {
-  display: grid;
-  gap: 0.5rem;
+  display: block;
   margin: 0;
-  padding-left: 1.4rem;
+  padding-left: 1.65rem;
+}
+
+.output-list > li {
+  display: list-item;
+  padding-left: 0.2rem;
+}
+
+.output-list > li + li,
+.output-list > li > * + * {
+  margin-top: 0.5rem;
+}
+
+.output-list > li::marker {
+  color: inherit;
+  font-weight: 500;
 }
 
 .output-quote {
-  border-left: 2px solid var(--line);
+  border-left: 3px solid var(--line-strong);
   margin: 0;
-  padding-left: 0.75rem;
+  padding: 0.15rem 0 0.15rem 0.9rem;
 }
 
 .message-body p {
@@ -8772,6 +8851,37 @@ article:hover {
   overflow-wrap: anywhere;
   white-space: pre-wrap;
   word-break: break-word;
+  font-size: inherit;
+  font-weight: inherit;
+  line-height: inherit;
+}
+
+.message-body .message-paragraph {
+  line-height: inherit;
+}
+
+.message-paragraph.is-collapsed > .message-paragraph-preview {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 10;
+  line-clamp: 10;
+  max-height: 17.5em;
+  overflow: hidden;
+}
+
+.message-body .message-expand-button {
+  border-radius: 4px;
+  font-size: 0.75rem;
+  font-weight: 500;
+  letter-spacing: 0;
+}
+
+.message-body .bounded-text-block.is-expanded pre {
+  max-height: 65dvh;
+}
+
+.process-detail-modal .message-body .bounded-text-block.is-expanded pre {
+  max-height: none;
 }
 
 .message-table-wrap {
@@ -8782,6 +8892,13 @@ article:hover {
   border: 1px solid #dce1e8;
   border-radius: 4px;
   background: #ffffff;
+  scrollbar-width: thin;
+}
+
+.message-table-wrap:focus-visible,
+.bounded-text-block pre:focus-visible {
+  outline: 2px solid #2462ad;
+  outline-offset: -2px;
 }
 
 .message-table {
@@ -8792,8 +8909,9 @@ article:hover {
   border-radius: 0;
   background: #ffffff;
   color: #263445;
-  font-size: 0.86rem;
-  line-height: 1.5;
+  font-size: 0.9375rem;
+  font-weight: 400;
+  line-height: 1.65;
 }
 
 .message-table col {
@@ -8802,7 +8920,7 @@ article:hover {
 
 .message-table th,
 .message-table td {
-  padding: 0.55rem 0.7rem;
+  padding: 0.7rem 0.9rem;
   border-right: 1px solid #e3e7ed;
   border-bottom: 1px solid #e3e7ed;
   text-align: left;
@@ -8836,12 +8954,12 @@ article:hover {
 
 @media (max-width: 640px) {
   .message-table {
-    font-size: 0.82rem;
+    font-size: 0.875rem;
   }
 
   .message-table th,
   .message-table td {
-    padding: 0.46rem 0.55rem;
+    padding: 0.65rem 0.8rem;
   }
 }
 
