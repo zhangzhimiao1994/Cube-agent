@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import importlib
 import importlib.util
 import json
@@ -114,10 +115,12 @@ def test_wrong_envelope_cannot_reach_authority(api: Any, prepared: Any) -> None:
 
 def test_report_keeps_diagnostic_status_and_runner_measurement(api: Any, prepared: Any) -> None:
     payload = report(prepared)
-    assert api._report(process(payload), prepared.invocation, prepared.inputs) == payload
+    assert api._report(process(payload), prepared.invocation, prepared.inputs,
+                       prepared.inputs.scope.source_sha256) == payload
     payload.update(status='failed', failed_phase='build',
         checks=[{'phase': 'build', 'status': 'failed', 'error': 'go_project_build_failed'}])
-    assert api._report(process(payload), prepared.invocation, prepared.inputs) == payload
+    assert api._report(process(payload), prepared.invocation, prepared.inputs,
+                       prepared.inputs.scope.source_sha256) == payload
 
 
 @pytest.mark.parametrize('field,value', [
@@ -133,7 +136,8 @@ def test_report_rejects_identity_or_business_rebinding(
     api: Any, prepared: Any, field: str, value: object,
 ) -> None:
     with pytest.raises(ValueError):
-        api._report(process(report(prepared) | {field: value}), prepared.invocation, prepared.inputs)
+        api._report(process(report(prepared) | {field: value}), prepared.invocation, prepared.inputs,
+                    prepared.inputs.scope.source_sha256)
 
 
 @pytest.mark.parametrize('damage', ['duplicate', 'nested', 'nan', 'infinity', 'exponent'])
@@ -147,7 +151,8 @@ def test_report_rejects_ambiguous_json(api: Any, prepared: Any, damage: str) -> 
         raw = raw[:-1] + ',"unused":' + {'nan': 'NaN', 'infinity': 'Infinity',
                                         'exponent': '1e9999'}[damage] + '}'
     with pytest.raises(ValueError):
-        api._report(process(raw), prepared.invocation, prepared.inputs)
+        api._report(process(raw), prepared.invocation, prepared.inputs,
+                    prepared.inputs.scope.source_sha256)
 
 
 @pytest.mark.parametrize('changes', [
@@ -158,20 +163,23 @@ def test_report_rejects_ambiguous_json(api: Any, prepared: Any, damage: str) -> 
 ])
 def test_report_requires_complete_actual_utf8_output(api: Any, prepared: Any, changes: Any) -> None:
     with pytest.raises(ValueError):
-        api._report(process(report(prepared), **changes), prepared.invocation, prepared.inputs)
+        api._report(process(report(prepared), **changes), prepared.invocation, prepared.inputs,
+                    prepared.inputs.scope.source_sha256)
 
 
 def test_nested_cleanup_uncertainty_is_not_a_normal_failed_report(api: Any, prepared: Any) -> None:
     payload = report(prepared) | {'status': 'failed', 'failed_phase': 'test',
         'checks': [{'phase': 'test', 'status': 'failed', 'error': 'go_project_cleanup_incomplete'}]}
     with pytest.raises(ProcessCleanupIncomplete):
-        api._report(process(payload), prepared.invocation, prepared.inputs)
+        api._report(process(payload), prepared.invocation, prepared.inputs,
+                    prepared.inputs.scope.source_sha256)
 
 
 @pytest.fixture
 def flow(api: Any, prepared: Any, monkeypatch: pytest.MonkeyPatch) -> Any:
     """Replace only native IO/process boundaries, retain actual recipe/plan/report code."""
-    state = SimpleNamespace(events=[], authority_calls=0, fault=None, pins=0)
+    state = SimpleNamespace(events=[], authority_calls=0, fault=None, pins=0,
+                            candidate=None, candidate_digest=None, payload=None)
     monkeypatch.setattr(api, '_native', lambda: None)
 
     def check() -> None:
@@ -204,7 +212,22 @@ def flow(api: Any, prepared: Any, monkeypatch: pytest.MonkeyPatch) -> Any:
     def measured(root: Path, inv: Any, deadline: float) -> Any:
         state.events.append('source')
         assert inv == prepared.invocation
+        if root == prepared.stage / 'snapshot':
+            state.events.append('candidate')
+            return state.candidate | ({'assets/late.txt': 'f' * 64}
+                                      if state.fault == 'candidate' else {})
         return prepared.fixture.files | ({'extra.txt': 'f' * 64} if state.fault == 'source' else {})
+
+    async def snapshot(workspace: Path, inv: Any, *, destination: Path,
+                       _manifest: dict[str, str]) -> str:
+        assert workspace == prepared.policy.project_workspace_root
+        assert inv.output_limit_bytes == 1024**2
+        assert inv.tenant_id == prepared.invocation.tenant_id
+        assert destination == prepared.stage / 'snapshot'
+        state.events.append('snapshot')
+        _manifest.update(state.candidate)
+        assert type(state.candidate_digest) is str
+        return state.candidate_digest
 
     def observe(root: Path, *, artifact: Any, deadline: float) -> Any:
         state.events.append('sdk')
@@ -222,6 +245,7 @@ def flow(api: Any, prepared: Any, monkeypatch: pytest.MonkeyPatch) -> Any:
     def write(plan: Any, fd: int, target: Path) -> Path:
         state.events.append('plan')
         assert plan.invocation == prepared.invocation and plan.inputs == prepared.inputs.to_payload()
+        state.plan = plan
         return target / 'plan.json'
 
     def export(fd: int, target: Path, gid: int) -> Path:
@@ -230,7 +254,7 @@ def flow(api: Any, prepared: Any, monkeypatch: pytest.MonkeyPatch) -> Any:
 
     def launch(command: Any, **kwargs: Any) -> Any:
         state.events.append('launch')
-        assert state.events[-2] == 'authorize'
+        assert 'authorize' in state.events[:state.events.index('launch')]
         assert kwargs['capture_limit_bytes'] == 32 * 1024**2
         assert kwargs.get('pass_fds', ()) == () and kwargs['cwd'] == prepared.stage
         joined = '\n'.join(command)
@@ -240,11 +264,15 @@ def flow(api: Any, prepared: Any, monkeypatch: pytest.MonkeyPatch) -> Any:
         state.command = command
         if state.fault == 'launch':
             raise OSError('uncertain launcher')
-        return process(report(prepared))
+        payload = report(prepared)
+        if state.candidate is not None:
+            payload['source_sha256'] = state.candidate_digest
+        return process(payload | (state.payload or {}))
 
     def quiesce(policy: Any, job: Any) -> None:
         state.events.append('quiet')
         assert job.invocation.output_limit_bytes == prepared.invocation.output_limit_bytes
+        assert job.source_sha256 == (state.candidate_digest or prepared.inputs.scope.source_sha256)
         if state.fault == 'quiet':
             raise ProcessCleanupIncomplete('go_project_cleanup_incomplete')
 
@@ -253,6 +281,7 @@ def flow(api: Any, prepared: Any, monkeypatch: pytest.MonkeyPatch) -> Any:
     monkeypatch.setattr(api, '_disk_budget', lambda *a: state.events.append('budget'))
     monkeypatch.setattr(api, 'stage_original_contract', stage)
     monkeypatch.setattr(api, '_source_files', measured)
+    monkeypatch.setattr(api, 'snapshot_project_source', snapshot, raising=False)
     monkeypatch.setattr(api, 'observe_published_toolchain', observe)
     monkeypatch.setattr(api, 'toolchain_reference', lambda value: value)
     monkeypatch.setattr(api, '_write_plan', write)
@@ -263,9 +292,12 @@ def flow(api: Any, prepared: Any, monkeypatch: pytest.MonkeyPatch) -> Any:
     def command(inv: Any, policy: Any, **locations: Any) -> Any:
         # Synthetic staging reads a real Windows fixture; the real command builder
         # still validates the POSIX paths a native Root stage would supply.
-        assert locations['snapshot'] == locations['original'] == prepared.fixture.stored.snapshot
+        assert locations['original'] == prepared.fixture.stored.snapshot
+        assert locations['snapshot'] == (prepared.stage / 'snapshot' if state.candidate is not None
+                                        else prepared.fixture.stored.snapshot)
         return native_command(inv, policy, **(locations | {
-            'snapshot': prepared.stage / 'original_snapshot',
+            'snapshot': prepared.stage / ('snapshot' if state.candidate is not None
+                                          else 'original_snapshot'),
             'original': prepared.stage / 'original_snapshot'}))
 
     monkeypatch.setattr(api, 'build_go_project_systemd_command', command)
@@ -371,7 +403,8 @@ def test_report_nested_types_are_exact(api: Any, prepared: Any, field: str) -> N
     else:
         payload[field]['file_count'] = float(payload[field]['file_count'])
     with pytest.raises(ValueError):
-        api._report(process(payload), prepared.invocation, prepared.inputs)
+        api._report(process(payload), prepared.invocation, prepared.inputs,
+                    prepared.inputs.scope.source_sha256)
 
 
 @pytest.mark.parametrize('fault', ['sdk', 'source', 'pins'])
@@ -381,7 +414,7 @@ def test_late_changes_cannot_return_success(flow: Any, fault: str) -> None:
         if flow.authority_calls == 2:
             flow.fault = fault
     response = flow.execute(authority=authority)
-    assert not response.ok and 'quiet' in flow.events
+    assert not response.ok and 'launch' not in flow.events
 
 
 def test_launch_receives_exact_go_budget_not_source_projection(flow: Any, prepared: Any) -> None:
@@ -401,7 +434,7 @@ def test_report_process_rows_are_strict(api: Any, prepared: Any, changes: Any) -
         'stdout_observed_bytes': 0, 'stderr_observed_bytes': 0}
     with pytest.raises(ValueError):
         api._report(process(report(prepared) | {'checks': [row | changes]}),
-            prepared.invocation, prepared.inputs)
+            prepared.invocation, prepared.inputs, prepared.inputs.scope.source_sha256)
 
 
 def test_generated_capture_cannot_become_original_v1(flow: Any, prepared: Any) -> None:
@@ -413,12 +446,288 @@ def test_generated_capture_cannot_become_original_v1(flow: Any, prepared: Any) -
     assert not response.ok and 'launch' not in flow.events and flow.authority_calls == 0
 
 
-def test_candidate_is_explicitly_unsupported(flow: Any, prepared: Any) -> None:
-    request = prepared.request.model_copy(update={
-        'invocation': prepared.invocation.model_copy(update={'source_kind': 'candidate'})})
-    response = flow.execute(request)
-    assert not response.ok and response.error == 'go_project_unsupported'
-    assert 'stage' not in flow.events and 'launch' not in flow.events
+@pytest.fixture
+def candidate(flow: Any, prepared: Any) -> Any:
+    prepared.invocation = prepared.invocation.model_copy(update={'source_kind': 'candidate'})
+    prepared.request = prepared.request.model_copy(update={'invocation': prepared.invocation})
+    flow.candidate = prepared.fixture.files | {'main.go': hashlib.sha256(
+        b'f\0package main\nfunc main() { println("repair") }\n').hexdigest(),
+        'assets/added.txt': hashlib.sha256(b'f\0new inactive file').hexdigest()}
+    flow.candidate_digest = hashlib.sha256(json.dumps(flow.candidate, sort_keys=True,
+        separators=(',', ':'), ensure_ascii=True).encode('ascii')).hexdigest()
+    return flow
+
+
+def test_candidate_binds_measured_source_without_rebinding_original_recipe(
+    candidate: Any, prepared: Any,
+) -> None:
+    response = candidate.execute(prepared.request)
+    assert response.ok and response.result is not None
+    payload = json.loads(response.result.stdout)
+    assert payload['source_sha256'] == candidate.candidate_digest != prepared.inputs.scope.source_sha256
+    assert payload['scope'] == prepared.inputs.scope.to_payload()
+    assert payload['recipe_sha256'] == prepared.inputs.sha256
+    assert payload['toolchain'] == prepared.inputs.toolchain.model_dump(mode='json')
+    assert payload['status'] == 'incomplete' and payload['business_gate'] == 'not_run'
+    assert payload['toolchain_measurement'] == 'not_run'
+    assert candidate.plan.source_sha256 == candidate.candidate_digest
+    assert candidate.events.count('snapshot') == 1 and candidate.events.count('candidate') >= 3
+    assert candidate.authority_calls == 3
+    response.require_for(prepared.request)
+
+
+@pytest.mark.parametrize('path', ['go.mod', 'main_test.go', 'assets/new_test.go',
+    'assets/go.mod', 'assets/setup.py', 'assets/native.s', 'assets/native.S',
+    'assets/native.syso', 'assets/native.SYSO', 'assets/native.c', 'assets/native.cpp',
+    'assets/native.h', 'assets/native.swigcxx'])
+def test_candidate_cannot_change_protected_controls_tests_or_add_native_inputs(
+    candidate: Any, prepared: Any, path: str,
+) -> None:
+    candidate.candidate[path] = '1' * 64
+    candidate.candidate_digest = hashlib.sha256(json.dumps(candidate.candidate, sort_keys=True,
+        separators=(',', ':'), ensure_ascii=True).encode('ascii')).hexdigest()
+    response = candidate.execute(prepared.request)
+    assert not response.ok and 'launch' not in candidate.events and 'plan' not in candidate.events
+
+
+@pytest.mark.parametrize('path', ['go.mod', 'main_test.go', 'assets/readme.txt', 'inactive_windows.go'])
+def test_candidate_deletions_follow_captured_editable_scope(
+    candidate: Any, prepared: Any, path: str,
+) -> None:
+    del candidate.candidate[path]
+    candidate.candidate_digest = hashlib.sha256(json.dumps(candidate.candidate, sort_keys=True,
+        separators=(',', ':'), ensure_ascii=True).encode('ascii')).hexdigest()
+    response = candidate.execute(prepared.request)
+    if path == 'assets/readme.txt':
+        # assets is explicitly editable in the captured contract.
+        assert response.ok
+    else:
+        assert not response.ok and 'plan' not in candidate.events
+
+
+@pytest.mark.parametrize('boundary', ['manifest', 'current', 'after-process'])
+@pytest.mark.parametrize('damage,code', [
+    ('go.mod', 'go_project_protected_input_changed'),
+    ('main_test.go', 'go_project_protected_input_changed'),
+    ('inactive_windows.go', 'go_project_protected_input_changed'),
+    ('outside.go', 'go_project_protected_input_changed'),
+    ('assets/new_test.go', 'go_project_protected_input_changed'),
+    ('assets/go.mod', 'go_project_protected_input_changed'),
+    ('assets/native.S', 'go_project_unsupported'),
+    ('assets/bad path.S', 'go_project_source_unavailable'),
+    ('invalid-digest', 'go_project_source_unavailable'),
+    ('case-alias', 'go_project_source_unavailable'),
+    ('delete-protected', 'go_project_protected_input_changed'),
+    ('files-overbudget', 'go_project_capacity'),
+])
+def test_candidate_validation_errors_are_finite_at_each_boundary(
+    api: Any, candidate: Any, prepared: Any, monkeypatch: pytest.MonkeyPatch,
+    boundary: str, damage: str, code: str,
+) -> None:
+    bad = dict(candidate.candidate)
+    if damage == 'invalid-digest':
+        bad['main.go'] = 'not-a-digest'
+    elif damage == 'case-alias':
+        bad['Assets/other.txt'] = '1' * 64
+    elif damage == 'delete-protected':
+        del bad['inactive_windows.go']
+    elif damage == 'files-overbudget':
+        bad.update({f'assets/extra{i}.txt': '1' * 64 for i in range(prepared.inputs.file_limit)})
+    else:
+        bad[damage] = '1' * 64
+    if boundary == 'manifest':
+        candidate.candidate = bad
+        candidate.candidate_digest = hashlib.sha256(json.dumps(bad, sort_keys=True,
+            separators=(',', ':'), ensure_ascii=True).encode('ascii')).hexdigest()
+    else:
+        measured = api._source_files
+
+        def current(root: Path, inv: Any, deadline: float) -> Any:
+            files = measured(root, inv, deadline)
+            if root == prepared.stage / 'snapshot' and (
+                boundary == 'current' or 'quiet' in candidate.events
+            ):
+                return bad
+            return files
+
+        monkeypatch.setattr(api, '_source_files', current)
+    response = candidate.execute(prepared.request)
+    assert not response.ok and response.error == code
+    assert ('launch' in candidate.events) == (boundary == 'after-process')
+    if boundary == 'after-process':
+        assert candidate.events.count('quiet') == 1
+    response.require_for(prepared.request)
+
+
+@pytest.mark.parametrize('boundary', ['manifest', 'current', 'after-process'])
+@pytest.mark.parametrize('failure', ['unknown', 'cleanup', 'cancel'])
+def test_candidate_validation_preserves_unknown_execution_errors_and_control_flow(
+    api: Any, candidate: Any, prepared: Any, monkeypatch: pytest.MonkeyPatch,
+    boundary: str, failure: str,
+) -> None:
+    error = {'unknown': RuntimeError('go_project_protected_input_changed'),
+             'cleanup': ProcessCleanupIncomplete('go_project_cleanup_incomplete'),
+             'cancel': asyncio.CancelledError()}[failure]
+    original = api.GoProjectInputs.require_current
+
+    def validate(inputs: Any, files: Any) -> None:
+        if files == candidate.candidate and (
+            boundary != 'after-process' or 'quiet' in candidate.events
+        ) and (boundary != 'current' or 'candidate' in candidate.events):
+            raise error
+        original(inputs, files)
+
+    monkeypatch.setattr(api.GoProjectInputs, 'require_current', validate)
+    if failure == 'unknown':
+        response = candidate.execute(prepared.request)
+        assert not response.ok and response.error == 'go_project_execution_unavailable'
+    else:
+        with pytest.raises(type(error)):
+            candidate.execute(prepared.request)
+    assert ('launch' in candidate.events) == (boundary == 'after-process')
+
+
+@pytest.mark.parametrize('step', ['_write_plan', '_make_export', '_export_empty'])
+@pytest.mark.parametrize('kind', [ValueError, RuntimeError])
+def test_candidate_unknown_errors_outside_validators_stay_generic(
+    api: Any, candidate: Any, prepared: Any, monkeypatch: pytest.MonkeyPatch,
+    step: str, kind: type[Exception],
+) -> None:
+    def fail(*args: Any, **kwargs: Any) -> None:
+        raise kind('go_project_protected_input_changed')
+
+    monkeypatch.setattr(api, step, fail)
+    response = candidate.execute(prepared.request)
+    assert not response.ok and response.error == 'go_project_execution_unavailable'
+    assert 'launch' not in candidate.events
+
+
+@pytest.mark.parametrize('fault', ['source', 'candidate', 'sdk'])
+@pytest.mark.parametrize('phase', [2, 3])
+def test_candidate_remeasures_both_sources_and_sdk_after_live_authority(
+    candidate: Any, prepared: Any, fault: str, phase: int,
+) -> None:
+    def authority(inputs: Any, inv: Any) -> None:
+        candidate.authorize(inputs, inv)
+        if candidate.authority_calls == phase:
+            candidate.fault = fault
+    response = candidate.execute(prepared.request, authority=authority)
+    assert not response.ok
+    assert response.error == {'source': 'go_project_protected_input_changed',
+        'candidate': 'go_project_source_unavailable', 'sdk': 'go_project_toolchain_changed'}[fault]
+    assert ('launch' in candidate.events) == (phase == 3)
+
+
+@pytest.mark.parametrize('field', ['source_sha256', 'source_kind', 'scope', 'toolchain'])
+def test_candidate_report_cannot_substitute_original_digest_sdk_or_scope(
+    candidate: Any, prepared: Any, field: str,
+) -> None:
+    candidate.payload = {field: {'source_sha256': prepared.inputs.scope.source_sha256,
+        'source_kind': 'original', 'scope': {}, 'toolchain': {}}[field]}
+    response = candidate.execute(prepared.request)
+    assert not response.ok and candidate.events.count('quiet') == 1
+
+
+@pytest.mark.parametrize('fault', ['launch', 'quiet'])
+def test_candidate_cleanup_uncertainty_is_unknown_without_retry(
+    candidate: Any, prepared: Any, fault: str,
+) -> None:
+    candidate.fault = fault
+    with pytest.raises(ProcessCleanupIncomplete):
+        candidate.execute(prepared.request)
+    assert candidate.events.count('launch') == candidate.events.count('quiet') == 1
+
+
+@pytest.mark.parametrize('phase', [1, 2, 3])
+def test_candidate_live_revocation_is_preserved(candidate: Any, prepared: Any, phase: int) -> None:
+    candidate.fault = f'authority-{phase}'
+    response = candidate.execute(prepared.request)
+    assert not response.ok and response.error == 'go_project_recipe_approval_required'
+    assert ('launch' in candidate.events) == (phase == 3)
+
+
+def test_candidate_snapshot_digest_is_checked_before_plan(candidate: Any, prepared: Any) -> None:
+    candidate.candidate_digest = '9' * 64
+    response = candidate.execute(prepared.request)
+    assert not response.ok and 'plan' not in candidate.events and 'launch' not in candidate.events
+
+
+def test_candidate_inspect_validates_snapshot_without_launch(candidate: Any, prepared: Any) -> None:
+    request = prepared.request.model_copy(update={'action': 'inspect_go_project_environment'})
+    response = candidate.execute(request)
+    assert response.ok and response.environment == prepared.inputs.toolchain
+    assert candidate.events.count('snapshot') == 1 and candidate.events.count('candidate') >= 3
+    assert 'launch' not in candidate.events and 'plan' not in candidate.events
+
+
+@pytest.mark.parametrize('fault', ['source', 'candidate', 'sdk'])
+def test_candidate_process_changes_are_rejected_after_quiescence(
+    api: Any, candidate: Any, prepared: Any, monkeypatch: pytest.MonkeyPatch, fault: str,
+) -> None:
+    launch = api.run_python_phase
+
+    def changed(*args: Any, **kwargs: Any) -> Any:
+        result = launch(*args, **kwargs)
+        candidate.fault = fault
+        return result
+
+    monkeypatch.setattr(api, 'run_python_phase', changed)
+    response = candidate.execute(prepared.request)
+    assert not response.ok and candidate.events.count('quiet') == 1
+    assert response.error == {'source': 'go_project_protected_input_changed',
+        'candidate': 'go_project_source_unavailable', 'sdk': 'go_project_toolchain_changed'}[fault]
+
+
+@pytest.mark.parametrize('phase', [1, 2, 3])
+def test_candidate_authority_unknown_is_never_converted_to_denial(
+    candidate: Any, prepared: Any, phase: int,
+) -> None:
+    def authority(inputs: Any, inv: Any) -> None:
+        candidate.authorize(inputs, inv)
+        if candidate.authority_calls == phase:
+            raise ProcessCleanupIncomplete('go_project_cleanup_incomplete')
+    with pytest.raises(ProcessCleanupIncomplete):
+        candidate.execute(prepared.request, authority=authority)
+    assert ('launch' in candidate.events) == (phase == 3)
+
+
+@pytest.mark.parametrize('phase', [1, 2, 3])
+def test_candidate_cancellation_is_preserved(candidate: Any, prepared: Any, phase: int) -> None:
+    def authority(inputs: Any, inv: Any) -> None:
+        candidate.authorize(inputs, inv)
+        if candidate.authority_calls == phase:
+            raise asyncio.CancelledError
+    with pytest.raises(asyncio.CancelledError):
+        candidate.execute(prepared.request, authority=authority)
+    assert ('launch' in candidate.events) == (phase == 3)
+
+
+def test_candidate_unknown_admission_never_copies_or_executes(
+    api: Any, candidate: Any, prepared: Any, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    @contextmanager
+    def unknown(*args: Any) -> Any:
+        raise api.GoProjectBackendError('go_project_unknown')
+        yield
+
+    monkeypatch.setattr(api, '_admission', unknown)
+    response = candidate.execute(prepared.request)
+    assert not response.ok and response.error == 'go_project_unknown'
+    assert 'snapshot' not in candidate.events and 'launch' not in candidate.events
+
+
+def test_candidate_wrong_scope_is_rejected_by_rebuilt_recipe(
+    api: Any, prepared: Any, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from uuid import UUID
+
+    monkeypatch.setattr(api, '_source_files', lambda *_: prepared.fixture.files)
+    monkeypatch.setattr(api, 'observe_published_toolchain', lambda *a, **k: prepared.inputs.toolchain)
+    monkeypatch.setattr(api, 'toolchain_reference', lambda value: value)
+    inv = prepared.invocation.model_copy(update={'source_kind': 'candidate',
+        'scope': prepared.inputs.scope.model_copy(update={'user_id': UUID(int=99)})})
+    with pytest.raises(ValueError, match='go_project_recipe_changed'):
+        api._measured_inputs(prepared.fixture.stored, inv, prepared.catalog, time.monotonic() + 10)
 
 
 @pytest.mark.parametrize('fault', ['launch', 'quiet'])
@@ -445,19 +754,121 @@ def test_native_requires_root_single_thread_no_loop(api: Any, monkeypatch: pytes
     asyncio.run(running())
 
 
+@pytest.mark.parametrize('source_kind,copies', [('original', 1), ('candidate', 2)])
 def test_disk_budget_includes_rounding_entries_controls_and_reserve(
-    api: Any, prepared: Any, monkeypatch: pytest.MonkeyPatch,
+    api: Any, prepared: Any, monkeypatch: pytest.MonkeyPatch, source_kind: str, copies: int,
 ) -> None:
     block = 4096
-    required = (prepared.invocation.source_limit_bytes + prepared.invocation.file_limit * 10 * block
-                + 64 * 1024**2 + 1024**2 + prepared.invocation.workspace_limit_bytes)
+    inv = prepared.invocation.model_copy(update={'source_kind': source_kind})
+    required = (copies * (inv.source_limit_bytes + inv.file_limit * 10 * block + 32 * 1024**2)
+                + 32 * 1024**2 + 1024**2 + inv.workspace_limit_bytes)
     available = required + prepared.catalog.min_free_bytes
     monkeypatch.setattr(api.os, 'fstatvfs', lambda fd: SimpleNamespace(
         f_bavail=available // block, f_frsize=block), raising=False)
-    api._disk_budget(20, prepared.invocation, prepared.catalog)
+    api._disk_budget(20, inv, prepared.catalog)
     available -= block
     with pytest.raises(ValueError, match='go_project_capacity'):
-        api._disk_budget(20, prepared.invocation, prepared.catalog)
+        api._disk_budget(20, inv, prepared.catalog)
+
+
+@pytest.mark.parametrize('limit', ['bytes', 'files'])
+def test_candidate_appended_files_cannot_exceed_source_budget(
+    api: Any, prepared: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, limit: str,
+) -> None:
+    workspace = tmp_path / 'workspace'
+    inv = prepared.invocation.model_copy(update={'source_kind': 'candidate'})
+    source = workspace / str(inv.tenant_id) / 'projects' / inv.project_id / 'sessions' / inv.session_id
+    source.mkdir(parents=True)
+    for name, data in prepared.fixture.raw.items():
+        path = source / name
+        path.parent.mkdir(exist_ok=True)
+        path.write_bytes(data)
+    (source / 'assets' / 'added.txt').write_bytes(b'additional source bytes')
+    if limit == 'bytes':
+        inv = inv.model_copy(update={'source_limit_bytes': sum(map(len, prepared.fixture.raw.values()))})
+    else:
+        inv = inv.model_copy(update={'file_limit': len(prepared.fixture.raw)})
+    stage = tmp_path / 'stage'
+    stage.mkdir()
+    policy = replace(prepared.policy, project_workspace_root=workspace)
+    monkeypatch.setattr(api, '_source_files', lambda *args: pytest.fail('overbudget copy admitted'))
+    with pytest.raises(api.GoProjectBackendError) as failure:
+        api._source_snapshot(prepared.fixture.stored, prepared.inputs, inv, policy,
+                             stage, time.monotonic() + 10)
+    assert failure.value.code == 'go_project_source_unavailable'
+
+
+@pytest.mark.parametrize('kind', [RuntimeError, ProcessCleanupIncomplete, asyncio.CancelledError])
+def test_candidate_snapshot_helper_rejection_preserves_control_flow(
+    api: Any, prepared: Any, monkeypatch: pytest.MonkeyPatch, kind: type[BaseException],
+) -> None:
+    error = kind('unrelated private helper error text')
+
+    async def reject(*args: Any, **kwargs: Any) -> str:
+        raise error
+
+    monkeypatch.setattr(api, 'snapshot_project_source', reject)
+    monkeypatch.setattr(api, '_source_files', lambda *a: pytest.fail('rejected copy remeasured'))
+    inv = prepared.invocation.model_copy(update={'source_kind': 'candidate'})
+    if kind is RuntimeError:
+        with pytest.raises(api.GoProjectBackendError) as failure:
+            api._source_snapshot(prepared.fixture.stored, prepared.inputs, inv, prepared.policy,
+                                 prepared.stage, time.monotonic() + 10)
+        assert failure.value.code == 'go_project_source_unavailable'
+    else:
+        with pytest.raises(kind) as failure:
+            api._source_snapshot(prepared.fixture.stored, prepared.inputs, inv, prepared.policy,
+                                 prepared.stage, time.monotonic() + 10)
+        assert failure.value is error
+
+
+def test_candidate_real_copy_binds_complete_live_scope_and_ignores_later_workspace_edits(
+    api: Any, prepared: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace, stage = tmp_path / 'workspace', tmp_path / 'stage'
+    inv = prepared.invocation.model_copy(update={'source_kind': 'candidate'})
+    source = workspace / str(inv.tenant_id) / 'projects' / inv.project_id / 'sessions' / inv.session_id
+    source.mkdir(parents=True)
+    raw = prepared.fixture.raw | {'main.go': b'package main\nfunc main() { println("fixed") }\n',
+                                 'assets/extra.txt': b'non-Go candidate input\n'}
+    expected = {name: hashlib.sha256(b'f\0' + data).hexdigest() for name, data in raw.items()}
+    digest = hashlib.sha256(json.dumps(expected, sort_keys=True,
+        separators=(',', ':'), ensure_ascii=True).encode('ascii')).hexdigest()
+    for name, data in raw.items():
+        path = source / name
+        path.parent.mkdir(exist_ok=True)
+        path.write_bytes(data)
+    stage.mkdir()
+    policy = replace(prepared.policy, project_workspace_root=workspace)
+    observed = []
+
+    def measured(root: Path, invocation: Any, deadline: float) -> Any:
+        observed.append(root)
+        # Only native ownership/dir_fd measurement is replaced on Windows.
+        return {path.relative_to(root).as_posix(): hashlib.sha256(
+            b'f\0' + path.read_bytes()).hexdigest() for path in root.rglob('*') if path.is_file()}
+
+    monkeypatch.setattr(api, '_source_files', measured)
+    try:
+        assert api._source_snapshot(prepared.fixture.stored, prepared.inputs, inv,
+                                    policy, stage, time.monotonic() + 10) == digest
+        snapshot = stage / 'snapshot'
+        assert {p.relative_to(snapshot).as_posix(): p.read_bytes()
+                for p in snapshot.rglob('*') if p.is_file()} == raw
+        (source / 'main.go').write_bytes(b'later workspace mutation')
+        api._recheck_source(prepared.fixture.stored, prepared.inputs, inv, snapshot,
+                            digest, time.monotonic() + 10)
+        assert observed.count(prepared.fixture.stored.snapshot) == 2
+        assert observed.count(snapshot) == 2
+        with pytest.raises(api.GoProjectBackendError) as failure:
+            api._source_snapshot(prepared.fixture.stored, prepared.inputs, inv,
+                                 policy, stage, time.monotonic() + 10)
+        assert failure.value.code == 'go_project_source_unavailable'
+    finally:
+        if (stage / 'snapshot').exists():
+            for path in (stage / 'snapshot').rglob('*'):
+                path.chmod(0o700 if path.is_dir() else 0o600)
+            (stage / 'snapshot').chmod(0o700)
 
 
 @pytest.mark.parametrize('change', ['stage-parent', 'policy-stage', 'uid', 'gid', 'group',
@@ -505,6 +916,8 @@ def test_quiesce_uses_existing_broker_and_preserves_go_invocation(
 def test_native_plan_is_root_readonly_exclusive_and_never_removes_stage(
     api: Any, prepared: Any, tmp_path: Path,
 ) -> None:
+    if sys.platform != 'linux':
+        pytest.skip('requires native Linux Root dir_fd/modes')
     if os.geteuid() != 0 or os.getegid() != 0:
         pytest.skip('requires Root')
     plan = api.GoProjectRunnerPlan(invocation=prepared.invocation,
@@ -525,6 +938,8 @@ def test_native_plan_is_root_readonly_exclusive_and_never_removes_stage(
 def test_native_full_source_measurement_catches_non_go_extra_file(
     api: Any, prepared: Any,
 ) -> None:
+    if sys.platform != 'linux':
+        pytest.skip('requires native Linux Root sealed measurement')
     if os.geteuid() != 0 or os.getegid() != 0:
         pytest.skip('requires Root')
     root = prepared.fixture.stored.snapshot
@@ -549,6 +964,8 @@ def test_native_full_source_measurement_catches_non_go_extra_file(
 def test_native_export_is_empty_root_group_writable_only_outer(
     api: Any, tmp_path: Path,
 ) -> None:
+    if sys.platform != 'linux':
+        pytest.skip('requires native Linux Root dir_fd/modes')
     if os.geteuid() != 0 or os.getegid() != 0:
         pytest.skip('requires Root')
     fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)

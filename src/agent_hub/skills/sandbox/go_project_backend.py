@@ -1,4 +1,4 @@
-"""Trusted synchronous Root Go diagnostics, original captures only in v1.
+"""Trusted synchronous Root Go diagnostics with protected candidate snapshots.
 
 No CLI, RPC admission, DB grant adapter, binary export or business receipt lives
 here. The trusted caller supplies live authority, execution/UNKNOWN fences and
@@ -9,6 +9,7 @@ cleanup or delete any stage here. Call only in a single-threaded Root helper.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import os
 import re
@@ -16,15 +17,20 @@ import stat
 import sys
 import threading
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Protocol, cast
 
 from agent_hub.capabilities.go_project_inputs import GoProjectInputs, bind_go_project_inputs
-from agent_hub.capabilities.go_project_recipe import parse_go_project_declaration
+from agent_hub.capabilities.go_project_recipe import (
+    parse_go_project_declaration,
+    validate_go_source_paths,
+)
 from agent_hub.capabilities.project_baselines import ProjectBaselineReference, StoredProjectBaseline
+from agent_hub.capabilities.project_contracts import _files
+from agent_hub.capabilities.project_stack_registry import is_stack_control_path
 from agent_hub.capabilities.scoped_read import _read_no_links
 from agent_hub.skills.sandbox import python_project_backend as _python
 from agent_hub.skills.sandbox.base import SkillResult
@@ -41,7 +47,7 @@ from agent_hub.skills.sandbox.go_project_protocol import (
     parse_go_project_request,
 )
 from agent_hub.skills.sandbox.go_project_runner import GoProjectRunnerPlan
-from agent_hub.skills.sandbox.project import _Execution
+from agent_hub.skills.sandbox.project import _Execution, snapshot_project_source
 from agent_hub.skills.sandbox.project_contract_broker import (
     _encoded,
     _Observed,
@@ -189,8 +195,9 @@ def _disk_budget(fd: int, inv: GoProjectInvocation, catalog: ToolchainCatalog) -
     disk = statvfs(fd)
     block = disk.f_frsize
     _need(type(block) is int and 0 < block <= 1024**2, 'go_project_capacity')
-    # One original copy, rounded entries, contract + plan controls and work.
-    required = (source_copy_peak(inv.source_limit_bytes, inv.file_limit * 10, block)
+    # Candidate execution retains both sealed copies alongside controls and work.
+    copies = 2 if inv.source_kind == 'candidate' else 1
+    required = (copies * source_copy_peak(inv.source_limit_bytes, inv.file_limit * 10, block)
                 + _MAX_PLAN + 1024**2 + inv.workspace_limit_bytes)
     _need(disk.f_bavail * block >= required + max(_RESERVE, catalog.min_free_bytes),
           'go_project_capacity')
@@ -230,6 +237,60 @@ def _measured_inputs(original: StoredProjectBaseline, inv: GoProjectInvocation,
     inputs.require_current(files)
     _check(deadline)
     return inputs
+
+
+def _require_current(inputs: GoProjectInputs, source_files: Mapping[str, str]) -> None:
+    # Classify at validator boundaries; exception messages are never protocol codes.
+    try:
+        current = _files(source_files)
+    except ValueError:
+        raise GoProjectBackendError('go_project_source_unavailable') from None
+    _need(len(current) <= inputs.file_limit, 'go_project_capacity')
+    controls = {path: value for path, value in current.items() if is_stack_control_path(path)}
+    original_controls = {path: value for path, value in inputs.source_files.items()
+                         if is_stack_control_path(path)}
+    _need(controls == original_controls, 'go_project_protected_input_changed')
+    try:
+        validate_go_source_paths(tuple(current))
+    except ValueError:
+        raise GoProjectBackendError('go_project_unsupported') from None
+    try:
+        inputs.require_current(current)
+    except ValueError:
+        raise GoProjectBackendError('go_project_protected_input_changed') from None
+
+
+def _recheck_source(original: StoredProjectBaseline, inputs: GoProjectInputs,
+                    inv: GoProjectInvocation, snapshot: Path, digest: str,
+                    deadline: float) -> None:
+    files = _source_files(original.snapshot, inv, deadline)
+    _need(files == original.source_files, 'go_project_protected_input_changed')
+    current = files if snapshot == original.snapshot else _source_files(snapshot, inv, deadline)
+    _require_current(inputs, current)
+    _need(hashlib.sha256(_encoded(current)).hexdigest() == digest,
+          'go_project_source_unavailable')
+    _check(deadline)
+
+
+def _source_snapshot(original: StoredProjectBaseline, inputs: GoProjectInputs,
+                     inv: GoProjectInvocation, policy: BrokerPolicy, stage: Path,
+                     deadline: float) -> str:
+    _check(deadline)
+    if inv.source_kind == 'original':
+        snapshot, digest = original.snapshot, original.reference.input_source_sha256
+    else:
+        snapshot = stage / 'snapshot'
+        manifest: dict[str, str] = {}
+        try:
+            digest = asyncio.run(snapshot_project_source(policy.project_workspace_root,
+                base_go_invocation(inv), destination=snapshot, _manifest=manifest))
+        except ProcessCleanupIncomplete:
+            raise
+        except RuntimeError:
+            raise GoProjectBackendError('go_project_source_unavailable') from None
+        _require_current(inputs, manifest)
+    _recheck_source(original, inputs, inv, snapshot, digest, deadline)
+    return digest
 
 
 def _write_plan(plan: GoProjectRunnerPlan, parent: int, stage: Path) -> Path:
@@ -284,7 +345,7 @@ def _quiesce(policy: BrokerPolicy, job: _Execution) -> None:
 
 
 def _report(process: PythonPhaseProcessResult, inv: GoProjectInvocation,
-            inputs: GoProjectInputs) -> dict[str, Any]:
+            inputs: GoProjectInputs, source_sha256: str) -> dict[str, Any]:
     """Validate the complete outer process stream without claiming project pass."""
     import json
 
@@ -307,7 +368,7 @@ def _report(process: PythonPhaseProcessResult, inv: GoProjectInvocation,
     expected = {
         'schema_version': 1, 'kind': 'go_project', 'evidence': 'native_process_only',
         'execution_id': inv.execution_id, 'scope': inputs.scope.to_payload(),
-        'source_kind': inv.source_kind, 'source_sha256': inputs.scope.source_sha256,
+        'source_kind': inv.source_kind, 'source_sha256': source_sha256,
         'recipe_sha256': inputs.sha256, 'environment_input_sha256': inputs.environment_input_sha256,
         'original_reference': inputs.original_reference.to_payload(),
         'original_check_contract': inputs.contract.protected_sha256,
@@ -381,7 +442,6 @@ def execute_go_project_request(
     try:
         _native()
         _need(callable(authorize), 'go_project_recipe_approval_required')
-        _need(inv.source_kind == 'original', 'go_project_unsupported')
         _need(type(catalog) is ToolchainCatalog, 'go_project_environment_unavailable')
         catalog_bytes = catalog.to_json()
         catalog = ToolchainCatalog.from_json(catalog_bytes)
@@ -407,31 +467,36 @@ def execute_go_project_request(
             _authorize(authorize, inputs, inv)
             _native()
             _check(deadline)
-            if request.action == 'inspect_go_project_environment':
+            source_sha256 = _source_snapshot(original, inputs, inv, policy, stage, deadline)
+            snapshot = original.snapshot if inv.source_kind == 'original' else stage / 'snapshot'
+
+            def remeasure() -> None:
+                recheck()
                 _need(_measured_inputs(original, inv, catalog, deadline) == inputs,
                       'go_project_environment_changed')
+                _recheck_source(original, inputs, inv, snapshot, source_sha256, deadline)
                 recheck()
+
+            if request.action == 'inspect_go_project_environment':
+                remeasure()
                 response = _response(request, ok=True, environment=inputs.toolchain)
                 _authorize(authorize, inputs, inv)
             else:
                 plan = GoProjectRunnerPlan(invocation=inv, inputs=inputs.to_payload(),
-                                           source_sha256=inputs.scope.source_sha256)
+                                           source_sha256=source_sha256)
                 plan_path = _write_plan(plan, roots.stage_fd, stage)
                 export = _make_export(roots.stage_fd, stage, policy.allowed_gid)
                 artifact = catalog.select(inputs.declaration)
                 command = build_go_project_systemd_command(inv, policy,
-                    snapshot=original.snapshot, original=original.snapshot, plan=plan_path,
+                    snapshot=snapshot, original=original.snapshot, plan=plan_path,
                     toolchain_root=Path(catalog.runtime_root) / artifact.artifact_sha256 / 'payload/go',
                     export=export)
                 _export_empty(roots.stage_fd, deadline)
-                _need(_measured_inputs(original, inv, catalog, deadline) == inputs,
-                      'go_project_environment_changed')
-                recheck()
+                remeasure()
                 job = _Execution(inv, None, stage=stage, launched=True,
-                                 source_sha256=inputs.scope.source_sha256)
+                                 source_sha256=source_sha256)
                 _authorize(authorize, inputs, inv)
-                _native()
-                _check(deadline)
+                remeasure()
                 try:
                     process = run_python_phase(command, cwd=stage, deadline=deadline,
                         capture_limit_bytes=GO_PROJECT_DIAGNOSTIC_MAX_BYTES)
@@ -439,15 +504,14 @@ def execute_go_project_request(
                     raise ProcessCleanupIncomplete('go_project_cleanup_incomplete') from None
                 finally:
                     _quiesce(policy, job)
-                _report(process, inv, inputs)
+                _report(process, inv, inputs, source_sha256)
                 _export_empty(roots.stage_fd, deadline)
-                _need(_measured_inputs(original, inv, catalog, deadline) == inputs,
-                      'go_project_environment_changed')
-                recheck()
+                remeasure()
                 response = _response(request, ok=True, result=SkillResult(
                     exit_code=process.exit_code, stdout=process.stdout, stderr=process.stderr,
                     timed_out=False))
                 _authorize(authorize, inputs, inv)
+            remeasure()
             _native()
             _check(deadline)
         return response
