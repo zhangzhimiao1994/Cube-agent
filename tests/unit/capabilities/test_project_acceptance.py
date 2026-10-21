@@ -57,7 +57,7 @@ def source_files(stack: str = "node", raw: bytes | None = None) -> dict[str, str
 
 def binding(stack: str = "node", raw: bytes | None = None) -> dict[str, Any]:
     files = source_files(stack, raw)
-    scope = {"tenant_id": UUID(int=1), "user_id": UUID(int=2), "run_id": UUID(int=3),
+    scope: dict[str, Any] = {"tenant_id": UUID(int=1), "user_id": UUID(int=2), "run_id": UUID(int=3),
              "project_id": "new-project", "session_id": "session-one", "request_sha256": "4" * 64,
              "proposer_actor": "engineer"}
     contract = build_project_check_contract(scope["tenant_id"], scope["run_id"], scope["project_id"],

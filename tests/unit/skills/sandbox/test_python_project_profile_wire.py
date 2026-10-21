@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -19,7 +19,8 @@ from tests.unit.skills.sandbox.test_python_project_profile import invocation
 
 async def serve(monkeypatch: pytest.MonkeyPatch, payload: dict[str, Any], *, uid: int = 10001) -> dict[str, Any]:
     monkeypatch.setattr(broker, '_peer_uid', lambda writer: uid)
-    reader, writer = asyncio.StreamReader(), Writer()
+    # The shared transport fake predates typed fixtures; it is not a real socket.
+    reader, writer = asyncio.StreamReader(), cast(Any, Writer)()
     body = json.dumps(payload).encode()
     reader.feed_data(len(body).to_bytes(4) + body)
     reader.feed_eof()
