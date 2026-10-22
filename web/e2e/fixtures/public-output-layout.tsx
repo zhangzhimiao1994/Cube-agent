@@ -58,10 +58,16 @@ window.fetch = async (input, init) => {
     tenant_id:"00000000-0000-4000-8000-000000000001",username:"test",role:"super_admin",permissions:["*"]}
     : path === "/api/v1/admin/runs" ? [run]
     : path === `/api/v1/admin/runs/${run.id}` ? run
-    : path === "/api/v1/admin/conversations" ? url.searchParams.get("archived") === "true" ? [] : [conversation]
+    : path === "/api/v1/admin/conversations" ? url.searchParams.get("archived") === "true"
+      ? [{ ...conversation, conversation_id: "layout-archived", title: "已归档排版回归", archived_at: "2026-10-22T01:00:00Z", runs: [] }] : [conversation]
+    : path === "/api/v1/admin/conversation-questions/search" ? { items: [{ run_id: run.id,
+      conversation_id: run.conversation_id, project_id: "default", conversation_title: "排版回归",
+      question: "检查结果和排版", created_at: run.created_at }], next_cursor: null }
     : path === "/api/v1/admin/conversations/layout-conversation" ? conversation
     : path.endsWith("/files") ? { items: [], bundle_download_url: "/unused" }
     : path.endsWith("/project-workspaces") ? [{ project_id: "default", label: "默认项目", workspace_path: "main" }]
+    : path.endsWith("/directories") ? { project_id: "default", platform: "linux", separator: "/",
+      configured_root: "/fixture/workspaces", logical_root: "projects/default", directories: ["main"], native_picker_available: false }
     : path.endsWith("/execution-backends") ? [{id:"systemd",name:"本机 systemd 隔离",adapter:"SystemdSkillSandbox",
       description:"本地只读布局夹具中的可用执行器状态",available:true,reason:null,isolation:"严格隔离",cost:"本机资源",supported_sandbox_profiles:["none","read_only","restricted","workspace_write"]}]
     : path.endsWith("/settings") ? { default_mode: "auto", default_workflow_id: null, default_agent_ids: [], log_level: "warning",

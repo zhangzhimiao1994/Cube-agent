@@ -160,12 +160,33 @@ body:has(.conversation-workspace)::after { display: none; }
 .conversation-workspace .composer-attachment-card { background: #f8fafb; border-color: #dfe3e8; border-radius: 6px; box-shadow: none; color: #1f2329; }
 .conversation-workspace .agent-workbench-trigger { background: #f5f6f8; border-color: #dfe3e8; border-radius: 6px; box-shadow: none; color: #535d6a; }
 .conversation-workspace .conversation-list { background: #fff; border-color: #dfe3e8; box-shadow: var(--shadow); }
+.conversation-workspace .conversation-drawer-backdrop { border-radius: 0; box-shadow: none; }
+.conversation-workspace .conversation-list input[type="checkbox"] { appearance: auto; accent-color: #087f8c; background: #fff; border-radius: 3px; box-shadow: none; min-height: 16px; padding: 0; }
+.conversation-workspace .conversation-list input[type="checkbox"]::after { display: none; }
+.conversation-workspace .conversation-list :is(input, select, button):focus-visible { outline: 2px solid #087f8c; outline-offset: 2px; box-shadow: none; }
+.conversation-workspace .conversation-list :is(input, select):focus { box-shadow: none; }
 .conversation-workspace .conversation-list :is(h3, strong, .conversation-title-text) { color: #1f2329; }
 .conversation-workspace .conversation-list :is(small, code, .conversation-meta-line) { color: #646b78; }
 .conversation-workspace .conversation-list-header,
-.conversation-workspace .conversation-project-card,
-.conversation-workspace .conversation-project-heading,
-.conversation-workspace .conversation-item { background: #f8fafb; border-color: #dfe3e8; border-radius: 6px; box-shadow: none; }
+.conversation-workspace .conversation-project,
+.conversation-workspace .conversation-project-detail-header,
+.conversation-workspace .conversation-row,
+.conversation-workspace .conversation-bulk-actions,
+.conversation-workspace .conversation-question-results,
+.conversation-workspace .conversation-question-result { background: #f8fafb; border-color: #dfe3e8; border-radius: 6px; box-shadow: none; }
+.conversation-workspace .conversation-project-new { background: #f5f6f8; border-color: #dfe3e8; color: #076b76; }
+.conversation-workspace .conversation-project-select:hover,
+.conversation-workspace .conversation-project-new:hover { background: #edf7f6; }
+.conversation-workspace .conversation-item { background: transparent; border-color: transparent; box-shadow: none; }
+.conversation-workspace .conversation-row-active { background: #edf7f6; border-color: #b9d8da; box-shadow: none; }
+.conversation-workspace .conversation-question-result span { color: #076b76; }
+.conversation-workspace .conversation-manager-tabs { background: #f5f6f8; border-color: #dfe3e8; }
+.conversation-workspace .conversation-manager-tabs button { color: #535d6a; }
+.conversation-workspace .conversation-manager-tabs button.selected { background: #fff; border-color: #cdd3dc; color: #1f2329; }
+.conversation-workspace :is(.conversation-branch-button, .conversation-restore-button) { background: #fff; border-color: #dfe3e8; box-shadow: none; color: #076b76; }
+.conversation-workspace .conversation-delete-button { background: #fff; border-color: #e5c4c9; box-shadow: none; color: #b42336; }
+.conversation-workspace :is(.conversation-branch-button, .conversation-restore-button, .conversation-delete-button):is(:hover, :focus-visible) { background: #f5f6f8; border-color: #b7c0cc; box-shadow: none; }
+.conversation-workspace :is(.conversation-branch-button, .conversation-restore-button, .conversation-delete-button):disabled { background: #f5f6f8; border-color: #dfe3e8; color: #7b8491; }
 .conversation-workspace .conversation-menu { background: #fff; border-color: #dfe3e8; box-shadow: var(--shadow); }
 .conversation-workspace .conversation-menu button { color: #1f2329; }
 .conversation-workspace .conversation-drawer-trigger { border-radius: 6px; box-shadow: none; height: 34px; right: 18px; top: 15px; width: 34px; z-index: 31; }
@@ -176,7 +197,10 @@ body:has(.conversation-workspace) button:hover { box-shadow: none; transform: no
 body:has(.conversation-workspace) :is(input, select, textarea) { background: #fff; border-color: #cdd3dc; border-radius: 6px; box-shadow: none; color: #1f2329; }
 body:has(.conversation-workspace) :is(.secondary-action, .conversation-menu-trigger, .conversation-close-button, .conversation-branch-button) { background: #fff; border-color: #dfe3e8; border-radius: 6px; box-shadow: none; color: #535d6a; }
 body:has(.conversation-workspace) :is(.composer-settings-dialog, .conversation-dialog) { background: #fff; border-color: #dfe3e8; border-radius: 8px; color: #1f2329; }
+body:has(.conversation-workspace) .conversation-dialog button:not(.secondary-action):not(.conversation-dialog-close):not(.selected) { background: #087f8c; border-color: #087f8c; border-radius: 6px; box-shadow: none; color: #fff; }
 body:has(.conversation-workspace) :is(.composer-config-sheet, .composer-config-summary, .chat-config-strip, .run-settings-panel, .conversation-workspace-summary) { background: #fff; border-color: #dfe3e8; box-shadow: none; }
+body:has(.conversation-workspace) .workspace-configured-root { background: #f5f6f8; border-color: #dfe3e8; color: #1f2329; }
+body:has(.conversation-workspace) .workspace-directory-options button.selected { background: #edf7f6; border-color: #087f8c; color: #1f2329; }
 body:has(.conversation-workspace) .run-settings-panel > summary { background: #f5f6f8; color: #1f2329; }
 body:has(.conversation-workspace) .sandbox-choice { background: #fff; border-color: #dfe3e8; border-radius: 6px; color: #1f2329; }
 body:has(.conversation-workspace) .sandbox-choice strong { color: #1f2329; }

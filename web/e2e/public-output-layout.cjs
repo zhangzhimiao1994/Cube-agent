@@ -98,7 +98,7 @@ for (const [device, viewport] of [
       assert(after.height > before.height && after.text === before.text && after.weight === before.weight);
       await screenshot(page, `${device}-runs-long-expanded`);
       await paragraph.getByRole('button', { name: '复制全文', exact: true }).click();
-      await expect(paragraph.getByRole('button', { name: '已复制', exact: true })).toBeVisible();
+      await expect(paragraph.getByRole('button', { name: '已复制全文', exact: true })).toBeVisible();
       const copied = await page.evaluate(() => navigator.clipboard.readText());
       assert.equal(copied, '**关键结论**与 `settings.json`：'
         + '长回复正文需要保留一致的文字层级。'.repeat(80) + '末尾完整内容。');

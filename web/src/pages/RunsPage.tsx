@@ -6596,6 +6596,10 @@ export function RunsPage() {
     };
   });
   const [conversationMenuOpen, setConversationMenuOpen] = useState(false);
+  const conversationMenuAnchorRef = useRef<HTMLDivElement>(null);
+  const conversationMenuTriggerRef = useRef<HTMLButtonElement>(null);
+  const conversationMenuRef = useRef<HTMLDivElement>(null);
+  const conversationMenuInitialFocusRef = useRef<"first" | "last">("first");
   const [renameConversationOpen, setRenameConversationOpen] = useState(false);
   const [renameConversationTitle, setRenameConversationTitle] = useState("");
   const [conversationSearch, setConversationSearch] = useState("");
@@ -6708,6 +6712,39 @@ export function RunsPage() {
 
   const selectedRunConversationId = runConversationId(selectedRun.data);
   const activeConversationId = conversationId.trim();
+  useEffect(() => {
+    if (conversationMenuRef.current?.contains(document.activeElement)) {
+      conversationMenuTriggerRef.current?.focus();
+    }
+    setConversationMenuOpen(false);
+  }, [activeConversationId]);
+
+  useEffect(() => {
+    if (!conversationMenuOpen) return;
+    const items = conversationMenuRef.current?.querySelectorAll<HTMLButtonElement>('[role="menuitem"]:not(:disabled)');
+    const index = conversationMenuInitialFocusRef.current === "last" ? (items?.length ?? 1) - 1 : 0;
+    items?.[index]?.focus();
+    function onPointerDown(event: PointerEvent) {
+      if (event.target instanceof Node && !conversationMenuAnchorRef.current?.contains(event.target)) {
+        setConversationMenuOpen(false);
+      }
+    }
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      if (conversationMenuAnchorRef.current?.contains(document.activeElement)) {
+        conversationMenuTriggerRef.current?.focus();
+      }
+      setConversationMenuOpen(false);
+    }
+    document.addEventListener("pointerdown", onPointerDown, true);
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("pointerdown", onPointerDown, true);
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, [conversationMenuOpen]);
+
   const listedConversationMetadata = [
     ...(conversations.data ?? []),
     ...(archivedConversations.data ?? []),
@@ -7454,8 +7491,13 @@ export function RunsPage() {
         ...updated,
         runs: current?.runs ?? conversationRunCache[updated.conversation_id] ?? [],
       }));
-      setRenameConversationOpen(false);
-      setConversationMenuOpen(false);
+      if (variables.conversationId === activeConversationId) {
+        if (renameConversationOpen || conversationMenuRef.current?.contains(document.activeElement)) {
+          conversationMenuTriggerRef.current?.focus();
+        }
+        setRenameConversationOpen(false);
+        setConversationMenuOpen(false);
+      }
       if (variables.archived === false) setConversationManagerView("current");
       setSubmitNotice(
         variables.title !== undefined
@@ -9028,22 +9070,56 @@ export function RunsPage() {
                 {currentConversationArchived ? <span className="conversation-archived-badge">已归档</span> : null}
               </div>
               <div className="chat-session-actions">
-                <div className="conversation-menu-anchor">
+                <div ref={conversationMenuAnchorRef} className="conversation-menu-anchor">
                   <button
+                    ref={conversationMenuTriggerRef}
                     type="button"
                     className="conversation-menu-trigger"
                     aria-label="会话操作"
+                    title={currentConversationPersisted ? `会话操作：重命名、${currentConversationArchived ? "恢复" : "归档"}` : "开始会话后可重命名或归档"}
+                    aria-haspopup="menu"
                     aria-expanded={conversationMenuOpen}
                     disabled={!currentConversationPersisted}
-                    onClick={() => setConversationMenuOpen((current) => !current)}
+                    onClick={() => {
+                      conversationMenuInitialFocusRef.current = "first";
+                      setConversationMenuOpen((current) => !current);
+                    }}
+                    onKeyDown={(event) => {
+                      if (!["ArrowDown", "ArrowUp", "Enter", " "].includes(event.key)) return;
+                      event.preventDefault();
+                      conversationMenuInitialFocusRef.current = event.key === "ArrowUp" ? "last" : "first";
+                      setConversationMenuOpen(true);
+                    }}
                   >
                     <MoreHorizontal size={18} aria-hidden="true" />
                   </button>
                   {conversationMenuOpen ? (
-                    <div className="conversation-menu" role="menu">
+                    <div
+                      ref={conversationMenuRef}
+                      className="conversation-menu"
+                      role="menu"
+                      aria-label="会话操作"
+                      onKeyDown={(event) => {
+                        if (event.key === "Tab") {
+                          // Let the browser move focus before removing the focused menu item.
+                          queueMicrotask(() => setConversationMenuOpen(false));
+                          return;
+                        }
+                        if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) return;
+                        event.preventDefault();
+                        event.stopPropagation();
+                        const items = [...event.currentTarget.querySelectorAll<HTMLButtonElement>('[role="menuitem"]:not(:disabled)')];
+                        if (!items.length) return;
+                        const current = items.findIndex((item) => item === document.activeElement);
+                        const next = event.key === "Home" ? 0 : event.key === "End" ? items.length - 1
+                          : (current + (event.key === "ArrowDown" ? 1 : -1) + items.length) % items.length;
+                        items[next].focus();
+                      }}
+                    >
                       <button
                         type="button"
                         role="menuitem"
+                        tabIndex={-1}
                         onClick={() => {
                           setRenameConversationTitle(currentConversationTitle);
                           updateConversation.reset();
@@ -9056,6 +9132,7 @@ export function RunsPage() {
                       <button
                         type="button"
                         role="menuitem"
+                        tabIndex={-1}
                         disabled={updateConversation.isPending}
                         onClick={() =>
                           updateConversation.mutate({
@@ -9836,7 +9913,10 @@ export function RunsPage() {
             setRenameConversationTitle(value);
           }}
           onClose={() => {
-            if (!updateConversation.isPending) setRenameConversationOpen(false);
+            if (!updateConversation.isPending) {
+              setRenameConversationOpen(false);
+              conversationMenuTriggerRef.current?.focus();
+            }
           }}
           onSubmit={() => {
             const title = renameConversationTitle.trim();

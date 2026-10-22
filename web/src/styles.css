@@ -5408,6 +5408,27 @@ article:hover {
   min-width: 0;
 }
 
+.message-paragraph-tools .message-copy-button {
+  align-items: center;
+  background: transparent;
+  border: 0;
+  border-radius: 4px;
+  box-shadow: none;
+  color: var(--muted);
+  display: inline-flex;
+  flex: 0 0 32px;
+  height: 32px;
+  justify-content: center;
+  min-height: 32px;
+  min-width: 32px;
+  padding: 0;
+  width: 32px;
+}
+
+.message-copy-button > svg { flex: 0 0 16px; height: 16px; width: 16px; }
+.message-copy-button:hover,
+.message-copy-button:focus-visible { background: var(--panel-strong); color: var(--ink); }
+
 .message-expand-button {
   background: rgba(255, 255, 255, 0.08);
   border-color: rgba(148, 163, 184, 0.28);
