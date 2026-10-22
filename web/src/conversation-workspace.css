@@ -148,7 +148,9 @@ body:has(.conversation-workspace)::after { display: none; }
 .conversation-workspace .conversation-checkpoints { background: #fafbfc; border-color: #e4e7ec; box-shadow: none; }
 .conversation-workspace .message-table { min-width: min(42rem, calc(var(--output-column-count) * 8rem)); table-layout: auto; width: 100%; }
 .conversation-workspace .message-table col { width: auto; }
-.conversation-workspace .message-table :is(th, td) { font-size: 14px; line-height: 1.6; padding: 10px 12px; }
+.conversation-workspace .message-table :is(th, td) { font-size: 14px; line-height: 1.6; min-width: 5.5rem; padding: 10px 12px; }
+.conversation-workspace .message-table :is(th, td):first-child { min-width: 3.5rem; }
+.conversation-workspace .message-table th:first-child { white-space: nowrap; }
 .conversation-workspace .message-table td:last-child { max-width: 26rem; min-width: 12rem; }
 .conversation-workspace .message-table th { background: #f5f6f8; color: #535d6a; }
 .conversation-workspace .run-process-summary,
