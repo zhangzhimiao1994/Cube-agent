@@ -4613,6 +4613,10 @@ article:hover {
   max-height: 12rem;
 }
 
+.bounded-text-block:not(.is-expanded) pre {
+  overscroll-behavior-y: auto;
+}
+
 .bounded-text-block pre code {
   background: none;
   color: inherit;
