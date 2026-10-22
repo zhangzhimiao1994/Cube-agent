@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import TYPE_CHECKING, Protocol
@@ -61,6 +62,8 @@ class ApprovalReviewRepository(Protocol):
         status: str,
         toolchain_authority: ToolchainSupplyAuthority | None = None,
         approval_scope: str | None = None,
+        go_recipe_authority: ToolchainSupplyAuthority | None = None,
+        expected_go_recipe: Mapping[str, object] | None = None,
     ) -> object: ...
 
 
@@ -83,6 +86,7 @@ class CapabilityGateway:
         approval_reviewer: ApprovalReviewer | None = None,
         plugin_policy_source: object | None = None,
         toolchain_authority: ToolchainSupplyAuthority | None = None,
+        go_recipe_authority: ToolchainSupplyAuthority | None = None,
     ) -> None:
         self._policy = policy
         self._approvals = approvals
@@ -90,9 +94,32 @@ class CapabilityGateway:
         self._approval_reviewer = approval_reviewer
         self._plugin_policy_source = plugin_policy_source
         self._toolchain_authority = toolchain_authority
+        self._go_recipe_authority = go_recipe_authority
         approvals.bind_run_repository(run_repository)  # type: ignore[arg-type]
 
     async def invoke(self, request: CapabilityRequest, *, role: Role) -> CapabilityResult:
+        go_recipe = _is_go_recipe_request(request)
+        expected_go_recipe: Mapping[str, object] | None = None
+        if go_recipe:
+            from agent_hub.runs.go_project_admission import (
+                APPROVAL_REQUIRED,
+                RECIPE_KEY,
+                require_recipe_request,
+            )
+            from agent_hub.runs.repository import RunConflict
+            from agent_hub.runs.toolchain_supply import ToolchainSupplyAuthority
+            from agent_hub.runtime.contracts import _freeze_object
+
+            authority = self._go_recipe_authority
+            if type(authority) is not ToolchainSupplyAuthority or authority.actor_role is not role:
+                return CapabilityResult(CapabilityStatus.DENIED, request.run_id, reason='capability denied')
+            try:
+                record = await self._run_repository.get(request.tenant_id, request.run_id)  # type: ignore[attr-defined]
+                authority.require_current(record, request.tenant_id, request.run_id)
+                require_recipe_request(record, request)
+                expected_go_recipe = _freeze_object(record.routing_decision[RECIPE_KEY], name='Go recipe admission')
+            except Exception:  # noqa: BLE001 - public request fields cannot establish private authority.
+                return CapabilityResult(CapabilityStatus.DENIED, request.run_id, reason='capability denied')
         if _is_toolchain_supply_request(request) and self._toolchain_authority is None:
             return CapabilityResult(CapabilityStatus.DENIED, request.run_id, reason='capability denied')
         decision = self._policy.evaluate(request, role)
@@ -102,7 +129,17 @@ class CapabilityGateway:
                 request.run_id,
                 reason="capability denied",
             )
-        if decision.effect is PolicyEffect.ALLOW:
+        if go_recipe:
+            try:
+                await self._run_repository.require_go_project_recipe_approval(  # type: ignore[attr-defined]
+                    request.tenant_id, request.run_id, authority=self._go_recipe_authority,
+                    request=request, expected_go_recipe=expected_go_recipe)
+            except RunConflict as error:
+                if str(error) != APPROVAL_REQUIRED:
+                    raise
+            else:
+                return CapabilityResult(CapabilityStatus.ALLOWED, request.run_id)
+        if decision.effect is PolicyEffect.ALLOW and not go_recipe:
             return CapabilityResult(CapabilityStatus.ALLOWED, request.run_id)
 
         review = await self._review_required_request(request)
@@ -112,7 +149,11 @@ class CapabilityGateway:
                     request,
                     review,
                     status="approved",
+                    expected_go_recipe=expected_go_recipe,
                 ):
+                    if go_recipe:
+                        return CapabilityResult(CapabilityStatus.DENIED, request.run_id,
+                                                reason='Go recipe approval audit unavailable')
                     review = ApprovalReviewDecision(
                         outcome=ApprovalReviewOutcome.REQUIRE_USER_APPROVAL,
                         reviewer="auto_review",
@@ -130,6 +171,7 @@ class CapabilityGateway:
                     request,
                     review,
                     status="denied",
+                    expected_go_recipe=expected_go_recipe,
                 )
                 return CapabilityResult(
                     CapabilityStatus.DENIED,
@@ -146,6 +188,9 @@ class CapabilityGateway:
             )
             if self._toolchain_authority is not None:
                 identity_args['toolchain_authority'] = self._toolchain_authority
+            if go_recipe:
+                identity_args['go_recipe_authority'] = self._go_recipe_authority
+                identity_args['expected_go_recipe'] = expected_go_recipe
             await self._run_repository.begin_capability_approval(  # type: ignore[attr-defined]
                 request.tenant_id,
                 request.run_id,
@@ -156,7 +201,7 @@ class CapabilityGateway:
                 **identity_args,
             )
 
-        if self._toolchain_authority is not None:
+        if self._toolchain_authority is not None or go_recipe:
             # A rejected DB fence must not leave even an in-memory SDK approval.
             approval = await self._approvals.start_waiting(request, begin_wait, publish_after_begin=True)
         else:
@@ -190,16 +235,21 @@ class CapabilityGateway:
         review: ApprovalReviewDecision,
         *,
         status: str,
+        expected_go_recipe: Mapping[str, object] | None = None,
     ) -> bool:
         recorder = getattr(self._run_repository, "record_capability_approval_review", None)
         if not callable(recorder):
-            return self._toolchain_authority is None
+            return self._toolchain_authority is None and self._go_recipe_authority is None
         fingerprint = fingerprint_capability_request(request)
         approval_id = f"auto_review_{hashlib.sha256(fingerprint.encode()).hexdigest()[:24]}"
         try:
             toolchain_options: dict[str, object] = {}
             if self._toolchain_authority is not None:
                 toolchain_options = {'toolchain_authority': self._toolchain_authority,
+                                     'approval_scope': capability_approval_scope(request)}
+            if self._go_recipe_authority is not None:
+                toolchain_options = {'go_recipe_authority': self._go_recipe_authority,
+                                     'expected_go_recipe': expected_go_recipe,
                                      'approval_scope': capability_approval_scope(request)}
             await recorder(
                 request.tenant_id,
@@ -219,6 +269,12 @@ class CapabilityGateway:
 def _is_toolchain_supply_request(request: CapabilityRequest) -> bool:
     resource = normalize_resource(request.resource)
     prefix = 'workspace/current/project-inputs/toolchain'
+    return resource is not None and (resource == prefix or resource.startswith(prefix + '/'))
+
+
+def _is_go_recipe_request(request: CapabilityRequest) -> bool:
+    resource = normalize_resource(request.resource)
+    prefix = 'workspace/current/project-verification/go'
     return resource is not None and (resource == prefix or resource.startswith(prefix + '/'))
 
 

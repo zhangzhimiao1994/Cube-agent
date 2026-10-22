@@ -16,6 +16,7 @@ from agent_hub.capabilities.types import CapabilityRequest
 from agent_hub.harness.types import HarnessToolCallRequest, HarnessToolCallResult, JsonValue
 
 if TYPE_CHECKING:
+    from agent_hub.capabilities.go_project_inputs import GoProjectInputs
     from agent_hub.capabilities.project_baselines import ProjectBaselineReference
     from agent_hub.runs.toolchain_supply import ToolchainSupplyAuthority
     from agent_hub.skills.sandbox.python_input_supply_protocol import PythonInputSupplyPlan
@@ -82,6 +83,12 @@ class HarnessCapabilityPolicyGateway(Protocol):
 
 class HarnessToolchainPolicyGateway(Protocol):
     async def authorize_project_toolchain(
+        self, request: CapabilityRequest, *, role: Role, authority: ToolchainSupplyAuthority,
+    ) -> CapabilityResult: ...
+
+
+class HarnessGoRecipePolicyGateway(Protocol):
+    async def authorize_project_go_recipe(
         self, request: CapabilityRequest, *, role: Role, authority: ToolchainSupplyAuthority,
     ) -> CapabilityResult: ...
 
@@ -221,6 +228,44 @@ class HarnessToolGateway:
             payload = {'approval_id': result.approval_id}
         return self._failure(request, result.reason or _capability_failure_reason(result.status), payload=payload)
 
+    async def authorize_project_go_recipe(
+        self, tenant_id: UUID, request: HarnessToolCallRequest, *, user_id: UUID,
+        role: Role, inputs: GoProjectInputs, authority: ToolchainSupplyAuthority | None = None,
+    ) -> HarnessToolCallResult:
+        """Private original recipe admission; no public registration or execution wiring."""
+        from agent_hub.capabilities.go_project_inputs import GoProjectInputs
+        from agent_hub.runs.toolchain_supply import ToolchainSupplyAuthority
+
+        if not isinstance(request, HarnessToolCallRequest):
+            raise TypeError('request must be HarnessToolCallRequest')
+        if (request.tool_name != 'project.prepare_go_recipe' or request.actor != 'main_agent'
+                or request.arguments or request.sandbox != 'workspace_write' or _uses_external_envelope(request)):
+            return self._failure(request, 'tool permission mapping unavailable')
+        if (type(user_id) is not UUID or not isinstance(role, Role)
+                or type(authority) is not ToolchainSupplyAuthority or type(inputs) is not GoProjectInputs
+                or not callable(getattr(self._policy_gateway, 'authorize_project_go_recipe', None))):
+            return self._failure(request, 'capability identity unavailable')
+        try:
+            inputs = GoProjectInputs.from_payload(inputs.to_payload())
+            admission = inputs.approval_request(user_id=user_id, agent_id='main_agent',
+                                                idempotency_key=request.idempotency_key)
+            if (admission.tenant_id != tenant_id or admission.run_id != request.run_id
+                    or inputs.scope.actor_role != role.value
+                    or (authority.tenant_id, authority.run_id, authority.actor_id, authority.actor_role)
+                        != (tenant_id, request.run_id, user_id, role)):
+                return self._failure(request, 'capability denied')
+            result = await cast(HarnessGoRecipePolicyGateway, self._policy_gateway).authorize_project_go_recipe(
+                admission, role=role, authority=authority)
+        except Exception:  # noqa: BLE001 - protected recipe internals never escape admission.
+            return self._failure(request, 'capability authorization unavailable')
+        if result.status is CapabilityStatus.ALLOWED:
+            return HarnessToolCallResult(call_id=request.call_id, tool_name=request.tool_name,
+                                         status='succeeded', payload={'authorized': True})
+        payload: Mapping[str, JsonValue] = {}
+        if result.status is CapabilityStatus.WAITING_APPROVAL and result.approval_id is not None:
+            payload = {'approval_id': result.approval_id}
+        return self._failure(request, result.reason or _capability_failure_reason(result.status), payload=payload)
+
     async def invoke(
         self,
         tenant_id: UUID,
@@ -231,7 +276,7 @@ class HarnessToolGateway:
     ) -> HarnessToolCallResult:
         if not isinstance(request, HarnessToolCallRequest):
             raise TypeError("request must be HarnessToolCallRequest")
-        if request.tool_name in {'project.prepare_inputs', 'project.prepare_toolchain'}:
+        if request.tool_name in {'project.prepare_inputs', 'project.prepare_toolchain', 'project.prepare_go_recipe'}:
             return self._failure(request, 'tool permission mapping unavailable')
         policy_mapping_failure = _builtin_policy_mapping_failure(request)
         if policy_mapping_failure is not None:

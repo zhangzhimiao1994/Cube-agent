@@ -88,6 +88,8 @@ class RunStatusRepository(Protocol):
         actor_id: UUID | None = None,
         plugin_identity: PluginApprovalIdentity | None = None,
         toolchain_authority: ToolchainSupplyAuthority | None = None,
+        go_recipe_authority: ToolchainSupplyAuthority | None = None,
+        expected_go_recipe: Mapping[str, object] | None = None,
     ) -> object: ...
 
     async def resolve_capability_approval(
@@ -387,7 +389,7 @@ def capability_approval_scope(request: CapabilityRequest) -> str | None:
     if (
         request.capability == "command" and request.operation == "run"
         and normalized_resource is not None
-        and re.fullmatch(r"workspace/current/(?:project-verification/python|project-inputs/(?:python|toolchain))/[a-f0-9]{64}",
+        and re.fullmatch(r"workspace/current/(?:project-verification/(?:python|go)|project-inputs/(?:python|toolchain))/[a-f0-9]{64}",
                          normalized_resource)
     ):
         return _run_capability_scope(request, normalized_resource)

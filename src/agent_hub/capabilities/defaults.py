@@ -21,6 +21,7 @@ from agent_hub.capabilities.gateway import (
     CapabilityGateway,
     CapabilityResult,
     CapabilityStatus,
+    _is_go_recipe_request,
     _is_toolchain_supply_request,
 )
 from agent_hub.capabilities.policy import CapabilityPolicy, CapabilityRule, normalize_resource
@@ -82,7 +83,7 @@ class DefaultRuntimeCapabilityPolicyGateway:
         *,
         role: Role,
     ) -> CapabilityResult:
-        if _is_toolchain_supply_request(request):
+        if _is_toolchain_supply_request(request) or _is_go_recipe_request(request):
             return CapabilityResult(CapabilityStatus.DENIED, request.run_id, reason='capability denied')
         return await self._invoke(request, role=role)
 
@@ -97,6 +98,26 @@ class DefaultRuntimeCapabilityPolicyGateway:
         try:
             return await self._invoke(request, role=role, toolchain_authority=authority)
         except Exception:  # noqa: BLE001 - rejected lease fences never become an approval or grant.
+            return CapabilityResult(CapabilityStatus.DENIED, request.run_id, reason='capability denied')
+
+    async def authorize_project_go_recipe(
+        self, request: CapabilityRequest, *, role: Role,
+        authority: ToolchainSupplyAuthority | None = None,
+    ) -> CapabilityResult:
+        """Private admission only. SDK supply and public invoke cannot grant a Go recipe."""
+        from agent_hub.runs.toolchain_supply import ToolchainSupplyAuthority
+
+        if type(authority) is not ToolchainSupplyAuthority or not _is_go_recipe_request(request):
+            return CapabilityResult(CapabilityStatus.DENIED, request.run_id, reason='capability denied')
+        try:
+            rules = (*self._extra_policy_rules(request), CapabilityRule(request.tenant_id, role,
+                'main_agent', 'command', 'run', request.resource, PolicyEffect.REQUIRE_APPROVAL))
+            gateway = CapabilityGateway(default_capability_policy(request.tenant_id, extra_rules=rules),
+                self._approvals, self._run_repository,
+                approval_reviewer=await self._approval_reviewer_for_request(request.tenant_id),
+                go_recipe_authority=authority)
+            return await gateway.invoke(request, role=role)
+        except Exception:  # noqa: BLE001 - a failed DB fence never grants admission.
             return CapabilityResult(CapabilityStatus.DENIED, request.run_id, reason='capability denied')
 
     async def _invoke(
