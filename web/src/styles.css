@@ -8899,6 +8899,15 @@ article:hover {
   max-width: 100%;
 }
 
+.process-detail-modal-backdrop > .process-detail-modal:has(.bounded-text-block.is-expanded) {
+  max-height: 100%;
+  max-width: 100%;
+}
+
+.composer-settings-backdrop > .composer-settings-dialog {
+  max-width: min(760px, 100%);
+}
+
 .process-detail-modal dl:focus-visible {
   outline: 2px solid #2462ad;
   outline-offset: -2px;
