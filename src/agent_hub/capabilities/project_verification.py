@@ -42,6 +42,8 @@ if TYPE_CHECKING:
         PythonOriginalContext,
         PythonProjectExecutor,
     )
+    from agent_hub.runs.project_verification_receipts import ProjectVerificationReceiptRepository
+    from agent_hub.runtime.artifacts import ArtifactRepository
     from agent_hub.skills.sandbox.project import ProjectInvocation
     from agent_hub.skills.sandbox.python_project_protocol import PythonProjectInvocation
 
@@ -294,7 +296,10 @@ class _GeneratedReceipt:
 
 class ProjectVerificationService:
     def __init__(self, *, root: Path, repository: object, executor: ProjectExecutor | None,
-                 python_executor: PythonProjectExecutor | None = None) -> None:
+                 python_executor: PythonProjectExecutor | None = None,
+                 receipt_repository: ProjectVerificationReceiptRepository | None = None,
+                 artifact_repository: ArtifactRepository | None = None) -> None:
+        from agent_hub.capabilities.durable_verification import DurableVerification
         from agent_hub.capabilities.generated_project_service import GeneratedProjectService
         from agent_hub.capabilities.python_generated_service import PythonGeneratedProjectService
         from agent_hub.capabilities.python_project_service import PythonProjectService
@@ -307,6 +312,33 @@ class ProjectVerificationService:
         self.generated = GeneratedProjectService(root=root, repository=repository)
         self._python_generated = PythonGeneratedProjectService(self, self.generated, python_executor)
         self._generated_receipts: dict[tuple[UUID, UUID], _GeneratedReceipt] = {}
+        if (receipt_repository is None) != (artifact_repository is None):
+            raise ValueError('durable verification requires both repositories')
+        self._durable = (DurableVerification(self, receipt_repository, artifact_repository)
+                         if receipt_repository is not None and artifact_repository is not None else None)
+
+    def _clear_receipts(self, tenant_id: UUID, run_id: UUID) -> None:
+        key = (tenant_id, run_id)
+        for receipts in (self._receipts, self._original_receipts, self._python.receipts,
+                         self._generated_receipts, self._python_generated.receipts):
+            receipts.pop(key, None)
+        self._python.environments.pop(key, None)
+        if self._durable is not None:
+            self._durable.clear(tenant_id, run_id)
+
+    async def _begin_verification(self, *, tenant_id: UUID, run_id: UUID, actor: str,
+                                  execution_id: str, source_sha256: str) -> None:
+        if self._durable is not None:
+            await self._durable.begin(tenant_id=tenant_id, run_id=run_id, actor=actor,
+                execution_id=execution_id, source_sha256=source_sha256)
+
+    async def restore(self, *, tenant_id: UUID, run_id: UUID, actor: str,
+                      action_key: str) -> Mapping[str, JsonValue]:
+        if self._durable is None:
+            self._clear_receipts(tenant_id, run_id)
+            raise ProjectVerificationError('durable verification is not configured')
+        return await self._durable.restore(tenant_id=tenant_id, run_id=run_id,
+                                           actor=actor, action_key=action_key)
 
     async def _require_supported_source(self, tenant_id: UUID, run_id: UUID) -> None:
         from agent_hub.files.workspace import ProjectWorkspaceStore
@@ -402,6 +434,7 @@ class ProjectVerificationService:
 
     async def _run_original_contract(
         self, invocation: ProjectInvocation, stored: StoredProjectBaseline, *, original: bool,
+        actor: str = 'main_agent',
     ) -> Mapping[str, JsonValue]:
         from agent_hub.skills.sandbox.project import (
             ContractProjectInvocation,
@@ -423,6 +456,9 @@ class ProjectVerificationService:
             'original_reference': stored.reference.to_payload(),
         }, strict=True)
         try:
+            if not original:
+                await self._begin_verification(tenant_id=invocation.tenant_id, run_id=invocation.run_id,
+                    actor=actor, execution_id=invocation.execution_id, source_sha256=before)
             result = await (self.executor or ProjectSystemdSandbox()).run(scoped)
             if result.exit_code != 0 or result.timed_out:
                 raise ProjectVerificationError('project execution outcome is not confirmed')
@@ -534,18 +570,21 @@ class ProjectVerificationService:
         except Exception:  # noqa: BLE001 - no repository/path details cross this boundary.
             raise ProjectVerificationError("project verification scope is not authorized") from None
 
-    async def verify(self, *, tenant_id: UUID, run_id: UUID, actor: str) -> Mapping[str, JsonValue]:
+    async def verify(self, *, tenant_id: UUID, run_id: UUID, actor: str,
+                     action_key: str = '') -> Mapping[str, JsonValue]:
+        if self._durable is not None:
+            return await self._durable.verify(tenant_id=tenant_id, run_id=run_id,
+                                              actor=actor, action_key=action_key)
+        return await self._verify(tenant_id=tenant_id, run_id=run_id, actor=actor)
+
+    async def _verify(self, *, tenant_id: UUID, run_id: UUID, actor: str) -> Mapping[str, JsonValue]:
         from agent_hub.skills.sandbox.project import (
             ProjectSystemdSandbox,
             project_source_fingerprint,
         )
 
         key = (tenant_id, run_id)
-        self._receipts.pop(key, None)
-        self._original_receipts.pop(key, None)
-        self._python.receipts.pop(key, None)
-        self._generated_receipts.pop(key, None)
-        self._python_generated.receipts.pop(key, None)
+        self._clear_receipts(tenant_id, run_id)
         from agent_hub.capabilities.generated_project_service import (
             generated_authority,
             generated_selected,
@@ -565,7 +604,7 @@ class ProjectVerificationService:
                 return await self._python_generated.verify(context, actor)
             invocation = await self._invocation(tenant_id, run_id, actor)
             await self._current_generated(context, actor)
-            generated_result = await self._run_original_contract(invocation, context.stored, original=False)
+            generated_result = await self._run_original_contract(invocation, context.stored, original=False, actor=actor)
             generated_receipt = dict(cast(Mapping[str, JsonValue], generated_result['verification']))
             source = cast(str, generated_receipt['source_sha256'])
             evidence = generated_result.get('generated_test_execution')
@@ -585,7 +624,7 @@ class ProjectVerificationService:
         invocation = await self._invocation(tenant_id, run_id, actor)
         stored = await self._original_scope(invocation)
         if stored is not None:
-            contract_result = await self._run_original_contract(invocation, stored.stored, original=False)
+            contract_result = await self._run_original_contract(invocation, stored.stored, original=False, actor=actor)
             receipt = cast(Mapping[str, JsonValue], contract_result['verification'])
             source = cast(str, receipt['source_sha256'])
             binding = stored.binding(source)
@@ -595,8 +634,12 @@ class ProjectVerificationService:
                     'summary': 'Original checks preserved; dependencies, build and tests verified in isolation.'}
         try:
             before = await project_source_fingerprint(self.root, invocation)
+            await self._begin_verification(tenant_id=tenant_id, run_id=run_id, actor=actor,
+                execution_id=invocation.execution_id, source_sha256=before)
             try:
                 result = await (self.executor or ProjectSystemdSandbox()).run(invocation)
+            except ProcessCleanupIncomplete:
+                raise
             except Exception:  # noqa: BLE001 - executor exceptions are never trusted observations.
                 # Only our decoded, source-checked report can create process evidence.
                 raise ProjectVerificationError("project execution backend is unavailable") from None
@@ -606,7 +649,7 @@ class ProjectVerificationService:
             if current != before:
                 raise ProjectVerificationError("project source changed during verification")
             receipt = _validate_report(result.stdout, expected_source=before)
-        except ProjectVerificationError:
+        except (ProjectVerificationError, ProcessCleanupIncomplete):
             raise
         except Exception:  # noqa: BLE001 - backend failures are not trusted process evidence.
             raise ProjectVerificationError("project execution backend is unavailable") from None
@@ -622,6 +665,15 @@ class ProjectVerificationService:
     async def require_current_receipt(self, tenant_id: UUID, run_id: UUID) -> str:
         from agent_hub.skills.sandbox.project import project_source_fingerprint
 
+        if self._durable is not None:
+            try:
+                await self._durable.require_current(tenant_id, run_id)
+            except (asyncio.CancelledError, ProcessCleanupIncomplete):
+                self._clear_receipts(tenant_id, run_id)
+                raise
+            except Exception:  # noqa: BLE001 - revoked issuance never authorizes cached delivery.
+                self._clear_receipts(tenant_id, run_id)
+                raise ProjectVerificationError('project verification required before delivery') from None
         if (tenant_id, run_id) in self._python_generated.receipts:
             return await self._python_generated.require_current(tenant_id, run_id)
         generated = self._generated_receipts.get((tenant_id, run_id))

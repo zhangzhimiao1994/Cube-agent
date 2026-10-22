@@ -20,6 +20,7 @@ if TYPE_CHECKING:
     from agent_hub.capabilities.python_project_reports import PythonProjectFailure
     from agent_hub.harness.tool_gateway import HarnessToolGateway
     from agent_hub.runs.project_inputs import OriginalProjectPreparer
+    from agent_hub.runs.project_verification_receipts import ProjectVerificationReceiptRepository
 
 from agent_hub.capabilities.execution_diagnostics import ExecutionDiagnostic
 from agent_hub.capabilities.manifest import (
@@ -74,6 +75,7 @@ from agent_hub.project_preflight import (
     build_project_preflight_files,
     project_preflight_model_input_schema,
 )
+from agent_hub.runtime.artifacts import ArtifactRepository
 from agent_hub.runtime.contracts import JsonValue
 from agent_hub.skills.package import InvalidSkillPackage, SkillPackageInspector
 from agent_hub.skills.sandbox.base import (
@@ -233,6 +235,8 @@ class RuntimeCapabilityGateway:
         http_reader: HttpReader | None = None,
         tool_registry: CapabilityManifestProvider | None = None,
         project_executor: ProjectExecutor | None = None,
+        artifact_repository: ArtifactRepository | None = None,
+        receipt_repository: ProjectVerificationReceiptRepository | None = None,
     ) -> None:
         self._skill_store_dir = skill_store_dir
         self._workspace_root = workspace_root
@@ -265,7 +269,10 @@ class RuntimeCapabilityGateway:
         self._project_executor_configured = project_executor is not None or sys.platform == "linux"
         self._project_verification = (
             ProjectVerificationService(root=project_workspace_dir, repository=run_repository,
-                                       executor=project_executor)
+                                       executor=project_executor,
+                                       receipt_repository=receipt_repository,
+                                       artifact_repository=(artifact_repository
+                                           if receipt_repository is not None else None))
             if project_workspace_dir is not None else None
         )
         self._project_delivery_receipts: dict[tuple[UUID, UUID], tuple[str, str]] = {}
@@ -461,18 +468,9 @@ class RuntimeCapabilityGateway:
             self._generated_delivery_bindings.pop((tenant_id, run_id), None)
             try:
                 result = await self._project_verification.verify(
-                    tenant_id=tenant_id, run_id=run_id, actor=actor,
+                    tenant_id=tenant_id, run_id=run_id, actor=actor, action_key=idempotency_key,
                 )
-                receipt = cast(Mapping[str, JsonValue], result["verification"])
-                receipt_digest = hashlib.sha256(json.dumps(
-                    receipt, default=dict, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
-                ).encode("ascii")).hexdigest()
-                self._project_delivery_receipts[(tenant_id, run_id)] = (
-                    cast(str, receipt["source_sha256"]), receipt_digest,
-                )
-                generated_binding = result.get('generated_project_acceptance')
-                if isinstance(generated_binding, Mapping):
-                    self._generated_delivery_bindings[(tenant_id, run_id)] = generated_binding
+                self._cache_project_verification(tenant_id, run_id, result)
                 return result
             except PythonGeneratedRecipeApprovalRequired:
                 raise
@@ -493,6 +491,41 @@ class RuntimeCapabilityGateway:
             arguments=arguments,
             idempotency_key=idempotency_key,
         )
+
+    def _cache_project_verification(
+        self, tenant_id: UUID, run_id: UUID, result: Mapping[str, JsonValue],
+    ) -> None:
+        receipt = cast(Mapping[str, JsonValue], result["verification"])
+        receipt_digest = hashlib.sha256(json.dumps(
+            receipt, default=dict, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+        ).encode("ascii")).hexdigest()
+        self._project_delivery_receipts[(tenant_id, run_id)] = (
+            cast(str, receipt["source_sha256"]), receipt_digest,
+        )
+        generated_binding = result.get('generated_project_acceptance')
+        if isinstance(generated_binding, Mapping):
+            self._generated_delivery_bindings[(tenant_id, run_id)] = generated_binding
+        else:
+            self._generated_delivery_bindings.pop((tenant_id, run_id), None)
+
+    async def restore_project_verification(
+        self, *, tenant_id: UUID, run_id: UUID, actor: str, action_key: str,
+    ) -> Mapping[str, JsonValue]:
+        self._project_delivery_receipts.pop((tenant_id, run_id), None)
+        self._generated_delivery_bindings.pop((tenant_id, run_id), None)
+        if self._project_verification is None:
+            raise RuntimeCapabilityError("project verification scope is unavailable")
+        try:
+            result = await self._project_verification.restore(
+                tenant_id=tenant_id, run_id=run_id, actor=actor, action_key=action_key,
+            )
+            self._cache_project_verification(tenant_id, run_id, result)
+            return result
+        except ProjectVerificationError as error:
+            raise RuntimeCapabilityError(str(error), execution_diagnostic=error.diagnostic,
+                                         project_failure=error.project_failure,
+                                         python_project_failure=error.python_project_failure,
+                                         project_prerequisite=error.project_prerequisite) from None
 
     async def _python_build_profile(self, tenant_id: UUID, run_id: UUID) -> Mapping[str, JsonValue]:
         from agent_hub.skills.sandbox.project import ProjectInvocation

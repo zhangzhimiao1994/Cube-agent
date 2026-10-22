@@ -617,6 +617,9 @@ class PythonProjectService:
         invocation = invocation.model_copy(
             update={"source_kind": "original" if original else "candidate"}
         )
+        if not original:
+            await self.owner._begin_verification(tenant_id=invocation.tenant_id, run_id=invocation.run_id,
+                actor=actor, execution_id=invocation.execution_id, source_sha256=before)
         response = await self.executor.run(invocation)
         _need(type(response) is PythonProjectBrokerResponse)
         response = PythonProjectBrokerResponse.model_validate(response.model_dump(), strict=True)

@@ -359,6 +359,8 @@ async def test_original_long_error_tail_survives_persisted_validation(
     text = 'building dependency\n' * 300 + 'AssertionError: final business check failed\n'
     async def long_error(actual: Any) -> PythonProjectBrokerResponse:
         response = await original_run(actual)
+        assert isinstance(response, PythonProjectBrokerResponse)
+        assert response.result is not None
         raw = json.loads(response.result.stdout)
         fail(raw, 2, stderr=text, stderr_observed_bytes=len(text.encode()))
         return response.model_copy(update={'result': SkillResult(
