@@ -6,7 +6,9 @@ import { conversationMessages, MessageBody, RunsPage } from "../../src/pages/Run
 import { RunDetailPage } from "../../src/pages/RunDetailPage";
 import type { RunDetail } from "../../src/api/client";
 import { useVisibleViewport } from "../../src/app/useVisibleViewport";
+import { TestApp } from "../../src/app/router";
 import "../../src/styles.css";
+import "../../src/conversation-workspace.css";
 
 export const prose = "## 调查结果\n\n第一段说明当前执行结果，保留清晰的阅读节奏。**重点信息**和 `config.json` 应当容易识别。\n\n第二段说明后续安排，不应与上一段挤在一起。\n\n### 下一步\n\n3. 检查配置\n   - 对照输入\n   - 核对结果\n4. 完成验证\n\n> 引用说明：正文和辅助信息保持明确层级。";
 export const source = 'const message = "' + "long-source-value-".repeat(30) + '";\n'
@@ -48,19 +50,23 @@ if (new URLSearchParams(location.search).has("files")) {
 
 // Supply only local fixture data; the components and message selection are production code.
 const conversation = { conversation_id: run.conversation_id, title: "排版回归", project_id: "default",
-  project_label: "默认项目", workspace_path: "layout-conversation", archived_at: null, runs: [run] };
+  project_label: "默认项目", workspace_path: "layout-conversation", created_at:"2026-10-22T00:00:00Z", archived_at: null, runs: [run] };
 window.fetch = async (input, init) => {
   if (init?.method && init.method !== "GET") throw new Error("Layout fixture is read-only");
   const url = new URL(String(input), location.origin), path = url.pathname;
-  const data = path === "/api/v1/admin/runs" ? [run]
+  const data = path === "/api/v1/auth/me" ? {user_id:"11111111-1111-4111-8111-111111111111",
+    tenant_id:"00000000-0000-4000-8000-000000000001",username:"test",role:"super_admin",permissions:["*"]}
+    : path === "/api/v1/admin/runs" ? [run]
     : path === `/api/v1/admin/runs/${run.id}` ? run
     : path === "/api/v1/admin/conversations" ? url.searchParams.get("archived") === "true" ? [] : [conversation]
     : path === "/api/v1/admin/conversations/layout-conversation" ? conversation
     : path.endsWith("/files") ? { items: [], bundle_download_url: "/unused" }
     : path.endsWith("/project-workspaces") ? [{ project_id: "default", label: "默认项目", workspace_path: "main" }]
+    : path.endsWith("/execution-backends") ? [{id:"systemd",name:"本机 systemd 隔离",adapter:"SystemdSkillSandbox",
+      description:"本地只读布局夹具中的可用执行器状态",available:true,reason:null,isolation:"严格隔离",cost:"本机资源",supported_sandbox_profiles:["none","read_only","restricted","workspace_write"]}]
     : path.endsWith("/settings") ? { default_mode: "auto", default_workflow_id: null, default_agent_ids: [], log_level: "warning",
       hermes_enabled: false, safe_tools_enabled: true, require_approval_for_tools: true,
-      channel_entry: "main_agent", attachment_retention_days: 7, attachment_max_mb: 25 }
+      channel_entry: "main_agent", default_execution_backend:"systemd", attachment_retention_days: 7, attachment_max_mb: 25 }
     : path.endsWith("/main-agent") ? { model: null, control_mode: "supervisor", decision_policy: "", hermes_policy: "off", max_review_rounds: 2 }
     : [];
   return new Response(JSON.stringify(data), { headers: { "Content-Type": "application/json" } });
@@ -69,6 +75,10 @@ const client = new QueryClient({ defaultOptions: { queries: { retry: false } } }
 const messages = conversationMessages([run]);
 function FixtureRoot() {
   useVisibleViewport();
+  if (location.pathname === "/shell") {
+    sessionStorage.setItem("agent_hub_access_token", "local-readonly-layout-fixture");
+    return <TestApp initialPath="/?conversation=layout-conversation" />;
+  }
   return location.pathname === "/detail"
   ? <QueryClientProvider client={client}><MemoryRouter initialEntries={[`/runs/${run.id}`]}>
     <Routes><Route path="/runs/:runId" element={<RunDetailPage />} /></Routes>
