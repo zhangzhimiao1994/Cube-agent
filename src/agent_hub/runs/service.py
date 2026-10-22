@@ -83,7 +83,7 @@ from agent_hub.runtime.failure_reason import (
 from agent_hub.runtime.instruction_context import InstructionContextLoader
 from agent_hub.runtime.progress import artifact_progress_key
 from agent_hub.runtime.registry import RuntimeRegistry
-from agent_hub.runtime.streams import closing_runtime_events
+from agent_hub.runtime.worker_execution import worker_runtime_events
 from agent_hub.subprocess_cleanup import ProcessCleanupIncomplete
 
 _LOGGER = logging.getLogger(__name__)
@@ -2285,6 +2285,7 @@ class RunService:
                 runtime_events = _adaptive_runtime_events(
                     runtime,
                     context,
+                    worker_id=self._worker_id,
                     configured_tokens=self._runtime_token_budget,
                     routing_decision=runtime_routing_decision,
                     initial_progress_units=checkpoint_progress_units,
@@ -5502,6 +5503,7 @@ async def _adaptive_runtime_events(
     non_progress_artifact_ids: frozenset[str] = frozenset(),
     initial_artifact_progress_keys: Mapping[str, str | None] | None = None,
     meaningful_progress: bool = True,
+    worker_id: str | None = None,
 ) -> AsyncGenerator[RunEvent, None]:
     progress_units = max(0, initial_progress_units)
     seen_tool_calls: set[str] = set()
@@ -5509,7 +5511,7 @@ async def _adaptive_runtime_events(
     seen_artifacts: set[str] = set(artifact_keys)
     seen_progress_keys = {key for key in artifact_keys.values() if key is not None}
     metadata_artifact_ids = set(non_progress_artifact_ids)
-    async with closing_runtime_events(runtime.run(context)) as stream:
+    async with worker_runtime_events(runtime, context, worker_id=worker_id) as stream:
         async for event in stream:
             new_artifact_key = None
             if event.artifact is not None:
