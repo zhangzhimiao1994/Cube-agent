@@ -4456,7 +4456,8 @@ article:hover {
   min-width: 0;
   overflow-y: auto;
   overscroll-behavior: contain;
-  padding: 0.1rem 0 0;
+  padding: 0.1rem 0 1rem;
+  scroll-padding-bottom: 1rem;
   scroll-padding-top: 0.5rem;
   width: 100%;
 }
@@ -8880,6 +8881,27 @@ article:hover {
 
 .process-detail-modal .message-body .bounded-text-block.is-expanded pre {
   max-height: none;
+}
+
+/* Share the visible viewport boundary across nested readers and configuration dialogs. */
+:is(.process-detail-modal-backdrop, .process-drawer-backdrop, .conversation-dialog-backdrop, .composer-settings-backdrop, .modal-backdrop) {
+  bottom: auto;
+  height: var(--visible-viewport-height, 100dvh);
+  left: var(--visible-viewport-left, 0px);
+  right: auto;
+  top: var(--visible-viewport-top, 0px);
+  width: var(--visible-viewport-width, 100vw);
+}
+
+:is(.process-detail-modal-backdrop, .process-drawer-backdrop, .conversation-dialog-backdrop, .composer-settings-backdrop, .modal-backdrop)
+  > :is(.process-detail-modal, .process-drawer, .conversation-dialog, .composer-settings-dialog, .modal-card) {
+  max-height: 100%;
+  max-width: 100%;
+}
+
+.process-detail-modal dl:focus-visible {
+  outline: 2px solid #2462ad;
+  outline-offset: -2px;
 }
 
 .message-table-wrap {

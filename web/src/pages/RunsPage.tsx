@@ -5824,7 +5824,7 @@ function ProcessDetailCards({ target }: { target: ProcessDetailTarget }) {
                     关闭
                   </button>
                 </div>
-                <dl>
+                <dl tabIndex={0} aria-label={`${openGroup.label}详情内容`}>
                   {openGroup.rows.map((row, index) => (
                     <Fragment key={`${target.id}-${openGroup.key}-${row.label}-${index}`}>
                       <dt>{row.label}</dt>
