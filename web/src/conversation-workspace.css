@@ -131,7 +131,8 @@ body:has(.conversation-workspace)::after { display: none; }
 .conversation-workspace .composer-plus-button { font-size: 22px; }
 .conversation-workspace .composer-send-row { display: flex; gap: 6px; }
 .conversation-workspace .composer-send-row button { background: #087f8c; border-color: #087f8c; border-radius: 6px; box-shadow: none; color: #fff; font-size: 13px; font-weight: 600; min-height: 34px; padding: 6px 12px; }
-.conversation-workspace .composer-send-row button[type="submit"] { align-items: center; display: flex; height: 34px; justify-content: center; padding: 6px; width: 36px; }
+.conversation-workspace .composer-send-row button[type="submit"] { align-items: center; display: flex; height: 34px; justify-content: center; min-width: 36px; padding: 6px; width: 36px; }
+.conversation-workspace .conversation-drawer-trigger > svg { flex: 0 0 18px; height: 18px; width: 18px; }
 .composer-submit-label { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
 .conversation-workspace .composer-upload-button { gap: 5px; }
 .conversation-workspace .composer-send-row .composer-stop-button { background: #fff; border-color: #dfe3e8; color: #535d6a; }
