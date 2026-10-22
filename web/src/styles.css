@@ -8896,6 +8896,10 @@ article:hover {
 :is(.process-detail-modal-backdrop, .process-drawer-backdrop, .conversation-dialog-backdrop, .composer-settings-backdrop, .modal-backdrop)
   > :is(.process-detail-modal, .process-drawer, .conversation-dialog, .composer-settings-dialog, .modal-card) {
   max-height: 100%;
+}
+
+:is(.process-detail-modal-backdrop, .process-drawer-backdrop, .conversation-dialog-backdrop)
+  > :is(.process-detail-modal, .process-drawer, .conversation-dialog) {
   max-width: 100%;
 }
 
