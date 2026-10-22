@@ -238,7 +238,8 @@ def binary_boundary(api: Any, monkeypatch: pytest.MonkeyPatch) -> Any:
     info = SimpleNamespace(st_dev=1, st_ino=10, st_mode=stat.S_IFREG | 0o555,
         st_uid=40001, st_gid=40001, st_nlink=1, st_size=64, st_mtime_ns=1, st_ctime_ns=1)
     state = SimpleNamespace(raw=raw, info=info, data=bytearray(), closes=[], opens=[],
-                            seals=0, source=None, swapped=False, stat_count=0, checks=[])
+        seals=0, seal_mask=15, controls=[], modes=[], read_flags=0, inheritable=False,
+        source=None, swapped=False, stat_count=0, checks=[])
 
     def pin(root: Path, stack: Any, pins: list[Any]) -> int:
         pins.append(SimpleNamespace(check=lambda: state.checks.append('pin')))
@@ -276,19 +277,27 @@ def binary_boundary(api: Any, monkeypatch: pytest.MonkeyPatch) -> Any:
         return take
 
     def control(fd: int, command: int, value: int = 0) -> int:
+        state.controls.append((fd, command, value))
         if command == 1033:
-            state.seals = value
-        return state.seals if command == 1034 else 0
+            assert fd == 62 and value == 15
+            state.seals = value & state.seal_mask
+            return 0
+        if command == 1034:
+            assert fd == 62
+            return state.seals
+        assert fd == 63 and command == 3
+        return state.read_flags
 
     monkeypatch.setattr(api, '_pin_directory', pin)
     monkeypatch.setattr(api, 'os', SimpleNamespace(stat=checked_stat, open=opened, fstat=info_for,
         close=state.closes.append, O_RDONLY=0, O_NOFOLLOW=2, O_NONBLOCK=4, O_CLOEXEC=8,
         O_ACCMODE=3, MFD_CLOEXEC=1, MFD_ALLOW_SEALING=2,
         getuid=lambda: 40001, read=lambda fd, count: state.source.read(count), write=write,
-        memfd_create=lambda name, flags: 62, fchmod=lambda fd, mode: None,
-        get_inheritable=lambda fd: False))
+        memfd_create=lambda name, flags: 62,
+        fchmod=lambda fd, mode: state.modes.append((fd, mode)),
+        get_inheritable=lambda fd: state.inheritable))
     monkeypatch.setitem(sys.modules, 'fcntl', SimpleNamespace(
-        F_ADD_SEALS=1033, F_GET_SEALS=1034, F_GETFL=3, fcntl=control))
+        F_GETFL=3, fcntl=control))
     state.digest = hashlib.sha256(raw).hexdigest()
     return state
 
@@ -300,6 +309,47 @@ def test_binary_is_read_hashed_and_sealed_with_short_writes(api: Any, binary_bou
         assert fd == 63 and not state.closes and state.seals == 15
         assert state.data == state.raw and state.checks == ['pin']
     assert state.closes == [63, 62, 61, 60]
+
+
+def test_missing_python_seal_constants_still_uses_verified_linux_kernel_operations(
+    api: Any, binary_boundary: Any,
+) -> None:
+    state = binary_boundary
+    assert not hasattr(sys.modules['fcntl'], 'F_ADD_SEALS')
+    assert not hasattr(sys.modules['fcntl'], 'F_GET_SEALS')
+    with ExitStack() as stack:
+        fd = api._sealed_binary(Path('/binary'), stack,
+            expected_sha256=state.digest, expected_bytes=64)
+        assert fd == 63 and state.data == state.raw and state.checks == ['pin']
+        assert state.modes == [(62, 0o555)]
+        assert state.controls == [(62, 1033, 15), (62, 1034, 0), (63, 3, 0)]
+    assert state.closes == [63, 62, 61, 60]
+
+
+@pytest.mark.parametrize('mask', [0, 7, 11, 13, 14])
+def test_missing_python_constants_never_allows_incomplete_kernel_seals(
+    api: Any, binary_boundary: Any, mask: int,
+) -> None:
+    state = binary_boundary
+    state.seal_mask = mask
+    with ExitStack() as stack, pytest.raises(ValueError, match='go_business_mounts_rejected'):
+        api._sealed_binary(Path('/binary'), stack,
+            expected_sha256=state.digest, expected_bytes=64)
+    assert state.controls == [(62, 1033, 15), (62, 1034, 0)]
+    assert state.closes == [62, 61, 60]
+    assert len(state.opens) == 1
+
+
+@pytest.mark.parametrize('flags,inheritable', [(1, False), (2, False), (0, True)])
+def test_missing_python_constants_never_allows_writable_or_inheritable_export(
+    api: Any, binary_boundary: Any, flags: int, inheritable: bool,
+) -> None:
+    state = binary_boundary
+    state.read_flags, state.inheritable = flags, inheritable
+    with ExitStack() as stack, pytest.raises(ValueError, match='go_business_mounts_rejected'):
+        api._sealed_binary(Path('/binary'), stack,
+            expected_sha256=state.digest, expected_bytes=64)
+    assert state.seals == 15 and state.closes == [63, 62, 61, 60]
 
 
 @pytest.mark.parametrize('fault', ['sha', 'size', 'mode', 'owner', 'nlink', 'symlink',
@@ -351,7 +401,7 @@ def test_linux_binary_is_independently_measured_and_sealed(api: Any, tmp_path: P
     with ExitStack() as stack:
         descriptor = api._sealed_binary(root, stack, expected_sha256=digest, expected_bytes=64)
         import fcntl
-        assert fcntl.fcntl(descriptor, fcntl.F_GET_SEALS) & 15 == 15
+        assert fcntl.fcntl(descriptor, 1034) & 15 == 15
         assert fcntl.fcntl(descriptor, fcntl.F_GETFL) & os.O_ACCMODE == os.O_RDONLY
         assert os.read(descriptor, 100) == raw
         assert stat.S_IMODE(os.fstat(descriptor).st_mode) == 0o555

@@ -126,8 +126,9 @@ def _sealed_binary(
     for pin in pins:
         pin.check()
     os.fchmod(sealed, 0o555)
-    fcntl.fcntl(sealed, fcntl.F_ADD_SEALS, 15)
-    _need(fcntl.fcntl(sealed, fcntl.F_GET_SEALS) & 15 == 15)
+    # Match project_contract_mounts._seal: some Python builds omit the Linux names.
+    fcntl.fcntl(sealed, 1033, 15)
+    _need(fcntl.fcntl(sealed, 1034) & 15 == 15)
     readonly = os.open(f'/proc/self/fd/{sealed}', os.O_RDONLY | os.O_CLOEXEC)
     stack.callback(os.close, readonly)
     _need(_file_stamp(os.fstat(readonly)) == _file_stamp(os.fstat(sealed))
