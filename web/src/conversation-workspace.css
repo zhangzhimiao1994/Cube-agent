@@ -129,6 +129,12 @@ body:has(.conversation-workspace)::after { display: none; }
   height: 34px; justify-content: center; min-height: 34px; min-width: 34px; padding: 6px 8px; width: auto;
 }
 .conversation-workspace .composer-plus-button { font-size: 22px; }
+.conversation-workspace .composer-reference-button.composer-toggle-active { background: #edf7f6; border-color: #b9d8da; border-radius: 4px; box-shadow: none; color: #076b76; font-size: 12px; height: 34px; padding: 6px 8px; }
+.conversation-workspace .slash-command-panel { background: #fff; border-color: #dfe3e8; box-shadow: none; }
+.conversation-workspace .slash-command-panel button { background: #fff; color: #1f2329; }
+.conversation-workspace .slash-command-panel button:hover,
+.conversation-workspace .slash-command-panel button:focus-visible { background: #edf7f6; border-color: #b9d8da; }
+.conversation-workspace .slash-command-panel small { color: #646b78; }
 .conversation-workspace .composer-send-row { display: flex; gap: 6px; }
 .conversation-workspace .composer-send-row button { background: #087f8c; border-color: #087f8c; border-radius: 6px; box-shadow: none; color: #fff; font-size: 13px; font-weight: 600; min-height: 34px; padding: 6px 12px; }
 .conversation-workspace .composer-send-row button[type="submit"] { align-items: center; display: flex; height: 34px; justify-content: center; min-width: 36px; padding: 6px; width: 36px; }
