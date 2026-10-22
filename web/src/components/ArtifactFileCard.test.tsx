@@ -2,7 +2,7 @@ import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { ArtifactFileCard, artifactFileName, hasArtifactDownload } from "./ArtifactFileCard";
+import { ArtifactFileCard, artifactFileName, artifactFilePath, hasArtifactDownload } from "./ArtifactFileCard";
 
 const downloadable = {
   id: "artifact-zip",
@@ -62,6 +62,26 @@ describe("ArtifactFileCard", () => {
     expect(screen.getByText(/SHA-256 8f4d0c8d0e4d/)).not.toBeNull();
     const download = screen.getByRole("button", { name: "下载 源码包" });
     expect(download).not.toBeNull();
+  });
+
+  it("keeps the actual filename primary when the artifact title names an agent", () => {
+    const filename = "项目交付-20261022-完整源代码.zip";
+    render(<ArtifactFileCard artifact={{ ...downloadable, title: "implementer", filename }} />);
+
+    expect(screen.getByText(filename).tagName).toBe("STRONG");
+    expect(screen.getByRole("button", { name: `下载 ${filename}` })).not.toBeNull();
+  });
+
+  it("prefers the basename of a known path over a producer title when filename is absent", () => {
+    expect(artifactFileName({ title: "implementer", path: "dist/项目交付.zip" })).toBe("项目交付.zip");
+    expect(artifactFileName({ title: "implementer", path: "dist\\项目交付.zip" })).toBe("项目交付.zip");
+  });
+
+  it("only treats a workspace title as a path when it identifies the same file", () => {
+    expect(artifactFilePath({ kind: "workspace_file", title: "src/app.ts", filename: "app.ts" })).toBe("src/app.ts");
+    expect(artifactFilePath({ kind: "workspace_file", title: "implementer", filename: "交付.zip" })).toBe("交付.zip");
+    expect(artifactFilePath({ title: "implementer", filename: "交付.zip" })).toBe("交付.zip");
+    expect(artifactFilePath({ title: "implementer", filename: "app.ts", path: "dist/app.ts" })).toBe("dist/app.ts");
   });
 
   it("downloads generated files with the current bearer token", async () => {

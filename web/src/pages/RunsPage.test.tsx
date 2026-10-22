@@ -1635,6 +1635,21 @@ describe("agentInlineSummary", () => {
 });
 
 describe("workspace and sandbox submission helpers", () => {
+  it("uses the delivery filename rather than the producing agent as the preview path", () => {
+    const run: RunDetail = {
+      ...baseRun,
+      artifacts: [{
+        id: "delivery-name", kind: "tool_result", title: "implementer", text: null,
+        filename: "项目交付-20261022.zip", mime_type: "application/zip",
+        download_url: "/api/v1/runs/run-1/artifacts/delivery-name/download",
+      }],
+      events: [],
+    };
+    const files = workbenchFileItems([run], { final: [], intermediate: [], total: 0 }, []);
+    expect(files[0]?.filename).toBe("项目交付-20261022.zip");
+    expect(files[0]?.path).toBe("项目交付-20261022.zip");
+  });
+
   it("groups current conversation downloadable files by final and intermediate artifacts", () => {
     const firstRun: RunDetail = {
       ...baseRun,

@@ -1015,7 +1015,7 @@ describe("RunDetailPage", () => {
     const finalArtifact = {
       ...runDetail.artifacts[0],
       filename: "final-script.md",
-      title: "final-script.md",
+      title: "implementer",
       text: longArtifactText,
       download_url: "/api/v1/artifacts/final-script/download",
     };
