@@ -8,6 +8,7 @@ import { MemoryRouter, useNavigate } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { api, WebPreviewSchema, type Conversation, type ProjectWorkspace, type RunDetail } from "../api/client";
+import { AuthProvider } from "../auth/AuthProvider";
 import {
   agentInlineSummary,
   ConversationCheckpointNav,
@@ -212,6 +213,9 @@ describe("conversation action menu", () => {
   });
 
   function renderMenuPage() {
+    vi.spyOn(api, "me").mockResolvedValue({
+      tenant_id: "menu-tenant", user_id: "menu-user", username: "menu-user", role: "operator", permissions: ["*"],
+    });
     const conversations: Conversation[] = ["alpha", "beta"].map((name) => ({
       conversation_id: `conv-menu-${name}`,
       title: `Menu ${name}`,
@@ -260,7 +264,7 @@ describe("conversation action menu", () => {
     }
     render(
       <QueryClientProvider client={client}>
-        <MemoryRouter initialEntries={["/?conversation=conv-menu-alpha"]}><MenuTestPage /></MemoryRouter>
+        <AuthProvider><MemoryRouter initialEntries={["/?conversation=conv-menu-alpha"]}><MenuTestPage /></MemoryRouter></AuthProvider>
       </QueryClientProvider>,
     );
     return { navigate: (to: string) => navigate(to), update };

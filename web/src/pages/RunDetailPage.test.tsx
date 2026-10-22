@@ -8,6 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { api, WebPreviewSchema, type RunDetail } from "../api/client";
 import { TestApp } from "../app/router";
+import { AuthProvider } from "../auth/AuthProvider";
 import { RunDetailPage } from "./RunDetailPage";
 
 const runId = "55555555-5555-4555-8555-555555555555";
@@ -332,9 +333,9 @@ describe("RunDetailPage", () => {
     vi.stubGlobal("fetch", fetchMock);
     const client = new QueryClient({ defaultOptions: { queries: { retry: false, refetchOnWindowFocus: false } } });
     const view = render(<QueryClientProvider client={client}>
-      <MemoryRouter initialEntries={[`/runs/${runId}`]}>
+      <AuthProvider><MemoryRouter initialEntries={[`/runs/${runId}`]}>
         <Routes><Route path="/runs/:runId" element={<RunDetailPage />} /></Routes>
-      </MemoryRouter>
+      </MemoryRouter></AuthProvider>
     </QueryClientProvider>);
     try {
       const user = userEvent.setup();
@@ -358,15 +359,15 @@ describe("RunDetailPage", () => {
   });
 
   it("keeps the original failure page when the first run fetch has no cached data", async () => {
-    const fetchMock = vi.fn(async () => jsonResponse({ error: {
+    const fetchMock = vi.fn(async (_input: RequestInfo | URL) => jsonResponse({ error: {
       code: "service_unavailable", message: "initial run read unavailable",
     } }, { status: 503 }));
     vi.stubGlobal("fetch", fetchMock);
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     const view = render(<QueryClientProvider client={client}>
-      <MemoryRouter initialEntries={[`/runs/${runId}`]}>
+      <AuthProvider><MemoryRouter initialEntries={[`/runs/${runId}`]}>
         <Routes><Route path="/runs/:runId" element={<RunDetailPage />} /></Routes>
-      </MemoryRouter>
+      </MemoryRouter></AuthProvider>
     </QueryClientProvider>);
     try {
       const alert = await screen.findByRole("alert");
@@ -375,7 +376,9 @@ describe("RunDetailPage", () => {
       expect(screen.queryByRole("heading", { name: "运行详情" })).toBeNull();
       expect(screen.queryByRole("button", { name: "插件安装计划" })).toBeNull();
       expect(client.getQueryData(["run", runId])).toBeUndefined();
-      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(fetchMock.mock.calls.filter(([input]) =>
+        new URL(String(input), "https://agent-hub.test").pathname === `/api/v1/admin/runs/${runId}`,
+      )).toHaveLength(1);
     } finally {
       view.unmount();
       client.clear();
@@ -426,9 +429,9 @@ describe("RunDetailPage", () => {
       vi.stubGlobal("fetch", fetchMock);
       const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
       const view = render(<QueryClientProvider client={client}>
-        <MemoryRouter initialEntries={[`/runs/${runId}`]}>
+        <AuthProvider><MemoryRouter initialEntries={[`/runs/${runId}`]}>
           <Routes><Route path="/runs/:runId" element={<RunDetailPage />} /></Routes>
-        </MemoryRouter>
+        </MemoryRouter></AuthProvider>
       </QueryClientProvider>);
       try {
         const user = userEvent.setup();
