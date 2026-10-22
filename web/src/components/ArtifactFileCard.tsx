@@ -31,7 +31,17 @@ export function hasArtifactDownload(
 }
 
 export function artifactFileName(artifact: FileLike) {
-  return artifact.filename?.trim() || artifact.title || artifact.path || artifact.id || "download";
+  return artifact.filename?.trim() || artifact.path?.trim().split(/[\\/]/).at(-1) || artifact.title?.trim() || artifact.id || "download";
+}
+
+export function artifactFilePath(artifact: FileLike) {
+  const title = artifact.title?.trim();
+  const filename = artifact.filename?.trim();
+  const workspacePath = artifact.kind === "workspace_file"
+    && title && (!filename || title.split(/[\\/]/).at(-1) === filename) ? title : "";
+  return artifact.path?.trim()
+    || workspacePath
+    || artifactFileName(artifact);
 }
 
 function isArchitectureGraphArtifact(artifact: FileLike) {
@@ -124,7 +134,7 @@ export function ArtifactFileCard({
         {architectureGraph ? "MAP" : "FILE"}
       </span>
       <div className="artifact-file-main">
-        <strong>{filename}</strong>
+        <strong title={filename}>{filename}</strong>
         {meta.length > 0 ? (
           <small className="artifact-file-meta">
             {meta.map((item) => (

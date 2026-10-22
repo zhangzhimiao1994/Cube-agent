@@ -9,6 +9,7 @@ import { BoundedTextBlock, OutputContent, hasStructuredOutput, isMarkdownOutputF
 import {
   ArtifactFileCard,
   artifactFileName,
+  artifactFilePath,
   formatFileSize,
   hasArtifactDownload,
   type DownloadableFile,
@@ -1620,7 +1621,7 @@ function detailWorkbenchFiles(cards: DetailProcessCard[]) {
         id: `${downloadUrl}:${card.id}`,
         title: artifact.title || filename,
         filename,
-        path: artifact.kind === "workspace_file" ? artifact.title ?? artifact.filename ?? null : artifact.filename ?? artifact.title ?? null,
+        path: artifactFilePath(artifact),
         kind: artifact.kind || "file",
         operation: detailWorkbenchFileOperation(card, artifact),
         mimeType: artifact.mime_type ?? null,

@@ -3414,9 +3414,8 @@ article:hover {
 
 .agent-workbench-file-list strong {
   min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  overflow-wrap: anywhere;
+  white-space: normal;
 }
 
 .agent-workbench-file-preview {
@@ -4684,9 +4683,8 @@ article:hover {
   color: var(--text);
   font-size: 0.92rem;
   line-height: 1.25;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  overflow-wrap: anywhere;
+  white-space: normal;
 }
 
 .artifact-file-main small {
