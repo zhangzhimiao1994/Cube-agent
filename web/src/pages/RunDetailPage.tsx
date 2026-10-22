@@ -2852,7 +2852,7 @@ function DetailProcessCards({ card }: { card: DetailProcessCard }) {
                     关闭
                   </button>
                 </div>
-                <dl>
+                <dl tabIndex={0} aria-label={`${openGroup.label}详情内容`}>
                   {openGroup.rows.map((row, index) => (
                     <Fragment key={`${card.id}-${openGroup.key}-${row.label}-${index}`}>
                       <dt>{row.label}</dt>

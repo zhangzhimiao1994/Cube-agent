@@ -4,6 +4,7 @@ import { useEffect, useMemo, useState } from "react";
 import { APP_BRAND_LOGO_SRC, APP_BRAND_NAME } from "./brand";
 import { MODULE_GROUPS, type ModuleItem } from "./navigation";
 import { useAuth } from "../auth/AuthProvider";
+import { useVisibleViewport } from "./useVisibleViewport";
 
 function dispatchTertiaryNavigation(to: string) {
   const section = sectionFromNavigationTarget(to);
@@ -22,6 +23,7 @@ function sectionFromNavigationTarget(to: string): string | null {
   return null;
 }
 export function AppShell() {
+  useVisibleViewport();
   const auth = useAuth();
   const location = useLocation();
   const [hoveredGroupId, setHoveredGroupId] = useState<string | null>(null);
