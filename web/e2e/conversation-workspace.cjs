@@ -37,7 +37,17 @@ for(const [name,viewport]of[['mobile',{width:390,height:844}],['compact-desktop'
       await page.getByRole('button',{name:'打开本次运行配置',exact:true}).click();
       const settings=page.getByRole('dialog',{name:'本次运行设置',exact:true});await expect(settings).toBeVisible();
       assert.equal(await settings.evaluate(el=>getComputedStyle(el).backgroundColor),'rgb(255, 255, 255)');
+      const details=settings.locator('details[aria-label="本次运行设置"]');
+      if(await details.getAttribute('open')===null)await details.locator('summary').click();
+      await settings.getByLabel('参考会话 ID',{exact:true}).fill('layout-conversation');
       await settings.getByRole('button',{name:'关闭运行设置',exact:true}).click();
+      const reference=page.getByRole('button',{name:'取消引用会话',exact:true});await expect(reference).toBeVisible();
+      assert.equal(await reference.evaluate(el=>getComputedStyle(el).color),'rgb(7, 107, 118)');
+      await reference.click();
+      await input.fill('/');
+      const commands=page.getByRole('listbox',{name:'Slash 命令',exact:true});await expect(commands).toBeVisible();
+      assert.equal(await commands.evaluate(el=>getComputedStyle(el).backgroundColor),'rgb(255, 255, 255)');
+      await input.fill('');
       await page.getByRole('button',{name:'打开项目与会话',exact:true}).click();
       await expect(page.getByRole('navigation',{name:'项目与会话管理',exact:true})).toBeVisible();
       await page.locator('.conversation-list-header').getByRole('button',{name:'关闭项目与会话',exact:true}).click();
