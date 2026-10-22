@@ -4,7 +4,7 @@ import userEvent from "@testing-library/user-event";
 import { MemoryRouter, Route, Routes, useNavigate } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { api, type Conversation, type CurrentUser, type RunDetail, type SubmittedRun } from "../api/client";
+import { api, type Conversation, type ConversationQueueItem, type CurrentUser, type RunDetail, type SubmittedRun } from "../api/client";
 import { AuthProvider, RequireAuth, useAuth } from "../auth/AuthProvider";
 import { RunDetailPage } from "./RunDetailPage";
 import { RunsPage } from "./RunsPage";
@@ -159,6 +159,134 @@ async function mountPage(page: "runs" | "detail") {
   const card = await screen.findByRole("status", { name: "沙箱权限确认" });
   return { user, alpha, beta, client, read, approve, reject, open, select, card, remount, isolatedClient, changeIdentity, unmount: () => view.unmount() };
 }
+
+async function mountConversationEntry(details: RunDetail[], options: {
+  entry?: string;
+  readConversation?: (conversation: Conversation) => Promise<Conversation>;
+  queue?: ConversationQueueItem[];
+} = {}) {
+  const user = userEvent.setup();
+  const client = new QueryClient({
+    defaultOptions: { queries: { enabled: false, retry: false, staleTime: Infinity }, mutations: { retry: false } },
+  });
+  clients.push(client);
+  const conversations = [...new Set(details.map((run) => run.conversation_id!))].map((id): Conversation => ({
+    conversation_id: id, title: `History ${id}`, project_id: "default", project_label: "Default",
+    workspace_path: id, archived_at: null, created_at: details[0].created_at, updated_at: details[0].created_at,
+    runs: details.filter((run) => run.conversation_id === id),
+  }));
+  client.setQueryData(["runs"], []);
+  client.setQueryData(["conversations", false], conversations);
+  client.setQueryData(["conversations", true], []);
+  client.setQueryData(["project-workspaces"], []);
+  vi.spyOn(api, "me").mockResolvedValue(initialActor);
+  const read = vi.spyOn(api, "run").mockImplementation(async (id) => details.find((run) => run.id === id)!);
+  const readConversation = vi.spyOn(api, "conversation").mockImplementation(async (id) => {
+    const conversation = conversations.find((item) => item.conversation_id === id)!;
+    return options.readConversation ? options.readConversation(conversation) : conversation;
+  });
+  vi.spyOn(api, "conversationQueue").mockResolvedValue(options.queue ?? []);
+  vi.spyOn(api, "workspaceFiles").mockResolvedValue({ items: [], bundle_download_url: "" });
+  const approve = vi.spyOn(api, "approveCapability").mockImplementation(async (id) => accepted(details.find((run) => run.id === id)!));
+  const reject = vi.spyOn(api, "rejectCapability");
+  let navigate!: ReturnType<typeof useNavigate>;
+  function Page() {
+    navigate = useNavigate();
+    return <RunsPage />;
+  }
+  render(<QueryClientProvider client={client}><AuthProvider>
+    <MemoryRouter initialEntries={[options.entry ?? "/?conversation=conv-alpha"]}>
+      <Routes><Route path="/" element={<RequireAuth><Page /></RequireAuth>} /></Routes>
+    </MemoryRouter>
+  </AuthProvider></QueryClientProvider>);
+  await screen.findByRole("navigation", { name: "项目与会话管理" });
+  async function go(id: string) {
+    await act(async () => {
+      navigate(`/?conversation=${id}`);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    await waitFor(() => expect(readConversation).toHaveBeenCalledWith(id));
+  }
+  return { user, client, read, readConversation, approve, reject, go };
+}
+
+describe("conversation entry capability approval", () => {
+  const latestRun = (): RunDetail => ({
+    ...approvalRun("latest", "approval-latest", 13), conversation_id: "conv-alpha", mode: "direct",
+    created_at: "2026-10-23T00:00:00Z",
+  });
+
+  it.each(["deep-link", "history"] as const)("restores the latest direct run approval from %s without selecting a run", async (entry) => {
+    const latest = latestRun();
+    // Deliberately unsorted: choose by run chronology, not response position or the first pending ID.
+    const { user, read, approve, reject } = await mountConversationEntry([latest, approvalRun("alpha")], {
+      entry: entry === "history" ? "/" : undefined,
+    });
+    if (entry === "history") await user.click(screen.getByRole("button", { name: "进入会话 History conv-alpha" }));
+    const card = await screen.findByRole("status", { name: "沙箱权限确认" });
+    expect(within(card).getByText("审批 approval-latest")).toBeTruthy();
+    expect(within(card).queryByText("审批 approval-alpha")).toBeNull();
+    expect(read).not.toHaveBeenCalled();
+    expect(approve).not.toHaveBeenCalled();
+    expect(reject).not.toHaveBeenCalled();
+    await user.click(within(card).getByRole("button", { name: "允许一次" }));
+    await waitFor(() => expect(approve).toHaveBeenCalledExactlyOnceWith("run-latest", { approval_id: "approval-latest", version: 13 }));
+    await waitFor(() => expect(screen.queryByRole("status", { name: "沙箱权限确认" })).toBeNull());
+  });
+
+  it.each(["completed", "cancelled", "running"])("does not fall back to historical pending when the latest run is %s", async (status) => {
+    const { client, approve } = await mountConversationEntry([approvalRun("alpha"), { ...latestRun(), status }]);
+    await waitFor(() => expect(client.getQueryData(["conversation", "conv-alpha"])).toBeTruthy());
+    expect(screen.queryByRole("status", { name: "沙箱权限确认" })).toBeNull();
+    expect(approve).not.toHaveBeenCalled();
+  });
+
+  it("keeps an explicit run selection authoritative over a newer conversation run", async () => {
+    const { alpha, client, card } = await mountPage("runs");
+    await act(async () => {
+      client.setQueryData<Conversation>(["conversation", "conv-alpha"], (current) => ({ ...current!, runs: [alpha, latestRun()] }));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(within(card).getByText("审批 approval-alpha")).toBeTruthy();
+    expect(screen.queryByText("审批 approval-latest")).toBeNull();
+  });
+
+  it("does not display a late conversation response after navigating to another conversation", async () => {
+    const response = deferred<Conversation>();
+    const alpha = approvalRun("alpha");
+    const beta = { ...approvalRun("beta"), status: "running" };
+    const { client, readConversation, go, approve } = await mountConversationEntry([alpha, beta], {
+      readConversation: async (conversation) => conversation.conversation_id === "conv-alpha" ? response.promise : conversation,
+    });
+    await waitFor(() => expect(readConversation).toHaveBeenCalledWith("conv-alpha"));
+    await go("conv-beta");
+    await waitFor(() => expect(client.getQueryData(["conversation", "conv-beta"])).toBeTruthy());
+    await act(async () => response.resolve({
+      conversation_id: "conv-alpha", title: "Alpha", project_id: "default", project_label: "Default",
+      workspace_path: "conv-alpha", archived_at: null, created_at: alpha.created_at, updated_at: alpha.created_at, runs: [alpha],
+    }));
+    expect(screen.queryByRole("status", { name: "沙箱权限确认" })).toBeNull();
+    expect(approve).not.toHaveBeenCalled();
+    await go("conv-alpha");
+    expect((await screen.findByRole("status", { name: "沙箱权限确认" })).textContent).toContain("审批 approval-alpha");
+  });
+
+  it("rejects mismatched conversation payloads and runs instead of exposing their approvals", async () => {
+    const alpha = approvalRun("alpha");
+    const beta = approvalRun("beta");
+    const { client, approve } = await mountConversationEntry([alpha, beta], {
+      readConversation: async (conversation) => ({ ...conversation, runs: [beta] }),
+    });
+    await waitFor(() => expect(client.getQueryData(["conversation", "conv-alpha"])).toBeTruthy());
+    expect(screen.queryByRole("status", { name: "沙箱权限确认" })).toBeNull();
+    await act(async () => {
+      client.setQueryData<Conversation>(["conversation", "conv-alpha"], (current) => ({ ...current!, conversation_id: "conv-beta", runs: [alpha] }));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(screen.queryByRole("status", { name: "沙箱权限确认" })).toBeNull();
+    expect(approve).not.toHaveBeenCalled();
+  });
+});
 
 describe.each(["runs", "detail"] as const)("%s capability approval component", (page) => {
   it.each(["user_id", "tenant_id", "role"] as const)("does not inherit a success when %s changes on the same QueryClient", async (field) => {

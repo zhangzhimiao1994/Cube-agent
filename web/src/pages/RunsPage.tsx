@@ -6687,7 +6687,7 @@ export function RunsPage() {
   } | null>(null);
   const [capabilityApprovalCandidate, setCapabilityApproval] = useState<CapabilityApproval | null>(null);
   const capabilityDecisions = useCapabilityApprovalDecisions((run, approval, decision) => {
-    if (selectedRunId === approval.runId) {
+    if (capabilityApprovalRun?.id === approval.runId) {
       setSubmitNotice(decision === "approve"
         ? "已允许本次沙箱工具调用，当前任务已重新排队继续执行。"
         : "已拒绝本次沙箱工具调用，当前任务已取消。");
@@ -6697,11 +6697,6 @@ export function RunsPage() {
       conversation_id: run.conversation_id ?? queryClient.getQueryData<RunDetail>(["run", approval.runId])?.conversation_id,
     });
   });
-  const capabilityDecision = capabilityDecisions.stateFor(capabilityApprovalCandidate);
-  const capabilityApproval = capabilityApprovalCandidate?.runId === selectedRunId && capabilityDecision?.status !== "success"
-    ? capabilityApprovalCandidate
-    : null;
-  const capabilityPending = capabilityDecision?.status === "pending";
   const trimmedReferenceConversationId = referenceConversationId.trim();
   const handoffActive = Boolean(trimmedReferenceConversationId);
 
@@ -6793,6 +6788,29 @@ export function RunsPage() {
     refetchInterval: 1000,
     refetchIntervalInBackground: true,
   });
+  // A conversation deep-link has no explicit run selection. Inspect only its latest
+  // actionable run, never search backwards for an older pending approval.
+  const approvalConversationRuns = activeConversation.data?.conversation_id === activeConversationId
+    ? activeConversation.data.runs.filter((run) => runConversationId(run) === activeConversationId)
+    : [];
+  const blockedApprovalRunIds = new Set((conversationQueue.data ?? [])
+    .filter((item) => item.conversation_id === activeConversationId && (item.status === "queued" || item.status === "redirecting"))
+    .map((item) => item.successor_run_id));
+  const capabilityApprovalRun = selectedRunId
+    ? selectedRun.data?.id === selectedRunId && runConversationId(selectedRun.data) === activeConversationId
+      ? selectedRun.data
+      : undefined
+    : orderedConversationRuns(approvalConversationRuns).reverse().find((run) => !blockedApprovalRunIds.has(run.id));
+  const proposedCapabilityApproval = capabilityApprovalFromRunDetail(capabilityApprovalRun);
+  const capabilityDecision = capabilityDecisions.stateFor(capabilityApprovalCandidate);
+  const capabilityApproval = capabilityApprovalCandidate && proposedCapabilityApproval &&
+    capabilityApprovalCandidate.runId === proposedCapabilityApproval.runId &&
+    capabilityApprovalCandidate.approvalId === proposedCapabilityApproval.approvalId &&
+    capabilityApprovalCandidate.version === proposedCapabilityApproval.version &&
+    capabilityDecision?.status !== "success"
+    ? capabilityApprovalCandidate
+    : null;
+  const capabilityPending = capabilityDecision?.status === "pending";
   const activeWorkspaceProjectId =
     activeConversation.data?.project_id?.trim() || listedConversationMetadata?.project_id?.trim() || projectId.trim() || "default";
   const activeWorkspaceSessionId =
@@ -6985,7 +7003,7 @@ export function RunsPage() {
     } else if (selectedRun.data && projectPreflightApproval?.runId === selectedRun.data.id) {
       setProjectPreflightApproval(null);
     }
-    const proposedCapabilityApproval = capabilityApprovalFromRunDetail(selectedRun.data);
+    const proposedCapabilityApproval = capabilityApprovalFromRunDetail(capabilityApprovalRun);
     if (proposedCapabilityApproval) {
       setModeSelection(null);
       setTemporaryApproval(null);
@@ -7002,10 +7020,10 @@ export function RunsPage() {
           ? current
           : proposedCapabilityApproval,
       );
-    } else if (selectedRun.data && capabilityApproval?.runId === selectedRun.data.id) {
+    } else if (capabilityApprovalCandidate) {
       setCapabilityApproval(null);
     }
-  }, [capabilityApproval, dismissedEvolutionApprovalRunIds, dismissedOpenClawApprovalRunIds, dismissedProjectPreflightApprovalRunIds, dismissedRepairApprovalRunIds, dismissedScheduleApprovalRunIds, modeSelection, projectPreflightApproval, selectedRun.data, temporaryApproval]);
+  }, [capabilityApprovalCandidate, capabilityApprovalRun, dismissedEvolutionApprovalRunIds, dismissedOpenClawApprovalRunIds, dismissedProjectPreflightApprovalRunIds, dismissedRepairApprovalRunIds, dismissedScheduleApprovalRunIds, modeSelection, projectPreflightApproval, selectedRun.data, temporaryApproval]);
 
   useEffect(() => {
     setProcessDetailTarget(null);
