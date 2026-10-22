@@ -1,3 +1,11 @@
+/* Keep logo artwork soft across authentication and both workspace surfaces. */
+:is(.auth-brand-logo, .brand-card img, .brand-lockup img) {
+  background: transparent;
+  box-shadow: none;
+  filter: saturate(0.55);
+  opacity: 0.78;
+}
+
 /* Management surfaces share the conversation palette without changing the conversation. */
 :root:not(:has(.conversation-workspace)) {
   color-scheme: light;
