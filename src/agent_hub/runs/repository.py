@@ -11,7 +11,7 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import TypedDict, cast
+from typing import TYPE_CHECKING, TypedDict, cast
 from uuid import UUID, uuid4
 
 from sqlalchemy import Select, and_, delete, func, or_, select, update
@@ -31,6 +31,7 @@ from agent_hub.db.models import (
     RunRow,
     RunStepRow,
     RunUsageRow,
+    UserRow,
 )
 from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.runs.approval_checkpoint import checkpoint_waits_for_approval
@@ -42,6 +43,9 @@ from agent_hub.runtime.failure_reason import (
     is_public_project_prerequisite_text,
     runtime_failure_diagnostic_from_reason,
 )
+
+if TYPE_CHECKING:
+    from agent_hub.runs.toolchain_supply import ToolchainSupplyAuthority
 
 
 def _database_uuid(value: UUID) -> UUID:
@@ -775,6 +779,77 @@ class RunRepository:
         if row is None:
             raise RunNotFound("run was not found")
         return row
+
+    async def _locked_toolchain_supply(
+        self, session: AsyncSession, tenant_id: UUID, run_id: UUID,
+        authority: ToolchainSupplyAuthority,
+    ) -> RunRow:
+        from agent_hub.runs.toolchain_supply import ToolchainSupplyAuthority
+
+        if type(authority) is not ToolchainSupplyAuthority:
+            raise RunConflict('toolchain_scope_changed')
+        row = await session.scalar(self._run_select(tenant_id, run_id).with_for_update())
+        if row is None:
+            raise RunNotFound('run was not found')
+        try:
+            record = self._record(row)
+        except (ValueError, TypeError):
+            raise RunConflict('toolchain_scope_changed') from None
+        authority.require_current(record, tenant_id, run_id)
+        user = await session.scalar(select(UserRow).where(
+            UserRow.tenant_id == tenant_id, UserRow.id == authority.actor_id).with_for_update())
+        if (user is None or user.tenant_id != tenant_id or user.id != authority.actor_id
+                or user.disabled is not False or user.role != authority.actor_role.value):
+            raise RunConflict('toolchain_scope_changed')
+        authority.require_current(self._record(row), tenant_id, run_id)
+        return row
+
+    @staticmethod
+    async def _require_toolchain_supply_grant(session: AsyncSession, row: RunRow) -> None:
+        rows = (await session.scalars(select(RunApprovalRow).where(
+            RunApprovalRow.tenant_id == row.tenant_id,
+            RunApprovalRow.run_id == row.id,
+            RunApprovalRow.status == 'approved',
+        ).with_for_update())).all()
+        if not any(approval.tenant_id == row.tenant_id and approval.run_id == row.id
+                   and approval.status == 'approved' and _toolchain_approval_matches(row, approval)
+                   for approval in rows):
+            raise RunConflict('toolchain_supply_approval_required')
+
+    async def get_toolchain_supply_state(
+        self, tenant_id: UUID, run_id: UUID, *, authority: ToolchainSupplyAuthority,
+    ) -> Mapping[str, JsonValue] | None:
+        from agent_hub.runs.toolchain_supply import supply_state
+
+        async with self._session_factory() as session, session.begin():
+            row = await self._locked_toolchain_supply(session, tenant_id, run_id, authority)
+            state = supply_state(self._record(row))
+            if state is not None and state['phase'] in {'executing', 'supplied'}:
+                await self._require_toolchain_supply_grant(session, row)
+            authority.require_current(self._record(row), tenant_id, run_id)
+        return state
+
+    async def compare_and_set_toolchain_supply(
+        self, tenant_id: UUID, run_id: UUID, *, authority: ToolchainSupplyAuthority,
+        expected: Mapping[str, JsonValue] | None, replacement: Mapping[str, JsonValue],
+    ) -> RunRecord:
+        from agent_hub.runs.toolchain_supply import supply_transition
+        from agent_hub.runtime.contracts import _freeze_object
+
+        expected = None if expected is None else _freeze_object(expected, name='expected supply')
+        replacement = _freeze_object(replacement, name='replacement supply')
+        async with self._session_factory() as session, session.begin():
+            row = await self._locked_toolchain_supply(session, tenant_id, run_id, authority)
+            after = supply_transition(self._record(row), expected, replacement)
+            if after['phase'] in {'executing', 'supplied'}:
+                await self._require_toolchain_supply_grant(session, row)
+            authority.require_current(self._record(row), tenant_id, run_id)
+            row.routing_decision = {**(row.routing_decision or {}),
+                                    'toolchain_supply': json.loads(json.dumps(after, default=dict))}
+            row.version += 1
+            await session.flush()
+            result = self._record(row)
+        return result
 
     async def compare_and_set_generated_preparation(
         self, tenant_id: UUID, run_id: UUID, *, actor_id: UUID, actor_role: Role,
