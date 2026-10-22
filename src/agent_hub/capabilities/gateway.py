@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 from uuid import UUID
 
 from agent_hub.auth.models import Role
@@ -14,8 +14,11 @@ from agent_hub.capabilities.approvals import (
     fingerprint_capability_request,
     plugin_approval_identity,
 )
-from agent_hub.capabilities.policy import CapabilityPolicy
+from agent_hub.capabilities.policy import CapabilityPolicy, normalize_resource
 from agent_hub.capabilities.types import CapabilityRequest, PolicyEffect
+
+if TYPE_CHECKING:
+    from agent_hub.runs.toolchain_supply import ToolchainSupplyAuthority
 
 
 class CapabilityStatus(StrEnum):
@@ -56,6 +59,8 @@ class ApprovalReviewRepository(Protocol):
         reviewer: str,
         reason: str,
         status: str,
+        toolchain_authority: ToolchainSupplyAuthority | None = None,
+        approval_scope: str | None = None,
     ) -> object: ...
 
 
@@ -77,15 +82,19 @@ class CapabilityGateway:
         *,
         approval_reviewer: ApprovalReviewer | None = None,
         plugin_policy_source: object | None = None,
+        toolchain_authority: ToolchainSupplyAuthority | None = None,
     ) -> None:
         self._policy = policy
         self._approvals = approvals
         self._run_repository = run_repository
         self._approval_reviewer = approval_reviewer
         self._plugin_policy_source = plugin_policy_source
+        self._toolchain_authority = toolchain_authority
         approvals.bind_run_repository(run_repository)  # type: ignore[arg-type]
 
     async def invoke(self, request: CapabilityRequest, *, role: Role) -> CapabilityResult:
+        if _is_toolchain_supply_request(request) and self._toolchain_authority is None:
+            return CapabilityResult(CapabilityStatus.DENIED, request.run_id, reason='capability denied')
         decision = self._policy.evaluate(request, role)
         if decision.effect is PolicyEffect.DENY:
             return CapabilityResult(
@@ -131,10 +140,12 @@ class CapabilityGateway:
 
         async def begin_wait(approval: ApprovalRecord) -> None:
             identity = plugin_approval_identity(self._plugin_policy_source, request)
-            identity_args = (
+            identity_args: dict[str, object] = (
                 {"plugin_identity": identity}
                 if identity is not None else {}
             )
+            if self._toolchain_authority is not None:
+                identity_args['toolchain_authority'] = self._toolchain_authority
             await self._run_repository.begin_capability_approval(  # type: ignore[attr-defined]
                 request.tenant_id,
                 request.run_id,
@@ -145,10 +156,11 @@ class CapabilityGateway:
                 **identity_args,
             )
 
-        approval = await self._approvals.start_waiting(
-            request,
-            begin_wait,
-        )
+        if self._toolchain_authority is not None:
+            # A rejected DB fence must not leave even an in-memory SDK approval.
+            approval = await self._approvals.start_waiting(request, begin_wait, publish_after_begin=True)
+        else:
+            approval = await self._approvals.start_waiting(request, begin_wait)
         return CapabilityResult(
             CapabilityStatus.WAITING_APPROVAL,
             request.run_id,
@@ -181,10 +193,14 @@ class CapabilityGateway:
     ) -> bool:
         recorder = getattr(self._run_repository, "record_capability_approval_review", None)
         if not callable(recorder):
-            return True
+            return self._toolchain_authority is None
         fingerprint = fingerprint_capability_request(request)
         approval_id = f"auto_review_{hashlib.sha256(fingerprint.encode()).hexdigest()[:24]}"
         try:
+            toolchain_options: dict[str, object] = {}
+            if self._toolchain_authority is not None:
+                toolchain_options = {'toolchain_authority': self._toolchain_authority,
+                                     'approval_scope': capability_approval_scope(request)}
             await recorder(
                 request.tenant_id,
                 request.run_id,
@@ -193,10 +209,17 @@ class CapabilityGateway:
                 reviewer=review.reviewer,
                 reason=review.reason,
                 status=status,
+                **toolchain_options,
             )
         except Exception:  # noqa: BLE001 - failed audit must not auto-approve execution.
             return False
         return True
+
+
+def _is_toolchain_supply_request(request: CapabilityRequest) -> bool:
+    resource = normalize_resource(request.resource)
+    prefix = 'workspace/current/project-inputs/toolchain'
+    return resource is not None and (resource == prefix or resource.startswith(prefix + '/'))
 
 
 def _bounded_printable_text(value: str, *, field_name: str, max_length: int) -> None:

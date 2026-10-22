@@ -65,6 +65,11 @@ class _PythonApprovalOptions(TypedDict, total=False):
     toolchain_input_binding: dict[str, object]
 
 
+class _ToolchainReviewOptions(TypedDict, total=False):
+    approval_scope: str
+    toolchain_input_binding: dict[str, object]
+
+
 def _has_generated_preparation(route: Mapping[str, object]) -> bool:
     # Even malformed or mixed markers must not acquire original-input credit.
     return bool({'generated_project_contract_version', 'generated_project_preparation'} & route.keys())
@@ -1645,9 +1650,17 @@ class RunRepository:
         approval_scope: str | None = None,
         actor_id: UUID | None = None,
         plugin_identity: PluginApprovalIdentity | None = None,
+        toolchain_authority: ToolchainSupplyAuthority | None = None,
     ) -> RunRecord:
         async with self._session_factory() as session, session.begin():
-            row = await session.scalar(self._run_select(tenant_id, run_id).with_for_update())
+            row: RunRow | None
+            toolchain_scope = _is_toolchain_supply_scope(approval_scope)
+            if toolchain_scope or toolchain_authority is not None:
+                if not toolchain_scope or toolchain_authority is None:
+                    raise RunConflict('toolchain authority is required')
+                row = await self._locked_toolchain_supply(session, tenant_id, run_id, toolchain_authority)
+            else:
+                row = await session.scalar(self._run_select(tenant_id, run_id).with_for_update())
             if row is None:
                 raise RunNotFound("run was not found")
             if (actor_id is not None and row.actor_id != actor_id) or (
@@ -1695,6 +1708,8 @@ class RunRepository:
                 python_options['python_input_binding'] = input_binding
             if toolchain_binding is not None:
                 python_options['toolchain_input_binding'] = toolchain_binding
+            if toolchain_authority is not None:
+                toolchain_authority.require_current(self._record(row), tenant_id, run_id)
             row.status = RunStatus.WAITING_APPROVAL.value
             self.clear_worker_lease(row)
             row.routing_decision = {
@@ -1806,13 +1821,30 @@ class RunRepository:
         reviewer: str,
         reason: str,
         status: str,
+        toolchain_authority: ToolchainSupplyAuthority | None = None,
+        approval_scope: str | None = None,
     ) -> RunRecord:
         if status not in {"approved", "denied"}:
             raise RunConflict("approval review status is invalid")
         async with self._session_factory() as session, session.begin():
-            row = await session.scalar(self._run_select(tenant_id, run_id).with_for_update())
+            row: RunRow | None
+            toolchain_binding = None
+            if _is_toolchain_supply_scope(approval_scope) or toolchain_authority is not None:
+                if not _is_toolchain_supply_scope(approval_scope) or toolchain_authority is None:
+                    raise RunConflict('toolchain authority is required')
+                row = await self._locked_toolchain_supply(session, tenant_id, run_id, toolchain_authority)
+                toolchain_binding = _toolchain_supply_approval_binding(row, approval_scope, planned=True)
+                if toolchain_binding is None:
+                    raise RunConflict('toolchain approval binding is invalid or stale')
+            else:
+                row = await session.scalar(self._run_select(tenant_id, run_id).with_for_update())
             if row is None:
                 raise RunNotFound("run was not found")
+            toolchain_options: _ToolchainReviewOptions = {}
+            if toolchain_binding is not None:
+                assert isinstance(approval_scope, str)
+                toolchain_options['approval_scope'] = approval_scope
+                toolchain_options['toolchain_input_binding'] = toolchain_binding
             await self._upsert_capability_approval_review(
                 session,
                 tenant_id,
@@ -1822,7 +1854,10 @@ class RunRepository:
                 reviewer=reviewer,
                 reason=reason,
                 status=status,
+                **toolchain_options,
             )
+            if toolchain_authority is not None:
+                toolchain_authority.require_current(self._record(row), tenant_id, run_id)
             await session.flush()
             return self._record(row)
 
@@ -2746,6 +2781,8 @@ class RunRepository:
         reviewer: str,
         reason: str,
         status: str,
+        approval_scope: str | None = None,
+        toolchain_input_binding: dict[str, object] | None = None,
     ) -> None:
         payload: dict[str, object] = {
             "approval_id": approval_id,
@@ -2754,6 +2791,8 @@ class RunRepository:
             "reviewer": reviewer,
             "reason": reason,
             "status": status,
+            **({'approval_scope': approval_scope, 'toolchain_input_binding': toolchain_input_binding}
+               if toolchain_input_binding is not None else {}),
         }
         result = await session.execute(
             insert(RunApprovalRow)

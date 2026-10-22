@@ -4,12 +4,16 @@ from __future__ import annotations
 
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
-from agent_hub.domain.runs import RunStatus
+from agent_hub.auth.models import Role
+from agent_hub.db.models import UserRow
+from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.runs.repository import RunConflict, _public_plugin_approval_events
+from agent_hub.runs.toolchain_supply import ToolchainSupplyAuthority
+from agent_hub.runtime.contracts import TaskContext
 from tests.unit.capabilities.test_toolchain_preparation import (
     KEY,
     PREFIX,
@@ -31,6 +35,35 @@ def sdk(dao: Any, case: Any) -> Any:
     dao.run.routing_decision[KEY] = state_for(case)
     dao.run.worker_lease_expires_at = datetime.now(UTC) + timedelta(minutes=5)
     dao.plan = case.plan
+    row = dao.run
+    dao.authority = ToolchainSupplyAuthority.from_context(TaskContext(tenant_id=row.tenant_id,
+        run_id=row.id, actor_id=row.actor_id, actor_role=Role(row.actor_role),
+        execution_token=row.worker_lease_token, request=row.request, mode=TaskMode(row.mode),
+        routing_decision=row.routing_decision), worker_id=row.worker_id)
+    original_factory = dao.repository._session_factory
+
+    class Session:
+        def __init__(self) -> None:
+            self.base = original_factory()
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self.base, name)
+
+        async def __aenter__(self) -> Any:
+            await self.base.__aenter__()
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            await self.base.__aexit__(*args)
+
+        async def scalar(self, statement: Any) -> Any:
+            if {item.name for item in statement.get_final_froms()} == {'agent_hub_users'}:
+                assert statement._for_update_arg is not None
+                return UserRow(id=row.actor_id, tenant_id=row.tenant_id, username='operator',
+                               role=row.actor_role, disabled=False)
+            return await self.base.scalar(statement)
+
+    dao.repository._session_factory = cast(Any, Session)
     return dao
 
 
@@ -43,7 +76,7 @@ def approval_scope(sdk: Any, prefix: str = PREFIX) -> str:
 async def begin(sdk: Any, *, scope: str | None = None) -> Any:
     return await sdk.repository.begin_capability_approval(sdk.run.tenant_id, sdk.run.id,
         actor_id=sdk.run.actor_id, approval_id='approval_sdk', approval_fingerprint='sdk-private',
-        approval_scope=approval_scope(sdk) if scope is None else scope)
+        approval_scope=approval_scope(sdk) if scope is None else scope, toolchain_authority=sdk.authority)
 
 
 async def test_sdk_approval_is_persisted_and_public_resource_is_exact(sdk: Any) -> None:

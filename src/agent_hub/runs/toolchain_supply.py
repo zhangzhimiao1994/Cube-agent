@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, cast
@@ -73,7 +73,7 @@ class ToolchainSupplyAuthority:
     actor_id: UUID
     actor_role: Role
     worker_id: str
-    lease_token: UUID
+    lease_token: UUID = field(repr=False)
     request: str
     mode: TaskMode
     binding: Mapping[str, JsonValue]

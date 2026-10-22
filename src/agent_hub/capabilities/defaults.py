@@ -4,7 +4,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Protocol, cast
+from typing import TYPE_CHECKING, Protocol, cast
 from uuid import UUID
 
 from agent_hub.auth.models import Role
@@ -21,6 +21,7 @@ from agent_hub.capabilities.gateway import (
     CapabilityGateway,
     CapabilityResult,
     CapabilityStatus,
+    _is_toolchain_supply_request,
 )
 from agent_hub.capabilities.policy import CapabilityPolicy, CapabilityRule, normalize_resource
 from agent_hub.capabilities.python_project_lifecycle import (
@@ -36,6 +37,9 @@ from agent_hub.harness.tool_gateway import (
     _python_recipe_authorization,
 )
 from agent_hub.runtime.contracts import TaskContext
+
+if TYPE_CHECKING:
+    from agent_hub.runs.toolchain_supply import ToolchainSupplyAuthority
 
 ToolApprovalPolicyGetter = Callable[[UUID], Awaitable[bool]]
 ToolApprovalModeGetter = Callable[[UUID], Awaitable[str]]
@@ -78,9 +82,33 @@ class DefaultRuntimeCapabilityPolicyGateway:
         *,
         role: Role,
     ) -> CapabilityResult:
+        if _is_toolchain_supply_request(request):
+            return CapabilityResult(CapabilityStatus.DENIED, request.run_id, reason='capability denied')
+        return await self._invoke(request, role=role)
+
+    async def authorize_project_toolchain(
+        self, request: CapabilityRequest, *, role: Role,
+        authority: ToolchainSupplyAuthority | None = None,
+    ) -> CapabilityResult:
+        from agent_hub.runs.toolchain_supply import ToolchainSupplyAuthority
+
+        if type(authority) is not ToolchainSupplyAuthority or not _is_toolchain_supply_request(request):
+            return CapabilityResult(CapabilityStatus.DENIED, request.run_id, reason='capability denied')
+        try:
+            return await self._invoke(request, role=role, toolchain_authority=authority)
+        except Exception:  # noqa: BLE001 - rejected lease fences never become an approval or grant.
+            return CapabilityResult(CapabilityStatus.DENIED, request.run_id, reason='capability denied')
+
+    async def _invoke(
+        self, request: CapabilityRequest, *, role: Role,
+        toolchain_authority: ToolchainSupplyAuthority | None = None,
+    ) -> CapabilityResult:
         approval_required = await self._tool_approval_required(request.tenant_id)
         extra_rules = self._extra_policy_rules(request)
-        project_effect = await _project_input_supply_effect(self._run_repository, request, role=role)
+        project_effect = await _project_toolchain_supply_effect(self._run_repository, request,
+            role=role, authority=toolchain_authority)
+        if project_effect is None:
+            project_effect = await _project_input_supply_effect(self._run_repository, request, role=role)
         if project_effect is None:
             project_effect = await _project_verification_effect(self._run_repository, request, role=role)
         if project_effect in {PolicyEffect.DENY, PolicyEffect.REQUIRE_APPROVAL}:
@@ -110,7 +138,7 @@ class DefaultRuntimeCapabilityPolicyGateway:
             )
         if explicit_plugin_effect is PolicyEffect.ALLOW and project_effect is None:
             return CapabilityResult(CapabilityStatus.ALLOWED, request.run_id)
-        if await _has_approved_capability_request(self._run_repository, request):
+        if toolchain_authority is None and await _has_approved_capability_request(self._run_repository, request):
             return CapabilityResult(CapabilityStatus.ALLOWED, request.run_id)
         if await _has_approved_capability_scope(self._run_repository, request):
             return CapabilityResult(CapabilityStatus.ALLOWED, request.run_id)
@@ -120,6 +148,7 @@ class DefaultRuntimeCapabilityPolicyGateway:
             self._run_repository,
             approval_reviewer=await self._approval_reviewer_for_request(request.tenant_id),
             plugin_policy_source=self._plugin_policy_rules,
+            toolchain_authority=toolchain_authority,
         )
         return await gateway.invoke(request, role=role)
 
@@ -366,6 +395,41 @@ async def _project_verification_effect(
             return PolicyEffect.DENY
         return PolicyEffect.ALLOW if "network.read" in permissions else PolicyEffect.REQUIRE_APPROVAL
     except Exception:  # noqa: BLE001 - missing authority cannot enable project execution.
+        return PolicyEffect.DENY
+
+
+async def _project_toolchain_supply_effect(
+    repository: object, request: CapabilityRequest, *, role: Role,
+    authority: ToolchainSupplyAuthority | None,
+) -> PolicyEffect | None:
+    if not _is_toolchain_supply_request(request):
+        return None
+    if authority is None or request.resource != normalize_resource(request.resource):
+        return PolicyEffect.DENY
+    try:
+        from agent_hub.capabilities.toolchain_preparation import toolchain_supply_binding
+        from agent_hub.domain.runs import RunStatus
+
+        getter = getattr(repository, 'get', None)
+        if not callable(getter):
+            return PolicyEffect.DENY
+        record = await getter(request.tenant_id, request.run_id)
+        authority.require_current(record, request.tenant_id, request.run_id)
+        expected = toolchain_supply_binding(record, planned=True)
+        expiry = getattr(record, 'worker_lease_expires_at', None)
+        actual_role = getattr(record, 'actor_role', None)
+        # Canonical JSON fingerprints preserve bool/int distinctions in the
+        # protected capture and exact arguments; only the retry key may differ.
+        selected = request.model_copy(update={'idempotency_key': expected.idempotency_key})
+        if (not isinstance(actual_role, str) or Role(actual_role) is not role
+                or getattr(record, 'status', None) is not RunStatus.RUNNING
+                or not getattr(record, 'worker_id', None)
+                or getattr(record, 'worker_lease_token', None) is None
+                or not isinstance(expiry, datetime) or expiry <= datetime.now(UTC)
+                or fingerprint_capability_request(selected) != fingerprint_capability_request(expected)):
+            return PolicyEffect.DENY
+        return PolicyEffect.REQUIRE_APPROVAL
+    except Exception:  # noqa: BLE001 - stale or malformed DB state cannot authorize SDK supply.
         return PolicyEffect.DENY
 
 
