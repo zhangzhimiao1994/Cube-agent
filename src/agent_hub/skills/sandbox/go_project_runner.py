@@ -11,17 +11,19 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import secrets
 import stat
 import sys
 import time
 from contextlib import ExitStack
 from pathlib import Path
-from typing import Any, Self, cast
+from typing import Any, Literal, Self, TextIO, cast
 
 from pydantic import BaseModel, ConfigDict, model_validator
 
 from agent_hub.capabilities.go_project_inputs import GoProjectInputs
+from agent_hub.observability.logging import SENSITIVE_KEY_PATTERN, SENSITIVE_VALUE_PATTERN
 from agent_hub.skills.sandbox.go_project_binary_export import (
     export_go_project_binary,
     measure_go_project_binary,
@@ -66,6 +68,15 @@ _WORK = Path('/run/agent-hub-go-work/owned')
 _INSPECTION_HELPER = Path(__file__).with_name('go_project_inspect.go')
 _MAX_PLAN_BYTES = 32 * 1024**2
 _MAX_REPORT_BYTES = 32 * 1024**2
+_DiagnosticStage = Literal['native', 'arguments', 'plan', 'run', 'encode', 'write']
+_RUNNER_ERROR_CODES = frozenset({
+    'go_project_runner_rejected', 'go_project_timeout', 'go_project_toolchain_changed',
+    'go_project_build_output_invalid', 'go_project_output_incomplete',
+    'go_project_build_output_changed', 'go_project_source_changed', 'go_project_business_failed',
+    'go_project_inspection_helper_unavailable', 'go_project_inspection_failed',
+    'go_project_acceptance_tests_changed', 'go_project_build_failed', 'go_project_test_failed',
+    'go_project_canary_failed', 'go_project_cleanup_incomplete',
+})
 
 
 class GoProjectRunnerError(ValueError):
@@ -74,6 +85,47 @@ class GoProjectRunnerError(ValueError):
     def __init__(self, code: str) -> None:
         self.code = code
         super().__init__(code)
+
+
+def _exception_diagnostic(error: BaseException) -> dict[str, str]:
+    """Finite class names and optional identifiers; never format exception objects."""
+    kinds = (GoProjectRunnerError, ProcessCleanupIncomplete, PythonPhaseCleanupError,
+             FileNotFoundError, PermissionError, OSError, KeyError, AttributeError,
+             OverflowError, ValueError, RuntimeError, TypeError, AssertionError, SystemExit)
+    detail = {'exception_type': next(
+        (kind.__name__ for kind in kinds if isinstance(error, kind)), 'Exception')}
+    if (type(error) is GoProjectRunnerError and type(error.code) is str
+            and error.code in _RUNNER_ERROR_CODES):
+        detail['code'] = error.code
+    identifier = None
+    if type(error) is KeyError and len(error.args) == 1:
+        identifier = error.args[0]
+    elif type(error) is AttributeError:
+        identifier = error.name
+    if (type(identifier) is str and len(identifier) <= 64
+            and re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', identifier) is not None
+            and not SENSITIVE_KEY_PATTERN.search(identifier)
+            and not SENSITIVE_VALUE_PATTERN.search(identifier)):
+        detail['identifier'] = identifier
+    return detail
+
+
+def _write_diagnostic(stream: TextIO, payload: dict[str, Any]) -> None:
+    """Best effort private stderr, including when the sink raises a control exception."""
+    try:
+        raw = json.dumps(payload, ensure_ascii=True, allow_nan=False, separators=(',', ':')) + '\n'
+        if len(raw) <= 64 * 1024:
+            stream.write(raw)
+    except BaseException:  # noqa: BLE001 - diagnostics must never replace the original failure
+        return
+
+
+def _diagnostic(stage: _DiagnosticStage, error: BaseException) -> None:
+    try:
+        _write_diagnostic(sys.stderr, {'go_project_runner_diagnostic': {
+            'stage': stage, **_exception_diagnostic(error)}})
+    except BaseException:  # noqa: BLE001 - preserve the original CLI outcome even without stderr
+        return
 
 
 def _need(value: object, code: str = 'go_project_runner_rejected') -> None:
@@ -479,15 +531,22 @@ def encode_go_report(report: dict[str, Any]) -> bytes:
 
 
 def main() -> int:
+    phase: _DiagnosticStage = 'native'
     try:
         _native()
+        phase = 'arguments'
         _need(len(sys.argv) == 1)
+        phase = 'plan'
         plan = parse_go_runner_plan(_read_plan())
+        phase = 'run'
         report = run_go_project(plan)
-        sys.stdout.write(encode_go_report(report).decode('ascii') + '\n')
+        phase = 'encode'
+        encoded = encode_go_report(report).decode('ascii') + '\n'
+        phase = 'write'
+        sys.stdout.write(encoded)
         return 0
-    except Exception:  # noqa: BLE001 - fixed CLI diagnostic, never a raw traceback or host path
-        sys.stderr.write('go_project_runner_rejected\n')
+    except Exception as error:  # noqa: BLE001 - never a raw traceback or host path
+        _diagnostic(phase, error)
         return 1
 
 

@@ -662,6 +662,130 @@ def test_main_prints_only_bounded_report_and_hides_invalid_plan_details(
     assert output.out == '' and '/root/secret' not in output.err
 
 
+@pytest.fixture
+def cli(api: Any, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> Any:
+    class Stream:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def write(self, value: str) -> int:
+            return getattr(sys, self.name).write(value)
+
+    monkeypatch.setattr(api, 'sys', SimpleNamespace(argv=['go_project_runner'],
+        stdout=Stream('stdout'), stderr=Stream('stderr')))
+    monkeypatch.setattr(api, '_native', lambda: None)
+    monkeypatch.setattr(api, '_read_plan', lambda: b'{}')
+    monkeypatch.setattr(api, 'parse_go_runner_plan', lambda raw: object())
+    monkeypatch.setattr(api, 'run_go_project', lambda plan: {'status': 'incomplete'})
+    return api
+
+
+@pytest.mark.parametrize('stage,target', [
+    ('native', '_native'), ('plan', '_read_plan'), ('plan', 'parse_go_runner_plan'),
+    ('run', 'run_go_project'), ('encode', 'encode_go_report'),
+])
+def test_cli_failure_diagnostic_keeps_literal_stage_and_safe_key(
+    cli: Any, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+    stage: str, target: str,
+) -> None:
+    def fail(*args: Any) -> Any:
+        raise KeyError('test_evidence')
+
+    monkeypatch.setattr(cli, target, fail)
+    assert cli.main() == 1
+    output = capsys.readouterr()
+    assert output.out == '' and len(output.err.splitlines()) == 1
+    assert json.loads(output.err) == {'go_project_runner_diagnostic': {
+        'stage': stage, 'exception_type': 'KeyError', 'identifier': 'test_evidence'}}
+
+
+@pytest.mark.parametrize('failure,details', [
+    (KeyError('/root/private'), {'exception_type': 'KeyError'}),
+    (KeyError('api_token'), {'exception_type': 'KeyError'}),
+    (KeyError('x' * 65), {'exception_type': 'KeyError'}),
+    (KeyError({'private': '/root/secret'}), {'exception_type': 'KeyError'}),
+    (AttributeError('/root/private', name='inventory'),
+     {'exception_type': 'AttributeError', 'identifier': 'inventory'}),
+    (AttributeError('/root/private', name='password'), {'exception_type': 'AttributeError'}),
+    (AttributeError('missing inventory /root/private'), {'exception_type': 'AttributeError'}),
+    (RuntimeError('/root/private token=private-secret\ntraceback'), {'exception_type': 'RuntimeError'}),
+])
+def test_cli_failure_diagnostic_never_copies_exception_text_or_repr(
+    cli: Any, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+    failure: Exception, details: dict[str, str],
+) -> None:
+    def fail(*args: Any) -> Any:
+        raise failure
+
+    monkeypatch.setattr(cli, 'run_go_project', fail)
+    assert cli.main() == 1
+    output = capsys.readouterr()
+    assert json.loads(output.err) == {'go_project_runner_diagnostic': {'stage': 'run', **details}}
+    assert len(output.err.encode()) < 512
+
+
+@pytest.mark.parametrize('code,kept', [
+    ('go_project_timeout', True), ('go_project_runner_rejected', True),
+    ('go_project_private_secret', False), ('/root/private\nsecret', False),
+])
+def test_cli_only_retains_finite_runner_error_codes(
+    cli: Any, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+    code: str, kept: bool,
+) -> None:
+    def fail(*args: Any) -> Any:
+        raise cli.GoProjectRunnerError(code)
+
+    monkeypatch.setattr(cli, 'run_go_project', fail)
+    assert cli.main() == 1
+    details = json.loads(capsys.readouterr().err)['go_project_runner_diagnostic']
+    assert details == {'stage': 'run', 'exception_type': 'GoProjectRunnerError',
+                       **({'code': code} if kept else {})}
+
+
+def test_cli_arguments_and_write_failures_are_distinct(
+    cli: Any, capsys: pytest.CaptureFixture[str],
+) -> None:
+    cli.sys.argv.append('/root/private')
+    assert cli.main() == 1
+    details = json.loads(capsys.readouterr().err)['go_project_runner_diagnostic']
+    assert details == {'stage': 'arguments', 'exception_type': 'GoProjectRunnerError',
+                       'code': 'go_project_runner_rejected'}
+
+    class Broken:
+        def write(self, value: str) -> None:
+            raise BrokenPipeError('/root/private')
+
+    cli.sys.argv.pop()
+    cli.sys.stdout = Broken()
+    assert cli.main() == 1
+    details = json.loads(capsys.readouterr().err)['go_project_runner_diagnostic']
+    assert details == {'stage': 'write', 'exception_type': 'OSError'}
+    cli.sys.stderr = Broken()
+    assert cli.main() == 1
+
+
+def test_cli_unknown_exception_name_and_broken_stderr_cannot_escape(
+    cli: Any, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    class PrivateException(Exception):
+        def __str__(self) -> str:
+            raise AssertionError('exception stringified')
+
+    class Broken:
+        def write(self, value: str) -> None:
+            raise SystemExit('private stderr failure')
+
+    def fail(*args: Any) -> Any:
+        raise PrivateException()
+
+    monkeypatch.setattr(cli, 'run_go_project', fail)
+    assert cli.main() == 1
+    assert json.loads(capsys.readouterr().err)['go_project_runner_diagnostic'] == {
+        'stage': 'run', 'exception_type': 'Exception'}
+    cli.sys.stderr = Broken()
+    assert cli.main() == 1
+
+
 @pytest.mark.skipif(sys.platform != 'linux', reason='real Linux FD tests; Windows is not native PASS')
 def test_native_plan_reader_requires_root_owned_single_link_nofollow(
     api: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,

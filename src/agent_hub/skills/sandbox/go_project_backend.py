@@ -22,8 +22,9 @@ from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Protocol, cast
+from typing import Any, Literal, Protocol, cast, get_args
 
+from agent_hub.capabilities.execution_diagnostics import ExecutionDiagnostic
 from agent_hub.capabilities.go_project_inputs import GoProjectInputs, bind_go_project_inputs
 from agent_hub.capabilities.go_project_receipts import validate_go_passed_receipt
 from agent_hub.capabilities.go_project_recipe import (
@@ -49,7 +50,11 @@ from agent_hub.skills.sandbox.go_project_protocol import (
     base_go_invocation,
     parse_go_project_request,
 )
-from agent_hub.skills.sandbox.go_project_runner import GoProjectRunnerPlan
+from agent_hub.skills.sandbox.go_project_runner import (
+    GoProjectRunnerPlan,
+    _exception_diagnostic,
+    _write_diagnostic,
+)
 from agent_hub.skills.sandbox.project import _Execution, snapshot_project_source
 from agent_hub.skills.sandbox.project_contract_broker import (
     _encoded,
@@ -63,6 +68,7 @@ from agent_hub.skills.sandbox.project_contract_broker import (
 )
 from agent_hub.skills.sandbox.python_project_backend import _admission, _source_files
 from agent_hub.skills.sandbox.python_project_process import (
+    PYTHON_PHASE_OUTPUT_WITHHELD,
     PythonPhaseProcessResult,
     run_python_phase,
 )
@@ -73,6 +79,11 @@ from agent_hub.subprocess_cleanup import ProcessCleanupIncomplete
 
 _MAX_PLAN = 32 * 1024**2
 _RESERVE = 3 * 1024**3
+_DiagnosticStage = Literal[
+    'request', 'native', 'configuration', 'admission', 'baseline', 'inputs', 'authority',
+    'source', 'plan', 'command', 'run', 'quiesce', 'report', 'receipt', 'export',
+    'remeasure', 'response', 'stage_validation',
+]
 
 
 class GoProjectAuthority(Protocol):
@@ -89,6 +100,49 @@ class GoProjectBackendError(ValueError):
     def __init__(self, code: GoProjectError) -> None:
         self.code = code
         super().__init__(code)
+
+
+def _process_diagnostic(process: PythonPhaseProcessResult) -> dict[str, Any]:
+    # Native capture loss and preview clipping are separate facts. A truncated
+    # capture may begin/end inside a secret, so withhold it before redaction.
+    _need(process.exit_code is None or
+          (type(process.exit_code) is int and -(2**63) <= process.exit_code < 2**63))
+    _need(all(type(getattr(process, name)) is bool for name in (
+        'timed_out', 'stdout_truncated', 'stderr_truncated')))
+    for name in ('stdout_observed_bytes', 'stderr_observed_bytes'):
+        value = getattr(process, name)
+        _need(type(value) is int and 0 <= value < 2**63)
+    metadata = {name: getattr(process, name) for name in (
+        'exit_code', 'timed_out', 'stdout_observed_bytes', 'stderr_observed_bytes',
+        'stdout_truncated', 'stderr_truncated')}
+    if process.exit_code is None and not process.timed_out:
+        return metadata
+    _need(all(type(getattr(process, name)) is str
+              and len(getattr(process, name).encode('utf-8', errors='replace'))
+              <= GO_PROJECT_DIAGNOSTIC_MAX_BYTES for name in ('stdout', 'stderr')))
+    result = SkillResult(exit_code=process.exit_code, timed_out=process.timed_out,
+        stdout=PYTHON_PHASE_OUTPUT_WITHHELD if process.stdout_truncated else process.stdout,
+        stderr=PYTHON_PHASE_OUTPUT_WITHHELD if process.stderr_truncated else process.stderr)
+    return {**ExecutionDiagnostic('systemd', result, retain_tail=True).to_payload(), **metadata}
+
+
+def _diagnostic(stage: _DiagnosticStage, error: BaseException,
+                process: PythonPhaseProcessResult | None = None) -> None:
+    """Private helper stderr only; neither wire data nor passed receipt evidence."""
+    try:
+        detail: dict[str, Any] = {'stage': stage, **_exception_diagnostic(error)}
+        if isinstance(error, GoProjectBackendError):
+            detail['exception_type'] = 'GoProjectBackendError'
+            if type(error.code) is str and error.code in get_args(GoProjectError):
+                detail['code'] = error.code
+        if type(process) is PythonPhaseProcessResult:
+            try:
+                detail['process'] = _process_diagnostic(process)
+            except BaseException:  # noqa: BLE001 - malformed evidence cannot hide the failure stage
+                detail['process_withheld'] = True
+        _write_diagnostic(sys.stderr, {'go_project_diagnostic': detail})
+    except BaseException:  # noqa: BLE001 - stderr failure must preserve UNKNOWN and original errors
+        return
 
 
 def _need(value: object, code: GoProjectError = 'go_project_execution_unavailable') -> None:
@@ -494,14 +548,18 @@ def execute_go_project_request(
     original business fixtures, real observations and Root's independent binary
     measurement; neither response is itself DB approval or delivery authority.
     """
-    _need(type(request) is GoProjectRequest, 'go_project_request_invalid')
     try:
+        _need(type(request) is GoProjectRequest, 'go_project_request_invalid')
         request = parse_go_project_request(request.model_dump_json(warnings='error').encode())
-    except (ValueError, TypeError, AttributeError):
+    except (ValueError, TypeError, AttributeError) as error:
+        _diagnostic('request', error)
         raise GoProjectBackendError('go_project_request_invalid') from None
     inv = request.invocation
+    process: PythonPhaseProcessResult | None = None
+    phase: _DiagnosticStage = 'native'
     try:
         _native()
+        phase = 'configuration'
         _need(callable(authorize), 'go_project_recipe_approval_required')
         _need(type(catalog) is ToolchainCatalog, 'go_project_environment_unavailable')
         catalog_bytes = catalog.to_json()
@@ -509,6 +567,7 @@ def execute_go_project_request(
         _need(type(policy) is BrokerPolicy, 'go_project_request_invalid')
         policy_snapshot = replace(policy)
         deadline = time.monotonic() + inv.timeout_seconds
+        phase = 'admission'
         with _roots(policy, catalog, stage) as roots, _admission(roots.admission_fd, deadline):
             def recheck() -> None:
                 _native()
@@ -520,14 +579,18 @@ def execute_go_project_request(
 
             recheck()
             _disk_budget(roots.stage_fd, inv, catalog)
+            phase = 'baseline'
             original = stage_original_contract(policy.project_workspace_root,
                 base_go_invocation(inv),
                 ProjectBaselineReference.from_payload(inv.original_reference.model_dump()),
                 stage, policy.allowed_uid)
+            phase = 'inputs'
             inputs = _measured_inputs(original, inv, catalog, deadline)
+            phase = 'authority'
             _authorize(authorize, inputs, inv)
             _native()
             _check(deadline)
+            phase = 'source'
             source_sha256 = _source_snapshot(original, inputs, inv, policy, stage, deadline)
             snapshot = original.snapshot if inv.source_kind == 'original' else stage / 'snapshot'
             binary: dict[str, object] | None = None
@@ -545,56 +608,80 @@ def execute_go_project_request(
                 recheck()
 
             if request.action == 'inspect_go_project_environment':
+                phase = 'remeasure'
                 remeasure()
+                phase = 'response'
                 response = _response(request, ok=True, environment=inputs.toolchain)
+                phase = 'authority'
                 _authorize(authorize, inputs, inv)
             else:
+                phase = 'plan'
                 plan = GoProjectRunnerPlan(invocation=inv, inputs=inputs.to_payload(),
                                            source_sha256=source_sha256)
                 plan_path = _write_plan(plan, roots.stage_fd, stage)
                 export = _make_export(roots.stage_fd, stage, policy.allowed_gid)
+                phase = 'command'
                 artifact = catalog.select(inputs.declaration)
                 command = build_go_project_systemd_command(inv, policy,
                     snapshot=snapshot, original=original.snapshot, plan=plan_path,
                     toolchain_root=Path(catalog.runtime_root) / artifact.artifact_sha256 / 'payload/go',
                     export=export)
                 _export_empty(roots.stage_fd, deadline)
+                phase = 'remeasure'
                 remeasure()
                 job = _Execution(inv, None, stage=stage, launched=True,
                                  source_sha256=source_sha256)
+                phase = 'authority'
                 _authorize(authorize, inputs, inv)
+                phase = 'remeasure'
                 remeasure()
+                phase = 'run'
                 try:
                     process = run_python_phase(command, cwd=stage, deadline=deadline,
                         capture_limit_bytes=GO_PROJECT_DIAGNOSTIC_MAX_BYTES)
                 except BaseException:  # noqa: BLE001 - launcher uncertainty is never retryable
                     raise ProcessCleanupIncomplete('go_project_cleanup_incomplete') from None
                 finally:
+                    failed_phase = phase
+                    phase = 'quiesce'
                     _quiesce(policy, job)
+                    phase = failed_phase
+                phase = 'report'
                 payload = _report(process, inv, inputs, source_sha256)
                 receipt = None
                 if (inputs.business is not None and payload.get('status') == 'incomplete'
                         and payload.get('business_gate') == 'completed'):
+                    phase = 'remeasure'
                     remeasure()
+                    phase = 'receipt'
                     binary = observe_go_project_binary(roots.stage_fd, gid=policy.allowed_gid,
                         service_uid=policy.allowed_uid,
                         maximum=inv.workspace_limit_bytes, deadline=deadline)
                     receipt = _passed_receipt(payload, inputs, inv, source_sha256, binary)
                 else:
+                    phase = 'export'
                     _export_empty(roots.stage_fd, deadline)
+                phase = 'remeasure'
                 remeasure()
+                phase = 'response'
                 response = _response(request, ok=True, result=SkillResult(
                     exit_code=process.exit_code, stdout=process.stdout, stderr=process.stderr,
                     timed_out=False), receipt=receipt)
+                phase = 'authority'
                 _authorize(authorize, inputs, inv)
+            phase = 'remeasure'
             remeasure()
             _native()
             _check(deadline)
+            phase = 'stage_validation'
         return response
-    except ProcessCleanupIncomplete:
+    except ProcessCleanupIncomplete as error:
+        _diagnostic(phase, error, process)
         raise
     except GoProjectBackendError as error:
+        _diagnostic(phase, error, process)
         code = error.code
-    except Exception:  # noqa: BLE001 - finite boundary; never expose source or host exceptions
+    except Exception as error:  # noqa: BLE001 - finite boundary; never expose source or host exceptions
+        _diagnostic(phase, error, process)
         code = 'go_project_execution_unavailable'
     return _response(request, ok=False, error=code)

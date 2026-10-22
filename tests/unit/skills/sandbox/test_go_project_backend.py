@@ -330,6 +330,195 @@ def test_run_rebuilds_then_authorizes_and_remeasures_before_return(flow: Any, pr
     response.require_for(prepared.request)
 
 
+def test_failure_diagnostic_retains_actual_nonzero_process_without_changing_response(
+    api: Any, flow: Any, prepared: Any, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    stderr = '{"go_project_runner_diagnostic":{"stage":"run","exception_type":"KeyError",' \
+        '"identifier":"inventory"}}\n'
+    actual = process('safe compiler output\n', exit_code=1, stderr=stderr,
+                     stderr_observed_bytes=len(stderr.encode()))
+    launch = api.run_python_phase
+
+    def collect(*args: Any, **kwargs: Any) -> Any:
+        launch(*args, **kwargs)
+        return actual
+
+    monkeypatch.setattr(api, 'run_python_phase', collect)
+    response = flow.execute()
+    assert not response.ok and response.error == 'go_project_execution_unavailable'
+    assert response.result is response.receipt is None
+    response.require_for(prepared.request)
+    output = capsys.readouterr()
+    assert output.out == '' and len(output.err.splitlines()) == 1
+    detail = json.loads(output.err)['go_project_diagnostic']
+    assert detail['stage'] == 'report' and detail['exception_type'] == 'GoProjectBackendError'
+    evidence = detail['process']
+    assert evidence['exit_code'] == 1 and evidence['timed_out'] is False
+    assert evidence['stdout'] == actual.stdout and evidence['stderr'] == stderr
+    assert evidence['stdout_observed_bytes'] == actual.stdout_observed_bytes
+    assert evidence['stderr_observed_bytes'] == actual.stderr_observed_bytes
+    assert evidence['stdout_truncated'] is evidence['stderr_truncated'] is False
+    assert flow.events.count('launch') == flow.events.count('quiet') == 1
+    assert flow.events[-1] == 'release'
+
+
+@pytest.mark.parametrize('truncated', [False, True])
+def test_failure_diagnostic_redacts_and_bounds_previews_with_separate_native_counters(
+    api: Any, flow: Any, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str], truncated: bool,
+) -> None:
+    stdout = 'begin\n' + 'x' * 10000 + '\nend\napi_key=private-secret\n'
+    stderr = 'token=private-secret\nuseful failure\n'
+    actual = process(stdout, exit_code=1, stderr=stderr, stdout_truncated=truncated,
+        stdout_observed_bytes=987654 if truncated else len(stdout.encode()),
+        stderr_observed_bytes=len(stderr.encode()))
+    monkeypatch.setattr(api, 'run_python_phase', lambda *a, **k: actual)
+    assert not flow.execute().ok
+    raw = capsys.readouterr().err
+    evidence = json.loads(raw)['go_project_diagnostic']['process']
+    assert 'private-secret' not in raw and len(raw.encode()) < 64 * 1024
+    assert evidence['stdout_observed_bytes'] == actual.stdout_observed_bytes
+    assert evidence['stderr_observed_bytes'] == actual.stderr_observed_bytes
+    assert evidence['stdout_truncated'] is truncated and evidence['stderr_truncated'] is False
+    assert evidence['stderr_metadata']['redacted'] is True
+    assert len(evidence['stdout'].encode()) <= 4096
+    if truncated:
+        assert 'begin' not in evidence['stdout'] and 'end' not in evidence['stdout']
+    else:
+        assert evidence['stdout'].startswith('begin\n') and 'end\n' in evidence['stdout']
+        assert evidence['stdout_metadata']['truncated'] is True
+        assert evidence['stdout_metadata']['redacted'] is True
+
+
+@pytest.mark.parametrize('target,stage', [
+    ('_native', 'native'), ('_disk_budget', 'admission'),
+    ('stage_original_contract', 'baseline'), ('_measured_inputs', 'inputs'),
+    ('_source_snapshot', 'source'), ('_write_plan', 'plan'),
+    ('build_go_project_systemd_command', 'command'), ('_report', 'report'),
+])
+def test_backend_failure_diagnostic_tracks_stage_and_safe_identifier(
+    api: Any, flow: Any, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+    target: str, stage: str,
+) -> None:
+    def fail(*args: Any, **kwargs: Any) -> Any:
+        raise KeyError('inventory')
+
+    monkeypatch.setattr(api, target, fail)
+    assert not flow.execute().ok
+    detail = json.loads(capsys.readouterr().err)['go_project_diagnostic']
+    assert detail['stage'] == stage and detail['exception_type'] == 'KeyError'
+    assert detail['identifier'] == 'inventory'
+    assert ('process' in detail) == (stage == 'report')
+    assert ('quiet' in flow.events) == (stage == 'report')
+
+
+@pytest.mark.parametrize('fault', ['launch', 'quiet', 'nested'])
+@pytest.mark.parametrize('broken', [False, True])
+def test_failure_diagnostic_cannot_mask_cleanup_unknown_or_invent_process(
+    api: Any, flow: Any, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+    fault: str, broken: bool,
+) -> None:
+    flow.fault = fault
+    if fault == 'nested':
+        flow.payload = {'status': 'failed', 'failed_phase': 'test', 'checks': [
+            {'phase': 'test', 'status': 'failed', 'error': 'go_project_cleanup_incomplete'}]}
+
+    class Broken:
+        def write(self, value: str) -> None:
+            raise SystemExit('private stderr failure')
+
+    if broken:
+        monkeypatch.setattr(api, 'sys', SimpleNamespace(stderr=Broken()))
+    with pytest.raises(ProcessCleanupIncomplete, match='go_project_cleanup_incomplete'):
+        flow.execute()
+    raw = capsys.readouterr().err
+    if not broken:
+        detail = json.loads(raw)['go_project_diagnostic']
+        assert detail['stage'] == {'launch': 'run', 'quiet': 'quiesce', 'nested': 'report'}[fault]
+        assert detail['exception_type'] == 'ProcessCleanupIncomplete'
+        assert ('process' in detail) == (fault != 'launch')
+    assert flow.events.count('launch') == flow.events.count('quiet') == 1
+    assert flow.events[-1] == 'release'
+
+
+def test_backend_exception_details_and_stderr_failure_do_not_change_error(
+    api: Any, flow: Any, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    def fail(*args: Any, **kwargs: Any) -> Any:
+        raise AttributeError('/root/private token=private-secret', name='/root/private')
+
+    class Broken:
+        def write(self, value: str) -> None:
+            raise BrokenPipeError('private stderr failure')
+
+    monkeypatch.setattr(api, '_write_plan', fail)
+    response = flow.execute()
+    assert not response.ok and response.error == 'go_project_execution_unavailable'
+    assert json.loads(capsys.readouterr().err) == {'go_project_diagnostic': {
+        'stage': 'plan', 'exception_type': 'AttributeError'}}
+    monkeypatch.setattr(api, 'sys', SimpleNamespace(stderr=Broken()))
+    assert flow.execute() == response
+
+
+@pytest.mark.parametrize('changes', [
+    {'stdout_observed_bytes': 'private-counter'}, {'stderr_truncated': 'private-flag'},
+    {'stdout_observed_bytes': True}, {'stdout_observed_bytes': -1},
+    {'exit_code': 2**1000},
+])
+def test_failure_diagnostic_withholds_malformed_native_metadata(
+    api: Any, flow: Any, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+    changes: dict[str, Any],
+) -> None:
+    actual = process('safe output', exit_code=1)
+    actual = replace(actual, **changes)
+    monkeypatch.setattr(api, 'run_python_phase', lambda *a, **k: actual)
+    assert not flow.execute().ok
+    raw = capsys.readouterr().err
+    detail = json.loads(raw)['go_project_diagnostic']
+    assert detail['stage'] == 'report' and detail['process_withheld'] is True
+    assert 'process' not in detail and 'private' not in raw
+
+
+@pytest.mark.parametrize('exit_code,timed_out', [(None, True), (-9, True), (None, False)])
+def test_failure_diagnostic_keeps_actual_exit_and_timeout_without_inventing_completion(
+    api: Any, flow: Any, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+    exit_code: int | None, timed_out: bool,
+) -> None:
+    actual = process('safe output', exit_code=exit_code, timed_out=timed_out)
+    monkeypatch.setattr(api, 'run_python_phase', lambda *a, **k: actual)
+    assert not flow.execute().ok
+    detail = json.loads(capsys.readouterr().err)['go_project_diagnostic']['process']
+    assert detail['exit_code'] == exit_code and detail['timed_out'] is timed_out
+    assert detail['stdout_observed_bytes'] == len(actual.stdout.encode())
+    if exit_code is None and not timed_out:
+        assert 'stdout' not in detail
+
+
+@pytest.mark.parametrize('prepared', [True], indirect=True)
+def test_nonzero_process_diagnostic_cannot_be_used_as_passed_business_receipt(
+    api: Any, business_flow: Any, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    launch = api.run_python_phase
+
+    def nonzero(*args: Any, **kwargs: Any) -> Any:
+        return replace(launch(*args, **kwargs), exit_code=1)
+
+    class Sink:
+        def write(self, value: str) -> None:
+            assert business_flow.events.count('quiet') == 1
+            sys.stderr.write(value)
+
+    monkeypatch.setattr(api, 'run_python_phase', nonzero)
+    monkeypatch.setattr(api, 'sys', SimpleNamespace(stderr=Sink()))
+    response = business_flow.execute()
+    assert not response.ok and response.result is response.receipt is None
+    assert 'binary' not in business_flow.events
+    detail = json.loads(capsys.readouterr().err)['go_project_diagnostic']
+    assert detail['process']['exit_code'] == 1 and 'receipt' not in detail
+
+
 @pytest.fixture
 def business_flow(api: Any, flow: Any, prepared: Any, monkeypatch: pytest.MonkeyPatch) -> Any:
     receipt = _receipt(prepared.inputs)
