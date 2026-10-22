@@ -1962,7 +1962,9 @@ class RunService:
                 row.routing_decision = routing_decision
         if claimed_record is not None:
             if claimed_record.status is RunStatus.FAILED:
-                await self._safe_record_self_repair_decision_for_record(claimed_record)
+                repair_decision = await self._safe_record_self_repair_decision_for_record(
+                    claimed_record
+                )
                 refreshed = await self._submitted_by_run_id(
                     claimed_record.tenant_id,
                     claimed_record.id,
@@ -1972,6 +1974,14 @@ class RunService:
                 await self._safe_record_empty_response_closure_artifact_for_record(
                     claimed_record
                 )
+                if not _record_has_worker_execution(claimed_record):
+                    auto_repair = await self._safe_auto_accept_self_repair_if_allowed(
+                        tenant_id=claimed_record.tenant_id,
+                        run_id=claimed_record.id,
+                        decision=repair_decision,
+                    )
+                    if auto_repair is not None:
+                        return auto_repair
                 await self._safe_record_hermes_outcome_for_record(claimed_record)
                 await self._safe_notify_terminal_hooks_once_for_record(claimed_record)
                 if not _record_has_worker_execution(claimed_record):
@@ -2644,7 +2654,9 @@ class RunService:
                 type(error).__name__,
             )
 
-    async def _safe_record_self_repair_decision_for_record(self, record: RunRecord) -> None:
+    async def _safe_record_self_repair_decision_for_record(
+        self, record: RunRecord
+    ) -> SelfRepairDecision | None:
         try:
             events = await self._repository.raw_events(record.tenant_id, record.id)
         except Exception as error:
@@ -2667,6 +2679,7 @@ class RunService:
                 run_id=record.id,
                 decision=repair_decision,
             )
+        return repair_decision
 
     async def _safe_record_hermes_outcome_for_record(self, record: RunRecord) -> None:
         if record.status not in {RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED}:

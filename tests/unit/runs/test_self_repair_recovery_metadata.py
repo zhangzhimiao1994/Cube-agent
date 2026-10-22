@@ -325,6 +325,30 @@ def test_manual_review_plugin_and_mcp_failures_do_not_build_retry_plan(
     assert self_repair_recovery_plan_payload(routing_decision) is None
 
 
+@pytest.mark.parametrize("reason", ("plugin.backend_unavailable", "mcp.server_unavailable"))
+@pytest.mark.parametrize("requires_approval", (True, False))
+def test_retryable_runtime_failure_pauses_only_when_approval_is_required(
+    reason: str, requires_approval: bool,
+) -> None:
+    run_id = uuid4()
+    decision = classify_terminal_run(
+        status=RunStatus.FAILED,
+        mode=TaskMode.DISPATCH,
+        routing_decision={"source": "manual"},
+        events=(RunEvent(
+            kind=EventKind.RUNTIME_FAILED, sequence=1, run_id=run_id, reason=reason,
+        ),),
+        policy=SelfRepairPolicy(requires_approval=requires_approval),
+    )
+
+    assert decision is not None
+    proposal = decision.to_proposal(run_id=run_id)
+    assert proposal is not None
+    assert proposal["requires_approval"] is requires_approval
+    assert proposal["automatic_execution"] is (not requires_approval)
+    assert proposal["pauses_run"] is requires_approval
+
+
 def test_policy_without_approval_marks_repair_as_automatic_execution() -> None:
     run_id = uuid4()
     decision = classify_terminal_run(
