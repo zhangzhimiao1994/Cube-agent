@@ -966,6 +966,38 @@ class RunRepository:
                                            'created' if previous is None else 'existing')
         return result
 
+    async def require_go_project_execution(
+        self, tenant_id: UUID, run_id: UUID, *, authority: ToolchainSupplyAuthority,
+        inputs: GoProjectInputs, invocation: GoProjectInvocation,
+    ) -> None:
+        """Service-side locked SQL check only; never return a dispatch permit.
+
+        This is not Root's independent SQL adapter. No reservation or state writes.
+        """
+        from agent_hub.runs.go_project_admission import (
+            EXECUTION_KEY,
+            encoded,
+            go_recipe_marker,
+            go_reservation_state,
+            require_recipe_marker,
+        )
+
+        async with self._session_factory() as session, session.begin():
+            row = await self._locked_toolchain_supply(session, tenant_id, run_id, authority)
+            try:
+                route = row.routing_decision or {}
+                supply = cast(Mapping[str, object], route['toolchain_supply'])
+                marker = go_recipe_marker(inputs,
+                    supply_plan_sha256=cast(str, supply['plan_sha256']))
+                require_recipe_marker(row, marker)
+                state = go_reservation_state(row, invocation)
+                if encoded(route.get(EXECUTION_KEY)) != encoded(state):
+                    raise ValueError
+            except (ValueError, TypeError, RuntimeError, LookupError):
+                raise RunConflict('go_project_recipe_changed') from None
+            await self._require_go_recipe_grant(session, row)
+            authority.require_current(self._record(row), tenant_id, run_id)
+
     async def _revalidate_go_manual_approval(
         self, session: AsyncSession, row: RunRow, *, approval_id: str, fingerprint: str,
         grant: bool,

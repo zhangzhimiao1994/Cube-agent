@@ -494,3 +494,173 @@ async def test_same_token_mode_change_cannot_adopt_existing_intent(db: GoDB, api
         await db.repository.reserve_go_project_execution(db.row.tenant_id, db.row.id,
             authority=db.current_authority(), invocation=original)
     assert db.row.worker_lease_token == token and snapshot(db) == before
+
+
+async def seed_execution(db: GoDB, api: Any) -> GoProjectInvocation:
+    await seed_grant(db, api)
+    request = invocation(db)
+    await db.repository.reserve_go_project_execution(db.row.tenant_id, db.row.id,
+        authority=db.current_authority(), invocation=request)
+    return request
+
+
+@pytest.mark.parametrize('heartbeat', [False, True])
+async def test_require_execution_is_locked_readonly_and_heartbeat_stable(
+    db: GoDB, api: Any, heartbeat: bool,
+) -> None:
+    request = await seed_execution(db, api)
+    authority = db.current_authority()
+    if heartbeat:
+        db.row.worker_lease_expires_at += timedelta(minutes=5)
+        db.row.worker_heartbeat_at = datetime.now(UTC)
+    before = snapshot(db)
+    db.locks.clear()
+    db.reads = 0
+    db.fail_write = True
+    assert await db.repository.require_go_project_execution(db.row.tenant_id, db.row.id,
+        authority=authority, inputs=db.inputs, invocation=request) is None
+    assert db.locks == ['run', 'user', 'approval'] and db.reads == 0
+    assert snapshot(db) == before
+
+
+async def test_require_execution_does_not_create_missing_intent(db: GoDB, api: Any) -> None:
+    await seed_grant(db, api)
+    before = snapshot(db)
+    with pytest.raises(RunConflict, match='go_project_recipe_changed'):
+        await db.repository.require_go_project_execution(db.row.tenant_id, db.row.id,
+            authority=db.current_authority(), inputs=db.inputs, invocation=invocation(db))
+    assert snapshot(db) == before and 'go_project_execution' not in db.row.routing_decision
+
+
+@pytest.mark.parametrize('defect', [
+    'missing_grant', 'revoked_grant', 'disabled', 'role', 'missing_user', 'expired',
+    'wrong_sdk', 'changed_inputs', 'changed_input_sdk', 'candidate', 'invocation',
+    'capture', 'marker', 'legacy_intent', 'intent', 'source',
+])
+async def test_require_execution_rejects_changed_live_binding_without_mutation(
+    db: GoDB, api: Any, defect: str,
+) -> None:
+    request = await seed_execution(db, api)
+    authority = db.current_authority()
+    inputs = db.inputs
+    if defect == 'missing_grant':
+        db.approvals.clear()
+    elif defect == 'revoked_grant':
+        db.approvals[0].status = 'denied'
+    elif defect == 'disabled':
+        db.user.disabled = True
+    elif defect == 'role':
+        db.user.role = 'admin'
+    elif defect == 'missing_user':
+        db.user_missing = True
+    elif defect == 'expired':
+        db.row.worker_lease_expires_at = datetime.now(UTC)
+    elif defect == 'wrong_sdk':
+        request = request.model_copy(update={'toolchain':
+            request.toolchain.model_copy(update={'tree_sha256': '0' * 64})})
+    elif defect == 'changed_inputs':
+        inputs = replace(inputs, file_limit=inputs.file_limit + 1)
+    elif defect == 'changed_input_sdk':
+        inputs = replace(inputs, toolchain=inputs.toolchain.model_copy(update={'tree_sha256': '0' * 64}))
+    elif defect == 'candidate':
+        request = invocation(db, source_kind='candidate')
+    elif defect == 'invocation':
+        request = invocation(db, timeout_seconds=301)
+    elif defect == 'capture':
+        db.row.routing_decision['project_input_preparation']['reference']['file_count'] += 1
+    elif defect == 'marker':
+        db.row.routing_decision['go_project_recipe']['binding']['recipe_sha256'] = '0' * 64
+    elif defect == 'legacy_intent':
+        db.row.routing_decision['go_project_execution'].pop('lease_binding_sha256')
+    elif defect == 'intent':
+        db.row.routing_decision['go_project_execution']['schema_version'] = True
+    else:
+        payload = request.model_dump(mode='json')
+        payload['scope']['source_sha256'] = 'f' * 64
+        payload['original_reference']['input_source_sha256'] = 'f' * 64
+        request = GoProjectInvocation.model_validate_json(json.dumps(payload), strict=True)
+    before = snapshot(db)
+    db.fail_write = True
+    with pytest.raises(RunConflict):
+        await db.repository.require_go_project_execution(db.row.tenant_id, db.row.id,
+            authority=authority, inputs=inputs, invocation=request)
+    assert snapshot(db) == before
+
+
+@pytest.mark.parametrize('change', ['takeover', 'worker', 'token', 'request', 'mode'])
+@pytest.mark.parametrize('fresh_authority', [False, True])
+async def test_require_execution_cannot_adopt_another_creator_lease(
+    db: GoDB, api: Any, change: str, fresh_authority: bool,
+) -> None:
+    request = await seed_execution(db, api)
+    authority = db.current_authority()
+    if change == 'takeover':
+        db.takeover()
+    elif change == 'worker':
+        db.row.worker_id = 'another-worker'
+    elif change == 'token':
+        db.row.worker_lease_token = uuid4()
+    elif change == 'request':
+        db.row.request = 'another request'
+    else:
+        db.row.mode = TaskMode.DIRECT
+    if fresh_authority:
+        authority = db.current_authority()
+    before = snapshot(db)
+    with pytest.raises(RunConflict):
+        await db.repository.require_go_project_execution(db.row.tenant_id, db.row.id,
+            authority=authority, inputs=db.inputs, invocation=request)
+    assert snapshot(db) == before
+
+
+async def test_require_execution_rejects_rebound_marker_even_with_matching_grant_and_intent(
+    db: GoDB, api: Any,
+) -> None:
+    await seed_execution(db, api)
+    original_inputs = db.inputs
+    db.inputs = replace(db.inputs, file_limit=db.inputs.file_limit + 1)
+    request = invocation(db)
+    marker = api.go_recipe_marker(db.inputs,
+        supply_plan_sha256=db.row.routing_decision['toolchain_supply']['plan_sha256'])
+    db.row.routing_decision['go_project_recipe'] = marker
+    db.row.routing_decision['go_project_execution'] = api.go_reservation_state(db.row, request)
+    db.approvals[0].payload = {**db.approvals[0].payload,
+        'approval_scope': capability_approval_scope(api.go_recipe_binding(db.row)),
+        'go_recipe_binding': deepcopy(marker)}
+    before = snapshot(db)
+    with pytest.raises(RunConflict, match='go_project_recipe_changed'):
+        await db.repository.require_go_project_execution(db.row.tenant_id, db.row.id,
+            authority=db.current_authority(), inputs=original_inputs, invocation=request)
+    assert snapshot(db) == before
+
+
+async def test_require_execution_reads_current_authority_after_waiting_for_run_lock(
+    db: GoDB, api: Any,
+) -> None:
+    request = await seed_execution(db, api)
+    authority = db.current_authority()
+    expected: list[tuple[object, ...]] = []
+
+    def takeover(live: GoDB) -> None:
+        live.takeover()
+        expected.append(snapshot(live))
+
+    db.before_lock = takeover
+    with pytest.raises(RunConflict):
+        await db.repository.require_go_project_execution(db.row.tenant_id, db.row.id,
+            authority=authority, inputs=db.inputs, invocation=request)
+    assert expected == [snapshot(db)]
+
+
+async def test_require_execution_rechecks_authority_after_approval_lock(db: GoDB, api: Any) -> None:
+    request = await seed_execution(db, api)
+    before = snapshot(db)
+
+    def expire(session: Session) -> None:
+        session.row.worker_lease_expires_at = datetime.now(UTC)
+
+    db.during_approval_lock = expire
+    with pytest.raises(RunConflict):
+        await db.repository.require_go_project_execution(db.row.tenant_id, db.row.id,
+            authority=db.current_authority(), inputs=db.inputs, invocation=request)
+    assert snapshot(db) == before
