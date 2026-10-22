@@ -555,6 +555,21 @@ describe("conversation ordering", () => {
     expect(messages[1].artifact?.filename).toBe("project.zip");
   });
 
+  it("keeps automatic recovery noise out of an active conversation but preserves the final result", () => {
+    const recovering: RunDetail = { ...baseRun, status: "running", artifacts: [
+      { id: "partial", kind: "text", title: "main", text: "上次失败的中间输出" },
+    ], events: [{ sequence: 8, kind: "repair.started", message: "repair.started", created_at:"2026-10-22T00:00:00Z", participants: [],
+      payload: { automatic_execution: true, requires_approval: false } }] };
+    expect(conversationMessages([recovering]).map(item => item.title)).toEqual(["你"]);
+    expect(conversationMessages([{...recovering, status:"waiting_approval"}]).map(item=>item.title)).toContain("回复");
+    expect(conversationMessages([{...recovering, events:recovering.events.map(event=>({...event,
+      payload:{automatic_execution:true,requires_approval:true}}))}]).map(item=>item.title)).toContain("回复");
+    const complete: RunDetail = { ...recovering, status: "completed", artifacts: [
+      { id: "final", kind: "text", title: "main", text: "构建验证完成，这是最终结果。" },
+    ] };
+    expect(conversationMessages([complete]).at(-1)?.body).toBe("构建验证完成，这是最终结果。");
+  });
+
   it("builds compact jump checkpoints from user questions", () => {
     const runs: RunDetail[] = [
       {
