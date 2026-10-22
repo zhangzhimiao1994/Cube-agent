@@ -1,16 +1,19 @@
 import { readFileSync } from "node:fs";
 
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor, within } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import userEvent from "@testing-library/user-event";
 import { useState } from "react";
+import { MemoryRouter, useNavigate } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { api, WebPreviewSchema, type ProjectWorkspace, type RunDetail } from "../api/client";
+import { api, WebPreviewSchema, type Conversation, type ProjectWorkspace, type RunDetail } from "../api/client";
 import {
   agentInlineSummary,
   ConversationCheckpointNav,
   ConversationManagerTabs,
   ProjectOverview,
+  RunsPage,
   conversationProjectOptions,
   sortProjectOverview,
   type ProjectSort,
@@ -196,6 +199,183 @@ describe("conversation manager views", () => {
     expect(screen.getByRole("tab", { name: "已归档 2" }).getAttribute("aria-selected")).toBe(
       "true",
     );
+  });
+});
+
+describe("conversation action menu", () => {
+  const clients: QueryClient[] = [];
+
+  afterEach(() => {
+    cleanup();
+    clients.splice(0).forEach((client) => client.clear());
+    vi.restoreAllMocks();
+  });
+
+  function renderMenuPage() {
+    const conversations: Conversation[] = ["alpha", "beta"].map((name) => ({
+      conversation_id: `conv-menu-${name}`,
+      title: `Menu ${name}`,
+      project_id: "menu-project",
+      project_label: "Menu project",
+      workspace_path: `conv-menu-${name}`,
+      archived_at: null,
+      created_at: "2026-10-22T00:00:00Z",
+      updated_at: "2026-10-22T00:00:00Z",
+      runs: [],
+    }));
+    const client = new QueryClient({
+      defaultOptions: { queries: { enabled: false, retry: false, staleTime: Infinity } },
+    });
+    clients.push(client);
+    client.setQueryData(["runs"], []);
+    client.setQueryData(["conversations", false], conversations);
+    client.setQueryData(["conversations", true], []);
+    client.setQueryData(["project-workspaces"], []);
+    conversations.forEach((conversation) => {
+      client.setQueryData(["conversation", conversation.conversation_id], conversation);
+      client.setQueryData(["conversation-queue", conversation.conversation_id], []);
+      client.setQueryData(["workspace-files", "menu-project", conversation.workspace_path], {
+        items: [], bundle_download_url: "",
+      });
+    });
+    vi.spyOn(api, "conversation").mockImplementation(async (id) => {
+      const conversation = conversations.find((item) => item.conversation_id === id);
+      if (!conversation) throw new Error(`Unexpected conversation ${id}`);
+      return conversation;
+    });
+    vi.spyOn(api, "conversationQueue").mockResolvedValue([]);
+    vi.spyOn(api, "workspaceFiles").mockResolvedValue({ items: [], bundle_download_url: "" });
+    const update = vi.spyOn(api, "updateConversation").mockImplementation(async (id, patch) => {
+      const conversation = conversations.find((item) => item.conversation_id === id)!;
+      Object.assign(conversation, {
+        ...(patch.title !== undefined ? { title: patch.title } : {}),
+        ...(patch.archived !== undefined ? { archived_at: patch.archived ? "2026-10-22T01:00:00Z" : null } : {}),
+      });
+      return { ...conversation };
+    });
+    let navigate!: ReturnType<typeof useNavigate>;
+    function MenuTestPage() {
+      navigate = useNavigate();
+      return <RunsPage />;
+    }
+    render(
+      <QueryClientProvider client={client}>
+        <MemoryRouter initialEntries={["/?conversation=conv-menu-alpha"]}><MenuTestPage /></MemoryRouter>
+      </QueryClientProvider>,
+    );
+    return { navigate: (to: string) => navigate(to), update };
+  }
+
+  it("dismisses outside pointer clicks without stealing their focus", async () => {
+    const user = userEvent.setup();
+    renderMenuPage();
+    const trigger = screen.getByRole("button", { name: "会话操作" });
+    await user.click(trigger);
+    await user.click(screen.getByRole("menu"));
+    expect(screen.queryByRole("menu")).not.toBeNull();
+    const composer = screen.getByPlaceholderText(/输入消息/);
+    await user.click(composer);
+    expect(screen.queryByRole("menu")).toBeNull();
+    expect(document.activeElement).toBe(composer);
+    expect(trigger.getAttribute("aria-expanded")).toBe("false");
+  });
+
+  it("closes on Escape and returns focus to the trigger", async () => {
+    const user = userEvent.setup();
+    renderMenuPage();
+    const trigger = screen.getByRole("button", { name: "会话操作" });
+    await user.click(trigger);
+    screen.getByRole("menuitem", { name: "重命名" }).focus();
+    await user.keyboard("{Escape}");
+    expect(screen.queryByRole("menu")).toBeNull();
+    expect(document.activeElement).toBe(trigger);
+  });
+
+  it.each([
+    ["{Enter}", "重命名"], [" ", "重命名"],
+    ["{ArrowDown}", "重命名"], ["{ArrowUp}", "归档"],
+  ])("opens with %s and focuses %s", async (key, name) => {
+    const user = userEvent.setup();
+    renderMenuPage();
+    const trigger = screen.getByRole("button", { name: "会话操作" });
+    expect(trigger.getAttribute("title")).toBe("会话操作：重命名、归档");
+    expect(trigger.getAttribute("aria-haspopup")).toBe("menu");
+    trigger.focus();
+    await user.keyboard(key);
+    expect(document.activeElement).toBe(screen.getByRole("menuitem", { name }));
+  });
+
+  it("navigates with wrapping arrows and Home/End without invoking actions", async () => {
+    const user = userEvent.setup();
+    const { update } = renderMenuPage();
+    await user.click(screen.getByRole("button", { name: "会话操作" }));
+    const rename = screen.getByRole("menuitem", { name: "重命名" });
+    const archive = screen.getByRole("menuitem", { name: "归档" });
+    rename.focus();
+    for (const [key, target] of [
+      ["{ArrowDown}", archive], ["{ArrowDown}", rename],
+      ["{ArrowUp}", archive], ["{Home}", rename], ["{End}", archive],
+    ] as const) {
+      await user.keyboard(key);
+      expect(document.activeElement).toBe(target);
+    }
+    expect(update).not.toHaveBeenCalled();
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
+  it.each([false, true])("dismisses on Tab (shift=%s) without trapping focus", async (shift) => {
+    const user = userEvent.setup();
+    renderMenuPage();
+    const trigger = screen.getByRole("button", { name: "会话操作" });
+    await user.click(trigger);
+    screen.getByRole("menuitem", { name: "重命名" }).focus();
+    await user.tab({ shift });
+    expect(screen.queryByRole("menu")).toBeNull();
+    expect(document.activeElement).toBe(shift ? trigger : screen.getByPlaceholderText(/输入消息/));
+  });
+
+  it("resets on conversation navigation without pulling focus from the composer", async () => {
+    const user = userEvent.setup();
+    const { navigate } = renderMenuPage();
+    await user.click(screen.getByRole("button", { name: "会话操作" }));
+    const composer = screen.getByPlaceholderText(/输入消息/);
+    composer.focus();
+    await act(async () => { await navigate("/?conversation=conv-menu-beta"); });
+    expect(screen.getByText("会话：Menu beta")).not.toBeNull();
+    expect(screen.queryByRole("menu")).toBeNull();
+    expect(document.activeElement).toBe(composer);
+  });
+
+  it("returns from the rename dialog to the trigger instead of its removed menu item", async () => {
+    const user = userEvent.setup();
+    renderMenuPage();
+    const trigger = screen.getByRole("button", { name: "会话操作" });
+    await user.click(trigger);
+    screen.getByRole("menuitem", { name: "重命名" }).focus();
+    await user.keyboard("{Enter}");
+    expect(screen.queryByRole("menu")).toBeNull();
+    const dialog = screen.getByRole("dialog", { name: "重命名会话" });
+    await waitFor(() => expect(dialog.contains(document.activeElement)).toBe(true));
+    await user.keyboard("{Escape}");
+    await waitFor(() => expect(document.activeElement).toBe(trigger));
+  });
+
+  it("preserves archive/restore actions and restores focus after success", async () => {
+    const user = userEvent.setup();
+    const { update } = renderMenuPage();
+    const trigger = screen.getByRole("button", { name: "会话操作" });
+    await user.click(trigger);
+    await user.click(screen.getByRole("menuitem", { name: "归档" }));
+    await waitFor(() => expect(screen.queryByRole("menu")).toBeNull());
+    expect(update).toHaveBeenCalledWith("conv-menu-alpha", { archived: true });
+    expect(document.activeElement).toBe(trigger);
+    expect(trigger.getAttribute("title")).toBe("会话操作：重命名、恢复");
+    await user.click(trigger);
+    await user.click(screen.getByRole("menuitem", { name: "恢复" }));
+    await waitFor(() => expect(screen.queryByRole("menu")).toBeNull());
+    expect(update).toHaveBeenLastCalledWith("conv-menu-alpha", { archived: false });
+    expect(document.activeElement).toBe(trigger);
+    expect(trigger.getAttribute("title")).toBe("会话操作：重命名、归档");
   });
 });
 
@@ -905,7 +1085,7 @@ describe("MessageBody", () => {
 
     await userEvent.click(screen.getByRole("button", { name: "复制全文" }));
     await waitFor(() => expect(writeText).toHaveBeenCalledWith(longText));
-    expect(screen.getByRole("button", { name: "已复制" })).not.toBeNull();
+    expect(screen.getByRole("button", { name: "已复制全文" })).not.toBeNull();
 
     await userEvent.click(screen.getByRole("button", { name: "展开全文" }));
     expect(screen.getByText(/line-22: long architecture detail/)).not.toBeNull();

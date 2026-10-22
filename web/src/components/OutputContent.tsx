@@ -144,8 +144,9 @@ function MessageParagraph({ text, children }: { text: string; children?: ReactNo
               {expanded ? "收起" : "展开全文"}
             </button>
           ) : null}
-          <button type="button" className="message-expand-button" onClick={() => { void copy(); }}>
-            {copied ? "已复制" : "复制全文"}
+          <button type="button" className="message-copy-button" aria-label={copied ? "已复制全文" : "复制全文"}
+            title={copied ? "已复制" : "复制全文"} onClick={() => { void copy(); }}>
+            {copied ? <Check size={16} aria-hidden="true" /> : <Copy size={16} aria-hidden="true" />}
           </button>
           {failed ? <span role="status">复制失败</span> : null}
         </div>
