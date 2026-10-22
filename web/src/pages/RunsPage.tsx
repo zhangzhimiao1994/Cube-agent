@@ -3,6 +3,7 @@ import { Fragment, FormEvent, type ReactNode, useEffect, useMemo, useRef, useSta
 import { createPortal } from "react-dom";
 import { Link, useLocation, useNavigate } from "react-router-dom";
 import { z } from "zod";
+import { ArrowUp, FolderClock, MoreHorizontal, Paperclip, Plus } from "lucide-react";
 
 import { ApiError, api, formatApiError, type AttachmentUpload, type Conversation, type ConversationMetadata, type ConversationQueueItem, type ModelDeployment, type ProjectWorkspace, type RunDetail, type RunListItem, type Skill, type SkillArchiveUpload, type SubmittedRun, type WebPreview, type WorkspaceDirectoryList, type WorkspaceFileList } from "../api/client";
 import { APP_BRAND_NAME } from "../app/brand";
@@ -2567,8 +2568,16 @@ function TemporaryAgentApprovalMessage({ proposal }: { proposal: TemporaryAgentP
   );
 }
 
+function automaticRepairInProgress(detail: RunDetail): boolean {
+  if (!["queued", "running", "waiting_capacity"].includes(detail.status)) return false;
+  const latest = detail.events.filter(event => ["repair.started", "repair.completed", "repair.failed"].includes(event.kind)).at(-1);
+  return latest?.kind === "repair.started" && latest.payload.automatic_execution === true
+    && latest.payload.requires_approval === false;
+}
+
 function detailMessages(detail: RunDetail | undefined): ChatMessage[] {
   if (!detail) return [];
+  if (automaticRepairInProgress(detail)) return [{ id: "request", role: "user", title: "你", body: detail.request }];
   const textArtifacts = dedupeTextArtifacts(detail.artifacts);
   const replyArtifact = preferredReplyArtifact(textArtifacts);
   const internalNotice = internalArtifactNotice(detail);
@@ -8473,13 +8482,7 @@ export function RunsPage() {
   }
 
   return (
-    <section>
-      <p className="eyebrow">Conversation</p>
-      <h2>对话</h2>
-      <p className="compact-page-intro">
-        连续对话窗口，可承接多轮任务、上下文压缩和历史会话。
-      </p>
-
+    <section className="conversation-workspace">
       <button
         type="button"
         className="mobile-nav-trigger conversation-drawer-trigger"
@@ -8494,11 +8497,7 @@ export function RunsPage() {
           setHistoryOpen(next);
         }}
       >
-        <span className="mobile-nav-trigger-icon" aria-hidden="true">
-          <span />
-          <span />
-          <span />
-        </span>
+        <FolderClock size={18} aria-hidden="true" />
       </button>
 
       <div className={`chat-console${historyOpen ? " history-drawer-open" : ""}`}>
@@ -9038,7 +9037,7 @@ export function RunsPage() {
                     disabled={!currentConversationPersisted}
                     onClick={() => setConversationMenuOpen((current) => !current)}
                   >
-                    ⋯
+                    <MoreHorizontal size={18} aria-hidden="true" />
                   </button>
                   {conversationMenuOpen ? (
                     <div className="conversation-menu" role="menu">
@@ -9167,12 +9166,12 @@ export function RunsPage() {
                 </article>
                 {item.id.endsWith("-request") && item.run ? (
                   <>
-                    <RunInteractionSummaryInline
+                    {automaticRepairInProgress(item.run) ? null : <RunInteractionSummaryInline
                       run={item.run}
                       agentNames={agentNameMap}
                       mainAgentModelName={mainAgentModelName}
                       onPreviewFile={setConversationPreviewFile}
-                    />
+                    />}
                     <RunProcessSummary
                       detail={item.run}
                       onOpen={setProcessDetailTarget}
@@ -9642,6 +9641,7 @@ export function RunsPage() {
             <div className="composer-actions">
               <div className={`composer-tool-row${handoffActive ? " composer-tool-row-reference" : ""}`} aria-label="消息工具">
                 <label className="composer-upload-button">
+                  <Paperclip size={17} aria-hidden="true" />
                   <span>附件</span>
                   <input
                     aria-label="上传文件或 Skill 压缩包"
@@ -9673,7 +9673,7 @@ export function RunsPage() {
                   aria-pressed={configOpen}
                   onClick={() => setConfigOpen((current) => !current)}
                 >
-                  +
+                  <Plus size={18} aria-hidden="true" />
                 </button>
               </div>
               <div className="composer-status-line" role="status">
@@ -9714,6 +9714,7 @@ export function RunsPage() {
                         : "发送消息")
                   }
                 >
+                  <span className="composer-submit-label">
                   {queueMessage.isPending
                     ? "排队中..."
                     : createRun.isPending
@@ -9723,6 +9724,8 @@ export function RunsPage() {
                         : canStopLatestRun
                           ? "排队"
                           : "发送"}
+                  </span>
+                  <ArrowUp size={19} aria-hidden="true" />
                 </button>
               </div>
             </div>
