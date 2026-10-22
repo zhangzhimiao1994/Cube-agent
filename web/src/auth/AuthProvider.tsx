@@ -4,6 +4,7 @@ import {
   useContext,
   useEffect,
   useMemo,
+  useRef,
   useState,
 } from "react";
 import { Navigate, useLocation } from "react-router-dom";
@@ -24,38 +25,49 @@ const AuthContext = createContext<AuthState | null>(null);
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<CurrentUser | null>(null);
   const [loading, setLoading] = useState(true);
+  const identityVersion = useRef(0);
 
   useEffect(() => {
     let active = true;
+    const version = identityVersion.current;
     api
       .me()
       .then((current) => {
-        if (active) setUser(current);
+        if (active && version === identityVersion.current) setUser(current);
       })
       .catch(() => {
-        if (active) setUser(null);
+        if (active && version === identityVersion.current) setUser(null);
       })
       .finally(() => {
-        if (active) setLoading(false);
+        if (active && version === identityVersion.current) setLoading(false);
       });
     return () => {
       active = false;
     };
   }, []);
 
+  async function changeIdentity(action: () => Promise<CurrentUser | null>) {
+    const version = ++identityVersion.current;
+    try {
+      const current = await action();
+      if (version === identityVersion.current) setUser(current);
+    } finally {
+      if (version === identityVersion.current) setLoading(false);
+    }
+  }
+
   const value = useMemo<AuthState>(
     () => ({
       user,
       loading,
       async login(username, password) {
-        setUser(await api.login(username, password));
+        await changeIdentity(() => api.login(username, password));
       },
       async setup(code, username, password) {
-        setUser(await api.setup(code, username, password));
+        await changeIdentity(() => api.setup(code, username, password));
       },
       async logout() {
-        await api.logout();
-        setUser(null);
+        await changeIdentity(async () => { await api.logout(); return null; });
       },
       hasPermission(permission) {
         if (user === null) return false;
