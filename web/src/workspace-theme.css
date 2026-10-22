@@ -184,6 +184,7 @@ body:not(:has(.conversation-workspace)) :is(.nav-drawer-link:hover, .nav-tertiar
 
 body:not(:has(.conversation-workspace)) .workspace { min-width: 0; padding: 0; }
 body:not(:has(.conversation-workspace)) .topbar {
+  display: none;
   border-bottom: 1px solid var(--line);
   margin: 0;
   max-width: none;

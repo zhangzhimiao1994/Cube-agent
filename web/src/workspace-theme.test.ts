@@ -36,6 +36,11 @@ afterEach(() => {
 });
 
 describe("shared workspace theme", () => {
+  it("avoids repeating the brand and account header above a management page", () => {
+    mount('<div class="app-shell"><header class="topbar"><h2>Brand</h2><div class="user-chip">Account</div></header><main class="page-surface"><h2>Settings</h2></main></div>');
+    expect(styles('.topbar').display).toBe('none');
+    expect(styles('.page-surface').display).not.toBe('none');
+  });
   it("uses the conversation palette on management pages", () => {
     mount('<main class="page-surface"><h2>Settings</h2></main>');
     const root = getComputedStyle(document.documentElement);
