@@ -68,6 +68,19 @@ describe("AppShell presentation", () => {
     vi.unstubAllGlobals();
   });
 
+  it("uses the same navigation icons on conversation and configuration pages", async () => {
+    render(<TestApp initialPath="/system" />);
+    const navigation = await screen.findByRole("navigation", { name: "Main navigation" });
+    const links = within(navigation).getAllByRole("link");
+    expect(links).toHaveLength(6);
+    for (const link of links) {
+      const icon = link.querySelector('svg');
+      expect(icon).not.toBeNull();
+      expect(icon?.getAttribute('width')).toBe('18');
+      expect(icon?.getAttribute('aria-hidden')).toBe('true');
+    }
+  });
+
   it("renders the operations shell without global capability cards above every page", async () => {
     render(<TestApp initialPath="/" />);
 

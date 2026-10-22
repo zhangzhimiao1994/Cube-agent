@@ -1,0 +1,513 @@
+/* Management surfaces share the conversation palette without changing the conversation. */
+:root:not(:has(.conversation-workspace)) {
+  color-scheme: light;
+  color: #1f2329;
+  background: #fff;
+  --bg: #fff;
+  --bg-2: #f5f6f8;
+  --ink: #1f2329;
+  --text: #1f2329;
+  --muted: #646b78;
+  --line: #dfe3e8;
+  --line-strong: #b7c0cc;
+  --panel: #fff;
+  --panel-strong: #f5f6f8;
+  --panel-dark: #f5f6f8;
+  --accent: #087f8c;
+  --accent-2: #157347;
+  --accent-3: #5f4b8b;
+  --accent-dark: #076b76;
+  --danger: #b42336;
+  --good: #157347;
+  --success: #157347;
+  --warning: #8c5d12;
+  --shadow: 0 8px 32px #1f232912;
+  --glow: none;
+  --workspace-selected: #e2eff0;
+  --workspace-success-bg: #edf7f1;
+  --workspace-warning-bg: #fff7e6;
+  --workspace-danger-bg: #fff1f2;
+  --workspace-info-bg: #edf7f6;
+}
+
+body:not(:has(.conversation-workspace)) {
+  background: var(--bg);
+  color: var(--ink);
+  line-height: 1.6;
+}
+
+body:not(:has(.conversation-workspace))::before,
+body:not(:has(.conversation-workspace))::after {
+  display: none;
+}
+
+body:not(:has(.conversation-workspace)) :is(h1, h2, h3, h4, h5, legend, th, label, .eyebrow, .module-entry-number) {
+  letter-spacing: 0;
+  text-shadow: none;
+  font-weight: 600;
+}
+
+body:not(:has(.conversation-workspace)) :is(section > h2:first-child, .page-surface > section > h2) {
+  font-size: 22px;
+  line-height: 1.4;
+  margin: 0 0 16px;
+}
+
+body:not(:has(.conversation-workspace)) :is(h3, .module-entry-card strong) {
+  font-size: 16px;
+  line-height: 1.5;
+}
+
+body:not(:has(.conversation-workspace)) :is(.eyebrow, legend) {
+  color: var(--muted);
+  font-size: 12px;
+  text-transform: none;
+}
+
+body:not(:has(.conversation-workspace)) :is(.field-help, .field-hint, .list-toolbar small) {
+  color: var(--muted);
+  font-weight: 400;
+}
+
+/* Only the sidebar is viewport-bound. Forms and tables remain in normal document flow. */
+body:not(:has(.conversation-workspace)) .app-shell {
+  --desktop-nav-column: 208px;
+  background: var(--bg);
+  grid-template-columns: var(--desktop-nav-column) minmax(0, 1fr);
+}
+
+body:not(:has(.conversation-workspace)) .sidebar {
+  background: var(--bg-2);
+  border-right: 1px solid var(--line);
+  height: 100dvh;
+  padding: 0;
+  position: sticky;
+  top: 0;
+}
+
+body:not(:has(.conversation-workspace)) .floating-nav-panel {
+  display: block;
+  height: 100%;
+}
+
+body:not(:has(.conversation-workspace)) .floating-nav-rail {
+  background: var(--bg-2);
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+  gap: 28px;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  height: 100%;
+  max-height: none;
+  min-height: 0;
+  padding: 20px 12px;
+}
+
+body:not(:has(.conversation-workspace)) .brand-card {
+  align-items: center;
+  background: none;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+  display: flex;
+  gap: 10px;
+  padding: 0 8px;
+}
+
+body:not(:has(.conversation-workspace)) .brand-card img {
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+  height: 32px;
+  width: 32px;
+  object-fit: contain;
+}
+
+body:not(:has(.conversation-workspace)) .brand-card .eyebrow {
+  color: var(--ink);
+  font-size: 15px;
+  font-weight: 650;
+}
+
+body:not(:has(.conversation-workspace)) .brand-card h1 { display: none; }
+body:not(:has(.conversation-workspace)) .nav-list { gap: 5px; }
+
+body:not(:has(.conversation-workspace)) .nav-link {
+  border: 0;
+  border-radius: 6px;
+  color: #535d6a;
+  font-size: 14px;
+  font-weight: 500;
+  gap: 12px;
+  justify-content: start;
+  min-height: 42px;
+  padding: 10px 14px;
+  transform: none;
+}
+
+body:not(:has(.conversation-workspace)) .nav-link > svg { flex: 0 0 18px; }
+body:not(:has(.conversation-workspace)) .nav-link:hover { background: #e9edf1; transform: none; }
+body:not(:has(.conversation-workspace)) .nav-link-active { background: var(--workspace-selected); color: #086d77; }
+
+body:not(:has(.conversation-workspace)) .nav-session {
+  border-color: var(--line);
+  gap: 10px;
+  padding: 14px 6px 0;
+}
+
+body:not(:has(.conversation-workspace)) .nav-session span { color: #535d6a; font-size: 13px; font-weight: 500; }
+body:not(:has(.conversation-workspace)) .nav-drawer {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  box-shadow: var(--shadow);
+  display: none;
+  left: 190px;
+  margin: 0;
+  min-width: 240px;
+  position: absolute;
+  top: 76px;
+  width: 280px;
+  z-index: 2;
+}
+
+body:not(:has(.conversation-workspace)) :is(.nav-drawer-link, .nav-tertiary-links a) {
+  background: var(--bg-2);
+  border-color: var(--line);
+  border-radius: 6px;
+  box-shadow: none;
+  color: var(--ink);
+}
+
+body:not(:has(.conversation-workspace)) :is(.nav-drawer-link span, .nav-drawer p) { color: var(--muted); }
+body:not(:has(.conversation-workspace)) :is(.nav-drawer-title, .nav-drawer-link strong) { letter-spacing: 0; font-weight: 600; }
+body:not(:has(.conversation-workspace)) :is(.nav-drawer-link:hover, .nav-tertiary-links a:hover) { background: var(--workspace-selected); border-color: var(--line-strong); }
+
+body:not(:has(.conversation-workspace)) .workspace { min-width: 0; padding: 0; }
+body:not(:has(.conversation-workspace)) .topbar {
+  display: none;
+  border-bottom: 1px solid var(--line);
+  margin: 0;
+  max-width: none;
+  padding: 16px 24px;
+}
+
+body:not(:has(.conversation-workspace)) .topbar h2 { font-size: 20px; line-height: 1.4; margin: 0; }
+body:not(:has(.conversation-workspace)) .topbar .eyebrow { margin: 0 0 2px; }
+body:not(:has(.conversation-workspace)) .user-chip {
+  background: var(--bg-2);
+  border-color: var(--line);
+  border-radius: 6px;
+  box-shadow: none;
+  font-size: 13px;
+  padding: 6px 10px;
+  overflow-wrap: anywhere;
+}
+
+body:not(:has(.conversation-workspace)) .page-surface {
+  background: var(--panel);
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+  height: auto;
+  margin: 0;
+  max-width: none;
+  min-height: 0;
+  min-width: 0;
+  overflow: visible;
+  padding: 24px;
+}
+
+body:not(:has(.conversation-workspace)) .page-surface > section { animation: none; }
+body:not(:has(.conversation-workspace)) .page-surface :is(section, article, form, .two-column, .form-grid, .table-shell) { min-width: 0; max-width: 100%; }
+body:not(:has(.conversation-workspace)) article {
+  background: transparent;
+  background-image: none;
+  border: 0;
+  border-bottom: 1px solid var(--line);
+  border-radius: 0;
+  box-shadow: none;
+  overflow: visible;
+  padding: 20px 0;
+}
+
+body:not(:has(.conversation-workspace)) article::before,
+body:not(:has(.conversation-workspace)) .module-hub::before { display: none; }
+body:not(:has(.conversation-workspace)) article:hover { border-color: var(--line); box-shadow: none; transform: none; }
+
+/* Compact controls, with the existing code reader toolbar explicitly excluded. */
+body:not(:has(.conversation-workspace)) button:where(:not(.code-tool-button)) {
+  background: var(--accent);
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  box-shadow: none;
+  color: #fff;
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: 0;
+  min-height: 36px;
+  padding: 8px 12px;
+  transform: none;
+  transition: background 120ms ease, border-color 120ms ease;
+}
+
+body:not(:has(.conversation-workspace)) button:where(:not(.code-tool-button)):hover {
+  background: var(--accent-dark);
+  border-color: var(--accent-dark);
+  box-shadow: none;
+  transform: none;
+}
+
+body:not(:has(.conversation-workspace)) button:where(:not(.code-tool-button)):disabled { cursor: not-allowed; opacity: 0.5; transform: none; }
+body:not(:has(.conversation-workspace)) :is(.secondary-action, .button-link, .link-actions a, .channel-option, .nav-session button, .plugin-handover-close) {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  box-shadow: none;
+  color: #535d6a;
+  font-weight: 500;
+  text-shadow: none;
+}
+
+body:not(:has(.conversation-workspace)) :is(.secondary-action, .button-link, .link-actions a, .channel-option, .nav-session button, .plugin-handover-close):hover {
+  background: var(--bg-2);
+  border-color: var(--line-strong);
+  box-shadow: none;
+  color: var(--ink);
+}
+
+body:not(:has(.conversation-workspace)) :is(.danger-button, .danger-action) { background: var(--danger); border-color: var(--danger); color: #fff; }
+body:not(:has(.conversation-workspace)) :is(.danger-button, .danger-action):hover { background: #951c2c; border-color: #951c2c; color: #fff; }
+body:not(:has(.conversation-workspace)) :is(.table-sort-button, .inline-link, .nav-session button) {
+  background: transparent;
+  border: 0;
+  box-shadow: none;
+  color: var(--accent);
+  min-height: 28px;
+  padding: 2px 4px;
+}
+
+body:not(:has(.conversation-workspace)) :is(.table-sort-button, .inline-link):hover { background: var(--workspace-info-bg); box-shadow: none; transform: none; }
+body:not(:has(.conversation-workspace)) :is(.table-sort-button, .event-log-list strong) { color: var(--accent-dark); }
+body:not(:has(.conversation-workspace)) :is(input, select, textarea) {
+  background: var(--panel);
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  box-shadow: none;
+  color: var(--ink);
+  font-size: 14px;
+  font-weight: 400;
+  min-height: 38px;
+  padding: 9px 12px;
+}
+
+body:not(:has(.conversation-workspace)) :is(input, textarea)::placeholder { color: #7b8491; }
+body:not(:has(.conversation-workspace)) :is(input, select, textarea):focus {
+  background: var(--panel);
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px #087f8c12;
+}
+
+body:not(:has(.conversation-workspace)) :is(input, select, textarea, a, button:where(:not(.code-tool-button))):focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+body:not(:has(.conversation-workspace)) :is(input, select, textarea):disabled { background: var(--bg-2); color: var(--muted); }
+body:not(:has(.conversation-workspace)) :is(input[type="checkbox"], input[type="radio"]) {
+  accent-color: var(--accent);
+  appearance: auto;
+  background: var(--panel);
+  border-color: var(--line-strong);
+  border-radius: 3px;
+  box-shadow: none;
+  height: 16px;
+  min-height: 16px;
+  padding: 0;
+  width: 16px;
+}
+
+body:not(:has(.conversation-workspace)) :is(input[type="checkbox"], input[type="radio"])::after { display: none; }
+body:not(:has(.conversation-workspace)) fieldset { background: var(--bg-2); border-color: var(--line); border-radius: 6px; }
+
+/* Allow wide data to scroll within its table, rather than compressing CJK columns. */
+body:not(:has(.conversation-workspace)) .table-shell { border-color: var(--line); border-radius: 6px; contain: inline-size; max-width: 100%; min-width: 0; overflow-x: auto; width: 100%; }
+body:not(:has(.conversation-workspace)) table { background: var(--panel); border-color: var(--line); border-radius: 6px; table-layout: auto; }
+body:not(:has(.conversation-workspace)) .table-shell table { min-width: max(100%, 760px); width: max-content; }
+body:not(:has(.conversation-workspace)) :is(th, td) {
+  border-color: var(--line);
+  color: var(--ink);
+  font-size: 14px;
+  line-height: 1.5;
+  overflow-wrap: normal;
+  padding: 8px 10px;
+  word-break: normal;
+}
+
+body:not(:has(.conversation-workspace)) th { background: var(--bg-2); color: #535d6a; font-size: 13px; text-transform: none; white-space: nowrap; }
+body:not(:has(.conversation-workspace)) td { max-width: 32rem; min-width: 5rem; }
+body:not(:has(.conversation-workspace)) .table-filter-row th { background: var(--panel); }
+body:not(:has(.conversation-workspace)) .table-filter-row :is(input, select) { min-width: 7.5rem; }
+body:not(:has(.conversation-workspace)) tbody tr:hover { background: var(--bg-2); }
+body:not(:has(.conversation-workspace)) .table-shell table[aria-label="运行时能力注册表"] :is(th, td) { white-space: nowrap; }
+body:not(:has(.conversation-workspace)) .table-shell table[aria-label="运行时能力注册表"] :is(td:first-child, td:last-child) { overflow-wrap: anywhere; white-space: normal; }
+body:not(:has(.conversation-workspace)) .table-shell table[aria-label="运行时能力注册表"] td:first-child { max-width: 24rem; min-width: 16rem; width: 20rem; }
+body:not(:has(.conversation-workspace)) .table-shell table[aria-label="运行时能力注册表"] td:first-child strong { display: block; max-width: 24rem; min-width: 16rem; overflow-wrap: anywhere; white-space: normal; }
+body:not(:has(.conversation-workspace)) .table-shell table[aria-label="运行时能力注册表"] .field-help { min-width: 12rem; max-width: 28rem; white-space: normal; }
+body:not(:has(.conversation-workspace)) .monospace-cell { max-width: 28rem; overflow-wrap: anywhere; }
+body:not(:has(.conversation-workspace)) td.table-actions { display: table-cell; min-width: 9rem; white-space: nowrap; }
+body:not(:has(.conversation-workspace)) td.table-actions > :is(button, a) { font-size: 13px; margin: 2px 4px 2px 0; min-height: 32px; padding: 5px 8px; }
+
+/* Repeated resources are framed; page sections remain flat bands. */
+body:not(:has(.conversation-workspace)) :is(.card-grid > article, .detail-grid > article, .mini-card, .resource-card, .skill-source-card, .evolution-run-card, .openclaw-adapter-card, .execution-environment-card, .module-entry-card, .log-module-card) {
+  background: var(--panel);
+  background-image: none;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  box-shadow: none;
+  color: var(--ink);
+  min-width: 0;
+  padding: 16px;
+  transform: none;
+}
+
+body:not(:has(.conversation-workspace)) :is(.card-grid > article, .detail-grid > article, .mini-card, .resource-card, .skill-source-card) :is(h3, h4, p, dl, dt, dd, .eyebrow) {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  white-space: normal;
+  word-break: normal;
+}
+
+body:not(:has(.conversation-workspace)) :is(.module-entry-card, .log-module-card, .settings-shortcut-card):hover { border-color: var(--line-strong); box-shadow: none; transform: none; }
+body:not(:has(.conversation-workspace)) .module-entry-number { color: var(--accent); }
+body:not(:has(.conversation-workspace)) :is(.settings-shortcut-card, .settings-form .inline-guide, .reference-preview, .plugin-readiness, .channel-runtime-status, .channel-picker, .bulk-action-bar, .openclaw-policy-preview, .hermes-journey, .error-log-panel) {
+  background: var(--bg-2);
+  background-image: none;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  box-shadow: none;
+  color: var(--ink);
+}
+
+body:not(:has(.conversation-workspace)) :is(.detail-list div, .skill-source-summary > div, .evolution-dashboard div, .channel-command-grid div, .hermes-approval-loop > div, .hermes-journey li, .diagnostic-row, .openclaw-allowlist-preview li) {
+  background: var(--panel);
+  background-image: none;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  box-shadow: none;
+  color: var(--ink);
+}
+
+body:not(:has(.conversation-workspace)) .channel-command-guide { background: transparent; background-image: none; }
+
+body:not(:has(.conversation-workspace)) :is(.skill-source-panel > .skill-source-form, .skill-source-snapshot, .skill-source-revision-list, .skill-source-revision-row + .skill-source-revision-row) { border-color: var(--line); }
+body:not(:has(.conversation-workspace)) :is(.error-log-panel h4, .diagnostic-row dt) { color: var(--danger); font-weight: 600; }
+body:not(:has(.conversation-workspace)) .diagnostic-row dd { font-weight: 400; }
+
+body:not(:has(.conversation-workspace)) :is([role="tablist"], .agent-workbench-tabs) { background: var(--bg-2); border-color: var(--line); border-radius: 6px; }
+body:not(:has(.conversation-workspace)) :is(button[role="tab"], .agent-workbench-tabs button) { background: transparent; border-color: transparent; box-shadow: none; color: var(--muted); }
+body:not(:has(.conversation-workspace)) :is(button[role="tab"][aria-selected="true"], button[aria-pressed="true"]:not(.code-tool-button), .agent-workbench-tabs button.active, .channel-option-active) {
+  background: var(--workspace-selected);
+  border-color: #b9d8da;
+  box-shadow: none;
+  color: #086d77;
+}
+
+body:not(:has(.conversation-workspace)) :where(.status-pill, .status-chip, .level-pill, .process-card-badge, .hermes-journey-header strong, .hermes-journey li > a) {
+  background: var(--workspace-info-bg);
+  border: 1px solid #b9d8da;
+  border-radius: 4px;
+  color: var(--accent-dark);
+  font-weight: 500;
+}
+
+body:not(:has(.conversation-workspace)) :is([role="status"]:not(.code-block-editor [role="status"]), .channel-config-status) {
+  background: var(--workspace-info-bg);
+  border-color: #b9d8da;
+  border-radius: 6px;
+  color: var(--accent-dark);
+}
+
+body:not(:has(.conversation-workspace)) .status-pill.success,
+body:not(:has(.conversation-workspace)) .status-chip,
+body:not(:has(.conversation-workspace)) .openclaw-policy-header span,
+body:not(:has(.conversation-workspace)) .openclaw-adapter-available .openclaw-adapter-header span { background: var(--workspace-success-bg); border-color: #b8d9c5; color: var(--success); }
+
+body:not(:has(.conversation-workspace)) :is([role="alert"], .openclaw-policy-warning, .level-warning, .status-chip.warning, .status-pill.warning) { background: var(--workspace-warning-bg); border-color: #e7d2a2; border-radius: 6px; color: var(--warning); }
+body:not(:has(.conversation-workspace)) :is([role="alert"], .form-error, .level-error, .status-chip.danger) { background: var(--workspace-danger-bg); border-color: #ecc1c7; color: var(--danger); }
+body:not(:has(.conversation-workspace)) :is(.success-text, .success, .succeeded, .trusted) { color: var(--success); }
+body:not(:has(.conversation-workspace)) :is(.warning-text, .warning) { color: var(--warning); }
+body:not(:has(.conversation-workspace)) :is(.danger-text, .danger, .failed) { color: var(--danger); }
+body:not(:has(.conversation-workspace)) .status-pill.danger { background: var(--workspace-danger-bg); border-color: #ecc1c7; color: var(--danger); }
+
+/* Match the three legacy important text colors without raising other theme rules. */
+body:not(:has(.conversation-workspace)) .openclaw-policy-warning { color: var(--warning) !important; }
+body:not(:has(.conversation-workspace)) .warning-text { color: var(--warning) !important; }
+body:not(:has(.conversation-workspace)) .success-text { color: var(--success) !important; }
+
+/* These surfaces can be portaled to body. Their layout and focus management stay unchanged. */
+body:not(:has(.conversation-workspace)) :is(.modal-backdrop, .process-detail-modal-backdrop, .process-drawer-backdrop, .plugin-handover-backdrop) { background: #1f232952; backdrop-filter: none; }
+body:not(:has(.conversation-workspace)) :is(.modal-card, .process-detail-modal, .composer-approval-popover, .process-drawer, .plugin-handover-modal) {
+  background: var(--panel);
+  background-image: none;
+  border-color: var(--line);
+  border-radius: 8px;
+  box-shadow: var(--shadow);
+  color: var(--ink);
+}
+
+body:not(:has(.conversation-workspace)) :is(.plugin-handover-modal, .agent-workbench-drawer) { --text: #1f2329; --ink: #1f2329; --muted: #646b78; --accent: #087f8c; --accent-2: #157347; --danger: #b42336; }
+body:not(:has(.conversation-workspace)) :is(.agent-workbench-trigger, .process-intermediate-card, .process-detail-card, .composer-attachment-card, .run-process-posture, .run-model-outcome-summary, .run-detail-process-detail, .run-process-detail, .event-log-list li) {
+  background: var(--bg-2);
+  background-image: none;
+  border-color: var(--line);
+  border-radius: 6px;
+  box-shadow: none;
+  color: var(--ink);
+}
+
+body:not(:has(.conversation-workspace)) :is(.mode-choice-grid button, .mode-choice-grid small, .run-detail-process-detail p, .run-detail-process-detail em, .run-execution-intents-header span) { color: var(--ink); }
+body:not(:has(.conversation-workspace)) :is(.run-detail-process-detail em, .run-process-posture li, .run-model-outcome-summary li, .process-detail-card small, .run-failure-diagnostic em, .run-execution-intent em) { background: var(--panel); border-color: var(--line); }
+body:not(:has(.conversation-workspace)) .mode-choice-grid button { background: var(--panel); border-color: var(--line); box-shadow: none; }
+body:not(:has(.conversation-workspace)) .process-drawer-handle { background: var(--line-strong); }
+
+body:not(:has(.conversation-workspace)) :is(.code-block, .agent-workbench-file-code, .channel-command-examples code) {
+  background: var(--bg-2);
+  border-color: var(--line);
+  border-radius: 6px;
+  color: var(--ink);
+  font-weight: 400;
+  letter-spacing: 0;
+}
+
+body:not(:has(.conversation-workspace)) .bounded-text-block:not(.code-block-editor) { --bounded-text-border: #dfe3e8; background: var(--panel); border-color: var(--line); }
+body:not(:has(.conversation-workspace)) .bounded-text-block:not(.code-block-editor) > .bounded-text-block-header { background: var(--bg-2); border-color: var(--line); }
+body:not(:has(.conversation-workspace)) .auth-card { background: var(--panel); border-color: var(--line); border-radius: 8px; box-shadow: var(--shadow); }
+body:not(:has(.conversation-workspace)) .auth-brand-logo { border: 0; border-radius: 0; box-shadow: none; object-fit: contain; }
+body:not(:has(.conversation-workspace)) .auth-hero h1 { font-size: 32px; line-height: 1.2; text-shadow: none; }
+
+@media (min-width: 981px) {
+  body:not(:has(.conversation-workspace)) .floating-nav-panel:has(.nav-link:hover) .nav-drawer,
+  body:not(:has(.conversation-workspace)) .floating-nav-panel:focus-within .nav-drawer,
+  body:not(:has(.conversation-workspace)) .nav-drawer:hover { display: grid; }
+}
+
+@media (max-width: 980px) {
+  body:not(:has(.conversation-workspace)) .app-shell { grid-template-columns: minmax(0, 1fr); }
+  body:not(:has(.conversation-workspace)) .sidebar { border: 0; height: auto; padding: 10px; position: static; }
+  body:not(:has(.conversation-workspace)) .nav-floating .floating-nav-panel { background: var(--bg-2); display: grid; height: 100dvh; }
+  body:not(:has(.conversation-workspace)) .floating-nav-rail { height: auto; min-height: calc(100dvh - 28px); }
+  body:not(:has(.conversation-workspace)) .mobile-nav-bar { background: var(--bg-2); border-color: var(--line); border-radius: 6px; box-shadow: none; }
+  body:not(:has(.conversation-workspace)) :is(.mobile-nav-group-trigger, .mobile-nav-submenu-link) { background: transparent; border-color: var(--line); color: var(--ink); }
+  body:not(:has(.conversation-workspace)) .mobile-nav-group-active { background: var(--workspace-selected); }
+  body:not(:has(.conversation-workspace)) .nav-floating .nav-drawer { display: none; }
+  body:not(:has(.conversation-workspace)) :is(.plugin-signing-key-layout, .channel-console) { grid-template-columns: minmax(0, 1fr); }
+}
+
+@media (max-width: 640px) {
+  body:not(:has(.conversation-workspace)) .page-surface { padding: 16px; }
+  body:not(:has(.conversation-workspace)) .topbar { align-items: start; flex-wrap: wrap; gap: 8px; padding: 12px 16px; }
+  body:not(:has(.conversation-workspace)) :is(.two-column, .form-grid, .card-grid, .detail-grid) { grid-template-columns: minmax(0, 1fr); }
+  body:not(:has(.conversation-workspace)) :is(.card-grid > article, .detail-grid > article) { padding: 12px; }
+  body:not(:has(.conversation-workspace)) :is(input, select, textarea) { font-size: 16px; }
+}

@@ -1,9 +1,11 @@
 import { Link, NavLink, Outlet, useLocation } from "react-router-dom";
 import { useEffect, useMemo, useState } from "react";
+import { Boxes, Database, MessageSquare, Network, Radio, Settings, Wrench } from "lucide-react";
 
 import { APP_BRAND_LOGO_SRC, APP_BRAND_NAME } from "./brand";
 import { MODULE_GROUPS, type ModuleItem } from "./navigation";
 import { useAuth } from "../auth/AuthProvider";
+import { useVisibleViewport } from "./useVisibleViewport";
 
 function dispatchTertiaryNavigation(to: string) {
   const section = sectionFromNavigationTarget(to);
@@ -22,8 +24,12 @@ function sectionFromNavigationTarget(to: string): string | null {
   return null;
 }
 export function AppShell() {
+  useVisibleViewport();
   const auth = useAuth();
   const location = useLocation();
+  const conversationWorkspace = location.pathname === "/";
+  const navigationIcons: Record<string, typeof Boxes> = { workspace: MessageSquare, orchestration: Network,
+    resources: Database, extensions: Wrench, channels: Radio, system: Settings };
   const [hoveredGroupId, setHoveredGroupId] = useState<string | null>(null);
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const [expandedMobileGroupId, setExpandedMobileGroupId] = useState<string | null>(null);
@@ -73,7 +79,7 @@ export function AppShell() {
   }, [mobileNavOpen]);
 
   return (
-    <div className={`app-shell nav-floating${mobileNavOpen ? " mobile-nav-open" : ""}`}>
+    <div className={`app-shell nav-floating${conversationWorkspace ? " is-conversation-workspace" : ""}${mobileNavOpen ? " mobile-nav-open" : ""}`}>
       <aside className="sidebar floating-sidebar">
         <div className="mobile-nav-bar">
           <button
@@ -131,6 +137,7 @@ export function AppShell() {
                     `nav-link${isActive || item.id === activeGroup?.id ? " nav-link-active" : ""}`
                   }
                 >
+                  {createNavigationIcon(navigationIcons[item.id] ?? Boxes)}
                   {item.label}
                 </NavLink>
               ))}
@@ -241,6 +248,10 @@ export function AppShell() {
       </div>
     </div>
   );
+}
+
+function createNavigationIcon(Icon: typeof Boxes) {
+  return <Icon size={18} aria-hidden="true" />;
 }
 
 function moduleMatchesPath(module: ModuleItem, pathname: string): boolean {

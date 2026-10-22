@@ -3,6 +3,7 @@ import { Fragment, FormEvent, type ReactNode, useEffect, useMemo, useRef, useSta
 import { createPortal } from "react-dom";
 import { Link, useLocation, useNavigate } from "react-router-dom";
 import { z } from "zod";
+import { ArrowUp, FolderClock, MoreHorizontal, Paperclip, Plus } from "lucide-react";
 
 import { ApiError, api, formatApiError, type AttachmentUpload, type Conversation, type ConversationMetadata, type ConversationQueueItem, type ModelDeployment, type ProjectWorkspace, type RunDetail, type RunListItem, type Skill, type SkillArchiveUpload, type SubmittedRun, type WebPreview, type WorkspaceDirectoryList, type WorkspaceFileList } from "../api/client";
 import { APP_BRAND_NAME } from "../app/brand";
@@ -17,6 +18,10 @@ import {
   type DownloadableFile,
 } from "../components/ArtifactFileCard";
 import { repairActionLabel, repairErrorCodeLabel, repairFailureKindLabel, repairRecoveryStrategyLabel } from "./repairLabels";
+import { useCapabilityApprovalDecisions } from "./useCapabilityApprovalDecisions";
+import { useAuth } from "../auth/AuthProvider";
+import { PermissionSelector, type PermissionMode } from "../components/PermissionSelector";
+import { resolvePermissionSelection, sandboxPermissions, type SupportedPermissionMode } from "./permissionSelection";
 
 const RUN_MODES = [
   { value: "auto", label: "自动", description: "主 Agent 判断应使用直连、派单、讨论或混合；不确定时向你确认。" },
@@ -37,10 +42,7 @@ const SANDBOX_OPTIONS = [
 type SandboxProfile = (typeof SANDBOX_OPTIONS)[number]["value"];
 type ExecutionBackendId = "systemd" | "docker" | "ssh" | "modal" | "daytona" | "vercel";
 export function requestedPermissionsForSandbox(profile: SandboxProfile): string[] {
-  if (profile === "none") return [];
-  if (profile === "read_only") return ["workspace.read"];
-  if (profile === "restricted") return ["workspace.read", "command.run"];
-  return ["workspace.read", "workspace.write", "command.run"];
+  return sandboxPermissions(profile);
 }
 export function workspacePreviewPath(projectId: string, sessionId: string): string {
   return `projects/${safeWorkspaceSegment(projectId, "default")}/sessions/${safeWorkspaceSegment(sessionId, "session-default")}`;
@@ -83,6 +85,7 @@ type CapabilityApproval = {
   approvalId: string;
   version: number;
   summary: string;
+  toolName: string | null;
 };
 type RunSubmissionOverride = {
   message?: string;
@@ -90,6 +93,7 @@ type RunSubmissionOverride = {
   mode?: RunMode;
   skipEvolutionProposal?: boolean;
   successNotice?: string;
+  permissions?: ReturnType<typeof resolvePermissionSelection>;
 };
 
 const TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled"]);
@@ -2377,6 +2381,7 @@ function capabilityApprovalFromRunDetail(run: RunDetail | undefined): Capability
     approvalId,
     version: runDetailVersion(run),
     summary,
+    toolName: diagnostic?.tool_name?.trim() || pending?.tool_name?.trim() || null,
   };
 }
 
@@ -2567,8 +2572,16 @@ function TemporaryAgentApprovalMessage({ proposal }: { proposal: TemporaryAgentP
   );
 }
 
+function automaticRepairInProgress(detail: RunDetail): boolean {
+  if (!["queued", "running", "waiting_capacity"].includes(detail.status)) return false;
+  const latest = detail.events.filter(event => ["repair.started", "repair.completed", "repair.failed"].includes(event.kind)).at(-1);
+  return latest?.kind === "repair.started" && latest.payload.automatic_execution === true
+    && latest.payload.requires_approval === false;
+}
+
 function detailMessages(detail: RunDetail | undefined): ChatMessage[] {
   if (!detail) return [];
+  if (automaticRepairInProgress(detail)) return [{ id: "request", role: "user", title: "你", body: detail.request }];
   const textArtifacts = dedupeTextArtifacts(detail.artifacts);
   const replyArtifact = preferredReplyArtifact(textArtifacts);
   const internalNotice = internalArtifactNotice(detail);
@@ -5824,7 +5837,7 @@ function ProcessDetailCards({ target }: { target: ProcessDetailTarget }) {
                     关闭
                   </button>
                 </div>
-                <dl>
+                <dl tabIndex={0} aria-label={`${openGroup.label}详情内容`}>
                   {openGroup.rows.map((row, index) => (
                     <Fragment key={`${target.id}-${openGroup.key}-${row.label}-${index}`}>
                       <dt>{row.label}</dt>
@@ -6492,6 +6505,8 @@ export function MessageBody({ text, title }: { text: string; title: string }) {
   return <OutputContent text={text} title={title} />;
 }
 export function RunsPage() {
+  const { user: permissionActor } = useAuth();
+  const permissionActorKey = [permissionActor?.tenant_id, permissionActor?.user_id, permissionActor?.role];
   const queryClient = useQueryClient();
   const navigate = useNavigate();
   const location = useLocation();
@@ -6512,7 +6527,8 @@ export function RunsPage() {
   });
   const models = useQuery({ queryKey: ["models"], queryFn: () => api.models() });
   const workflows = useQuery({ queryKey: ["workflows"], queryFn: () => api.workflows() });
-  const settings = useQuery({ queryKey: ["settings"], queryFn: () => api.settings() });
+  const settings = useQuery({ queryKey: ["settings", ...permissionActorKey], queryFn: () => api.settings(), enabled: Boolean(permissionActor) });
+  const permissionSettingsReady = Boolean(permissionActor && settings.data && !settings.isError);
   const executionBackends = useQuery({
     queryKey: ["execution-backends"],
     queryFn: () => api.executionBackends(),
@@ -6545,7 +6561,26 @@ export function RunsPage() {
   );
   const [projectId, setProjectId] = useState("default");
   const [projectLabel, setProjectLabel] = useState("");
-  const [sandboxProfile, setSandboxProfile] = useState<SandboxProfile>("workspace_write");
+  const [permissionDrafts, setPermissionDrafts] = useState<Record<string, {
+    mode: SupportedPermissionMode; profile: SandboxProfile;
+  }>>({});
+  const permissionScopeKey = JSON.stringify([...permissionActorKey, conversationId]);
+  const permissionDraft = permissionDrafts[permissionScopeKey];
+  const supportedPermissionModes = settings.data?.supported_permission_modes ?? [];
+  const configuredPermissionMode = settings.data?.default_permission_mode ?? "default";
+  const permissionMode = permissionDraft?.mode ?? configuredPermissionMode;
+  const sandboxProfile: SandboxProfile = permissionMode === "read_only" ? "read_only"
+    : permissionDraft ? permissionDraft.profile
+      : settings.data?.default_sandbox_profile ?? "workspace_write";
+  function selectPermissionMode(next: PermissionMode) {
+    if (!permissionSettingsReady || next === "full_access" || (next !== "default" && !supportedPermissionModes.includes(next))) return;
+    setPermissionDrafts((current) => ({ ...current, [permissionScopeKey]: { mode: next,
+      profile: next === "read_only" ? "read_only" : settings.data?.default_sandbox_profile ?? "workspace_write" } }));
+  }
+  function permissionSelectionForSubmission() {
+    if (!permissionSettingsReady) throw new Error("权限设置尚未确认，请稍后再发送。");
+    return resolvePermissionSelection(permissionMode, sandboxProfile, supportedPermissionModes);
+  }
   const [executionBackend, setExecutionBackend] = useState<ExecutionBackendId>("systemd");
   const [runWorkspacePath, setRunWorkspacePath] = useState("");
   const [projectInputAuthorization, setProjectInputAuthorization] = useState<{
@@ -6587,6 +6622,10 @@ export function RunsPage() {
     };
   });
   const [conversationMenuOpen, setConversationMenuOpen] = useState(false);
+  const conversationMenuAnchorRef = useRef<HTMLDivElement>(null);
+  const conversationMenuTriggerRef = useRef<HTMLButtonElement>(null);
+  const conversationMenuRef = useRef<HTMLDivElement>(null);
+  const conversationMenuInitialFocusRef = useRef<"first" | "last">("first");
   const [renameConversationOpen, setRenameConversationOpen] = useState(false);
   const [renameConversationTitle, setRenameConversationTitle] = useState("");
   const [conversationSearch, setConversationSearch] = useState("");
@@ -6669,7 +6708,18 @@ export function RunsPage() {
     version: number;
     proposal: RepairProposal;
   } | null>(null);
-  const [capabilityApproval, setCapabilityApproval] = useState<CapabilityApproval | null>(null);
+  const [capabilityApprovalCandidate, setCapabilityApproval] = useState<CapabilityApproval | null>(null);
+  const capabilityDecisions = useCapabilityApprovalDecisions((run, approval, decision) => {
+    if (capabilityApprovalRun?.id === approval.runId) {
+      setSubmitNotice(decision === "approve"
+        ? "已允许本次沙箱工具调用，当前任务已重新排队继续执行。"
+        : "已拒绝本次沙箱工具调用，当前任务已取消。");
+    }
+    void refreshRunSurfaces({
+      id: approval.runId,
+      conversation_id: run.conversation_id ?? queryClient.getQueryData<RunDetail>(["run", approval.runId])?.conversation_id,
+    });
+  });
   const trimmedReferenceConversationId = referenceConversationId.trim();
   const handoffActive = Boolean(trimmedReferenceConversationId);
 
@@ -6699,6 +6749,39 @@ export function RunsPage() {
 
   const selectedRunConversationId = runConversationId(selectedRun.data);
   const activeConversationId = conversationId.trim();
+  useEffect(() => {
+    if (conversationMenuRef.current?.contains(document.activeElement)) {
+      conversationMenuTriggerRef.current?.focus();
+    }
+    setConversationMenuOpen(false);
+  }, [activeConversationId]);
+
+  useEffect(() => {
+    if (!conversationMenuOpen) return;
+    const items = conversationMenuRef.current?.querySelectorAll<HTMLButtonElement>('[role="menuitem"]:not(:disabled)');
+    const index = conversationMenuInitialFocusRef.current === "last" ? (items?.length ?? 1) - 1 : 0;
+    items?.[index]?.focus();
+    function onPointerDown(event: PointerEvent) {
+      if (event.target instanceof Node && !conversationMenuAnchorRef.current?.contains(event.target)) {
+        setConversationMenuOpen(false);
+      }
+    }
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      if (conversationMenuAnchorRef.current?.contains(document.activeElement)) {
+        conversationMenuTriggerRef.current?.focus();
+      }
+      setConversationMenuOpen(false);
+    }
+    document.addEventListener("pointerdown", onPointerDown, true);
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("pointerdown", onPointerDown, true);
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, [conversationMenuOpen]);
+
   const listedConversationMetadata = [
     ...(conversations.data ?? []),
     ...(archivedConversations.data ?? []),
@@ -6728,6 +6811,29 @@ export function RunsPage() {
     refetchInterval: 1000,
     refetchIntervalInBackground: true,
   });
+  // A conversation deep-link has no explicit run selection. Inspect only its latest
+  // actionable run, never search backwards for an older pending approval.
+  const approvalConversationRuns = activeConversation.data?.conversation_id === activeConversationId
+    ? activeConversation.data.runs.filter((run) => runConversationId(run) === activeConversationId)
+    : [];
+  const blockedApprovalRunIds = new Set((conversationQueue.data ?? [])
+    .filter((item) => item.conversation_id === activeConversationId && (item.status === "queued" || item.status === "redirecting"))
+    .map((item) => item.successor_run_id));
+  const capabilityApprovalRun = selectedRunId
+    ? selectedRun.data?.id === selectedRunId && runConversationId(selectedRun.data) === activeConversationId
+      ? selectedRun.data
+      : undefined
+    : orderedConversationRuns(approvalConversationRuns).reverse().find((run) => !blockedApprovalRunIds.has(run.id));
+  const proposedCapabilityApproval = capabilityApprovalFromRunDetail(capabilityApprovalRun);
+  const capabilityDecision = capabilityDecisions.stateFor(capabilityApprovalCandidate);
+  const capabilityApproval = capabilityApprovalCandidate && proposedCapabilityApproval &&
+    capabilityApprovalCandidate.runId === proposedCapabilityApproval.runId &&
+    capabilityApprovalCandidate.approvalId === proposedCapabilityApproval.approvalId &&
+    capabilityApprovalCandidate.version === proposedCapabilityApproval.version &&
+    capabilityDecision?.status !== "success"
+    ? capabilityApprovalCandidate
+    : null;
+  const capabilityPending = capabilityDecision?.status === "pending";
   const activeWorkspaceProjectId =
     activeConversation.data?.project_id?.trim() || listedConversationMetadata?.project_id?.trim() || projectId.trim() || "default";
   const activeWorkspaceSessionId =
@@ -6920,7 +7026,7 @@ export function RunsPage() {
     } else if (selectedRun.data && projectPreflightApproval?.runId === selectedRun.data.id) {
       setProjectPreflightApproval(null);
     }
-    const proposedCapabilityApproval = capabilityApprovalFromRunDetail(selectedRun.data);
+    const proposedCapabilityApproval = capabilityApprovalFromRunDetail(capabilityApprovalRun);
     if (proposedCapabilityApproval) {
       setModeSelection(null);
       setTemporaryApproval(null);
@@ -6937,10 +7043,10 @@ export function RunsPage() {
           ? current
           : proposedCapabilityApproval,
       );
-    } else if (selectedRun.data && capabilityApproval?.runId === selectedRun.data.id) {
+    } else if (capabilityApprovalCandidate) {
       setCapabilityApproval(null);
     }
-  }, [capabilityApproval, dismissedEvolutionApprovalRunIds, dismissedOpenClawApprovalRunIds, dismissedProjectPreflightApprovalRunIds, dismissedRepairApprovalRunIds, dismissedScheduleApprovalRunIds, modeSelection, projectPreflightApproval, selectedRun.data, temporaryApproval]);
+  }, [capabilityApprovalCandidate, capabilityApprovalRun, dismissedEvolutionApprovalRunIds, dismissedOpenClawApprovalRunIds, dismissedProjectPreflightApprovalRunIds, dismissedRepairApprovalRunIds, dismissedScheduleApprovalRunIds, modeSelection, projectPreflightApproval, selectedRun.data, temporaryApproval]);
 
   useEffect(() => {
     setProcessDetailTarget(null);
@@ -7085,6 +7191,8 @@ export function RunsPage() {
 
   const createRun = useMutation({
     mutationFn: async (override?: RunSubmissionOverride) => {
+      if (!permissionSettingsReady) throw new Error("权限设置尚未确认，请稍后再发送。");
+      const permissions = override?.permissions ?? permissionSelectionForSubmission();
       const projectInput = projectInputForSubmission();
       const runMessage = (override?.message ?? message).trim();
       let conversationMetadata = activeConversation.data ?? listedConversationMetadata;
@@ -7121,9 +7229,8 @@ export function RunsPage() {
         project_label: conversationMetadata.project_label?.trim() || projectLabel.trim() || null,
         workspace_session_id:
           runWorkspacePath.trim() || conversationMetadata.workspace_path?.trim() || conversationId.trim() || null,
-        sandbox_profile: sandboxProfile,
+        ...permissions,
         ...(selectedExecutionBackend?.available ? { execution_backend: executionBackend } : {}),
-        requested_permissions: requestedPermissionsForSandbox(sandboxProfile),
         attachment_ids: attachmentDraft?.attachment ? [attachmentDraft.attachment.id] : [],
         skip_evolution_proposal: override?.skipEvolutionProposal === true ? true : undefined,
       });
@@ -7256,7 +7363,8 @@ export function RunsPage() {
   });
 
   const queueMessage = useMutation({
-    onMutate: () => ({ scopeKey: projectInputScopeKey, authorization: projectInputAuthorization }),
+    onMutate: () => ({ scopeKey: projectInputScopeKey, authorization: projectInputAuthorization,
+      permissionScopeKey, permissions: permissionSelectionForSubmission() }),
     mutationFn: (queuedMessage: string) =>
       api.queueConversationMessage(
         activeConversationId,
@@ -7269,9 +7377,8 @@ export function RunsPage() {
           project_id: activeWorkspaceProjectId || null,
           project_label: projectLabel.trim() || null,
           workspace_session_id: selectedRunWorkspaceSessionId || null,
-          sandbox_profile: sandboxProfile,
+          ...permissionSelectionForSubmission(),
           ...(selectedExecutionBackend?.available ? { execution_backend: executionBackend } : {}),
-          requested_permissions: requestedPermissionsForSandbox(sandboxProfile),
           attachment_ids: attachmentDraft?.attachment ? [attachmentDraft.attachment.id] : [],
         },
       ),
@@ -7287,11 +7394,13 @@ export function RunsPage() {
       if (error instanceof ApiError && error.code === "conversation_not_active") {
         if (submitted && (
           submitted.scopeKey !== projectInputScopeKey || submitted.authorization !== projectInputAuthorization
+          || submitted.permissionScopeKey !== permissionScopeKey
         )) {
           setSubmitNotice("工作区授权已变更，请重新发送消息。");
           return;
         }
-        createRun.mutate({ message: queuedMessage, mode: "auto" });
+        if (!submitted) return;
+        createRun.mutate({ message: queuedMessage, mode: "auto", permissions: submitted.permissions });
       }
     },
   });
@@ -7445,8 +7554,13 @@ export function RunsPage() {
         ...updated,
         runs: current?.runs ?? conversationRunCache[updated.conversation_id] ?? [],
       }));
-      setRenameConversationOpen(false);
-      setConversationMenuOpen(false);
+      if (variables.conversationId === activeConversationId) {
+        if (renameConversationOpen || conversationMenuRef.current?.contains(document.activeElement)) {
+          conversationMenuTriggerRef.current?.focus();
+        }
+        setRenameConversationOpen(false);
+        setConversationMenuOpen(false);
+      }
       if (variables.archived === false) setConversationManagerView("current");
       setSubmitNotice(
         variables.title !== undefined
@@ -7543,36 +7657,6 @@ export function RunsPage() {
     setProjectPreflightApproval(null);
     setSubmitNotice("已取消项目架构预检，本轮不会自动进入执行。你可以继续补充要求或重新发送。");
   };
-
-  const approveCapability = useMutation({
-    mutationFn: () => {
-      if (!capabilityApproval) throw new Error("capability approval is unavailable");
-      return api.approveCapability(capabilityApproval.runId, {
-        approval_id: capabilityApproval.approvalId,
-        version: capabilityApproval.version,
-      });
-    },
-    onSuccess: async (run) => {
-      setCapabilityApproval(null);
-      setSubmitNotice("已允许本次沙箱工具调用，当前任务已重新排队继续执行。");
-      await refreshRunSurfaces(run);
-    },
-  });
-
-  const rejectCapability = useMutation({
-    mutationFn: () => {
-      if (!capabilityApproval) throw new Error("capability approval is unavailable");
-      return api.rejectCapability(capabilityApproval.runId, {
-        approval_id: capabilityApproval.approvalId,
-        version: capabilityApproval.version,
-      });
-    },
-    onSuccess: async (run) => {
-      setCapabilityApproval(null);
-      setSubmitNotice("已拒绝本次沙箱工具调用，当前任务已取消。");
-      await refreshRunSurfaces(run);
-    },
-  });
 
   const cancelScheduleApproval = () => {
     if (!scheduleApproval) return;
@@ -7960,6 +8044,7 @@ export function RunsPage() {
       return;
     }
     if (capabilityApproval) {
+      if (capabilityPending) return;
       const choice = parseChoiceText(trimmed, [
         { value: "approve", label: "允许一次", aliases: ["允许", "同意", "通过", "approve", "yes", "allow"] },
         { value: "reject", label: "拒绝", aliases: ["拒绝", "取消", "reject", "no", "deny"] },
@@ -7971,11 +8056,11 @@ export function RunsPage() {
       setMessage("");
       if (choice.option.value === "approve") {
         setSubmitNotice("已选择允许一次，正在重新排队继续执行。");
-        approveCapability.mutate();
+        capabilityDecisions.approve(capabilityApproval);
         return;
       }
       setSubmitNotice("已选择拒绝，本次任务会取消。");
-      rejectCapability.mutate();
+      capabilityDecisions.reject(capabilityApproval);
       return;
     }
     if (modeSelection) {
@@ -8002,6 +8087,10 @@ export function RunsPage() {
     }
     if (projectInputError) {
       setSubmitNotice(projectInputError);
+      return;
+    }
+    if (!permissionSettingsReady) {
+      setSubmitNotice("权限设置尚未确认，请稍后再发送。");
       return;
     }
     if (canStopLatestRun) {
@@ -8473,13 +8562,7 @@ export function RunsPage() {
   }
 
   return (
-    <section>
-      <p className="eyebrow">Conversation</p>
-      <h2>对话</h2>
-      <p className="compact-page-intro">
-        连续对话窗口，可承接多轮任务、上下文压缩和历史会话。
-      </p>
-
+    <section className="conversation-workspace">
       <button
         type="button"
         className="mobile-nav-trigger conversation-drawer-trigger"
@@ -8494,11 +8577,7 @@ export function RunsPage() {
           setHistoryOpen(next);
         }}
       >
-        <span className="mobile-nav-trigger-icon" aria-hidden="true">
-          <span />
-          <span />
-          <span />
-        </span>
+        <FolderClock size={18} aria-hidden="true" />
       </button>
 
       <div className={`chat-console${historyOpen ? " history-drawer-open" : ""}`}>
@@ -8908,23 +8987,6 @@ export function RunsPage() {
               </select>
               <span className="field-help">只把步骤与交付物作为主 Agent 的参考，不会固定模式或角色。</span>
             </label>
-            <div className="sandbox-settings" aria-label="沙箱权限">
-              <span className="field-label">沙箱权限</span>
-              <div className="sandbox-choice-row" role="group" aria-label="选择本次运行沙箱权限">
-                {SANDBOX_OPTIONS.map((option) => (
-                  <button
-                    key={option.value}
-                    type="button"
-                    className={`sandbox-choice${sandboxProfile === option.value ? " selected" : ""}`}
-                    aria-pressed={sandboxProfile === option.value}
-                    onClick={() => setSandboxProfile(option.value)}
-                  >
-                    <strong>{option.label}</strong>
-                    <span>{option.summary}</span>
-                  </button>
-                ))}
-              </div>
-            </div>
             <label htmlFor="execution-backend">
               执行环境
               <select
@@ -9029,22 +9091,56 @@ export function RunsPage() {
                 {currentConversationArchived ? <span className="conversation-archived-badge">已归档</span> : null}
               </div>
               <div className="chat-session-actions">
-                <div className="conversation-menu-anchor">
+                <div ref={conversationMenuAnchorRef} className="conversation-menu-anchor">
                   <button
+                    ref={conversationMenuTriggerRef}
                     type="button"
                     className="conversation-menu-trigger"
                     aria-label="会话操作"
+                    title={currentConversationPersisted ? `会话操作：重命名、${currentConversationArchived ? "恢复" : "归档"}` : "开始会话后可重命名或归档"}
+                    aria-haspopup="menu"
                     aria-expanded={conversationMenuOpen}
                     disabled={!currentConversationPersisted}
-                    onClick={() => setConversationMenuOpen((current) => !current)}
+                    onClick={() => {
+                      conversationMenuInitialFocusRef.current = "first";
+                      setConversationMenuOpen((current) => !current);
+                    }}
+                    onKeyDown={(event) => {
+                      if (!["ArrowDown", "ArrowUp", "Enter", " "].includes(event.key)) return;
+                      event.preventDefault();
+                      conversationMenuInitialFocusRef.current = event.key === "ArrowUp" ? "last" : "first";
+                      setConversationMenuOpen(true);
+                    }}
                   >
-                    ⋯
+                    <MoreHorizontal size={18} aria-hidden="true" />
                   </button>
                   {conversationMenuOpen ? (
-                    <div className="conversation-menu" role="menu">
+                    <div
+                      ref={conversationMenuRef}
+                      className="conversation-menu"
+                      role="menu"
+                      aria-label="会话操作"
+                      onKeyDown={(event) => {
+                        if (event.key === "Tab") {
+                          // Let the browser move focus before removing the focused menu item.
+                          queueMicrotask(() => setConversationMenuOpen(false));
+                          return;
+                        }
+                        if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) return;
+                        event.preventDefault();
+                        event.stopPropagation();
+                        const items = [...event.currentTarget.querySelectorAll<HTMLButtonElement>('[role="menuitem"]:not(:disabled)')];
+                        if (!items.length) return;
+                        const current = items.findIndex((item) => item === document.activeElement);
+                        const next = event.key === "Home" ? 0 : event.key === "End" ? items.length - 1
+                          : (current + (event.key === "ArrowDown" ? 1 : -1) + items.length) % items.length;
+                        items[next].focus();
+                      }}
+                    >
                       <button
                         type="button"
                         role="menuitem"
+                        tabIndex={-1}
                         onClick={() => {
                           setRenameConversationTitle(currentConversationTitle);
                           updateConversation.reset();
@@ -9057,6 +9153,7 @@ export function RunsPage() {
                       <button
                         type="button"
                         role="menuitem"
+                        tabIndex={-1}
                         disabled={updateConversation.isPending}
                         onClick={() =>
                           updateConversation.mutate({
@@ -9167,12 +9264,12 @@ export function RunsPage() {
                 </article>
                 {item.id.endsWith("-request") && item.run ? (
                   <>
-                    <RunInteractionSummaryInline
+                    {automaticRepairInProgress(item.run) ? null : <RunInteractionSummaryInline
                       run={item.run}
                       agentNames={agentNameMap}
                       mainAgentModelName={mainAgentModelName}
                       onPreviewFile={setConversationPreviewFile}
-                    />
+                    />}
                     <RunProcessSummary
                       detail={item.run}
                       onOpen={setProcessDetailTarget}
@@ -9298,12 +9395,6 @@ export function RunsPage() {
             {approveProjectPreflight.isError ? (
               <p role="alert">{formatApiError(approveProjectPreflight.error, "项目预检确认失败")}</p>
             ) : null}
-            {approveCapability.isError ? (
-              <p role="alert">{formatApiError(approveCapability.error, "沙箱权限确认失败")}</p>
-            ) : null}
-            {rejectCapability.isError ? (
-              <p role="alert">{formatApiError(rejectCapability.error, "沙箱权限拒绝失败")}</p>
-            ) : null}
             {repairApproval ? (
               <aside className="composer-attachment-card" role="status" aria-label="自修复确认">
                 <div>
@@ -9354,25 +9445,26 @@ export function RunsPage() {
               <aside className="composer-attachment-card" role="status" aria-label="沙箱权限确认">
                 <div>
                   <span className="eyebrow">沙箱权限待确认</span>
-                  <strong>工具调用需要授权</strong>
+                  <strong>{capabilityApproval.toolName ?? "工具调用需要授权"}</strong>
                   <small>审批 {capabilityApproval.approvalId}</small>
                 </div>
                 <p>{capabilityApproval.summary}</p>
+                {capabilityDecision?.error ? <p role="alert">{capabilityDecision.error}</p> : null}
                 <div className="composer-card-actions">
                   <button
                     type="button"
-                    disabled={approveCapability.isPending || rejectCapability.isPending}
-                    onClick={() => approveCapability.mutate()}
+                    disabled={capabilityPending}
+                    onClick={() => capabilityDecisions.approve(capabilityApproval)}
                   >
-                    {approveCapability.isPending ? "允许中..." : "允许一次"}
+                    {capabilityPending && capabilityDecision.decision === "approve" ? "允许中..." : "允许一次"}
                   </button>
                   <button
                     type="button"
                     className="secondary-action"
-                    disabled={approveCapability.isPending || rejectCapability.isPending}
-                    onClick={() => rejectCapability.mutate()}
+                    disabled={capabilityPending}
+                    onClick={() => capabilityDecisions.reject(capabilityApproval)}
                   >
-                    {rejectCapability.isPending ? "拒绝中..." : "拒绝"}
+                    {capabilityPending && capabilityDecision.decision === "reject" ? "拒绝中..." : "拒绝"}
                   </button>
                 </div>
               </aside>
@@ -9642,6 +9734,7 @@ export function RunsPage() {
             <div className="composer-actions">
               <div className={`composer-tool-row${handoffActive ? " composer-tool-row-reference" : ""}`} aria-label="消息工具">
                 <label className="composer-upload-button">
+                  <Paperclip size={17} aria-hidden="true" />
                   <span>附件</span>
                   <input
                     aria-label="上传文件或 Skill 压缩包"
@@ -9673,8 +9766,17 @@ export function RunsPage() {
                   aria-pressed={configOpen}
                   onClick={() => setConfigOpen((current) => !current)}
                 >
-                  +
+                  <Plus size={18} aria-hidden="true" />
                 </button>
+                <PermissionSelector
+                  value={permissionMode}
+                  onChange={selectPermissionMode}
+                  autoReviewAvailable={supportedPermissionModes.includes("auto_review") && settings.data?.tool_approval_mode === "auto_review"}
+                  readOnlyAvailable={supportedPermissionModes.includes("read_only")}
+                  disabled={!permissionSettingsReady}
+                  permissionSupportNotice={supportedPermissionModes.length === 0
+                    ? "沿用当前工作区边界与系统审批策略；运行级权限需更新服务器后启用。" : undefined}
+                />
               </div>
               <div className="composer-status-line" role="status">
                 <span>
@@ -9700,6 +9802,7 @@ export function RunsPage() {
                 <button
                   type="submit"
                   disabled={
+                    (!permissionSettingsReady && !capabilityApproval && !modeSelection && !temporaryApproval && !scheduleApproval && !evolutionApproval && !openClawApproval && !projectPreflightApproval && !repairApproval) ||
                     createRun.isPending ||
                     queueMessage.isPending ||
                     Boolean(projectInputError) ||
@@ -9714,6 +9817,7 @@ export function RunsPage() {
                         : "发送消息")
                   }
                 >
+                  <span className="composer-submit-label">
                   {queueMessage.isPending
                     ? "排队中..."
                     : createRun.isPending
@@ -9723,9 +9827,15 @@ export function RunsPage() {
                         : canStopLatestRun
                           ? "排队"
                           : "发送"}
+                  </span>
+                  <ArrowUp size={19} aria-hidden="true" />
                 </button>
               </div>
             </div>
+            {!permissionSettingsReady ? <p className="field-help" role={settings.isError ? "alert" : "status"}>
+              {settings.isError ? "权限设置加载失败，已暂停发送。" : "正在确认当前账号的权限设置..."}
+              {settings.isError ? <button type="button" className="secondary-action" onClick={() => void settings.refetch()}>重试</button> : null}
+            </p> : null}
             {executionBackendFallbackNotice ? <p className="field-help" role="status">{executionBackendFallbackNotice}</p> : null}
             {executionBackendNotice && !executionBackends.isLoading ? (
               <div className="execution-backend-notice" role="status">
@@ -9833,7 +9943,10 @@ export function RunsPage() {
             setRenameConversationTitle(value);
           }}
           onClose={() => {
-            if (!updateConversation.isPending) setRenameConversationOpen(false);
+            if (!updateConversation.isPending) {
+              setRenameConversationOpen(false);
+              conversationMenuTriggerRef.current?.focus();
+            }
           }}
           onSubmit={() => {
             const title = renameConversationTitle.trim();

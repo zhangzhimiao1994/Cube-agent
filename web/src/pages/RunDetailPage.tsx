@@ -4,6 +4,7 @@ import { createPortal } from "react-dom";
 import { Link, useParams } from "react-router-dom";
 
 import { api, formatApiError, type RunDetail } from "../api/client";
+import { useCapabilityApprovalDecisions } from "./useCapabilityApprovalDecisions";
 import { PluginHandoverPanel } from "../components/PluginHandoverPanel";
 import { BoundedTextBlock, OutputContent, hasStructuredOutput, isMarkdownOutputFile, outputFileLanguage } from "../components/OutputContent";
 import {
@@ -271,6 +272,7 @@ type CapabilityApproval = {
   approvalId: string;
   version: number;
   summary: string;
+  toolName: string | null;
 };
 
 type ToolLifecycle = {
@@ -586,6 +588,7 @@ function capabilityApprovalFromRunDetail(run: RunDetail | undefined): Capability
     approvalId,
     version: runDetailVersion(run),
     summary,
+    toolName: diagnostic?.tool_name?.trim() || pending?.tool_name?.trim() || null,
   };
 }
 
@@ -2852,7 +2855,7 @@ function DetailProcessCards({ card }: { card: DetailProcessCard }) {
                     关闭
                   </button>
                 </div>
-                <dl>
+                <dl tabIndex={0} aria-label={`${openGroup.label}详情内容`}>
                   {openGroup.rows.map((row, index) => (
                     <Fragment key={`${card.id}-${openGroup.key}-${row.label}-${index}`}>
                       <dt>{row.label}</dt>
@@ -3440,29 +3443,9 @@ export function RunDetailPage() {
       await queryClient.invalidateQueries({ queryKey: ["runs"] });
     },
   });
-  const approveCapability = useMutation({
-    mutationFn: (approval: CapabilityApproval) =>
-      api.approveCapability(approval.runId, {
-        approval_id: approval.approvalId,
-        version: approval.version,
-      }),
-    onSuccess: async (updated) => {
-      void updated;
-      await queryClient.invalidateQueries({ queryKey: ["run", runId] });
-      await queryClient.invalidateQueries({ queryKey: ["runs"] });
-    },
-  });
-  const rejectCapability = useMutation({
-    mutationFn: (approval: CapabilityApproval) =>
-      api.rejectCapability(approval.runId, {
-        approval_id: approval.approvalId,
-        version: approval.version,
-      }),
-    onSuccess: async (updated) => {
-      void updated;
-      await queryClient.invalidateQueries({ queryKey: ["run", runId] });
-      await queryClient.invalidateQueries({ queryKey: ["runs"] });
-    },
+  const capabilityDecisions = useCapabilityApprovalDecisions((_updated, approval) => {
+    void queryClient.invalidateQueries({ queryKey: ["run", approval.runId] });
+    void queryClient.invalidateQueries({ queryKey: ["runs"] });
   });
   const [capabilityInstallMessage, setCapabilityInstallMessage] = useState("");
   const installMissingCapability = useMutation({
@@ -3532,7 +3515,10 @@ export function RunDetailPage() {
   const canResume = orderedRunData.status === "paused";
   const canCancel = !TERMINAL_STATUSES.has(orderedRunData.status);
   const isWaitingForMode = orderedRunData.status === "waiting_user_mode" && Boolean(orderedRunData.decision_token);
-  const capabilityApproval = capabilityApprovalFromRunDetail(orderedRunData);
+  const capabilityApprovalCandidate = capabilityApprovalFromRunDetail(orderedRunData);
+  const capabilityDecision = capabilityDecisions.stateFor(capabilityApprovalCandidate);
+  const capabilityApproval = capabilityDecision?.status === "success" ? null : capabilityApprovalCandidate;
+  const capabilityPending = capabilityDecision?.status === "pending";
   const repairApproval = repairApprovalFromRunDetail(orderedRunData);
   const capabilityInstallProposal = orderedRunData.capability_install_proposal;
   const observerNotices = collectObserverNotices(orderedRunData.events);
@@ -3777,25 +3763,26 @@ export function RunDetailPage() {
               <aside className="composer-attachment-card" role="status" aria-label="沙箱权限确认">
                 <div>
                   <span className="eyebrow">沙箱权限待确认</span>
-                  <strong>工具调用需要授权</strong>
+                  <strong>{capabilityApproval.toolName ?? "工具调用需要授权"}</strong>
                   <small>审批 {capabilityApproval.approvalId}</small>
                 </div>
                 <p>{capabilityApproval.summary}</p>
+                {capabilityDecision?.error ? <p role="alert">{capabilityDecision.error}</p> : null}
                 <div className="composer-card-actions">
                   <button
                     type="button"
-                    disabled={approveCapability.isPending || rejectCapability.isPending}
-                    onClick={() => approveCapability.mutate(capabilityApproval)}
+                    disabled={capabilityPending}
+                    onClick={() => capabilityDecisions.approve(capabilityApproval)}
                   >
-                    {approveCapability.isPending ? "允许中..." : "允许一次"}
+                    {capabilityPending && capabilityDecision.decision === "approve" ? "允许中..." : "允许一次"}
                   </button>
                   <button
                     type="button"
                     className="secondary-action"
-                    disabled={approveCapability.isPending || rejectCapability.isPending}
-                    onClick={() => rejectCapability.mutate(capabilityApproval)}
+                    disabled={capabilityPending}
+                    onClick={() => capabilityDecisions.reject(capabilityApproval)}
                   >
-                    {rejectCapability.isPending ? "拒绝中..." : "拒绝"}
+                    {capabilityPending && capabilityDecision.decision === "reject" ? "拒绝中..." : "拒绝"}
                   </button>
                 </div>
               </aside>
@@ -3886,8 +3873,6 @@ export function RunDetailPage() {
         ) : null}
         {control.isError ? <p role="alert">{formatApiError(control.error, "运行控制失败")}</p> : null}
         {chooseMode.isError ? <p role="alert">{formatApiError(chooseMode.error, "运行模式确认失败")}</p> : null}
-        {approveCapability.isError ? <p role="alert">{formatApiError(approveCapability.error, "沙箱权限确认失败")}</p> : null}
-        {rejectCapability.isError ? <p role="alert">{formatApiError(rejectCapability.error, "沙箱权限拒绝失败")}</p> : null}
         {acceptSelfRepair.isError ? <p role="alert">{formatApiError(acceptSelfRepair.error, "自修复确认失败")}</p> : null}
         {installMissingCapability.isError ? <p role="alert">{formatApiError(installMissingCapability.error, "能力安装失败")}</p> : null}
         {cancelCapabilityInstall.isError ? <p role="alert">{formatApiError(cancelCapabilityInstall.error, "能力安装取消失败")}</p> : null}

@@ -391,11 +391,12 @@ article:hover {
 .brand-lockup img,
 .brand-card img {
   aspect-ratio: 1;
-  border: 1px solid rgba(123, 225, 255, 0.32);
-  border-radius: 0.85rem;
-  box-shadow: 0 0 22px rgba(85, 215, 255, 0.18);
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
   display: block;
-  object-fit: cover;
+  flex-shrink: 0;
+  object-fit: contain;
 }
 
 .brand-lockup img {
@@ -410,12 +411,12 @@ article:hover {
 
 .auth-brand-logo {
   aspect-ratio: 1;
-  border: 1px solid rgba(123, 225, 255, 0.36);
-  border-radius: 1rem;
-  box-shadow: 0 0 28px rgba(85, 215, 255, 0.22);
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
   display: block;
   height: 4.5rem;
-  object-fit: cover;
+  object-fit: contain;
   width: 4.5rem;
 }
 
@@ -4456,7 +4457,8 @@ article:hover {
   min-width: 0;
   overflow-y: auto;
   overscroll-behavior: contain;
-  padding: 0.1rem 0 0;
+  padding: 0.1rem 0 1rem;
+  scroll-padding-bottom: 1rem;
   scroll-padding-top: 0.5rem;
   width: 100%;
 }
@@ -4610,6 +4612,10 @@ article:hover {
 
 .bounded-text-block.is-collapsed pre {
   max-height: 12rem;
+}
+
+.bounded-text-block:not(.is-expanded) pre {
+  overscroll-behavior-y: auto;
 }
 
 .bounded-text-block pre code {
@@ -5402,6 +5408,27 @@ article:hover {
   justify-content: flex-end;
   min-width: 0;
 }
+
+.message-paragraph-tools .message-copy-button {
+  align-items: center;
+  background: transparent;
+  border: 0;
+  border-radius: 4px;
+  box-shadow: none;
+  color: var(--muted);
+  display: inline-flex;
+  flex: 0 0 32px;
+  height: 32px;
+  justify-content: center;
+  min-height: 32px;
+  min-width: 32px;
+  padding: 0;
+  width: 32px;
+}
+
+.message-copy-button > svg { flex: 0 0 16px; height: 16px; width: 16px; }
+.message-copy-button:hover,
+.message-copy-button:focus-visible { background: var(--panel-strong); color: var(--ink); }
 
 .message-expand-button {
   background: rgba(255, 255, 255, 0.08);
@@ -8880,6 +8907,40 @@ article:hover {
 
 .process-detail-modal .message-body .bounded-text-block.is-expanded pre {
   max-height: none;
+}
+
+/* Share the visible viewport boundary across nested readers and configuration dialogs. */
+:is(.process-detail-modal-backdrop, .process-drawer-backdrop, .conversation-dialog-backdrop, .composer-settings-backdrop, .modal-backdrop) {
+  bottom: auto;
+  height: var(--visible-viewport-height, 100dvh);
+  left: var(--visible-viewport-left, 0px);
+  right: auto;
+  top: var(--visible-viewport-top, 0px);
+  width: var(--visible-viewport-width, 100vw);
+}
+
+:is(.process-detail-modal-backdrop, .process-drawer-backdrop, .conversation-dialog-backdrop, .composer-settings-backdrop, .modal-backdrop)
+  > :is(.process-detail-modal, .process-drawer, .conversation-dialog, .composer-settings-dialog, .modal-card) {
+  max-height: 100%;
+}
+
+:is(.process-detail-modal-backdrop, .process-drawer-backdrop, .conversation-dialog-backdrop)
+  > :is(.process-detail-modal, .process-drawer, .conversation-dialog) {
+  max-width: 100%;
+}
+
+.process-detail-modal-backdrop > .process-detail-modal:has(.bounded-text-block.is-expanded) {
+  max-height: 100%;
+  max-width: 100%;
+}
+
+.composer-settings-backdrop > .composer-settings-dialog {
+  max-width: min(760px, 100%);
+}
+
+.process-detail-modal dl:focus-visible {
+  outline: 2px solid #2462ad;
+  outline-offset: -2px;
 }
 
 .message-table-wrap {

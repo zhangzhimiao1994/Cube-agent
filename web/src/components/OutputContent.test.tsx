@@ -48,8 +48,13 @@ describe("shared output rendering", () => {
     await user.click(screen.getByRole("button", { name: "展开全文" }));
     expect(container.querySelector("p strong")?.textContent).toBe("关键结论");
     expect(container.querySelector("p")?.textContent).toContain("末尾完整内容。");
-    await user.click(screen.getByRole("button", { name: "复制全文" }));
+    const copyButton = screen.getByRole("button", { name: "复制全文" });
+    expect(copyButton.textContent).toBe("");
+    expect(copyButton.querySelector("svg")).toBeTruthy();
+    expect(copyButton.getAttribute("title")).toBe("复制全文");
+    await user.click(copyButton);
     await waitFor(() => expect(copy).toHaveBeenCalledWith(text));
+    expect(screen.getByRole("button", { name: "已复制全文" }).getAttribute("title")).toBe("已复制");
   });
 
   it("keeps multi-paragraph nested list text readable without repeated paragraph toolbars", () => {
@@ -233,7 +238,7 @@ describe("shared output rendering", () => {
     render(<OutputContent title="回复" format="plain" text={text} />);
     await user.click(screen.getByRole("button", { name: "复制全文" }));
     expect(copied).toBe(text);
-    expect(screen.getByRole("button", { name: "已复制" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "已复制全文" })).toBeTruthy();
     expect(document.querySelectorAll("textarea")).toHaveLength(0);
   });
 

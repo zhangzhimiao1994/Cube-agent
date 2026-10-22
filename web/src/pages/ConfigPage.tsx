@@ -3,6 +3,7 @@ import { FormEvent, useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 
 import { useNavSection } from "../app/navSections";
+import { useAuth } from "../auth/AuthProvider";
 import {
   ApiError,
   api,
@@ -83,10 +84,22 @@ function pluginPackageSubprocessStatusText(
 }
 
 export function ConfigPage() {
+  const { user } = useAuth();
+  const identity = user ? JSON.stringify([user.tenant_id, user.user_id, user.role]) : "anonymous";
+  // A new identity must not inherit an editable draft or an in-flight save's UI state.
+  return <IdentityConfigPage key={identity} />;
+}
+
+function IdentityConfigPage() {
+  const { user } = useAuth();
   const queryClient = useQueryClient();
   const { navTargetProps } = useNavSection();
   const current = useQuery({ queryKey: ["config-current"], queryFn: () => api.currentConfig() });
-  const settingsQuery = useQuery({ queryKey: ["settings"], queryFn: () => api.settings() });
+  const settingsQuery = useQuery({
+    queryKey: ["settings", user?.tenant_id, user?.user_id, user?.role],
+    queryFn: () => api.settings(),
+    enabled: Boolean(user),
+  });
   const agentsQuery = useQuery({ queryKey: ["agents"], queryFn: () => api.agents() });
   const workflowsQuery = useQuery({ queryKey: ["workflows"], queryFn: () => api.workflows() });
   const modelsQuery = useQuery({ queryKey: ["models"], queryFn: () => api.models() });
@@ -116,9 +129,19 @@ export function ConfigPage() {
 
   const saveSettings = useMutation({
     mutationFn: async () => {
-      if (!settings) throw new Error("设置尚未加载完成");
+      if (!user || !settings || !settingsQuery.isSuccess || settingsQuery.isError) throw new Error("当前身份的设置尚未加载完成，不能保存。");
       setSettingsLocalError(null);
-      return api.updateSettings(settings);
+      if (settings.supported_permission_modes.length === 0) return api.updateSettings(settings);
+      if (!settings.supported_permission_modes.includes(settings.default_permission_mode)) {
+        throw new Error("服务端不支持所选默认权限模式，请重新选择。");
+      }
+      if (settings.default_permission_mode === "auto_review" && settings.tool_approval_mode !== "auto_review") {
+        throw new Error("自动审查需要先启用全局规则审查，请调整默认权限模式或工具审批模式。");
+      }
+      return api.updateSettings({
+        ...settings,
+        default_sandbox_profile: settings.default_permission_mode === "read_only" ? "read_only" : settings.default_sandbox_profile,
+      });
     },
     onSuccess: async (saved) => {
       setSettings(saved);
@@ -153,6 +176,7 @@ export function ConfigPage() {
   });
 
   if (
+    !user ||
     current.isLoading ||
     settingsQuery.isLoading ||
     agentsQuery.isLoading ||
@@ -168,7 +192,7 @@ export function ConfigPage() {
   if (agentsQuery.isError) return <p role="alert">{formatApiError(agentsQuery.error, "Agent 列表加载失败")}</p>;
   if (workflowsQuery.isError) return <p role="alert">{formatApiError(workflowsQuery.error, "工作流列表加载失败")}</p>;
   if (modelsQuery.isError) return <p role="alert">{formatApiError(modelsQuery.error, "模型列表加载失败")}</p>;
-  if (!settings) return <p role="alert">系统设置加载失败：后端没有返回设置内容。</p>;
+  if (!settingsQuery.isSuccess || !settings) return <p>正在加载当前身份的系统设置...</p>;
 
   const agents = agentsQuery.data ?? [];
   const workflows = workflowsQuery.data ?? [];
@@ -348,6 +372,48 @@ export function ConfigPage() {
 
         <h3 {...navTargetProps("safety")}>安全与学习</h3>
         <fieldset>
+          <legend>沙箱权限</legend>
+          {settings.supported_permission_modes.length === 0 ? (
+            <p className="field-help">服务需更新：当前服务尚未支持权限模式协议，以下新默认值不可修改或保存。原有租户审批策略继续生效。</p>
+          ) : null}
+          <div className="form-grid">
+            <label htmlFor="default-permission-mode">
+              默认权限模式
+              <select id="default-permission-mode" value={settings.default_permission_mode}
+                disabled={settings.supported_permission_modes.length === 0}
+                onChange={(event) => {
+                  const next = event.target.value as SystemSettings["default_permission_mode"];
+                  if (!settings.supported_permission_modes.includes(next) || (next === "auto_review" && settings.tool_approval_mode !== "auto_review")) return;
+                  updateSettings({
+                    default_permission_mode: next,
+                    default_sandbox_profile: next === "read_only" ? "read_only"
+                      : settings.default_sandbox_profile === "read_only" ? "workspace_write" : settings.default_sandbox_profile,
+                  });
+                }}>
+                <option value="default" disabled={!settings.supported_permission_modes.includes("default")}>默认权限：边界内操作，需审批时人工确认</option>
+                <option value="auto_review" disabled={!settings.supported_permission_modes.includes("auto_review") || settings.tool_approval_mode !== "auto_review"}>自动审查：仅规则审查，非独立模型</option>
+                <option value="read_only" disabled={!settings.supported_permission_modes.includes("read_only")}>只读</option>
+              </select>
+            </label>
+            <label htmlFor="default-sandbox-profile">
+              默认沙箱边界
+              <select id="default-sandbox-profile" value={settings.default_permission_mode === "read_only" ? "read_only" : settings.default_sandbox_profile}
+                disabled={settings.supported_permission_modes.length === 0 || settings.default_permission_mode === "read_only"}
+                onChange={(event) => {
+                  const next = event.target.value as SystemSettings["default_sandbox_profile"];
+                  if (next === "read_only" && !settings.supported_permission_modes.includes("read_only")) return;
+                  updateSettings({ default_sandbox_profile: next, ...(next === "read_only" ? { default_permission_mode: "read_only" as const } : {}) });
+                }}>
+                <option value="none">不预授权工作区</option>
+                <option value="read_only" disabled={!settings.supported_permission_modes.includes("read_only")}>工作区只读</option>
+                <option value="restricted">受限读取与命令</option>
+                <option value="workspace_write">项目工作区读写与命令</option>
+              </select>
+            </label>
+          </div>
+          <p className="field-help">当前执行环境尚未开放完整访问。执行环境的固定隔离始终生效。</p>
+        </fieldset>
+        <fieldset>
           <legend>生产安全策略</legend>
           <label className="inline-check">
             <input
@@ -381,8 +447,8 @@ export function ConfigPage() {
               onChange={(event) => updateSettings({ tool_approval_mode: event.target.value as SystemSettings["tool_approval_mode"] })}
               disabled={!settings.require_approval_for_tools}
             >
-              <option value="auto_review">auto_review：Codex 自动审核安全工具</option>
-              <option value="ask">ask：全部交给人工审批</option>
+              <option value="auto_review">规则自动审查：有限安全产物，非独立模型</option>
+              <option value="ask">人工审批：全部交给人工确认</option>
             </select>
           </label>
           <label className="inline-check">
@@ -489,9 +555,11 @@ export function ConfigPage() {
         <button type="submit" data-testid="save-system-settings" disabled={saveSettings.isPending}>
           {saveSettings.isPending ? "正在保存设置..." : "保存系统设置"}
         </button>
-        {saveSettings.isSuccess ? <p role="status">系统设置已保存，并会在后续任务提交时作为默认值使用。</p> : null}
+        {saveSettings.isSuccess ? <p role="status">{settings.supported_permission_modes.length === 0
+          ? "原有系统设置已保存；沙箱权限默认值未保存，服务需更新。"
+          : "系统设置已保存，并会在后续任务提交时作为默认值使用。"}</p> : null}
         {settingsLocalError ? <p role="alert">{settingsLocalError}</p> : null}
-        {saveSettings.isError ? <p role="alert">{formatApiError(saveSettings.error, "系统设置保存失败")}</p> : null}
+        {saveSettings.isError && !settingsLocalError ? <p role="alert">{formatApiError(saveSettings.error, "系统设置保存失败")}</p> : null}
       </form>
 
       <details className="inline-guide">
