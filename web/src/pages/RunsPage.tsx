@@ -18,6 +18,7 @@ import {
   type DownloadableFile,
 } from "../components/ArtifactFileCard";
 import { repairActionLabel, repairErrorCodeLabel, repairFailureKindLabel, repairRecoveryStrategyLabel } from "./repairLabels";
+import { useCapabilityApprovalDecisions } from "./useCapabilityApprovalDecisions";
 
 const RUN_MODES = [
   { value: "auto", label: "自动", description: "主 Agent 判断应使用直连、派单、讨论或混合；不确定时向你确认。" },
@@ -84,6 +85,7 @@ type CapabilityApproval = {
   approvalId: string;
   version: number;
   summary: string;
+  toolName: string | null;
 };
 type RunSubmissionOverride = {
   message?: string;
@@ -2378,6 +2380,7 @@ function capabilityApprovalFromRunDetail(run: RunDetail | undefined): Capability
     approvalId,
     version: runDetailVersion(run),
     summary,
+    toolName: diagnostic?.tool_name?.trim() || pending?.tool_name?.trim() || null,
   };
 }
 
@@ -6682,7 +6685,23 @@ export function RunsPage() {
     version: number;
     proposal: RepairProposal;
   } | null>(null);
-  const [capabilityApproval, setCapabilityApproval] = useState<CapabilityApproval | null>(null);
+  const [capabilityApprovalCandidate, setCapabilityApproval] = useState<CapabilityApproval | null>(null);
+  const capabilityDecisions = useCapabilityApprovalDecisions((run, approval, decision) => {
+    if (selectedRunId === approval.runId) {
+      setSubmitNotice(decision === "approve"
+        ? "已允许本次沙箱工具调用，当前任务已重新排队继续执行。"
+        : "已拒绝本次沙箱工具调用，当前任务已取消。");
+    }
+    void refreshRunSurfaces({
+      id: approval.runId,
+      conversation_id: run.conversation_id ?? queryClient.getQueryData<RunDetail>(["run", approval.runId])?.conversation_id,
+    });
+  });
+  const capabilityDecision = capabilityDecisions.stateFor(capabilityApprovalCandidate);
+  const capabilityApproval = capabilityApprovalCandidate?.runId === selectedRunId && capabilityDecision?.status !== "success"
+    ? capabilityApprovalCandidate
+    : null;
+  const capabilityPending = capabilityDecision?.status === "pending";
   const trimmedReferenceConversationId = referenceConversationId.trim();
   const handoffActive = Boolean(trimmedReferenceConversationId);
 
@@ -7595,36 +7614,6 @@ export function RunsPage() {
     setSubmitNotice("已取消项目架构预检，本轮不会自动进入执行。你可以继续补充要求或重新发送。");
   };
 
-  const approveCapability = useMutation({
-    mutationFn: () => {
-      if (!capabilityApproval) throw new Error("capability approval is unavailable");
-      return api.approveCapability(capabilityApproval.runId, {
-        approval_id: capabilityApproval.approvalId,
-        version: capabilityApproval.version,
-      });
-    },
-    onSuccess: async (run) => {
-      setCapabilityApproval(null);
-      setSubmitNotice("已允许本次沙箱工具调用，当前任务已重新排队继续执行。");
-      await refreshRunSurfaces(run);
-    },
-  });
-
-  const rejectCapability = useMutation({
-    mutationFn: () => {
-      if (!capabilityApproval) throw new Error("capability approval is unavailable");
-      return api.rejectCapability(capabilityApproval.runId, {
-        approval_id: capabilityApproval.approvalId,
-        version: capabilityApproval.version,
-      });
-    },
-    onSuccess: async (run) => {
-      setCapabilityApproval(null);
-      setSubmitNotice("已拒绝本次沙箱工具调用，当前任务已取消。");
-      await refreshRunSurfaces(run);
-    },
-  });
-
   const cancelScheduleApproval = () => {
     if (!scheduleApproval) return;
     setDismissedScheduleApprovalRunIds((current) =>
@@ -8011,6 +8000,7 @@ export function RunsPage() {
       return;
     }
     if (capabilityApproval) {
+      if (capabilityPending) return;
       const choice = parseChoiceText(trimmed, [
         { value: "approve", label: "允许一次", aliases: ["允许", "同意", "通过", "approve", "yes", "allow"] },
         { value: "reject", label: "拒绝", aliases: ["拒绝", "取消", "reject", "no", "deny"] },
@@ -8022,11 +8012,11 @@ export function RunsPage() {
       setMessage("");
       if (choice.option.value === "approve") {
         setSubmitNotice("已选择允许一次，正在重新排队继续执行。");
-        approveCapability.mutate();
+        capabilityDecisions.approve(capabilityApproval);
         return;
       }
       setSubmitNotice("已选择拒绝，本次任务会取消。");
-      rejectCapability.mutate();
+      capabilityDecisions.reject(capabilityApproval);
       return;
     }
     if (modeSelection) {
@@ -9374,12 +9364,6 @@ export function RunsPage() {
             {approveProjectPreflight.isError ? (
               <p role="alert">{formatApiError(approveProjectPreflight.error, "项目预检确认失败")}</p>
             ) : null}
-            {approveCapability.isError ? (
-              <p role="alert">{formatApiError(approveCapability.error, "沙箱权限确认失败")}</p>
-            ) : null}
-            {rejectCapability.isError ? (
-              <p role="alert">{formatApiError(rejectCapability.error, "沙箱权限拒绝失败")}</p>
-            ) : null}
             {repairApproval ? (
               <aside className="composer-attachment-card" role="status" aria-label="自修复确认">
                 <div>
@@ -9430,25 +9414,26 @@ export function RunsPage() {
               <aside className="composer-attachment-card" role="status" aria-label="沙箱权限确认">
                 <div>
                   <span className="eyebrow">沙箱权限待确认</span>
-                  <strong>工具调用需要授权</strong>
+                  <strong>{capabilityApproval.toolName ?? "工具调用需要授权"}</strong>
                   <small>审批 {capabilityApproval.approvalId}</small>
                 </div>
                 <p>{capabilityApproval.summary}</p>
+                {capabilityDecision?.error ? <p role="alert">{capabilityDecision.error}</p> : null}
                 <div className="composer-card-actions">
                   <button
                     type="button"
-                    disabled={approveCapability.isPending || rejectCapability.isPending}
-                    onClick={() => approveCapability.mutate()}
+                    disabled={capabilityPending}
+                    onClick={() => capabilityDecisions.approve(capabilityApproval)}
                   >
-                    {approveCapability.isPending ? "允许中..." : "允许一次"}
+                    {capabilityPending && capabilityDecision.decision === "approve" ? "允许中..." : "允许一次"}
                   </button>
                   <button
                     type="button"
                     className="secondary-action"
-                    disabled={approveCapability.isPending || rejectCapability.isPending}
-                    onClick={() => rejectCapability.mutate()}
+                    disabled={capabilityPending}
+                    onClick={() => capabilityDecisions.reject(capabilityApproval)}
                   >
-                    {rejectCapability.isPending ? "拒绝中..." : "拒绝"}
+                    {capabilityPending && capabilityDecision.decision === "reject" ? "拒绝中..." : "拒绝"}
                   </button>
                 </div>
               </aside>

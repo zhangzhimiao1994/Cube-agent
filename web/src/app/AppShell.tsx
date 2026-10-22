@@ -137,7 +137,7 @@ export function AppShell() {
                     `nav-link${isActive || item.id === activeGroup?.id ? " nav-link-active" : ""}`
                   }
                 >
-                  {conversationWorkspace ? createNavigationIcon(navigationIcons[item.id] ?? Boxes) : null}
+                  {createNavigationIcon(navigationIcons[item.id] ?? Boxes)}
                   {item.label}
                 </NavLink>
               ))}
