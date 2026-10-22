@@ -22,6 +22,12 @@ from typing import Any, Self, cast
 from pydantic import BaseModel, ConfigDict, model_validator
 
 from agent_hub.capabilities.go_project_inputs import GoProjectInputs
+from agent_hub.skills.sandbox.go_project_binary_export import (
+    export_go_project_binary,
+    measure_go_project_binary,
+    seal_go_project_binary,
+)
+from agent_hub.skills.sandbox.go_project_business_runner import run_go_business_case
 from agent_hub.skills.sandbox.go_project_canary import GoOverlayCanary, create_go_overlay_canary
 from agent_hub.skills.sandbox.go_project_evidence import (
     GoEvidenceLimits,
@@ -40,7 +46,7 @@ from agent_hub.skills.sandbox.go_project_mounts import (
 )
 from agent_hub.skills.sandbox.go_project_protocol import GoProjectInvocation, _json
 from agent_hub.skills.sandbox.project_contract_mounts import ContractWork, validate_contract_work
-from agent_hub.skills.sandbox.project_runner import _copy_snapshot
+from agent_hub.skills.sandbox.project_runner import _cleanup_work, _copy_snapshot
 from agent_hub.skills.sandbox.python_project_mounts import _file_stamp, _pin_directory, _Pinned
 from agent_hub.skills.sandbox.python_project_process import (
     PYTHON_PHASE_OUTPUT_WITHHELD,
@@ -49,6 +55,7 @@ from agent_hub.skills.sandbox.python_project_process import (
     run_python_phase,
 )
 from agent_hub.skills.sandbox.toolchain_protocol import Digest, ToolchainReference
+from agent_hub.subprocess_cleanup import ProcessCleanupIncomplete
 
 _INPUT = Path('/run/agent-hub-go-source')
 _ORIGINAL = Path('/run/agent-hub-go-original')
@@ -223,6 +230,52 @@ def _check_detail(phase: str, result: PythonPhaseProcessResult) -> dict[str, Any
             'stderr_observed_bytes': result.stderr_observed_bytes}
 
 
+def _business_cases(
+    inputs: GoProjectInputs, invocation: GoProjectInvocation, report: dict[str, Any],
+    arguments: dict[str, Any], output: Path, deadline: float,
+) -> None:
+    assert inputs.acceptance is not None and inputs.business is not None
+    binary = report['binary']
+    rows: list[dict[str, object]] = []
+    report.update(acceptance_sha256=inputs.acceptance.sha256,
+                  business_suite_sha256=inputs.business.sha256, business_evidence=rows)
+    # Bound retained observations, including arbitrary-length original case IDs.
+    remaining = _MAX_REPORT_BYTES // 2
+
+    def collected(result: PythonPhaseProcessResult) -> None:
+        report['checks'][-1].update(_check_detail('business', result))
+        _trim_report_streams(report)
+
+    for index, case in enumerate(inputs.business.cases):
+        report['checks'][-1].clear()
+        report['checks'][-1].update(phase='business', status='failed')
+        _remaining(deadline)
+        _source_view(inputs, arguments)
+        _need(measure_go_project_binary(output, maximum=invocation.workspace_limit_bytes,
+                                    deadline=deadline) == binary, 'go_project_build_output_changed')
+        work = _WORK / ('business-' + str(index))
+        digest = _copy_snapshot(_INPUT, work, deadline)
+        _need(digest == report['source_sha256'], 'go_project_source_changed')
+        case_arguments = {**arguments, 'work_root': work,
+                          'source_timeout_seconds': min(3600.0, _remaining(deadline))}
+        observation = run_go_business_case(case, work_root=work, binary_root=output,
+            expected_binary_sha256=binary['sha256'], expected_binary_bytes=binary['size'],
+            contract_arguments=case_arguments, deadline=deadline,
+            output_limit_bytes=invocation.output_limit_bytes, on_collected=collected)
+        # No cleanup on uncertain child drain: the outer owner must first quiesce.
+        _source_view(inputs, case_arguments)
+        _need(measure_go_project_binary(output, maximum=invocation.workspace_limit_bytes,
+                                    deadline=deadline) == binary, 'go_project_build_output_changed')
+        payload = observation.to_payload()
+        remaining -= len(json.dumps(payload, sort_keys=True, separators=(',', ':'),
+                                    ensure_ascii=True, allow_nan=False).encode('ascii')) + 1
+        _need(remaining >= 0, 'go_project_output_incomplete')
+        rows.append(payload)
+        _cleanup_work(work, deadline)
+        _need(observation.passed, 'go_project_business_failed')
+    report['business_gate'] = 'completed'
+
+
 def run_go_project(plan: GoProjectRunnerPlan) -> dict[str, Any]:
     _native()
     _need(type(plan) is GoProjectRunnerPlan)
@@ -309,10 +362,18 @@ def run_go_project(plan: GoProjectRunnerPlan) -> dict[str, Any]:
                     'package_count': len(inventory.packages), 'test_count': len(inventory.expected_tests),
                     'source_go_file_count': len(inventory.source_go_files),
                     'report_sha256': hashlib.sha256(raw).hexdigest()}
+                if inputs.acceptance is not None:
+                    names = tuple(sorted(package + '::' + name
+                                         for package, name in inventory.expected_tests))
+                    _need(names == inputs.acceptance.test_ids, 'go_project_acceptance_tests_changed')
+                    report['named_tests'] = list(names)
             elif phase == 'build':
                 _need(result.exit_code == 0 and not result.timed_out, 'go_project_build_failed')
                 report['binary'] = _built_binary(output, maximum=invocation.workspace_limit_bytes,
                                                   deadline=deadline)
+                if inputs.business is not None:
+                    _need(seal_go_project_binary(output, maximum=invocation.workspace_limit_bytes,
+                        deadline=deadline) == report['binary'], 'go_project_build_output_changed')
             elif phase == 'test':
                 _need(inventory is not None)
                 assert inventory is not None
@@ -348,14 +409,26 @@ def run_go_project(plan: GoProjectRunnerPlan) -> dict[str, Any]:
                 _need(negative.observed_expected_failure, 'go_project_canary_failed')
                 report['canary'] = 'completed'
             check['status'] = 'completed'
+        if inputs.business is not None:
+            phase = 'business'
+            checks.append({'phase': phase, 'status': 'failed'})
+            _business_cases(inputs, invocation, report, arguments, output, deadline)
+            checks[-1]['status'] = 'completed'
         phase = 'source_integrity'
         arguments['source_timeout_seconds'] = min(3600.0, _remaining(deadline))
         _source_view(inputs, arguments)
         phase = 'toolchain'
         _check_sdk(inputs.toolchain, deadline=deadline)
+        if inputs.business is not None:
+            phase = 'export'
+            binary = report['binary']
+            _need(export_go_project_binary(output, _EXPORT,
+                expected_sha256=binary['sha256'], expected_bytes=binary['size'],
+                maximum=invocation.workspace_limit_bytes, deadline=deadline) == binary,
+                'go_project_build_output_changed')
     except (OSError, ValueError, TypeError, RuntimeError) as error:
         # Preserve collector diagnostics; exception messages may contain host paths.
-        code = ('go_project_cleanup_incomplete' if isinstance(error, PythonPhaseCleanupError)
+        code = ('go_project_cleanup_incomplete' if isinstance(error, (PythonPhaseCleanupError, ProcessCleanupIncomplete))
                 else 'go_project_timeout' if time.monotonic() >= deadline
                 else error.code if isinstance(error, GoProjectRunnerError)
                 else 'go_project_' + phase + '_failed')
@@ -366,6 +439,8 @@ def run_go_project(plan: GoProjectRunnerPlan) -> dict[str, Any]:
         report.update(status='failed', failed_phase=phase)
         if phase == 'canary':
             report['canary'] = 'failed'
+        if phase == 'business':
+            report['business_gate'] = 'failed'
     return cast(dict[str, Any], json.loads(encode_go_report(report)))
 
 

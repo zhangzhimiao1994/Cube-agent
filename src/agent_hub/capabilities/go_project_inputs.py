@@ -16,13 +16,18 @@ from types import MappingProxyType
 from typing import cast
 from uuid import UUID
 
+from agent_hub.capabilities.go_project_acceptance import (
+    GoAcceptanceManifest,
+    parse_go_acceptance_manifest,
+)
+from agent_hub.capabilities.go_project_business import GoBusinessLimits, GoBusinessSuite
 from agent_hub.capabilities.go_project_recipe import (
     GoProjectDeclaration,
     parse_go_project_declaration,
     validate_go_source_paths,
 )
 from agent_hub.capabilities.project_baselines import ProjectBaselineReference, StoredProjectBaseline
-from agent_hub.capabilities.project_contracts import ProjectCheckContract, _files
+from agent_hub.capabilities.project_contracts import ProjectCheckContract, _files, _spellings
 from agent_hub.capabilities.project_stack_registry import detect_stacks, is_stack_control_path
 from agent_hub.capabilities.scoped_read import _read_no_links
 from agent_hub.capabilities.types import CapabilityRequest
@@ -33,6 +38,8 @@ _ERROR = "go_project_inputs_invalid"
 _PROTECTED = "go_project_protected_input_changed"
 _RESOURCE = "workspace/current/project-verification/go/"
 _KIND = "go_stdlib_cli_v1"
+_BUSINESS_KIND = "go_stdlib_cli_business_v1"
+_MANIFEST = "ACCEPTANCE.json"
 
 
 def _need(value: object, code: str = _ERROR) -> None:
@@ -69,6 +76,18 @@ def _policy() -> dict[str, object]:
     }
 
 
+def _acceptance_limits(source_limit_bytes: int) -> GoBusinessLimits:
+    # Every case/stream/argument consumes original source bytes. JSON escaping
+    # can expand a UTF-8 byte by at most six ASCII bytes in canonical form.
+    return GoBusinessLimits(max_cases=source_limit_bytes, max_json_bytes=6 * source_limit_bytes,
+                            max_stream_bytes=source_limit_bytes, max_argv_bytes=source_limit_bytes)
+
+
+def _control_path(path: str) -> bool:
+    return is_stack_control_path(path) or any(
+        part.casefold() == _MANIFEST.casefold() for part in path.split("/"))
+
+
 @dataclass(frozen=True, slots=True)
 class GoProjectInputs:
     scope: ToolchainPlanScope
@@ -79,6 +98,7 @@ class GoProjectInputs:
     toolchain: ToolchainReference
     source_limit_bytes: int
     file_limit: int
+    acceptance: GoAcceptanceManifest | None = None
 
     def __post_init__(self) -> None:
         _need(
@@ -126,7 +146,7 @@ class GoProjectInputs:
         )
         contract.require_current(files)
         _need(detect_stacks(tuple(files)) == ("go",))
-        controls = {path for path in files if is_stack_control_path(path)}
+        controls = {path for path in files if _control_path(path)}
         _need(
             "go.mod" in controls and any(path.endswith("_test.go") for path in controls),
             "go_project_tests_missing",
@@ -139,6 +159,21 @@ class GoProjectInputs:
             _version(sdk.version) >= _version(declaration.go_version)
             and declaration.toolchain in {None, "default", "go" + sdk.version}
         )
+        _need((_MANIFEST in files) == (self.acceptance is not None))
+        if self.acceptance is not None:
+            _need(type(self.acceptance) is GoAcceptanceManifest)
+            manifest = GoAcceptanceManifest.from_payload(
+                self.acceptance.to_payload(), limits=_acceptance_limits(self.source_limit_bytes))
+            _spellings((*files, *manifest.editable_paths, *manifest.test_files))
+            _need(manifest.editable_paths == contract.editable_paths)
+            _need(set(manifest.test_files) == {path for path in files if path.endswith("_test.go")})
+            _need(all(contract.protected_files.get(path) == files[path]
+                      for path in (_MANIFEST, *manifest.test_files)), _PROTECTED)
+            module = declaration.module_path
+            _need(all(name.partition("::")[0] == module
+                      or name.partition("::")[0].startswith(module + "/")
+                      for name in manifest.test_ids))
+            object.__setattr__(self, "acceptance", manifest)
         object.__setattr__(self, "source_files", MappingProxyType(files))
 
     def require_current(self, source_files: Mapping[str, str]) -> None:
@@ -148,16 +183,16 @@ class GoProjectInputs:
         _need(len(current) <= self.file_limit)
         self.contract.require_current(current)
         original_controls = {
-            p: value for p, value in self.source_files.items() if is_stack_control_path(p)
+            p: value for p, value in self.source_files.items() if _control_path(p)
         }
-        controls = {p: value for p, value in current.items() if is_stack_control_path(p)}
+        controls = {p: value for p, value in current.items() if _control_path(p)}
         _need(controls == original_controls, _PROTECTED)
         _need(detect_stacks(tuple(current)) == ("go",))
 
     def _binding(self) -> dict[str, object]:
         return {
-            "schema_version": 1,
-            "kind": _KIND,
+            "schema_version": 1 if self.acceptance is None else 2,
+            "kind": _KIND if self.acceptance is None else _BUSINESS_KIND,
             "scope": self.scope.to_payload(),
             "contract": self.contract.to_payload(),
             "original_reference": self.original_reference.to_payload(),
@@ -167,7 +202,12 @@ class GoProjectInputs:
             "source_limit_bytes": self.source_limit_bytes,
             "file_limit": self.file_limit,
             **_policy(),
+            **({} if self.acceptance is None else {"acceptance": self.acceptance.to_payload()}),
         }
+
+    @property
+    def business(self) -> GoBusinessSuite | None:
+        return None if self.acceptance is None else self.acceptance.business
 
     @property
     def sha256(self) -> str:
@@ -191,10 +231,18 @@ class GoProjectInputs:
         }
 
     @classmethod
-    def from_payload(cls, value: object) -> GoProjectInputs:
+    def from_payload(
+        cls, value: object, *, limits: GoBusinessLimits | None = None,
+    ) -> GoProjectInputs:
+        """Validate binding data only, never authority or correspondence to raw bytes.
+
+        Root must rebuild from the sealed original manifest and measured source,
+        compare recipes, observe the SDK and enforce current execution approval.
+        """
         try:
             _need(type(value) is dict)
             item = cast(dict[str, object], value)
+            business = "acceptance" in item
             _need(
                 set(item)
                 == {
@@ -211,11 +259,16 @@ class GoProjectInputs:
                     "recipe_sha256",
                     "environment_input_sha256",
                     *_policy(),
+                    *({"acceptance"} if business else set()),
                 }
                 and type(item["schema_version"]) is int
-                and item["schema_version"] == 1
-                and item["kind"] == _KIND
+                and item["schema_version"] == (2 if business else 1)
+                and item["kind"] == (_BUSINESS_KIND if business else _KIND)
             )
+            _need(type(item["source_limit_bytes"]) is int
+                  and 1 <= item["source_limit_bytes"] <= 500 * 1024**2)
+            allocated = (_acceptance_limits(cast(int, item["source_limit_bytes"]))
+                         if limits is None else limits)
             result = cls(
                 scope=ToolchainPlanScope.from_payload(item["scope"]),
                 contract=ProjectCheckContract.from_payload(item["contract"]),
@@ -229,6 +282,8 @@ class GoProjectInputs:
                 ),
                 source_limit_bytes=cast(int, item["source_limit_bytes"]),
                 file_limit=cast(int, item["file_limit"]),
+                acceptance=(GoAcceptanceManifest.from_payload(item["acceptance"], limits=allocated)
+                            if business else None),
             )
             _need(_encoded(result.to_payload()) == _encoded(item))
             return result
@@ -237,8 +292,8 @@ class GoProjectInputs:
 
     def _approval_arguments(self) -> dict[str, object]:
         return {
-            "schema_version": 1,
-            "kind": _KIND,
+            "schema_version": 1 if self.acceptance is None else 2,
+            "kind": _KIND if self.acceptance is None else _BUSINESS_KIND,
             "recipe_sha256": self.sha256,
             "environment_input_sha256": self.environment_input_sha256,
             "scope": self.scope.to_payload(),
@@ -298,6 +353,7 @@ def bind_go_project_inputs(
     toolchain: ToolchainReference,
     source_limit_bytes: int,
     file_limit: int,
+    limits: GoBusinessLimits | None = None,
 ) -> GoProjectInputs:
     """Reread every recorded original file; Root still must rederive before exec.
 
@@ -326,6 +382,10 @@ def bind_go_project_inputs(
     declaration = parse_go_project_declaration(
         raw, max_source_bytes=source_limit_bytes, max_files=file_limit
     )
+    acceptance = None
+    if _MANIFEST in raw:
+        allocated = _acceptance_limits(source_limit_bytes) if limits is None else limits
+        acceptance = parse_go_acceptance_manifest(raw[_MANIFEST], limits=allocated)
     return GoProjectInputs(
         scope=scope,
         contract=stored.contract,
@@ -335,4 +395,5 @@ def bind_go_project_inputs(
         toolchain=toolchain,
         source_limit_bytes=source_limit_bytes,
         file_limit=file_limit,
+        acceptance=acceptance,
     )

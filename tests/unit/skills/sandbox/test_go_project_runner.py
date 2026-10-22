@@ -28,6 +28,7 @@ from agent_hub.skills.sandbox.python_project_process import (
     PythonPhaseCleanupError,
     PythonPhaseProcessResult,
 )
+from tests.unit.capabilities.test_go_project_acceptance import manifest
 from tests.unit.capabilities.test_go_project_inputs import case
 from tests.unit.skills.sandbox.test_go_project_evidence import event, happy, stream
 
@@ -40,13 +41,17 @@ def api() -> Any:
 
 
 @pytest.fixture
-def prepared(tmp_path: Path) -> Iterator[Any]:
+def prepared(tmp_path: Path, request: pytest.FixtureRequest) -> Iterator[Any]:
     original = tmp_path / 'original'
     original.mkdir()
-    fixture = case(original, editable=('main.go', 'assets'), changes={
+    changes = {
         'assets/readme.txt': b'non-Go input also requires full source binding\n',
         'inactive_windows.go': b'package main\n',
-    })
+    }
+    if getattr(request, 'param', False):
+        acceptance = replace(manifest(), editable_paths=('main.go', 'assets'))
+        changes['ACCEPTANCE.json'] = json.dumps(acceptance.to_payload()).encode()
+    fixture = case(original, editable=('main.go', 'assets'), changes=changes)
     inputs = bind_go_project_inputs(stored=fixture.stored, scope=fixture.scope,
         toolchain=fixture.sdk, source_limit_bytes=1024**2, file_limit=100)
     invocation = GoProjectInvocation(
@@ -286,6 +291,151 @@ def test_complete_diagnostic_chain_never_claims_delivery_pass(api: Any, orchestr
     assert len(caches) == len(set(caches)) == 4
     assert '"passed"' not in json.dumps(report)
     assert len(api.encode_go_report(report)) <= 32 * 1024**2
+
+
+@pytest.fixture
+def business_orchestration(
+    api: Any, orchestration: Any, monkeypatch: pytest.MonkeyPatch,
+) -> Any:
+    state = orchestration
+    state.business_calls = []
+    state.exports = []
+    state.binary_checks = []
+    state.business_fault = None
+    state.binary = {'filename': 'project', 'sha256': '8' * 64, 'size': 100}
+
+    def seal(output: Path, **arguments: Any) -> Any:
+        assert output == state.paths['WORK'] / 'output'
+        state.binary_checks.append(arguments)
+        return dict(state.binary)
+
+    def export(output: Path, destination: Path, **arguments: Any) -> Any:
+        assert len(state.business_calls) == 2
+        state.exports.append((output, destination, arguments))
+        return dict(state.binary)
+
+    def business(case: Any, **arguments: Any) -> Any:
+        from agent_hub.skills.sandbox.go_project_business_runner import GoBusinessObservation
+
+        state.business_calls.append((case, arguments))
+        assert state.phases == ['inspect', 'build', 'test', 'canary']
+        assert arguments['binary_root'] == state.paths['WORK'] / 'output'
+        assert arguments['expected_binary_sha256'] == state.binary['sha256']
+        assert arguments['expected_binary_bytes'] == state.binary['size']
+        work = arguments['work_root']
+        assert work.is_dir() and work != state.paths['WORK'] / 'source'
+        assert (work / 'ACCEPTANCE.json').read_bytes() == state.prepared.raw['ACCEPTANCE.json']
+        assert arguments['contract_arguments']['work_root'] == work
+        assert state.paths['EXPORT'] not in arguments.values()
+        if state.business_fault == 'cleanup' or (
+                state.business_fault == 'second-cleanup' and len(state.business_calls) == 2):
+            from agent_hub.subprocess_cleanup import ProcessCleanupIncomplete
+
+            raise ProcessCleanupIncomplete('private cgroup detail')
+        passed = state.business_fault != 'mismatch'
+        callback = arguments.get('on_collected')
+        if callback is not None:
+            callback(collected(case.expected_stdout if passed else 'actual unexpected result\n',
+                               exit_code=case.expected_exit))
+        return GoBusinessObservation(case_id=case.id, criterion_id=case.criterion_id,
+            case_sha256=hashlib.sha256(json.dumps(case.to_payload(), sort_keys=True,
+                separators=(',', ':'), ensure_ascii=True).encode()).hexdigest(),
+            expected_exit=case.expected_exit, exit_code=case.expected_exit, timed_out=False,
+            stdout_sha256=hashlib.sha256(case.expected_stdout.encode()).hexdigest(),
+            stderr_sha256=hashlib.sha256(case.expected_stderr.encode()).hexdigest(),
+            stdout_observed_bytes=len(case.expected_stdout.encode()),
+            stderr_observed_bytes=len(case.expected_stderr.encode()),
+            stdout_truncated=False, stderr_truncated=False,
+            stdout_utf8_complete=True, stderr_utf8_complete=True,
+            stdout_matches=passed, stderr_matches=True, passed=passed,
+            reason=None if passed else 'stdout_mismatch')
+
+    monkeypatch.setattr(api, 'seal_go_project_binary', seal, raising=False)
+    monkeypatch.setattr(api, 'measure_go_project_binary', seal, raising=False)
+    monkeypatch.setattr(api, 'export_go_project_binary', export, raising=False)
+    monkeypatch.setattr(api, 'run_go_business_case', business, raising=False)
+    return state
+
+
+@pytest.mark.parametrize('prepared', [True], indirect=True)
+def test_business_profile_runs_actual_case_adapter_before_export_without_self_attesting(
+    api: Any, business_orchestration: Any,
+) -> None:
+    state = business_orchestration
+    report = api.run_go_project(state.plan)
+    assert len(state.business_calls) == 2
+    assert len(state.exports) == 1
+    assert report['status'] == 'incomplete' and report['toolchain_measurement'] == 'not_run'
+    assert report['business_gate'] == 'completed'
+    assert report['acceptance_sha256'] == state.prepared.inputs.acceptance.sha256
+    assert report['business_suite_sha256'] == state.prepared.inputs.business.sha256
+    assert report['named_tests'] == ['example.org/demo::TestMainLogic']
+    assert len(report['business_evidence']) == 2
+    assert len(state.binary_checks) >= 3
+    assert [row['phase'] for row in report['checks']] == ['inspect', 'build', 'test', 'canary', 'business']
+
+
+@pytest.mark.parametrize('prepared', [True], indirect=True)
+@pytest.mark.parametrize('fault,code', [
+    ('mismatch', 'go_project_business_failed'), ('cleanup', 'go_project_cleanup_incomplete'),
+])
+def test_business_failure_or_cleanup_uncertainty_cannot_export_a_binary(
+    api: Any, business_orchestration: Any, fault: str, code: str,
+) -> None:
+    state = business_orchestration
+    state.business_fault = fault
+    report = api.run_go_project(state.plan)
+    assert report['status'] == 'failed' and report['failed_phase'] == 'business'
+    assert report['business_gate'] == 'failed'
+    assert report['checks'][-1]['error'] == code
+    assert len(state.business_calls) == 1 and not state.exports
+    assert 'private cgroup' not in json.dumps(report)
+
+
+@pytest.mark.parametrize('prepared', [True], indirect=True)
+def test_business_mismatch_keeps_actual_bounded_diagnostic_output_for_autonomous_repair(
+    api: Any, business_orchestration: Any,
+) -> None:
+    state = business_orchestration
+    state.business_fault = 'mismatch'
+    report = api.run_go_project(state.plan)
+    check = report['checks'][-1]
+    assert check['phase'] == 'business' and check['status'] == 'failed'
+    assert check['stdout'] == 'actual unexpected result\n'
+    assert check['stdout_observed_bytes'] == len(check['stdout'].encode())
+    assert report['business_evidence'][0]['reason'] == 'stdout_mismatch'
+    assert 'stdout' not in report['business_evidence'][0]
+    assert not state.exports
+
+
+@pytest.mark.parametrize('prepared', [True], indirect=True)
+def test_next_case_cleanup_does_not_retain_previous_case_diagnostics(
+    api: Any, business_orchestration: Any,
+) -> None:
+    state = business_orchestration
+    state.business_fault = 'second-cleanup'
+    report = api.run_go_project(state.plan)
+    assert len(state.business_calls) == 2
+    assert report['checks'][-1]['error'] == 'go_project_cleanup_incomplete'
+    assert 'stdout' not in report['checks'][-1]
+    assert 'stderr' not in report['checks'][-1]
+    assert not state.exports
+
+
+@pytest.mark.parametrize('prepared', [True], indirect=True)
+def test_manifest_named_tests_must_match_authenticated_inventory_before_build(
+    api: Any, orchestration: Any, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real = api.parse_go_source_inventory
+
+    def inventory(*args: Any, **kwargs: Any) -> Any:
+        return replace(real(*args, **kwargs), expected_tests=(('example.org/demo', 'TestOther'),))
+
+    monkeypatch.setattr(api, 'parse_go_source_inventory', inventory)
+    report = api.run_go_project(orchestration.plan)
+    assert report['status'] == 'failed' and report['failed_phase'] == 'inspect'
+    assert report['checks'][-1]['error'] == 'go_project_acceptance_tests_changed'
+    assert orchestration.phases == ['inspect']
 
 
 @pytest.mark.parametrize('fault,failed_phase,executed', [

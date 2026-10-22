@@ -1,7 +1,7 @@
 """Trusted synchronous Root Go diagnostics with protected candidate snapshots.
 
-No CLI, RPC admission, DB grant adapter, binary export or business receipt lives
-here. The trusted caller supplies live authority, execution/UNKNOWN fences and
+No CLI, RPC admission or DB grant adapter lives here. The trusted caller supplies
+live authority, execution/UNKNOWN fences and
 an already-created private stage, and owns its lifetime. Never retry uncertain
 cleanup or delete any stage here. Call only in a single-threaded Root helper.
 """
@@ -20,10 +20,12 @@ import time
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, replace
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol, cast
 
 from agent_hub.capabilities.go_project_inputs import GoProjectInputs, bind_go_project_inputs
+from agent_hub.capabilities.go_project_receipts import validate_go_passed_receipt
 from agent_hub.capabilities.go_project_recipe import (
     parse_go_project_declaration,
     validate_go_source_paths,
@@ -35,6 +37,7 @@ from agent_hub.capabilities.scoped_read import _read_no_links
 from agent_hub.skills.sandbox import python_project_backend as _python
 from agent_hub.skills.sandbox.base import SkillResult
 from agent_hub.skills.sandbox.broker import BrokerPolicy
+from agent_hub.skills.sandbox.go_project_binary_export import observe_go_project_binary
 from agent_hub.skills.sandbox.go_project_command import build_go_project_systemd_command
 from agent_hub.skills.sandbox.go_project_protocol import (
     GO_PROJECT_DIAGNOSTIC_MAX_BYTES,
@@ -373,19 +376,25 @@ def _report(process: PythonPhaseProcessResult, inv: GoProjectInvocation,
         'original_reference': inputs.original_reference.to_payload(),
         'original_check_contract': inputs.contract.protected_sha256,
         'toolchain': inputs.toolchain.model_dump(mode='json'), 'toolchain_measurement': 'not_run',
-        'business_gate': 'not_run', 'cache_reuse': 'none',
+        'cache_reuse': 'none',
     }
     _need(type(payload.get('schema_version')) is int
           and all(key in payload and _encoded(payload[key]) == _encoded(value)
                   for key, value in expected.items()))
     allowed = {*expected, 'status', 'checks', 'canary', 'failed_phase', 'inventory',
-               'binary', 'test_evidence', 'canary_evidence', 'diagnostics_withheld'}
+               'binary', 'test_evidence', 'canary_evidence', 'diagnostics_withheld', 'business_gate'}
+    if inputs.business is not None:
+        allowed |= {'acceptance_sha256', 'business_suite_sha256', 'named_tests', 'business_evidence'}
+    _need(payload.get('business_gate') in ({'not_run', 'completed', 'failed'}
+                                         if inputs.business is not None else {'not_run'}))
     _need(set(payload) <= allowed and payload.get('status') in {'incomplete', 'failed'}
           and payload.get('canary') in {'not_run', 'completed', 'failed'})
     checks = payload.get('checks')
     _need(type(checks) is list and len(checks) <= 8)
     checks = cast(list[dict[str, Any]], checks)
     phases = {'source', 'toolchain', 'source_integrity', 'inspect', 'build', 'test', 'canary'}
+    if inputs.business is not None:
+        phases |= {'business', 'export'}
     for row in checks:
         _need(type(row) is dict and row.get('phase') in phases
               and row.get('status') in {'completed', 'failed'})
@@ -414,6 +423,57 @@ def _report(process: PythonPhaseProcessResult, inv: GoProjectInvocation,
     return payload
 
 
+def _passed_receipt(
+    payload: dict[str, Any], inputs: GoProjectInputs, inv: GoProjectInvocation,
+    source_sha256: str, binary: dict[str, object],
+) -> dict[str, Any]:
+    """Only after trusted execution, quiet cgroup and independent Root measures."""
+    assert inputs.acceptance is not None and inputs.business is not None
+    phases = ('inspect', 'build', 'test', 'canary', 'business')
+    _need(payload.get('status') == 'incomplete' and payload.get('business_gate') == 'completed'
+          and payload.get('canary') == 'completed' and 'failed_phase' not in payload)
+    checks = payload.get('checks')
+    _need(type(checks) is list and len(checks) == len(phases)
+          and all(row.get('phase') == phase and row.get('status') == 'completed'
+                  and 'error' not in row for phase, row in zip(phases, checks, strict=True)))
+    _need(_encoded(payload.get('binary')) == _encoded(binary), 'go_project_environment_changed')
+    evidence, inventory, canary = (payload.get(name) for name in
+                                  ('test_evidence', 'inventory', 'canary_evidence'))
+    count = len(inputs.acceptance.test_ids)
+    _need(type(evidence) is dict and evidence.get('status') == 'completed'
+          and all(type(evidence.get(field)) is int and evidence[field] == expected
+                  for field, expected in (('required_test_count', count),
+                      ('required_passed_count', count), ('failed_count', 0)))
+          and type(inventory) is dict and type(inventory.get('test_count')) is int
+          and inventory['test_count'] == count
+          and inventory.get('module_path') == inputs.declaration.module_path)
+    _need(type(canary) is dict and canary.get('observed_expected_failure') is True
+          and canary.get('project_execution_id') == inv.execution_id
+          and type(canary.get('execution_id')) is str
+          and re.fullmatch(r'[a-z0-9][a-z0-9_-]{0,127}', canary['execution_id']) is not None
+          and canary['execution_id'] != inv.execution_id)
+    receipt: dict[str, Any] = {
+        'schema_version': 1, 'kind': 'go_project_execution_receipt', 'status': 'passed',
+        'execution_id': inv.execution_id, 'scope': inputs.scope.to_payload(),
+        'source_kind': inv.source_kind, 'source_sha256': source_sha256,
+        'recipe_sha256': inputs.sha256, 'environment_input_sha256': inputs.environment_input_sha256,
+        'original_reference': inputs.original_reference.to_payload(),
+        'original_check_contract': inputs.contract.protected_sha256,
+        'toolchain': inputs.toolchain.model_dump(mode='json'),
+        'acceptance_sha256': payload.get('acceptance_sha256'),
+        'business_suite_sha256': payload.get('business_suite_sha256'),
+        'binary': {**binary, 'format': 'ELF64', 'target': 'linux_amd64'},
+        'checks': [{'phase': phase, 'status': 'passed'} for phase in phases],
+        'named_tests': payload.get('named_tests'), 'business_evidence': payload.get('business_evidence'),
+        'verified_at': datetime.now(UTC).isoformat(),
+    }
+    validate_go_passed_receipt(receipt, inputs=inputs, expected_source=source_sha256,
+        expected_binary_sha256=cast(str, binary['sha256']),
+        expected_binary_bytes=cast(int, binary['size']),
+        expected_execution_id=inv.execution_id, source_kind=inv.source_kind)
+    return receipt
+
+
 def _response(request: GoProjectRequest, **outcome: Any) -> GoProjectResponse:
     inv = request.invocation
     response = GoProjectResponse(action=request.action, execution_id=inv.execution_id,
@@ -430,8 +490,9 @@ def execute_go_project_request(
     """Caller-authorized Root helper only; never RPC/event-loop/thread admission.
 
     Full archive/tree observations before and after are Root's own acceptance
-    checks. They do not rewrite the runner's toolchain_measurement=not_run or
-    turn its diagnostic result into a service approval or business receipt.
+    checks. The runner stays diagnostic-only. A separate optional receipt requires
+    original business fixtures, real observations and Root's independent binary
+    measurement; neither response is itself DB approval or delivery authority.
     """
     _need(type(request) is GoProjectRequest, 'go_project_request_invalid')
     try:
@@ -469,12 +530,18 @@ def execute_go_project_request(
             _check(deadline)
             source_sha256 = _source_snapshot(original, inputs, inv, policy, stage, deadline)
             snapshot = original.snapshot if inv.source_kind == 'original' else stage / 'snapshot'
+            binary: dict[str, object] | None = None
 
             def remeasure() -> None:
                 recheck()
                 _need(_measured_inputs(original, inv, catalog, deadline) == inputs,
                       'go_project_environment_changed')
                 _recheck_source(original, inputs, inv, snapshot, source_sha256, deadline)
+                if binary is not None:
+                    _need(observe_go_project_binary(roots.stage_fd, gid=policy.allowed_gid,
+                        service_uid=policy.allowed_uid,
+                        maximum=inv.workspace_limit_bytes, deadline=deadline) == binary,
+                        'go_project_environment_changed')
                 recheck()
 
             if request.action == 'inspect_go_project_environment':
@@ -504,12 +571,21 @@ def execute_go_project_request(
                     raise ProcessCleanupIncomplete('go_project_cleanup_incomplete') from None
                 finally:
                     _quiesce(policy, job)
-                _report(process, inv, inputs, source_sha256)
-                _export_empty(roots.stage_fd, deadline)
+                payload = _report(process, inv, inputs, source_sha256)
+                receipt = None
+                if (inputs.business is not None and payload.get('status') == 'incomplete'
+                        and payload.get('business_gate') == 'completed'):
+                    remeasure()
+                    binary = observe_go_project_binary(roots.stage_fd, gid=policy.allowed_gid,
+                        service_uid=policy.allowed_uid,
+                        maximum=inv.workspace_limit_bytes, deadline=deadline)
+                    receipt = _passed_receipt(payload, inputs, inv, source_sha256, binary)
+                else:
+                    _export_empty(roots.stage_fd, deadline)
                 remeasure()
                 response = _response(request, ok=True, result=SkillResult(
                     exit_code=process.exit_code, stdout=process.stdout, stderr=process.stderr,
-                    timed_out=False))
+                    timed_out=False), receipt=receipt)
                 _authorize(authorize, inputs, inv)
             remeasure()
             _native()

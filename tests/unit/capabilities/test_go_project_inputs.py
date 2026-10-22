@@ -271,3 +271,149 @@ def test_payload_cannot_change_policy_or_digests(api: Any, tmp_path: Path) -> No
     ):
         with pytest.raises(ValueError):
             api.GoProjectInputs.from_payload(inputs.to_payload() | change)
+
+
+def acceptance_payload() -> dict[str, Any]:
+    return {
+        "schema_version": 2, "stack": "go", "editable_paths": ["main.go"],
+        "test_files": ["main_test.go"],
+        "criteria": [{"id": "AC-001", "description": "CLI result",
+                      "tests": ["example.org/demo::TestMainLogic"]}],
+        "business": {"schema_version": 1, "kind": "go_cli_business_v1", "cases": [
+            {"id": "ok", "criterion_id": "AC-001", "argv": [], "stdin": "",
+             "expected_stdout": "ok\n", "expected_stderr": "", "expected_exit": 0},
+            {"id": "bad", "criterion_id": "AC-001", "argv": ["bad"], "stdin": "",
+             "expected_stdout": "", "expected_stderr": "bad\n", "expected_exit": 2},
+        ]},
+    }
+
+
+def test_original_acceptance_is_bound_in_versioned_recipe(api: Any, tmp_path: Path) -> None:
+    payload = acceptance_payload()
+    value = case(tmp_path, changes={"ACCEPTANCE.json": encoded(payload)})
+    inputs = bind(api, value)
+    assert inputs.acceptance.to_payload() == payload
+    assert inputs.business == inputs.acceptance.business
+    assert inputs.to_payload()["schema_version"] == 2
+    assert inputs.to_payload()["kind"] == "go_stdlib_cli_business_v1"
+    assert inputs.to_payload()["acceptance"] == payload
+    assert api.GoProjectInputs.from_payload(inputs.to_payload()) == inputs
+    assert inputs.matches_approval_request(inputs.approval_request(
+        user_id=UUID(int=2), agent_id="main_agent", idempotency_key="business"))
+    with pytest.raises(ValueError):
+        replace(inputs, acceptance=None)
+    changed = dict(value.files) | {"main.go": "1" * 64}
+    inputs.require_current(changed)
+    with pytest.raises(ValueError):
+        inputs.require_current(changed | {"ACCEPTANCE.json": "2" * 64})
+    with pytest.raises(ValueError):
+        inputs.require_current(changed | {"nested/ACCEPTANCE.json": "2" * 64})
+
+
+def test_legacy_payload_and_recipe_are_byte_compatible(api: Any, tmp_path: Path) -> None:
+    inputs = bind(api, case(tmp_path))
+    assert inputs.acceptance is None and inputs.business is None
+    payload = inputs.to_payload()
+    assert "acceptance" not in payload
+    assert set(payload) == {"schema_version", "kind", "scope", "contract", "original_reference",
+        "source_files", "declaration", "toolchain", "source_limit_bytes", "file_limit",
+        "dependency_policy", "external_dependencies", "build_target", "test_target",
+        "recipe_sha256", "environment_input_sha256"}
+    binding = {key: value for key, value in payload.items()
+               if key not in {"recipe_sha256", "environment_input_sha256"}}
+    assert inputs.sha256 == hashlib.sha256(encoded(binding)).hexdigest()
+    assert payload["schema_version"] == 1 and payload["kind"] == "go_stdlib_cli_v1"
+
+
+@pytest.mark.parametrize("change", [
+    {"schema_version": 1}, {"stack": "node"}, {"unknown": True},
+    {"editable_paths": ["other.go"]}, {"test_files": ["absent_test.go"]},
+    {"criteria": [{"id": "AC-001", "description": "outside module",
+                   "tests": ["example.org/demonstration::TestMainLogic"]}]},
+])
+def test_bad_original_manifest_cannot_fall_back_to_diagnostics(
+    api: Any, tmp_path: Path, change: dict[str, object],
+) -> None:
+    with pytest.raises(ValueError):
+        bind(api, case(tmp_path, changes={"ACCEPTANCE.json": encoded(acceptance_payload() | change)}))
+
+
+def test_manifest_must_be_protected_and_cover_every_original_test(api: Any, tmp_path: Path) -> None:
+    raw = encoded(acceptance_payload())
+    with pytest.raises(ValueError):
+        bind(api, case(tmp_path / "unprotected", editable=("main.go", "ACCEPTANCE.json"),
+                       changes={"ACCEPTANCE.json": raw}))
+    with pytest.raises(ValueError):
+        bind(api, case(tmp_path / "unlisted", changes={"ACCEPTANCE.json": raw,
+                       "extra_test.go": b"package main\n"}))
+
+
+def test_payload_cannot_downgrade_or_detach_business_manifest(api: Any, tmp_path: Path) -> None:
+    inputs = bind(api, case(tmp_path, changes={"ACCEPTANCE.json": encoded(acceptance_payload())}))
+    payload = inputs.to_payload()
+    for changed in (
+        payload | {"schema_version": 1}, payload | {"kind": "go_stdlib_cli_v1"},
+        payload | {"acceptance": None}, payload | {"approved": True},
+        {key: value for key, value in payload.items() if key != "acceptance"},
+    ):
+        with pytest.raises(ValueError):
+            api.GoProjectInputs.from_payload(changed)
+
+
+def test_sealed_manifest_mutation_is_rejected(api: Any, tmp_path: Path) -> None:
+    value = case(tmp_path, changes={"ACCEPTANCE.json": encoded(acceptance_payload())})
+    (tmp_path / "ACCEPTANCE.json").write_bytes(b"{}")
+    with pytest.raises(ValueError):
+        bind(api, value)
+
+
+def test_explicit_caller_budget_is_enforced_for_bind_and_payload(api: Any, tmp_path: Path) -> None:
+    from agent_hub.capabilities.go_project_business import GoBusinessLimits
+
+    value = case(tmp_path, changes={"ACCEPTANCE.json": encoded(acceptance_payload())})
+    inputs = bind(api, value)
+    limits = GoBusinessLimits(max_cases=1, max_json_bytes=1024**2,
+                              max_stream_bytes=1024**2, max_argv_bytes=1024**2)
+    with pytest.raises(ValueError):
+        api.bind_go_project_inputs(stored=value.stored, scope=value.scope, toolchain=value.sdk,
+                                   source_limit_bytes=1024**2, file_limit=100, limits=limits)
+    with pytest.raises(ValueError):
+        api.GoProjectInputs.from_payload(inputs.to_payload(), limits=limits)
+
+
+def test_recipe_binds_all_expectations_and_case_order_without_attesting_raw_bytes(
+    api: Any, tmp_path: Path,
+) -> None:
+    value = case(tmp_path, changes={"ACCEPTANCE.json": encoded(acceptance_payload())})
+    inputs = bind(api, value)
+    request = inputs.approval_request(user_id=UUID(int=2), agent_id="main_agent",
+                                      idempotency_key="original")
+    for manifest in (
+        replace(inputs.acceptance, criteria=(replace(inputs.acceptance.criteria[0],
+                                                     description="different"),)),
+        replace(inputs.acceptance, business=replace(inputs.business, cases=tuple(
+            reversed(inputs.business.cases)))),
+        replace(inputs.acceptance, business=replace(inputs.business, cases=(
+            replace(inputs.business.cases[0], expected_stdout="different"),
+            inputs.business.cases[1]))),
+    ):
+        changed = replace(inputs, acceptance=manifest)
+        assert changed.sha256 != inputs.sha256
+        assert changed.environment_input_sha256 == inputs.environment_input_sha256
+        assert not changed.matches_approval_request(request)
+        with pytest.raises(ValueError):
+            api.GoProjectInputs.from_payload(inputs.to_payload() | {"acceptance": manifest.to_payload()})
+        # A self-consistent payload validates data, not authenticity of the raw
+        # original: Root must independently rebuild the sealed recipe below.
+        assert api.GoProjectInputs.from_payload(changed.to_payload()) == changed
+        assert bind(api, value).sha256 == inputs.sha256
+
+
+def test_named_subpackage_can_bind_but_must_stay_inside_the_module(api: Any, tmp_path: Path) -> None:
+    payload = acceptance_payload()
+    payload["criteria"][0]["tests"] = ["example.org/demo/logic::TestLogic"]
+    payload["test_files"].append("logic/logic_test.go")
+    value = case(tmp_path, changes={"ACCEPTANCE.json": encoded(payload),
+                                    "logic/logic_test.go": b"package logic\n"})
+    inputs = bind(api, value)
+    assert inputs.acceptance.test_ids == ("example.org/demo/logic::TestLogic",)

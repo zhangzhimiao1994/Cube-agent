@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
+import json
 from typing import Any
 from uuid import UUID
 
 import pytest
+from pydantic import ConfigDict, create_model
 
 from agent_hub.skills.sandbox.project import ContractProjectBrokerRequest, ProjectBrokerRequest
 from agent_hub.skills.sandbox.python_project_protocol import PythonProjectBrokerRequest
@@ -297,3 +299,298 @@ def test_unknown_request_fields_and_constructed_install_authority_are_revalidate
         response(api, call).require_for(bad)
     with pytest.raises(ValueError):
         api.base_go_invocation(bad.invocation)
+
+
+def receipt_payload(call: Any) -> dict[str, Any]:
+    inv = call.invocation
+    evidence = [{
+        'case_id': name, 'criterion_id': 'AC-001', 'case_sha256': '4' * 64,
+        'expected_exit': code, 'exit_code': code, 'timed_out': False,
+        'stdout_sha256': '5' * 64, 'stderr_sha256': '6' * 64,
+        'stdout_observed_bytes': 0, 'stderr_observed_bytes': 0,
+        'stdout_truncated': False, 'stderr_truncated': False,
+        'stdout_utf8_complete': True, 'stderr_utf8_complete': True,
+        'stdout_matches': True, 'stderr_matches': True, 'passed': True, 'reason': None,
+    } for name, code in (('success', 0), ('invalid', 2))]
+    return {
+        'schema_version': 1, 'kind': 'go_project_execution_receipt', 'status': 'passed',
+        'execution_id': inv.execution_id, 'scope': inv.scope.model_dump(mode='json'),
+        'source_kind': inv.source_kind,
+        'source_sha256': inv.scope.source_sha256 if inv.source_kind == 'original' else '9' * 64,
+        'recipe_sha256': inv.recipe_sha256,
+        'environment_input_sha256': inv.environment_input_sha256,
+        'original_reference': inv.original_reference.model_dump(mode='json'),
+        # This is the protected-input hash, not the baseline reference hash.
+        'original_check_contract': '7' * 64,
+        'toolchain': inv.toolchain.model_dump(mode='json'),
+        'acceptance_sha256': '8' * 64, 'business_suite_sha256': '9' * 64,
+        'binary': {'filename': 'project', 'sha256': 'a' * 64, 'size': 42,
+                   'format': 'ELF64', 'target': 'linux_amd64'},
+        'checks': [{'phase': phase, 'status': 'passed'}
+                   for phase in ('inspect', 'build', 'test', 'canary', 'business')],
+        'named_tests': ['example.org/demo::TestA'], 'business_evidence': evidence,
+        'verified_at': '2026-10-22T01:02:03Z',
+    }
+
+
+def receipted_response(api: Any, call: Any, **changes: Any) -> Any:
+    return api.parse_go_project_response(json.dumps(
+        response(api, call).model_dump(mode='json') | {'receipt': receipt_payload(call)} | changes,
+    ).encode())
+
+
+@pytest.mark.parametrize('kind', ['original', 'candidate'])
+def test_receipt_is_typed_frozen_data_bound_to_request(api: Any, kind: str) -> None:
+    call = api.GoProjectRequest(action='run_go_project', invocation=invocation(api, source_kind=kind))
+    reply = receipted_response(api, call)
+    reply.require_for(call)
+    assert isinstance(reply.receipt, api.GoProjectReceipt)
+    assert reply.receipt.model_dump(mode='json') == receipt_payload(call)
+    # Root/backend dictionaries must work without callers constructing nested DTOs.
+    assert api.GoProjectResponse.model_validate(
+        response(api, call).model_dump() | {'receipt': receipt_payload(call)}, strict=True,
+    ) == reply
+    for item, field, value in (
+        (reply.receipt, 'source_kind', 'candidate'),
+        (reply.receipt.binary, 'size', 43),
+        (reply.receipt.checks[0], 'status', 'failed'),
+        (reply.receipt.business_evidence[0], 'passed', False),
+    ):
+        with pytest.raises(ValueError):
+            setattr(item, field, value)
+    assert isinstance(reply.receipt.checks, tuple)
+    assert isinstance(reply.receipt.named_tests, tuple)
+    assert isinstance(reply.receipt.business_evidence, tuple)
+
+
+@pytest.mark.parametrize('action', ['run_go_project', 'inspect_go_project_environment'])
+@pytest.mark.parametrize('ok', [True, False])
+def test_legacy_diagnostic_responses_keep_receipt_optional(api: Any, action: str, ok: bool) -> None:
+    call = request(api, action)
+    payload = response(api, call, ok=ok).model_dump(mode='json')
+    payload.pop('receipt', None)
+    reply = api.parse_go_project_response(json.dumps(payload).encode())
+    reply.require_for(call)
+    assert reply.receipt is None
+
+
+@pytest.mark.parametrize('action', ['run_go_project', 'inspect_go_project_environment'])
+@pytest.mark.parametrize('ok', [True, False])
+def test_new_diagnostic_serializer_is_accepted_by_previous_strict_wire_shape(
+    api: Any, action: str, ok: bool,
+) -> None:
+    legacy = create_model('LegacyV8Response', __config__=ConfigDict(extra='forbid', strict=True),
+        **{name: (field.annotation, field) for name, field in api.GoProjectResponse.model_fields.items()
+           if name != 'receipt'})
+    reply = response(api, request(api, action), ok=ok)
+    raw = reply.model_dump_json()
+    assert 'receipt' not in json.loads(raw)
+    assert legacy.model_validate_json(raw, strict=True).execution_id == reply.execution_id
+
+
+@pytest.mark.parametrize('action,ok', [
+    ('run_go_project', False), ('inspect_go_project_environment', False),
+    ('inspect_go_project_environment', True),
+])
+def test_only_successful_run_can_carry_receipt(api: Any, action: str, ok: bool) -> None:
+    call = request(api, action)
+    with pytest.raises(ValueError):
+        api.GoProjectResponse.model_validate_json(json.dumps(
+            response(api, call, ok=ok).model_dump(mode='json') | {'receipt': receipt_payload(call)},
+        ), strict=True)
+
+
+@pytest.mark.parametrize('patch', [
+    {'exit_code': 1}, {'exit_code': None}, {'timed_out': True},
+])
+def test_passed_receipt_requires_successful_process_result(api: Any, patch: dict[str, object]) -> None:
+    call = request(api)
+    payload = response(api, call).model_dump(mode='json')
+    payload['result'].update(patch)
+    with pytest.raises(ValueError):
+        receipted_response(api, call, result=payload['result'])
+
+
+@pytest.mark.parametrize('path,value', [
+    (('schema_version',), True), (('schema_version',), 1.0),
+    (('status',), 'failed'), (('kind',), 'go_project'),
+    (('binary', 'size'), True), (('binary', 'size'), 0),
+    (('binary', 'size'), 2**63), (('binary', 'format'), 'PE'),
+    (('binary', 'filename'), '/tmp/project'), (('binary', 'target'), 'win32'),
+    (('binary', 'sha256'), 'A' * 64), (('binary', 'authority'), True),
+    (('scope', 'user_id'), 1), (('toolchain', 'total_bytes'), True),
+    (('original_reference', 'schema_version'), True),
+    (('checks', 0, 'status'), 'completed'), (('checks', 0, 'phase'), 'business'),
+    (('checks', 0, 'extra'), True),
+    (('business_evidence', 0, 'exit_code'), True),
+    (('business_evidence', 0, 'exit_code'), 2),
+    (('business_evidence', 0, 'expected_exit'), 256),
+    (('business_evidence', 0, 'timed_out'), 0),
+    (('business_evidence', 0, 'passed'), 1),
+    (('business_evidence', 0, 'stdout_utf8_complete'), False),
+    (('business_evidence', 0, 'stderr_matches'), False),
+    (('business_evidence', 0, 'stdout_truncated'), True),
+    (('business_evidence', 0, 'stderr_observed_bytes'), -1),
+    (('business_evidence', 0, 'stdout_observed_bytes'), 2**63),
+    (('business_evidence', 0, 'reason'), 'failed'),
+    (('business_evidence', 0, 'approval'), True),
+    (('verified_at',), '2026-02-30T00:00:00Z'),
+    (('verified_at',), '2026-10-22T01:02:03+01:00'),
+    (('verified_at',), '2026-10-22'),
+    (('named_tests',), []), (('named_tests',), ['a', 'a']),
+    (('named_tests',), [1]), (('checks',), []), (('business_evidence',), []),
+    (('approval',), True), (('provenance',), 'root'),
+])
+def test_receipt_rejects_coercion_extra_fields_and_invalid_nested_data(
+    api: Any, path: tuple[str | int, ...], value: object,
+) -> None:
+    call = request(api)
+    payload = receipt_payload(call)
+    parent: Any = payload
+    for key in path[:-1]:
+        parent = parent[key]
+    parent[path[-1]] = value
+    with pytest.raises(ValueError):
+        receipted_response(api, call, receipt=payload)
+
+
+@pytest.mark.parametrize('path', [
+    ('binary', 'size'), ('checks', 0, 'status'), ('business_evidence', 0, 'reason'),
+    ('schema_version',), ('original_reference', 'schema_version'),
+    ('toolchain', 'schema_version'), ('toolchain', 'kind'),
+])
+def test_receipt_requires_every_nested_field(api: Any, path: tuple[str | int, ...]) -> None:
+    call = request(api)
+    payload = receipt_payload(call)
+    parent: Any = payload
+    for key in path[:-1]:
+        parent = parent[key]
+    del parent[path[-1]]
+    with pytest.raises(ValueError):
+        receipted_response(api, call, receipt=payload)
+
+
+@pytest.mark.parametrize('field,value', [
+    ('execution_id', 'other'), ('recipe_sha256', '0' * 64),
+    ('environment_input_sha256', '0' * 64), ('source_sha256', '0' * 64),
+    ('scope', None), ('toolchain', None),
+])
+def test_receipt_basic_identity_must_match_response(
+    api: Any, field: str, value: object,
+) -> None:
+    call = request(api)
+    payload = receipt_payload(call)
+    if field == 'scope':
+        value = payload[field] | {'user_id': str(UUID(int=99))}
+    elif field == 'toolchain':
+        value = payload[field] | {'tree_sha256': '0' * 64}
+    payload[field] = value
+    with pytest.raises(ValueError):
+        receipted_response(api, call, receipt=payload)
+
+
+def test_require_for_binds_receipt_source_kind_and_full_original_reference(api: Any) -> None:
+    original = request(api)
+    reply = receipted_response(api, original)
+    for changes in (
+        {'source_kind': 'candidate'},
+        {'original_reference': original.invocation.original_reference.model_copy(
+            update={'file_count': 4},
+        )},
+    ):
+        other = api.GoProjectRequest(action=original.action, invocation=invocation(api, **changes))
+        with pytest.raises(ValueError):
+            reply.require_for(other)
+    forged = reply.model_copy(update={
+        'receipt': reply.receipt.model_copy(update={'source_sha256': '0' * 64}),
+    })
+    with pytest.raises(ValueError):
+        forged.require_for(original)
+
+
+@pytest.mark.parametrize('ascii_wire', [True, False])
+def test_receipt_and_diagnostics_share_serialized_metadata_budget(
+    api: Any, ascii_wire: bool,
+) -> None:
+    call = request(api)
+    payload = receipt_payload(call)
+    payload['named_tests'] = ['example.org/\u4e2d\U0001f600::TestA']
+    metadata_size = len(json.dumps(payload, ensure_ascii=True, separators=(',', ':')).encode('ascii'))
+    reply = receipted_response(api, call, receipt=payload)
+    raw = json.dumps(reply.model_dump(mode='json'), ensure_ascii=ascii_wire).encode('utf-8')
+    assert api.parse_go_project_response(raw, diagnostic_limit_bytes=metadata_size + 2) == reply
+    with pytest.raises(ValueError):
+        api.parse_go_project_response(raw, diagnostic_limit_bytes=metadata_size + 1)
+
+
+def test_model_receipt_cannot_bypass_total_32mib_budget(api: Any) -> None:
+    call = request(api)
+    receipt = receipt_payload(call)
+    streams = response(api, call, stdout='x' * (32 * 1024**2)).model_dump()
+    with pytest.raises(ValueError):
+        api.GoProjectResponse.model_validate(streams | {'receipt': receipt}, strict=True)
+
+
+@pytest.mark.parametrize('metadata_padding', [0, 1024**2 + 1])
+async def test_existing_client_transports_receipt_and_enforces_combined_budget(
+    api: Any, monkeypatch: pytest.MonkeyPatch, metadata_padding: int,
+) -> None:
+    from agent_hub.skills.sandbox import go_project_client as client
+    from tests.unit.skills.sandbox.test_go_project_client import SOCKET, connect_wire
+
+    monkeypatch.setattr(client, '_systemd_supported', lambda: True)
+    call = request(api)
+    payload = receipt_payload(call)
+    payload['named_tests'][0] += 'x' * metadata_padding
+    reply = receipted_response(api, call, receipt=payload)
+    raw = reply.model_dump_json().encode()
+    writer = connect_wire(monkeypatch, raw)
+    assert await client.request_go_project_broker(call, socket_path=SOCKET) == reply
+    assert writer.closed and writer.waited
+    writer = connect_wire(monkeypatch, raw)
+    with pytest.raises(ValueError, match='^go_project_request_invalid$'):
+        await client.request_go_project_broker(call, socket_path=SOCKET, diagnostic_limit_bytes=2)
+    assert writer.closed and writer.waited
+
+
+def test_typed_receipt_roundtrips_through_independent_capability_validator(api: Any) -> None:
+    from agent_hub.capabilities.go_project_acceptance import (
+        GoAcceptanceCriterion,
+        GoAcceptanceManifest,
+    )
+    from agent_hub.capabilities.go_project_business import GoBusinessCase, GoBusinessSuite
+    from agent_hub.capabilities.go_project_receipts import validate_go_passed_receipt
+    from tests.unit.capabilities.test_go_project_receipts import _inputs, _receipt
+
+    trusted = _inputs(GoAcceptanceManifest(
+        editable_paths=('main.go',), test_files=('main_test.go',),
+        criteria=(GoAcceptanceCriterion('AC-001', 'Handle valid and invalid input',
+                                       ('example.org/demo::TestA', 'example.org/demo::TestB')),),
+        business=GoBusinessSuite((
+            GoBusinessCase('success', 'AC-001', (), '', 'ok', '', 0),
+            GoBusinessCase('invalid', 'AC-001', (), '', '', 'invalid', 2),
+        )),
+    ))
+    call = api.GoProjectRequest(action='run_go_project', invocation=invocation(
+        api, execution_id='exec-go_1', scope=trusted.scope,
+        original_reference=trusted.original_reference.to_payload(),
+        toolchain=trusted.toolchain, recipe_sha256=trusted.sha256,
+        environment_input_sha256=trusted.environment_input_sha256,
+    ))
+    reply = receipted_response(api, call, receipt=_receipt(trusted))
+    reply.require_for(call)
+    assert reply.receipt.original_check_contract != call.invocation.original_reference.contract_sha256
+    value = reply.receipt.model_dump(mode='json')
+    checked = validate_go_passed_receipt(
+        value, inputs=trusted, expected_source=trusted.scope.source_sha256,
+        expected_binary_sha256='b' * 64, expected_binary_bytes=42,
+        expected_execution_id='exec-go_1', source_kind='original',
+    )
+    assert checked['execution_id'] == 'exec-go_1'
+    # Successful transport validation does not replace independent binary binding.
+    with pytest.raises(ValueError):
+        validate_go_passed_receipt(
+            value, inputs=trusted, expected_source=trusted.scope.source_sha256,
+            expected_binary_sha256='c' * 64, expected_binary_bytes=42,
+            expected_execution_id='exec-go_1', source_kind='original',
+        )

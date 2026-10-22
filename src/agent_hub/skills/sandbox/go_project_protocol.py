@@ -9,12 +9,26 @@ from __future__ import annotations
 
 import json
 import math
-from typing import Literal, Self
+from datetime import datetime
+from typing import Any, Literal, Self, cast
+from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SerializerFunctionWrapHandler,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 
 from agent_hub.skills.sandbox.base import SkillResult
-from agent_hub.skills.sandbox.project import ContractProjectInvocation, ProjectInvocation
+from agent_hub.skills.sandbox.project import (
+    ContractProjectInvocation,
+    OriginalProjectReference,
+    ProjectInvocation,
+)
 from agent_hub.skills.sandbox.toolchain_catalog import ToolchainPlanScope
 from agent_hub.skills.sandbox.toolchain_protocol import Digest, ExecutionId, ToolchainReference
 
@@ -99,13 +113,141 @@ class GoProjectRequest(_Envelope):
     invocation: GoProjectInvocation
 
 
+class _ReceiptData(BaseModel):
+    model_config = ConfigDict(extra='forbid', strict=True, frozen=True)
+
+
+class GoProjectReceiptBinary(_ReceiptData):
+    filename: Literal['project']
+    sha256: Digest
+    size: int = Field(ge=1, le=2**63 - 1)
+    format: Literal['ELF64']
+    target: Literal['linux_amd64']
+
+
+class GoProjectReceiptCheck(_ReceiptData):
+    phase: Literal['inspect', 'build', 'test', 'canary', 'business']
+    status: Literal['passed']
+
+
+class GoProjectReceiptObservation(_ReceiptData):
+    case_id: str
+    criterion_id: str
+    case_sha256: Digest
+    expected_exit: int = Field(ge=0, le=255)
+    exit_code: int = Field(ge=0, le=255)
+    timed_out: Literal[False]
+    stdout_sha256: Digest
+    stderr_sha256: Digest
+    stdout_observed_bytes: int = Field(ge=0, le=2**63 - 1)
+    stderr_observed_bytes: int = Field(ge=0, le=2**63 - 1)
+    stdout_truncated: Literal[False]
+    stderr_truncated: Literal[False]
+    stdout_utf8_complete: Literal[True]
+    stderr_utf8_complete: Literal[True]
+    stdout_matches: Literal[True]
+    stderr_matches: Literal[True]
+    passed: Literal[True]
+    reason: None
+
+    @field_validator(
+        'timed_out', 'stdout_truncated', 'stderr_truncated', 'stdout_utf8_complete',
+        'stderr_utf8_complete', 'stdout_matches', 'stderr_matches', 'passed', mode='before',
+    )
+    @classmethod
+    def boolean_flags(cls, value: object) -> object:
+        _need(type(value) is bool)
+        return value
+
+    @model_validator(mode='after')
+    def passed_exit(self) -> Self:
+        _need(self.exit_code == self.expected_exit)
+        return self
+
+
+class GoProjectReceipt(_ReceiptData):
+    """Inert passed-receipt data, never Root provenance or approval.
+
+    The backend must independently reconstruct Inputs and measure source and
+    binary before calling capabilities.go_project_receipts validation.
+    """
+
+    schema_version: Literal[1]
+    kind: Literal['go_project_execution_receipt']
+    status: Literal['passed']
+    execution_id: ExecutionId
+    scope: ToolchainPlanScope
+    source_kind: Literal['original', 'candidate']
+    source_sha256: Digest
+    recipe_sha256: Digest
+    environment_input_sha256: Digest
+    original_reference: OriginalProjectReference
+    original_check_contract: Digest
+    toolchain: ToolchainReference
+    acceptance_sha256: Digest
+    business_suite_sha256: Digest
+    binary: GoProjectReceiptBinary
+    checks: tuple[GoProjectReceiptCheck, ...] = Field(min_length=5, max_length=5)
+    named_tests: tuple[str, ...] = Field(min_length=1)
+    business_evidence: tuple[GoProjectReceiptObservation, ...] = Field(min_length=1)
+    verified_at: str = Field(pattern=(
+        r'^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}'
+        r'(?:\.[0-9]+)?(?:Z|\+00:00)$'
+    ))
+
+    @field_validator('schema_version', mode='before')
+    @classmethod
+    def integer_schema(cls, value: object) -> object:
+        _need(type(value) is int)
+        return value
+
+    @field_validator('scope', mode='before')
+    @classmethod
+    def serialized_scope(cls, value: object) -> object:
+        # Backend receipts carry JSON UUID strings; keep all other values strict.
+        if isinstance(value, dict):
+            value = {key: str(item) if isinstance(item, UUID) else item
+                     for key, item in value.items()}
+            return ToolchainPlanScope.model_validate_json(json.dumps(value), strict=True)
+        return value
+
+    @field_validator('checks', 'named_tests', 'business_evidence', mode='before')
+    @classmethod
+    def immutable_arrays(cls, value: object) -> object:
+        _need(type(value) in (list, tuple))
+        if isinstance(value, list):
+            return tuple(value)
+        return value
+
+    @model_validator(mode='after')
+    def passed_shape(self) -> Self:
+        _checked_scope(self.scope)
+        _need(self.original_reference.model_fields_set == OriginalProjectReference.model_fields.keys()
+              and self.toolchain.model_fields_set == ToolchainReference.model_fields.keys())
+        _need((self.scope.source_sha256, self.scope.contract_sha256)
+              == (self.original_reference.input_source_sha256,
+                  self.original_reference.contract_sha256))
+        if self.source_kind == 'original':
+            _need(self.source_sha256 == self.scope.source_sha256)
+        _need(tuple(check.phase for check in self.checks)
+              == ('inspect', 'build', 'test', 'canary', 'business'))
+        _need(len(set(self.named_tests)) == len(self.named_tests))
+        _need(len({row.case_id for row in self.business_evidence}) == len(self.business_evidence)
+              and any(row.expected_exit == 0 for row in self.business_evidence)
+              and any(row.expected_exit != 0 for row in self.business_evidence))
+        datetime.fromisoformat(self.verified_at)
+        return self
+
+
 def go_project_response_limit(
     *, diagnostic_limit_bytes: int = GO_PROJECT_DIAGNOSTIC_MAX_BYTES,
 ) -> int:
     """Wire cap: bounded metadata plus worst-case six-byte JSON escapes.
 
-    The raw diagnostic budget covers combined UTF-8 stdout/stderr (including
-    the GoReport), not the old invocation's per-phase output_limit_bytes.
+    The shared budget covers UTF-8 stdout/stderr (including the GoReport) plus
+    the receipt's complete ASCII JSON bytes. Six times this combined budget
+    bounds both escaped diagnostics and UTF-8/ASCII receipt representations.
+    It is independent of the invocation's per-phase output_limit_bytes.
     Transports can select a smaller budget and use this same cap for framing.
     """
     _need(type(diagnostic_limit_bytes) is int
@@ -115,6 +257,14 @@ def go_project_response_limit(
 
 def _diagnostic_bytes(result: SkillResult | None) -> int:
     return 0 if result is None else len(result.stdout.encode('utf-8')) + len(result.stderr.encode('utf-8'))
+
+
+def _receipt_bytes(receipt: GoProjectReceipt | None) -> int:
+    if receipt is None:
+        return 0
+    # ASCII JSON also bounds UTF-8 JSON, including supplementary characters.
+    return len(json.dumps(receipt.model_dump(mode='json'), ensure_ascii=True,
+                          separators=(',', ':'), allow_nan=False).encode('ascii'))
 
 
 class GoProjectResponse(_Envelope):
@@ -128,11 +278,28 @@ class GoProjectResponse(_Envelope):
     result: SkillResult | None = None
     environment: ToolchainReference | None = None
     error: GoProjectError | None = None
+    receipt: GoProjectReceipt | None = None
+
+    @model_serializer(mode='wrap')
+    def compatible_wire(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        result = cast(dict[str, Any], handler(self))
+        if self.receipt is None:
+            result.pop('receipt', None)
+        return result
 
     @model_validator(mode='after')
     def exclusive_outcome(self) -> Self:
         _checked_scope(self.scope)
-        _need(_diagnostic_bytes(self.result) <= GO_PROJECT_DIAGNOSTIC_MAX_BYTES)
+        _need(_diagnostic_bytes(self.result) + _receipt_bytes(self.receipt)
+              <= GO_PROJECT_DIAGNOSTIC_MAX_BYTES)
+        if self.receipt is not None:
+            _need(self.ok and self.action == 'run_go_project' and self.result is not None)
+            assert self.result is not None
+            _need(self.result.exit_code == 0 and not self.result.timed_out)
+            _need((self.receipt.execution_id, self.receipt.scope, self.receipt.recipe_sha256,
+                   self.receipt.environment_input_sha256, self.receipt.toolchain)
+                  == (self.execution_id, self.scope, self.recipe_sha256,
+                      self.environment_input_sha256, self.toolchain), 'go_project_scope_changed')
         if not self.ok:
             _need(self.error is not None and self.result is None and self.environment is None)
         else:
@@ -157,6 +324,14 @@ class GoProjectResponse(_Envelope):
                 invocation.recipe_sha256, invocation.environment_input_sha256, invocation.toolchain),
             'go_project_scope_changed',
         )
+        if checked.receipt is not None:
+            _need(checked.receipt.source_kind == invocation.source_kind
+                  and checked.receipt.original_reference == invocation.original_reference,
+                  'go_project_scope_changed')
+            # candidate's actual source hash is known only at the Root boundary.
+            if invocation.source_kind == 'original':
+                _need(checked.receipt.source_sha256 == invocation.scope.source_sha256,
+                      'go_project_scope_changed')
 
 
 def base_go_invocation(invocation: GoProjectInvocation) -> ProjectInvocation:
@@ -215,7 +390,8 @@ def parse_go_project_response(
     try:
         _json(raw, go_project_response_limit(diagnostic_limit_bytes=diagnostic_limit_bytes))
         response = GoProjectResponse.model_validate_json(raw, strict=True)
-        _need(_diagnostic_bytes(response.result) <= diagnostic_limit_bytes)
+        _need(_diagnostic_bytes(response.result) + _receipt_bytes(response.receipt)
+              <= diagnostic_limit_bytes)
         return response
     except (ValueError, TypeError, RecursionError, OverflowError):
         raise ValueError('go_project_request_invalid') from None

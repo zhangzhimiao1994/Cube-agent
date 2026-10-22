@@ -25,7 +25,9 @@ from agent_hub.skills.sandbox.project import OriginalProjectReference
 from agent_hub.skills.sandbox.python_project_process import PythonPhaseProcessResult
 from agent_hub.skills.sandbox.toolchain_catalog import ToolchainArtifact, ToolchainCatalog
 from agent_hub.subprocess_cleanup import ProcessCleanupIncomplete
+from tests.unit.capabilities.test_go_project_acceptance import manifest
 from tests.unit.capabilities.test_go_project_inputs import case
+from tests.unit.capabilities.test_go_project_receipts import _receipt
 
 MODULE = 'agent_hub.skills.sandbox.go_project_backend'
 
@@ -42,11 +44,15 @@ def api() -> Any:
 
 
 @pytest.fixture
-def prepared(tmp_path: Path) -> Any:
-    fixture = case(tmp_path / 'original', editable=('main.go', 'assets'), changes={
+def prepared(tmp_path: Path, request: pytest.FixtureRequest) -> Any:
+    changes = {
         'assets/readme.txt': b'full source, including inactive and non-Go files\n',
         'inactive_windows.go': b'package main\n',
-    })
+    }
+    if getattr(request, 'param', False):
+        acceptance = replace(manifest(), editable_paths=('main.go', 'assets'))
+        changes['ACCEPTANCE.json'] = json.dumps(acceptance.to_payload()).encode()
+    fixture = case(tmp_path / 'original', editable=('main.go', 'assets'), changes=changes)
     artifact = ToolchainArtifact(stack='go', version='1.27.3', platform='linux_amd64',
         url='https://dl.google.com/go/go1.27.3.linux-amd64.tar.gz', sha256='b' * 64,
         archive_bytes=1024, unpacked_bytes_limit=8192, archive_entries_limit=100,
@@ -322,6 +328,134 @@ def test_run_rebuilds_then_authorizes_and_remeasures_before_return(flow: Any, pr
     assert 'export-empty' in flow.events[flow.events.index('quiet') + 1:]
     assert flow.events[-1] == 'release'
     response.require_for(prepared.request)
+
+
+@pytest.fixture
+def business_flow(api: Any, flow: Any, prepared: Any, monkeypatch: pytest.MonkeyPatch) -> Any:
+    receipt = _receipt(prepared.inputs)
+    binary = {key: receipt['binary'][key] for key in ('filename', 'sha256', 'size')}
+    flow.payload = {
+        'checks': [{'phase': phase, 'status': 'completed'}
+                   for phase in ('inspect', 'build', 'test', 'canary', 'business')],
+        'canary': 'completed', 'business_gate': 'completed', 'binary': binary,
+        'named_tests': receipt['named_tests'], 'business_evidence': receipt['business_evidence'],
+        'acceptance_sha256': receipt['acceptance_sha256'],
+        'business_suite_sha256': receipt['business_suite_sha256'],
+        'inventory': {'module_path': prepared.inputs.declaration.module_path,
+                      'package_count': 1, 'test_count': 1, 'source_go_file_count': 2,
+                      'report_sha256': '1' * 64},
+        'test_evidence': {'status': 'completed', 'report_sha256': '1' * 64,
+            'expected_sha256': '2' * 64, 'required_test_count': 1, 'required_passed_count': 1,
+            'failed_count': 0, 'test_count': 1, 'package_count': 1},
+        'canary_evidence': {'execution_id': 'go_canary_123',
+            'project_execution_id': prepared.invocation.execution_id, 'report_sha256': '3' * 64,
+            'expected_sha256': '4' * 64, 'observed_expected_failure': True},
+    }
+    flow.binary = binary
+
+    def observe(fd: int, **kwargs: Any) -> Any:
+        assert fd == 20
+        assert kwargs['gid'] == prepared.policy.allowed_gid
+        assert kwargs['service_uid'] == prepared.policy.allowed_uid
+        assert flow.events.index('quiet') < len(flow.events)
+        flow.events.append('binary')
+        if flow.fault == 'binary-missing':
+            raise ValueError('private missing binary')
+        return binary | ({'sha256': 'f' * 64} if flow.fault == 'binary-mismatch' else {})
+
+    monkeypatch.setattr(api, 'observe_go_project_binary', observe, raising=False)
+    return flow
+
+
+@pytest.mark.parametrize('prepared', [True], indirect=True)
+def test_root_business_receipt_requires_quiet_measurement_and_final_rechecks(
+    business_flow: Any, prepared: Any,
+) -> None:
+    flow = business_flow
+    response = flow.execute()
+    assert response.ok and response.receipt is not None
+    receipt = response.receipt.model_dump(mode='json')
+    assert receipt['status'] == 'passed' and receipt['execution_id'] == prepared.invocation.execution_id
+    assert receipt['binary']['sha256'] == flow.binary['sha256']
+    assert json.loads(response.result.stdout)['status'] == 'incomplete'
+    assert flow.events.count('binary') >= 2
+    assert flow.events.index('quiet') < flow.events.index('binary')
+    assert flow.events[-1] == 'release'
+    response.require_for(prepared.request)
+
+
+@pytest.mark.parametrize('prepared', [True], indirect=True)
+@pytest.mark.parametrize('fault', ['binary-missing', 'binary-mismatch', 'authority-3'])
+def test_business_report_without_matching_actual_export_or_live_grant_cannot_pass(
+    business_flow: Any, fault: str,
+) -> None:
+    business_flow.fault = fault
+    response = business_flow.execute()
+    assert not response.ok and response.receipt is None
+    assert 'quiet' in business_flow.events
+
+
+@pytest.mark.parametrize('prepared', [True], indirect=True)
+@pytest.mark.parametrize('damage', ['observation', 'tests', 'canary', 'phase', 'acceptance'])
+def test_root_rejects_forged_incomplete_or_rebound_business_evidence(
+    business_flow: Any, damage: str,
+) -> None:
+    payload = business_flow.payload
+    if damage == 'observation':
+        payload['business_evidence'][0]['stdout_truncated'] = True
+    elif damage == 'tests':
+        payload['named_tests'] = []
+    elif damage == 'canary':
+        payload['canary_evidence']['observed_expected_failure'] = False
+    elif damage == 'phase':
+        payload['checks'].pop(2)
+    else:
+        payload['acceptance_sha256'] = '9' * 64
+    response = business_flow.execute()
+    assert not response.ok and response.receipt is None
+
+
+@pytest.mark.parametrize('prepared', [True], indirect=True)
+def test_binary_changed_after_receipt_authority_is_rejected(
+    api: Any, business_flow: Any, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real = api.observe_go_project_binary
+
+    def late(fd: int, **kwargs: Any) -> Any:
+        result = real(fd, **kwargs)
+        return result | ({'sha256': 'f' * 64} if business_flow.authority_calls == 3 else {})
+
+    monkeypatch.setattr(api, 'observe_go_project_binary', late)
+    response = business_flow.execute()
+    assert not response.ok and response.receipt is None
+
+
+@pytest.mark.parametrize('prepared', [True], indirect=True)
+def test_business_candidate_receipt_keeps_original_recipe_and_actual_candidate_digest(
+    business_flow: Any, candidate: Any, prepared: Any,
+) -> None:
+    response = candidate.execute(prepared.request)
+    assert response.ok and response.receipt is not None
+    receipt = response.receipt.model_dump(mode='json')
+    assert receipt['source_kind'] == 'candidate'
+    assert receipt['source_sha256'] == candidate.candidate_digest
+    assert receipt['source_sha256'] != prepared.inputs.scope.source_sha256
+    assert receipt['recipe_sha256'] == prepared.inputs.sha256
+    assert receipt['original_reference'] == prepared.inputs.original_reference.to_payload()
+    response.require_for(prepared.request)
+
+
+@pytest.mark.parametrize('prepared', [True], indirect=True)
+def test_failure_after_completed_business_preserves_diagnostics_without_receipt(
+    business_flow: Any,
+) -> None:
+    business_flow.payload.update(status='failed', failed_phase='toolchain')
+    business_flow.payload['checks'].append(
+        {'phase': 'toolchain', 'status': 'failed', 'error': 'go_project_toolchain_changed'})
+    response = business_flow.execute()
+    assert response.ok and response.receipt is None
+    assert json.loads(response.result.stdout)['failed_phase'] == 'toolchain'
+    assert 'binary' not in business_flow.events
 
 
 def test_inspect_is_live_measured_and_never_launches(flow: Any, prepared: Any) -> None:
