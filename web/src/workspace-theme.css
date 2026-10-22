@@ -1,9 +1,9 @@
-/* Keep logo artwork soft across authentication and both workspace surfaces. */
+/* The asset separates faint faces from contours; preserve the contour contrast. */
 :is(.auth-brand-logo, .brand-card img, .brand-lockup img) {
   background: transparent;
   box-shadow: none;
-  filter: saturate(0.55);
-  opacity: 0.78;
+  filter: none;
+  opacity: 1;
 }
 
 /* Management surfaces share the conversation palette without changing the conversation. */

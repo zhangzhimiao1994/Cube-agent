@@ -1,5 +1,6 @@
 import { existsSync, readFileSync } from "node:fs";
 import { afterEach, describe, expect, it } from "vitest";
+import { APP_BRAND_LOGO_SRC } from "./app/brand";
 
 const legacy = readFileSync("src/styles.css", "utf8");
 const conversation = readFileSync("src/conversation-workspace.css", "utf8");
@@ -55,7 +56,7 @@ describe("shared workspace theme", () => {
     ["conversation sidebar", '<div class="is-conversation-workspace"><aside class="sidebar"><div class="brand-card compact-brand-card"><img src="/brand/mofang-agent-light.png"><span class="eyebrow">Mofang Agent</span></div></aside><section class="conversation-workspace"></section></div>', ".brand-card img", ".eyebrow"],
     ["conversation mobile header", '<div class="is-conversation-workspace"><aside class="sidebar"><span class="brand-lockup"><img src="/brand/mofang-agent-light.png"><strong>Mofang Agent</strong></span></aside><section class="conversation-workspace"></section></div>', ".brand-lockup img", "strong"],
   ])("softens only the logo image in %s without changing its size or text", (_name, markup, logoSelector, textSelector) => {
-    mount(markup, false);
+    mount(markup.replaceAll("/brand/mofang-agent-light.png", APP_BRAND_LOGO_SRC), false);
     const dimensions = () => {
       const logo = styles(logoSelector);
       return [logo.width, logo.height, logo.aspectRatio, logo.objectFit];
@@ -74,15 +75,15 @@ describe("shared workspace theme", () => {
     // Verify the real import order: conversation overrides load after the shared theme.
     addStyle(conversation);
     const logo = styles(logoSelector);
-    expect(logo.filter).toBe("saturate(0.55)");
-    expect(logo.opacity).toBe("0.78");
+    expect(logo.filter).toBe("none");
+    expect(logo.opacity).toBe("1");
     expect(logo.backgroundColor).toBe("rgba(0, 0, 0, 0)");
     expect(logo.backgroundImage || "none").toBe("none");
     expect(logo.boxShadow).toBe("none");
     const size = logoSelector === ".brand-card img" ? "32px" : logoSelector === ".brand-lockup img" ? "2rem" : "4.5rem";
     expect(dimensions()).toEqual([size, size, "1", "contain"]);
     expect(textAppearance()).toEqual(beforeText);
-    expect(document.querySelector(logoSelector)!.getAttribute("src")).toBe("/brand/mofang-agent-light.png");
+    expect(document.querySelector(logoSelector)!.getAttribute("src")).toBe(APP_BRAND_LOGO_SRC);
   });
 
   it("avoids repeating the brand and account header above a management page", () => {
