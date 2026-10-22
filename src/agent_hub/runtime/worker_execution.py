@@ -4,7 +4,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, nullcontext
 
 from agent_hub.auth.models import Role
-from agent_hub.runtime.contracts import ExecutionRuntime, RunEvent, TaskContext
+from agent_hub.runtime.contracts import ExecutionRuntime, RunEvent, TaskContext, _freeze_object
 from agent_hub.runtime.streams import closing_runtime_events
 
 
@@ -16,6 +16,13 @@ async def worker_runtime_events(
     # runs.__init__ imports RunService; defer this dependency until package initialization ends.
     from agent_hub.capabilities.execution_authority import bind_execution_authority
 
+    # Private DB locators/leases are not model context or continuation payloads.
+    private = {'project_verification_receipt', 'approval_checkpoint_worker_token'}
+    if private.intersection(context.routing_decision):
+        context = context.model_copy(update={'routing_decision': _freeze_object(
+            {key: value for key, value in context.routing_decision.items() if key not in private},
+            name='runtime-visible routing',
+        )})
     binding = (
         bind_execution_authority(context, worker_id=worker_id)
         if worker_id is not None and context.execution_token is not None

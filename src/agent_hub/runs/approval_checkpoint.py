@@ -4,6 +4,7 @@ from collections.abc import Mapping
 from typing import cast
 
 from agent_hub.domain.runs import TaskMode
+from agent_hub.runtime.action_checkpoint import action_checkpoint_valid
 from agent_hub.runtime.contracts import RuntimeCheckpoint
 
 
@@ -22,6 +23,8 @@ def checkpoint_waits_for_approval(
             from agent_hub.runtime.engineering_admission import admission_checkpoint_valid
 
             return admission_checkpoint_valid(checkpoint, approval_id)
+        if checkpoint.runtime_type == 'direct_action':
+            return action_checkpoint_valid(checkpoint, approval_id)
         if checkpoint.runtime_type == "hybrid":
             if (
                 checkpoint.runtime_version not in {"2", "3"}
@@ -39,8 +42,9 @@ def checkpoint_waits_for_approval(
             if child.run_id != checkpoint.run_id or child.tenant_id != checkpoint.tenant_id:
                 return False
             checkpoint = child
-        # Only Crew v11 defines waiting_approval receipts. Never recursively search
-        # arbitrary state, or accept nested Hybrid/direct/discussion ledgers.
+        # Hybrid Direct actions remain unsupported until the actual plan's Direct
+        # stage is validated. Preserve the existing one-level Crew v11 rule only;
+        # never recursively search arbitrary references or nested Hybrid ledgers.
         if (
             checkpoint.runtime_type != "crew"
             or checkpoint.runtime_version != "11"
