@@ -38,7 +38,12 @@ from agent_hub.runs.conversations import ConversationArchived
 from agent_hub.runs.repository import RunConflict, RunNotFound
 from agent_hub.runs.self_repair import repair_proposal_projection
 from agent_hub.runs.service import RunSummary, SubmittedRun, VibeCodingUnavailable
-from agent_hub.runs.workspace import REQUESTED_PERMISSIONS, SANDBOX_PROFILES, workspace_selection
+from agent_hub.runs.workspace import (
+    REQUESTED_PERMISSIONS,
+    SANDBOX_PROFILES,
+    PermissionMode,
+    workspace_selection,
+)
 
 router = APIRouter(
     prefix="/api/v1/runs",
@@ -109,6 +114,7 @@ class RunServiceProtocol(Protocol):
         execution_backend: str = "systemd",
         requested_permissions: tuple[str, ...] = (),
         runtime_timeout_seconds: float | None = None,
+        permission_mode: PermissionMode | None = None,
         idempotency_key: str | None = None,
     ) -> SubmittedRun: ...
 
@@ -322,6 +328,7 @@ class CreateRunRequest(BaseModel):
     project_label: str | None = Field(default=None, max_length=80)
     workspace_session_id: str | None = Field(default=None, max_length=128)
     project_input: ManagedProjectInputRequest | None = None
+    permission_mode: PermissionMode | None = None
     sandbox_profile: Literal["none", "read_only", "restricted", "workspace_write"] = (
         "workspace_write"
     )
@@ -393,11 +400,16 @@ class CreateRunRequest(BaseModel):
 
     @model_validator(mode="after")
     def default_requested_permissions_from_sandbox(self) -> CreateRunRequest:
+        if self.permission_mode is not None and "sandbox_profile" not in self.model_fields_set:
+            if self.permission_mode != "read_only":
+                return self  # Resolve the configured profile at the authenticated API boundary.
+            object.__setattr__(self, "sandbox_profile", "read_only")
         self.requested_permissions = workspace_selection(
             project_id=None,
             session_id=None,
             sandbox_profile=self.sandbox_profile,
             requested_permissions=self.requested_permissions,
+            permission_mode=self.permission_mode,
         ).requested_permissions
         return self
 
@@ -501,6 +513,7 @@ class SubmittedRunResponse(BaseModel):
     workspace_session_path: str | None = None
     workspace_artifacts_path: str | None = None
     sandbox_profile: str | None = None
+    permission_mode: PermissionMode | None = None
     execution_backend: str = "systemd"
     requested_permissions: tuple[str, ...] = ()
     temporary_agent_proposal: dict[str, object] | None = None
@@ -533,6 +546,7 @@ class SubmittedRunResponse(BaseModel):
             workspace_session_path=run.workspace_session_path,
             workspace_artifacts_path=run.workspace_artifacts_path,
             sandbox_profile=run.sandbox_profile,
+            permission_mode=run.permission_mode,
             execution_backend=run.execution_backend,
             requested_permissions=run.requested_permissions,
             temporary_agent_proposal=run.temporary_agent_proposal,
@@ -706,6 +720,40 @@ async def _default_execution_backend(request: Request) -> str:
         return "systemd"
     configured = getattr(settings, "default_execution_backend", "systemd")
     return configured if configured in {"systemd", "docker"} else "systemd"
+
+
+class _PermissionModeOptions(TypedDict, total=False):
+    permission_mode: PermissionMode
+
+
+def _permission_mode_options(body: CreateRunRequest) -> _PermissionModeOptions:
+    return {} if body.permission_mode is None else {"permission_mode": body.permission_mode}
+
+
+async def _resolve_permission_selection(
+    request: Request, principal: AuthenticatedPrincipal, body: CreateRunRequest,
+) -> CreateRunRequest:
+    if body.permission_mode is None:
+        return body
+    profile = body.sandbox_profile
+    if "sandbox_profile" not in body.model_fields_set and body.permission_mode != "read_only":
+        service = getattr(request.app.state, "admin_resource_service", None)
+        if service is None:
+            raise PublicAPIError(503, "service_unavailable", "permission settings unavailable")
+        try:
+            scope = getattr(service, "for_principal", None)
+            if callable(scope):
+                service = scope(principal.tenant_id, principal.user_id)
+            settings = await service.get_settings()
+            profile = settings.default_sandbox_profile
+        except (AttributeError, RuntimeError, TypeError, ValueError, SQLAlchemyError):
+            raise PublicAPIError(503, "service_unavailable", "permission settings unavailable") from None
+    selection = workspace_selection(
+        project_id=None, session_id=None, sandbox_profile=profile,
+        requested_permissions=body.requested_permissions, permission_mode=body.permission_mode,
+    )
+    return body.model_copy(update={"sandbox_profile": selection.sandbox_profile,
+                                  "requested_permissions": selection.requested_permissions})
 
 
 async def _record_run_submit_audit(
@@ -1246,6 +1294,7 @@ async def create_run(
         )
     await _stop_conversation_preview(request, principal.tenant_id, body.conversation_id)
     try:
+        body = await _resolve_permission_selection(request, principal, body)
         execution_backend = body.execution_backend or await _default_execution_backend(request)
         if body.execution_backend is not None:
             unavailable_reason = await asyncio.to_thread(
@@ -1291,6 +1340,7 @@ async def create_run(
             runtime_timeout_seconds=body.runtime_timeout_seconds,
             idempotency_key=idempotency_key,
             **_project_input_options(body),
+            **_permission_mode_options(body),
         )
     except VibeCodingUnavailable as error:
         reason = str(error)
@@ -1345,6 +1395,7 @@ async def queue_conversation_message(
         raise PublicAPIError(422, "request_validation", "conversation_id does not match path")
     await _stop_conversation_preview(request, principal.tenant_id, conversation_id)
     try:
+        body = await _resolve_permission_selection(request, principal, body)
         execution_backend = body.execution_backend or await _default_execution_backend(request)
         item = await service.queue_message(
             tenant_id=principal.tenant_id,
@@ -1374,6 +1425,7 @@ async def queue_conversation_message(
             requested_permissions=body.requested_permissions,
             runtime_timeout_seconds=body.runtime_timeout_seconds,
             **_project_input_options(body),
+            **_permission_mode_options(body),
         )
     except (ConversationQueueConflict, ConversationQueueNotFound) as error:
         raise _queue_error(error) from error

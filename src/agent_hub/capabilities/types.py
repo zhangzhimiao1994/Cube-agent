@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 from enum import StrEnum
+from typing import Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -27,6 +28,7 @@ class CapabilityRequest(BaseModel):
     arguments: dict[str, object] = Field(default_factory=dict)
     idempotency_key: str = Field(min_length=1, max_length=160)
     run_id: UUID
+    tool_origin: Literal["builtin", "mcp", "plugin"] = "builtin"
 
     @field_validator("resource", "idempotency_key")
     @classmethod

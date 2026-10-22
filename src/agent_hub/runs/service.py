@@ -59,7 +59,13 @@ from agent_hub.runs.self_repair import (
     SelfRepairPolicy,
     classify_terminal_run,
 )
-from agent_hub.runs.workspace import DEFAULT_PROJECT_ID, REQUESTED_PERMISSIONS, workspace_selection
+from agent_hub.runs.workspace import (
+    DEFAULT_PROJECT_ID,
+    PERMISSION_MODES,
+    REQUESTED_PERMISSIONS,
+    PermissionMode,
+    workspace_selection,
+)
 from agent_hub.runtime.contracts import (
     Artifact,
     EventKind,
@@ -185,6 +191,7 @@ class SubmittedRun:
     workspace_session_path: str | None = None
     workspace_artifacts_path: str | None = None
     sandbox_profile: str | None = None
+    permission_mode: PermissionMode | None = None
     execution_backend: str = "systemd"
     requested_permissions: tuple[str, ...] = ()
     temporary_agent_proposal: dict[str, object] | None = None
@@ -594,6 +601,7 @@ class RunService:
         execution_backend: str = "systemd",
         requested_permissions: tuple[str, ...] = (),
         runtime_timeout_seconds: float | None = None,
+        permission_mode: PermissionMode | None = None,
         channel_context: dict[str, str] | None = None,
         idempotency_key: str | None = None,
         blocked_by_run_id: UUID | None = None,
@@ -639,6 +647,7 @@ class RunService:
             session_id=workspace_session_id or effective_conversation_id,
             sandbox_profile=sandbox_profile,
             requested_permissions=requested_permissions,
+            permission_mode=permission_mode,
         )
         resolved_execution_backend = normalize_execution_backend(execution_backend)
         if project_input is not None:
@@ -3971,6 +3980,8 @@ def _submitted(record: RunRecord) -> SubmittedRun:
         workspace_session_path=_string_or_none(decision.get("workspace_session_path")),
         workspace_artifacts_path=_string_or_none(decision.get("workspace_artifacts_path")),
         sandbox_profile=sandbox_profile,
+        permission_mode=cast(PermissionMode, decision["permission_mode"])
+        if decision.get("permission_mode") in PERMISSION_MODES else None,
         execution_backend=_string_or_none(decision.get("execution_backend")) or "systemd",
         requested_permissions=requested_permissions,
         temporary_agent_proposal=cast(dict[str, object], proposal)
