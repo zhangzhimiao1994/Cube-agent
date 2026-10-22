@@ -116,10 +116,11 @@ body:not(:has(.conversation-workspace)) .brand-card {
 
 body:not(:has(.conversation-workspace)) .brand-card img {
   border: 0;
-  border-radius: 6px;
+  border-radius: 0;
   box-shadow: none;
-  height: 30px;
-  width: 30px;
+  height: 32px;
+  width: 32px;
+  object-fit: contain;
 }
 
 body:not(:has(.conversation-workspace)) .brand-card .eyebrow {
@@ -482,7 +483,7 @@ body:not(:has(.conversation-workspace)) :is(.code-block, .agent-workbench-file-c
 body:not(:has(.conversation-workspace)) .bounded-text-block:not(.code-block-editor) { --bounded-text-border: #dfe3e8; background: var(--panel); border-color: var(--line); }
 body:not(:has(.conversation-workspace)) .bounded-text-block:not(.code-block-editor) > .bounded-text-block-header { background: var(--bg-2); border-color: var(--line); }
 body:not(:has(.conversation-workspace)) .auth-card { background: var(--panel); border-color: var(--line); border-radius: 8px; box-shadow: var(--shadow); }
-body:not(:has(.conversation-workspace)) .auth-brand-logo { border-color: var(--line); border-radius: 8px; box-shadow: none; }
+body:not(:has(.conversation-workspace)) .auth-brand-logo { border: 0; border-radius: 0; box-shadow: none; object-fit: contain; }
 body:not(:has(.conversation-workspace)) .auth-hero h1 { font-size: 32px; line-height: 1.2; text-shadow: none; }
 
 @media (min-width: 981px) {

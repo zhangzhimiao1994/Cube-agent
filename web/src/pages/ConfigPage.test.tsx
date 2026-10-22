@@ -1,9 +1,14 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import userEvent from "@testing-library/user-event";
 import { readFileSync } from "node:fs";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { MemoryRouter } from "react-router-dom";
 
 import { TestApp } from "../app/router";
+import { api } from "../api/client";
+import { AuthProvider, useAuth } from "../auth/AuthProvider";
+import { ConfigPage } from "./ConfigPage";
 
 const principal = {
   user_id: "11111111-1111-4111-8111-111111111111",
@@ -15,6 +20,9 @@ const settings = {
   default_mode: "auto",
   default_workflow_id: null,
   default_execution_backend: "systemd",
+  default_permission_mode: "default",
+  default_sandbox_profile: "workspace_write",
+  supported_permission_modes: ["default", "auto_review", "read_only"],
   default_agent_ids: [],
   log_level: "warning",
   hermes_enabled: true,
@@ -46,6 +54,17 @@ function jsonResponse(payload: unknown, init: ResponseInit = {}) {
   });
 }
 
+function IdentityControls() {
+  const { login } = useAuth();
+  return <button onClick={() => void login("next", "password")}>切换设置身份</button>;
+}
+
+function renderScopedConfig(client: QueryClient) {
+  return render(<QueryClientProvider client={client}><AuthProvider><MemoryRouter>
+    <IdentityControls /><ConfigPage />
+  </MemoryRouter></AuthProvider></QueryClientProvider>);
+}
+
 describe("ConfigPage", () => {
   const requests: Array<{ body: unknown; method: string; path: string }> = [];
   let openClawSessions: Array<Record<string, unknown>> = [];
@@ -71,7 +90,10 @@ describe("ConfigPage", () => {
           return jsonResponse(principal);
         }
         if (path === "/api/v1/admin/settings") {
-          if (method === "PUT") return jsonResponse(JSON.parse(String(init?.body)));
+          if (method === "PUT") return jsonResponse({
+            ...JSON.parse(String(init?.body)),
+            supported_permission_modes: currentSettings.supported_permission_modes,
+          });
           return jsonResponse(currentSettings);
         }
         if (path === "/api/v1/admin/execution-backends") {
@@ -315,6 +337,64 @@ describe("ConfigPage", () => {
   afterEach(() => {
     window.sessionStorage.clear();
     vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it("does not read or expose settings until the authenticated identity is loaded", async () => {
+    const identity = await api.me();
+    let resolveIdentity!: (value: typeof identity) => void;
+    vi.spyOn(api, "me").mockReturnValue(new Promise((resolve) => { resolveIdentity = resolve; }));
+    const read = vi.spyOn(api, "settings");
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    renderScopedConfig(client);
+    await act(async () => {});
+    expect(read).not.toHaveBeenCalled();
+    expect(screen.queryByRole("form", { name: "保存系统设置" })).toBeNull();
+    await act(async () => resolveIdentity(identity));
+    expect(await screen.findByRole("group", { name: "沙箱权限" })).toBeTruthy();
+  });
+
+  it.each(["tenant_id", "user_id", "role"] as const)("isolates cached settings and pending drafts when %s changes", async (field) => {
+    const identity = await api.me();
+    const nextIdentity = { ...identity, [field]: field === "role" ? "admin" : "22222222-2222-4222-8222-222222222222" };
+    vi.spyOn(api, "login").mockResolvedValue(nextIdentity as typeof identity);
+    const original = api.settings;
+    let resolveSettings!: (value: Awaited<ReturnType<typeof api.settings>>) => void;
+    const nextSettings = await original();
+    let secondIdentity = false;
+    const read = vi.spyOn(api, "settings").mockImplementation(() => secondIdentity
+      ? new Promise((resolve) => { resolveSettings = resolve; }) : original());
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false, staleTime: Infinity } } });
+    client.setQueryData(["settings"], { ...nextSettings, default_permission_mode: "read_only" });
+    const user = userEvent.setup();
+    renderScopedConfig(client);
+    const mode = await screen.findByLabelText("默认权限模式");
+    expect((mode as HTMLSelectElement).value).toBe("default");
+    await user.selectOptions(mode, "read_only");
+    secondIdentity = true;
+    await user.click(screen.getByRole("button", { name: "切换设置身份" }));
+    await waitFor(() => expect(read).toHaveBeenCalledTimes(2));
+    expect(screen.queryByRole("form", { name: "保存系统设置" })).toBeNull();
+    expect(screen.queryByLabelText("默认权限模式")).toBeNull();
+    await act(async () => resolveSettings({ ...nextSettings, default_permission_mode: "default", default_sandbox_profile: "restricted" }));
+    expect((await screen.findByLabelText("默认权限模式") as HTMLSelectElement).value).toBe("default");
+    expect((screen.getByLabelText("默认沙箱边界") as HTMLSelectElement).value).toBe("restricted");
+    expect(client.getQueryData(["settings", nextIdentity.tenant_id, nextIdentity.user_id, nextIdentity.role])).toBeTruthy();
+  });
+
+  it("does not permit editing or saving stale settings after a failed scoped refresh", async () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const user = userEvent.setup();
+    renderScopedConfig(client);
+    await screen.findByRole("group", { name: "沙箱权限" });
+    vi.spyOn(api, "settings").mockRejectedValue(new Error("settings unavailable"));
+    await act(async () => { await client.invalidateQueries({ queryKey: ["settings"] }); });
+    expect((await screen.findByRole("alert")).textContent).toContain("系统设置加载失败");
+    expect(screen.queryByRole("button", { name: "保存系统设置" })).toBeNull();
+    expect(screen.queryByLabelText("默认权限模式")).toBeNull();
+    expect(requests.some((request) => request.path === "/api/v1/admin/settings")).toBe(false);
+    await user.keyboard("{Enter}");
+    expect(requests.some((request) => request.path === "/api/v1/admin/settings")).toBe(false);
   });
 
   it("loads system settings and saves production defaults through dedicated controls", async () => {
@@ -344,7 +424,7 @@ describe("ConfigPage", () => {
     expect(requests.find((request) => request.path === "/api/v1/admin/settings")).toMatchObject({
       method: "PUT",
       body: {
-        ...settings,
+        ...Object.fromEntries(Object.entries(settings).filter(([key]) => key !== "supported_permission_modes")),
         default_mode: "dispatch",
         default_workflow_id: "short-video-dispatch",
         default_agent_ids: ["director"],
@@ -356,6 +436,102 @@ describe("ConfigPage", () => {
         temporary_agent_policy: "缺少专业能力时先申请临时 Agent，任务结束后询问是否永久保存。",
       },
     });
+  });
+
+  it("normalizes read-only mode before saving and strips server capability metadata", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/config" />);
+    const group = await screen.findByRole("group", { name: "沙箱权限" });
+    await user.selectOptions(within(group).getByLabelText("默认权限模式"), "read_only");
+    expect((within(group).getByLabelText("默认沙箱边界") as HTMLSelectElement).value).toBe("read_only");
+    await user.click(screen.getByRole("button", { name: "保存系统设置" }));
+    await waitFor(() => expect(requests.find((request) => request.path === "/api/v1/admin/settings")).toBeTruthy());
+    const body = requests.find((request) => request.path === "/api/v1/admin/settings")!.body;
+    expect(body).toMatchObject({ default_permission_mode: "read_only", default_sandbox_profile: "read_only" });
+    expect(body).not.toHaveProperty("supported_permission_modes");
+  });
+
+  it("normalizes an inconsistent read-only response at the save boundary", async () => {
+    currentSettings.default_permission_mode = "read_only";
+    currentSettings.default_sandbox_profile = "workspace_write";
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/config" />);
+    await screen.findByRole("group", { name: "沙箱权限" });
+    await user.click(screen.getByRole("button", { name: "保存系统设置" }));
+    await waitFor(() => expect(requests.some((request) => request.path === "/api/v1/admin/settings")).toBe(true));
+    expect(requests.find((request) => request.path === "/api/v1/admin/settings")!.body).toMatchObject({
+      default_permission_mode: "read_only", default_sandbox_profile: "read_only",
+    });
+  });
+
+  it("keeps a read-only boundary paired with read-only mode and can leave read-only", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/config" />);
+    const group = await screen.findByRole("group", { name: "沙箱权限" });
+    await user.selectOptions(within(group).getByLabelText("默认沙箱边界"), "read_only");
+    expect((within(group).getByLabelText("默认权限模式") as HTMLSelectElement).value).toBe("read_only");
+    await user.selectOptions(within(group).getByLabelText("默认权限模式"), "default");
+    expect((within(group).getByLabelText("默认沙箱边界") as HTMLSelectElement).value).toBe("workspace_write");
+  });
+
+  it("requires both server support and global rule review to choose auto review", async () => {
+    currentSettings.tool_approval_mode = "ask";
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/config" />);
+    const group = await screen.findByRole("group", { name: "沙箱权限" });
+    const mode = within(group).getByLabelText("默认权限模式");
+    const auto = within(mode).getByRole("option", { name: /自动审查/ }) as HTMLOptionElement;
+    expect(auto.disabled).toBe(true);
+    await user.selectOptions(screen.getByLabelText("工具审批模式"), "auto_review");
+    expect(auto.disabled).toBe(false);
+    await user.selectOptions(mode, "auto_review");
+    await user.selectOptions(screen.getByLabelText("工具审批模式"), "ask");
+    await user.click(screen.getByRole("button", { name: "保存系统设置" }));
+    expect(await screen.findByText(/自动审查需要先启用全局规则审查/)).toBeTruthy();
+    expect(requests.some((request) => request.path === "/api/v1/admin/settings")).toBe(false);
+  });
+
+  it("disables an unadvertised mode even when global rule review is enabled", async () => {
+    currentSettings.supported_permission_modes = ["default", "read_only"];
+    render(<TestApp initialPath="/config" />);
+    const group = await screen.findByRole("group", { name: "沙箱权限" });
+    expect((within(group).getByRole("option", { name: /自动审查/ }) as HTMLOptionElement).disabled).toBe(true);
+  });
+
+  it("disables new defaults for old services and saves only the legacy payload", async () => {
+    const { supported_permission_modes: _supported, default_permission_mode: _mode, default_sandbox_profile: _profile, ...legacy } = settings;
+    currentSettings = legacy as typeof settings;
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/config" />);
+    const group = await screen.findByRole("group", { name: "沙箱权限" });
+    expect((within(group).getByLabelText("默认权限模式") as HTMLSelectElement).disabled).toBe(true);
+    expect((within(group).getByLabelText("默认沙箱边界") as HTMLSelectElement).disabled).toBe(true);
+    expect(within(group).getByText(/服务需更新/)).toBeTruthy();
+    await user.click(screen.getByRole("button", { name: "保存系统设置" }));
+    await waitFor(() => expect(requests.some((request) => request.path === "/api/v1/admin/settings")).toBe(true));
+    const body = requests.find((request) => request.path === "/api/v1/admin/settings")!.body;
+    expect(body).not.toHaveProperty("supported_permission_modes");
+    expect(body).not.toHaveProperty("default_permission_mode");
+    expect(body).not.toHaveProperty("default_sandbox_profile");
+    expect(screen.queryByText(/沙箱权限.*已保存/)).toBeNull();
+  });
+
+  it("defaults absent permission fields in legacy API responses", async () => {
+    const { supported_permission_modes: _supported, default_permission_mode: _mode, default_sandbox_profile: _profile, ...legacy } = settings;
+    currentSettings = legacy as typeof settings;
+    const parsed = await api.settings();
+    expect(parsed).toMatchObject({
+      supported_permission_modes: [], default_permission_mode: "default", default_sandbox_profile: "workspace_write",
+    });
+  });
+
+  it.each([
+    ["default_permission_mode", "full_access"],
+    ["default_sandbox_profile", "full_access"],
+    ["supported_permission_modes", ["full_access"]],
+  ])("rejects unsupported permission protocol values for %s", async (key, value) => {
+    currentSettings = { ...settings, [key]: value };
+    await expect(api.settings()).rejects.toThrow();
   });
 
   it("keeps other system settings available when execution backend probing fails", async () => {

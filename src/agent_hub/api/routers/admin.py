@@ -2243,6 +2243,8 @@ PluginPackageSubprocessRegistrationStatus = Literal[
 class SystemSettingsRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    default_permission_mode: Literal["default", "auto_review", "read_only"] = "default"
+    default_sandbox_profile: Literal["none", "read_only", "restricted", "workspace_write"] = "workspace_write"
     default_mode: str = Field(
         default="auto",
         pattern=r"^(auto|direct|dispatch|discuss|hybrid)$",
@@ -2288,9 +2290,19 @@ class SystemSettingsRequest(BaseModel):
             OpenClawOperationRequest.validate_argv(argv)
         return value
 
+    @model_validator(mode="after")
+    def validate_permission_defaults(self) -> SystemSettingsRequest:
+        if self.default_permission_mode == "read_only" and self.default_sandbox_profile != "read_only":
+            raise ValueError("read_only default requires read_only sandbox_profile")
+        if self.default_permission_mode == "auto_review" and self.tool_approval_mode != "auto_review":
+            raise ValueError("auto_review default requires tenant auto_review policy")
+        return self
+
 
 class SystemSettingsResponse(SystemSettingsRequest):
-    pass
+    supported_permission_modes: tuple[Literal["default", "auto_review", "read_only"], ...] = (
+        "default", "auto_review", "read_only",
+    )
 
 
 class ExecutionBackendResponse(BaseModel):
@@ -2328,6 +2340,7 @@ _PLUGIN_PACKAGE_SUBPROCESS_REGISTRATION_STATUSES = frozenset(
 
 def _migrate_system_settings_payload(payload: Mapping[str, object]) -> dict[str, object]:
     migrated = dict(payload)
+    migrated.pop("supported_permission_modes", None)
     if migrated.get("tool_approval_mode") not in {"ask", "auto_review"}:
         migrated["tool_approval_mode"] = "ask"
     return migrated
@@ -2353,7 +2366,7 @@ def _persisted_system_settings_payload(
     settings: SystemSettingsRequest | SystemSettingsResponse,
 ) -> dict[str, Any]:
     return settings.model_dump(
-        exclude={"plugin_package_subprocess_registration_status"}
+        exclude={"plugin_package_subprocess_registration_status", "supported_permission_modes"}
     )
 
 
@@ -18004,6 +18017,7 @@ def _routing_details(routing_decision: dict[str, object] | None) -> dict[str, st
         "workspace_artifacts_path",
         "sandbox_profile",
         "sandbox_permission_policy",
+        "permission_mode",
         "execution_backend",
     ):
         value = routing_decision.get(key)

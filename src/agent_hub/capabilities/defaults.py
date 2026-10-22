@@ -24,6 +24,10 @@ from agent_hub.capabilities.gateway import (
     _is_go_recipe_request,
     _is_toolchain_supply_request,
 )
+from agent_hub.capabilities.permission_modes import (
+    read_only_capability_allowed,
+    run_permission_mode,
+)
 from agent_hub.capabilities.policy import CapabilityPolicy, CapabilityRule, normalize_resource
 from agent_hub.capabilities.python_project_lifecycle import (
     PythonProjectTerminalHook,
@@ -110,11 +114,14 @@ class DefaultRuntimeCapabilityPolicyGateway:
         if type(authority) is not ToolchainSupplyAuthority or not _is_go_recipe_request(request):
             return CapabilityResult(CapabilityStatus.DENIED, request.run_id, reason='capability denied')
         try:
+            permission_mode = await run_permission_mode(self._run_repository, request, role=role)
+            if permission_mode == "read_only":
+                return CapabilityResult(CapabilityStatus.DENIED, request.run_id, reason="capability denied")
             rules = (*self._extra_policy_rules(request), CapabilityRule(request.tenant_id, role,
                 'main_agent', 'command', 'run', request.resource, PolicyEffect.REQUIRE_APPROVAL))
             gateway = CapabilityGateway(default_capability_policy(request.tenant_id, extra_rules=rules),
                 self._approvals, self._run_repository,
-                approval_reviewer=await self._approval_reviewer_for_request(request.tenant_id),
+                approval_reviewer=await self._approval_reviewer_for_request(request.tenant_id, permission_mode),
                 go_recipe_authority=authority)
             return await gateway.invoke(request, role=role)
         except Exception:  # noqa: BLE001 - a failed DB fence never grants admission.
@@ -124,7 +131,14 @@ class DefaultRuntimeCapabilityPolicyGateway:
         self, request: CapabilityRequest, *, role: Role,
         toolchain_authority: ToolchainSupplyAuthority | None = None,
     ) -> CapabilityResult:
-        approval_required = await self._tool_approval_required(request.tenant_id)
+        try:
+            permission_mode = await run_permission_mode(self._run_repository, request, role=role)
+        except Exception:  # noqa: BLE001 - trusted run policy must fail closed.
+            return CapabilityResult(CapabilityStatus.DENIED, request.run_id, reason="capability denied")
+        if permission_mode == "read_only" and not read_only_capability_allowed(request):
+            return CapabilityResult(CapabilityStatus.DENIED, request.run_id, reason="read_only capability denied")
+        approval_required = (permission_mode is not None
+                             or await self._tool_approval_required(request.tenant_id))
         extra_rules = self._extra_policy_rules(request)
         project_effect = await _project_toolchain_supply_effect(self._run_repository, request,
             role=role, authority=toolchain_authority)
@@ -167,7 +181,7 @@ class DefaultRuntimeCapabilityPolicyGateway:
             policy,
             self._approvals,
             self._run_repository,
-            approval_reviewer=await self._approval_reviewer_for_request(request.tenant_id),
+            approval_reviewer=await self._approval_reviewer_for_request(request.tenant_id, permission_mode),
             plugin_policy_source=self._plugin_policy_rules,
             toolchain_authority=toolchain_authority,
         )
@@ -181,7 +195,14 @@ class DefaultRuntimeCapabilityPolicyGateway:
         except Exception:  # noqa: BLE001 - approval policy must fail closed.
             return True
 
-    async def _approval_reviewer_for_request(self, tenant_id: UUID) -> ApprovalReviewer | None:
+    async def _approval_reviewer_for_request(
+        self, tenant_id: UUID, permission_mode: str | None = None,
+    ) -> ApprovalReviewer | None:
+        if permission_mode is not None:
+            if (permission_mode == "auto_review"
+                and await self._tool_approval_mode_for_tenant(tenant_id) == "auto_review"):
+                return _BoundedAutoApprovalReviewer(self._approval_reviewer)
+            return None
         if self._approval_reviewer is not None:
             return self._approval_reviewer
         if await self._tool_approval_mode_for_tenant(tenant_id) == "auto_review":
@@ -209,6 +230,22 @@ class DefaultRuntimeCapabilityPolicyGateway:
         if not isinstance(rules, tuple) or not all(isinstance(rule, CapabilityRule) for rule in rules):
             return _deny_current_plugin_request_rules(request)
         return rules
+
+
+class _BoundedAutoApprovalReviewer:
+    """Additional reviewer policy can restrict, but never widen, the safe allowlist."""
+
+    def __init__(self, additional: ApprovalReviewer | None) -> None:
+        self._additional = additional
+
+    async def review(self, request: CapabilityRequest) -> ApprovalReviewDecision:
+        if request.tool_origin != "builtin":
+            return ApprovalReviewDecision(ApprovalReviewOutcome.REQUIRE_USER_APPROVAL,
+                                          "auto_review", "external tool requires human approval")
+        baseline = CodexAutoApprovalReviewer().review_sync(request)
+        if baseline.outcome is not ApprovalReviewOutcome.ALLOW or self._additional is None:
+            return baseline
+        return await self._additional.review(request)
 
 
 class CodexAutoApprovalReviewer:

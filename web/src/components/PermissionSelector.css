@@ -1,0 +1,131 @@
+.permission-selector-trigger {
+  align-items: center;
+  background: #ffffff;
+  background-image: none;
+  border: 1px solid #c7cdd2;
+  border-radius: 6px;
+  color: #263039;
+  box-shadow: none;
+  display: inline-flex;
+  flex: 0 1 auto;
+  font: inherit;
+  font-size: 13px;
+  gap: 6px;
+  justify-content: center;
+  letter-spacing: 0;
+  max-width: 100%;
+  min-height: 34px;
+  min-width: 0;
+  padding: 6px 9px;
+}
+
+.permission-selector-trigger span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.permission-selector-trigger svg,
+.permission-selector-option > svg {
+  flex-shrink: 0;
+}
+
+.permission-selector-trigger:hover:not(:disabled) {
+  background: #f1f4f5;
+  border-color: #87949d;
+}
+
+.permission-selector-trigger:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+.permission-selector-menu {
+  background: #ffffff;
+  border: 1px solid #c7cdd2;
+  border-radius: 8px;
+  box-shadow: 0 8px 28px #18232b26;
+  box-sizing: border-box;
+  color: #263039;
+  font-family: inherit;
+  isolation: isolate;
+  letter-spacing: 0;
+  margin: 0;
+  max-width: calc(100vw - 16px);
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 5px;
+  position: fixed;
+  z-index: 1600;
+}
+
+.permission-selector-option {
+  align-items: start;
+  background: transparent;
+  background-image: none;
+  border: 0;
+  border-radius: 4px;
+  box-sizing: border-box;
+  color: #263039;
+  box-shadow: none;
+  cursor: pointer;
+  display: grid;
+  font: inherit;
+  gap: 9px;
+  grid-template-columns: 18px minmax(0, 1fr) 17px;
+  letter-spacing: 0;
+  min-height: 68px;
+  padding: 11px 9px;
+  text-align: left;
+  width: 100%;
+}
+
+.permission-selector-copy {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.permission-selector-copy strong {
+  color: inherit;
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1.4;
+}
+
+.permission-selector-copy > span,
+.permission-selector-copy small {
+  color: #57636c;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: normal;
+}
+
+.permission-selector-option[aria-checked="true"] {
+  background: #eaf5ef;
+}
+
+.permission-selector-option:hover:not(:disabled) {
+  background: #edf1f4;
+}
+
+.permission-selector-trigger:focus-visible,
+.permission-selector-option:focus-visible {
+  outline: 2px solid #087c73;
+  outline-offset: -2px;
+}
+
+.permission-selector-option:disabled {
+  background: transparent;
+  box-shadow: none;
+  color: #68727a;
+  cursor: not-allowed;
+  opacity: 1;
+}
+
+.permission-selector-check {
+  color: #16734f;
+  height: 18px;
+  width: 17px;
+}

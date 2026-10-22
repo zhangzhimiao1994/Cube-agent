@@ -38,7 +38,7 @@ body:has(.conversation-workspace)::after { display: none; }
   align-items: center; background: none; border: 0; border-radius: 0;
   box-shadow: none; display: flex; gap: 10px; padding: 0 8px;
 }
-.is-conversation-workspace .brand-card img { border: 0; border-radius: 6px; box-shadow: none; height: 30px; width: 30px; }
+.is-conversation-workspace .brand-card img { border: 0; border-radius: 0; box-shadow: none; height: 32px; width: 32px; object-fit: contain; }
 .is-conversation-workspace .brand-card .eyebrow { color: #1f2329; font-size: 15px; font-weight: 650; letter-spacing: 0; }
 .is-conversation-workspace .brand-card h1 { display: none; }
 .is-conversation-workspace .nav-list { gap: 5px; }

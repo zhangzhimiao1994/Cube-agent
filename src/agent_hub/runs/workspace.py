@@ -5,8 +5,11 @@ from __future__ import annotations
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass
+from typing import Literal
 
 SandboxProfile = str
+PermissionMode = Literal["default", "auto_review", "read_only"]
+PERMISSION_MODES = frozenset({"default", "auto_review", "read_only"})
 
 SANDBOX_PROFILES = frozenset({"none", "read_only", "restricted", "workspace_write"})
 REQUESTED_PERMISSIONS = frozenset(
@@ -31,6 +34,7 @@ class WorkspaceSelection:
     session_id: str
     sandbox_profile: SandboxProfile
     requested_permissions: tuple[str, ...]
+    permission_mode: PermissionMode | None = None
 
     @property
     def project_path(self) -> str:
@@ -46,6 +50,7 @@ class WorkspaceSelection:
 
     def routing_payload(self) -> dict[str, object]:
         return {
+            **({"permission_mode": self.permission_mode} if self.permission_mode is not None else {}),
             "project_id": self.project_id,
             "project_label": self.project_label,
             "workspace_session_id": self.session_id,
@@ -65,8 +70,15 @@ def workspace_selection(
     project_label: str | None = None,
     sandbox_profile: SandboxProfile | None = None,
     requested_permissions: Iterable[str] | None = None,
+    permission_mode: PermissionMode | None = None,
 ) -> WorkspaceSelection:
-    profile = _sandbox_profile(sandbox_profile)
+    if permission_mode is not None and permission_mode not in PERMISSION_MODES:
+        raise ValueError("unsupported permission_mode")
+    profile = _sandbox_profile(
+        "read_only" if permission_mode == "read_only" and sandbox_profile is None else sandbox_profile
+    )
+    if permission_mode == "read_only" and profile != "read_only":
+        raise ValueError("read_only permission_mode requires read_only sandbox_profile")
     normalized_project_id = _normalize_segment(
         project_id,
         name="project_id",
@@ -83,6 +95,7 @@ def workspace_selection(
         session_id=normalized_session_id,
         sandbox_profile=profile,
         requested_permissions=_permissions_for_profile(profile, requested_permissions),
+        permission_mode=permission_mode,
     )
 
 

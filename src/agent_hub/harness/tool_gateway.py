@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import re
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Protocol, cast
+from typing import TYPE_CHECKING, Literal, Protocol, cast
 from uuid import UUID
 
 from agent_hub.auth.models import Role
@@ -334,6 +334,7 @@ class HarnessToolGateway:
                 mcp_backend=mcp_backend,
                 plugin_backend=plugin_backend,
             ),
+            tool_origin="mcp" if mcp_backend is not None else "plugin" if plugin_backend is not None else "builtin",
         )
         if authorization_failure is not None:
             return authorization_failure
@@ -440,6 +441,7 @@ class HarnessToolGateway:
         role: Role | None,
         capability_parts: tuple[str, str, str] | None = None,
         static_only: bool = False,
+        tool_origin: Literal["builtin", "mcp", "plugin"] = "builtin",
     ) -> HarnessToolCallResult | None:
         if type(user_id) is not UUID or not isinstance(role, Role):
             if self._policy_gateway is not None or self._require_actor_identity:
@@ -447,7 +449,8 @@ class HarnessToolGateway:
             return None
         if self._policy_gateway is None:
             return None
-        admission = _capability_request(tenant_id, user_id, request, capability_parts=capability_parts)
+        admission = _capability_request(tenant_id, user_id, request,
+                                        capability_parts=capability_parts, tool_origin=tool_origin)
         if request.tool_name == "project.verify" and capability_parts is None:
             resolver = getattr(self._backend, "project_verification_static_authorization", None) if static_only else None
             if not callable(resolver):
@@ -651,6 +654,7 @@ def _capability_request(
     request: HarnessToolCallRequest,
     *,
     capability_parts: tuple[str, str, str] | None = None,
+    tool_origin: Literal["builtin", "mcp", "plugin"] = "builtin",
 ) -> CapabilityRequest:
     capability, operation, resource = capability_parts or _capability_parts(request)
     return CapabilityRequest(
@@ -663,6 +667,7 @@ def _capability_request(
         arguments=dict(_mutable_json_object(request.arguments)),
         idempotency_key=request.idempotency_key,
         run_id=request.run_id,
+        tool_origin=tool_origin,
     )
 
 

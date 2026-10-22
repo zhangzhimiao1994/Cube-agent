@@ -15,6 +15,10 @@ from agent_hub.capabilities.approvals import (
     fingerprint_capability_request,
     plugin_approval_identity,
 )
+from agent_hub.capabilities.permission_modes import (
+    read_only_capability_allowed,
+    run_permission_mode,
+)
 from agent_hub.capabilities.policy import CapabilityPolicy, normalize_resource
 from agent_hub.capabilities.types import CapabilityRequest, PolicyEffect
 
@@ -98,6 +102,12 @@ class CapabilityGateway:
         approvals.bind_run_repository(run_repository)  # type: ignore[arg-type]
 
     async def invoke(self, request: CapabilityRequest, *, role: Role) -> CapabilityResult:
+        try:
+            permission_mode = await run_permission_mode(self._run_repository, request, role=role)
+        except Exception:  # noqa: BLE001 - a missing trusted policy never grants execution.
+            return CapabilityResult(CapabilityStatus.DENIED, request.run_id, reason="capability denied")
+        if permission_mode == "read_only" and not read_only_capability_allowed(request):
+            return CapabilityResult(CapabilityStatus.DENIED, request.run_id, reason="read_only capability denied")
         go_recipe = _is_go_recipe_request(request)
         expected_go_recipe: Mapping[str, object] | None = None
         if go_recipe:
