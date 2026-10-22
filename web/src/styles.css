@@ -391,11 +391,12 @@ article:hover {
 .brand-lockup img,
 .brand-card img {
   aspect-ratio: 1;
-  border: 1px solid rgba(123, 225, 255, 0.32);
-  border-radius: 0.85rem;
-  box-shadow: 0 0 22px rgba(85, 215, 255, 0.18);
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
   display: block;
-  object-fit: cover;
+  flex-shrink: 0;
+  object-fit: contain;
 }
 
 .brand-lockup img {
@@ -410,12 +411,12 @@ article:hover {
 
 .auth-brand-logo {
   aspect-ratio: 1;
-  border: 1px solid rgba(123, 225, 255, 0.36);
-  border-radius: 1rem;
-  box-shadow: 0 0 28px rgba(85, 215, 255, 0.22);
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
   display: block;
   height: 4.5rem;
-  object-fit: cover;
+  object-fit: contain;
   width: 4.5rem;
 }
 

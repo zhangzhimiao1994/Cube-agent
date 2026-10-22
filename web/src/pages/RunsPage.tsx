@@ -19,6 +19,9 @@ import {
 } from "../components/ArtifactFileCard";
 import { repairActionLabel, repairErrorCodeLabel, repairFailureKindLabel, repairRecoveryStrategyLabel } from "./repairLabels";
 import { useCapabilityApprovalDecisions } from "./useCapabilityApprovalDecisions";
+import { useAuth } from "../auth/AuthProvider";
+import { PermissionSelector, type PermissionMode } from "../components/PermissionSelector";
+import { resolvePermissionSelection, sandboxPermissions, type SupportedPermissionMode } from "./permissionSelection";
 
 const RUN_MODES = [
   { value: "auto", label: "自动", description: "主 Agent 判断应使用直连、派单、讨论或混合；不确定时向你确认。" },
@@ -39,10 +42,7 @@ const SANDBOX_OPTIONS = [
 type SandboxProfile = (typeof SANDBOX_OPTIONS)[number]["value"];
 type ExecutionBackendId = "systemd" | "docker" | "ssh" | "modal" | "daytona" | "vercel";
 export function requestedPermissionsForSandbox(profile: SandboxProfile): string[] {
-  if (profile === "none") return [];
-  if (profile === "read_only") return ["workspace.read"];
-  if (profile === "restricted") return ["workspace.read", "command.run"];
-  return ["workspace.read", "workspace.write", "command.run"];
+  return sandboxPermissions(profile);
 }
 export function workspacePreviewPath(projectId: string, sessionId: string): string {
   return `projects/${safeWorkspaceSegment(projectId, "default")}/sessions/${safeWorkspaceSegment(sessionId, "session-default")}`;
@@ -93,6 +93,7 @@ type RunSubmissionOverride = {
   mode?: RunMode;
   skipEvolutionProposal?: boolean;
   successNotice?: string;
+  permissions?: ReturnType<typeof resolvePermissionSelection>;
 };
 
 const TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled"]);
@@ -6504,6 +6505,8 @@ export function MessageBody({ text, title }: { text: string; title: string }) {
   return <OutputContent text={text} title={title} />;
 }
 export function RunsPage() {
+  const { user: permissionActor } = useAuth();
+  const permissionActorKey = [permissionActor?.tenant_id, permissionActor?.user_id, permissionActor?.role];
   const queryClient = useQueryClient();
   const navigate = useNavigate();
   const location = useLocation();
@@ -6524,7 +6527,8 @@ export function RunsPage() {
   });
   const models = useQuery({ queryKey: ["models"], queryFn: () => api.models() });
   const workflows = useQuery({ queryKey: ["workflows"], queryFn: () => api.workflows() });
-  const settings = useQuery({ queryKey: ["settings"], queryFn: () => api.settings() });
+  const settings = useQuery({ queryKey: ["settings", ...permissionActorKey], queryFn: () => api.settings(), enabled: Boolean(permissionActor) });
+  const permissionSettingsReady = Boolean(permissionActor && settings.data && !settings.isError);
   const executionBackends = useQuery({
     queryKey: ["execution-backends"],
     queryFn: () => api.executionBackends(),
@@ -6557,7 +6561,26 @@ export function RunsPage() {
   );
   const [projectId, setProjectId] = useState("default");
   const [projectLabel, setProjectLabel] = useState("");
-  const [sandboxProfile, setSandboxProfile] = useState<SandboxProfile>("workspace_write");
+  const [permissionDrafts, setPermissionDrafts] = useState<Record<string, {
+    mode: SupportedPermissionMode; profile: SandboxProfile;
+  }>>({});
+  const permissionScopeKey = JSON.stringify([...permissionActorKey, conversationId]);
+  const permissionDraft = permissionDrafts[permissionScopeKey];
+  const supportedPermissionModes = settings.data?.supported_permission_modes ?? [];
+  const configuredPermissionMode = settings.data?.default_permission_mode ?? "default";
+  const permissionMode = permissionDraft?.mode ?? configuredPermissionMode;
+  const sandboxProfile: SandboxProfile = permissionMode === "read_only" ? "read_only"
+    : permissionDraft ? permissionDraft.profile
+      : settings.data?.default_sandbox_profile ?? "workspace_write";
+  function selectPermissionMode(next: PermissionMode) {
+    if (!permissionSettingsReady || next === "full_access" || (next !== "default" && !supportedPermissionModes.includes(next))) return;
+    setPermissionDrafts((current) => ({ ...current, [permissionScopeKey]: { mode: next,
+      profile: next === "read_only" ? "read_only" : settings.data?.default_sandbox_profile ?? "workspace_write" } }));
+  }
+  function permissionSelectionForSubmission() {
+    if (!permissionSettingsReady) throw new Error("权限设置尚未确认，请稍后再发送。");
+    return resolvePermissionSelection(permissionMode, sandboxProfile, supportedPermissionModes);
+  }
   const [executionBackend, setExecutionBackend] = useState<ExecutionBackendId>("systemd");
   const [runWorkspacePath, setRunWorkspacePath] = useState("");
   const [projectInputAuthorization, setProjectInputAuthorization] = useState<{
@@ -7168,6 +7191,8 @@ export function RunsPage() {
 
   const createRun = useMutation({
     mutationFn: async (override?: RunSubmissionOverride) => {
+      if (!permissionSettingsReady) throw new Error("权限设置尚未确认，请稍后再发送。");
+      const permissions = override?.permissions ?? permissionSelectionForSubmission();
       const projectInput = projectInputForSubmission();
       const runMessage = (override?.message ?? message).trim();
       let conversationMetadata = activeConversation.data ?? listedConversationMetadata;
@@ -7204,9 +7229,8 @@ export function RunsPage() {
         project_label: conversationMetadata.project_label?.trim() || projectLabel.trim() || null,
         workspace_session_id:
           runWorkspacePath.trim() || conversationMetadata.workspace_path?.trim() || conversationId.trim() || null,
-        sandbox_profile: sandboxProfile,
+        ...permissions,
         ...(selectedExecutionBackend?.available ? { execution_backend: executionBackend } : {}),
-        requested_permissions: requestedPermissionsForSandbox(sandboxProfile),
         attachment_ids: attachmentDraft?.attachment ? [attachmentDraft.attachment.id] : [],
         skip_evolution_proposal: override?.skipEvolutionProposal === true ? true : undefined,
       });
@@ -7339,7 +7363,8 @@ export function RunsPage() {
   });
 
   const queueMessage = useMutation({
-    onMutate: () => ({ scopeKey: projectInputScopeKey, authorization: projectInputAuthorization }),
+    onMutate: () => ({ scopeKey: projectInputScopeKey, authorization: projectInputAuthorization,
+      permissionScopeKey, permissions: permissionSelectionForSubmission() }),
     mutationFn: (queuedMessage: string) =>
       api.queueConversationMessage(
         activeConversationId,
@@ -7352,9 +7377,8 @@ export function RunsPage() {
           project_id: activeWorkspaceProjectId || null,
           project_label: projectLabel.trim() || null,
           workspace_session_id: selectedRunWorkspaceSessionId || null,
-          sandbox_profile: sandboxProfile,
+          ...permissionSelectionForSubmission(),
           ...(selectedExecutionBackend?.available ? { execution_backend: executionBackend } : {}),
-          requested_permissions: requestedPermissionsForSandbox(sandboxProfile),
           attachment_ids: attachmentDraft?.attachment ? [attachmentDraft.attachment.id] : [],
         },
       ),
@@ -7370,11 +7394,13 @@ export function RunsPage() {
       if (error instanceof ApiError && error.code === "conversation_not_active") {
         if (submitted && (
           submitted.scopeKey !== projectInputScopeKey || submitted.authorization !== projectInputAuthorization
+          || submitted.permissionScopeKey !== permissionScopeKey
         )) {
           setSubmitNotice("工作区授权已变更，请重新发送消息。");
           return;
         }
-        createRun.mutate({ message: queuedMessage, mode: "auto" });
+        if (!submitted) return;
+        createRun.mutate({ message: queuedMessage, mode: "auto", permissions: submitted.permissions });
       }
     },
   });
@@ -8061,6 +8087,10 @@ export function RunsPage() {
     }
     if (projectInputError) {
       setSubmitNotice(projectInputError);
+      return;
+    }
+    if (!permissionSettingsReady) {
+      setSubmitNotice("权限设置尚未确认，请稍后再发送。");
       return;
     }
     if (canStopLatestRun) {
@@ -8957,23 +8987,6 @@ export function RunsPage() {
               </select>
               <span className="field-help">只把步骤与交付物作为主 Agent 的参考，不会固定模式或角色。</span>
             </label>
-            <div className="sandbox-settings" aria-label="沙箱权限">
-              <span className="field-label">沙箱权限</span>
-              <div className="sandbox-choice-row" role="group" aria-label="选择本次运行沙箱权限">
-                {SANDBOX_OPTIONS.map((option) => (
-                  <button
-                    key={option.value}
-                    type="button"
-                    className={`sandbox-choice${sandboxProfile === option.value ? " selected" : ""}`}
-                    aria-pressed={sandboxProfile === option.value}
-                    onClick={() => setSandboxProfile(option.value)}
-                  >
-                    <strong>{option.label}</strong>
-                    <span>{option.summary}</span>
-                  </button>
-                ))}
-              </div>
-            </div>
             <label htmlFor="execution-backend">
               执行环境
               <select
@@ -9755,6 +9768,15 @@ export function RunsPage() {
                 >
                   <Plus size={18} aria-hidden="true" />
                 </button>
+                <PermissionSelector
+                  value={permissionMode}
+                  onChange={selectPermissionMode}
+                  autoReviewAvailable={supportedPermissionModes.includes("auto_review") && settings.data?.tool_approval_mode === "auto_review"}
+                  readOnlyAvailable={supportedPermissionModes.includes("read_only")}
+                  disabled={!permissionSettingsReady}
+                  permissionSupportNotice={supportedPermissionModes.length === 0
+                    ? "沿用当前工作区边界与系统审批策略；运行级权限需更新服务器后启用。" : undefined}
+                />
               </div>
               <div className="composer-status-line" role="status">
                 <span>
@@ -9780,6 +9802,7 @@ export function RunsPage() {
                 <button
                   type="submit"
                   disabled={
+                    (!permissionSettingsReady && !capabilityApproval && !modeSelection && !temporaryApproval && !scheduleApproval && !evolutionApproval && !openClawApproval && !projectPreflightApproval && !repairApproval) ||
                     createRun.isPending ||
                     queueMessage.isPending ||
                     Boolean(projectInputError) ||
@@ -9809,6 +9832,10 @@ export function RunsPage() {
                 </button>
               </div>
             </div>
+            {!permissionSettingsReady ? <p className="field-help" role={settings.isError ? "alert" : "status"}>
+              {settings.isError ? "权限设置加载失败，已暂停发送。" : "正在确认当前账号的权限设置..."}
+              {settings.isError ? <button type="button" className="secondary-action" onClick={() => void settings.refetch()}>重试</button> : null}
+            </p> : null}
             {executionBackendFallbackNotice ? <p className="field-help" role="status">{executionBackendFallbackNotice}</p> : null}
             {executionBackendNotice && !executionBackends.isLoading ? (
               <div className="execution-backend-notice" role="status">

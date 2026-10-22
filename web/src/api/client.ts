@@ -256,6 +256,9 @@ const SystemSettingsSchema = z.object({
   default_execution_backend: z
     .enum(["systemd", "docker", "ssh", "modal", "daytona", "vercel"])
     .default("systemd"),
+  default_permission_mode: z.enum(["default", "auto_review", "read_only"]).default("default"),
+  default_sandbox_profile: z.enum(["none", "read_only", "restricted", "workspace_write"]).default("workspace_write"),
+  supported_permission_modes: z.array(z.enum(["default", "auto_review", "read_only"])).default([]),
   default_agent_ids: z.array(z.string()),
   log_level: z.enum(["warning", "error"]),
   hermes_enabled: z.boolean(),
@@ -2590,9 +2593,13 @@ export const api = {
     );
   },
   updateSettings(payload: SystemSettings): Promise<SystemSettings> {
+    const { supported_permission_modes, default_permission_mode, default_sandbox_profile, ...legacy } = payload;
+    const body = supported_permission_modes.length > 0
+      ? { ...legacy, default_permission_mode, default_sandbox_profile }
+      : legacy;
     return request(
       "/api/v1/admin/settings",
-      { method: "PUT", body: JSON.stringify(payload) },
+      { method: "PUT", body: JSON.stringify(body) },
       SystemSettingsSchema,
     );
   },
@@ -2723,6 +2730,7 @@ export const api = {
     project_label?: string | null;
     workspace_session_id?: string | null;
     sandbox_profile?: "none" | "read_only" | "restricted" | "workspace_write";
+    permission_mode?: "default" | "auto_review" | "read_only";
     execution_backend?: "systemd" | "docker" | "ssh" | "modal" | "daytona" | "vercel";
     requested_permissions?: string[];
     attachment_ids?: string[];
@@ -2748,6 +2756,7 @@ export const api = {
       project_label?: string | null;
       workspace_session_id?: string | null;
       sandbox_profile?: "none" | "read_only" | "restricted" | "workspace_write";
+      permission_mode?: "default" | "auto_review" | "read_only";
       execution_backend?: "systemd" | "docker" | "ssh" | "modal" | "daytona" | "vercel";
       requested_permissions?: string[];
       project_input?: ManagedWorkspaceProjectInput;
