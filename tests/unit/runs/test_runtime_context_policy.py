@@ -384,6 +384,52 @@ def test_project_delivery_assessment_ignores_document_about_software() -> None:
     assert _project_delivery_assessment("分析如何实现网站") is None
 
 
+@pytest.mark.parametrize(
+    "message",
+    (
+        (
+            "切换到普通对话，使用 direct 模式。请直接回复一张规范的 Markdown 表格，"
+            "不要放在代码块内，不要调用工具或创建文件。标题为‘项目交付验收表’。"
+            "表头：序号、模块、验收状态、收入（元）、成本（元）、验收备注。"
+            "12行，第6行含行内代码 npm run build。"
+        ),
+        (
+            "请直接回复一张规范的 Markdown 表格。标题为‘项目交付验收表’。"
+            "12行，第6行含行内代码 npm run build。"
+        ),
+        "请仅输出 Markdown表格。标题为‘项目交付验收表’，包含 `npm run build`。",
+        (
+            "Reply only with a Markdown table titled 'Project delivery acceptance'. "
+            "Include `npm run build` in row 6."
+        ),
+    ),
+)
+def test_project_delivery_assessment_ignores_explicit_markdown_table_reply(message: str) -> None:
+    assert _project_delivery_assessment(message) is None
+
+
+@pytest.mark.parametrize(
+    "message",
+    (
+        "开发一个公司官网，不要调用工具或创建文件。",
+        "创建一个小型项目，不要放在代码块内。",
+        "开发一个公司官网。请直接回复 Markdown 表格汇总验收状态，不要调用工具或创建文件。",
+        "请仅输出 Markdown表格汇总验收状态。构建一个网盘网站。",
+        "搭建 API 后端。请直接回复 Markdown 表格汇总验收状态。",
+        (
+            "Build a website. Reply only with a Markdown table summarizing acceptance. "
+            "Do not call tools or create files."
+        ),
+    ),
+)
+def test_project_delivery_assessment_preserves_builds_with_reply_constraints(message: str) -> None:
+    assessment = _project_delivery_assessment(message)
+
+    assert assessment is not None
+    assert assessment["project_delivery"] == "workspace"
+    assert assessment["artifact_strategy"] == "workspace_bundle"
+
+
 def test_project_delivery_assessment_upgrades_feature_rich_website_to_large() -> None:
     assessment = _project_delivery_assessment(
         "开发一个带登录、文件上传、分享链接、全文搜索和角色权限的文件管理网站"

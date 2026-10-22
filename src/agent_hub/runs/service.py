@@ -4346,6 +4346,18 @@ def _project_delivery_assessment(message: str) -> dict[str, object] | None:
         "software",
         "project",
     )
+    # Table titles and displayed commands are not software construction instructions.
+    if re.search(
+        r"(?:(?:直接|只|仅)(?:回复|输出|展示|返回)|(?:reply|respond|output) only)"
+        r"[^，。；！？,.;!?]*markdown\s*(?:表格|table)",
+        text,
+    ) and not re.search(
+        rf"(?:{'|'.join(re.escape(marker) for marker in action_markers)})"
+        r"[^，。；！？,.;!?]*"
+        rf"(?:{'|'.join(re.escape(marker) for marker in software_markers)})",
+        text,
+    ):
+        return None
     if not any(marker in text for marker in action_markers) or not any(
         marker in text for marker in software_markers
     ):
