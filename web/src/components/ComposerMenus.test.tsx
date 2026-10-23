@@ -55,6 +55,20 @@ describe("ComposerMoreMenu", () => {
     expect(screen.queryByRole("menu")).toBeNull();
   });
 
+  it.each(["上传照片", "上传文件"])("restores the trigger before opening the %s picker", async (label) => {
+    const user = userEvent.setup();
+    const props = moreProps();
+    const callback = label === "上传照片" ? props.onImages : props.onFiles;
+    let focusAtPicker: Element | null = null;
+    callback.mockImplementation(() => { focusAtPicker = document.activeElement; });
+    render(<ComposerMoreMenu {...props} />);
+    const trigger = screen.getByRole("button", { name: "更多消息工具" });
+    await user.click(trigger);
+    await user.click(screen.getByRole("menuitem", { name: label }));
+    expect(focusAtPicker).toBe(trigger);
+    expect(document.activeElement).toBe(trigger);
+  });
+
   it("disables only upload actions and skips them in keyboard navigation", async () => {
     const user = userEvent.setup();
     const props = moreProps(true);
