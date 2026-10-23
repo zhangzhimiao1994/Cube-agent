@@ -1,15 +1,17 @@
-import { useQuery } from "@tanstack/react-query";
-import { RotateCw } from "lucide-react";
+import { RotateCw, ShieldCheck, ShieldX } from "lucide-react";
 import { useRef } from "react";
 
-import { ApiError, api, type CapabilityApprovalEvent, type RunDetail } from "../api/client";
+import { ApiError, type CapabilityApprovalEvent, type RunDetail } from "../api/client";
 import { useAuth } from "../auth/AuthProvider";
+import { useRunCapabilityApprovals } from "./useRunCapabilityApprovals";
+import "../components/CapabilityApprovalCard.css";
 
 type ApprovalRecord = {
   id: string;
   sequence: number;
   source: number;
   decision: "approved" | "rejected";
+  scope?: "conversation";
   createdAt: string;
   label?: string;
 };
@@ -38,6 +40,7 @@ function approvalRecords(run: RunDetail, history: CapabilityApprovalEvent[]): Ap
         records.set(event.approval_id, {
           id: event.approval_id, sequence: event.sequence, source, decision: event.decision,
           createdAt: event.created_at, label: requests.get(event.approval_id),
+          scope: event.payload.decision_scope === "conversation" ? "conversation" : undefined,
         });
       }
     }
@@ -55,17 +58,7 @@ export function RunApprovalHistory({ run }: { run: RunDetail }) {
   const actorScope = user ? JSON.stringify([user.tenant_id, user.user_id, user.role]) : null;
   const legacyActor = useRef(actorScope);
   if (legacyActor.current === null && actorScope !== null) legacyActor.current = actorScope;
-  const terminal = ["completed", "failed", "cancelled"].includes(run.status);
-  const history = useQuery({
-    queryKey: ["capability-approval-history", user?.tenant_id, user?.user_id, user?.role, run.id, terminal],
-    queryFn: ({ signal }) => api.capabilityApprovals(run.id, signal),
-    enabled: Boolean(user && hasPermission("run:read")),
-    gcTime: 0,
-    staleTime: 0,
-    retry: false,
-    refetchOnMount: "always",
-    refetchInterval: terminal ? false : 1000,
-  });
+  const history = useRunCapabilityApprovals(run);
   if (!user || !hasPermission("run:read")) return null;
   const scopeDenied = history.error instanceof ApiError && [401, 403, 404].includes(history.error.status);
   const records = scopeDenied ? [] : approvalRecords(
@@ -74,8 +67,11 @@ export function RunApprovalHistory({ run }: { run: RunDetail }) {
   );
   return <>
     {records.map((record) => (
-      <article key={record.id} className="run-approval-result" aria-label="权限审批结果">
-        <strong>{record.decision === "approved" ? "已批准本次操作" : "已拒绝本次操作"}</strong>
+      <article key={record.id} className="run-approval-result" aria-label="权限审批结果" data-decision={record.decision}>
+        {record.decision === "approved" ? <ShieldCheck size={16} aria-hidden="true" /> : <ShieldX size={16} aria-hidden="true" />}
+        <span className="approval-record-label">权限审批</span>
+        <strong>{record.decision === "rejected" ? "已拒绝本次操作"
+          : record.scope === "conversation" ? "已批准本次会话内同范围操作" : "已批准本次操作"}</strong>
         {record.label ? <span>{record.label}</span> : null}
         <code>{record.id}</code>
         {Number.isFinite(Date.parse(record.createdAt)) ? (

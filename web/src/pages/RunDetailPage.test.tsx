@@ -2872,7 +2872,7 @@ describe("RunDetailPage", () => {
 
     const card = await screen.findByRole("status", { name: "沙箱权限确认" });
     expect(within(card).getByText("project.generate_zip 需要沙箱权限。")).not.toBeNull();
-    await user.click(within(card).getByRole("button", { name: "允许一次" }));
+    await user.click(within(card).getByRole("button", { name: "批准" }));
 
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining("/approve-capability"), expect.any(Object)));
   });
