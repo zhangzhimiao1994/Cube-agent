@@ -172,16 +172,38 @@ async def test_native_fixture_model_identity_matches_committed_tool_intent_witho
                                        harness_tool_gateway=backend)
     stream = runtime.run(context)
     saved = None
+    framework = None
+    dispatch = None
     try:
         async with asyncio.timeout(2):
             async for event in stream:
                 if event.checkpoint is not None and event.checkpoint.state.get("tool_ledger"):
                     saved = event.checkpoint
+                    framework = runtime.last_team._runtime
+                    dispatch = framework._run_context._run_task
                     break
     finally:
         await stream.aclose()
     assert saved is not None and len(model.requests) == 2 and not backend.calls
+    assert dispatch is not None and dispatch.done(), "owned AutoGen dispatch loop leaked after close"
+    assert framework is not None and not any(not task.done() for task in framework._background_tasks)
     for row, request in zip(saved.state["model_ledger"], model.requests, strict=True):
         names = {"project.inspect": "project.inspect",
                  "project_inspect": "project.inspect"} if request.tools else None
         assert row["request_hash"] == _DiscussionDurability.request_hash(request, tool_names=names)
+
+
+async def test_incomplete_ack_cleanup_is_not_reported_as_a_successful_close():
+    context, plan, model, _ = fixture()
+
+    class IncompleteCleanup(AutoGenDiscussionRuntime):
+        async def _await_autogen_cleanup(self, operation):
+            complete = await super()._await_autogen_cleanup(operation)
+            return False if operation.cr_code.co_name == "drain_owned_handlers" else complete
+
+    runtime = IncompleteCleanup(model, plan, capability_gateway=object())
+    stream = runtime.run(context)
+    await pending_checkpoint(stream)
+    with pytest.raises(RuntimeError, match="cleanup incomplete"):
+        await stream.aclose()
+    assert not model.calls

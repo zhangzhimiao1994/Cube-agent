@@ -325,6 +325,10 @@ class RuntimeExecutionError(RuntimeError):
     """Stable discussion runtime failure."""
 
 
+class _AutoGenCleanupIncomplete(RuntimeError):
+    """Owned framework cleanup failed; stream closure must not hide that fact."""
+
+
 class RuntimeBusy(RuntimeExecutionError):
     """A runtime instance has one active stream."""
 
@@ -2751,13 +2755,15 @@ class AutoGenDiscussionRuntime:
                 publication_task = asyncio.create_task(publications.next())
             framework_failed = False
             framework_timed_out = False
+            item_task: asyncio.Task[Any] | None = None
+            stream: Any = None
             try:
                 stream = team.run_stream(
                     task=self._task_text(context, tuple(message_artifacts)),
                     cancellation_token=self._cancel_token,
                 )
                 while True:
-                    item_task: asyncio.Task[Any] = asyncio.create_task(anext(stream))
+                    item_task = asyncio.create_task(anext(stream))
                     while not item_task.done() or (publication_task is not None and publication_task.done()):
                         if publication_task is not None and publication_task.done():
                             publication = publication_task.result()
@@ -2900,12 +2906,33 @@ class AutoGenDiscussionRuntime:
                         self._cancel_token.cancel()
                     round_published.set()
                 cleanup_failed = False
+                if checkpoint_ack and (framework_failed or framework_timed_out):
+                    async def drain_owned_handlers() -> None:
+                        if item_task is not None:
+                            if not item_task.done():
+                                item_task.cancel()
+                            await asyncio.gather(item_task, return_exceptions=True)
+                        # AutoGen 0.7.5 owns these handlers. Drain them before reset
+                        # can replace the queue whose unfinished counts they own.
+                        handlers = tuple(framework_runtime._background_tasks)
+                        for handler in handlers:
+                            handler.cancel()
+                        await asyncio.gather(*handlers, return_exceptions=True)
+                        if stream is not None:
+                            await stream.aclose()
+                        if any(not handler.done() for handler in framework_runtime._background_tasks):
+                            raise RuntimeExecutionError("AutoGen handlers did not stop")
+
+                    if not await self._await_autogen_cleanup(drain_owned_handlers()):
+                        cleanup_failed = True
                 if not await self._await_autogen_cleanup(team.reset()):
                     cleanup_failed = True
                 if not await self._await_autogen_cleanup(framework_runtime.stop_when_idle()):
                     cleanup_failed = True
                 if not await self._await_autogen_cleanup(framework_runtime.close()):
                     cleanup_failed = True
+                if checkpoint_ack and cleanup_failed:
+                    raise _AutoGenCleanupIncomplete("AutoGen runtime cleanup incomplete")
                 if _should_fail_on_autogen_cleanup(
                     cleanup_failed=cleanup_failed,
                     framework_failed=framework_failed,
@@ -3071,6 +3098,9 @@ class AutoGenDiscussionRuntime:
                 run_id=context.run_id,
                 payload=durability.failure_payload if durability is not None else {},
             )
+            raise
+        except _AutoGenCleanupIncomplete:
+            # Also propagate on GeneratorExit: yielding a failure from aclose is invalid.
             raise
         except Exception as error:  # noqa: BLE001 - AutoGen wraps participant failures
             failure_reason = (
