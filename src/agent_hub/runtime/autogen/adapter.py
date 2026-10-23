@@ -1908,6 +1908,7 @@ class GatewayChatCompletionClient(ChatCompletionClient):
         compaction_window: _MessageCompactionWindow = _DEFAULT_MESSAGE_COMPACTION_WINDOW,
         engineering_action: Callable[[bool], str | None] | None = None,
         engineering_budget: Callable[[], tuple[int, float]] | None = None,
+        request_timeout: Callable[[], float] | None = None,
     ) -> None:
         self._gateway = gateway
         self._logical_model = logical_model
@@ -1918,6 +1919,7 @@ class GatewayChatCompletionClient(ChatCompletionClient):
         self._compaction_window = compaction_window
         self._engineering_action = engineering_action
         self._engineering_budget = engineering_budget
+        self._request_timeout = request_timeout
         self._actual = RequestUsage(prompt_tokens=0, completion_tokens=0)
         self._total = RequestUsage(prompt_tokens=0, completion_tokens=0)
 
@@ -2020,7 +2022,8 @@ class GatewayChatCompletionClient(ChatCompletionClient):
                 raise RuntimeExecutionError("engineering action budget is exhausted")
         return replace(request, tools=selected, required_tool=name,
                        max_output_tokens=min(self._max_output_tokens, tokens),
-                       timeout_seconds=min(request.timeout_seconds, float(seconds))), {
+                       timeout_seconds=(float(seconds) if self._request_timeout is not None
+                                        else min(request.timeout_seconds, float(seconds)))), {
             key: value for key, value in tool_names.items() if value == action
         }
 
@@ -2035,10 +2038,21 @@ class GatewayChatCompletionClient(ChatCompletionClient):
         )
         replayed = completion is not None
         if completion is None:
-            task = asyncio.create_task(self._gateway.complete_with_context(request))
-            if cancellation_token is not None:
-                cancellation_token.link_future(task)
             try:
+                # Replayed outcomes need no new deadline; durable publication may
+                # consume time, so bind new transport calls at the last boundary.
+                if self._request_timeout is not None:
+                    seconds = self._request_timeout()
+                    if (isinstance(seconds, bool) or not isinstance(seconds, int | float)
+                        or not math.isfinite(seconds) or seconds <= 0):
+                        raise RuntimeExecutionError("discussion model deadline exhausted")
+                    request = replace(request, timeout_seconds=(
+                        min(request.timeout_seconds, float(seconds))
+                        if request.required_tool is not None else float(seconds)
+                    ))
+                task = asyncio.create_task(self._gateway.complete_with_context(request))
+                if cancellation_token is not None:
+                    cancellation_token.link_future(task)
                 completion = await task
             except asyncio.CancelledError:
                 if self._durability is not None:
@@ -2299,6 +2313,13 @@ class AutoGenDiscussionRuntime:
                     if usage.cost_usd < self._plan.cost_budget_usd else 0,
                     max(0.0, deadline - asyncio.get_running_loop().time()) if deadline is not None else 0.0)
 
+        def request_timeout() -> float:
+            budget = self._wall_budget
+            if budget is None:
+                raise RuntimeExecutionError("discussion wall deadline is unavailable")
+            now = asyncio.get_running_loop().time()
+            return min(budget.remaining(now=now), budget.absolute_remaining(now=now))
+
         wall_expired = asyncio.Event()
         wall_handle: asyncio.TimerHandle | None = None
         try:
@@ -2462,6 +2483,7 @@ class AutoGenDiscussionRuntime:
                     compaction_window=compaction_window,
                     engineering_action=next_action if actions and participant.id == owner else None,
                     engineering_budget=action_budget if actions and participant.id == owner else None,
+                    request_timeout=request_timeout,
                 )
                 for participant in self._plan.participants
             }
@@ -2476,6 +2498,7 @@ class AutoGenDiscussionRuntime:
                 max_output_tokens=self._plan.selector_max_output_tokens,
                 durability=durability,
                 compaction_window=compaction_window,
+                request_timeout=request_timeout,
             )
             tool_records: list[_ToolRecord] = []
 
