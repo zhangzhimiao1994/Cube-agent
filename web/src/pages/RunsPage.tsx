@@ -7218,7 +7218,7 @@ export function RunsPage() {
       return api.createRun({
         ...projectInput,
         message: runMessage,
-        mode: "auto",
+        mode: override?.mode ?? "auto",
         reference_workflow_id: workflowId || null,
         allow_workflow_adjustment: false,
         agent_ids: [],
@@ -7240,7 +7240,8 @@ export function RunsPage() {
       setSelectedRunId(run.id);
       if (run.conversation_id) setConversationId(run.conversation_id);
       const selection = modeSelectionFromSubmittedRun(run);
-      const submittedMode: RunMode = "auto";
+      const submittedMode: RunMode = override?.mode ?? "auto";
+      setMode("auto");
       if (selection && submittedMode !== "auto") {
         setTemporaryApproval(null);
         setScheduleApproval(null);
@@ -7586,7 +7587,7 @@ export function RunsPage() {
     },
     onSuccess: async (run) => {
       setModeSelection(null);
-      if (run.mode) setMode(run.mode as RunMode);
+      setMode("auto");
       setSubmitNotice(explainActualMode(run));
       await refreshRunSurfaces(run);
     },
@@ -8078,7 +8079,7 @@ export function RunsPage() {
       }
       setMessage("");
       setSubmitNotice(`已选择“${choice.option.label}”，正在按你的选择继续。`);
-      setMode(choice.option.value as RunMode);
+      setMode("auto");
       chooseMode.mutate({
         chosenMode: choice.option.value as ManualRunMode,
         operatorNote: choice.note || undefined,
@@ -8097,7 +8098,7 @@ export function RunsPage() {
       queueMessage.mutate(trimmed);
       return;
     }
-    createRun.mutate({ message: trimmed, mode: "auto" });
+    createRun.mutate({ message: trimmed, mode });
   }
 
   function clearConversationTransientState() {
@@ -8267,7 +8268,7 @@ export function RunsPage() {
       setUsageOpen(false);
       setConfigOpen(true);
       setMessage("");
-      setSubmitNotice("已打开本轮运行设置，可调整参考方案、执行环境和沙箱权限。");
+      setSubmitNotice("已打开本轮运行设置，可调整运行模式、参考方案、执行环境和沙箱权限。");
       return;
     }
     if (commandId === "memory") {
@@ -8903,12 +8904,25 @@ export function RunsPage() {
           <div className="composer-config-summary" aria-label="本次运行设置概览">
             <strong>本次运行配置</strong>
             <div>
-              <span>主 Agent 自动</span>
+              <span>{mode === "auto" ? "主 Agent 自动" : `本次${displayMode(mode)}`}</span>
               <span>{selectedSandboxLabel}</span>
               <span>{executionBackendLabel}</span>
               <span>{workflowId ? `参考 ${selectedWorkflow?.name ?? workflowId}` : "无参考方案"}</span>
             </div>
           </div>
+          <label htmlFor="run-mode">
+            运行模式
+            <select
+              id="run-mode"
+              value={mode}
+              disabled={canStopLatestRun || createRun.isPending}
+              onChange={(event) => setMode(event.target.value as RunMode)}
+            >
+              {RUN_MODES.map((item) => (
+                <option key={item.value} value={item.value}>{item.label}</option>
+              ))}
+            </select>
+          </label>
           <div className="conversation-workspace-summary">
             <span className="field-label">本次工作目录</span>
             <strong>{activeConversation.data?.project_label?.trim() || projectLabel || projectId}</strong>
@@ -9036,7 +9050,7 @@ export function RunsPage() {
             <div className="mode-help">
               <span className="eyebrow">当前设置</span>
               <p>
-                工作区：{workspacePreviewPath(activeWorkspaceProjectId, selectedRunWorkspaceSessionId)} · 主 Agent 自动 · {selectedSandboxLabel} ·
+                工作区：{workspacePreviewPath(activeWorkspaceProjectId, selectedRunWorkspaceSessionId)} · {mode === "auto" ? "主 Agent 自动" : `本次${displayMode(mode)}`} · {selectedSandboxLabel} ·
                 {executionBackendLabel}
               </p>
               {settings.isLoading ? <p>正在加载默认运行设置...</p> : null}
@@ -9781,7 +9795,7 @@ export function RunsPage() {
               <div className="composer-status-line" role="status">
                 <span>
                   {[
-                    "主 Agent 自动",
+                    mode === "auto" ? "主 Agent 自动" : `本次${displayMode(mode)}`,
                     selectedSandboxLabel,
                     workflowId ? `参考 ${selectedWorkflow?.name ?? workflowId}` : null,
                     referenceConversationId.trim() ? "已引用" : null,
