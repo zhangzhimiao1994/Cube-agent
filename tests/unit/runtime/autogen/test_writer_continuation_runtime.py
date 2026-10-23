@@ -168,3 +168,30 @@ async def exercise_writer_continuation(*, artifact_repository=None, restore_repo
 
 async def test_new_policy_authors_acceptance_before_multiple_files_without_reselecting_each_tool() -> None:
     await exercise_writer_continuation()
+
+
+@pytest.mark.parametrize("reserved_writer", [False, True])
+@pytest.mark.parametrize("multiple_writers", [False, True])
+async def test_reserved_user_participant_is_rejected_before_any_model_or_publication_wait(
+    reserved_writer, multiple_writers,
+):
+    ctx = action_context()
+    ctx = ctx.model_copy(update={"routing_decision": {**ctx.routing_decision, POLICY: 1}})
+
+    class NoModel:
+        async def complete_with_context(self, request):
+            raise AssertionError("reserved participants must be rejected before model dispatch")
+
+    plan = DiscussionPlan(participants=(
+        DiscussionParticipant(id="user" if reserved_writer else "implementer", role="Engineer",
+            goal="Build", logical_model="writer", allowed_tools=TOOLS),
+        DiscussionParticipant(id="reviewer" if reserved_writer else "user", role="Reviewer",
+            goal="Review", logical_model="reviewer", allowed_tools=TOOLS if multiple_writers else ()),
+    ), selector_model="selector", max_turns=8, token_budget=500, wall_time_seconds=0.1)
+    runner = AutoGenDiscussionRuntime(NoModel(), plan, capability_gateway=object())
+    async with asyncio.timeout(2):
+        events = [event async for event in runner.run(ctx)]
+    assert events[-1].kind is EventKind.RUNTIME_FAILED
+    assert events[-1].reason == "engineering continuation participant is reserved"
+    assert not any(event.checkpoint is not None for event in events)
+    assert runner._active_task is None

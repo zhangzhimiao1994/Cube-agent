@@ -2395,6 +2395,8 @@ class AutoGenDiscussionRuntime:
         wall_expired = asyncio.Event()
         wall_handle: asyncio.TimerHandle | None = None
         try:
+            if engineering_continuation_selected(context) and "user" in allowed_tools:
+                raise RuntimeExecutionError("engineering continuation participant is reserved")
             restored = self._restored
             ledger_artifacts: tuple[Artifact, ...] = ()
             if restored is not None:
