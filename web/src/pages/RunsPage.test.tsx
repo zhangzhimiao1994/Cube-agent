@@ -270,6 +270,31 @@ describe("conversation action menu", () => {
     return { navigate: (to: string) => navigate(to), update };
   }
 
+  it("keeps the composer blank and exposes the current conversation ID only in its menu", async () => {
+    const user = userEvent.setup();
+    renderMenuPage();
+    const input = screen.getByRole("textbox", { name: "消息" });
+    expect(input.getAttribute("placeholder")).toBeNull();
+    expect(screen.queryByText("conv-menu-alpha")).toBeNull();
+    await user.click(screen.getByRole("button", { name: "会话操作" }));
+    const menu = screen.getByRole("menu", { name: "会话操作" });
+    expect(within(menu).getByText("conv-menu-alpha")).not.toBeNull();
+    const copy = vi.spyOn(navigator.clipboard, "writeText").mockResolvedValue();
+    await user.click(within(menu).getByRole("menuitem", { name: "复制会话 ID" }));
+    expect(copy).toHaveBeenCalledExactlyOnceWith("conv-menu-alpha");
+    expect(await within(menu).findByText("已复制")).not.toBeNull();
+  });
+
+  it("shows copy failure without closing the menu or changing the conversation", async () => {
+    const user = userEvent.setup();
+    renderMenuPage();
+    await user.click(screen.getByRole("button", { name: "会话操作" }));
+    vi.spyOn(navigator.clipboard, "writeText").mockRejectedValue(new Error("clipboard blocked"));
+    await user.click(screen.getByRole("menuitem", { name: "复制会话 ID" }));
+    expect(await within(screen.getByRole("menu", { name: "会话操作" })).findByRole("alert")).toHaveProperty("textContent", "复制失败，请重试");
+    expect(screen.getByText("会话：Menu alpha")).not.toBeNull();
+  });
+
   it("dismisses outside pointer clicks without stealing their focus", async () => {
     const user = userEvent.setup();
     renderMenuPage();
@@ -277,7 +302,7 @@ describe("conversation action menu", () => {
     await user.click(trigger);
     await user.click(screen.getByRole("menu"));
     expect(screen.queryByRole("menu")).not.toBeNull();
-    const composer = screen.getByPlaceholderText(/输入消息/);
+    const composer = screen.getByRole("textbox", { name: "消息" });
     await user.click(composer);
     expect(screen.queryByRole("menu")).toBeNull();
     expect(document.activeElement).toBe(composer);
@@ -297,7 +322,7 @@ describe("conversation action menu", () => {
 
   it.each([
     ["{Enter}", "重命名"], [" ", "重命名"],
-    ["{ArrowDown}", "重命名"], ["{ArrowUp}", "归档"],
+    ["{ArrowDown}", "重命名"], ["{ArrowUp}", "复制会话 ID"],
   ])("opens with %s and focuses %s", async (key, name) => {
     const user = userEvent.setup();
     renderMenuPage();
@@ -315,10 +340,11 @@ describe("conversation action menu", () => {
     await user.click(screen.getByRole("button", { name: "会话操作" }));
     const rename = screen.getByRole("menuitem", { name: "重命名" });
     const archive = screen.getByRole("menuitem", { name: "归档" });
+    const copy = screen.getByRole("menuitem", { name: "复制会话 ID" });
     rename.focus();
     for (const [key, target] of [
-      ["{ArrowDown}", archive], ["{ArrowDown}", rename],
-      ["{ArrowUp}", archive], ["{Home}", rename], ["{End}", archive],
+      ["{ArrowDown}", archive], ["{ArrowDown}", copy], ["{ArrowDown}", rename],
+      ["{ArrowUp}", copy], ["{Home}", rename], ["{End}", copy],
     ] as const) {
       await user.keyboard(key);
       expect(document.activeElement).toBe(target);
@@ -335,14 +361,14 @@ describe("conversation action menu", () => {
     screen.getByRole("menuitem", { name: "重命名" }).focus();
     await user.tab({ shift });
     expect(screen.queryByRole("menu")).toBeNull();
-    expect(document.activeElement).toBe(shift ? trigger : screen.getByPlaceholderText(/输入消息/));
+    expect(document.activeElement).toBe(shift ? trigger : screen.getByRole("textbox", { name: "消息" }));
   });
 
   it("resets on conversation navigation without pulling focus from the composer", async () => {
     const user = userEvent.setup();
     const { navigate } = renderMenuPage();
     await user.click(screen.getByRole("button", { name: "会话操作" }));
-    const composer = screen.getByPlaceholderText(/输入消息/);
+    const composer = screen.getByRole("textbox", { name: "消息" });
     composer.focus();
     await act(async () => { await navigate("/?conversation=conv-menu-beta"); });
     expect(screen.getByText("会话：Menu beta")).not.toBeNull();
@@ -710,6 +736,20 @@ describe("conversation ordering", () => {
     const messages = conversationMessages([run]);
 
     expect(messages.map((message) => message.title)).toEqual(["你"]);
+  });
+
+  it("shows a neutral outcome for a completed round without a visible reply or final delivery", () => {
+    const completed: RunDetail = { ...baseRun, status: "completed", artifacts: [] };
+    const snapshot = JSON.stringify(completed);
+    const messages = conversationMessages([completed]);
+    const notice = messages.find((item) => item.title === "暂无交付结果");
+    expect(notice?.body).toContain("本轮已结束，但未提供最终回复或交付文件");
+    expect(notice?.body).toContain("不能据此确认项目完成");
+    expect(notice?.body).not.toMatch(/失败|重试|重跑|已完成项目/);
+    expect(JSON.stringify(completed)).toBe(snapshot);
+    expect(conversationMessages([{ ...completed, status: "running" }]).some((item) => item.title === "暂无交付结果")).toBe(false);
+    expect(conversationMessages([{ ...completed, artifacts: [{ id: "reply", kind: "text", title: "main", text: "已提供回复。" }] }])
+      .some((item) => item.title === "暂无交付结果")).toBe(false);
   });
 
   it("keeps final artifacts with text as normal assistant replies", () => {

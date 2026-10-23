@@ -952,6 +952,25 @@ const RunBulkDeleteSchema = z.object({
 });
 
 export type RunDetail = z.infer<typeof RunDetailSchema>;
+const CapabilityApprovalEventSchema = z.object({
+  sequence: z.number().int().positive(),
+  kind: z.enum(["approval.requested", "approval.resolved"]),
+  run_id: z.string(),
+  approval_id: z.string().min(1),
+  created_at: z.string(),
+  tool_name: z.string().nullable().optional(),
+  action: z.string().nullable().optional(),
+  decision: z.enum(["approved", "rejected"]).nullable().optional(),
+  payload: z.object({
+    capability: z.string().optional(),
+    operation: z.string().optional(),
+  }).default({}),
+});
+const CapabilityApprovalsSchema = z.object({
+  items: z.array(CapabilityApprovalEventSchema),
+  ready: z.boolean(),
+});
+export type CapabilityApprovalEvent = z.infer<typeof CapabilityApprovalEventSchema>;
 export type RunDeleteResult = z.infer<typeof RunDeleteSchema>;
 export type BulkFailure = z.infer<typeof BulkFailureSchema>;
 export type RunBulkDeleteResult = z.infer<typeof RunBulkDeleteSchema>;
@@ -2941,6 +2960,17 @@ export const api = {
       { method: "POST", body: JSON.stringify(payload) },
       SubmittedRunSchema,
     );
+  },
+  async capabilityApprovals(id: string, signal?: AbortSignal) {
+    const history = await request(
+      `/api/v1/runs/${encodeURIComponent(id)}/capability-approvals`,
+      { method: "GET", signal },
+      CapabilityApprovalsSchema,
+    );
+    if (history.items.some((event) => event.run_id !== id)) {
+      throw new ApiError("approval history scope mismatch", 200, "invalid_response");
+    }
+    return history;
   },
   rejectCapability(
     id: string,

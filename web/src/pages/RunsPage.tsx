@@ -3,7 +3,7 @@ import { Fragment, FormEvent, type ReactNode, useEffect, useMemo, useRef, useSta
 import { createPortal } from "react-dom";
 import { Link, useLocation, useNavigate } from "react-router-dom";
 import { z } from "zod";
-import { ArrowUp, FolderClock, MoreHorizontal } from "lucide-react";
+import { ArrowUp, Copy, FolderClock, MoreHorizontal } from "lucide-react";
 
 import { ApiError, api, formatApiError, type AttachmentUpload, type Conversation, type ConversationMetadata, type ConversationQueueItem, type ModelDeployment, type ProjectWorkspace, type RunDetail, type RunListItem, type Skill, type SkillArchiveUpload, type SubmittedRun, type WebPreview, type WorkspaceDirectoryList, type WorkspaceFileList } from "../api/client";
 import { APP_BRAND_NAME } from "../app/brand";
@@ -19,6 +19,7 @@ import {
 } from "../components/ArtifactFileCard";
 import { repairActionLabel, repairErrorCodeLabel, repairFailureKindLabel, repairRecoveryStrategyLabel } from "./repairLabels";
 import { useCapabilityApprovalDecisions } from "./useCapabilityApprovalDecisions";
+import { RunApprovalHistory } from "./RunApprovalHistory";
 import { useAuth } from "../auth/AuthProvider";
 import { PermissionSelector, type PermissionMode } from "../components/PermissionSelector";
 import { ComposerModeMenu, ComposerMoreMenu } from "../components/ComposerMenus";
@@ -2627,6 +2628,13 @@ function detailMessages(detail: RunDetail | undefined): ChatMessage[] {
           },
         ]
       : [];
+  const emptyDelivery: ChatMessage[] = detail.status === "completed" && !replyArtifact
+    && downloadableArtifacts.length === 0 && artifactMessages.length === 0 && !internalNotice
+    ? [{
+        id: "empty-delivery", role: "assistant", title: "暂无交付结果",
+        body: "本轮已结束，但未提供最终回复或交付文件；不能据此确认项目完成。",
+      }]
+    : [];
   return [
     {
       id: "request",
@@ -2697,6 +2705,7 @@ function detailMessages(detail: RunDetail | undefined): ChatMessage[] {
       : []),
     ...(internalNotice ? [internalNotice] : []),
     ...artifactMessages,
+    ...emptyDelivery,
     ...failureMessages,
   ];
 }
@@ -6625,6 +6634,7 @@ export function RunsPage() {
     };
   });
   const [conversationMenuOpen, setConversationMenuOpen] = useState(false);
+  const [conversationCopyNotice, setConversationCopyNotice] = useState<"copied" | "failed" | null>(null);
   const conversationMenuAnchorRef = useRef<HTMLDivElement>(null);
   const conversationMenuTriggerRef = useRef<HTMLButtonElement>(null);
   const conversationMenuRef = useRef<HTMLDivElement>(null);
@@ -6712,12 +6722,7 @@ export function RunsPage() {
     proposal: RepairProposal;
   } | null>(null);
   const [capabilityApprovalCandidate, setCapabilityApproval] = useState<CapabilityApproval | null>(null);
-  const capabilityDecisions = useCapabilityApprovalDecisions((run, approval, decision) => {
-    if (capabilityApprovalRun?.id === approval.runId) {
-      setSubmitNotice(decision === "approve"
-        ? "已允许本次沙箱工具调用，当前任务已重新排队继续执行。"
-        : "已拒绝本次沙箱工具调用，当前任务已取消。");
-    }
+  const capabilityDecisions = useCapabilityApprovalDecisions((run, approval) => {
     void refreshRunSurfaces({
       id: approval.runId,
       conversation_id: run.conversation_id ?? queryClient.getQueryData<RunDetail>(["run", approval.runId])?.conversation_id,
@@ -6752,11 +6757,14 @@ export function RunsPage() {
 
   const selectedRunConversationId = runConversationId(selectedRun.data);
   const activeConversationId = conversationId.trim();
+  const conversationIdRef = useRef(activeConversationId);
+  conversationIdRef.current = activeConversationId;
   useEffect(() => {
     if (conversationMenuRef.current?.contains(document.activeElement)) {
       conversationMenuTriggerRef.current?.focus();
     }
     setConversationMenuOpen(false);
+    setConversationCopyNotice(null);
   }, [activeConversationId]);
 
   useEffect(() => {
@@ -6867,6 +6875,10 @@ export function RunsPage() {
   });
 
   async function refreshRunSurfaces(run: { id: string; conversation_id?: string | null }) {
+    await queryClient.invalidateQueries({ queryKey: [
+      "capability-approval-history", permissionActor?.tenant_id, permissionActor?.user_id,
+      permissionActor?.role, run.id,
+    ] });
     await queryClient.invalidateQueries({ queryKey: ["runs"] });
     await queryClient.invalidateQueries({ queryKey: ["run", run.id] });
     await queryClient.invalidateQueries({ queryKey: ["hermes"] });
@@ -8059,11 +8071,11 @@ export function RunsPage() {
       }
       setMessage("");
       if (choice.option.value === "approve") {
-        setSubmitNotice("已选择允许一次，正在重新排队继续执行。");
+        setSubmitNotice(null);
         capabilityDecisions.approve(capabilityApproval);
         return;
       }
-      setSubmitNotice("已选择拒绝，本次任务会取消。");
+      setSubmitNotice(null);
       capabilityDecisions.reject(capabilityApproval);
       return;
     }
@@ -8525,7 +8537,9 @@ export function RunsPage() {
   const currentConversationListItem = items.find((item) => item.conversation_id === activeConversationId);
   const currentConversationTitle =
     activeConversation.data?.title?.trim() ||
-    (currentConversationListItem ? conversationTitle(currentConversationListItem, items) : activeConversationKnown ? conversationId : "新会话");
+    listedConversationMetadata?.title?.trim() ||
+    currentConversationListItem?.conversation_title?.trim() ||
+    (activeConversationKnown ? "未命名会话" : "新会话");
   const currentConversationArchived = Boolean(activeConversation.data?.archived_at);
   const currentConversationPersisted = Boolean(
     activeConversation.data?.created_at || listedConversationMetadata?.created_at,
@@ -9120,12 +9134,14 @@ export function RunsPage() {
                     disabled={!currentConversationPersisted}
                     onClick={() => {
                       conversationMenuInitialFocusRef.current = "first";
+                      setConversationCopyNotice(null);
                       setConversationMenuOpen((current) => !current);
                     }}
                     onKeyDown={(event) => {
                       if (!["ArrowDown", "ArrowUp", "Enter", " "].includes(event.key)) return;
                       event.preventDefault();
                       conversationMenuInitialFocusRef.current = event.key === "ArrowUp" ? "last" : "first";
+                      setConversationCopyNotice(null);
                       setConversationMenuOpen(true);
                     }}
                   >
@@ -9181,6 +9197,29 @@ export function RunsPage() {
                       >
                         {currentConversationArchived ? "恢复" : "归档"}
                       </button>
+                      <div className="conversation-menu-identity">
+                        <div><small>会话 ID</small><code>{activeConversationId}</code></div>
+                      <button
+                        type="button"
+                        role="menuitem"
+                        tabIndex={-1}
+                        aria-label="复制会话 ID"
+                        title="复制会话 ID"
+                        onClick={async () => {
+                          const copiedId = activeConversationId;
+                          try {
+                            await copyTextToClipboard(copiedId);
+                            if (conversationIdRef.current === copiedId) setConversationCopyNotice("copied");
+                          } catch {
+                            if (conversationIdRef.current === copiedId) setConversationCopyNotice("failed");
+                          }
+                        }}
+                      >
+                        <Copy size={16} aria-hidden="true" />
+                      </button>
+                      </div>
+                      {conversationCopyNotice === "copied" ? <span role="status">已复制</span> : null}
+                      {conversationCopyNotice === "failed" ? <span role="alert">复制失败，请重试</span> : null}
                     </div>
                   ) : null}
                 </div>
@@ -9281,6 +9320,7 @@ export function RunsPage() {
                 </article>
                 {item.id.endsWith("-request") && item.run ? (
                   <>
+                    <RunApprovalHistory run={item.run} />
                     {automaticRepairInProgress(item.run) ? null : <RunInteractionSummaryInline
                       run={item.run}
                       agentNames={agentNameMap}
@@ -9745,7 +9785,7 @@ export function RunsPage() {
             <textarea
               value={message}
               onChange={(event) => setMessage(event.target.value)}
-              placeholder="输入消息，继续当前对话。例如：这个方案继续往更玄幻一点改。"
+              aria-label="消息"
               required
             />
             <div className="composer-actions">

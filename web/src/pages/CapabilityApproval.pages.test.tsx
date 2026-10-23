@@ -211,6 +211,48 @@ async function mountConversationEntry(details: RunDetail[], options: {
 }
 
 describe("conversation entry capability approval", () => {
+  it("keeps persisted decisions in every round, including an automatically repairing run", async () => {
+    const repairing: RunDetail = { ...approvalRun("alpha"), status: "running", events: [{
+      kind: "repair.started", sequence: 40, participants: [], message: "repair", created_at: "2026-10-24T00:02:00Z",
+      payload: { automatic_execution: true, requires_approval: false },
+    }] };
+    const completed: RunDetail = { ...repairing, id: "run-older", status: "completed", events: [],
+      created_at: "2026-10-21T00:00:00Z" };
+    vi.spyOn(api, "capabilityApprovals").mockImplementation(async (id) => ({ ready: false, items: [
+      { kind: "approval.resolved", run_id: id, sequence: 2, approval_id: `approval-${id}`,
+        decision: "approved", created_at: "2026-10-24T00:01:00Z", payload: {} },
+    ] }));
+    await mountConversationEntry([completed, repairing]);
+    const stream = screen.getByRole("region", { name: "主对话内容" });
+    await waitFor(() => expect(within(stream).getAllByRole("article", { name: "权限审批结果" })).toHaveLength(2));
+    expect(within(stream).getByText("approval-run-older")).toBeTruthy();
+    expect(within(stream).getByText("approval-run-alpha")).toBeTruthy();
+    expect(within(screen.getByRole("form", { name: "发送消息" })).queryByText("已批准本次操作")).toBeNull();
+  });
+
+  it.each(["approved", "rejected"] as const)("renders persisted %s decisions in the interaction stream after a fresh mount", async (decision) => {
+    const run: RunDetail = {
+      ...approvalRun("alpha"), status: decision === "approved" ? "running" : "cancelled",
+      events: [],
+    };
+    vi.spyOn(api, "capabilityApprovals").mockResolvedValue({ ready: false, items: [
+        { sequence: 1, run_id: run.id, kind: "approval.requested", approval_id: "approval-alpha", action: "capability_tool",
+          tool_name: "project.write_file", message: "Confirm write", created_at: "2026-10-24T00:00:00Z",
+          payload: { arguments: { content: "SECRET_CONTENT_MUST_NOT_RENDER" } } },
+        { sequence: 2, run_id: run.id, kind: "approval.resolved", approval_id: "approval-alpha", decision,
+          message: "Resolved", created_at: "2026-10-24T00:01:00Z", payload: {} },
+      ] } as unknown as Awaited<ReturnType<typeof api.capabilityApprovals>>);
+    await mountConversationEntry([run]);
+    const stream = await screen.findByRole("region", { name: "主对话内容" });
+    const result = await within(stream).findByRole("article", { name: "权限审批结果" });
+    expect(within(result).getByText(decision === "approved" ? "已批准本次操作" : "已拒绝本次操作")).toBeTruthy();
+    expect(within(result).getByText("approval-alpha")).toBeTruthy();
+    expect(result.querySelector("time")?.getAttribute("dateTime")).toBe("2026-10-24T00:01:00Z");
+    expect(within(stream).queryByText(/SECRET_CONTENT_MUST_NOT_RENDER/)).toBeNull();
+    const form = screen.getByRole("form", { name: "发送消息" });
+    expect(within(form).queryByText(/已允许本次沙箱|已批准本次操作|已拒绝本次操作/)).toBeNull();
+  });
+
   const latestRun = (): RunDetail => ({
     ...approvalRun("latest", "approval-latest", 13), conversation_id: "conv-alpha", mode: "direct",
     created_at: "2026-10-23T00:00:00Z",

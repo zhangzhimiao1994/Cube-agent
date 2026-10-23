@@ -93,6 +93,17 @@ body:has(.conversation-workspace)::after { display: none; }
 .conversation-workspace .chat-session-toolbar > .chat-conversation-heading { justify-content: flex-start; }
 .conversation-workspace .chat-session-actions { flex: 0 0 auto; }
 .conversation-workspace .conversation-menu-trigger { color: #535d6a; }
+.conversation-workspace .chat-session-toolbar .conversation-menu { max-width: min(22rem, calc(100vw - 32px)); }
+.conversation-workspace .conversation-menu-identity { align-items: center; border-top: 1px solid #eceef1; display: flex; gap: 8px; padding-top: 6px; }
+.conversation-workspace .conversation-menu-identity > div { flex: 1 1 auto; min-width: 0; }
+.conversation-workspace .conversation-menu-identity small { color: #646b78; display: block; font-size: 12px; }
+.conversation-workspace .conversation-menu-identity code { display: block; font-size: 12px; overflow-wrap: anywhere; }
+.conversation-workspace .conversation-menu-identity button { align-items: center; display: inline-flex; flex: 0 0 32px; height: 32px; justify-content: center; padding: 6px; width: 32px; }
+.conversation-workspace .run-approval-result { align-items: baseline; color: #646b78; display: flex; flex-wrap: wrap; font-size: 12px; gap: 4px 10px; line-height: 1.5; margin: 0; max-width: 100%; }
+.conversation-workspace .run-approval-result strong { color: #424b57; font-size: 12px; }
+.conversation-workspace .run-approval-result code { font-size: 12px; overflow-wrap: anywhere; }
+.conversation-workspace .approval-history-error { align-items: center; color: #646b78; display: flex; font-size: 12px; gap: 8px; margin: 0; }
+.conversation-workspace .approval-history-error button { align-items: center; display: inline-flex; height: 28px; justify-content: center; padding: 4px; width: 28px; }
 .conversation-workspace .mobile-nav-trigger-icon span { background: #535d6a; }
 .conversation-workspace .chat-message { font-size: 16px; line-height: 1.75; max-width: 100%; padding: 0; }
 .conversation-workspace .chat-message.assistant { align-self: stretch; }
