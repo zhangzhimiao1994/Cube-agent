@@ -180,7 +180,7 @@ class InspectingModel(CheckingModel):
             response = ModelResponse(text=None, usage=TokenUsage(1, 1, 2), tool_calls=(
                 ToolCall(id='offline-inspect', name=request.required_tool, arguments={}),))
         return GatewayCompletion(response=response, deployment_id='offline',
-            logical_model=request.logical_model, provider_id='offline', provider_model='fixed',
+            logical_model=request.logical_model, provider_id='offline', provider_model='offline/fixed',
             cost_usd=Decimal(0))
 
 
