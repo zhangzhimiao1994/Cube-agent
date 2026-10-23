@@ -13,6 +13,7 @@ from agent_hub.models.capacity import (
     CapacityConfigurationError,
     CapacityLease,
     CapacityPool,
+    CapacityRequestTooLarge,
     CapacityUnavailable,
     CredentialDescriptor,
     CredentialRegistry,
@@ -1701,7 +1702,7 @@ async def test_conservative_payload_estimate_is_rejected_by_tpm(
     )
     estimate = ConservativeTokenEstimator().estimate(request)
     assert estimate > 500
-    with pytest.raises(CapacityUnavailable):
+    with pytest.raises(CapacityRequestTooLarge):
         await pool.acquire([limited], wait_timeout=0, estimated_tokens=estimate)
 
 

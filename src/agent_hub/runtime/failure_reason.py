@@ -12,6 +12,7 @@ from agent_hub.models.capacity import (
     CapacityBackendError,
     CapacityConfigurationError,
     CapacityQueueFull,
+    CapacityRequestTooLarge,
     CapacityUnavailable,
     CapacityWaitTimeout,
     capacity_backend_diagnostic_payload,
@@ -96,6 +97,8 @@ def safe_model_gateway_failure_reason(error: Exception) -> str | None:
         return f"{GENERIC_MODEL_GATEWAY_FAILURE}: {base}"
     if isinstance(error, NoCapableDeployment):
         return f"{GENERIC_MODEL_GATEWAY_FAILURE}: no capable deployment"
+    if isinstance(error, CapacityRequestTooLarge):
+        return f"{GENERIC_MODEL_GATEWAY_FAILURE}: model request exceeds capacity token limit"
     if isinstance(error, CapacityQueueFull):
         return f"{GENERIC_MODEL_GATEWAY_FAILURE}: model capacity queue is full"
     if isinstance(error, CapacityWaitTimeout):
@@ -726,6 +729,15 @@ def _model_gateway_diagnostic(
             error_code="model.no_capable_deployment",
             retryable=False,
             suggested_action="在模型配置中为当前能力补齐可用部署，或调整 Agent/工作流使用的逻辑模型。",
+        )
+    if "model request exceeds capacity token limit" in lowered:
+        return _base_diagnostic(
+            reason,
+            error_stage="model_capacity",
+            error_category="request_too_large",
+            error_code="model.capacity_request_too_large",
+            retryable=False,
+            suggested_action="单次请求预留超过有效 token 配额；压缩请求上下文或使用已配置的兼容部署，不重复等待或自动放宽配额。",
         )
     if "capacity queue is full" in lowered:
         return _base_diagnostic(

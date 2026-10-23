@@ -27,6 +27,7 @@ from agent_hub.models.capacity import (
     CapacityLease,
     CapacityPool,
     CapacityQueueFull,
+    CapacityRequestTooLarge,
     CapacityUnavailable,
     CapacityWaitTimeout,
     _capacity_initialization_timeout,
@@ -769,6 +770,9 @@ class ModelGateway:
             elif isinstance(error, asyncio.CancelledError):
                 failure_history.mark_incomplete(ScopeIncompletePhase.CANCELLATION,
                                                 ScopeIncompleteReason.CANCELLED)
+            elif isinstance(error, CapacityRequestTooLarge):
+                failure_history.mark_incomplete(ScopeIncompletePhase.PRETRANSPORT_CAPACITY,
+                                                ScopeIncompleteReason.CAPACITY_UNAVAILABLE)
             elif isinstance(error, (CapacityBackendError, CapacityConfigurationError)):
                 failure_history.capacity_backend = get_capacity_backend_diagnostic(error)
                 _log_capacity_failure(error)
@@ -810,9 +814,12 @@ class ModelGateway:
         capacity = self._capacity if scoped is None else scoped(relevant_deployments)
         input_tokens = self._estimated_input_tokens(request, relevant_deployments)
         last_retryable_error: BaseException | None = None
+        token_limit_error: CapacityRequestTooLarge | None = None
+        only_token_limits = True
         for group_index, (logical_model, candidates) in enumerate(candidate_groups):
             remaining_seconds = request_deadline - asyncio.get_running_loop().time()
             if remaining_seconds <= 0:
+                only_token_limits = False
                 failure_history.mark_incomplete(ScopeIncompletePhase.OUTER_DEADLINE,
                                                 ScopeIncompleteReason.DEADLINE_EXHAUSTED)
                 break
@@ -838,13 +845,23 @@ class ModelGateway:
                         for _, items in candidate_groups[group_index + 1:]
                     ),
                 )
-            except (TimeoutError, CapacityWaitTimeout, CapacityQueueFull):
+            except CapacityRequestTooLarge as error:
+                token_limit_error = error
                 failure_history.mark_incomplete(ScopeIncompletePhase.PRETRANSPORT_CAPACITY,
                                                 ScopeIncompleteReason.CAPACITY_UNAVAILABLE)
                 if fallback_from_logical_model is None:
                     fallback_from_logical_model = logical_model
                     fallback_reason = "capacity_unavailable"
                 continue
+            except (TimeoutError, CapacityWaitTimeout, CapacityQueueFull):
+                only_token_limits = False
+                failure_history.mark_incomplete(ScopeIncompletePhase.PRETRANSPORT_CAPACITY,
+                                                ScopeIncompleteReason.CAPACITY_UNAVAILABLE)
+                if fallback_from_logical_model is None:
+                    fallback_from_logical_model = logical_model
+                    fallback_reason = "capacity_unavailable"
+                continue
+            only_token_limits = False
             selected = next(
                 (
                     item
@@ -921,6 +938,8 @@ class ModelGateway:
             )
         if last_retryable_error is not None:
             raise last_retryable_error from None
+        if only_token_limits and token_limit_error is not None:
+            raise CapacityRequestTooLarge("model request exceeds capacity token limit") from None
         raise CapacityUnavailable("model capacity unavailable") from None
 
     async def stream_openai_compatible_events(
@@ -929,6 +948,8 @@ class ModelGateway:
         request_deadline = asyncio.get_running_loop().time() + request.timeout_seconds
         streaming_transport = self._streaming_transport()
         last_retryable_error: BaseException | None = None
+        token_limit_error: CapacityRequestTooLarge | None = None
+        only_token_limits = True
         (
             candidate_groups,
             attempted_logical_models,
@@ -946,6 +967,7 @@ class ModelGateway:
         for group_index, (logical_model, candidates) in enumerate(candidate_groups):
             remaining_seconds = request_deadline - asyncio.get_running_loop().time()
             if remaining_seconds <= 0:
+                only_token_limits = False
                 break
             attempted_logical_models.append(logical_model)
             compatible_candidates = self._context_compatible_candidates(
@@ -972,6 +994,7 @@ class ModelGateway:
                 )
             remaining_seconds = request_deadline - asyncio.get_running_loop().time()
             if remaining_seconds <= 0:
+                only_token_limits = False
                 break
             try:
                 lease = await self._acquire_capacity(
@@ -983,10 +1006,17 @@ class ModelGateway:
                         for _, items in candidate_groups[group_index + 1:]
                     ),
                 )
-            except (TimeoutError, CapacityWaitTimeout, CapacityQueueFull):
+            except CapacityRequestTooLarge as error:
+                token_limit_error = error
                 fallback_from_logical_model = logical_model
                 fallback_reason = "capacity_unavailable"
                 continue
+            except (TimeoutError, CapacityWaitTimeout, CapacityQueueFull):
+                only_token_limits = False
+                fallback_from_logical_model = logical_model
+                fallback_reason = "capacity_unavailable"
+                continue
+            only_token_limits = False
             selected = next(
                 (
                     item
@@ -1052,6 +1082,8 @@ class ModelGateway:
             return
         if last_retryable_error is not None:
             raise last_retryable_error from None
+        if only_token_limits and token_limit_error is not None:
+            raise CapacityRequestTooLarge("model request exceeds capacity token limit") from None
         raise CapacityUnavailable("model capacity unavailable") from None
 
     async def _acquire_capacity(
