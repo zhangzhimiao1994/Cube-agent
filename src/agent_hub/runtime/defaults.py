@@ -1185,6 +1185,7 @@ class ConfigBackedDiscussionRuntime:
         role_planner: RolePlanner | None = None,
         capability_gateway: RuntimeCapabilityGatewayProtocol | None = None,
         harness_tool_gateway: HarnessToolInvoker | None = None,
+        artifact_repository: ArtifactRepository | None = None,
     ) -> None:
         self._config_service = config_service
         self._secret_service = secret_service
@@ -1193,6 +1194,7 @@ class ConfigBackedDiscussionRuntime:
         self._role_planner = role_planner or RolePlanner()
         self._capability_gateway = capability_gateway
         self._harness_tool_gateway = harness_tool_gateway
+        self._artifact_repository = artifact_repository
         self._pending_checkpoints: dict[UUID, RuntimeCheckpoint] = {}
         self._active: dict[tuple[UUID, UUID], ExecutionRuntime] = {}
 
@@ -1322,6 +1324,7 @@ class ConfigBackedDiscussionRuntime:
                 plan,
                 capability_gateway=self._capability_gateway,
                 harness_tool_gateway=self._harness_tool_gateway,
+                artifact_repository=self._artifact_repository,
             ),
             mode=TaskMode.DISCUSS,
             main_agent_model=logical_model,
@@ -5096,6 +5099,7 @@ def configured_runtime_registry(
                 transport=transport,
                 capability_gateway=capability_gateway,
                 harness_tool_gateway=harness_tool_gateway,
+                artifact_repository=artifact_repository,
             ),
             ConfigBackedHybridRuntime(
                 config_service=config_service,
