@@ -174,21 +174,21 @@ function useComposerMenu(disabled = false, suppliedRef?: RefObject<HTMLButtonEle
 export function ComposerMoreMenu({ onImages, onFiles, onSettings, onPlugins, uploadsDisabled, triggerRef }: ComposerMoreMenuProps) {
   const menu = useComposerMenu(false, triggerRef);
   const options = [
-    { label: "上传照片", Icon: ImagePlus, action: onImages, disabled: uploadsDisabled },
-    { label: "上传文件", Icon: Paperclip, action: onFiles, disabled: uploadsDisabled },
-    { label: "运行设置", Icon: Settings2, action: onSettings, disabled: false },
-    { label: "插件", Icon: Blocks, action: onPlugins, disabled: false },
+    { label: "上传照片", Icon: ImagePlus, action: onImages, disabled: uploadsDisabled, restoreFocus: true },
+    { label: "上传文件", Icon: Paperclip, action: onFiles, disabled: uploadsDisabled, restoreFocus: true },
+    { label: "运行设置", Icon: Settings2, action: onSettings, disabled: false, restoreFocus: false },
+    { label: "插件", Icon: Blocks, action: onPlugins, disabled: false, restoreFocus: false },
   ];
   return <>
     <button {...menu.triggerProps} type="button" className="composer-menu-trigger composer-more-trigger"
       aria-label="更多消息工具" title="更多消息工具"><Plus size={19} aria-hidden="true" /></button>
     {menu.visible ? createPortal(
       <div {...menu.menuProps} aria-label="消息工具">
-        {options.map(({ label, Icon, action, disabled }) => (
+        {options.map(({ label, Icon, action, disabled, restoreFocus }) => (
           <button key={label} type="button" role="menuitem" tabIndex={-1} disabled={disabled}
             className="composer-menu-option" onClick={() => {
               if (disabled) return;
-              menu.close();
+              menu.close(restoreFocus);
               action();
             }}><Icon size={18} aria-hidden="true" /><span>{label}</span></button>
         ))}
