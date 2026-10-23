@@ -17,6 +17,9 @@ redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', now_ms)
 local active = redis.call('ZCARD', KEYS[1])
 local effective = tonumber(redis.call('HGET', KEYS[4], 'effective')) or base_limit
 effective = math.max(1, math.min(effective, base_limit))
+if tpm > 0 and estimated_tokens > tpm then
+    return {0, active, effective, 3}
+end
 redis.call('HSET', KEYS[4], 'effective', effective)
 redis.call('PEXPIRE', KEYS[4], state_ttl_ms)
 if active >= effective then
