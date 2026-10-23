@@ -1,0 +1,125 @@
+.composer-menu-trigger {
+  align-items: center;
+  background: #ffffff;
+  background-image: none;
+  border: 1px solid #c7cdd2;
+  border-radius: 6px;
+  box-shadow: none;
+  box-sizing: border-box;
+  color: #263039;
+  cursor: pointer;
+  display: inline-flex;
+  flex: 0 0 auto;
+  font: inherit;
+  font-size: 13px;
+  gap: 6px;
+  height: 34px;
+  justify-content: center;
+  letter-spacing: 0;
+  padding: 6px 9px;
+}
+
+.composer-more-trigger {
+  padding: 0;
+  width: 34px;
+}
+
+.composer-mode-trigger {
+  width: 76px;
+}
+
+.composer-menu-trigger svg,
+.composer-menu-option svg {
+  flex-shrink: 0;
+}
+
+.composer-menu-trigger:hover:not(:disabled) {
+  background: #f1f4f5;
+  border-color: #87949d;
+}
+
+.composer-menu-trigger:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+.composer-menu {
+  background: #ffffff;
+  border: 1px solid #c7cdd2;
+  border-radius: 8px;
+  box-shadow: 0 8px 28px #18232b26;
+  box-sizing: border-box;
+  color: #263039;
+  font-family: inherit;
+  isolation: isolate;
+  letter-spacing: 0;
+  margin: 0;
+  max-width: calc(100vw - 16px);
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 5px;
+  position: fixed;
+  z-index: 1600;
+}
+
+.composer-menu-option {
+  align-items: center;
+  background: transparent;
+  background-image: none;
+  border: 0;
+  border-radius: 4px;
+  box-shadow: none;
+  box-sizing: border-box;
+  color: #263039;
+  cursor: pointer;
+  display: flex;
+  font: inherit;
+  font-size: 14px;
+  gap: 9px;
+  letter-spacing: 0;
+  min-height: 40px;
+  padding: 9px;
+  text-align: left;
+  width: 100%;
+}
+
+.composer-menu-option > span:not(.composer-menu-check) {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.composer-menu-option[aria-checked="true"] {
+  background: #eaf5ef;
+}
+
+.composer-menu-option:hover:not(:disabled) {
+  background: #edf1f4;
+}
+
+.composer-menu-trigger:focus-visible,
+.composer-menu-option:focus-visible {
+  outline: 2px solid #087c73;
+  outline-offset: -2px;
+}
+
+.composer-menu-option:disabled {
+  background: transparent;
+  box-shadow: none;
+  color: #68727a;
+  cursor: not-allowed;
+  opacity: 1;
+}
+
+.composer-menu-check {
+  color: #16734f;
+  display: inline-flex;
+  height: 16px;
+  width: 16px;
+}
+
+.composer-menu-separator {
+  border-top: 1px solid #dce1e4;
+  margin: 4px 0;
+}

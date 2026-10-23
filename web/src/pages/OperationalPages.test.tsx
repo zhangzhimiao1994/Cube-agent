@@ -1834,7 +1834,8 @@ describe("operational management pages", () => {
   });
 
   async function openRunConfig(user: ReturnType<typeof userEvent.setup>) {
-    await user.click(screen.getByRole("button", { name: /打开本次运行配置|open/i }));
+    await user.click(screen.getByRole("button", { name: "更多消息工具" }));
+    await user.click(screen.getByRole("menuitem", { name: "运行设置" }));
   }
 
   async function expandRunConfigDetails(user: ReturnType<typeof userEvent.setup>) {
@@ -3790,7 +3791,8 @@ describe("operational management pages", () => {
     const composer = view.container.querySelector(".chat-composer") as HTMLFormElement;
 
     expect(composer.querySelector(".composer-tool-row")).not.toBeNull();
-    expect(composer.querySelector(".composer-status-line")).not.toBeNull();
+    expect(composer.querySelector(".composer-status-line")).toBeNull();
+    expect(within(composer).getByRole("button", { name: "模式：自动" })).not.toBeNull();
     expect(composer.querySelector(".composer-send-row")).not.toBeNull();
   });
 
@@ -7663,7 +7665,7 @@ describe("operational management pages", () => {
     await user.keyboard("{Escape}");
     expect(screen.queryByRole("dialog", { name: "本次运行设置" })).toBeNull();
     expect(document.body.style.overflow).toBe("");
-    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("button", { name: "打开本次运行配置" })));
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("button", { name: "更多消息工具" })));
   });
 
   it("reopens project setup instead of submitting when no project workspace exists", async () => {
@@ -8087,7 +8089,7 @@ describe("operational management pages", () => {
     expect(await screen.findByRole("form", { name: "发送消息" })).not.toBeNull();
     expect(screen.getByRole("navigation", { name: "项目与会话管理" })).not.toBeNull();
     expect(screen.getByRole("region", { name: "主对话内容" })).not.toBeNull();
-    expect(screen.getByRole("button", { name: /打开本次运行配置/ })).not.toBeNull();
+    expect(screen.getByRole("button", { name: "更多消息工具" })).not.toBeNull();
     await openRunConfig(user);
     expect(screen.getByRole("dialog", { name: "本次运行设置" })).not.toBeNull();
     expect(screen.getByRole("group", { name: "本次运行设置" })).not.toBeNull();
@@ -8103,7 +8105,7 @@ describe("operational management pages", () => {
     expect(screen.queryByRole("button", { name: "直连" })).toBeNull();
 
     const composer = screen.getByRole("form", { name: "发送消息" });
-    expect(within(composer).getByText("主 Agent 自动 · 项目写入")).not.toBeNull();
+    expect(within(composer).getByRole("button", { name: "模式：自动" }).textContent).toBe("模式");
     const permissionSelector = within(composer).getByRole("button", { name: /沙箱权限/ });
     await user.click(permissionSelector);
     const permissionMenu = screen.getByRole("menu", { name: "沙箱权限" });

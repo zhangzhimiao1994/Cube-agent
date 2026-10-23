@@ -3,7 +3,7 @@ import { Fragment, FormEvent, type ReactNode, useEffect, useMemo, useRef, useSta
 import { createPortal } from "react-dom";
 import { Link, useLocation, useNavigate } from "react-router-dom";
 import { z } from "zod";
-import { ArrowUp, FolderClock, MoreHorizontal, Paperclip, Plus } from "lucide-react";
+import { ArrowUp, FolderClock, MoreHorizontal } from "lucide-react";
 
 import { ApiError, api, formatApiError, type AttachmentUpload, type Conversation, type ConversationMetadata, type ConversationQueueItem, type ModelDeployment, type ProjectWorkspace, type RunDetail, type RunListItem, type Skill, type SkillArchiveUpload, type SubmittedRun, type WebPreview, type WorkspaceDirectoryList, type WorkspaceFileList } from "../api/client";
 import { APP_BRAND_NAME } from "../app/brand";
@@ -21,6 +21,7 @@ import { repairActionLabel, repairErrorCodeLabel, repairFailureKindLabel, repair
 import { useCapabilityApprovalDecisions } from "./useCapabilityApprovalDecisions";
 import { useAuth } from "../auth/AuthProvider";
 import { PermissionSelector, type PermissionMode } from "../components/PermissionSelector";
+import { ComposerModeMenu, ComposerMoreMenu } from "../components/ComposerMenus";
 import { resolvePermissionSelection, sandboxPermissions, type SupportedPermissionMode } from "./permissionSelection";
 
 const RUN_MODES = [
@@ -6595,6 +6596,8 @@ export function RunsPage() {
   const [configOpen, setConfigOpen] = useState(false);
   const configDialogRef = useRef<HTMLElement>(null);
   const configTriggerRef = useRef<HTMLButtonElement>(null);
+  const attachmentPickerRef = useRef<HTMLInputElement>(null);
+  const imagePickerRef = useRef<HTMLInputElement>(null);
   const [directModel, setDirectModel] = useState("");
   const [historyOpen, setHistoryOpen] = useState(false);
   const [managedProjectId, setManagedProjectId] = useState("");
@@ -9747,20 +9750,38 @@ export function RunsPage() {
             />
             <div className="composer-actions">
               <div className={`composer-tool-row${handoffActive ? " composer-tool-row-reference" : ""}`} aria-label="消息工具">
-                <label className="composer-upload-button">
-                  <Paperclip size={17} aria-hidden="true" />
-                  <span>附件</span>
-                  <input
-                    aria-label="上传文件或 Skill 压缩包"
-                    type="file"
-                    accept={ATTACHMENT_ACCEPT}
-                    disabled={uploadSkillArchive.isPending || uploadAttachment.isPending}
-                    onChange={(event) => {
-                      handleAttachmentUpload(event.currentTarget.files);
-                      event.currentTarget.value = "";
-                    }}
-                  />
-                </label>
+                <input
+                  ref={attachmentPickerRef}
+                  hidden
+                  aria-label="上传文件或 Skill 压缩包"
+                  type="file"
+                  accept={ATTACHMENT_ACCEPT}
+                  disabled={uploadSkillArchive.isPending || uploadAttachment.isPending}
+                  onChange={(event) => {
+                    handleAttachmentUpload(event.currentTarget.files);
+                    event.currentTarget.value = "";
+                  }}
+                />
+                <input
+                  ref={imagePickerRef}
+                  hidden
+                  aria-label="上传照片"
+                  type="file"
+                  accept="image/*"
+                  disabled={uploadSkillArchive.isPending || uploadAttachment.isPending}
+                  onChange={(event) => {
+                    handleAttachmentUpload(event.currentTarget.files);
+                    event.currentTarget.value = "";
+                  }}
+                />
+                <ComposerMoreMenu
+                  triggerRef={configTriggerRef}
+                  uploadsDisabled={uploadSkillArchive.isPending || uploadAttachment.isPending}
+                  onImages={() => imagePickerRef.current?.click()}
+                  onFiles={() => attachmentPickerRef.current?.click()}
+                  onSettings={() => setConfigOpen(true)}
+                  onPlugins={() => navigate("/mcp")}
+                />
                 {handoffActive ? (
                   <button
                     type="button"
@@ -9772,16 +9793,6 @@ export function RunsPage() {
                     取消引用
                   </button>
                 ) : null}
-                <button
-                  ref={configTriggerRef}
-                  type="button"
-                  className="composer-plus-button"
-                  aria-label={configOpen ? "收起本次运行配置" : "打开本次运行配置"}
-                  aria-pressed={configOpen}
-                  onClick={() => setConfigOpen((current) => !current)}
-                >
-                  <Plus size={18} aria-hidden="true" />
-                </button>
                 <PermissionSelector
                   value={permissionMode}
                   onChange={selectPermissionMode}
@@ -9791,16 +9802,11 @@ export function RunsPage() {
                   permissionSupportNotice={supportedPermissionModes.length === 0
                     ? "沿用当前工作区边界与系统审批策略；运行级权限需更新服务器后启用。" : undefined}
                 />
-              </div>
-              <div className="composer-status-line" role="status">
-                <span>
-                  {[
-                    mode === "auto" ? "主 Agent 自动" : `本次${displayMode(mode)}`,
-                    selectedSandboxLabel,
-                    workflowId ? `参考 ${selectedWorkflow?.name ?? workflowId}` : null,
-                    referenceConversationId.trim() ? "已引用" : null,
-                  ].filter(Boolean).join(" · ")}
-                </span>
+                <ComposerModeMenu
+                  value={mode}
+                  onChange={setMode}
+                  disabled={canStopLatestRun || createRun.isPending}
+                />
               </div>
               <div className="composer-send-row">
                 {canStopLatestRun && latestVisibleRun ? (
