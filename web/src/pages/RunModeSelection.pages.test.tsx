@@ -59,7 +59,8 @@ async function mount(active = false) {
 }
 
 async function openPicker(user: ReturnType<typeof userEvent.setup>) {
-  await user.click(screen.getByRole("button", { name: "打开本次运行配置" }));
+  await user.click(screen.getByRole("button", { name: "更多消息工具" }));
+  await user.click(screen.getByRole("menuitem", { name: "运行设置" }));
   const dialog = screen.getByRole("dialog", { name: "本次运行设置" });
   return within(dialog).getByRole("combobox", { name: "运行模式" }) as HTMLSelectElement;
 }
@@ -75,6 +76,58 @@ async function send(user: ReturnType<typeof userEvent.setup>, message: string, b
 }
 
 describe("explicit next-run mode selection", () => {
+  it("uses compact menus rather than a clipped Main Agent status label", async () => {
+    const { user, create } = await mount();
+    const composer = within(screen.getByRole("form", { name: "发送消息" }));
+    const trigger = composer.getByRole("button", { name: "模式：自动" });
+    expect(trigger.textContent).toBe("模式");
+    expect(composer.queryByText("主 Agent 自动 · 项目写入")).toBeNull();
+    expect(composer.getByRole("button", { name: /沙箱权限/ })).toBeTruthy();
+    await user.click(trigger);
+    const menu = screen.getByRole("menu", { name: "运行模式" });
+    expect(within(menu).getAllByRole("menuitemradio").map((item) => item.textContent))
+      .toEqual(["直连", "派单", "讨论", "混合", "恢复自动"]);
+    expect(menu.parentElement).toBe(document.body);
+    await user.click(composer.getByRole("textbox"));
+    expect(screen.queryByRole("menu", { name: "运行模式" })).toBeNull();
+    await user.click(composer.getByRole("button", { name: "更多消息工具" }));
+    const tools = screen.getByRole("menu", { name: "消息工具" });
+    expect(within(tools).getAllByRole("menuitem").map((item) => item.textContent))
+      .toEqual(["上传照片", "上传文件", "运行设置", "插件"]);
+    await user.keyboard("{Escape}");
+    expect(screen.queryByRole("menu", { name: "消息工具" })).toBeNull();
+    expect(create).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["直连", "direct"], ["派单", "dispatch"], ["讨论", "discuss"], ["混合", "hybrid"],
+  ])("submits %s selected from the compact menu once", async (label, value) => {
+    const { user, create } = await mount();
+    await user.click(screen.getByRole("button", { name: "模式：自动" }));
+    await user.click(screen.getByRole("menuitemradio", { name: label }));
+    expect(screen.getByRole("button", { name: `模式：${label}` }).textContent).toBe("模式");
+    await send(user, "Execute the selected mode");
+    await waitFor(() => expect(create).toHaveBeenCalledTimes(1));
+    expect(create.mock.calls[0][0].mode).toBe(value);
+    await waitFor(() => expect(screen.getByRole("button", { name: "模式：自动" })).toBeTruthy());
+  });
+
+  it("opens the real file pickers from plus without submitting or clearing the draft", async () => {
+    const { user, create } = await mount();
+    const form = within(screen.getByRole("form", { name: "发送消息" }));
+    await user.type(form.getByRole("textbox"), "Keep this unsent draft");
+    const pickFile = vi.spyOn(screen.getByLabelText("上传文件或 Skill 压缩包"), "click");
+    const pickImage = vi.spyOn(screen.getByLabelText("上传照片"), "click");
+    await user.click(screen.getByRole("button", { name: "更多消息工具" }));
+    await user.click(screen.getByRole("menuitem", { name: "上传文件" }));
+    expect(pickFile).toHaveBeenCalledTimes(1);
+    await user.click(screen.getByRole("button", { name: "更多消息工具" }));
+    await user.click(screen.getByRole("menuitem", { name: "上传照片" }));
+    expect(pickImage).toHaveBeenCalledTimes(1);
+    expect((form.getByRole("textbox") as HTMLTextAreaElement).value).toBe("Keep this unsent draft");
+    expect(create).not.toHaveBeenCalled();
+  });
+
   it("keeps ordinary Direct wording and previous Direct history under auto routing", async () => {
     const { user, create } = await mount();
     const picker = await openPicker(user);
@@ -168,7 +221,7 @@ describe("explicit next-run mode selection", () => {
     expect(document.activeElement).toBe(picker);
     await user.keyboard("{Escape}");
     expect(screen.queryByRole("dialog", { name: "本次运行设置" })).toBeNull();
-    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("button", { name: "打开本次运行配置" })));
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("button", { name: "更多消息工具" })));
     expect(create).not.toHaveBeenCalled();
   });
 });
