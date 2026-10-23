@@ -6,6 +6,7 @@ import signal
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import Any, Protocol, cast
 from uuid import UUID, uuid4
@@ -30,6 +31,7 @@ from agent_hub.plugins.runtime import (
     build_plugin_package_subprocess_adapters,
 )
 from agent_hub.runs.artifacts import PostgresArtifactRepository
+from agent_hub.runs.project_verification_receipts import ProjectVerificationReceiptRepository
 from agent_hub.runs.provider_continuation import PostgresProviderContinuationRepository
 from agent_hub.runs.repository import RunRepository
 from agent_hub.runs.service import RunService
@@ -172,6 +174,7 @@ class WorkerResources:
     runtime_mcp_service: RuntimeMcpService
     runtime_plugin_service: RuntimePluginService
     project_cache_cleanup_hook: PythonProjectTerminalHook | None = None
+    action_project_cache_cleanup_hook: PythonProjectTerminalHook | None = None
 
 
 async def run_worker_loop(
@@ -329,7 +332,8 @@ def build_worker_service(
             dependency_policy=plugin_dependency_policy,
         ),
     )
-    runtime_capability_stack = build_runtime_capability_stack(
+    capability_stack_builder = partial(
+        build_runtime_capability_stack,
         tenant_id=settings.bootstrap_tenant_id,
         run_repository=run_repository,
         skill_store_dir=settings.skill_store_dir,
@@ -351,6 +355,16 @@ def build_worker_service(
         mcp_backend=runtime_mcp_service,
         plugin_backend=runtime_plugin_service,
     )
+    artifact_repository = PostgresArtifactRepository(database.session_factory)
+    action_capability_stack = capability_stack_builder(
+        artifact_repository=artifact_repository,
+        receipt_repository=ProjectVerificationReceiptRepository(database.session_factory),
+    )
+    runtime_capability_stack = capability_stack_builder()
+    cache_cleanup_hooks = tuple(hook for hook in (
+        getattr(runtime_capability_stack, "project_cache_cleanup_hook", None),
+        getattr(action_capability_stack, "project_cache_cleanup_hook", None),
+    ) if hook is not None)
     service = RunService(
         run_repository,
         project_input_preparer=runtime_capability_stack.project_input_preparer,
@@ -363,7 +377,9 @@ def build_worker_service(
             redis_client=redis_client,
             capability_gateway=runtime_capability_stack.runtime_gateway,
             harness_tool_gateway=runtime_capability_stack.harness_tool_gateway,
-            artifact_repository=PostgresArtifactRepository(database.session_factory),
+            action_capability_gateway=action_capability_stack.runtime_gateway,
+            action_harness_tool_gateway=action_capability_stack.harness_tool_gateway,
+            artifact_repository=artifact_repository,
             provider_continuation_repository=PostgresProviderContinuationRepository(database.session_factory),
         ),
         router=None,
@@ -379,9 +395,7 @@ def build_worker_service(
             run_repository=run_repository,
             session_factory=database.session_factory,
             skill_store_dir=settings.skill_store_dir,
-        ), *(() if getattr(runtime_capability_stack, "project_cache_cleanup_hook", None) is None else (
-            runtime_capability_stack.project_cache_cleanup_hook,
-        ))),
+        ), *cache_cleanup_hooks),
     )
     return WorkerResources(
         database=database,
@@ -391,6 +405,9 @@ def build_worker_service(
         runtime_mcp_service=runtime_mcp_service,
         runtime_plugin_service=runtime_plugin_service,
         project_cache_cleanup_hook=getattr(runtime_capability_stack, "project_cache_cleanup_hook", None),
+        action_project_cache_cleanup_hook=getattr(
+            action_capability_stack, "project_cache_cleanup_hook", None,
+        ),
     )
 
 
@@ -427,6 +444,7 @@ async def _run() -> None:
     resources = build_worker_service(get_settings())
     invalidation_task: asyncio.Task[object] | None = None
     cache_cleanup_task: asyncio.Task[object] | None = None
+    action_cache_cleanup_task: asyncio.Task[object] | None = None
     try:
         await resources.runtime_mcp_service.start()
         await resources.runtime_plugin_service.start()
@@ -444,6 +462,11 @@ async def _run() -> None:
             cache_cleanup_task = cast(asyncio.Task[object], asyncio.create_task(
                 resources.project_cache_cleanup_hook.retry_loop(stop),
             ))
+        action_cleanup_hook = getattr(resources, "action_project_cache_cleanup_hook", None)
+        if action_cleanup_hook is not None:
+            action_cache_cleanup_task = cast(asyncio.Task[object], asyncio.create_task(
+                action_cleanup_hook.retry_loop(stop),
+            ))
         await run_worker_loop(
             resources.service,
             resources.queue,
@@ -452,6 +475,7 @@ async def _run() -> None:
             plugin_runtime=resources.runtime_plugin_service,
         )
     finally:
+        await _cancel_background_task(action_cache_cleanup_task)
         await _cancel_background_task(cache_cleanup_task)
         await _cancel_background_task(invalidation_task)
         await resources.redis_client.aclose()

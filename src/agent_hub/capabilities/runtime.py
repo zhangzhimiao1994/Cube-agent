@@ -75,8 +75,9 @@ from agent_hub.project_preflight import (
     build_project_preflight_files,
     project_preflight_model_input_schema,
 )
-from agent_hub.runtime.artifacts import ArtifactRepository
-from agent_hub.runtime.contracts import JsonValue
+from agent_hub.runtime.artifacts import ArtifactRepository, ArtifactRepositoryError
+from agent_hub.runtime.continuation_artifacts import load_continuation
+from agent_hub.runtime.contracts import JsonValue, TaskContext
 from agent_hub.skills.package import InvalidSkillPackage, SkillPackageInspector
 from agent_hub.skills.sandbox.base import (
     SANDBOX_PROFILES,
@@ -242,6 +243,7 @@ class RuntimeCapabilityGateway:
         self._workspace_root = workspace_root
         self._project_workspace_dir = project_workspace_dir
         self._run_repository = run_repository
+        self._artifact_repository = artifact_repository
         self._generated_file_store = (
             GeneratedFileStore(generated_artifact_dir) if generated_artifact_dir is not None else None
         )
@@ -527,6 +529,13 @@ class RuntimeCapabilityGateway:
                                          python_project_failure=error.python_project_failure,
                                          project_prerequisite=error.project_prerequisite) from None
 
+    async def action_preparation_snapshot(self, context: TaskContext) -> Mapping[str, JsonValue]:
+        from agent_hub.capabilities.action_preparation import capture_action_preparation
+
+        if self._project_verification is None:
+            raise RuntimeCapabilityError('project preparation scope is unavailable')
+        return await capture_action_preparation(self._project_verification, context)
+
     async def _python_build_profile(self, tenant_id: UUID, run_id: UUID) -> Mapping[str, JsonValue]:
         from agent_hub.skills.sandbox.project import ProjectInvocation
         from agent_hub.skills.sandbox.python_project_profile import PythonProjectProfileSandbox
@@ -795,10 +804,35 @@ class RuntimeCapabilityGateway:
         store = self._require_project_workspace_store()
         project_id, session_id = await self._project_workspace_scope(tenant_id, run_id)
         path = _required_string(arguments, "path")
-        content = _required_string(arguments, "content")
+        referenced = "content_reference" in arguments
+        if referenced:
+            # References transport reviewed file data only; they grant no write authority.
+            reference = arguments["content_reference"]
+            if set(arguments) != {"path", "content_reference"}:
+                raise RuntimeCapabilityError("workspace content sources must be exclusive with no extra arguments")
+            if self._artifact_repository is None or not isinstance(reference, Mapping):
+                raise RuntimeCapabilityError("workspace content reference is unavailable")
+            try:
+                loaded = await load_continuation(
+                    self._artifact_repository, tenant_id=tenant_id, run_id=run_id,
+                    reference=reference,
+                )
+            except ArtifactRepositoryError:
+                raise RuntimeCapabilityError("workspace content reference is invalid or unavailable") from None
+            if type(loaded) is not str or not loaded.strip():
+                raise RuntimeCapabilityError("workspace referenced content must be a nonempty string")
+            content = loaded
+            # Hydration may await remote storage; do not write using a stale workspace grant.
+            if await self._project_workspace_scope(tenant_id, run_id) != (project_id, session_id):
+                raise RuntimeCapabilityError("workspace scope changed during content resolution")
+        else:
+            content = _required_string(arguments, "content")
         contract = await self._original_project_contract(tenant_id, run_id)
         if contract is not None and path != 'DELIVERY_MANIFEST.json' and not contract.is_editable(path):
             raise RuntimeCapabilityError('original project checks are protected from modification')
+        task = asyncio.current_task()
+        if referenced and task is not None and task.cancelling():
+            raise asyncio.CancelledError
         try:
             metadata = store.write_bytes(
                 tenant_id=tenant_id,
@@ -1347,7 +1381,9 @@ class RuntimeCapabilityGateway:
             "replay_safe": self.is_replay_safe(name),
             "aliases": _builtin_aliases(name),
         }
-        input_schema = _builtin_input_schema(name)
+        input_schema = _builtin_input_schema(
+            name, content_references=self._artifact_repository is not None,
+        )
         if input_schema is not None:
             item["input_schema"] = input_schema
         description = builtin_tool_description(name)
@@ -1653,14 +1689,16 @@ def _builtin_sandbox_profile(name: str) -> str:
     return "generated_artifact_store"
 
 
-def _builtin_input_schema(name: str) -> Mapping[str, JsonValue] | None:
+def _builtin_input_schema(
+    name: str, *, content_references: bool = False,
+) -> Mapping[str, JsonValue] | None:
     builtin_schema = builtin_tool_input_schema(name)
     if builtin_schema is not None:
         return builtin_schema
     if name == _PROJECT_PREFLIGHT_TOOL:
         return project_preflight_model_input_schema()
     if name == _WORKSPACE_WRITE_TOOL:
-        return {
+        schema: dict[str, JsonValue] = {
             "type": "object",
             "additionalProperties": False,
             "required": ("path", "content"),
@@ -1669,6 +1707,32 @@ def _builtin_input_schema(name: str) -> Mapping[str, JsonValue] | None:
                 "content": {"type": "string", "minLength": 1},
             },
         }
+        if content_references:
+            properties = cast(dict[str, JsonValue], schema["properties"])
+            properties["content_reference"] = {
+                "type": "object", "additionalProperties": False,
+                "required": ("version", "content_sha256", "total_bytes", "segments"),
+                "properties": {
+                    "version": {"type": "integer", "const": 1},
+                    "content_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                    "total_bytes": {"type": "integer", "minimum": 1, "maximum": 64 * 1024 * 1024},
+                    "segments": {
+                        "type": "array", "minItems": 1, "maxItems": 1024,
+                        "items": {
+                            "type": "object", "additionalProperties": False,
+                            "required": ("id", "sha256"),
+                            "properties": {
+                                "id": {"type": "string", "pattern":
+                                       "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"},
+                                "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                            },
+                        },
+                    },
+                },
+            }
+            schema["required"] = ("path",)
+            schema["oneOf"] = ({"required": ("content",)}, {"required": ("content_reference",)})
+        return schema
     if name == _WORKSPACE_LIST_TOOL:
         return {"type": "object", "additionalProperties": False, "properties": {}}
     if name == _WORKSPACE_BUNDLE_TOOL:

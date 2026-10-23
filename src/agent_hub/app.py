@@ -9,6 +9,7 @@ import sys
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
 from datetime import UTC, date, datetime
+from functools import partial
 from pathlib import Path
 from typing import Any, Protocol, cast
 from uuid import UUID, uuid4
@@ -136,6 +137,7 @@ from agent_hub.routing.types import (
 from agent_hub.runs.artifacts import PostgresArtifactRepository
 from agent_hub.runs.conversation_queue import ConversationQueueRepository
 from agent_hub.runs.conversations import ConversationRepository
+from agent_hub.runs.project_verification_receipts import ProjectVerificationReceiptRepository
 from agent_hub.runs.provider_continuation import PostgresProviderContinuationRepository
 from agent_hub.runs.repository import RunRepository
 from agent_hub.runs.service import (
@@ -1577,7 +1579,8 @@ def create_app(
                             ),
                         )
                     )
-                    runtime_capability_stack = build_runtime_capability_stack(
+                    capability_stack_builder = partial(
+                        build_runtime_capability_stack,
                         tenant_id=configured.bootstrap_tenant_id,
                         run_repository=capability_run_repository,
                         skill_store_dir=configured.skill_store_dir,
@@ -1607,18 +1610,29 @@ def create_app(
                         mcp_backend=runtime_mcp_service,
                         plugin_backend=runtime_plugin_service,
                     )
+                    artifact_repository = PostgresArtifactRepository(active_sessions)
+                    action_capability_stack = capability_stack_builder(
+                        artifact_repository=artifact_repository,
+                        receipt_repository=ProjectVerificationReceiptRepository(active_sessions),
+                    )
+                    runtime_capability_stack = capability_stack_builder()
                     application.state.runtime_capability_gateway = (
                         runtime_capability_stack.runtime_gateway
                     )
                     application.state.project_input_preparer = runtime_capability_stack.project_input_preparer
                     application.state.project_cache_cleanup_hook = getattr(runtime_capability_stack, "project_cache_cleanup_hook", None)
+                    application.state.action_project_cache_cleanup_hook = getattr(
+                        action_capability_stack, "project_cache_cleanup_hook", None,
+                    )
                     active_runtime_registry = configured_runtime_registry(
                         config_service=ConfigService(active_sessions),
                         secret_service=active_secret_service,
                         redis_client=active_redis,
                         capability_gateway=runtime_capability_stack.runtime_gateway,
                         harness_tool_gateway=runtime_capability_stack.harness_tool_gateway,
-                        artifact_repository=PostgresArtifactRepository(active_sessions),
+                        action_capability_gateway=action_capability_stack.runtime_gateway,
+                        action_harness_tool_gateway=action_capability_stack.harness_tool_gateway,
+                        artifact_repository=artifact_repository,
                         provider_continuation_repository=PostgresProviderContinuationRepository(active_sessions),
                     )
                 if active_mode_router is None and active_secret_service is not None:
@@ -1670,8 +1684,10 @@ def create_app(
                 application.state.run_service = RunService(
                     RunRepository(active_sessions),
                     project_input_preparer=getattr(application.state, 'project_input_preparer', None),
-                    terminal_run_hooks=(() if getattr(application.state, 'project_cache_cleanup_hook', None) is None
-                        else (application.state.project_cache_cleanup_hook,)),
+                    terminal_run_hooks=tuple(hook for hook in (
+                        getattr(application.state, "project_cache_cleanup_hook", None),
+                        getattr(application.state, "action_project_cache_cleanup_hook", None),
+                    ) if hook is not None),
                     instruction_context_loader=InstructionContextLoader(
                         repository=RunRepository(active_sessions),
                         project_root=configured.project_workspace_dir,

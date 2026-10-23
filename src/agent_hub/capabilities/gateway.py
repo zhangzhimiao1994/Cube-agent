@@ -21,6 +21,10 @@ from agent_hub.capabilities.permission_modes import (
 )
 from agent_hub.capabilities.policy import CapabilityPolicy, normalize_resource
 from agent_hub.capabilities.types import CapabilityRequest, PolicyEffect
+from agent_hub.runtime.action_approval_capture import (
+    action_approval_capture_active,
+    before_action_approval,
+)
 
 if TYPE_CHECKING:
     from agent_hub.runs.toolchain_supply import ToolchainSupplyAuthority
@@ -201,6 +205,7 @@ class CapabilityGateway:
             if go_recipe:
                 identity_args['go_recipe_authority'] = self._go_recipe_authority
                 identity_args['expected_go_recipe'] = expected_go_recipe
+            await before_action_approval(request, approval.id)
             await self._run_repository.begin_capability_approval(  # type: ignore[attr-defined]
                 request.tenant_id,
                 request.run_id,
@@ -211,7 +216,7 @@ class CapabilityGateway:
                 **identity_args,
             )
 
-        if self._toolchain_authority is not None or go_recipe:
+        if self._toolchain_authority is not None or go_recipe or action_approval_capture_active():
             # A rejected DB fence must not leave even an in-memory SDK approval.
             approval = await self._approvals.start_waiting(request, begin_wait, publish_after_begin=True)
         else:

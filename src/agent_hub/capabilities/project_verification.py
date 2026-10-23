@@ -340,6 +340,28 @@ class ProjectVerificationService:
         return await self._durable.restore(tenant_id=tenant_id, run_id=run_id,
                                            actor=actor, action_key=action_key)
 
+    async def _require_legacy_candidate_scope(self, tenant_id: UUID, run_id: UUID) -> None:
+        if self._durable is not None:
+            return
+        from agent_hub.runs.project_verification_receipts import RECEIPT_KEY
+
+        try:
+            getter = getattr(self.repository, 'get', None)
+            if not callable(getter):
+                raise TypeError
+            record = await getter(tenant_id, run_id)
+            route = getattr(record, 'routing_decision', None)
+            if not isinstance(route, Mapping):
+                raise TypeError
+            if RECEIPT_KEY in route:
+                self._clear_receipts(tenant_id, run_id)
+                raise ProjectVerificationError('durable verification recovery required')
+        except ProjectVerificationError:
+            raise
+        except Exception:  # noqa: BLE001 - legacy fallback never reveals private index contents.
+            self._clear_receipts(tenant_id, run_id)
+            raise ProjectVerificationError('project verification scope is unavailable') from None
+
     async def _require_supported_source(self, tenant_id: UUID, run_id: UUID) -> None:
         from agent_hub.files.workspace import ProjectWorkspaceStore
 
@@ -359,6 +381,7 @@ class ProjectVerificationService:
             raise ProjectVerificationError('project stack discovery is unavailable') from None
 
     async def authorization_request(self, request: CapabilityRequest) -> CapabilityRequest | None:
+        await self._require_legacy_candidate_scope(request.tenant_id, request.run_id)
         await self._require_supported_source(request.tenant_id, request.run_id)
         generated = await self.generated.prepare(request.tenant_id, request.run_id, request.agent_id,
                                                  user_id=request.user_id)
@@ -572,6 +595,7 @@ class ProjectVerificationService:
 
     async def verify(self, *, tenant_id: UUID, run_id: UUID, actor: str,
                      action_key: str = '') -> Mapping[str, JsonValue]:
+        await self._require_legacy_candidate_scope(tenant_id, run_id)
         if self._durable is not None:
             return await self._durable.verify(tenant_id=tenant_id, run_id=run_id,
                                               actor=actor, action_key=action_key)
@@ -665,6 +689,7 @@ class ProjectVerificationService:
     async def require_current_receipt(self, tenant_id: UUID, run_id: UUID) -> str:
         from agent_hub.skills.sandbox.project import project_source_fingerprint
 
+        await self._require_legacy_candidate_scope(tenant_id, run_id)
         if self._durable is not None:
             try:
                 await self._durable.require_current(tenant_id, run_id)

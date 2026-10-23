@@ -41,9 +41,11 @@ from agent_hub.harness.tool_gateway import (
     PluginToolBackend,
     _python_recipe_authorization,
 )
+from agent_hub.runtime.artifacts import ArtifactRepository
 from agent_hub.runtime.contracts import TaskContext
 
 if TYPE_CHECKING:
+    from agent_hub.runs.project_verification_receipts import ProjectVerificationReceiptRepository
     from agent_hub.runs.toolchain_supply import ToolchainSupplyAuthority
 
 ToolApprovalPolicyGetter = Callable[[UUID], Awaitable[bool]]
@@ -578,6 +580,8 @@ def build_runtime_capability_stack(
     tool_registry: CapabilityManifestProvider | None = None,
     mcp_backend: McpToolBackend | None = None,
     plugin_backend: PluginToolBackend | None = None,
+    artifact_repository: ArtifactRepository | None = None,
+    receipt_repository: ProjectVerificationReceiptRepository | None = None,
 ) -> RuntimeCapabilityStack:
     runtime_gateway = RuntimeCapabilityGateway(
         skill_store_dir=skill_store_dir,
@@ -587,6 +591,8 @@ def build_runtime_capability_stack(
         project_workspace_dir=project_workspace_dir,
         run_repository=run_repository,
         tool_registry=tool_registry,
+        artifact_repository=artifact_repository,
+        receipt_repository=receipt_repository,
     )
     default_reviewer = (
         CodexAutoApprovalReviewer()
