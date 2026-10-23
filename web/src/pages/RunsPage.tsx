@@ -6364,6 +6364,13 @@ export function MessageBody({ text, title }: { text: string; title: string }) {
   return <OutputContent text={text} title={title} />;
 }
 export function RunsPage() {
+  const auth = useAuth();
+  if (auth.loading) return <p>正在确认身份...</p>;
+  if (!auth.user || !auth.hasPermission("run:read")) return <p role="alert">当前身份无法查看会话</p>;
+  return <RunsPageForActor key={JSON.stringify([auth.user.tenant_id, auth.user.user_id, auth.user.role])} />;
+}
+
+function RunsPageForActor() {
   const { user: permissionActor } = useAuth();
   const permissionActorKey = [permissionActor?.tenant_id, permissionActor?.user_id, permissionActor?.role];
   const queryClient = useQueryClient();

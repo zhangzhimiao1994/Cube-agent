@@ -1,5 +1,6 @@
 import { ShieldCheck } from "lucide-react";
 import { useId } from "react";
+import { useAuth } from "../auth/AuthProvider";
 import "./CapabilityApprovalCard.css";
 
 type Props = {
@@ -14,8 +15,12 @@ type Props = {
 
 export function CapabilityApprovalCard({ approval, decision, sessionAvailable = false, sessionUnavailableReason,
   onApprove, onApproveConversation, onReject }: Props) {
+  const { user, hasPermission } = useAuth();
+  const canDecide = Boolean(user && hasPermission("run:create"));
   const pending = decision?.status === "pending";
   const reasonId = useId();
+  const unavailableReason = !canDecide ? "当前身份没有操作审批权限"
+    : !sessionAvailable ? sessionUnavailableReason ?? "当前审批不支持会话批准" : undefined;
   return <aside className="capability-approval-card" role="status" aria-label="沙箱权限确认">
     <header>
       <ShieldCheck size={18} aria-hidden="true" />
@@ -25,18 +30,20 @@ export function CapabilityApprovalCard({ approval, decision, sessionAvailable = 
     <p>{approval.summary}</p>
     <small>审批 {approval.approvalId}</small>
     <div className="capability-approval-actions">
-      <button type="button" disabled={pending} onClick={onApprove}>
+      <button type="button" disabled={pending || !canDecide}
+        aria-describedby={!canDecide ? reasonId : undefined} onClick={onApprove}>
         {pending && decision.decision === "approve" ? "批准中..." : "批准"}
       </button>
-      <button type="button" disabled={pending || !sessionAvailable}
-        aria-describedby={!sessionAvailable ? reasonId : undefined} onClick={onApproveConversation}>
+      <button type="button" disabled={pending || !canDecide || !sessionAvailable}
+        aria-describedby={unavailableReason ? reasonId : undefined} onClick={onApproveConversation}>
         {pending && decision.decision === "approve_session" ? "批准中..." : "本次会话批准"}
       </button>
-      <button type="button" disabled={pending} onClick={onReject}>
+      <button type="button" disabled={pending || !canDecide}
+        aria-describedby={!canDecide ? reasonId : undefined} onClick={onReject}>
         {pending && decision.decision === "reject" ? "拒绝中..." : "拒绝"}
       </button>
     </div>
-    {!sessionAvailable ? <small id={reasonId}>{sessionUnavailableReason ?? "当前审批不支持会话批准"}</small> : null}
+    {unavailableReason ? <small id={reasonId}>{unavailableReason}</small> : null}
     {decision?.error ? <p role="alert">{decision.error}</p> : null}
   </aside>;
 }
