@@ -15,8 +15,16 @@ from agent_hub.runtime.autogen.adapter import (
     DiscussionParticipant,
     DiscussionPlan,
     RuntimeExecutionError,
+    _DiscussionDurability,
 )
 from agent_hub.runtime.contracts import EventKind
+from tests.integration.runs.test_autogen_checkpoint_ack_native import (
+    ForbiddenTools,
+    InspectingModel,
+)
+from tests.integration.runs.test_autogen_checkpoint_ack_native import (
+    plan as native_plan,
+)
 from tests.unit.runtime.autogen.test_draft_action_progress import (
     action_context,
     draft_case_for_context,
@@ -154,3 +162,26 @@ async def test_multiple_writers_publish_round_before_reselecting_with_checkpoint
     finally:
         await stream.aclose()
     assert saved is not None and model.selectors == 1
+
+
+async def test_native_fixture_model_identity_matches_committed_tool_intent_without_io():
+    context, _, _, _ = fixture()
+    model = InspectingModel(object(), context.tenant_id, context.actor_id)
+    backend = ForbiddenTools()
+    runtime = AutoGenDiscussionRuntime(model, native_plan(), capability_gateway=backend,
+                                       harness_tool_gateway=backend)
+    stream = runtime.run(context)
+    saved = None
+    try:
+        async with asyncio.timeout(2):
+            async for event in stream:
+                if event.checkpoint is not None and event.checkpoint.state.get("tool_ledger"):
+                    saved = event.checkpoint
+                    break
+    finally:
+        await stream.aclose()
+    assert saved is not None and len(model.requests) == 2 and not backend.calls
+    for row, request in zip(saved.state["model_ledger"], model.requests, strict=True):
+        names = {"project.inspect": "project.inspect",
+                 "project_inspect": "project.inspect"} if request.tools else None
+        assert row["request_hash"] == _DiscussionDurability.request_hash(request, tool_names=names)

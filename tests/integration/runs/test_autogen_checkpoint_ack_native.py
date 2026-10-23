@@ -238,7 +238,8 @@ class CheckingInspectTools(ForbiddenTools):
                 assert isinstance(models, tuple | list) and len(models) == 2
                 for entry, model_request in zip(models, model.requests, strict=True):
                     assert isinstance(entry, Mapping) and entry['status'] == 'succeeded'
-                    tool_names = {'project_inspect': 'project.inspect'} if model_request.tools else None
+                    tool_names = {'project.inspect': 'project.inspect',
+                                  'project_inspect': 'project.inspect'} if model_request.tools else None
                     assert entry['request_hash'] == _DiscussionDurability.request_hash(
                         model_request, tool_names=tool_names)
                 assert checkpoint.state['artifact_registry'], 'fixed replies must use private storage'
