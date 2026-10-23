@@ -971,6 +971,8 @@ const CapabilityApprovalsSchema = z.object({
   items: z.array(CapabilityApprovalEventSchema),
   ready: z.boolean(),
   conversation_approval_available: z.boolean().default(false),
+  conversation_approval_id: z.string().min(1).nullable().optional(),
+  conversation_approval_version: z.number().int().positive().nullable().optional(),
 });
 export type CapabilityApprovalEvent = z.infer<typeof CapabilityApprovalEventSchema>;
 export type RunDeleteResult = z.infer<typeof RunDeleteSchema>;

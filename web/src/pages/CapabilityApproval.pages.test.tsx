@@ -1,4 +1,5 @@
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { QueryClient, QueryClientProvider, useQueryClient } from "@tanstack/react-query";
+import { useEffect } from "react";
 import { act, cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter, Route, Routes, useNavigate } from "react-router-dom";
@@ -47,9 +48,22 @@ function accepted(run: RunDetail): SubmittedRun {
   };
 }
 
+function availableApproval(run: RunDetail) {
+  const id = run.explicit_details.approval_id ?? null;
+  const version = run.version ?? null;
+  const available = run.status === "waiting_approval" && Boolean(id) && version !== null && version > 0;
+  return {
+    ready: available, conversation_approval_available: available,
+    conversation_approval_id: available ? id : null, conversation_approval_version: available ? version : null,
+    items: id ? [{ kind: "approval.requested" as const, sequence: 1, run_id: run.id, approval_id: id,
+      created_at: "2026-10-22T00:00:00Z", payload: {} }] : [],
+  };
+}
+
 async function publishRun(client: QueryClient, run: RunDetail) {
   await act(async () => {
     client.setQueryData(["run", run.id], run);
+    client.setQueryData(["run", run.id, "actor", initialActor.tenant_id, initialActor.user_id, initialActor.role], run);
     // React Query batches observer notifications on the next timer turn.
     await new Promise((resolve) => setTimeout(resolve, 0));
   });
@@ -75,12 +89,17 @@ async function mountPage(page: "runs" | "detail", historyReader?: typeof api.cap
     workspace_path: run.conversation_id!, archived_at: null,
     created_at: run.created_at, updated_at: run.created_at, runs: [run],
   }));
-  function seedClient(target: QueryClient) {
+  const seededClients = new WeakSet<QueryClient>();
+  function seedClient(target: QueryClient, actor = initialActor) {
+    seededClients.add(target);
     target.setQueryData(["runs"], [alpha, beta]);
     target.setQueryData(["conversations", false], conversations);
     target.setQueryData(["conversations", true], []);
     target.setQueryData(["project-workspaces"], []);
-    for (const run of [alpha, beta]) target.setQueryData(["run", run.id], run);
+    for (const run of [alpha, beta]) {
+      target.setQueryData(["run", run.id], run);
+      target.setQueryData(["run", run.id, "actor", actor.tenant_id, actor.user_id, actor.role], run);
+    }
     for (const conversation of conversations) {
       target.setQueryData(["conversation", conversation.conversation_id], conversation);
       target.setQueryData(["conversation-queue", conversation.conversation_id], []);
@@ -92,24 +111,34 @@ async function mountPage(page: "runs" | "detail", historyReader?: typeof api.cap
   vi.spyOn(api, "me").mockImplementation(async () => currentActor);
   vi.spyOn(api, "login").mockImplementation(async () => currentActor);
   let auth!: ReturnType<typeof useAuth>;
+  let activeClient = client;
+  let mounted = true;
   function IdentityController() {
     auth = useAuth();
+    activeClient = useQueryClient();
+    useEffect(() => {
+      // Each fixture actor is independently allowed to read these shared test records.
+      if (auth.user && !seededClients.has(activeClient)) {
+        clients.push(activeClient);
+        seedClient(activeClient, auth.user);
+      }
+    }, [auth.user, activeClient]);
     return null;
   }
   async function changeIdentity(next: CurrentUser) {
     currentActor = next;
+    read.mockImplementation(async (id) => id === alpha.id ? alpha : beta);
+    if (!mounted) return;
     await act(async () => auth.login("test", "test-password"));
+    if (page === "runs") await open("alpha");
+    await screen.findByRole("status", { name: "沙箱权限确认" });
   }
   const read = vi.spyOn(api, "run").mockImplementation(async (id) => id === alpha.id ? alpha : beta);
   vi.spyOn(api, "conversation").mockImplementation(async (id) => conversations.find((item) => item.conversation_id === id)!);
   vi.spyOn(api, "conversationQueue").mockResolvedValue([]);
   vi.spyOn(api, "workspaceFiles").mockResolvedValue({ items: [], bundle_download_url: "" });
-  const history = vi.spyOn(api, "capabilityApprovals").mockImplementation(historyReader ?? (async (id) => ({
-    ready: true, conversation_approval_available: true, items: [{
-      kind: "approval.requested", sequence: 1, run_id: id, approval_id: `approval-${id.replace("run-", "")}`,
-      created_at: "2026-10-22T00:00:00Z", payload: {},
-    }],
-  })));
+  const history = vi.spyOn(api, "capabilityApprovals").mockImplementation(historyReader ?? (async (id) =>
+    availableApproval([alpha, beta].find((item) => item.id === id)!)));
   const approve = vi.spyOn(api, "approveCapability");
   const reject = vi.spyOn(api, "rejectCapability");
   let navigate!: ReturnType<typeof useNavigate>;
@@ -132,7 +161,7 @@ async function mountPage(page: "runs" | "detail", historyReader?: typeof api.cap
     if (page === "detail") {
       await act(async () => navigate(`/runs/run-${name}`));
     } else {
-      await user.click(screen.getByRole("button", { name: new RegExp(`^进入会话 Approval ${name}`) }));
+      await user.click(await screen.findByRole("button", { name: new RegExp(`^进入会话 Approval ${name}`) }));
     }
     await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
   }
@@ -142,6 +171,7 @@ async function mountPage(page: "runs" | "detail", historyReader?: typeof api.cap
   }
   async function remount(nextPage = page, target = client) {
     view.unmount();
+    mounted = true;
     page = nextPage;
     view = renderPage(target);
     if (page === "runs") {
@@ -163,7 +193,8 @@ async function mountPage(page: "runs" | "detail", historyReader?: typeof api.cap
     await select("alpha");
   }
   const card = await screen.findByRole("status", { name: "沙箱权限确认" });
-  return { user, alpha, beta, client, read, history, approve, reject, open, select, card, remount, isolatedClient, changeIdentity, unmount: () => view.unmount() };
+  return { user, alpha, beta, client, currentClient: () => activeClient, read, history, approve, reject, open, select, card, remount, isolatedClient, changeIdentity,
+    unmount: () => { mounted = false; view.unmount(); } };
 }
 
 async function mountConversationEntry(details: RunDetail[], options: {
@@ -260,7 +291,7 @@ describe.each(["runs", "detail"] as const)("session approval readiness on %s", (
     await waitFor(() => expect(history).toHaveBeenCalled());
     expect(within(card).getByRole("button", { name: "本次会话批准" }).hasAttribute("disabled")).toBe(true);
     expect(within(card).getByText("正在确认会话批准支持")).toBeTruthy();
-    await act(async () => response.resolve({ ready: true, conversation_approval_available: true, items: [] }));
+    await act(async () => response.resolve(availableApproval(approvalRun("alpha"))));
     await waitFor(() => expect(within(card).getByRole("button", { name: "本次会话批准" }).hasAttribute("disabled")).toBe(false));
   });
 
@@ -449,14 +480,16 @@ describe.each(["runs", "detail"] as const)("%s capability approval component", (
     expect(within(current).getByRole("button", { name: "批准" }).hasAttribute("disabled")).toBe(false);
     expect(within(current).queryByRole("alert")).toBeNull();
     await changeIdentity(initialActor);
-    expect(screen.queryByRole("status", { name: "沙箱权限确认" })).toBeNull();
+    const returned = await screen.findByRole("status", { name: "沙箱权限确认" });
+    expect(within(returned).getByRole("button", { name: "批准" }).hasAttribute("disabled")).toBe(false);
+    expect(within(returned).queryByRole("alert")).toBeNull();
   });
 
   it.each([
     ["user_id", "success"], ["user_id", "failure"],
     ["tenant_id", "success"], ["tenant_id", "failure"],
   ] as const)("isolates a late %s identity's %s from the new actor's pending decision", async (field, result) => {
-    const { user, alpha, client, read, approve, reject, card, changeIdentity } = await mountPage(page);
+    const { user, alpha, currentClient, read, approve, reject, card, changeIdentity } = await mountPage(page);
     const first = deferred<SubmittedRun>();
     const second = deferred<SubmittedRun>();
     approve.mockReturnValue(first.promise);
@@ -467,7 +500,7 @@ describe.each(["runs", "detail"] as const)("%s capability approval component", (
     const current = screen.getByRole("status", { name: "沙箱权限确认" });
     expect(within(current).getByRole("button", { name: "拒绝" }).hasAttribute("disabled")).toBe(false);
     await user.click(within(current).getByRole("button", { name: "拒绝" }));
-    const invalidate = vi.spyOn(client, "invalidateQueries");
+    const invalidate = vi.spyOn(currentClient(), "invalidateQueries");
     await act(async () => result === "success" ? first.resolve(accepted(alpha)) : first.reject(new Error("old identity failed")));
     expect(within(current).getByRole("button", { name: "拒绝中..." }).hasAttribute("disabled")).toBe(true);
     expect(within(current).queryByRole("alert")).toBeNull();
@@ -477,12 +510,13 @@ describe.each(["runs", "detail"] as const)("%s capability approval component", (
     await act(async () => second.resolve(accepted(alpha)));
     await waitFor(() => expect(screen.queryByRole("status", { name: "沙箱权限确认" })).toBeNull());
     await changeIdentity(initialActor);
-    if (result === "success") expect(screen.queryByRole("status", { name: "沙箱权限确认" })).toBeNull();
-    else expect(screen.getByRole("status", { name: "沙箱权限确认" }).textContent).toContain("old identity failed");
+    const returned = await screen.findByRole("status", { name: "沙箱权限确认" });
+    expect(within(returned).queryByRole("alert")).toBeNull();
+    expect(within(returned).getByRole("button", { name: "批准" }).hasAttribute("disabled")).toBe(false);
   });
 
   it.each(["success", "failure"] as const)("does not apply an unmounted actor's late %s to another actor", async (result) => {
-    const { user, alpha, client, read, approve, card, changeIdentity, unmount, remount } = await mountPage(page);
+    const { user, alpha, currentClient, read, approve, card, changeIdentity, unmount, remount } = await mountPage(page);
     const response = deferred<SubmittedRun>();
     approve.mockReturnValue(response.promise);
     read.mockReturnValue(deferred<RunDetail>().promise);
@@ -492,7 +526,7 @@ describe.each(["runs", "detail"] as const)("%s capability approval component", (
     await remount(page === "runs" ? "detail" : "runs");
     const current = screen.getByRole("status", { name: "沙箱权限确认" });
     expect(within(current).getByRole("button", { name: "批准" }).hasAttribute("disabled")).toBe(false);
-    const invalidate = vi.spyOn(client, "invalidateQueries");
+    const invalidate = vi.spyOn(currentClient(), "invalidateQueries");
     await act(async () => result === "success" ? response.resolve(accepted(alpha)) : response.reject(new Error("old identity failed")));
     expect(within(current).getByRole("button", { name: "批准" }).hasAttribute("disabled")).toBe(false);
     expect(within(current).queryByRole("alert")).toBeNull();

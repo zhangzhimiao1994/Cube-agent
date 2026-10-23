@@ -5,6 +5,7 @@ import { Link, useParams } from "react-router-dom";
 
 import { api, formatApiError, type RunDetail } from "../api/client";
 import { useCapabilityApprovalDecisions } from "./useCapabilityApprovalDecisions";
+import { useAuth } from "../auth/AuthProvider";
 import { useRunCapabilityApprovals } from "./useRunCapabilityApprovals";
 import { CapabilityApprovalCard } from "../components/CapabilityApprovalCard";
 import { PluginHandoverPanel } from "../components/PluginHandoverPanel";
@@ -3399,12 +3400,22 @@ function DetailProcessSummary({ cards, webPreviewScope }: { cards: DetailProcess
 }
 
 export function RunDetailPage() {
+  const auth = useAuth();
+  if (auth.loading) return <p>正在确认身份...</p>;
+  if (!auth.user || !auth.hasPermission("run:read")) return <p role="alert">当前身份无法查看运行详情</p>;
+  return <RunDetailPageForActor key={JSON.stringify([auth.user.tenant_id, auth.user.user_id, auth.user.role])} />;
+}
+
+function RunDetailPageForActor() {
+  const { user } = useAuth();
   const { runId = "" } = useParams();
   const queryClient = useQueryClient();
+  const scopedRunKey = ["run", runId, "actor", user?.tenant_id, user?.user_id, user?.role];
   const run = useQuery({
-    queryKey: ["run", runId],
+    queryKey: scopedRunKey,
     queryFn: () => api.run(runId),
-    enabled: runId.length > 0,
+    enabled: Boolean(user && runId),
+    placeholderData: undefined,
     refetchInterval: (query) => {
       const data = query.state.data;
       if (!data) return false;
@@ -3419,7 +3430,7 @@ export function RunDetailPage() {
       return api.cancelRun(runId);
     },
     onSuccess: (updated) => {
-      queryClient.setQueryData(["run", runId], updated);
+      queryClient.setQueryData(scopedRunKey, updated);
       void queryClient.invalidateQueries({ queryKey: ["runs"] });
     },
   });
@@ -3502,7 +3513,7 @@ export function RunDetailPage() {
       });
     },
     onSuccess: async (updated) => {
-      queryClient.setQueryData(["run", runId], updated);
+      queryClient.setQueryData(scopedRunKey, updated);
       await queryClient.invalidateQueries({ queryKey: ["run", runId] });
       await queryClient.invalidateQueries({ queryKey: ["runs"] });
     },

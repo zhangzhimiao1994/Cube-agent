@@ -212,7 +212,7 @@ describe("conversation action menu", () => {
     vi.restoreAllMocks();
   });
 
-  function renderMenuPage(persisted = true) {
+  async function renderMenuPage(persisted = true) {
     vi.spyOn(api, "me").mockResolvedValue({
       tenant_id: "menu-tenant", user_id: "menu-user", username: "menu-user", role: "operator", permissions: ["*"],
     });
@@ -267,12 +267,13 @@ describe("conversation action menu", () => {
         <AuthProvider><MemoryRouter initialEntries={["/?conversation=conv-menu-alpha"]}><MenuTestPage /></MemoryRouter></AuthProvider>
       </QueryClientProvider>,
     );
+    await screen.findByRole("form", { name: "发送消息" });
     return { navigate: (to: string) => navigate(to), update };
   }
 
   it("lets historical conversations copy their ID without offering unavailable metadata edits", async () => {
     const user = userEvent.setup();
-    const { update } = renderMenuPage(false);
+    const { update } = await renderMenuPage(false);
     const trigger = screen.getByRole("button", { name: "会话操作" });
     expect(trigger.hasAttribute("disabled")).toBe(false);
     await user.click(trigger);
@@ -286,7 +287,7 @@ describe("conversation action menu", () => {
 
   it("keeps the composer blank and exposes the current conversation ID only in its menu", async () => {
     const user = userEvent.setup();
-    renderMenuPage();
+    await renderMenuPage();
     const input = screen.getByRole("textbox", { name: "消息" });
     expect(input.getAttribute("placeholder")).toBeNull();
     expect(screen.queryByText("conv-menu-alpha")).toBeNull();
@@ -301,7 +302,7 @@ describe("conversation action menu", () => {
 
   it("shows copy failure without closing the menu or changing the conversation", async () => {
     const user = userEvent.setup();
-    renderMenuPage();
+    await renderMenuPage();
     await user.click(screen.getByRole("button", { name: "会话操作" }));
     vi.spyOn(navigator.clipboard, "writeText").mockRejectedValue(new Error("clipboard blocked"));
     await user.click(screen.getByRole("menuitem", { name: "复制会话 ID" }));
@@ -311,7 +312,7 @@ describe("conversation action menu", () => {
 
   it("dismisses outside pointer clicks without stealing their focus", async () => {
     const user = userEvent.setup();
-    renderMenuPage();
+    await renderMenuPage();
     const trigger = screen.getByRole("button", { name: "会话操作" });
     await user.click(trigger);
     await user.click(screen.getByRole("menu"));
@@ -325,7 +326,7 @@ describe("conversation action menu", () => {
 
   it("closes on Escape and returns focus to the trigger", async () => {
     const user = userEvent.setup();
-    renderMenuPage();
+    await renderMenuPage();
     const trigger = screen.getByRole("button", { name: "会话操作" });
     await user.click(trigger);
     screen.getByRole("menuitem", { name: "重命名" }).focus();
@@ -339,7 +340,7 @@ describe("conversation action menu", () => {
     ["{ArrowDown}", "重命名"], ["{ArrowUp}", "复制会话 ID"],
   ])("opens with %s and focuses %s", async (key, name) => {
     const user = userEvent.setup();
-    renderMenuPage();
+    await renderMenuPage();
     const trigger = screen.getByRole("button", { name: "会话操作" });
     expect(trigger.getAttribute("title")).toBe("会话操作：重命名、归档");
     expect(trigger.getAttribute("aria-haspopup")).toBe("menu");
@@ -350,7 +351,7 @@ describe("conversation action menu", () => {
 
   it("navigates with wrapping arrows and Home/End without invoking actions", async () => {
     const user = userEvent.setup();
-    const { update } = renderMenuPage();
+    const { update } = await renderMenuPage();
     await user.click(screen.getByRole("button", { name: "会话操作" }));
     const rename = screen.getByRole("menuitem", { name: "重命名" });
     const archive = screen.getByRole("menuitem", { name: "归档" });
@@ -369,7 +370,7 @@ describe("conversation action menu", () => {
 
   it.each([false, true])("dismisses on Tab (shift=%s) without trapping focus", async (shift) => {
     const user = userEvent.setup();
-    renderMenuPage();
+    await renderMenuPage();
     const trigger = screen.getByRole("button", { name: "会话操作" });
     await user.click(trigger);
     screen.getByRole("menuitem", { name: "重命名" }).focus();
@@ -380,7 +381,7 @@ describe("conversation action menu", () => {
 
   it("resets on conversation navigation without pulling focus from the composer", async () => {
     const user = userEvent.setup();
-    const { navigate } = renderMenuPage();
+    const { navigate } = await renderMenuPage();
     await user.click(screen.getByRole("button", { name: "会话操作" }));
     const composer = screen.getByRole("textbox", { name: "消息" });
     composer.focus();
@@ -392,7 +393,7 @@ describe("conversation action menu", () => {
 
   it("returns from the rename dialog to the trigger instead of its removed menu item", async () => {
     const user = userEvent.setup();
-    renderMenuPage();
+    await renderMenuPage();
     const trigger = screen.getByRole("button", { name: "会话操作" });
     await user.click(trigger);
     screen.getByRole("menuitem", { name: "重命名" }).focus();
@@ -406,7 +407,7 @@ describe("conversation action menu", () => {
 
   it("preserves archive/restore actions and restores focus after success", async () => {
     const user = userEvent.setup();
-    const { update } = renderMenuPage();
+    const { update } = await renderMenuPage();
     const trigger = screen.getByRole("button", { name: "会话操作" });
     await user.click(trigger);
     await user.click(screen.getByRole("menuitem", { name: "归档" }));
