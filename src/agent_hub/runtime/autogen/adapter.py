@@ -30,7 +30,12 @@ import autogen_agentchat
 import autogen_core
 from autogen_agentchat.agents import AssistantAgent
 from autogen_agentchat.base import ChatAgent, TaskResult, Team, TerminationCondition
-from autogen_agentchat.messages import BaseAgentEvent, BaseChatMessage, StopMessage
+from autogen_agentchat.messages import (
+    BaseAgentEvent,
+    BaseChatMessage,
+    StopMessage,
+    ToolCallSummaryMessage,
+)
 from autogen_agentchat.teams import SelectorGroupChat
 from autogen_core import CancellationToken, FunctionCall, SingleThreadedAgentRuntime
 from autogen_core.models import (
@@ -73,6 +78,12 @@ from agent_hub.runtime.artifacts import (
     ArtifactRepository,
     ArtifactRepositoryError,
     InMemoryArtifactRepository,
+)
+from agent_hub.runtime.autogen.engineering_continuation import (
+    ENGINEERING_CONTINUATION_POLICY,
+    draft_action,
+    engineering_continuation_selected,
+    writer_can_continue,
 )
 from agent_hub.runtime.autogen.engineering_delivery import (
     engineering_delivery_ready,
@@ -358,6 +369,7 @@ class _DiscussionDurability:
         self._tool_cursor = engineering_tool_prefix
         self.engineering_tool_prefix = engineering_tool_prefix
         self._model_lock = asyncio.Lock()
+        self._tool_lock = asyncio.Lock()
         self.failure_reason: str | None = None
         self.failure_payload: dict[str, str | int | bool] = {}
 
@@ -1442,6 +1454,7 @@ class GatewayCapabilityTool(BaseTool[_DynamicToolArguments, _DynamicToolResult])
         input_schema: Mapping[str, JsonValue] | None = None,
         failure_codes: Sequence[str] = (),
         server_context: TaskContext | None = None,
+        serialize_tool_calls: bool = False,
     ) -> None:
         super().__init__(
             _DynamicToolArguments,
@@ -1465,6 +1478,7 @@ class GatewayCapabilityTool(BaseTool[_DynamicToolArguments, _DynamicToolResult])
         self._sandbox_profile = sandbox_profile
         self._input_schema = _safe_manifest_input_schema(input_schema)
         self._server_context = server_context
+        self._serialize_tool_calls = serialize_tool_calls
 
     @property
     def schema(self) -> ToolSchema:
@@ -1495,6 +1509,29 @@ class GatewayCapabilityTool(BaseTool[_DynamicToolArguments, _DynamicToolResult])
         return await self._execute(validated, cancellation_token, call_id=call_id)
 
     async def _execute(
+        self,
+        args: _DynamicToolArguments,
+        cancellation_token: CancellationToken,
+        *,
+        call_id: str | None,
+    ) -> _DynamicToolResult:
+        if not self._serialize_tool_calls:
+            return await self._execute_ordered(args, cancellation_token, call_id=call_id)
+        acquired = asyncio.create_task(self._durability._tool_lock.acquire())
+        cancellation_token.link_future(acquired)
+        try:
+            await acquired
+            if cancellation_token.is_cancelled():
+                raise asyncio.CancelledError
+            if any(row.get("status") not in ("succeeded", "failed")
+                   for row in self._durability.tool_entries[self._durability._tool_cursor:]):
+                raise ToolOutcomeUncertain("capability outcome is uncertain")
+            return await self._execute_ordered(args, cancellation_token, call_id=call_id)
+        finally:
+            if acquired.done() and not acquired.cancelled() and acquired.result():
+                self._durability._tool_lock.release()
+
+    async def _execute_ordered(
         self,
         args: _DynamicToolArguments,
         cancellation_token: CancellationToken,
@@ -1877,6 +1914,7 @@ class GatewayChatCompletionClient(ChatCompletionClient):
         engineering_action: Callable[[bool], str | None] | None = None,
         engineering_budget: Callable[[], tuple[int, float]] | None = None,
         request_timeout: Callable[[], float] | None = None,
+        acceptance_first: bool = False,
     ) -> None:
         self._gateway = gateway
         self._logical_model = logical_model
@@ -1888,6 +1926,7 @@ class GatewayChatCompletionClient(ChatCompletionClient):
         self._engineering_action = engineering_action
         self._engineering_budget = engineering_budget
         self._request_timeout = request_timeout
+        self._acceptance_first = acceptance_first
         self._actual = RequestUsage(prompt_tokens=0, completion_tokens=0)
         self._total = RequestUsage(prompt_tokens=0, completion_tokens=0)
 
@@ -1971,6 +2010,20 @@ class GatewayChatCompletionClient(ChatCompletionClient):
         selected = tuple(tool for tool in request.tools if tool_names.get(tool.name) == action)
         if len(selected) != 1:
             raise RuntimeExecutionError("required engineering capability is unavailable")
+        if self._acceptance_first and action == "workspace.write_text":
+            # Narrow an existing writer grant; the model still authors the criteria.
+            selected = (replace(selected[0], parameters={
+                "type": "object", "additionalProperties": False,
+                "required": ("path", "content"), "properties": {
+                    "path": {"type": "string", "enum": ("ACCEPTANCE.json",)},
+                    "content": {"type": "string", "minLength": 1},
+                },
+            }),)
+            request = replace(request, messages=(*request.messages, ModelMessage(
+                role="user", content="Before implementation, write ACCEPTANCE.json with executable "
+                "criteria for the user's requirements and exact planned test IDs, using the supplied "
+                "generated-project schema. Author the manifest content yourself. This draft write "
+                "does not freeze tests, approve execution, or prove any test passed.")))
         name = selected[0].name
         replay_entry = (self._durability.model_entries[self._durability._model_cursor]
                         if self._durability is not None
@@ -2065,6 +2118,13 @@ class GatewayChatCompletionClient(ChatCompletionClient):
         if request.required_tool is not None and (len(response.tool_calls) != 1
             or response.tool_calls[0].name != request.required_tool):
             raise RuntimeExecutionError("required engineering tool was not returned")
+        if (self._acceptance_first and request.required_tool is not None
+            and tool_names.get(request.required_tool) == "workspace.write_text"
+            and (response.tool_calls[0].arguments.get("path") != "ACCEPTANCE.json"
+                 or type(response.tool_calls[0].arguments.get("content")) is not str
+                 or not str(response.tool_calls[0].arguments["content"]).strip()
+                 or set(response.tool_calls[0].arguments) != {"path", "content"})):
+            raise RuntimeExecutionError("required acceptance draft write was not returned")
         return completion, usage
 
     def create_stream(
@@ -2242,6 +2302,9 @@ class AutoGenDiscussionRuntime:
         actions = engineering and type(action_version) is int and action_version == 1
         owner = next((participant.id for participant in self._plan.participants
                       if "workspace.write_text" in participant.allowed_tools), None)
+        continuation = (engineering and engineering_continuation_selected(context)
+                        and sum("workspace.write_text" in tools for tools in allowed_tools.values()) == 1)
+        round_published = asyncio.Event()
 
         def delivery_ready() -> bool:
             if not engineering:
@@ -2269,11 +2332,39 @@ class AutoGenDiscussionRuntime:
                 context, tool_entries=durability.tool_entries[:durability._tool_cursor],
                 artifacts=durability.artifacts, allowed_tools=allowed_tools, completion_proposed=proposed,
                 recovering=(self._restored is not None
-                            and durability._model_cursor >= len(durability.model_entries)),
+                            and durability._model_cursor >= len(durability.model_entries)
+                            and not continuation),
             )
             if progress.uncertain:
                 raise RuntimeExecutionError("engineering action evidence is invalid")
+            if continuation and progress.inspected:
+                draft = draft_action(context, durability.tool_entries[:durability._tool_cursor],
+                                     durability.artifacts, allowed_tools)
+                if draft is not None:
+                    return draft
             return required_engineering_action(progress)
+
+        async def continue_writer(messages: Sequence[BaseAgentEvent | BaseChatMessage]) -> str | None:
+            if (messages and isinstance(messages[-1], BaseChatMessage)
+                    and messages[-1].source in allowed_tools):
+                # Publish the previous round before a new model can hold the journal lock.
+                published = asyncio.create_task(round_published.wait())
+                if self._cancel_token is not None:
+                    self._cancel_token.link_future(published)
+                await published
+                round_published.clear()
+            if (not messages or not isinstance(messages[-1], ToolCallSummaryMessage)
+                    or messages[-1].source != owner):
+                return None
+            if durability is None:
+                raise RuntimeExecutionError("engineering continuation evidence is unavailable")
+            if any(row.get("status") not in ("succeeded", "failed")
+                   for row in durability.tool_entries[durability._tool_cursor:]):
+                raise ToolOutcomeUncertain("capability outcome is uncertain")
+            return owner if writer_can_continue(
+                context, owner, durability.tool_entries[:durability._tool_cursor],
+                durability.artifacts, allowed_tools,
+            ) else None
 
         def action_budget() -> tuple[int, float]:
             deadline = self._wall_deadline
@@ -2465,6 +2556,7 @@ class AutoGenDiscussionRuntime:
                     engineering_action=next_action if actions and participant.id == owner else None,
                     engineering_budget=action_budget if actions and participant.id == owner else None,
                     request_timeout=request_timeout,
+                    acceptance_first=continuation and participant.id == owner,
                 )
                 for participant in self._plan.participants
             }
@@ -2544,6 +2636,7 @@ class AutoGenDiscussionRuntime:
                             input_schema=_manifest_input_schema(metadata),
                             failure_codes=_manifest_failure_codes(metadata),
                             server_context=context,
+                            serialize_tool_calls=continuation,
                         )
                     )
                 return tools
@@ -2592,6 +2685,8 @@ class AutoGenDiscussionRuntime:
                     "and current workspace.bundle. Prefer the engineering writer until these are delivered; "
                     "do not treat [COMPLETE] or consensus text as delivery. Return only one speaker name."
                 )
+            if continuation:
+                team_options["selector_func"] = continue_writer
             team = SelectorGroupChat(
                 agents,
                 selector,
@@ -2750,12 +2845,18 @@ class AutoGenDiscussionRuntime:
                             checkpoint=checkpoint,
                         )
                         sequence += 1
+                        if continuation:
+                            round_published.set()
                     elif isinstance(item, TaskResult):
                         reason = termination.reason or self._normalize_stop_reason(item.stop_reason)
             except BaseException:
                 framework_failed = True
                 raise
             finally:
+                if continuation:
+                    if (framework_failed or framework_timed_out) and self._cancel_token is not None:
+                        self._cancel_token.cancel()
+                    round_published.set()
                 cleanup_failed = False
                 if not await self._await_autogen_cleanup(team.reset()):
                     cleanup_failed = True
@@ -3224,6 +3325,8 @@ class AutoGenDiscussionRuntime:
             **({"engineering_action_version": 1} if engineering
                and type(context.routing_decision.get("engineering_action_version")) is int
                and context.routing_decision.get("engineering_action_version") == 1 else {}),
+            **({ENGINEERING_CONTINUATION_POLICY: 1} if engineering
+               and engineering_continuation_selected(context) else {}),
         }
         if engineering:
             while True:
@@ -3287,7 +3390,8 @@ class AutoGenDiscussionRuntime:
                 }
             )
         optional_state = (
-            {"remaining_absolute_timeout_seconds", "engineering_tool_prefix", "engineering_action_version"}
+            {"remaining_absolute_timeout_seconds", "engineering_tool_prefix", "engineering_action_version",
+             ENGINEERING_CONTINUATION_POLICY}
             if checkpoint.runtime_version == _RUNTIME_VERSION
             else set()
         )
@@ -3304,6 +3408,12 @@ class AutoGenDiscussionRuntime:
             or ("engineering_action_version" in state and (
                 type(state["engineering_action_version"]) is not int
                 or state["engineering_action_version"] != 1))):
+            raise RuntimeExecutionError("runtime checkpoint is incompatible")
+        continuation = engineering and engineering_continuation_selected(context)
+        if ((ENGINEERING_CONTINUATION_POLICY in state) != continuation
+            or (ENGINEERING_CONTINUATION_POLICY in state and (
+                type(state[ENGINEERING_CONTINUATION_POLICY]) is not int
+                or state[ENGINEERING_CONTINUATION_POLICY] != 1))):
             raise RuntimeExecutionError("runtime checkpoint is incompatible")
         registry = state["artifact_registry"]
         usage = state["usage"]
