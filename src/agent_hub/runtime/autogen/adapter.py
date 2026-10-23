@@ -79,6 +79,10 @@ from agent_hub.runtime.artifacts import (
     ArtifactRepositoryError,
     InMemoryArtifactRepository,
 )
+from agent_hub.runtime.autogen.checkpoint_publication import (
+    CheckpointPublications,
+    PendingCheckpoint,
+)
 from agent_hub.runtime.autogen.engineering_continuation import (
     ENGINEERING_CONTINUATION_POLICY,
     draft_action,
@@ -138,6 +142,12 @@ _ARTIFACT_CLEANUP_GRACE_SECONDS = 0.5
 _AUTOGEN_STREAM_POLL_SECONDS = 1.0
 _AUTOGEN_SHUTDOWN_GRACE_SECONDS = 2.0
 _GENERATED_DRAFT_NO_PROGRESS = "generated draft correction made no progress"
+_CHECKPOINT_ACK_POLICY = "engineering_checkpoint_ack_version"
+
+
+def _checkpoint_ack_selected(context: TaskContext) -> bool:
+    version = context.routing_decision.get(_CHECKPOINT_ACK_POLICY)
+    return engineering_continuation_selected(context) and type(version) is int and version == 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -2305,6 +2315,9 @@ class AutoGenDiscussionRuntime:
         continuation = (engineering and engineering_continuation_selected(context)
                         and sum("workspace.write_text" in tools for tools in allowed_tools.values()) == 1)
         round_published = asyncio.Event()
+        checkpoint_ack = engineering and _checkpoint_ack_selected(context)
+        publications = CheckpointPublications() if checkpoint_ack else None
+        publication_task: asyncio.Task[PendingCheckpoint] | None = None
 
         def delivery_ready() -> bool:
             if not engineering:
@@ -2353,7 +2366,7 @@ class AutoGenDiscussionRuntime:
                     self._cancel_token.link_future(published)
                 await published
                 round_published.clear()
-            if (not messages or not isinstance(messages[-1], ToolCallSummaryMessage)
+            if (not continuation or not messages or not isinstance(messages[-1], ToolCallSummaryMessage)
                     or messages[-1].source != owner):
                 return None
             if durability is None:
@@ -2489,18 +2502,23 @@ class AutoGenDiscussionRuntime:
                 model_entries: tuple[_LedgerEntry, ...],
                 tool_entries: tuple[_LedgerEntry, ...],
             ) -> None:
-                checkpoint = self._checkpoint(
-                    context,
-                    next_sequence=sequence,
-                    terminal=False,
-                    reason=None,
-                    artifacts=tuple(message_artifacts) + durable_artifacts,
-                    usage=usage,
-                    model_ledger=model_entries,
-                    tool_ledger=tool_entries,
-                    engineering_tool_prefix=(durability.engineering_tool_prefix if durability is not None else 0),
-                )
-                self._last_checkpoint = checkpoint
+                def build(next_sequence: int) -> RuntimeCheckpoint:
+                    return self._checkpoint(
+                        context,
+                        next_sequence=next_sequence,
+                        terminal=False,
+                        reason=None,
+                        artifacts=tuple(message_artifacts) + durable_artifacts,
+                        usage=usage,
+                        model_ledger=model_entries,
+                        tool_ledger=tool_entries,
+                        engineering_tool_prefix=(durability.engineering_tool_prefix if durability is not None else 0),
+                    )
+
+                if publications is not None:
+                    await publications.publish(build)
+                else:
+                    self._last_checkpoint = build(sequence)
 
             async def store_ledger_artifact(artifact: Artifact) -> UUID:
                 return await self._store_artifact(context, artifact)
@@ -2638,7 +2656,7 @@ class AutoGenDiscussionRuntime:
                             input_schema=_manifest_input_schema(metadata),
                             failure_codes=_manifest_failure_codes(metadata),
                             server_context=context,
-                            serialize_tool_calls=continuation,
+                            serialize_tool_calls=continuation or checkpoint_ack,
                         )
                     )
                 return tools
@@ -2687,7 +2705,7 @@ class AutoGenDiscussionRuntime:
                     "and current workspace.bundle. Prefer the engineering writer until these are delivered; "
                     "do not treat [COMPLETE] or consensus text as delivery. Return only one speaker name."
                 )
-            if continuation:
+            if continuation or checkpoint_ack:
                 team_options["selector_func"] = continue_writer
             team = SelectorGroupChat(
                 agents,
@@ -2729,6 +2747,8 @@ class AutoGenDiscussionRuntime:
                 expire_wall_time,
             )
             framework_runtime.start()
+            if publications is not None:
+                publication_task = asyncio.create_task(publications.next())
             framework_failed = False
             framework_timed_out = False
             try:
@@ -2738,7 +2758,21 @@ class AutoGenDiscussionRuntime:
                 )
                 while True:
                     item_task: asyncio.Task[Any] = asyncio.create_task(anext(stream))
-                    while not item_task.done():
+                    while not item_task.done() or (publication_task is not None and publication_task.done()):
+                        if publication_task is not None and publication_task.done():
+                            publication = publication_task.result()
+                            assert publications is not None
+                            publication_task = asyncio.create_task(publications.next())
+                            if publication.cancelled:
+                                continue
+                            checkpoint = publication.build(sequence + 1)
+                            self._last_checkpoint = checkpoint
+                            yield RunEvent(kind=EventKind.CHECKPOINT_SAVED, sequence=sequence,
+                                           run_id=context.run_id, checkpoint=checkpoint)
+                            sequence += 1
+                            # Resumption follows the driver's committed event transaction.
+                            publication.acknowledge()
+                            continue
                         deadline = self._wall_deadline
                         if deadline is None:
                             raise RuntimeExecutionError(
@@ -2765,7 +2799,8 @@ class AutoGenDiscussionRuntime:
                                         del error
                             break
                         await asyncio.wait(
-                            (item_task,),
+                            (item_task,) if publication_task is None else (item_task, publication_task),
+                            return_when=asyncio.FIRST_COMPLETED,
                             timeout=min(_AUTOGEN_STREAM_POLL_SECONDS, remaining),
                         )
                     if framework_timed_out:
@@ -2847,7 +2882,7 @@ class AutoGenDiscussionRuntime:
                             checkpoint=checkpoint,
                         )
                         sequence += 1
-                        if continuation:
+                        if continuation or checkpoint_ack:
                             round_published.set()
                     elif isinstance(item, TaskResult):
                         reason = termination.reason or self._normalize_stop_reason(item.stop_reason)
@@ -2855,7 +2890,12 @@ class AutoGenDiscussionRuntime:
                 framework_failed = True
                 raise
             finally:
-                if continuation:
+                if publications is not None:
+                    publications.close()
+                if publication_task is not None:
+                    publication_task.cancel()
+                    await asyncio.gather(publication_task, return_exceptions=True)
+                if continuation or checkpoint_ack:
                     if (framework_failed or framework_timed_out) and self._cancel_token is not None:
                         self._cancel_token.cancel()
                     round_published.set()
@@ -3083,6 +3123,8 @@ class AutoGenDiscussionRuntime:
                 } if durability is not None and durability.failure_payload else {},
             )
         finally:
+            if publications is not None:
+                publications.close()
             if wall_handle is not None:
                 wall_handle.cancel()
             self._active_task = None
@@ -3329,6 +3371,7 @@ class AutoGenDiscussionRuntime:
                and context.routing_decision.get("engineering_action_version") == 1 else {}),
             **({ENGINEERING_CONTINUATION_POLICY: 1} if engineering
                and engineering_continuation_selected(context) else {}),
+            **({_CHECKPOINT_ACK_POLICY: 1} if engineering and _checkpoint_ack_selected(context) else {}),
         }
         if engineering:
             while True:
@@ -3393,7 +3436,7 @@ class AutoGenDiscussionRuntime:
             )
         optional_state = (
             {"remaining_absolute_timeout_seconds", "engineering_tool_prefix", "engineering_action_version",
-             ENGINEERING_CONTINUATION_POLICY}
+             ENGINEERING_CONTINUATION_POLICY, _CHECKPOINT_ACK_POLICY}
             if checkpoint.runtime_version == _RUNTIME_VERSION
             else set()
         )
@@ -3416,6 +3459,12 @@ class AutoGenDiscussionRuntime:
             or (ENGINEERING_CONTINUATION_POLICY in state and (
                 type(state[ENGINEERING_CONTINUATION_POLICY]) is not int
                 or state[ENGINEERING_CONTINUATION_POLICY] != 1))):
+            raise RuntimeExecutionError("runtime checkpoint is incompatible")
+        checkpoint_ack = engineering and _checkpoint_ack_selected(context)
+        if ((_CHECKPOINT_ACK_POLICY in state) != checkpoint_ack
+            or (_CHECKPOINT_ACK_POLICY in state and (
+                type(state[_CHECKPOINT_ACK_POLICY]) is not int
+                or state[_CHECKPOINT_ACK_POLICY] != 1))):
             raise RuntimeExecutionError("runtime checkpoint is incompatible")
         registry = state["artifact_registry"]
         usage = state["usage"]

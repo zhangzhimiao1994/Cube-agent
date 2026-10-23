@@ -63,6 +63,7 @@ from agent_hub.runtime.contracts import (
 )
 from agent_hub.runtime.crew.adapter import CrewDispatchRuntime
 from agent_hub.runtime.crew.plan import AgentSpec, DispatchPlan, DispatchStep
+from agent_hub.runtime.delivery_followup import delivery_followup_guidance
 from agent_hub.runtime.direct import DirectRuntime
 from agent_hub.runtime.engineering_admission import _required as engineering_scope
 from agent_hub.runtime.engineering_admission import with_engineering_admission
@@ -2232,6 +2233,8 @@ def _dispatch_plan(
             f"{preflight_guidance}"
             f"{_project_preflight_final_guidance(preflight_context)}"
             f"{_software_final_guidance(context)}"
+            + (delivery_followup_guidance(context) + " " if delivery_followup_guidance(context) else "")
+            +
             "Resolve conflicts explicitly and state any user decision required."
         ),
         depends_on=final_dependencies,
@@ -4845,6 +4848,8 @@ def _discussion_plan(
         goal = role.mission
         if context is not None:
             goal += _software_delivery_guidance(context, tools)
+            if followup := delivery_followup_guidance(context):
+                goal += "\n" + followup
         participants.append(DiscussionParticipant(
             id=participant_id,
             role=role.role,
