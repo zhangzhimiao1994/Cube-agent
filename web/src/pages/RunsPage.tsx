@@ -9128,10 +9128,10 @@ export function RunsPage() {
                     type="button"
                     className="conversation-menu-trigger"
                     aria-label="会话操作"
-                    title={currentConversationPersisted ? `会话操作：重命名、${currentConversationArchived ? "恢复" : "归档"}` : "开始会话后可重命名或归档"}
+                    title={currentConversationPersisted ? `会话操作：重命名、${currentConversationArchived ? "恢复" : "归档"}` : "会话操作：复制会话 ID"}
                     aria-haspopup="menu"
                     aria-expanded={conversationMenuOpen}
-                    disabled={!currentConversationPersisted}
+                    disabled={!activeConversationKnown || !activeConversationId}
                     onClick={() => {
                       conversationMenuInitialFocusRef.current = "first";
                       setConversationCopyNotice(null);
@@ -9174,6 +9174,7 @@ export function RunsPage() {
                         type="button"
                         role="menuitem"
                         tabIndex={-1}
+                        disabled={!currentConversationPersisted}
                         onClick={() => {
                           setRenameConversationTitle(currentConversationTitle);
                           updateConversation.reset();
@@ -9187,7 +9188,7 @@ export function RunsPage() {
                         type="button"
                         role="menuitem"
                         tabIndex={-1}
-                        disabled={updateConversation.isPending}
+                        disabled={!currentConversationPersisted || updateConversation.isPending}
                         onClick={() =>
                           updateConversation.mutate({
                             conversationId: activeConversationId,

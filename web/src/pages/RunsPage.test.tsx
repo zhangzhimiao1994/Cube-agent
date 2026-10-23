@@ -212,7 +212,7 @@ describe("conversation action menu", () => {
     vi.restoreAllMocks();
   });
 
-  function renderMenuPage() {
+  function renderMenuPage(persisted = true) {
     vi.spyOn(api, "me").mockResolvedValue({
       tenant_id: "menu-tenant", user_id: "menu-user", username: "menu-user", role: "operator", permissions: ["*"],
     });
@@ -223,7 +223,7 @@ describe("conversation action menu", () => {
       project_label: "Menu project",
       workspace_path: `conv-menu-${name}`,
       archived_at: null,
-      created_at: "2026-10-22T00:00:00Z",
+      created_at: persisted ? "2026-10-22T00:00:00Z" : null,
       updated_at: "2026-10-22T00:00:00Z",
       runs: [],
     }));
@@ -269,6 +269,20 @@ describe("conversation action menu", () => {
     );
     return { navigate: (to: string) => navigate(to), update };
   }
+
+  it("lets historical conversations copy their ID without offering unavailable metadata edits", async () => {
+    const user = userEvent.setup();
+    const { update } = renderMenuPage(false);
+    const trigger = screen.getByRole("button", { name: "会话操作" });
+    expect(trigger.hasAttribute("disabled")).toBe(false);
+    await user.click(trigger);
+    expect(screen.getByRole("menuitem", { name: "重命名" }).hasAttribute("disabled")).toBe(true);
+    expect(screen.getByRole("menuitem", { name: "归档" }).hasAttribute("disabled")).toBe(true);
+    const copy = vi.spyOn(navigator.clipboard, "writeText").mockResolvedValue();
+    await user.click(screen.getByRole("menuitem", { name: "复制会话 ID" }));
+    expect(copy).toHaveBeenCalledExactlyOnceWith("conv-menu-alpha");
+    expect(update).not.toHaveBeenCalled();
+  });
 
   it("keeps the composer blank and exposes the current conversation ID only in its menu", async () => {
     const user = userEvent.setup();
