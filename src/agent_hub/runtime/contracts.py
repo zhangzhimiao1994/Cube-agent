@@ -116,7 +116,7 @@ _CAPACITY_DIAGNOSTIC_ENUMS = {
 _OPTIONAL_FAILURE_DIAGNOSTIC_KEYS = frozenset(
     {
         "status_code", "hybrid_child_mode", "orchestration_recovery_hint", "step_id", "actor",
-        "compression_trigger",
+        "compression_trigger", "termination_reason",
     }
 ) | frozenset(_CAPACITY_DIAGNOSTIC_ENUMS)
 _FAILURE_DIAGNOSTIC_KEYS = _REQUIRED_FAILURE_DIAGNOSTIC_KEYS | _OPTIONAL_FAILURE_DIAGNOSTIC_KEYS
@@ -268,6 +268,14 @@ def _validate_failure_diagnostic(payload: Mapping[str, JsonValue]) -> None:
         or payload["error_category"] != "incomplete_response"
     ):
         raise ValueError("runtime failure diagnostic compression trigger is invalid")
+    if "termination_reason" in payload and (
+        payload["termination_reason"] != "wall_time"
+        or payload["error_code"] != "runtime.discussion_budget_exhausted"
+        or payload["error_stage"] != "runtime_budget"
+        or payload["error_category"] != "budget_exhausted"
+        or payload["retryable"] is not False
+    ):
+        raise ValueError("runtime failure diagnostic termination reason is invalid")
     if "status_code" in payload:
         status_code = payload["status_code"]
         if type(status_code) is not int or not 100 <= status_code <= 599:
@@ -890,8 +898,13 @@ class RunEvent(_RuntimeContractModel):
             raise ValueError("event payload contains sensitive data")
         if (any(key.startswith("gateway_scope_") for key in self.payload)
                 or self.payload.keys() & _CAPACITY_DIAGNOSTIC_ENUMS.keys()):
-            if self.kind not in {EventKind.STEP_FAILED, EventKind.RUNTIME_FAILED}:
+            if self.kind not in {EventKind.STEP_FAILED, EventKind.RUNTIME_FAILED, EventKind.RUNTIME_CANCELLED}:
                 raise ValueError("gateway scope diagnostic event kind is invalid")
+            if self.kind is EventKind.RUNTIME_CANCELLED and (
+                self.reason is not None
+                or set(self.payload) - _GATEWAY_SCOPE_DIAGNOSTIC_KEYS - _CAPACITY_DIAGNOSTIC_ENUMS.keys()
+            ):
+                raise ValueError("cancelled gateway scope diagnostic fields are invalid")
             _validate_gateway_scope_diagnostic(self.payload)
         if self.kind is EventKind.ARTIFACT_CREATED:
             if self.artifact is None or self.checkpoint is not None or self.reason is not None:
@@ -1078,7 +1091,10 @@ class RunEvent(_RuntimeContractModel):
             EventKind.CHECKPOINT_SAVED: frozenset({"checkpoint"}),
             EventKind.RUNTIME_COMPLETED: frozenset({"actor", "message", "payload", "inputs", "reason"}),
             EventKind.RUNTIME_FAILED: frozenset({"reason", "payload"}),
-            EventKind.RUNTIME_CANCELLED: frozenset(),
+            EventKind.RUNTIME_CANCELLED: (
+                frozenset({"payload"}) if self.payload.keys() & _GATEWAY_SCOPE_DIAGNOSTIC_KEYS
+                else frozenset()
+            ),
         }
         if (
             isinstance(self.kind, EventKind)

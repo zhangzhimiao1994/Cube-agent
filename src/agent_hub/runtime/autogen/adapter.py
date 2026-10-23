@@ -489,6 +489,10 @@ class _DiscussionDurability:
         if reason and self.failure_reason is None:
             self.failure_reason = reason
             self.failure_payload = gateway_scope_failure_payload(source)
+        elif self.failure_reason is None and not self.failure_payload:
+            self.failure_payload = gateway_scope_failure_payload(
+                source, include_noncapacity=isinstance(source, asyncio.CancelledError),
+            )
         if self._model_lock.locked():
             self._model_lock.release()
 
@@ -2018,9 +2022,9 @@ class GatewayChatCompletionClient(ChatCompletionClient):
                 if cancellation_token is not None:
                     cancellation_token.link_future(task)
                 completion = await task
-            except asyncio.CancelledError:
+            except asyncio.CancelledError as error:
                 if self._durability is not None:
-                    self._durability.fail_model()
+                    self._durability.fail_model(source=error)
                 raise
             except Exception as error:
                 if self._durability is not None:
@@ -2283,6 +2287,19 @@ class AutoGenDiscussionRuntime:
                 raise RuntimeExecutionError("discussion wall deadline is unavailable")
             now = asyncio.get_running_loop().time()
             return min(budget.remaining(now=now), budget.absolute_remaining(now=now))
+
+        def wall_failure_payload() -> dict[str, JsonValue]:
+            return {
+                **runtime_failure_diagnostic_from_reason("engineering_delivery_missing"),
+                "termination_reason": "wall_time",
+                "error_code": "runtime.discussion_budget_exhausted",
+                "error_stage": "runtime_budget",
+                "error_category": "budget_exhausted",
+                "error_summary": "工程任务已用尽运行时限，尚未完成交付。",
+                "retryable": False,
+                "suggested_action": "先核查容量与调用阶段，保留已有输出；不要盲目重试或扩大预算。",
+                **(durability.failure_payload if durability is not None else {}),
+            }
 
         wall_expired = asyncio.Event()
         wall_handle: asyncio.TimerHandle | None = None
@@ -2591,6 +2608,9 @@ class AutoGenDiscussionRuntime:
             reason: str | None = None
 
             def expire_wall_time() -> None:
+                if (self._cancel_event is not None and self._cancel_event.is_set()
+                        and not wall_expired.is_set()):
+                    return
                 wall_expired.set()
                 if self._cancel_token is not None:
                     self._cancel_token.cancel()
@@ -2765,6 +2785,11 @@ class AutoGenDiscussionRuntime:
                 reason = "wall_time"
             reason = reason or termination.reason or "max_turns"
             if not delivery_ready():
+                if reason == "wall_time":
+                    yield RunEvent(kind=EventKind.RUNTIME_FAILED, sequence=sequence,
+                                   run_id=context.run_id, reason="engineering_delivery_missing",
+                                   payload=wall_failure_payload())
+                    return
                 raise RuntimeExecutionError("engineering_delivery_missing")
             last_discussion = next(
                 (
@@ -2839,7 +2864,8 @@ class AutoGenDiscussionRuntime:
             if wall_expired.is_set():
                 if not delivery_ready():
                     yield RunEvent(kind=EventKind.RUNTIME_FAILED, sequence=sequence,
-                                   run_id=context.run_id, reason="engineering_delivery_missing")
+                                   run_id=context.run_id, reason="engineering_delivery_missing",
+                                   payload=wall_failure_payload())
                     return
                 checkpoint = self._checkpoint(
                     context,
@@ -2900,6 +2926,7 @@ class AutoGenDiscussionRuntime:
                 kind=EventKind.RUNTIME_CANCELLED,
                 sequence=sequence,
                 run_id=context.run_id,
+                payload=durability.failure_payload if durability is not None else {},
             )
             raise
         except Exception as error:  # noqa: BLE001 - AutoGen wraps participant failures

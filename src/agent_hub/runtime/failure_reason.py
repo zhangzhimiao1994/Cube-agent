@@ -167,17 +167,19 @@ def safe_runtime_failure_diagnostic(
             **gateway_scope_failure_payload(error)}
 
 
-def gateway_scope_failure_payload(error: object) -> RuntimeFailureDiagnostic:
-    """Project issued capacity observations only; absence preserves legacy payloads."""
+def gateway_scope_failure_payload(
+    error: object, *, include_noncapacity: bool = False,
+) -> RuntimeFailureDiagnostic:
+    """Project issued observations; optional wait diagnostics preserve legacy defaults."""
     scope = get_gateway_scope_diagnostic(error)
     details = capacity_backend_diagnostic_payload(None if scope is None else scope.capacity_backend)
-    if scope is None or details is None:
+    if scope is None or (details is None and not include_noncapacity):
         return {}
     return {
         'gateway_scope_phase': scope.phase.value, 'gateway_scope_reason': scope.reason.value,
         'gateway_scope_transport_entered_count': scope.transport_entered_count,
         'gateway_scope_failure_attempt_count': scope.failure_attempt_count,
-        **{'capacity_' + key: value for key, value in details.items()},
+        **{'capacity_' + key: value for key, value in (details or {}).items()},
     }
 
 
