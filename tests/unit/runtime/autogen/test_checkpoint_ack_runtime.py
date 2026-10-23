@@ -18,6 +18,7 @@ from agent_hub.runtime.autogen.adapter import (
     _DiscussionDurability,
 )
 from agent_hub.runtime.contracts import EventKind
+from agent_hub.subprocess_cleanup import ProcessCleanupIncomplete
 from tests.integration.runs.test_autogen_checkpoint_ack_native import (
     ForbiddenTools,
     InspectingModel,
@@ -195,15 +196,24 @@ async def test_native_fixture_model_identity_matches_committed_tool_intent_witho
 
 async def test_incomplete_ack_cleanup_is_not_reported_as_a_successful_close():
     context, plan, model, _ = fixture()
+    operations = []
 
     class IncompleteCleanup(AutoGenDiscussionRuntime):
         async def _await_autogen_cleanup(self, operation):
+            operations.append(operation.cr_code.co_name)
             complete = await super()._await_autogen_cleanup(operation)
-            return False if operation.cr_code.co_name == "drain_owned_handlers" else complete
+            if operation.cr_code.co_name == "drain_owned_handlers":
+                # The fixture simulates a failed fence after real drain; stop its
+                # already-idle dispatcher explicitly so the negative test leaks nothing.
+                await self.last_team._runtime.stop_when_idle()
+                await self.last_team._runtime.close()
+                return False
+            return complete
 
     runtime = IncompleteCleanup(model, plan, capability_gateway=object())
     stream = runtime.run(context)
     await pending_checkpoint(stream)
-    with pytest.raises(RuntimeError, match="cleanup incomplete"):
+    with pytest.raises(ProcessCleanupIncomplete, match="cleanup incomplete"):
         await stream.aclose()
     assert not model.calls
+    assert "reset" not in operations

@@ -123,6 +123,7 @@ from agent_hub.runtime.generated_project_guidance import generated_project_guida
 from agent_hub.runtime.hermes_context import runtime_memory_context_text
 from agent_hub.runtime.project_prerequisite_feedback import project_prerequisite_feedback
 from agent_hub.runtime.self_repair_context import self_repair_context_text
+from agent_hub.subprocess_cleanup import ProcessCleanupIncomplete
 
 _ID = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,127}$")
 _RUNTIME_TYPE = "autogen"
@@ -325,7 +326,7 @@ class RuntimeExecutionError(RuntimeError):
     """Stable discussion runtime failure."""
 
 
-class _AutoGenCleanupIncomplete(RuntimeError):
+class _AutoGenCleanupIncomplete(ProcessCleanupIncomplete):
     """Owned framework cleanup failed; stream closure must not hide that fact."""
 
 
@@ -2924,7 +2925,7 @@ class AutoGenDiscussionRuntime:
                             raise RuntimeExecutionError("AutoGen handlers did not stop")
 
                     if not await self._await_autogen_cleanup(drain_owned_handlers()):
-                        cleanup_failed = True
+                        raise _AutoGenCleanupIncomplete("AutoGen runtime cleanup incomplete")
                 if not await self._await_autogen_cleanup(team.reset()):
                     cleanup_failed = True
                 if not await self._await_autogen_cleanup(framework_runtime.stop_when_idle()):
