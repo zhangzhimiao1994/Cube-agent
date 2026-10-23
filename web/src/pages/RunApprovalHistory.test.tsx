@@ -53,9 +53,29 @@ function mount(runs: RunDetail[], identity = actor) {
 }
 
 describe("durable per-run approval history", () => {
+  it("distinguishes a scoped conversation grant from a one-action approval", async () => {
+    const history = events();
+    history[1] = { ...history[1], payload: { decision_scope: "conversation" } } as CapabilityApprovalEvent;
+    vi.spyOn(api, "capabilityApprovals").mockResolvedValue({ items: history, ready: false, conversation_approval_available: false });
+    mount([run()]);
+    const record = await screen.findByRole("article", { name: "权限审批结果" });
+    expect(record.textContent).toContain("已批准本次会话内同范围操作");
+    expect(record.textContent).not.toContain("已批准本次操作");
+  });
+
+  it("marks approval receipts as permission records rather than chat replies", async () => {
+    vi.spyOn(api, "capabilityApprovals").mockResolvedValue({ items: events(), ready: false, conversation_approval_available: false });
+    mount([run()]);
+    const record = await screen.findByRole("article", { name: "权限审批结果" });
+    expect(record.getAttribute("data-decision")).toBe("approved");
+    expect(record.querySelector("svg")).toBeTruthy();
+    expect(record.classList.contains("chat-message")).toBe(false);
+    expect(record.textContent).toContain("权限审批");
+  });
+
   it("reads every run independently, including terminal runs with no worker approval events", async () => {
     const read = vi.spyOn(api, "capabilityApprovals").mockImplementation(async (id) => ({
-      items: events(id, `approval-${id}`), ready: false,
+      items: events(id, `approval-${id}`), ready: false, conversation_approval_available: false,
     }));
     mount([run(), run("run-b")]);
     await waitFor(() => expect(screen.getAllByRole("article", { name: "权限审批结果" })).toHaveLength(2));
@@ -69,7 +89,7 @@ describe("durable per-run approval history", () => {
     item.events = events().map((event) => ({ ...event, participants: [], message: event.kind, sequence: event.sequence + 90 }));
     const later = events("run-a", "approval-b").map((event) => ({ ...event, sequence: event.sequence + 2,
       created_at: event.kind === "approval.resolved" ? "2026-10-24T00:02:00Z" : event.created_at }));
-    vi.spyOn(api, "capabilityApprovals").mockResolvedValue({ ready: false, items: [...later, ...events(), ...events()] });
+    vi.spyOn(api, "capabilityApprovals").mockResolvedValue({ ready: false, conversation_approval_available: false, items: [...later, ...events(), ...events()] });
     mount([item]);
     await waitFor(() => expect(screen.getAllByRole("article", { name: "权限审批结果" })).toHaveLength(2));
     const records = screen.getAllByRole("article", { name: "权限审批结果" });
@@ -81,7 +101,7 @@ describe("durable per-run approval history", () => {
     const item = run();
     item.events = events().map((event) => ({ ...event, participants: [], message: "SECRET_RAW_COMMAND",
       payload: { arguments: { command: "SECRET_RAW_COMMAND" } } }));
-    vi.spyOn(api, "capabilityApprovals").mockResolvedValueOnce({ ready: false, items: [] })
+    vi.spyOn(api, "capabilityApprovals").mockResolvedValueOnce({ ready: false, conversation_approval_available: false, items: [] })
       .mockRejectedValue(new Error("offline"));
     const { client } = mount([item]);
     const record = await screen.findByRole("article", { name: "权限审批结果" });
@@ -106,8 +126,8 @@ describe("durable per-run approval history", () => {
   });
 
   it("performs a final read when the same mounted run becomes terminal between polls", async () => {
-    const read = vi.spyOn(api, "capabilityApprovals").mockResolvedValueOnce({ ready: false, items: [] })
-      .mockResolvedValue({ ready: false, items: events() });
+    const read = vi.spyOn(api, "capabilityApprovals").mockResolvedValueOnce({ ready: false, conversation_approval_available: false, items: [] })
+      .mockResolvedValue({ ready: false, conversation_approval_available: false, items: events() });
     const item = { ...run(), status: "waiting_approval" };
     const { refresh } = mount([item]);
     await waitFor(() => expect(read).toHaveBeenCalledTimes(1));
@@ -121,19 +141,19 @@ describe("durable per-run approval history", () => {
     let settle!: (value: Awaited<ReturnType<typeof api.capabilityApprovals>>) => void;
     const read = vi.spyOn(api, "capabilityApprovals")
       .mockImplementationOnce(() => new Promise((resolve) => { settle = resolve; }))
-      .mockResolvedValue({ ready: false, items: events() });
+      .mockResolvedValue({ ready: false, conversation_approval_available: false, items: events() });
     const item = { ...run(), status: "waiting_approval" };
     const { refresh } = mount([item]);
     await waitFor(() => expect(read).toHaveBeenCalledTimes(1));
     item.status = "cancelled";
     refresh();
-    await act(async () => { settle({ ready: false, items: [] }); });
+    await act(async () => { settle({ ready: false, conversation_approval_available: false, items: [] }); });
     await screen.findByRole("article", { name: "权限审批结果" });
     expect(read).toHaveBeenCalledTimes(2);
   });
 
   it("polls a pending run but performs only a read for a terminal run", async () => {
-    const read = vi.spyOn(api, "capabilityApprovals").mockResolvedValue({ ready: false, items: events() });
+    const read = vi.spyOn(api, "capabilityApprovals").mockResolvedValue({ ready: false, conversation_approval_available: false, items: events() });
     const item = { ...run(), status: "waiting_approval" };
     const { view } = mount([item]);
     await screen.findByRole("article", { name: "权限审批结果" });
@@ -151,7 +171,7 @@ describe("durable per-run approval history", () => {
     const items = events();
     items[0].payload = { capability: "file", operation: "write" };
     const read = vi.spyOn(api, "capabilityApprovals").mockRejectedValueOnce(new Error("offline"))
-      .mockResolvedValue({ ready: false, items });
+      .mockResolvedValue({ ready: false, conversation_approval_available: false, items });
     mount([run()]);
     await user.click(await screen.findByRole("button", { name: "重试读取审批记录" }));
     const record = await screen.findByRole("article", { name: "权限审批结果" });
@@ -162,15 +182,15 @@ describe("durable per-run approval history", () => {
   });
 
   it("discards another run's response instead of showing its approval", async () => {
-    vi.spyOn(api, "capabilityApprovals").mockResolvedValue({ ready: false, items: events("foreign-run") });
+    vi.spyOn(api, "capabilityApprovals").mockResolvedValue({ ready: false, conversation_approval_available: false, items: events("foreign-run") });
     mount([run()]);
     await waitFor(() => expect(api.capabilityApprovals).toHaveBeenCalled());
     expect(screen.queryByRole("article", { name: "权限审批结果" })).toBeNull();
   });
 
   it("does not reuse the previous actor's cached result after identity changes", async () => {
-    const read = vi.spyOn(api, "capabilityApprovals").mockResolvedValueOnce({ ready: false, items: events() })
-      .mockResolvedValue({ ready: false, items: [] });
+    const read = vi.spyOn(api, "capabilityApprovals").mockResolvedValueOnce({ ready: false, conversation_approval_available: false, items: events() })
+      .mockResolvedValue({ ready: false, conversation_approval_available: false, items: [] });
     vi.spyOn(api, "login").mockResolvedValue({ ...actor, user_id: "actor-b" });
     const item = run();
     item.events = events().map((event) => ({ ...event, participants: [], message: event.kind }));
@@ -207,6 +227,20 @@ describe("durable per-run approval history", () => {
 });
 
 describe("capability approval API projection", () => {
+  it.each([true, false, undefined])("preserves explicit session support %s and defaults old responses to false", async (available) => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({ ready: true, items: [],
+      ...(available === undefined ? {} : { conversation_approval_available: available }),
+    }), { status: 200 })));
+    expect(await api.capabilityApprovals("run-a")).toMatchObject({ conversation_approval_available: available ?? false });
+  });
+
+  it("rejects a non-boolean session readiness hint", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({ ready: true, items: [],
+      conversation_approval_available: "true",
+    }), { status: 200 })));
+    await expect(api.capabilityApprovals("run-a")).rejects.toMatchObject({ code: "invalid_response" });
+  });
+
   it("uses the authenticated read API and strips raw payload extensions", async () => {
     const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ ready: false, items: events().map((event) => ({
       ...event, payload: { capability: "file", operation: "write", arguments: { command: "SECRET" } },

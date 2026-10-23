@@ -964,11 +964,13 @@ const CapabilityApprovalEventSchema = z.object({
   payload: z.object({
     capability: z.string().optional(),
     operation: z.string().optional(),
+    decision_scope: z.enum(["once", "conversation"]).optional(),
   }).default({}),
 });
 const CapabilityApprovalsSchema = z.object({
   items: z.array(CapabilityApprovalEventSchema),
   ready: z.boolean(),
+  conversation_approval_available: z.boolean().default(false),
 });
 export type CapabilityApprovalEvent = z.infer<typeof CapabilityApprovalEventSchema>;
 export type RunDeleteResult = z.infer<typeof RunDeleteSchema>;
@@ -2953,7 +2955,7 @@ export const api = {
   },
   approveCapability(
     id: string,
-    payload: { approval_id: string; version: number },
+    payload: { approval_id: string; version: number; scope?: "once" | "conversation" },
   ): Promise<SubmittedRun> {
     return request(
       `/api/v1/runs/${encodeURIComponent(id)}/approve-capability`,

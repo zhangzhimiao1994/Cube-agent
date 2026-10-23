@@ -5,7 +5,7 @@ import { api, formatApiError, type SubmittedRun } from "../api/client";
 import { useAuth } from "../auth/AuthProvider";
 
 type Approval = { runId: string; approvalId: string; version: number };
-type Decision = "approve" | "reject";
+type Decision = "approve" | "approve_session" | "reject";
 type DecisionState = {
   status: "pending" | "success" | "error";
   decision: Decision;
@@ -52,9 +52,10 @@ export function useCapabilityApprovalDecisions(
   const mutation = useMutation({
     mutationFn: ({ approval, decision, clickedScope }: { approval: Approval; decision: Decision; clickedScope: ActorScope }) => {
       if (currentScopeRef.current !== JSON.stringify(clickedScope)) throw new Error("审批身份已变化，请重新确认");
-      return api[decision === "approve" ? "approveCapability" : "rejectCapability"](approval.runId, {
+      return api[decision !== "reject" ? "approveCapability" : "rejectCapability"](approval.runId, {
         approval_id: approval.approvalId,
         version: approval.version,
+        ...(decision === "approve_session" ? { scope: "conversation" as const } : {}),
       });
     },
     onSuccess: (run, { approval, decision, clickedScope }) => {
@@ -67,7 +68,7 @@ export function useCapabilityApprovalDecisions(
     onError: (error, { approval, decision, clickedScope }) => {
       update(clickedScope, approval, {
         status: "error", decision,
-        error: `${decision === "approve" ? "允许" : "拒绝"}失败：${formatApiError(error, "沙箱权限确认失败")}。请重试。`,
+        error: `${decision !== "reject" ? "批准" : "拒绝"}失败：${formatApiError(error, "沙箱权限确认失败")}。请重试。`,
       });
     },
   });
@@ -89,6 +90,7 @@ export function useCapabilityApprovalDecisions(
   return {
     stateFor: (approval: Approval | null) => approval ? states[approvalKey(approval)] : undefined,
     approve: (approval: Approval) => decide(approval, "approve"),
+    approveConversation: (approval: Approval) => decide(approval, "approve_session"),
     reject: (approval: Approval) => decide(approval, "reject"),
   };
 }

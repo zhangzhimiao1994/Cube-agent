@@ -429,7 +429,7 @@ body:not(:has(.conversation-workspace)) :where(.status-pill, .status-chip, .leve
   font-weight: 500;
 }
 
-body:not(:has(.conversation-workspace)) :is([role="status"]:not(.code-block-editor [role="status"]), .channel-config-status) {
+body:not(:has(.conversation-workspace)) :is([role="status"]:not(.code-block-editor [role="status"]):not(.capability-approval-card), .channel-config-status) {
   background: var(--workspace-info-bg);
   border-color: #b9d8da;
   border-radius: 6px;
