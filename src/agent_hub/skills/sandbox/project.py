@@ -385,6 +385,10 @@ class _Execution:
     def unit(self) -> str:
         return f"agent-hub-project-{self.invocation.execution_id}.service"
 
+    @property
+    def termination_grace_seconds(self) -> float:
+        return _CLEANUP_SECONDS + 3
+
 
 async def _uninterrupted[T](awaitable: Awaitable[T]) -> T:
     task = asyncio.ensure_future(awaitable)
@@ -719,7 +723,7 @@ class ProjectExecutionBroker:
             return
         if job.task is not None and not job.finished.is_set():
             job.task.cancel()
-            async with asyncio.timeout(_CLEANUP_SECONDS + 3):
+            async with asyncio.timeout(job.termination_grace_seconds):
                 await job.finished.wait()
         if not job.quiet:
             raise ProcessCleanupIncomplete("project_termination_cleanup_incomplete")

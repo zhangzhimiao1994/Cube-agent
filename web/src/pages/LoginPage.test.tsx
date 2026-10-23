@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -102,7 +102,13 @@ describe("LoginPage", () => {
     await userEvent.type(screen.getByLabelText("Password"), "correct horse battery staple");
     await userEvent.click(screen.getByRole("button", { name: "进入工作台" }));
 
-    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    const composer = await screen.findByRole("form", { name: "发送消息" });
+    const message = within(composer).getByRole<HTMLTextAreaElement>("textbox");
+    await userEvent.type(message, "登录后的对话草稿");
+    expect(message.value).toBe("登录后的对话草稿");
+    const conversationLink = within(screen.getByRole("navigation", { name: "Main navigation" })).getByRole("link", { name: "对话", exact: true });
+    expect(conversationLink.getAttribute("href")).toBe("/");
+    expect(conversationLink.getAttribute("aria-current")).toBe("page");
   });
 
   it("shows invalid credentials without storing browser tokens", async () => {
@@ -133,7 +139,13 @@ describe("LoginPage", () => {
     await userEvent.type(screen.getByLabelText("Password"), "correct horse battery staple");
     await userEvent.click(screen.getByRole("button", { name: "创建管理员" }));
 
-    expect(await screen.findByRole("heading", { name: "对话" })).not.toBeNull();
+    const composer = await screen.findByRole("form", { name: "发送消息" });
+    const message = within(composer).getByRole<HTMLTextAreaElement>("textbox");
+    await userEvent.type(message, "初始化后的对话草稿");
+    expect(message.value).toBe("初始化后的对话草稿");
+    const conversationLink = within(screen.getByRole("navigation", { name: "Main navigation" })).getByRole("link", { name: "对话", exact: true });
+    expect(conversationLink.getAttribute("href")).toBe("/");
+    expect(conversationLink.getAttribute("aria-current")).toBe("page");
   });
 
   it("shows the setup failure reason returned by the API", async () => {

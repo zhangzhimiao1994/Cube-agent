@@ -307,6 +307,7 @@ class SelfRepairDecision:
     def pauses_run(self) -> bool:
         return (
             self.kind == "repair.classified"
+            and self.requires_approval
             and self.failure_category in _PAUSABLE_FAILURE_CATEGORIES
         )
 

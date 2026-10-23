@@ -50,6 +50,7 @@ if TYPE_CHECKING:
         PythonProjectProbeRequest,
         PythonProjectReleaseEnvironmentRequest,
     )
+    from agent_hub.skills.sandbox.toolchain_protocol import ToolchainRequest, ToolchainResponse
 
 BROKER_SOCKET_PATH = Path("/run/agent-hub/skill-broker.sock")
 _PROTOCOL_VERSION: Literal[1] = 1
@@ -133,6 +134,7 @@ class BrokerPolicy:
     runtime_root: Path = Path("/run/agent-hub")
     project_runtime_root: Path = Path("/run/agent-hub-project")
     python_project_runtime_root: Path = Path("/var/lib/agent-hub-python-project-stages")
+    toolchain_runtime_root: Path = Path("/var/lib/agent-hub-toolchain-stages")
     read_only_roots: tuple[Path, ...] = (
         Path("/var/lib/agent-hub/attachments"),
         Path("/var/lib/agent-hub/workspaces"),
@@ -336,7 +338,8 @@ class SkillBroker:
         self._execution_slots = asyncio.Semaphore(8)
         self._project_broker = ProjectExecutionBroker(
             replace(policy, runtime_root=policy.project_runtime_root), self._execution_slots,
-            retained_runtime_roots=(policy.runtime_root, policy.python_project_runtime_root),
+            retained_runtime_roots=(policy.runtime_root, policy.python_project_runtime_root,
+                                    policy.toolchain_runtime_root),
         )
 
     async def handle_project(
@@ -358,6 +361,11 @@ class SkillBroker:
         from agent_hub.skills.sandbox.python_input_supply_broker import handle_input_supply
 
         return await handle_input_supply(self._project_broker, request, peer_uid=peer_uid)
+
+    async def handle_toolchain(self, request: ToolchainRequest, *, peer_uid: int) -> ToolchainResponse:
+        from agent_hub.skills.sandbox.toolchain_broker import handle_toolchain_request
+
+        return await handle_toolchain_request(self._project_broker, request, peer_uid=peer_uid)
 
     async def handle(self, request: BrokerRequest, *, peer_uid: int) -> BrokerResponse:
         try:
@@ -576,18 +584,34 @@ async def _serve_client(
         PythonProjectProbeRequest,
         PythonProjectReleaseEnvironmentRequest,
     )
+    from agent_hub.skills.sandbox.toolchain_protocol import (
+        ToolchainResponse,
+        parse_toolchain_request,
+    )
 
     is_project = False
     is_supply = False
     is_profile = False
+    is_toolchain = False
+    toolchain_request: ToolchainRequest | None = None
     supply_request: PythonInputSupplyRequest | None = None
     python_request: PythonProjectBrokerRequest | PythonProjectProbeRequest | PythonProjectInspectEnvironmentRequest | PythonProjectReleaseEnvironmentRequest | None = None
-    response: BrokerResponse | PythonProjectBrokerResponse | PythonInputSupplyResponse | PythonProjectProfileResponse
+    response: BrokerResponse | PythonProjectBrokerResponse | PythonInputSupplyResponse | PythonProjectProfileResponse | ToolchainResponse
     try:
         peer_uid = _peer_uid(writer)
         payload = await _read_frame(reader, _MAX_REQUEST_BYTES)
         envelope = json.loads(payload)
         if isinstance(envelope, dict) and (
+            type(envelope.get('version')) is int and envelope['version'] == 7
+            or isinstance(envelope.get('action'), str) and envelope['action'] in {
+                'plan_project_toolchain', 'supply_project_toolchain',
+                'inspect_project_toolchain_supply', 'inspect_project_toolchain',
+            }
+        ):
+            is_project = is_toolchain = True
+            toolchain_request = parse_toolchain_request(payload)
+            response = await broker.handle_toolchain(toolchain_request, peer_uid=peer_uid)
+        elif isinstance(envelope, dict) and (
             type(envelope.get('version')) is int and envelope['version'] == 6
             or envelope.get('action') == 'inspect_python_project_profile'
         ):
@@ -641,6 +665,10 @@ async def _serve_client(
             await writer.wait_closed()
             raise
         response = (
+            ToolchainResponse(action=toolchain_request.action,
+                execution_id=toolchain_request.invocation.execution_id,
+                scope=toolchain_request.invocation.scope, ok=False, error='toolchain_unavailable')
+            if toolchain_request is not None else
             PythonInputSupplyResponse(action=supply_request.action,
                 execution_id=supply_request.invocation.execution_id, ok=False,
                 error="input_supply_unavailable")
@@ -651,13 +679,18 @@ async def _serve_client(
             if python_request is not None else BrokerResponse(ok=False, error="project execution cancelled")
         )
     except (BrokerRequestError, OSError, ValueError) as error:
-        if supply_request is not None:
+        if toolchain_request is not None:
+            response = ToolchainResponse(action=toolchain_request.action,
+                execution_id=toolchain_request.invocation.execution_id,
+                scope=toolchain_request.invocation.scope, ok=False, error='toolchain_unavailable')
+        elif supply_request is not None:
             response = PythonInputSupplyResponse(action=supply_request.action,
                 execution_id=supply_request.invocation.execution_id, ok=False,
                 error="input_supply_unavailable")
         else:
             response = BrokerResponse(ok=False,
-                error='python_project_profile_request_invalid' if is_profile else
+                error='toolchain_request_invalid' if is_toolchain else
+                    'python_project_profile_request_invalid' if is_profile else
                     "input_supply_request_invalid" if is_supply else str(error))
     try:
         await _write_frame(writer, response.model_dump_json().encode("utf-8"))

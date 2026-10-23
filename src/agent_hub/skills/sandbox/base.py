@@ -95,7 +95,15 @@ async def run_subprocess_with_limits(
     stdin_payload: bytes | None = None,
     process_started: Callable[[asyncio.subprocess.Process], None] | None = None,
     on_forced_terminate: Callable[[], Awaitable[None]] | None = None,
+    termination_grace_seconds: float = _TERMINATION_GRACE_SECONDS,
 ) -> SkillResult:
+    try:
+        valid_grace = (type(termination_grace_seconds) in {int, float}
+                       and math.isfinite(termination_grace_seconds) and termination_grace_seconds > 0)
+    except OverflowError:
+        valid_grace = False
+    if not valid_grace:
+        raise ValueError("invalid backend cleanup grace")
     process = await asyncio.create_subprocess_exec(
         *argv,
         stdin=asyncio.subprocess.PIPE,
@@ -112,7 +120,7 @@ async def run_subprocess_with_limits(
             if on_forced_terminate is not None:
                 try:
                     await asyncio.wait_for(
-                        on_forced_terminate(), timeout=_TERMINATION_GRACE_SECONDS,
+                        on_forced_terminate(), timeout=termination_grace_seconds,
                     )
                 except TimeoutError as error:
                     raise ProcessCleanupIncomplete(

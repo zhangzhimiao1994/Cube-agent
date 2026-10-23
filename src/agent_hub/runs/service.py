@@ -83,7 +83,7 @@ from agent_hub.runtime.failure_reason import (
 from agent_hub.runtime.instruction_context import InstructionContextLoader
 from agent_hub.runtime.progress import artifact_progress_key
 from agent_hub.runtime.registry import RuntimeRegistry
-from agent_hub.runtime.streams import closing_runtime_events
+from agent_hub.runtime.worker_execution import worker_runtime_events
 from agent_hub.subprocess_cleanup import ProcessCleanupIncomplete
 
 _LOGGER = logging.getLogger(__name__)
@@ -1971,7 +1971,9 @@ class RunService:
                 row.routing_decision = routing_decision
         if claimed_record is not None:
             if claimed_record.status is RunStatus.FAILED:
-                await self._safe_record_self_repair_decision_for_record(claimed_record)
+                repair_decision = await self._safe_record_self_repair_decision_for_record(
+                    claimed_record
+                )
                 refreshed = await self._submitted_by_run_id(
                     claimed_record.tenant_id,
                     claimed_record.id,
@@ -1981,6 +1983,14 @@ class RunService:
                 await self._safe_record_empty_response_closure_artifact_for_record(
                     claimed_record
                 )
+                if not _record_has_worker_execution(claimed_record):
+                    auto_repair = await self._safe_auto_accept_self_repair_if_allowed(
+                        tenant_id=claimed_record.tenant_id,
+                        run_id=claimed_record.id,
+                        decision=repair_decision,
+                    )
+                    if auto_repair is not None:
+                        return auto_repair
                 await self._safe_record_hermes_outcome_for_record(claimed_record)
                 await self._safe_notify_terminal_hooks_once_for_record(claimed_record)
                 if not _record_has_worker_execution(claimed_record):
@@ -2275,6 +2285,7 @@ class RunService:
                 runtime_events = _adaptive_runtime_events(
                     runtime,
                     context,
+                    worker_id=self._worker_id,
                     configured_tokens=self._runtime_token_budget,
                     routing_decision=runtime_routing_decision,
                     initial_progress_units=checkpoint_progress_units,
@@ -2653,7 +2664,9 @@ class RunService:
                 type(error).__name__,
             )
 
-    async def _safe_record_self_repair_decision_for_record(self, record: RunRecord) -> None:
+    async def _safe_record_self_repair_decision_for_record(
+        self, record: RunRecord
+    ) -> SelfRepairDecision | None:
         try:
             events = await self._repository.raw_events(record.tenant_id, record.id)
         except Exception as error:
@@ -2676,6 +2689,7 @@ class RunService:
                 run_id=record.id,
                 decision=repair_decision,
             )
+        return repair_decision
 
     async def _safe_record_hermes_outcome_for_record(self, record: RunRecord) -> None:
         if record.status not in {RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED}:
@@ -4357,6 +4371,18 @@ def _project_delivery_assessment(message: str) -> dict[str, object] | None:
         "software",
         "project",
     )
+    # Table titles and displayed commands are not software construction instructions.
+    if re.search(
+        r"(?:(?:直接|只|仅)(?:回复|输出|展示|返回)|(?:reply|respond|output) only)"
+        r"[^，。；！？,.;!?]*markdown\s*(?:表格|table)",
+        text,
+    ) and not re.search(
+        rf"(?:{'|'.join(re.escape(marker) for marker in action_markers)})"
+        r"[^，。；！？,.;!?]*"
+        rf"(?:{'|'.join(re.escape(marker) for marker in software_markers)})",
+        text,
+    ):
+        return None
     if not any(marker in text for marker in action_markers) or not any(
         marker in text for marker in software_markers
     ):
@@ -5477,6 +5503,7 @@ async def _adaptive_runtime_events(
     non_progress_artifact_ids: frozenset[str] = frozenset(),
     initial_artifact_progress_keys: Mapping[str, str | None] | None = None,
     meaningful_progress: bool = True,
+    worker_id: str | None = None,
 ) -> AsyncGenerator[RunEvent, None]:
     progress_units = max(0, initial_progress_units)
     seen_tool_calls: set[str] = set()
@@ -5484,7 +5511,7 @@ async def _adaptive_runtime_events(
     seen_artifacts: set[str] = set(artifact_keys)
     seen_progress_keys = {key for key in artifact_keys.values() if key is not None}
     metadata_artifact_ids = set(non_progress_artifact_ids)
-    async with closing_runtime_events(runtime.run(context)) as stream:
+    async with worker_runtime_events(runtime, context, worker_id=worker_id) as stream:
         async for event in stream:
             new_artifact_key = None
             if event.artifact is not None:

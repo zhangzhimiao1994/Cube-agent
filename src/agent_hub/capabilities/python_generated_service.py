@@ -328,6 +328,8 @@ class PythonGeneratedProjectService:
             invocation = python_original_invocation(base.model_copy(update={'install_allowed': True}), inputs)
             invocation = invocation.model_copy(update={'source_kind': 'candidate'})
             await self._after(context, actor, approval, source)
+            await self.owner._begin_verification(tenant_id=invocation.tenant_id, run_id=invocation.run_id,
+                actor=actor, execution_id=invocation.execution_id, source_sha256=source)
             response = await self.executor.run(invocation)
             _need(type(response) is PythonProjectBrokerResponse)
             response = PythonProjectBrokerResponse.model_validate(response.model_dump(), strict=True)

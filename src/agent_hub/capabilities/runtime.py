@@ -20,6 +20,7 @@ if TYPE_CHECKING:
     from agent_hub.capabilities.python_project_reports import PythonProjectFailure
     from agent_hub.harness.tool_gateway import HarnessToolGateway
     from agent_hub.runs.project_inputs import OriginalProjectPreparer
+    from agent_hub.runs.project_verification_receipts import ProjectVerificationReceiptRepository
 
 from agent_hub.capabilities.execution_diagnostics import ExecutionDiagnostic
 from agent_hub.capabilities.manifest import (
@@ -74,7 +75,9 @@ from agent_hub.project_preflight import (
     build_project_preflight_files,
     project_preflight_model_input_schema,
 )
-from agent_hub.runtime.contracts import JsonValue
+from agent_hub.runtime.artifacts import ArtifactRepository, ArtifactRepositoryError
+from agent_hub.runtime.continuation_artifacts import load_continuation
+from agent_hub.runtime.contracts import JsonValue, TaskContext
 from agent_hub.skills.package import InvalidSkillPackage, SkillPackageInspector
 from agent_hub.skills.sandbox.base import (
     SANDBOX_PROFILES,
@@ -233,11 +236,14 @@ class RuntimeCapabilityGateway:
         http_reader: HttpReader | None = None,
         tool_registry: CapabilityManifestProvider | None = None,
         project_executor: ProjectExecutor | None = None,
+        artifact_repository: ArtifactRepository | None = None,
+        receipt_repository: ProjectVerificationReceiptRepository | None = None,
     ) -> None:
         self._skill_store_dir = skill_store_dir
         self._workspace_root = workspace_root
         self._project_workspace_dir = project_workspace_dir
         self._run_repository = run_repository
+        self._artifact_repository = artifact_repository
         self._generated_file_store = (
             GeneratedFileStore(generated_artifact_dir) if generated_artifact_dir is not None else None
         )
@@ -265,7 +271,10 @@ class RuntimeCapabilityGateway:
         self._project_executor_configured = project_executor is not None or sys.platform == "linux"
         self._project_verification = (
             ProjectVerificationService(root=project_workspace_dir, repository=run_repository,
-                                       executor=project_executor)
+                                       executor=project_executor,
+                                       receipt_repository=receipt_repository,
+                                       artifact_repository=(artifact_repository
+                                           if receipt_repository is not None else None))
             if project_workspace_dir is not None else None
         )
         self._project_delivery_receipts: dict[tuple[UUID, UUID], tuple[str, str]] = {}
@@ -461,18 +470,9 @@ class RuntimeCapabilityGateway:
             self._generated_delivery_bindings.pop((tenant_id, run_id), None)
             try:
                 result = await self._project_verification.verify(
-                    tenant_id=tenant_id, run_id=run_id, actor=actor,
+                    tenant_id=tenant_id, run_id=run_id, actor=actor, action_key=idempotency_key,
                 )
-                receipt = cast(Mapping[str, JsonValue], result["verification"])
-                receipt_digest = hashlib.sha256(json.dumps(
-                    receipt, default=dict, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
-                ).encode("ascii")).hexdigest()
-                self._project_delivery_receipts[(tenant_id, run_id)] = (
-                    cast(str, receipt["source_sha256"]), receipt_digest,
-                )
-                generated_binding = result.get('generated_project_acceptance')
-                if isinstance(generated_binding, Mapping):
-                    self._generated_delivery_bindings[(tenant_id, run_id)] = generated_binding
+                self._cache_project_verification(tenant_id, run_id, result)
                 return result
             except PythonGeneratedRecipeApprovalRequired:
                 raise
@@ -493,6 +493,48 @@ class RuntimeCapabilityGateway:
             arguments=arguments,
             idempotency_key=idempotency_key,
         )
+
+    def _cache_project_verification(
+        self, tenant_id: UUID, run_id: UUID, result: Mapping[str, JsonValue],
+    ) -> None:
+        receipt = cast(Mapping[str, JsonValue], result["verification"])
+        receipt_digest = hashlib.sha256(json.dumps(
+            receipt, default=dict, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+        ).encode("ascii")).hexdigest()
+        self._project_delivery_receipts[(tenant_id, run_id)] = (
+            cast(str, receipt["source_sha256"]), receipt_digest,
+        )
+        generated_binding = result.get('generated_project_acceptance')
+        if isinstance(generated_binding, Mapping):
+            self._generated_delivery_bindings[(tenant_id, run_id)] = generated_binding
+        else:
+            self._generated_delivery_bindings.pop((tenant_id, run_id), None)
+
+    async def restore_project_verification(
+        self, *, tenant_id: UUID, run_id: UUID, actor: str, action_key: str,
+    ) -> Mapping[str, JsonValue]:
+        self._project_delivery_receipts.pop((tenant_id, run_id), None)
+        self._generated_delivery_bindings.pop((tenant_id, run_id), None)
+        if self._project_verification is None:
+            raise RuntimeCapabilityError("project verification scope is unavailable")
+        try:
+            result = await self._project_verification.restore(
+                tenant_id=tenant_id, run_id=run_id, actor=actor, action_key=action_key,
+            )
+            self._cache_project_verification(tenant_id, run_id, result)
+            return result
+        except ProjectVerificationError as error:
+            raise RuntimeCapabilityError(str(error), execution_diagnostic=error.diagnostic,
+                                         project_failure=error.project_failure,
+                                         python_project_failure=error.python_project_failure,
+                                         project_prerequisite=error.project_prerequisite) from None
+
+    async def action_preparation_snapshot(self, context: TaskContext) -> Mapping[str, JsonValue]:
+        from agent_hub.capabilities.action_preparation import capture_action_preparation
+
+        if self._project_verification is None:
+            raise RuntimeCapabilityError('project preparation scope is unavailable')
+        return await capture_action_preparation(self._project_verification, context)
 
     async def _python_build_profile(self, tenant_id: UUID, run_id: UUID) -> Mapping[str, JsonValue]:
         from agent_hub.skills.sandbox.project import ProjectInvocation
@@ -713,6 +755,12 @@ class RuntimeCapabilityGateway:
         store = self._require_generated_file_store()
         title = _required_string(arguments, "title")
         files = _project_files(arguments)
+        from agent_hub.capabilities.project_stack_admission import require_supported_project_paths
+
+        try:
+            require_supported_project_paths(tuple(files))
+        except ValueError as error:
+            raise RuntimeCapabilityError(str(error)) from None
         if self._project_executor_configured and {"package.json", "pyproject.toml"}.intersection(files):
             raise RuntimeCapabilityError(
                 "Node/Python project delivery requires workspace.write_text, project.verify and workspace.bundle"
@@ -756,10 +804,35 @@ class RuntimeCapabilityGateway:
         store = self._require_project_workspace_store()
         project_id, session_id = await self._project_workspace_scope(tenant_id, run_id)
         path = _required_string(arguments, "path")
-        content = _required_string(arguments, "content")
+        referenced = "content_reference" in arguments
+        if referenced:
+            # References transport reviewed file data only; they grant no write authority.
+            reference = arguments["content_reference"]
+            if set(arguments) != {"path", "content_reference"}:
+                raise RuntimeCapabilityError("workspace content sources must be exclusive with no extra arguments")
+            if self._artifact_repository is None or not isinstance(reference, Mapping):
+                raise RuntimeCapabilityError("workspace content reference is unavailable")
+            try:
+                loaded = await load_continuation(
+                    self._artifact_repository, tenant_id=tenant_id, run_id=run_id,
+                    reference=reference,
+                )
+            except ArtifactRepositoryError:
+                raise RuntimeCapabilityError("workspace content reference is invalid or unavailable") from None
+            if type(loaded) is not str or not loaded.strip():
+                raise RuntimeCapabilityError("workspace referenced content must be a nonempty string")
+            content = loaded
+            # Hydration may await remote storage; do not write using a stale workspace grant.
+            if await self._project_workspace_scope(tenant_id, run_id) != (project_id, session_id):
+                raise RuntimeCapabilityError("workspace scope changed during content resolution")
+        else:
+            content = _required_string(arguments, "content")
         contract = await self._original_project_contract(tenant_id, run_id)
         if contract is not None and path != 'DELIVERY_MANIFEST.json' and not contract.is_editable(path):
             raise RuntimeCapabilityError('original project checks are protected from modification')
+        task = asyncio.current_task()
+        if referenced and task is not None and task.cancelling():
+            raise asyncio.CancelledError
         try:
             metadata = store.write_bytes(
                 tenant_id=tenant_id,
@@ -837,6 +910,13 @@ class RuntimeCapabilityGateway:
         store = self._require_project_workspace_store()
         generated_store = self._require_generated_file_store()
         project_id, session_id = await self._project_workspace_scope(tenant_id, run_id)
+        from agent_hub.capabilities.project_stack_admission import require_supported_project_paths
+
+        files = store.list_files(tenant_id, project_id, session_id)
+        try:
+            require_supported_project_paths(tuple(item.path for item in files))
+        except ValueError as error:
+            raise RuntimeCapabilityError(str(error)) from None
         original_contract = await self._original_project_contract(tenant_id, run_id)
         if original_contract is not None and (
             not self._project_executor_configured or self._project_verification is None
@@ -846,18 +926,17 @@ class RuntimeCapabilityGateway:
         verified_source: str | None = None
         delivery_receipt = self._project_delivery_receipts.get((tenant_id, run_id))
         generated_binding = self._generated_delivery_bindings.get((tenant_id, run_id))
-        if self._project_executor_configured and self._project_verification is not None:
-            files = store.list_files(tenant_id, project_id, session_id)
-            if original_contract is not None or delivery_receipt is not None or any(
+        if (self._project_executor_configured and self._project_verification is not None
+            and (original_contract is not None or delivery_receipt is not None or any(
                 item.path in {"package.json", "pyproject.toml"} for item in files
-            ):
-                try:
-                    verified_source = await self._project_verification.require_current_receipt(tenant_id, run_id)
-                except ProjectVerificationError as error:
-                    if generated_binding is not None:
-                        self._project_delivery_receipts.pop((tenant_id, run_id), None)
-                        self._generated_delivery_bindings.pop((tenant_id, run_id), None)
-                    raise RuntimeCapabilityError(str(error)) from None
+            ))):
+            try:
+                verified_source = await self._project_verification.require_current_receipt(tenant_id, run_id)
+            except ProjectVerificationError as error:
+                if generated_binding is not None:
+                    self._project_delivery_receipts.pop((tenant_id, run_id), None)
+                    self._generated_delivery_bindings.pop((tenant_id, run_id), None)
+                raise RuntimeCapabilityError(str(error)) from None
         filename = _filename(arguments, title=title, extension=".zip")
         try:
             artifact_id = uuid4()
@@ -1302,7 +1381,9 @@ class RuntimeCapabilityGateway:
             "replay_safe": self.is_replay_safe(name),
             "aliases": _builtin_aliases(name),
         }
-        input_schema = _builtin_input_schema(name)
+        input_schema = _builtin_input_schema(
+            name, content_references=self._artifact_repository is not None,
+        )
         if input_schema is not None:
             item["input_schema"] = input_schema
         description = builtin_tool_description(name)
@@ -1608,14 +1689,16 @@ def _builtin_sandbox_profile(name: str) -> str:
     return "generated_artifact_store"
 
 
-def _builtin_input_schema(name: str) -> Mapping[str, JsonValue] | None:
+def _builtin_input_schema(
+    name: str, *, content_references: bool = False,
+) -> Mapping[str, JsonValue] | None:
     builtin_schema = builtin_tool_input_schema(name)
     if builtin_schema is not None:
         return builtin_schema
     if name == _PROJECT_PREFLIGHT_TOOL:
         return project_preflight_model_input_schema()
     if name == _WORKSPACE_WRITE_TOOL:
-        return {
+        schema: dict[str, JsonValue] = {
             "type": "object",
             "additionalProperties": False,
             "required": ("path", "content"),
@@ -1624,6 +1707,32 @@ def _builtin_input_schema(name: str) -> Mapping[str, JsonValue] | None:
                 "content": {"type": "string", "minLength": 1},
             },
         }
+        if content_references:
+            properties = cast(dict[str, JsonValue], schema["properties"])
+            properties["content_reference"] = {
+                "type": "object", "additionalProperties": False,
+                "required": ("version", "content_sha256", "total_bytes", "segments"),
+                "properties": {
+                    "version": {"type": "integer", "const": 1},
+                    "content_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                    "total_bytes": {"type": "integer", "minimum": 1, "maximum": 64 * 1024 * 1024},
+                    "segments": {
+                        "type": "array", "minItems": 1, "maxItems": 1024,
+                        "items": {
+                            "type": "object", "additionalProperties": False,
+                            "required": ("id", "sha256"),
+                            "properties": {
+                                "id": {"type": "string", "pattern":
+                                       "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"},
+                                "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                            },
+                        },
+                    },
+                },
+            }
+            schema["required"] = ("path",)
+            schema["oneOf"] = ({"required": ("content",)}, {"required": ("content_reference",)})
+        return schema
     if name == _WORKSPACE_LIST_TOOL:
         return {"type": "object", "additionalProperties": False, "properties": {}}
     if name == _WORKSPACE_BUNDLE_TOOL:

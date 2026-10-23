@@ -1,3 +1,11 @@
+/* The asset separates faint faces from contours; preserve the contour contrast. */
+:is(.auth-brand-logo, .brand-card img, .brand-lockup img) {
+  background: transparent;
+  box-shadow: none;
+  filter: none;
+  opacity: 1;
+}
+
 /* Management surfaces share the conversation palette without changing the conversation. */
 :root:not(:has(.conversation-workspace)) {
   color-scheme: light;

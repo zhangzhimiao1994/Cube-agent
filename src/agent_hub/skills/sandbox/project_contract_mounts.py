@@ -14,6 +14,7 @@ keep the context open until bwrap exits. No project code is loaded or executed.
 
 import hashlib
 import json
+import math
 import os
 import re
 import runpy
@@ -140,9 +141,11 @@ class _Directory:
 
 
 class _Tree:
-    def __init__(self, root: Path, stack: ExitStack, deadline: float, *, immutable: bool) -> None:
+    def __init__(self, root: Path, stack: ExitStack, deadline: float, *, immutable: bool,
+                 file_limit: int = _MAX_FILES, byte_limit: int = _MAX_BYTES) -> None:
         _need(root.is_absolute() and ".." not in root.parts and root.resolve(strict=True) == root)
         self.root, self.stack, self.deadline, self.immutable = root, stack, deadline, immutable
+        self.file_limit, self.byte_limit = file_limit, byte_limit
         self.native = sys.platform == "linux" and os.open in os.supports_dir_fd
         self.directories: dict[str, _Directory] = {}
         self.ancestors: list[_Directory] = []
@@ -198,7 +201,7 @@ class _Tree:
             for entry in entries:
                 self.check()
                 _parts(entry.name)
-                _need(len(names) < _MAX_FILES * 10)
+                _need(len(names) < self.file_limit * 10)
                 names.append(entry.name)
         _need(len({name.casefold() for name in names}) == len(names))
         return tuple(sorted(names))
@@ -206,7 +209,7 @@ class _Tree:
     def read(self, relative: str, before: os.stat_result) -> _File:
         self.check()
         _safe_info(before, directory=False, immutable=self.immutable)
-        _need(before.st_size <= _MAX_BYTES - self.bytes)
+        _need(before.st_size <= self.byte_limit - self.bytes)
         parent, _, name = relative.rpartition("/")
         flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
         flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_BINARY", 0)
@@ -249,7 +252,7 @@ class _Tree:
             for name in names:
                 self.check()
                 self.visited += 1
-                _need(self.visited <= _MAX_FILES * 10)
+                _need(self.visited <= self.file_limit * 10)
                 member = relative + "/" + name if relative else name
                 _parts(member)
                 before = self.info(member)
@@ -272,7 +275,7 @@ class _Tree:
                         output_bytes += before.st_size
                         _need(output_bytes <= output_limit)
                     else:
-                        _need(len(files) < _MAX_FILES)
+                        _need(len(files) < self.file_limit)
                         files[member] = self.read(member, before)
 
         walk("")
@@ -314,7 +317,17 @@ def _source_digest(files: dict[str, _File]) -> str:
 
 def _capture(stack: ExitStack, *, contract_payload: object, expected_contract_sha256: str,
              original_root: Path, work_root: Path, expected_source_sha256: str, ephemeral_dirs: Sequence[str],
-             ephemeral_budget_bytes: int, ephemeral_file_limit: int) -> tuple[ContractWork, _Tree]:
+             ephemeral_budget_bytes: int, ephemeral_file_limit: int,
+             source_file_limit: int = _MAX_FILES, source_byte_limit: int = _MAX_BYTES,
+             source_timeout_seconds: float = 10) -> tuple[ContractWork, _Tree]:
+    _need(type(source_file_limit) is int and 0 < source_file_limit <= 100000
+          and type(source_byte_limit) is int and 0 < source_byte_limit <= 500 * 1024**2)
+    try:
+        valid_time = (type(source_timeout_seconds) in {int, float}
+                      and math.isfinite(source_timeout_seconds) and 0 < source_timeout_seconds <= 3600)
+    except OverflowError:
+        valid_time = False
+    _need(valid_time)
     contract = _contract_loader()(contract_payload)
     _need(type(expected_contract_sha256) is str and contract.protected_sha256 == expected_contract_sha256)
     protected = contract.protected_files
@@ -328,13 +341,15 @@ def _capture(stack: ExitStack, *, contract_payload: object, expected_contract_sh
     _need(isinstance(original_root, Path) and isinstance(work_root, Path))
     _need(original_root != work_root and not original_root.is_relative_to(work_root)
           and not work_root.is_relative_to(original_root))
-    deadline = monotonic() + 10
-    original = _Tree(original_root, stack, deadline, immutable=True)
+    deadline = monotonic() + source_timeout_seconds
+    original = _Tree(original_root, stack, deadline, immutable=True,
+                     file_limit=source_file_limit, byte_limit=source_byte_limit)
     original_files = original.scan()
     _need(_source_digest(original_files) == contract.input_source_sha256)
     contract.require_current({path: item.sha256 for path, item in original_files.items()})
     _need(not any(path in original.directories or path in original_files for path in outputs))
-    work = _Tree(work_root, stack, deadline, immutable=False)
+    work = _Tree(work_root, stack, deadline, immutable=False,
+                 file_limit=source_file_limit, byte_limit=source_byte_limit)
     files = work.scan(outputs=frozenset(outputs), output_limit=ephemeral_budget_bytes,
                       output_files=ephemeral_file_limit)
     _need(all(path in work.directories for path in outputs))
@@ -356,7 +371,9 @@ def _capture(stack: ExitStack, *, contract_payload: object, expected_contract_sh
 def validate_contract_work(*, contract_payload: object, expected_contract_sha256: str, original_root: Path,
                            work_root: Path, expected_source_sha256: str,
                            ephemeral_dirs: Sequence[str] = (), ephemeral_budget_bytes: int = 0,
-                           ephemeral_file_limit: int = 10000) -> ContractWork:
+                           ephemeral_file_limit: int = 10000,
+                           source_file_limit: int = _MAX_FILES, source_byte_limit: int = _MAX_BYTES,
+                           source_timeout_seconds: float = 10) -> ContractWork:
     """Read-only preflight. Expected digest covers all candidate source, not outputs.
 
     Both original and candidate manifests use the shared pure ProjectCheckContract
@@ -369,7 +386,8 @@ def validate_contract_work(*, contract_payload: object, expected_contract_sha256
                 expected_contract_sha256=expected_contract_sha256, original_root=original_root,
                 work_root=work_root, expected_source_sha256=expected_source_sha256,
                 ephemeral_dirs=ephemeral_dirs, ephemeral_budget_bytes=ephemeral_budget_bytes,
-                ephemeral_file_limit=ephemeral_file_limit)
+                ephemeral_file_limit=ephemeral_file_limit, source_file_limit=source_file_limit,
+                source_byte_limit=source_byte_limit, source_timeout_seconds=source_timeout_seconds)
             return view
     except (OSError, ValueError, TypeError, RuntimeError, RecursionError, AttributeError):
         raise ContractMountError(_ERROR) from None
@@ -469,7 +487,9 @@ def _mount_arguments(view: ContractWork, descriptors: tuple[int, ...],
 def build_contract_mounts(argv: Sequence[str], *, contract_payload: object, expected_contract_sha256: str,
                          original_root: Path, work_root: Path, expected_source_sha256: str,
                          ephemeral_dirs: Sequence[str] = (), ephemeral_budget_bytes: int = 0,
-                         ephemeral_file_limit: int = 10000) -> Iterator[ContractMountPlan]:
+                         ephemeral_file_limit: int = 10000,
+                         source_file_limit: int = _MAX_FILES, source_byte_limit: int = _MAX_BYTES,
+                         source_timeout_seconds: float = 10) -> Iterator[ContractMountPlan]:
     """Seal all candidate files; expose only explicitly owned derived directories rw.
 
     The original broad workspace bind is replaced by a sealed tmpfs tree,
@@ -489,7 +509,8 @@ def build_contract_mounts(argv: Sequence[str], *, contract_payload: object, expe
                 expected_contract_sha256=expected_contract_sha256, original_root=original_root,
                 work_root=work_root, expected_source_sha256=expected_source_sha256,
                 ephemeral_dirs=ephemeral_dirs, ephemeral_budget_bytes=ephemeral_budget_bytes,
-                ephemeral_file_limit=ephemeral_file_limit)
+                ephemeral_file_limit=ephemeral_file_limit, source_file_limit=source_file_limit,
+                source_byte_limit=source_byte_limit, source_timeout_seconds=source_timeout_seconds)
             descriptors = tuple(_seal(file, stack) for file in view._files)
             output_sources: dict[str, str] = {}
             output_descriptors: list[int] = []

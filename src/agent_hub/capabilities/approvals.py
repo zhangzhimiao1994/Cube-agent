@@ -7,12 +7,15 @@ import re
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 from uuid import UUID, uuid4
 
 from agent_hub.capabilities.policy import normalize_resource
 from agent_hub.capabilities.types import CapabilityRequest
 from agent_hub.domain.runs import RunStatus
+
+if TYPE_CHECKING:
+    from agent_hub.runs.toolchain_supply import ToolchainSupplyAuthority
 
 
 class ApprovalMismatch(RuntimeError):
@@ -84,6 +87,9 @@ class RunStatusRepository(Protocol):
         approval_scope: str | None = None,
         actor_id: UUID | None = None,
         plugin_identity: PluginApprovalIdentity | None = None,
+        toolchain_authority: ToolchainSupplyAuthority | None = None,
+        go_recipe_authority: ToolchainSupplyAuthority | None = None,
+        expected_go_recipe: Mapping[str, object] | None = None,
     ) -> object: ...
 
     async def resolve_capability_approval(
@@ -167,10 +173,14 @@ class ApprovalService:
         self,
         request: CapabilityRequest,
         begin_wait: Callable[[ApprovalRecord], Awaitable[None]],
+        *,
+        publish_after_begin: bool = False,
     ) -> ApprovalRecord:
         async with self._lock:
-            record = await self._create_unlocked(request)
+            record = await self._create_unlocked(request, publish=not publish_after_begin)
             await begin_wait(record)
+            if publish_after_begin:
+                await self._store.put(record)
             return record
 
     async def approve(
@@ -317,7 +327,7 @@ class ApprovalService:
             raise ApprovalExpired("approval expired")
         return record
 
-    async def _create_unlocked(self, request: CapabilityRequest) -> ApprovalRecord:
+    async def _create_unlocked(self, request: CapabilityRequest, *, publish: bool = True) -> ApprovalRecord:
         fingerprint = _fingerprint_request(request)
         existing = await self._store.get_pending_by_fingerprint(fingerprint)
         if existing is not None:
@@ -336,7 +346,8 @@ class ApprovalService:
             expires_at=self._clock() + self._expires_in,
             request_scope=request_scope,
         )
-        await self._store.put(record)
+        if publish:
+            await self._store.put(record)
         return record
 
     async def _record(self, approval_id: str) -> ApprovalRecord:
@@ -378,7 +389,7 @@ def capability_approval_scope(request: CapabilityRequest) -> str | None:
     if (
         request.capability == "command" and request.operation == "run"
         and normalized_resource is not None
-        and re.fullmatch(r"workspace/current/(?:project-verification|project-inputs)/python/[a-f0-9]{64}",
+        and re.fullmatch(r"workspace/current/(?:project-verification/(?:python|go)|project-inputs/(?:python|toolchain))/[a-f0-9]{64}",
                          normalized_resource)
     ):
         return _run_capability_scope(request, normalized_resource)

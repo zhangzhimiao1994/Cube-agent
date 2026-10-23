@@ -11,7 +11,7 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import TypedDict, cast
+from typing import TYPE_CHECKING, TypedDict, cast
 from uuid import UUID, uuid4
 
 from sqlalchemy import Select, and_, delete, func, or_, select, update
@@ -31,6 +31,7 @@ from agent_hub.db.models import (
     RunRow,
     RunStepRow,
     RunUsageRow,
+    UserRow,
 )
 from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.runs.approval_checkpoint import checkpoint_waits_for_approval
@@ -42,6 +43,13 @@ from agent_hub.runtime.failure_reason import (
     is_public_project_prerequisite_text,
     runtime_failure_diagnostic_from_reason,
 )
+
+if TYPE_CHECKING:
+    from agent_hub.capabilities.go_project_inputs import GoProjectInputs
+    from agent_hub.capabilities.types import CapabilityRequest
+    from agent_hub.runs.go_project_admission import GoExecutionReservation
+    from agent_hub.runs.toolchain_supply import ToolchainSupplyAuthority
+    from agent_hub.skills.sandbox.go_project_protocol import GoProjectInvocation
 
 
 def _database_uuid(value: UUID) -> UUID:
@@ -58,6 +66,34 @@ def _optional_database_uuid(value: UUID | None) -> UUID | None:
 class _PythonApprovalOptions(TypedDict, total=False):
     python_binding: dict[str, object]
     python_input_binding: dict[str, object]
+    toolchain_input_binding: dict[str, object]
+    go_recipe_binding: dict[str, object]
+
+
+class _ToolchainReviewOptions(TypedDict, total=False):
+    approval_scope: str
+    toolchain_input_binding: dict[str, object]
+    go_recipe_binding: dict[str, object]
+
+
+def _is_go_recipe_scope(scope: object) -> bool:
+    from agent_hub.runs.go_project_admission import is_go_recipe_scope
+
+    return is_go_recipe_scope(scope)
+
+
+def _go_approval_binding(row: RunRow, scope: object) -> dict[str, object]:
+    from agent_hub.capabilities.approvals import capability_approval_scope
+    from agent_hub.runs.go_project_admission import EXECUTION_KEY, RECIPE_KEY, go_recipe_binding
+
+    try:
+        request = go_recipe_binding(row)
+        if (capability_approval_scope(request) != scope
+                or EXECUTION_KEY in (row.routing_decision or {})):
+            raise ValueError
+        return cast(dict[str, object], (row.routing_decision or {})[RECIPE_KEY])
+    except (ValueError, TypeError, RuntimeError, LookupError):
+        raise RunConflict('go_project_recipe_changed') from None
 
 
 def _has_generated_preparation(route: Mapping[str, object]) -> bool:
@@ -181,6 +217,40 @@ def _python_input_supply_approval_binding(run: RunRow, approval_scope: object) -
         return request.arguments
     except (ValueError, TypeError, RuntimeError, LookupError):
         return None
+
+
+def _is_toolchain_supply_scope(scope: object) -> bool:
+    return isinstance(scope, str) and ':resource=workspace/current/project-inputs/toolchain/' in scope
+
+
+def _toolchain_supply_approval_binding(
+    run: RunRow, approval_scope: object, *, planned: bool = False,
+) -> dict[str, object] | None:
+    if not _is_toolchain_supply_scope(approval_scope):
+        return None
+    try:
+        from agent_hub.capabilities.approvals import capability_approval_scope
+        from agent_hub.capabilities.toolchain_preparation import toolchain_supply_binding
+
+        request = toolchain_supply_binding(run, planned=planned)
+        return request.arguments if approval_scope == capability_approval_scope(request) else None
+    except (ValueError, TypeError, RuntimeError, LookupError):
+        return None
+
+
+def _toolchain_approval_matches(run: RunRow, approval: RunApprovalRow) -> bool:
+    """Exact SDK binding is rederived from DB state, never a receipt or Python grant."""
+    payload = approval.payload
+    expected = _toolchain_supply_approval_binding(run, payload.get('approval_scope'))
+    stored = payload.get('toolchain_input_binding')
+    if expected is None or type(stored) is not dict or {
+        'python_binding', 'python_input_binding', 'public_binding',
+    } & payload.keys():
+        return False
+    try:
+        return json.dumps(stored, sort_keys=True, allow_nan=False) == json.dumps(expected, sort_keys=True)
+    except (ValueError, TypeError, RecursionError):
+        return False
 
 
 def _generated_python_approval_binding(run: RunRow, scope: object, *, supply: bool) -> dict[str, object] | None:
@@ -740,6 +810,258 @@ class RunRepository:
         if row is None:
             raise RunNotFound("run was not found")
         return row
+
+    async def _locked_toolchain_supply(
+        self, session: AsyncSession, tenant_id: UUID, run_id: UUID,
+        authority: ToolchainSupplyAuthority,
+    ) -> RunRow:
+        from agent_hub.runs.toolchain_supply import ToolchainSupplyAuthority
+
+        if type(authority) is not ToolchainSupplyAuthority:
+            raise RunConflict('toolchain_scope_changed')
+        row = await session.scalar(self._run_select(tenant_id, run_id).with_for_update())
+        if row is None:
+            raise RunNotFound('run was not found')
+        try:
+            record = self._record(row)
+        except (ValueError, TypeError):
+            raise RunConflict('toolchain_scope_changed') from None
+        authority.require_current(record, tenant_id, run_id)
+        user = await session.scalar(select(UserRow).where(
+            UserRow.tenant_id == tenant_id, UserRow.id == authority.actor_id).with_for_update())
+        if (user is None or user.tenant_id != tenant_id or user.id != authority.actor_id
+                or user.disabled is not False or user.role != authority.actor_role.value):
+            raise RunConflict('toolchain_scope_changed')
+        authority.require_current(self._record(row), tenant_id, run_id)
+        return row
+
+    @staticmethod
+    async def _require_toolchain_supply_grant(session: AsyncSession, row: RunRow) -> None:
+        rows = (await session.scalars(select(RunApprovalRow).where(
+            RunApprovalRow.tenant_id == row.tenant_id,
+            RunApprovalRow.run_id == row.id,
+            RunApprovalRow.status == 'approved',
+        ).with_for_update())).all()
+        if not any(approval.tenant_id == row.tenant_id and approval.run_id == row.id
+                   and approval.status == 'approved' and _toolchain_approval_matches(row, approval)
+                   for approval in rows):
+            raise RunConflict('toolchain_supply_approval_required')
+
+    async def bind_go_project_recipe(
+        self, tenant_id: UUID, run_id: UUID, *, authority: ToolchainSupplyAuthority,
+        inputs: GoProjectInputs, expected: Mapping[str, object] | None = None,
+    ) -> RunRecord:
+        from agent_hub.capabilities.toolchain_preparation import toolchain_state_plan
+        from agent_hub.runs.go_project_admission import (
+            EXECUTION_KEY,
+            RECIPE_KEY,
+            encoded,
+            go_recipe_binding,
+            go_recipe_marker,
+        )
+
+        async with self._session_factory() as session, session.begin():
+            row = await self._locked_toolchain_supply(session, tenant_id, run_id, authority)
+            route = dict(row.routing_decision or {})
+            try:
+                if EXECUTION_KEY in route:
+                    raise ValueError
+                supply = cast(Mapping[str, object], route['toolchain_supply'])
+                marker = go_recipe_marker(inputs, supply_plan_sha256=cast(str, supply['plan_sha256']))
+                if inputs.declaration.sha256 != toolchain_state_plan(supply).declaration_sha256:
+                    raise ValueError
+                previous = route.get(RECIPE_KEY)
+                if RECIPE_KEY in route and encoded(previous) != encoded(marker):
+                    raise ValueError
+                if previous is None and expected is not None:
+                    raise ValueError
+                if previous is not None and expected is not None and encoded(expected) != encoded(previous):
+                    raise ValueError
+                row.routing_decision = {**route, RECIPE_KEY: marker}
+                go_recipe_binding(row)
+            except (ValueError, TypeError, RuntimeError, LookupError):
+                raise RunConflict('go_project_recipe_changed') from None
+            authority.require_current(self._record(row), tenant_id, run_id)
+            if previous is None:
+                row.version += 1
+            await session.flush()
+            return self._record(row)
+
+    @staticmethod
+    async def _require_go_recipe_grant(session: AsyncSession, row: RunRow) -> None:
+        from agent_hub.capabilities.approvals import capability_approval_scope
+        from agent_hub.runs.go_project_admission import (
+            APPROVAL_REQUIRED,
+            RECIPE_KEY,
+            encoded,
+            go_recipe_binding,
+        )
+
+        try:
+            request = go_recipe_binding(row)
+        except ValueError:
+            raise RunConflict('go_project_recipe_changed') from None
+        rows = (await session.scalars(select(RunApprovalRow).where(
+            RunApprovalRow.tenant_id == row.tenant_id, RunApprovalRow.run_id == row.id,
+            RunApprovalRow.status == 'approved').with_for_update())).all()
+        marker = (row.routing_decision or {})[RECIPE_KEY]
+        if not any(approval.tenant_id == row.tenant_id and approval.run_id == row.id
+                   and approval.status == 'approved' and approval.action in {'capability_tool', 'capability_tool.auto_review'}
+                   and approval.payload.get('approval_scope') == capability_approval_scope(request)
+                   and not {'public_binding', 'python_binding', 'python_input_binding', 'toolchain_input_binding'}
+                       & approval.payload.keys()
+                   and encoded(approval.payload.get('go_recipe_binding')) == encoded(marker)
+                   for approval in rows):
+            raise RunConflict(APPROVAL_REQUIRED)
+
+    async def require_go_project_recipe_approval(
+        self, tenant_id: UUID, run_id: UUID, *, authority: ToolchainSupplyAuthority,
+        request: CapabilityRequest,
+        expected_go_recipe: Mapping[str, object] | None = None,
+    ) -> CapabilityRequest:
+        from agent_hub.runs.go_project_admission import (
+            require_recipe_marker,
+            require_recipe_request,
+        )
+
+        async with self._session_factory() as session, session.begin():
+            row = await self._locked_toolchain_supply(session, tenant_id, run_id, authority)
+            try:
+                result = require_recipe_request(row, request)
+                require_recipe_marker(row, expected_go_recipe)
+            except ValueError:
+                raise RunConflict('go_project_recipe_changed') from None
+            await self._require_go_recipe_grant(session, row)
+            authority.require_current(self._record(row), tenant_id, run_id)
+            return result
+
+    async def reserve_go_project_execution(
+        self, tenant_id: UUID, run_id: UUID, *, authority: ToolchainSupplyAuthority,
+        invocation: GoProjectInvocation,
+    ) -> GoExecutionReservation:
+        from agent_hub.runs.go_project_admission import (
+            EXECUTION_KEY,
+            GoExecutionReservation,
+            encoded,
+            go_reservation_state,
+        )
+
+        async with self._session_factory() as session, session.begin():
+            row = await self._locked_toolchain_supply(session, tenant_id, run_id, authority)
+            try:
+                state = go_reservation_state(row, invocation)
+                route = dict(row.routing_decision or {})
+                previous = route.get(EXECUTION_KEY)
+                if EXECUTION_KEY in route and encoded(previous) != encoded(state):
+                    raise ValueError
+            except (ValueError, TypeError, RuntimeError, LookupError):
+                raise RunConflict('go_project_recipe_changed') from None
+            await self._require_go_recipe_grant(session, row)
+            authority.require_current(self._record(row), tenant_id, run_id)
+            if previous is None:
+                row.routing_decision = {**route, EXECUTION_KEY: state}
+                row.version += 1
+                await session.flush()
+            result = GoExecutionReservation(cast(Mapping[str, JsonValue], state),
+                                           'created' if previous is None else 'existing')
+        return result
+
+    async def require_go_project_execution(
+        self, tenant_id: UUID, run_id: UUID, *, authority: ToolchainSupplyAuthority,
+        inputs: GoProjectInputs, invocation: GoProjectInvocation,
+    ) -> None:
+        """Service-side locked SQL check only; never return a dispatch permit.
+
+        This is not Root's independent SQL adapter. No reservation or state writes.
+        """
+        from agent_hub.runs.go_project_admission import (
+            EXECUTION_KEY,
+            encoded,
+            go_recipe_marker,
+            go_reservation_state,
+            require_recipe_marker,
+        )
+
+        async with self._session_factory() as session, session.begin():
+            row = await self._locked_toolchain_supply(session, tenant_id, run_id, authority)
+            try:
+                route = row.routing_decision or {}
+                supply = cast(Mapping[str, object], route['toolchain_supply'])
+                marker = go_recipe_marker(inputs,
+                    supply_plan_sha256=cast(str, supply['plan_sha256']))
+                require_recipe_marker(row, marker)
+                state = go_reservation_state(row, invocation)
+                if encoded(route.get(EXECUTION_KEY)) != encoded(state):
+                    raise ValueError
+            except (ValueError, TypeError, RuntimeError, LookupError):
+                raise RunConflict('go_project_recipe_changed') from None
+            await self._require_go_recipe_grant(session, row)
+            authority.require_current(self._record(row), tenant_id, run_id)
+
+    async def _revalidate_go_manual_approval(
+        self, session: AsyncSession, row: RunRow, *, approval_id: str, fingerprint: str,
+        grant: bool,
+    ) -> dict[str, object]:
+        from agent_hub.runs.go_project_admission import encoded
+
+        route = row.routing_decision or {}
+        marker = _go_approval_binding(row, route.get('approval_scope'))
+        # Denial/expiry closes a pending request, never grants execution. User
+        # disablement or a role change must not strand that request forever.
+        if grant:
+            user = await session.scalar(select(UserRow).where(
+                UserRow.tenant_id == row.tenant_id, UserRow.id == row.actor_id).with_for_update())
+            if (user is None or user.tenant_id != row.tenant_id or user.id != row.actor_id
+                    or user.disabled is not False or user.role != row.actor_role):
+                raise RunConflict('go_project_recipe_changed')
+        approvals = (await session.scalars(select(RunApprovalRow).where(
+            RunApprovalRow.tenant_id == row.tenant_id, RunApprovalRow.run_id == row.id,
+            RunApprovalRow.approval_id == approval_id).with_for_update())).all()
+        if not any(approval.tenant_id == row.tenant_id and approval.run_id == row.id
+                   and approval.approval_id == approval_id and approval.status == 'pending'
+                   and approval.action == 'capability_tool'
+                   and approval.payload.get('approval_fingerprint') == fingerprint
+                   and approval.payload.get('approval_scope') == route.get('approval_scope')
+                   and encoded(approval.payload.get('go_recipe_binding')) == encoded(marker)
+                   and not {'public_binding', 'python_binding', 'python_input_binding', 'toolchain_input_binding'}
+                       & approval.payload.keys() for approval in approvals):
+            raise RunConflict('go_project_recipe_changed')
+        return marker
+
+    async def get_toolchain_supply_state(
+        self, tenant_id: UUID, run_id: UUID, *, authority: ToolchainSupplyAuthority,
+    ) -> Mapping[str, JsonValue] | None:
+        from agent_hub.runs.toolchain_supply import supply_state
+
+        async with self._session_factory() as session, session.begin():
+            row = await self._locked_toolchain_supply(session, tenant_id, run_id, authority)
+            state = supply_state(self._record(row))
+            if state is not None and state['phase'] in {'executing', 'supplied'}:
+                await self._require_toolchain_supply_grant(session, row)
+            authority.require_current(self._record(row), tenant_id, run_id)
+        return state
+
+    async def compare_and_set_toolchain_supply(
+        self, tenant_id: UUID, run_id: UUID, *, authority: ToolchainSupplyAuthority,
+        expected: Mapping[str, JsonValue] | None, replacement: Mapping[str, JsonValue],
+    ) -> RunRecord:
+        from agent_hub.runs.toolchain_supply import supply_transition
+        from agent_hub.runtime.contracts import _freeze_object
+
+        expected = None if expected is None else _freeze_object(expected, name='expected supply')
+        replacement = _freeze_object(replacement, name='replacement supply')
+        async with self._session_factory() as session, session.begin():
+            row = await self._locked_toolchain_supply(session, tenant_id, run_id, authority)
+            after = supply_transition(self._record(row), expected, replacement)
+            if after['phase'] in {'executing', 'supplied'}:
+                await self._require_toolchain_supply_grant(session, row)
+            authority.require_current(self._record(row), tenant_id, run_id)
+            row.routing_decision = {**(row.routing_decision or {}),
+                                    'toolchain_supply': json.loads(json.dumps(after, default=dict))}
+            row.version += 1
+            await session.flush()
+            result = self._record(row)
+        return result
 
     async def compare_and_set_generated_preparation(
         self, tenant_id: UUID, run_id: UUID, *, actor_id: UUID, actor_role: Role,
@@ -1535,9 +1857,25 @@ class RunRepository:
         approval_scope: str | None = None,
         actor_id: UUID | None = None,
         plugin_identity: PluginApprovalIdentity | None = None,
+        toolchain_authority: ToolchainSupplyAuthority | None = None,
+        go_recipe_authority: ToolchainSupplyAuthority | None = None,
+        expected_go_recipe: Mapping[str, object] | None = None,
     ) -> RunRecord:
         async with self._session_factory() as session, session.begin():
-            row = await session.scalar(self._run_select(tenant_id, run_id).with_for_update())
+            row: RunRow | None
+            toolchain_scope = _is_toolchain_supply_scope(approval_scope)
+            go_scope = _is_go_recipe_scope(approval_scope)
+            if go_scope or go_recipe_authority is not None:
+                if (not go_scope or go_recipe_authority is None or toolchain_authority is not None
+                        or plugin_identity is not None or actor_id is None):
+                    raise RunConflict('Go recipe authority is required')
+                row = await self._locked_toolchain_supply(session, tenant_id, run_id, go_recipe_authority)
+            elif toolchain_scope or toolchain_authority is not None:
+                if not toolchain_scope or toolchain_authority is None:
+                    raise RunConflict('toolchain authority is required')
+                row = await self._locked_toolchain_supply(session, tenant_id, run_id, toolchain_authority)
+            else:
+                row = await session.scalar(self._run_select(tenant_id, run_id).with_for_update())
             if row is None:
                 raise RunNotFound("run was not found")
             if (actor_id is not None and row.actor_id != actor_id) or (
@@ -1554,6 +1892,14 @@ class RunRepository:
             if RunStatus(row.status) is not RunStatus.RUNNING:
                 raise RunConflict("run is not running")
             approval_worker_token = row.worker_lease_token
+            toolchain_binding = None
+            if _is_toolchain_supply_scope(approval_scope):
+                toolchain_binding = _toolchain_supply_approval_binding(row, approval_scope, planned=True)
+                if (plugin_identity is not None or toolchain_binding is None
+                        or actor_id is None or row.worker_id is None or approval_worker_token is None
+                        or row.worker_lease_expires_at is None
+                        or row.worker_lease_expires_at <= datetime.now(UTC)):
+                    raise RunConflict('toolchain approval binding is invalid or stale')
             python_binding = (
                 _python_project_approval_binding(row, approval_scope)
                 if plugin_identity is None else None
@@ -1567,6 +1913,13 @@ class RunRepository:
             checkpoint_required = _has_generated_preparation(routing_decision) or (
                 approval_worker_token is not None and not original_capture)
             python_options: _PythonApprovalOptions = {}
+            if go_scope:
+                python_options['go_recipe_binding'] = _go_approval_binding(row, approval_scope)
+                from agent_hub.runs.go_project_admission import require_recipe_marker
+                try:
+                    require_recipe_marker(row, expected_go_recipe)
+                except ValueError:
+                    raise RunConflict('go_project_recipe_changed') from None
             if python_binding is not None:
                 python_options['python_binding'] = python_binding
             input_binding = (
@@ -1575,6 +1928,18 @@ class RunRepository:
             )
             if input_binding is not None:
                 python_options['python_input_binding'] = input_binding
+            if toolchain_binding is not None:
+                python_options['toolchain_input_binding'] = toolchain_binding
+            if toolchain_authority is not None:
+                toolchain_authority.require_current(self._record(row), tenant_id, run_id)
+            if go_recipe_authority is not None:
+                # The approval INSERT may wait on its row/unique constraint. Keep
+                # the run lease intact until that await and its second fence pass.
+                await self._upsert_capability_approval(
+                    session, tenant_id, run_id, approval_id=approval_id,
+                    approval_fingerprint=approval_fingerprint, approval_scope=approval_scope,
+                    status='pending', request_version=row.version + 1, **python_options)
+                go_recipe_authority.require_current(self._record(row), tenant_id, run_id)
             row.status = RunStatus.WAITING_APPROVAL.value
             self.clear_worker_lease(row)
             row.routing_decision = {
@@ -1589,23 +1954,24 @@ class RunRepository:
                 **({"approval_scope": approval_scope} if approval_scope else {}),
             }
             row.version += 1
-            await self._upsert_capability_approval(
-                session,
-                tenant_id,
-                run_id,
-                approval_id=approval_id,
-                approval_fingerprint=approval_fingerprint,
-                approval_scope=approval_scope,
-                status="pending",
-                request_version=row.version,
-                public_binding=(
-                    {"plugin_id": plugin_identity.plugin_id,
-                     "capability_id": plugin_identity.capability_id,
-                     "run_id": str(row.id), "version": row.version}
-                    if plugin_identity is not None else None
-                ),
-                **python_options,
-            )
+            if go_recipe_authority is None:
+                await self._upsert_capability_approval(
+                    session,
+                    tenant_id,
+                    run_id,
+                    approval_id=approval_id,
+                    approval_fingerprint=approval_fingerprint,
+                    approval_scope=approval_scope,
+                    status="pending",
+                    request_version=row.version,
+                    public_binding=(
+                        {"plugin_id": plugin_identity.plugin_id,
+                         "capability_id": plugin_identity.capability_id,
+                         "run_id": str(row.id), "version": row.version}
+                        if plugin_identity is not None else None
+                    ),
+                    **python_options,
+                )
             await session.flush()
             return self._record(row)
 
@@ -1641,6 +2007,11 @@ class RunRepository:
                 or routing_decision.get("approval_fingerprint") != approval_fingerprint
             ):
                 raise RunConflict("run is waiting for a different approval")
+            go_options: _PythonApprovalOptions = {}
+            if _is_go_recipe_scope(routing_decision.get('approval_scope')):
+                go_options['go_recipe_binding'] = await self._revalidate_go_manual_approval(
+                    session, row, approval_id=approval_id, fingerprint=approval_fingerprint,
+                    grant=status is RunStatus.RUNNING)
             if (
                 status is RunStatus.RUNNING
                 and (_has_generated_preparation(routing_decision)
@@ -1672,6 +2043,7 @@ class RunRepository:
                 approval_scope=_optional_string(routing_decision.get("approval_scope")),
                 status="approved" if status is RunStatus.RUNNING else "rejected",
                 resolution_version=row.version,
+                **go_options,
             )
             await session.flush()
             return self._record(row)
@@ -1686,13 +2058,48 @@ class RunRepository:
         reviewer: str,
         reason: str,
         status: str,
+        toolchain_authority: ToolchainSupplyAuthority | None = None,
+        approval_scope: str | None = None,
+        go_recipe_authority: ToolchainSupplyAuthority | None = None,
+        expected_go_recipe: Mapping[str, object] | None = None,
     ) -> RunRecord:
         if status not in {"approved", "denied"}:
             raise RunConflict("approval review status is invalid")
         async with self._session_factory() as session, session.begin():
-            row = await session.scalar(self._run_select(tenant_id, run_id).with_for_update())
+            row: RunRow | None
+            toolchain_binding = None
+            go_binding = None
+            if _is_go_recipe_scope(approval_scope) or go_recipe_authority is not None:
+                if (not _is_go_recipe_scope(approval_scope) or go_recipe_authority is None
+                        or toolchain_authority is not None):
+                    raise RunConflict('Go recipe authority is required')
+                row = await self._locked_toolchain_supply(session, tenant_id, run_id, go_recipe_authority)
+                go_binding = _go_approval_binding(row, approval_scope)
+                from agent_hub.runs.go_project_admission import require_recipe_marker
+                try:
+                    require_recipe_marker(row, expected_go_recipe)
+                except ValueError:
+                    raise RunConflict('go_project_recipe_changed') from None
+            elif _is_toolchain_supply_scope(approval_scope) or toolchain_authority is not None:
+                if not _is_toolchain_supply_scope(approval_scope) or toolchain_authority is None:
+                    raise RunConflict('toolchain authority is required')
+                row = await self._locked_toolchain_supply(session, tenant_id, run_id, toolchain_authority)
+                toolchain_binding = _toolchain_supply_approval_binding(row, approval_scope, planned=True)
+                if toolchain_binding is None:
+                    raise RunConflict('toolchain approval binding is invalid or stale')
+            else:
+                row = await session.scalar(self._run_select(tenant_id, run_id).with_for_update())
             if row is None:
                 raise RunNotFound("run was not found")
+            toolchain_options: _ToolchainReviewOptions = {}
+            if go_binding is not None:
+                assert isinstance(approval_scope, str)
+                toolchain_options['approval_scope'] = approval_scope
+                toolchain_options['go_recipe_binding'] = go_binding
+            if toolchain_binding is not None:
+                assert isinstance(approval_scope, str)
+                toolchain_options['approval_scope'] = approval_scope
+                toolchain_options['toolchain_input_binding'] = toolchain_binding
             await self._upsert_capability_approval_review(
                 session,
                 tenant_id,
@@ -1702,7 +2109,12 @@ class RunRepository:
                 reviewer=reviewer,
                 reason=reason,
                 status=status,
+                **toolchain_options,
             )
+            if toolchain_authority is not None:
+                toolchain_authority.require_current(self._record(row), tenant_id, run_id)
+            if go_recipe_authority is not None:
+                go_recipe_authority.require_current(self._record(row), tenant_id, run_id)
             await session.flush()
             return self._record(row)
 
@@ -1722,10 +2134,19 @@ class RunRepository:
                     )
                 )
             ).all()
-            return any(
-                row.payload.get("approval_fingerprint") == approval_fingerprint
-                for row in rows
-            )
+            for row in rows:
+                if row.payload.get('approval_fingerprint') != approval_fingerprint:
+                    continue
+                if _is_go_recipe_scope(row.payload.get('approval_scope')) or 'go_recipe_binding' in row.payload:
+                    continue
+                if (_is_toolchain_supply_scope(row.payload.get('approval_scope'))
+                        or 'toolchain_input_binding' in row.payload):
+                    run = await session.scalar(self._run_select(tenant_id, run_id))
+                    if run is not None and _toolchain_approval_matches(run, row):
+                        return True
+                else:
+                    return True
+            return False
 
     async def is_capability_approval_scope_approved(
         self,
@@ -1743,7 +2164,18 @@ class RunRepository:
                     )
                 )
             ).all()
-            return any(row.payload.get("approval_scope") == approval_scope for row in rows)
+            for row in rows:
+                if row.payload.get('approval_scope') != approval_scope:
+                    continue
+                if _is_go_recipe_scope(approval_scope) or 'go_recipe_binding' in row.payload:
+                    continue
+                if _is_toolchain_supply_scope(approval_scope) or 'toolchain_input_binding' in row.payload:
+                    run = await session.scalar(self._run_select(tenant_id, run_id))
+                    if run is not None and _toolchain_approval_matches(run, row):
+                        return True
+                else:
+                    return True
+            return False
 
     @staticmethod
     async def _capability_approval_id_has_status(
@@ -1836,6 +2268,10 @@ class RunRepository:
             approval_scope = _optional_string(routing_decision.get("approval_scope"))
             if row.version != version:
                 raise RunConflict("run version is stale")
+            go_options: _PythonApprovalOptions = {}
+            if _is_go_recipe_scope(approval_scope):
+                go_options['go_recipe_binding'] = await self._revalidate_go_manual_approval(
+                    session, row, approval_id=approval_id, fingerprint=approval_fingerprint, grant=True)
             await self._require_capability_approval_checkpoint(
                 session, row, routing_decision, approval_id=approval_id,
             )
@@ -1859,6 +2295,7 @@ class RunRepository:
                 approval_scope=approval_scope,
                 status="approved",
                 resolution_version=row.version,
+                **go_options,
             )
             await session.flush()
             session.add(
@@ -1910,6 +2347,10 @@ class RunRepository:
             approval_scope = _optional_string(routing_decision.get("approval_scope"))
             if row.version != version:
                 raise RunConflict("run version is stale")
+            go_options: _PythonApprovalOptions = {}
+            if _is_go_recipe_scope(approval_scope):
+                go_options['go_recipe_binding'] = await self._revalidate_go_manual_approval(
+                    session, row, approval_id=approval_id, fingerprint=approval_fingerprint, grant=False)
             row.routing_decision = {
                 key: value
                 for key, value in routing_decision.items()
@@ -1931,6 +2372,7 @@ class RunRepository:
                 approval_scope=approval_scope,
                 status="rejected",
                 resolution_version=row.version,
+                **go_options,
             )
             await session.flush()
             return self._record(row)
@@ -2545,6 +2987,8 @@ class RunRepository:
         public_binding: dict[str, object] | None = None,
         python_binding: dict[str, object] | None = None,
         python_input_binding: dict[str, object] | None = None,
+        toolchain_input_binding: dict[str, object] | None = None,
+        go_recipe_binding: dict[str, object] | None = None,
         request_version: int | None = None,
         resolution_version: int | None = None,
     ) -> None:
@@ -2557,6 +3001,8 @@ class RunRepository:
             **({"public_binding": public_binding} if public_binding is not None else {}),
             **({'python_binding': python_binding} if python_binding is not None else {}),
             **({'python_input_binding': python_input_binding} if python_input_binding is not None else {}),
+            **({'toolchain_input_binding': toolchain_input_binding} if toolchain_input_binding is not None else {}),
+            **({'go_recipe_binding': go_recipe_binding} if go_recipe_binding is not None else {}),
         }
         if request_version is not None:
             payload["public_request"] = {
@@ -2590,6 +3036,10 @@ class RunRepository:
                     RunApprovalRow.approval_id == approval_id,
                     RunApprovalRow.status == "pending",
                     RunApprovalRow.payload["approval_fingerprint"].astext == approval_fingerprint,
+                    # Generic resolutions cannot approve a Go row whose route scope was stripped.
+                    (RunApprovalRow.payload['go_recipe_binding'] == go_recipe_binding
+                     if go_recipe_binding is not None
+                     else ~RunApprovalRow.payload.has_key('go_recipe_binding')),
                 ).values(action="capability_tool", status=status,
                          payload=RunApprovalRow.payload.op("||")(resolution))
                 .returning(RunApprovalRow.id)
@@ -2608,6 +3058,9 @@ class RunRepository:
         reviewer: str,
         reason: str,
         status: str,
+        approval_scope: str | None = None,
+        toolchain_input_binding: dict[str, object] | None = None,
+        go_recipe_binding: dict[str, object] | None = None,
     ) -> None:
         payload: dict[str, object] = {
             "approval_id": approval_id,
@@ -2616,6 +3069,10 @@ class RunRepository:
             "reviewer": reviewer,
             "reason": reason,
             "status": status,
+            **({'approval_scope': approval_scope, 'toolchain_input_binding': toolchain_input_binding}
+               if toolchain_input_binding is not None else {}),
+            **({'approval_scope': approval_scope, 'go_recipe_binding': go_recipe_binding}
+               if go_recipe_binding is not None else {}),
         }
         result = await session.execute(
             insert(RunApprovalRow)
@@ -2834,7 +3291,27 @@ def _public_plugin_approval_events(
             raise RunConflict("pending capability approval evidence is stale")
         public_binding = dict(binding)
         python_binding = None
-        if 'public_binding' not in approval.payload and 'python_input_binding' in approval.payload:
+        if 'public_binding' not in approval.payload and 'go_recipe_binding' in approval.payload:
+            from agent_hub.capabilities.approvals import capability_approval_scope
+            from agent_hub.runs.go_project_admission import RECIPE_KEY, encoded, go_recipe_binding
+
+            try:
+                request = go_recipe_binding(run)
+                if (approval.payload.get('approval_scope') == capability_approval_scope(request)
+                        and encoded(approval.payload['go_recipe_binding']) == encoded(routing[RECIPE_KEY])):
+                    public_binding.update({'capability': 'command', 'operation': 'run',
+                        'resource': request.resource, 'approval_scope': approval.payload['approval_scope']})
+            except (ValueError, TypeError, RuntimeError, LookupError):
+                pass
+        elif 'public_binding' not in approval.payload and 'toolchain_input_binding' in approval.payload:
+            if _toolchain_approval_matches(run, approval):
+                public_binding.update({
+                    'capability': 'command', 'operation': 'run',
+                    'resource': 'workspace/current/project-inputs/toolchain/'
+                    + cast(str, cast(dict[str, object], approval.payload['toolchain_input_binding'])['plan_sha256']),
+                    'approval_scope': approval.payload['approval_scope'],
+                })
+        elif 'public_binding' not in approval.payload and 'python_input_binding' in approval.payload:
             expected_supply = _python_input_supply_approval_binding(run, approval.payload.get('approval_scope'))
             stored_supply = approval.payload['python_input_binding']
             if expected_supply is not None and type(stored_supply) is dict and stored_supply == expected_supply:

@@ -1,5 +1,6 @@
 import { existsSync, readFileSync } from "node:fs";
 import { afterEach, describe, expect, it } from "vitest";
+import { APP_BRAND_LOGO_SRC } from "./app/brand";
 
 const legacy = readFileSync("src/styles.css", "utf8");
 const conversation = readFileSync("src/conversation-workspace.css", "utf8");
@@ -16,7 +17,18 @@ function addStyle(css: string) {
 function addTheme() {
   // jsdom cannot match nested :has() inside :not() on ancestor selectors.
   // Test the active management cascade separately from the scope contract below.
-  return addStyle(document.querySelector(".conversation-workspace") ? "" : theme
+  if (document.querySelector(".conversation-workspace")) {
+    const style = addStyle(theme);
+    const sheet = style.sheet!;
+    for (let index = sheet.cssRules.length - 1; index >= 0; index--) {
+      const rule = sheet.cssRules[index];
+      if (rule.type !== CSSRule.STYLE_RULE || /^(body|:root):not\(:has\(\.conversation-workspace\)\)/.test((rule as CSSStyleRule).selectorText)) {
+        sheet.deleteRule(index);
+      }
+    }
+    return style;
+  }
+  return addStyle(theme
     .replaceAll("body:not(:has(.conversation-workspace))", "body")
     .replaceAll(":root:not(:has(.conversation-workspace))", ":root"));
 }
@@ -36,6 +48,44 @@ afterEach(() => {
 });
 
 describe("shared workspace theme", () => {
+  it.each([
+    ["login", '<main class="auth-hero"><img class="auth-brand-logo" src="/brand/mofang-agent-light.png"><h1>Login</h1></main>', ".auth-brand-logo", "h1"],
+    ["setup", '<main class="auth-hero"><img class="auth-brand-logo" src="/brand/mofang-agent-light.png"><h1>Setup</h1></main>', ".auth-brand-logo", "h1"],
+    ["management sidebar", '<aside class="sidebar"><div class="brand-card compact-brand-card"><img src="/brand/mofang-agent-light.png"><span class="eyebrow">Mofang Agent</span></div></aside>', ".brand-card img", ".eyebrow"],
+    ["management mobile header", '<aside class="sidebar"><span class="brand-lockup"><img src="/brand/mofang-agent-light.png"><strong>Mofang Agent</strong></span></aside>', ".brand-lockup img", "strong"],
+    ["conversation sidebar", '<div class="is-conversation-workspace"><aside class="sidebar"><div class="brand-card compact-brand-card"><img src="/brand/mofang-agent-light.png"><span class="eyebrow">Mofang Agent</span></div></aside><section class="conversation-workspace"></section></div>', ".brand-card img", ".eyebrow"],
+    ["conversation mobile header", '<div class="is-conversation-workspace"><aside class="sidebar"><span class="brand-lockup"><img src="/brand/mofang-agent-light.png"><strong>Mofang Agent</strong></span></aside><section class="conversation-workspace"></section></div>', ".brand-lockup img", "strong"],
+  ])("softens only the logo image in %s without changing its size or text", (_name, markup, logoSelector, textSelector) => {
+    mount(markup.replaceAll("/brand/mofang-agent-light.png", APP_BRAND_LOGO_SRC), false);
+    const dimensions = () => {
+      const logo = styles(logoSelector);
+      return [logo.width, logo.height, logo.aspectRatio, logo.objectFit];
+    };
+    const textAppearance = () => {
+      const text = styles(textSelector);
+      const ancestors = [];
+      for (let node = document.querySelector(logoSelector)!.parentElement; node; node = node.parentElement) {
+        const style = getComputedStyle(node);
+        ancestors.push([style.opacity, style.filter]);
+      }
+      return [text.opacity, text.filter, ...ancestors];
+    };
+    const beforeText = textAppearance();
+    addTheme();
+    // Verify the real import order: conversation overrides load after the shared theme.
+    addStyle(conversation);
+    const logo = styles(logoSelector);
+    expect(logo.filter).toBe("none");
+    expect(logo.opacity).toBe("1");
+    expect(logo.backgroundColor).toBe("rgba(0, 0, 0, 0)");
+    expect(logo.backgroundImage || "none").toBe("none");
+    expect(logo.boxShadow).toBe("none");
+    const size = logoSelector === ".brand-card img" ? "32px" : logoSelector === ".brand-lockup img" ? "2rem" : "4.5rem";
+    expect(dimensions()).toEqual([size, size, "1", "contain"]);
+    expect(textAppearance()).toEqual(beforeText);
+    expect(document.querySelector(logoSelector)!.getAttribute("src")).toBe(APP_BRAND_LOGO_SRC);
+  });
+
   it("avoids repeating the brand and account header above a management page", () => {
     mount('<div class="app-shell"><header class="topbar"><h2>Brand</h2><div class="user-chip">Account</div></header><main class="page-surface"><h2>Settings</h2></main></div>');
     expect(styles('.topbar').display).toBe('none');
@@ -185,6 +235,7 @@ describe("shared workspace theme", () => {
       for (const rule of Array.from(rules)) {
         if (rule.type === CSSRule.STYLE_RULE) {
           const selector = (rule as CSSStyleRule).selectorText;
+          if (selector === ":is(.auth-brand-logo, .brand-card img, .brand-lockup img)") continue;
           expect(selector).toMatch(/^(body|:root):not\(:has\(\.conversation-workspace\)\)/);
           expect(selector).not.toMatch(/(^|[ >,])\*/);
         } else if (rule.type === CSSRule.MEDIA_RULE) checkScope((rule as CSSMediaRule).cssRules);

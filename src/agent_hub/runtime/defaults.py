@@ -64,6 +64,7 @@ from agent_hub.runtime.contracts import (
 from agent_hub.runtime.crew.adapter import CrewDispatchRuntime
 from agent_hub.runtime.crew.plan import AgentSpec, DispatchPlan, DispatchStep
 from agent_hub.runtime.direct import DirectRuntime
+from agent_hub.runtime.engineering_admission import _required as engineering_scope
 from agent_hub.runtime.engineering_admission import with_engineering_admission
 from agent_hub.runtime.hermes_context import runtime_memory_context_text
 from agent_hub.runtime.hybrid import HybridRuntime
@@ -845,6 +846,9 @@ class ConfigBackedDirectRuntime:
         transport: ModelTransport | None = None,
         capability_gateway: RuntimeCapabilityGatewayProtocol | None = None,
         harness_tool_gateway: HarnessToolInvoker | None = None,
+        artifact_repository: ArtifactRepository | None = None,
+        action_capability_gateway: RuntimeCapabilityGatewayProtocol | None = None,
+        action_harness_tool_gateway: HarnessToolInvoker | None = None,
     ) -> None:
         self._config_service = config_service
         self._harness_tool_gateway = harness_tool_gateway
@@ -852,17 +856,26 @@ class ConfigBackedDirectRuntime:
         self._capacity_factory = capacity_factory
         self._transport = transport or LiteLLMClient()
         self._capability_gateway = capability_gateway
+        self._artifact_repository = artifact_repository
+        self._action_capability_gateway = action_capability_gateway
+        self._action_harness_tool_gateway = action_harness_tool_gateway
         self._pending_checkpoints: dict[UUID, RuntimeCheckpoint] = {}
         self._active: dict[tuple[UUID, UUID], ExecutionRuntime] = {}
 
     async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
+        from agent_hub.runtime.action_direct import ActionApprovedDirectRuntime
+
         try:
             runtime = await self._runtime_for(context)
         except HarnessModelSelectionError:
             runtime = UnavailableRuntime(TaskMode.DIRECT, reason="harness_model_unavailable")
-        if not isinstance(runtime, UnavailableRuntime):
+        if not isinstance(runtime, (UnavailableRuntime, ActionApprovedDirectRuntime)):
             runtime = with_engineering_admission(runtime, self._harness_tool_gateway, context)
         checkpoint = self._pending_checkpoints.pop(context.run_id, None)
+        if isinstance(runtime, ActionApprovedDirectRuntime):
+            checkpoint = checkpoint or context.checkpoint
+            if checkpoint is not None and context.checkpoint is None:
+                context = context.model_copy(update={'checkpoint': checkpoint})
         if checkpoint is not None:
             await runtime.restore_checkpoint(checkpoint)
         execution_token = context.execution_token or uuid4()
@@ -893,6 +906,22 @@ class ConfigBackedDirectRuntime:
         await _cancel_owned_active_run(self._active, run_id, execution_token)
 
     async def _runtime_for(self, context: TaskContext) -> ExecutionRuntime:
+        pending = self._pending_checkpoints.get(context.run_id)
+        checkpoint = context.checkpoint or pending
+        action_checkpoint = any(saved is not None and saved.runtime_type == 'direct_action'
+                                and saved.runtime_version == '2'
+                                for saved in (context.checkpoint, pending))
+        action_ready = (self._artifact_repository is not None
+                        and self._action_capability_gateway is not None
+                        and self._action_harness_tool_gateway is not None)
+        if action_checkpoint and not action_ready:
+            return UnavailableRuntime(TaskMode.DIRECT, reason='action_runtime_not_configured')
+        new_workspace = (checkpoint is None and context.mode is TaskMode.DIRECT
+                         and context.routing_decision.get('project_delivery') == 'workspace'
+                         and context.routing_decision.get('artifact_strategy') == 'workspace_bundle'
+                         and engineering_scope(context)
+                         and context.routing_decision.get('execution_backend', 'systemd') == 'systemd'
+                         and context.routing_decision.get('permission_mode', 'default') in ('default', 'auto_review'))
         current = await self._config_service.get_current(context.tenant_id)
         if current is None:
             return UnavailableRuntime(TaskMode.DIRECT)
@@ -911,17 +940,29 @@ class ConfigBackedDirectRuntime:
             )
         except HarnessModelSelectionError:
             return UnavailableRuntime(TaskMode.DIRECT, reason="harness_model_unavailable")
+        available_model_attempts = _direct_available_model_attempts(
+            config, logical_model, fallback_policy=fallback_policy,
+            routing_decision=context.routing_decision,
+        )
+        if action_ready and (action_checkpoint or new_workspace):
+            from agent_hub.runtime.action_direct import ActionApprovedDirectRuntime
+
+            assert self._artifact_repository is not None
+            assert self._action_capability_gateway is not None
+            assert self._action_harness_tool_gateway is not None
+            return ActionApprovedDirectRuntime(
+                gateway, logical_model=logical_model,
+                artifact_repository=self._artifact_repository,
+                capability_gateway=self._action_capability_gateway,
+                harness_tool_gateway=self._action_harness_tool_gateway,
+                available_model_attempts=available_model_attempts,
+            )
         return DirectRuntime(
             gateway,
             logical_model=logical_model,
             capability_gateway=self._capability_gateway,
             harness_tool_gateway=self._harness_tool_gateway,
-            available_model_attempts=_direct_available_model_attempts(
-                config,
-                logical_model,
-                fallback_policy=fallback_policy,
-                routing_decision=context.routing_decision,
-            ),
+            available_model_attempts=available_model_attempts,
         )
 
 
@@ -5009,6 +5050,8 @@ def configured_runtime_registry(
     harness_tool_gateway: HarnessToolInvoker | None = None,
     artifact_repository: ArtifactRepository | None = None,
     provider_continuation_repository: ProviderContinuationRepository | None = None,
+    action_capability_gateway: RuntimeCapabilityGatewayProtocol | None = None,
+    action_harness_tool_gateway: HarnessToolInvoker | None = None,
 ) -> RuntimeRegistry:
     async def capacity_factory(
         tenant_id: UUID,
@@ -5032,6 +5075,9 @@ def configured_runtime_registry(
                 transport=transport,
                 capability_gateway=capability_gateway,
                 harness_tool_gateway=harness_tool_gateway,
+                artifact_repository=artifact_repository,
+                action_capability_gateway=action_capability_gateway,
+                action_harness_tool_gateway=action_harness_tool_gateway,
             ),
             ConfigBackedDispatchRuntime(
                 config_service=config_service,

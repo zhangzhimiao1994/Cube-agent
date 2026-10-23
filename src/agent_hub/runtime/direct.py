@@ -2532,9 +2532,7 @@ class DirectRuntime:
                 yield RunEvent(kind=EventKind.TOOL_STARTED, sequence=1, run_id=context.run_id,
                     actor='main_agent', tool_name='project.inspect', tool_call_id=inspection_request.call_id)
                 inspection = await self._inspect_generated_workspace(context, inspection_request, deadline=retry_deadline)
-                inspection_artifact = Artifact(id=uuid4(), type='tool_result', producer='main_agent', content={
-                    'agent_id': 'main_agent', 'tool_name': 'project.inspect', 'call_id': inspection_request.call_id,
-                    'arguments_sha256': hashlib.sha256(b'{}').hexdigest(), 'result': inspection})
+                inspection_artifact = self._inspection_artifact(inspection_request, inspection)
                 yield RunEvent(kind=EventKind.TOOL_COMPLETED, sequence=2, run_id=context.run_id,
                     actor='main_agent', tool_name='project.inspect', tool_call_id=inspection_request.call_id,
                     payload={'artifact_id': str(inspection_artifact.id), 'status': 'succeeded'})
@@ -3159,19 +3157,29 @@ class DirectRuntime:
                 if not gateway_task.done():
                     gateway_task.cancel()
                 await self._consume_task_terminal(gateway_task)
-            if self._active_token is token:
-                active_stream = self._active_stream
-                self._active_token = None
-                self._active_stream = None
-                self._active_done = None
-                self._active_task = None
-                self._active_capability_task = None
-                self._model_scope_tracker = None
-                self._generated_model_events = None
-                self._generated_model_run_id = None
-                if active_stream is not None:
-                    active_stream._mark_closed()
-            done.set()
+            self._release_run(token, done)
+
+    def _inspection_artifact(
+        self, request: HarnessToolCallRequest, inspection: Mapping[str, JsonValue],
+    ) -> Artifact:
+        return Artifact(id=uuid4(), type='tool_result', producer='main_agent', content={
+            'agent_id': 'main_agent', 'tool_name': 'project.inspect', 'call_id': request.call_id,
+            'arguments_sha256': hashlib.sha256(b'{}').hexdigest(), 'result': inspection})
+
+    def _release_run(self, token: object, done: asyncio.Event) -> None:
+        if self._active_token is token:
+            active_stream = self._active_stream
+            self._active_token = None
+            self._active_stream = None
+            self._active_done = None
+            self._active_task = None
+            self._active_capability_task = None
+            self._model_scope_tracker = None
+            self._generated_model_events = None
+            self._generated_model_run_id = None
+            if active_stream is not None:
+                active_stream._mark_closed()
+        done.set()
 
     def _build_request(self, context: TaskContext) -> _RequestOutcome:
         prompt = self._build_prompt(context)
