@@ -52,7 +52,7 @@ def test_guidance_is_shared_bounded_and_does_not_serialize_private_context(mode:
     assert str(ctx.tenant_id) not in text and str(ctx.actor_id) not in text
 
 
-@pytest.mark.parametrize("value", (None, False, True, 0, 1.0, "1", 2))
+@pytest.mark.parametrize("value", (None, False, True, 0, 1.0, "1", 3))
 def test_unsupported_or_boolean_versions_do_not_change_legacy_prompt(value: JsonValue) -> None:
     ctx = context()
     subject = DirectRuntime(FakeGateway(), logical_model="main")
@@ -127,7 +127,7 @@ def test_legacy_action_binding_stays_byte_identical_without_new_flag() -> None:
     assert _binding(opted(ctx), "main") != _binding(ctx, "main")
 
 
-@pytest.mark.parametrize("value", (None, False, True, 0, 1.0, "1", 2))
+@pytest.mark.parametrize("value", (None, False, True, 0, 1.0, "1", 3))
 def test_action_direct_rejects_present_invalid_version_before_io(value: JsonValue) -> None:
     with pytest.raises(RuntimeExecutionError, match="guidance"):
         _check_guidance(opted(context(), value))

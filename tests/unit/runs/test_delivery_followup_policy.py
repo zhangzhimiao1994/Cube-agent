@@ -21,12 +21,12 @@ async def test_fresh_execution_pins_followup_guidance(mode):
                          router=None, task_queue=object())
     submitted = await service.execute(repository.run_id)
     assert submitted.status is RunStatus.COMPLETED
-    assert runtime.contexts[0].routing_decision.get("delivery_followup_version") == 1
-    assert repository.row.routing_decision.get("delivery_followup_version") == 1
+    assert runtime.contexts[0].routing_decision.get("delivery_followup_version") == 2
+    assert repository.row.routing_decision.get("delivery_followup_version") == 2
 
 
 @pytest.mark.parametrize("mode", [mode for mode in TaskMode if mode is not TaskMode.AUTO])
-@pytest.mark.parametrize("version", [None, 1])
+@pytest.mark.parametrize("version", [None, 1, 2])
 async def test_recovery_keeps_existing_followup_policy(mode, version):
     class CheckpointRepository(ExecutableFakeRepository):
         async def claim_for_execution(self, session, run_id, **kwargs):

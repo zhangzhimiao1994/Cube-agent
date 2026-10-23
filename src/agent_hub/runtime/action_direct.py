@@ -37,7 +37,10 @@ from agent_hub.runtime.contracts import (
     TaskContext,
     _freeze_object,
 )
-from agent_hub.runtime.delivery_followup import DELIVERY_FOLLOWUP_POLICY, DELIVERY_FOLLOWUP_VERSION
+from agent_hub.runtime.delivery_followup import (
+    DELIVERY_FOLLOWUP_POLICY,
+    DELIVERY_FOLLOWUP_SUPPORTED_VERSIONS,
+)
 from agent_hub.runtime.direct import (
     CapabilityGateway,
     DirectRuntime,
@@ -155,7 +158,7 @@ def _check_guidance(context: TaskContext) -> None:
         _encode(_guidance_identity(route))
         if DELIVERY_FOLLOWUP_POLICY in route and (
             type(route[DELIVERY_FOLLOWUP_POLICY]) is not int
-            or route[DELIVERY_FOLLOWUP_POLICY] != DELIVERY_FOLLOWUP_VERSION
+            or route[DELIVERY_FOLLOWUP_POLICY] not in DELIVERY_FOLLOWUP_SUPPORTED_VERSIONS
         ):
             raise ValueError
         for flag in ('project_preflight_approved', 'self_repair_accepted'):
