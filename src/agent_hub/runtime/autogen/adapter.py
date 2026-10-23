@@ -79,6 +79,10 @@ from agent_hub.runtime.artifacts import (
     ArtifactRepositoryError,
     InMemoryArtifactRepository,
 )
+from agent_hub.runtime.autogen.checkpoint_publication import (
+    CheckpointPublications,
+    PendingCheckpoint,
+)
 from agent_hub.runtime.autogen.engineering_continuation import (
     ENGINEERING_CONTINUATION_POLICY,
     draft_action,
@@ -119,6 +123,7 @@ from agent_hub.runtime.generated_project_guidance import generated_project_guida
 from agent_hub.runtime.hermes_context import runtime_memory_context_text
 from agent_hub.runtime.project_prerequisite_feedback import project_prerequisite_feedback
 from agent_hub.runtime.self_repair_context import self_repair_context_text
+from agent_hub.subprocess_cleanup import ProcessCleanupIncomplete
 
 _ID = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,127}$")
 _RUNTIME_TYPE = "autogen"
@@ -138,6 +143,12 @@ _ARTIFACT_CLEANUP_GRACE_SECONDS = 0.5
 _AUTOGEN_STREAM_POLL_SECONDS = 1.0
 _AUTOGEN_SHUTDOWN_GRACE_SECONDS = 2.0
 _GENERATED_DRAFT_NO_PROGRESS = "generated draft correction made no progress"
+_CHECKPOINT_ACK_POLICY = "engineering_checkpoint_ack_version"
+
+
+def _checkpoint_ack_selected(context: TaskContext) -> bool:
+    version = context.routing_decision.get(_CHECKPOINT_ACK_POLICY)
+    return engineering_continuation_selected(context) and type(version) is int and version == 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -313,6 +324,10 @@ def _compact_llm_messages(
 
 class RuntimeExecutionError(RuntimeError):
     """Stable discussion runtime failure."""
+
+
+class _AutoGenCleanupIncomplete(ProcessCleanupIncomplete):
+    """Owned framework cleanup failed; stream closure must not hide that fact."""
 
 
 class RuntimeBusy(RuntimeExecutionError):
@@ -2305,6 +2320,9 @@ class AutoGenDiscussionRuntime:
         continuation = (engineering and engineering_continuation_selected(context)
                         and sum("workspace.write_text" in tools for tools in allowed_tools.values()) == 1)
         round_published = asyncio.Event()
+        checkpoint_ack = engineering and _checkpoint_ack_selected(context)
+        publications = CheckpointPublications() if checkpoint_ack else None
+        publication_task: asyncio.Task[PendingCheckpoint] | None = None
 
         def delivery_ready() -> bool:
             if not engineering:
@@ -2353,7 +2371,7 @@ class AutoGenDiscussionRuntime:
                     self._cancel_token.link_future(published)
                 await published
                 round_published.clear()
-            if (not messages or not isinstance(messages[-1], ToolCallSummaryMessage)
+            if (not continuation or not messages or not isinstance(messages[-1], ToolCallSummaryMessage)
                     or messages[-1].source != owner):
                 return None
             if durability is None:
@@ -2489,18 +2507,23 @@ class AutoGenDiscussionRuntime:
                 model_entries: tuple[_LedgerEntry, ...],
                 tool_entries: tuple[_LedgerEntry, ...],
             ) -> None:
-                checkpoint = self._checkpoint(
-                    context,
-                    next_sequence=sequence,
-                    terminal=False,
-                    reason=None,
-                    artifacts=tuple(message_artifacts) + durable_artifacts,
-                    usage=usage,
-                    model_ledger=model_entries,
-                    tool_ledger=tool_entries,
-                    engineering_tool_prefix=(durability.engineering_tool_prefix if durability is not None else 0),
-                )
-                self._last_checkpoint = checkpoint
+                def build(next_sequence: int) -> RuntimeCheckpoint:
+                    return self._checkpoint(
+                        context,
+                        next_sequence=next_sequence,
+                        terminal=False,
+                        reason=None,
+                        artifacts=tuple(message_artifacts) + durable_artifacts,
+                        usage=usage,
+                        model_ledger=model_entries,
+                        tool_ledger=tool_entries,
+                        engineering_tool_prefix=(durability.engineering_tool_prefix if durability is not None else 0),
+                    )
+
+                if publications is not None:
+                    await publications.publish(build)
+                else:
+                    self._last_checkpoint = build(sequence)
 
             async def store_ledger_artifact(artifact: Artifact) -> UUID:
                 return await self._store_artifact(context, artifact)
@@ -2638,7 +2661,7 @@ class AutoGenDiscussionRuntime:
                             input_schema=_manifest_input_schema(metadata),
                             failure_codes=_manifest_failure_codes(metadata),
                             server_context=context,
-                            serialize_tool_calls=continuation,
+                            serialize_tool_calls=continuation or checkpoint_ack,
                         )
                     )
                 return tools
@@ -2687,7 +2710,7 @@ class AutoGenDiscussionRuntime:
                     "and current workspace.bundle. Prefer the engineering writer until these are delivered; "
                     "do not treat [COMPLETE] or consensus text as delivery. Return only one speaker name."
                 )
-            if continuation:
+            if continuation or checkpoint_ack:
                 team_options["selector_func"] = continue_writer
             team = SelectorGroupChat(
                 agents,
@@ -2729,16 +2752,34 @@ class AutoGenDiscussionRuntime:
                 expire_wall_time,
             )
             framework_runtime.start()
+            if publications is not None:
+                publication_task = asyncio.create_task(publications.next())
             framework_failed = False
             framework_timed_out = False
+            item_task: asyncio.Task[Any] | None = None
+            stream: Any = None
             try:
                 stream = team.run_stream(
                     task=self._task_text(context, tuple(message_artifacts)),
                     cancellation_token=self._cancel_token,
                 )
                 while True:
-                    item_task: asyncio.Task[Any] = asyncio.create_task(anext(stream))
-                    while not item_task.done():
+                    item_task = asyncio.create_task(anext(stream))
+                    while not item_task.done() or (publication_task is not None and publication_task.done()):
+                        if publication_task is not None and publication_task.done():
+                            publication = publication_task.result()
+                            assert publications is not None
+                            publication_task = asyncio.create_task(publications.next())
+                            if publication.cancelled:
+                                continue
+                            checkpoint = publication.build(sequence + 1)
+                            self._last_checkpoint = checkpoint
+                            yield RunEvent(kind=EventKind.CHECKPOINT_SAVED, sequence=sequence,
+                                           run_id=context.run_id, checkpoint=checkpoint)
+                            sequence += 1
+                            # Resumption follows the driver's committed event transaction.
+                            publication.acknowledge()
+                            continue
                         deadline = self._wall_deadline
                         if deadline is None:
                             raise RuntimeExecutionError(
@@ -2765,7 +2806,8 @@ class AutoGenDiscussionRuntime:
                                         del error
                             break
                         await asyncio.wait(
-                            (item_task,),
+                            (item_task,) if publication_task is None else (item_task, publication_task),
+                            return_when=asyncio.FIRST_COMPLETED,
                             timeout=min(_AUTOGEN_STREAM_POLL_SECONDS, remaining),
                         )
                     if framework_timed_out:
@@ -2847,7 +2889,7 @@ class AutoGenDiscussionRuntime:
                             checkpoint=checkpoint,
                         )
                         sequence += 1
-                        if continuation:
+                        if continuation or checkpoint_ack:
                             round_published.set()
                     elif isinstance(item, TaskResult):
                         reason = termination.reason or self._normalize_stop_reason(item.stop_reason)
@@ -2855,17 +2897,43 @@ class AutoGenDiscussionRuntime:
                 framework_failed = True
                 raise
             finally:
-                if continuation:
+                if publications is not None:
+                    publications.close()
+                if publication_task is not None:
+                    publication_task.cancel()
+                    await asyncio.gather(publication_task, return_exceptions=True)
+                if continuation or checkpoint_ack:
                     if (framework_failed or framework_timed_out) and self._cancel_token is not None:
                         self._cancel_token.cancel()
                     round_published.set()
                 cleanup_failed = False
+                if checkpoint_ack and (framework_failed or framework_timed_out):
+                    async def drain_owned_handlers() -> None:
+                        if item_task is not None:
+                            if not item_task.done():
+                                item_task.cancel()
+                            await asyncio.gather(item_task, return_exceptions=True)
+                        # AutoGen 0.7.5 owns these handlers. Drain them before reset
+                        # can replace the queue whose unfinished counts they own.
+                        handlers = tuple(framework_runtime._background_tasks)
+                        for handler in handlers:
+                            handler.cancel()
+                        await asyncio.gather(*handlers, return_exceptions=True)
+                        if stream is not None:
+                            await stream.aclose()
+                        if any(not handler.done() for handler in framework_runtime._background_tasks):
+                            raise RuntimeExecutionError("AutoGen handlers did not stop")
+
+                    if not await self._await_autogen_cleanup(drain_owned_handlers()):
+                        raise _AutoGenCleanupIncomplete("AutoGen runtime cleanup incomplete")
                 if not await self._await_autogen_cleanup(team.reset()):
                     cleanup_failed = True
                 if not await self._await_autogen_cleanup(framework_runtime.stop_when_idle()):
                     cleanup_failed = True
                 if not await self._await_autogen_cleanup(framework_runtime.close()):
                     cleanup_failed = True
+                if checkpoint_ack and cleanup_failed:
+                    raise _AutoGenCleanupIncomplete("AutoGen runtime cleanup incomplete")
                 if _should_fail_on_autogen_cleanup(
                     cleanup_failed=cleanup_failed,
                     framework_failed=framework_failed,
@@ -3032,6 +3100,9 @@ class AutoGenDiscussionRuntime:
                 payload=durability.failure_payload if durability is not None else {},
             )
             raise
+        except _AutoGenCleanupIncomplete:
+            # Also propagate on GeneratorExit: yielding a failure from aclose is invalid.
+            raise
         except Exception as error:  # noqa: BLE001 - AutoGen wraps participant failures
             failure_reason = (
                 durability.failure_reason
@@ -3083,6 +3154,8 @@ class AutoGenDiscussionRuntime:
                 } if durability is not None and durability.failure_payload else {},
             )
         finally:
+            if publications is not None:
+                publications.close()
             if wall_handle is not None:
                 wall_handle.cancel()
             self._active_task = None
@@ -3329,6 +3402,7 @@ class AutoGenDiscussionRuntime:
                and context.routing_decision.get("engineering_action_version") == 1 else {}),
             **({ENGINEERING_CONTINUATION_POLICY: 1} if engineering
                and engineering_continuation_selected(context) else {}),
+            **({_CHECKPOINT_ACK_POLICY: 1} if engineering and _checkpoint_ack_selected(context) else {}),
         }
         if engineering:
             while True:
@@ -3393,7 +3467,7 @@ class AutoGenDiscussionRuntime:
             )
         optional_state = (
             {"remaining_absolute_timeout_seconds", "engineering_tool_prefix", "engineering_action_version",
-             ENGINEERING_CONTINUATION_POLICY}
+             ENGINEERING_CONTINUATION_POLICY, _CHECKPOINT_ACK_POLICY}
             if checkpoint.runtime_version == _RUNTIME_VERSION
             else set()
         )
@@ -3416,6 +3490,12 @@ class AutoGenDiscussionRuntime:
             or (ENGINEERING_CONTINUATION_POLICY in state and (
                 type(state[ENGINEERING_CONTINUATION_POLICY]) is not int
                 or state[ENGINEERING_CONTINUATION_POLICY] != 1))):
+            raise RuntimeExecutionError("runtime checkpoint is incompatible")
+        checkpoint_ack = engineering and _checkpoint_ack_selected(context)
+        if ((_CHECKPOINT_ACK_POLICY in state) != checkpoint_ack
+            or (_CHECKPOINT_ACK_POLICY in state and (
+                type(state[_CHECKPOINT_ACK_POLICY]) is not int
+                or state[_CHECKPOINT_ACK_POLICY] != 1))):
             raise RuntimeExecutionError("runtime checkpoint is incompatible")
         registry = state["artifact_registry"]
         usage = state["usage"]

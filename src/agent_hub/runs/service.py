@@ -1968,10 +1968,12 @@ class RunService:
                     routing_decision["runtime_progress_policy"] = "semantic_workspace_v1"
                     routing_decision["engineering_delivery_contract_version"] = 1
                     routing_decision["engineering_action_version"] = 1
+                    routing_decision["delivery_followup_version"] = 1
                     if (mode is TaskMode.DISCUSS
                             and type(routing_decision.get("generated_project_contract_version")) is int
                             and routing_decision["generated_project_contract_version"] == 1):
                         routing_decision["engineering_writer_continuation_version"] = 1
+                        routing_decision["engineering_checkpoint_ack_version"] = 1
                 row.routing_decision = routing_decision
         if claimed_record is not None:
             if claimed_record.status is RunStatus.FAILED:

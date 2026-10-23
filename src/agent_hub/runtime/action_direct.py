@@ -37,6 +37,7 @@ from agent_hub.runtime.contracts import (
     TaskContext,
     _freeze_object,
 )
+from agent_hub.runtime.delivery_followup import DELIVERY_FOLLOWUP_POLICY, DELIVERY_FOLLOWUP_VERSION
 from agent_hub.runtime.direct import (
     CapabilityGateway,
     DirectRuntime,
@@ -56,6 +57,7 @@ _FIXED_ROUTE_KEYS = (
 _GUIDANCE_ROUTE_KEYS = (
     'project_preflight_approved', 'project_preflight_proposal',
     'self_repair_context', 'self_repair_accepted', 'source',
+    DELIVERY_FOLLOWUP_POLICY,
 )
 _APPROVAL_ROUTE_KEYS = (
     'approval_kind', 'approval_id', 'approval_fingerprint', 'approval_scope',
@@ -151,6 +153,11 @@ def _check_guidance(context: TaskContext) -> None:
         # Reuse the storage boundary's checks before any model or tool side effect.
         # This grants no permission and never substitutes the bounded prompt text.
         _encode(_guidance_identity(route))
+        if DELIVERY_FOLLOWUP_POLICY in route and (
+            type(route[DELIVERY_FOLLOWUP_POLICY]) is not int
+            or route[DELIVERY_FOLLOWUP_POLICY] != DELIVERY_FOLLOWUP_VERSION
+        ):
+            raise ValueError
         for flag in ('project_preflight_approved', 'self_repair_accepted'):
             if flag in route and type(route[flag]) is not bool:
                 raise ValueError

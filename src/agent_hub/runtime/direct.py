@@ -52,6 +52,7 @@ from agent_hub.runtime.contracts import (
     RuntimeCheckpoint,
     TaskContext,
 )
+from agent_hub.runtime.delivery_followup import delivery_followup_guidance
 from agent_hub.runtime.failure_reason import safe_model_gateway_failure_reason
 from agent_hub.runtime.generated_draft_feedback import generated_draft_feedback
 from agent_hub.runtime.generated_project_guidance import generated_project_guidance
@@ -3340,6 +3341,8 @@ class DirectRuntime:
                            if guidance_context else "")
                         + ("\n\n" + _generated_direct_guidance(context)
                            if _generated_direct_guidance(context) else "")
+                        + ("\n\n" + delivery_followup_guidance(context)
+                           if delivery_followup_guidance(context) else "")
                     ),
                 ),
                 ModelMessage(role="user", content=payload),
