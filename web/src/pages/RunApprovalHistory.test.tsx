@@ -117,6 +117,21 @@ describe("durable per-run approval history", () => {
     expect(read).toHaveBeenCalledTimes(2);
   });
 
+  it("starts a fresh terminal read even while the initial pending request is still in flight", async () => {
+    let settle!: (value: Awaited<ReturnType<typeof api.capabilityApprovals>>) => void;
+    const read = vi.spyOn(api, "capabilityApprovals")
+      .mockImplementationOnce(() => new Promise((resolve) => { settle = resolve; }))
+      .mockResolvedValue({ ready: false, items: events() });
+    const item = { ...run(), status: "waiting_approval" };
+    const { refresh } = mount([item]);
+    await waitFor(() => expect(read).toHaveBeenCalledTimes(1));
+    item.status = "cancelled";
+    refresh();
+    await act(async () => { settle({ ready: false, items: [] }); });
+    await screen.findByRole("article", { name: "权限审批结果" });
+    expect(read).toHaveBeenCalledTimes(2);
+  });
+
   it("polls a pending run but performs only a read for a terminal run", async () => {
     const read = vi.spyOn(api, "capabilityApprovals").mockResolvedValue({ ready: false, items: events() });
     const item = { ...run(), status: "waiting_approval" };

@@ -1,6 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 import { RotateCw } from "lucide-react";
-import { useEffect, useRef } from "react";
+import { useRef } from "react";
 
 import { ApiError, api, type CapabilityApprovalEvent, type RunDetail } from "../api/client";
 import { useAuth } from "../auth/AuthProvider";
@@ -56,9 +56,8 @@ export function RunApprovalHistory({ run }: { run: RunDetail }) {
   const legacyActor = useRef(actorScope);
   if (legacyActor.current === null && actorScope !== null) legacyActor.current = actorScope;
   const terminal = ["completed", "failed", "cancelled"].includes(run.status);
-  const previousRunState = useRef({ actorScope, runId: run.id, terminal });
   const history = useQuery({
-    queryKey: ["capability-approval-history", user?.tenant_id, user?.user_id, user?.role, run.id],
+    queryKey: ["capability-approval-history", user?.tenant_id, user?.user_id, user?.role, run.id, terminal],
     queryFn: ({ signal }) => api.capabilityApprovals(run.id, signal),
     enabled: Boolean(user && hasPermission("run:read")),
     gcTime: 0,
@@ -67,14 +66,6 @@ export function RunApprovalHistory({ run }: { run: RunDetail }) {
     refetchOnMount: "always",
     refetchInterval: terminal ? false : 1000,
   });
-  useEffect(() => {
-    const previous = previousRunState.current;
-    previousRunState.current = { actorScope, runId: run.id, terminal };
-    if (user && hasPermission("run:read") && previous.actorScope === actorScope
-      && previous.runId === run.id && !previous.terminal && terminal) {
-      void history.refetch();
-    }
-  }, [actorScope, run.id, terminal, user, hasPermission, history.refetch]);
   if (!user || !hasPermission("run:read")) return null;
   const scopeDenied = history.error instanceof ApiError && [401, 403, 404].includes(history.error.status);
   const records = scopeDenied ? [] : approvalRecords(
