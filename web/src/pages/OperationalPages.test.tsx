@@ -2606,7 +2606,7 @@ describe("operational management pages", () => {
     await user.click(await screen.findByRole("button", { name: conversationOpenButtonName }));
     expect(screen.queryByRole("button", { name: /插话/ })).toBeNull();
     const composer = screen.getByRole("form", { name: "发送消息" });
-    const composerInput = within(composer).getByPlaceholderText(/输入消息/);
+    const composerInput = within(composer).getByRole("textbox", { name: "消息" });
     await user.type(composerInput, "先排队处理这条");
     await user.click(within(composer).getByRole("button", { name: "排队" }));
 
@@ -2650,7 +2650,7 @@ describe("operational management pages", () => {
     await expandRunConfigDetails(user);
     await user.selectOptions(screen.getByLabelText("参考方案"), "short-video-dispatch");
     expect(screen.getByText(/仅供主 Agent 参考/)).not.toBeNull();
-    await user.type(screen.getByPlaceholderText(/输入消息/), "给我做一个短视频脚本方案。");
+    await user.type(screen.getByRole("textbox", { name: "消息" }), "给我做一个短视频脚本方案。");
     await user.click(screen.getByRole("button", { name: "发送" }));
 
     await screen.findByText(/这是最终回复正文/);
@@ -2691,7 +2691,7 @@ describe("operational management pages", () => {
     expect(screen.getByText(/工作区：projects\/mofang-agent\/sessions\/app/)).not.toBeNull();
     await user.click(screen.getByRole("button", { name: "关闭运行设置" }));
 
-    await user.type(screen.getByPlaceholderText(/输入消息/), "生成一个简单项目并打包。");
+    await user.type(screen.getByRole("textbox", { name: "消息" }), "生成一个简单项目并打包。");
     await user.click(screen.getByRole("button", { name: "发送" }));
 
     await waitFor(() => expect(requests.find((request) => request.path === "/api/v1/runs")).toBeTruthy());
@@ -3214,7 +3214,7 @@ describe("operational management pages", () => {
 
     expect(await screen.findByRole("form", { name: "发送消息" })).not.toBeNull();
     expect(screen.queryByRole("button", { name: "直连" })).toBeNull();
-    await user.type(screen.getByPlaceholderText(/输入消息/), "直接帮我写一段口播。");
+    await user.type(screen.getByRole("textbox", { name: "消息" }), "直接帮我写一段口播。");
     await user.click(screen.getByRole("button", { name: "发送" }));
 
     await screen.findByText(/这是最终回复正文/);
@@ -3235,7 +3235,7 @@ describe("operational management pages", () => {
     render(<TestApp initialPath="/" />);
 
     expect(await screen.findByRole("form", { name: "发送消息" })).not.toBeNull();
-    await user.type(screen.getByPlaceholderText(/输入消息/), "直接回答这句话。");
+    await user.type(screen.getByRole("textbox", { name: "消息" }), "直接回答这句话。");
     await user.click(screen.getByRole("button", { name: "发送" }));
 
     expect(requests.find((request) => request.path === "/api/v1/runs")).toMatchObject({
@@ -3256,7 +3256,7 @@ describe("operational management pages", () => {
     render(<TestApp initialPath="/" />);
 
     expect(await screen.findByRole("form", { name: "发送消息" })).not.toBeNull();
-    await user.type(screen.getByPlaceholderText(/输入消息/), "请直接分析一下这个问题。");
+    await user.type(screen.getByRole("textbox", { name: "消息" }), "请直接分析一下这个问题。");
     expect((screen.getByRole("button", { name: "发送" }) as HTMLButtonElement).disabled).toBe(false);
     await user.click(screen.getByRole("button", { name: "发送" }));
     expect(requests.find((request) => request.path === "/api/v1/runs")).toMatchObject({ body: { mode: "auto" } });
@@ -3464,7 +3464,7 @@ describe("operational management pages", () => {
     expect(await screen.findByRole("form", { name: "发送消息" })).not.toBeNull();
     await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
     await screen.findByText(/会话：短视频脚本方案/);
-    await user.type(screen.getByPlaceholderText(/输入消息/), "继续优化这个脚本。");
+    await user.type(screen.getByRole("textbox", { name: "消息" }), "继续优化这个脚本。");
     await user.click(screen.getByRole("button", { name: "发送" }));
 
     expect(requests.slice().reverse().find((request) => request.path === "/api/v1/runs")).toMatchObject({
@@ -3482,7 +3482,7 @@ describe("operational management pages", () => {
 
     expect(await screen.findByRole("form", { name: "发送消息" })).not.toBeNull();
     expect(screen.queryByRole("button", { name: "Vibe Coding" })).toBeNull();
-    await user.type(screen.getByPlaceholderText(/输入消息/), "审查这个代码附件。");
+    await user.type(screen.getByRole("textbox", { name: "消息" }), "审查这个代码附件。");
     await user.click(screen.getByRole("button", { name: "发送" }));
 
     const request = requests.slice().reverse().find((item) => item.path === "/api/v1/runs");
@@ -3495,7 +3495,7 @@ describe("operational management pages", () => {
     render(<TestApp initialPath="/" />);
 
     expect(await screen.findByRole("form", { name: "发送消息" })).not.toBeNull();
-    const input = screen.getByPlaceholderText(/输入消息/);
+    const input = screen.getByRole("textbox", { name: "消息" });
     for (const message of [
       "每天9点提醒我填写日报",
       "设置提醒：每天9点提醒我填写日报",
@@ -3514,7 +3514,7 @@ describe("operational management pages", () => {
     render(<TestApp initialPath="/" />);
 
     expect(await screen.findByRole("form", { name: "发送消息" })).not.toBeNull();
-    await user.type(screen.getByPlaceholderText(/输入消息/), "创建计划任务：每天9点提醒我填写日报");
+    await user.type(screen.getByRole("textbox", { name: "消息" }), "创建计划任务：每天9点提醒我填写日报");
     await user.click(screen.getByRole("button", { name: "发送" }));
 
     expect(await screen.findByRole("status", { name: "计划任务确认" })).not.toBeNull();
@@ -3542,7 +3542,7 @@ describe("operational management pages", () => {
     render(<TestApp initialPath="/" />);
 
     expect(await screen.findByRole("form", { name: "发送消息" })).not.toBeNull();
-    await user.type(screen.getByPlaceholderText(/输入消息/), "创建计划任务：每天9点提醒我填写日报");
+    await user.type(screen.getByRole("textbox", { name: "消息" }), "创建计划任务：每天9点提醒我填写日报");
     await user.click(screen.getByRole("button", { name: "发送" }));
 
     expect(await screen.findByRole("status", { name: "计划任务确认" })).not.toBeNull();
@@ -3557,7 +3557,7 @@ describe("operational management pages", () => {
     render(<TestApp initialPath="/" />);
 
     expect(await screen.findByRole("form", { name: "发送消息" })).not.toBeNull();
-    await user.type(screen.getByPlaceholderText(/输入消息/), "请进化 darwin-skill，做多轮迭代");
+    await user.type(screen.getByRole("textbox", { name: "消息" }), "请进化 darwin-skill，做多轮迭代");
     await user.click(screen.getByRole("button", { name: "发送" }));
 
     expect(await screen.findByRole("status", { name: "进化任务确认" })).not.toBeNull();
@@ -3587,7 +3587,7 @@ describe("operational management pages", () => {
     render(<TestApp initialPath="/" />);
 
     expect(await screen.findByRole("form", { name: "发送消息" })).not.toBeNull();
-    await user.type(screen.getByPlaceholderText(/输入消息/), "请进化 darwin-skill，做多轮迭代");
+    await user.type(screen.getByRole("textbox", { name: "消息" }), "请进化 darwin-skill，做多轮迭代");
     await user.click(screen.getByRole("button", { name: "发送" }));
 
     expect(await screen.findByRole("status", { name: "进化任务确认" })).not.toBeNull();
@@ -3614,7 +3614,7 @@ describe("operational management pages", () => {
     render(<TestApp initialPath="/" />);
 
     expect(await screen.findByRole("form", { name: "发送消息" })).not.toBeNull();
-    await user.type(screen.getByPlaceholderText(/输入消息/), "Use OpenClaw to execute date on the Linux server after approval.");
+    await user.type(screen.getByRole("textbox", { name: "消息" }), "Use OpenClaw to execute date on the Linux server after approval.");
     await user.click(screen.getByRole("button", { name: "发送" }));
 
     expect(await screen.findByRole("status", { name: "OpenClaw 操作确认" })).not.toBeNull();
@@ -3628,7 +3628,7 @@ describe("operational management pages", () => {
     render(<TestApp initialPath="/" />);
 
     expect(await screen.findByRole("form", { name: "发送消息" })).not.toBeNull();
-    await user.type(screen.getByPlaceholderText(/输入消息/), "Use OpenClaw to execute date on the Linux server after approval.");
+    await user.type(screen.getByRole("textbox", { name: "消息" }), "Use OpenClaw to execute date on the Linux server after approval.");
     await user.click(screen.getByRole("button", { name: "发送" }));
 
     expect(await screen.findByRole("status", { name: "OpenClaw 操作确认" })).not.toBeNull();
@@ -3649,7 +3649,7 @@ describe("operational management pages", () => {
     render(<TestApp initialPath="/" />);
 
     expect(await screen.findByRole("form", { name: "发送消息" })).not.toBeNull();
-    await user.type(screen.getByPlaceholderText(/输入消息/), "trigger self repair");
+    await user.type(screen.getByRole("textbox", { name: "消息" }), "trigger self repair");
     await user.click(screen.getByRole("button", { name: "发送" }));
 
     const card = await screen.findByRole("status", { name: "自修复确认" });
@@ -3667,7 +3667,7 @@ describe("operational management pages", () => {
     render(<TestApp initialPath="/" />);
 
     expect(await screen.findByRole("form", { name: "发送消息" })).not.toBeNull();
-    await user.type(screen.getByPlaceholderText(/输入消息/), "trigger self repair");
+    await user.type(screen.getByRole("textbox", { name: "消息" }), "trigger self repair");
     await user.click(screen.getByRole("button", { name: "发送" }));
 
     expect(await screen.findByRole("status", { name: "自修复确认" })).not.toBeNull();
@@ -3689,7 +3689,7 @@ describe("operational management pages", () => {
     render(<TestApp initialPath="/" />);
 
     expect(await screen.findByRole("form", { name: "发送消息" })).not.toBeNull();
-    await user.type(screen.getByPlaceholderText(/输入消息/), "trigger self repair");
+    await user.type(screen.getByRole("textbox", { name: "消息" }), "trigger self repair");
     await user.click(screen.getByRole("button", { name: "发送" }));
 
     expect(await screen.findByRole("status", { name: "自修复确认" })).not.toBeNull();
@@ -3704,7 +3704,7 @@ describe("operational management pages", () => {
     render(<TestApp initialPath="/" />);
 
     expect(await screen.findByRole("form", { name: "发送消息" })).not.toBeNull();
-    await user.type(screen.getByPlaceholderText(/输入消息/), "trigger self repair");
+    await user.type(screen.getByRole("textbox", { name: "消息" }), "trigger self repair");
     await user.click(screen.getByRole("button", { name: "发送" }));
 
     expect(await screen.findByRole("status", { name: "自修复确认" })).not.toBeNull();
@@ -3761,7 +3761,9 @@ describe("operational management pages", () => {
         },
       }),
     );
-    expect(await screen.findByText("已允许本次沙箱工具调用，当前任务已重新排队继续执行。")).not.toBeNull();
+    await waitFor(() => expect(screen.queryByRole("status", { name: "沙箱权限确认" })).toBeNull());
+    expect(within(screen.getByRole("form", { name: "发送消息" }))
+      .queryByText("已允许本次沙箱工具调用，当前任务已重新排队继续执行。")).toBeNull();
   });
   it("clears failed attachment upload state and allows retrying the same file", async () => {
     failNextAttachmentUpload = true;
@@ -3805,7 +3807,7 @@ describe("operational management pages", () => {
     expect(await screen.findByText(/创建后会引用原会话/)).not.toBeNull();
     await user.click(screen.getByRole("button", { name: "创建会话" }));
     await screen.findByText(/分支会话已创建/);
-    await user.type(screen.getByPlaceholderText(/输入消息/), "沿用上一轮方向。");
+    await user.type(screen.getByRole("textbox", { name: "消息" }), "沿用上一轮方向。");
     await user.click(screen.getByRole("button", { name: "发送" }));
 
     expect(requests.slice().reverse().find((request) => request.path === "/api/v1/runs")).toMatchObject({
@@ -3827,7 +3829,7 @@ describe("operational management pages", () => {
     await screen.findByText(/分支会话已创建/);
     expect(screen.queryByRole("button", { name: "按照原思路" })).toBeNull();
     await user.click(screen.getByRole("button", { name: "取消引用会话" }));
-    await user.type(screen.getByPlaceholderText(/输入消息/), "不引用上一轮。");
+    await user.type(screen.getByRole("textbox", { name: "消息" }), "不引用上一轮。");
     await user.click(screen.getByRole("button", { name: "发送" }));
 
     const request = requests.slice().reverse().find((item) => item.path === "/api/v1/runs");
@@ -3848,7 +3850,7 @@ describe("operational management pages", () => {
     await user.click(screen.getByRole("button", { name: conversationOpenButtonName }));
     await screen.findByText(/会话：短视频脚本方案/);
 
-    await user.type(screen.getByPlaceholderText(/输入消息/), "继续优化这个脚本。");
+    await user.type(screen.getByRole("textbox", { name: "消息" }), "继续优化这个脚本。");
     await user.click(screen.getByRole("button", { name: "发送" }));
     await waitFor(() => {
       const postRequests = requests.filter((request) => request.path === "/api/v1/runs");
@@ -3857,7 +3859,7 @@ describe("operational management pages", () => {
       });
     });
 
-    await user.type(screen.getByPlaceholderText(/输入消息/), "再给我一个更强的开头。");
+    await user.type(screen.getByRole("textbox", { name: "消息" }), "再给我一个更强的开头。");
     await user.click(screen.getByRole("button", { name: "发送" }));
 
     const postRequests = requests.filter((request) => request.path === "/api/v1/runs");
@@ -3894,7 +3896,7 @@ describe("operational management pages", () => {
     expect((await within(stream).findAllByText(/这是第二轮回复正文/)).length).toBeGreaterThan(0);
 
     visibleConversationRuns = [secondRunDetail];
-    await user.type(screen.getByPlaceholderText(/输入消息/), "继续。");
+    await user.type(screen.getByRole("textbox", { name: "消息" }), "继续。");
     await user.click(screen.getByRole("button", { name: "发送" }));
 
     expect(await within(stream).findByText("给我做一个短视频脚本方案。", { selector: ".chat-message.user p" })).not.toBeNull();
@@ -3911,7 +3913,7 @@ describe("operational management pages", () => {
     await screen.findByText(/分支会话已创建/);
     expect(screen.queryByRole("button", { name: "自动" })).toBeNull();
     expect(screen.queryByRole("button", { name: "直连" })).toBeNull();
-    await user.type(screen.getByPlaceholderText(/输入消息/), "接着前面的方向继续。");
+    await user.type(screen.getByRole("textbox", { name: "消息" }), "接着前面的方向继续。");
     await user.click(screen.getByRole("button", { name: "发送" }));
 
     const request = requests.slice().reverse().find((item) => item.path === "/api/v1/runs");
@@ -7290,14 +7292,14 @@ describe("operational management pages", () => {
     await user.click(within(directoryDialog).getByRole("button", { name: "选择目录 scratch" }));
     await user.click(within(settingsDialog).getByRole("button", { name: "关闭运行设置" }));
 
-    await user.type(screen.getByPlaceholderText(/输入消息/), "使用临时目录执行");
+    await user.type(screen.getByRole("textbox", { name: "消息" }), "使用临时目录执行");
     await user.click(screen.getByRole("button", { name: "发送" }));
     await waitFor(() => expect(requests.find((request) => request.path === "/api/v1/runs")).toBeTruthy());
     expect(requests.find((request) => request.path === "/api/v1/runs")).toMatchObject({
       body: { workspace_session_id: "scratch", execution_backend: "systemd" },
     });
 
-    await user.type(screen.getByPlaceholderText(/输入消息/), "第二次恢复默认目录");
+    await user.type(screen.getByRole("textbox", { name: "消息" }), "第二次恢复默认目录");
     await user.click(screen.getByRole("button", { name: "发送" }));
     await waitFor(() => expect(requests.filter((request) => request.path === "/api/v1/runs")).toHaveLength(2));
     expect(requests.filter((request) => request.path === "/api/v1/runs").at(-1)).toMatchObject({
@@ -7317,7 +7319,7 @@ describe("operational management pages", () => {
 
     async function closeAndSend(user: ReturnType<typeof userEvent.setup>, busy = false) {
       await user.click(screen.getByRole("button", { name: "关闭运行设置" }));
-      await user.type(screen.getByPlaceholderText(/输入消息/), "修改已有项目");
+      await user.type(screen.getByRole("textbox", { name: "消息" }), "修改已有项目");
       await user.click(screen.getByRole("button", { name: busy ? "排队" : "发送" }));
     }
 
@@ -7368,7 +7370,7 @@ describe("operational management pages", () => {
       await user.type(screen.getByLabelText("允许修改路径（每行一项）"), "web/components/Widget.tsx");
       expect(screen.getByRole("alert").textContent).toBe("当前工作区输入必须使用当前会话工作区。");
       await user.click(screen.getByRole("button", { name: "关闭运行设置" }));
-      await user.type(screen.getByPlaceholderText(/输入消息/), "只修改已选工作区");
+      await user.type(screen.getByRole("textbox", { name: "消息" }), "只修改已选工作区");
       expect((screen.getByRole("button", { name: busy ? "排队" : "发送" }) as HTMLButtonElement).disabled).toBe(true);
       fireEvent.submit(view.container.querySelector(".chat-composer") as HTMLFormElement);
       expect(submittedRequests()).toHaveLength(0);
@@ -7415,7 +7417,7 @@ describe("operational management pages", () => {
       const user = userEvent.setup();
       render(<TestApp initialPath="/?conversation=conv-previous" />);
       await screen.findByText("会话：短视频脚本方案");
-      await user.type(screen.getByPlaceholderText(/输入消息/), "修改当前工作区 src 的所有文件");
+      await user.type(screen.getByRole("textbox", { name: "消息" }), "修改当前工作区 src 的所有文件");
       await user.click(screen.getByRole("button", { name: busy ? "排队" : "发送" }));
       await waitFor(() => expect(submittedRequests()).toHaveLength(1));
       expect(submittedRequests()[0].body).not.toHaveProperty("project_input");
@@ -7443,7 +7445,7 @@ describe("operational management pages", () => {
         await user.click(screen.getByRole("button", { name: /沙箱权限/ }));
         await user.click(within(screen.getByRole("menu", { name: "沙箱权限" })).getByRole("menuitemradio", { name: /^只读/ }));
       }
-      await user.type(screen.getByPlaceholderText(/输入消息/), "修改项目");
+      await user.type(screen.getByRole("textbox", { name: "消息" }), "修改项目");
       expect((screen.getByRole("button", { name: busy ? "排队" : "发送" }) as HTMLButtonElement).disabled).toBe(true);
       fireEvent.submit(view.container.querySelector(".chat-composer") as HTMLFormElement);
       expect(submittedRequests()).toHaveLength(0);
@@ -7520,7 +7522,7 @@ describe("operational management pages", () => {
         await user.click(screen.getByRole("button", { name: "停止生成" }));
         await waitFor(() => expect(screen.queryByRole("button", { name: "停止生成" })).toBeNull());
       }
-      await user.type(screen.getByPlaceholderText(/输入消息/), action === "retry" ? "/retry" : "继续修改");
+      await user.type(screen.getByRole("textbox", { name: "消息" }), action === "retry" ? "/retry" : "继续修改");
       await user.click(screen.getByRole("button", { name: "发送" }));
       await waitFor(() => expect(submittedRequests()).toHaveLength(1));
       expect(submittedRequests()[0].body).toMatchObject({
@@ -7678,7 +7680,7 @@ describe("operational management pages", () => {
 
     const initialDialog = await screen.findByRole("dialog", { name: "新建项目工作区" });
     await user.click(within(initialDialog).getByRole("button", { name: "关闭新建项目工作区" }));
-    await user.type(screen.getByPlaceholderText(/输入消息/), "第一次消息");
+    await user.type(screen.getByRole("textbox", { name: "消息" }), "第一次消息");
     await user.click(screen.getByRole("button", { name: "发送" }));
 
     expect(await screen.findByRole("dialog", { name: "新建项目工作区" })).not.toBeNull();
@@ -7705,7 +7707,7 @@ describe("operational management pages", () => {
 
     const initialDialog = await screen.findByRole("dialog", { name: "新建会话" });
     await user.click(within(initialDialog).getByRole("button", { name: "关闭新建会话" }));
-    await user.type(screen.getByPlaceholderText(/输入消息/), "第一次消息");
+    await user.type(screen.getByRole("textbox", { name: "消息" }), "第一次消息");
     await user.click(screen.getByRole("button", { name: "发送" }));
 
     const reopenedDialog = await screen.findByRole("dialog", { name: "新建会话" });
@@ -7765,7 +7767,7 @@ describe("operational management pages", () => {
       }),
     );
     expect((await screen.findAllByText("已归档")).length).toBeGreaterThan(0);
-    await user.type(screen.getByPlaceholderText(/输入消息/), "归档后不应继续发送");
+    await user.type(screen.getByRole("textbox", { name: "消息" }), "归档后不应继续发送");
     expect((screen.getByRole("button", { name: "发送" }) as HTMLButtonElement).disabled).toBe(true);
 
     await user.click(screen.getByRole("button", { name: "会话操作" }));
@@ -7786,7 +7788,7 @@ describe("operational management pages", () => {
     render(<TestApp initialPath="/" />);
 
     expect(await screen.findByRole("form", { name: "发送消息" })).not.toBeNull();
-    await user.type(screen.getByPlaceholderText(/输入消息/), "你好，直接回复我。");
+    await user.type(screen.getByRole("textbox", { name: "消息" }), "你好，直接回复我。");
     await user.click(screen.getByRole("button", { name: "发送" }));
 
     expect(requests.find((request) => request.path === "/api/v1/runs")).toMatchObject({
@@ -7836,7 +7838,7 @@ describe("operational management pages", () => {
     expect(await screen.findByRole("form", { name: "发送消息" })).not.toBeNull();
     expect(screen.queryByRole("button", { name: "讨论" })).toBeNull();
     expect(screen.queryByLabelText("模式")).toBeNull();
-    await user.type(screen.getByPlaceholderText(/输入消息/), "请让多个角色评审这个方案。");
+    await user.type(screen.getByRole("textbox", { name: "消息" }), "请让多个角色评审这个方案。");
     await user.click(screen.getByRole("button", { name: "发送" }));
 
     await waitFor(() => expect(requests.find((request) => request.path === "/api/v1/runs")).toBeTruthy());
@@ -7854,7 +7856,7 @@ describe("operational management pages", () => {
     render(<TestApp initialPath="/" />);
 
     expect(await screen.findByRole("form", { name: "发送消息" })).not.toBeNull();
-    await user.type(screen.getByPlaceholderText(/输入消息/), "讨论 请让多个角色评审这个方案。");
+    await user.type(screen.getByRole("textbox", { name: "消息" }), "讨论 请让多个角色评审这个方案。");
     await user.click(screen.getByRole("button", { name: "发送" }));
 
     await waitFor(() => expect(requests.find((request) => request.path === "/api/v1/runs")).toBeTruthy());
@@ -7908,7 +7910,7 @@ describe("operational management pages", () => {
     expect(await screen.findByText("图片附件")).not.toBeNull();
     expect(screen.getByText("screen.png")).not.toBeNull();
 
-    await user.type(screen.getByPlaceholderText(/输入消息/), "请根据图片说明问题");
+    await user.type(screen.getByRole("textbox", { name: "消息" }), "请根据图片说明问题");
     await user.click(screen.getByRole("button", { name: "发送" }));
 
     await waitFor(() => expect(requests.find((request) => request.path === "/api/v1/runs")).toBeTruthy());
@@ -8148,7 +8150,7 @@ describe("operational management pages", () => {
     expect(selector.disabled).toBe(false);
     expect((within(selector).getByRole("option", { name: "Docker 容器隔离（不可用）" }) as HTMLOptionElement).disabled).toBe(true);
 
-    await user.type(screen.getByPlaceholderText(/输入消息/), "使用可用执行环境继续");
+    await user.type(screen.getByRole("textbox", { name: "消息" }), "使用可用执行环境继续");
     await user.click(screen.getByRole("button", { name: "发送" }));
     await waitFor(() => expect(requests.find((request) => request.path === "/api/v1/runs")).toBeTruthy());
     expect(requests.find((request) => request.path === "/api/v1/runs")).toMatchObject({
@@ -8163,7 +8165,7 @@ describe("operational management pages", () => {
 
     expect(await screen.findByRole("form", { name: "发送消息" })).not.toBeNull();
     expect(await screen.findByText("执行环境状态读取失败。本次仍可普通对话，但不会执行 Skill。")).not.toBeNull();
-    await user.type(screen.getByPlaceholderText(/输入消息/), "继续普通对话");
+    await user.type(screen.getByRole("textbox", { name: "消息" }), "继续普通对话");
     expect((screen.getByRole("button", { name: "发送" }) as HTMLButtonElement).disabled).toBe(false);
 
     await openRunConfig(user);
@@ -8187,7 +8189,7 @@ describe("operational management pages", () => {
     expect(await screen.findByText(/服务器暂时无法安全运行 Skill/)).not.toBeNull();
     expect(screen.getByText(/本次仍可普通对话，但不会执行 Skill/)).not.toBeNull();
     expect(screen.getByRole("button", { name: "查看执行环境" })).not.toBeNull();
-    await user.type(screen.getByPlaceholderText(/输入消息/), "继续普通对话");
+    await user.type(screen.getByRole("textbox", { name: "消息" }), "继续普通对话");
     expect((screen.getByRole("button", { name: "发送" }) as HTMLButtonElement).disabled).toBe(false);
 
     await openRunConfig(user);
