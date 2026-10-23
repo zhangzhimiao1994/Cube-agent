@@ -99,7 +99,9 @@ from agent_hub.runtime.failure_reason import (
 from agent_hub.runtime.generated_draft_feedback import (
     REJECTION_REASON,
     generated_draft_feedback,
-    generated_draft_history_feedback,
+)
+from agent_hub.runtime.generated_draft_feedback import (
+    generated_draft_artifact_feedback as _generated_draft_artifact_feedback,
 )
 from agent_hub.runtime.generated_file_recovery import reusable_generated_file_result
 from agent_hub.runtime.generated_project_guidance import generated_project_guidance
@@ -1375,44 +1377,6 @@ def _execution_failure_result(
             return None
         result["verification_failure"] = report
     return result
-
-
-def _generated_draft_artifact_feedback(
-    artifact: Artifact, *, context: TaskContext | None, actor: str,
-    call_id: str | None = None,
-) -> Mapping[str, JsonValue] | None:
-    """Rebind stored pre-capture data without promoting it to an execution receipt."""
-    content = artifact.content
-    result = content.get("result")
-    stored_call = content.get("call_id")
-    if (
-        context is None or artifact.type != "tool_result" or artifact.producer != actor
-        or artifact.recompute_content_sha256() != artifact.content_sha256
-        or set(content) != {"result", "tool_name", "arguments_sha256", "call_id"}
-        or content["tool_name"] != "project.verify"
-        or content["arguments_sha256"] != hashlib.sha256(b"{}").hexdigest()
-        or type(stored_call) is not str or (call_id is not None and stored_call != call_id)
-        or not isinstance(result, Mapping)
-        or set(result) != {"status", "untrusted", "generated_draft_rejection"}
-        or result["status"] != "failed" or result["untrusted"] is not True
-    ):
-        return None
-    try:
-        request = HarnessToolCallRequest(
-            run_id=context.run_id, actor=actor, tool_name="project.verify", arguments={},
-            sandbox="workspace_write", approval_required=True,
-            idempotency_key="historical-draft-observation", call_id=stored_call,
-        )
-        feedback = generated_draft_history_feedback(HarnessToolCallResult(
-            call_id=stored_call, tool_name="project.verify", status="failed",
-            failure_reason=REJECTION_REASON, payload={
-                "generated_draft_rejection": result["generated_draft_rejection"],
-                "call_id": stored_call, "arguments_sha256": content["arguments_sha256"],
-            },
-        ), context=context, request=request)
-    except (TypeError, ValueError):
-        return None
-    return feedback if feedback == result else None
 
 
 def _draft_observation_repeated(

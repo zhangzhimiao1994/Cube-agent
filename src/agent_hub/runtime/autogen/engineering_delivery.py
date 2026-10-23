@@ -24,6 +24,7 @@ from agent_hub.runtime.contracts import (
 from agent_hub.runtime.crew.engineering_delivery import _successful_source
 from agent_hub.runtime.crew.workspace_maintenance_delivery import _file_metadata
 from agent_hub.runtime.engineering_actions import EngineeringProgress
+from agent_hub.runtime.generated_draft_feedback import generated_draft_artifact_feedback
 from agent_hub.runtime.generated_project_history import (
     generated_delivery_matches,
     generated_failure_current,
@@ -286,7 +287,11 @@ def engineering_progress(
             if name != "project.verify":
                 uncertain = True
                 break
-            if (generated_history_selected(context) and not generated_failure_current(context, result)
+            if "generated_draft_rejection" in result:
+                if generated_draft_artifact_feedback(artifact, context=context, actor=actor) != result:
+                    uncertain = True
+                    break
+            elif (generated_history_selected(context) and not generated_failure_current(context, result)
                     or python and not python_failure_current(context, result)):
                 uncertain = True
                 break
