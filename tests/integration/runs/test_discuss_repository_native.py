@@ -91,6 +91,8 @@ async def test_configured_discuss_persists_private_artifacts_across_real_pools(
             tenant_id=tenant, actor_id=actor, actor_role=Role.OPERATOR,
             mode=TaskMode.DISCUSS, message='Compare two options and finish with a short conclusion.',
             agent_ids=('analyst', 'critic'), direct_model='offline', allow_scale_mode_upgrade=False,
+            permission_mode='read_only', sandbox_profile='read_only',
+            requested_permissions=('workspace.read',),
         )
         await service.execute(submitted.id)
         record = await runs.get(tenant, submitted.id, actor_id=actor)
