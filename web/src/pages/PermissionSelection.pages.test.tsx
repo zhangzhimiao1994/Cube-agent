@@ -127,7 +127,8 @@ describe("independent composer sandbox permissions", () => {
   it("loads the configured default and does not duplicate the control in plus settings", async () => {
     const { user } = await mount({ ...defaults, default_permission_mode: "read_only", default_sandbox_profile: "read_only" });
     await waitFor(() => expect(screen.getByRole("button", { name: /沙箱权限.*只读/ })).toBeTruthy());
-    await user.click(screen.getByRole("button", { name: "打开本次运行配置" }));
+    await user.click(screen.getByRole("button", { name: "更多消息工具" }));
+    await user.click(screen.getByRole("menuitem", { name: "运行设置" }));
     expect(within(screen.getByRole("dialog", { name: "本次运行设置" })).queryByRole("group", { name: "选择本次运行沙箱权限" })).toBeNull();
   });
 

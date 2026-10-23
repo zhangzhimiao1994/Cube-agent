@@ -2144,12 +2144,13 @@ class RunService:
                 mode=mode,
                 request=request,
                 instruction_context=instructions,
-                artifacts=await self._conversation_artifacts(
+                artifacts=await self._runtime_context_artifacts(
                     tenant_id=tenant_id,
                     run_id=run_id,
                     current_request=request,
                     routing_decision=runtime_routing_decision,
                     runtime_token_budget=token_budget,
+                    checkpoint=checkpoint,
                 ),
                 checkpoint=checkpoint,
                 routing_decision=cast(
@@ -3255,6 +3256,25 @@ class RunService:
                 run_id,
                 type(error).__name__,
             )
+
+    async def _runtime_context_artifacts(
+        self, *, tenant_id: UUID, run_id: UUID, current_request: str,
+        routing_decision: Mapping[str, object], runtime_token_budget: int,
+        checkpoint: RuntimeCheckpoint | None,
+    ) -> tuple[Artifact, ...]:
+        from agent_hub.runs.action_context_artifacts import action_context_artifacts
+
+        history = await self._conversation_artifacts(tenant_id=tenant_id, run_id=run_id,
+            current_request=current_request, routing_decision=routing_decision,
+            runtime_token_budget=runtime_token_budget)
+        observations = await action_context_artifacts(self._repository, tenant_id=tenant_id,
+            run_id=run_id, checkpoint=checkpoint, routing_decision=routing_decision)
+        combined = {item.id:item for item in history}
+        for item in observations:
+            if item.id in combined and combined[item.id].to_payload() != item.to_payload():
+                raise ValueError('action observation conflicts with conversation input')
+            combined[item.id] = item
+        return tuple(combined.values())
 
     async def _conversation_artifacts(
         self,

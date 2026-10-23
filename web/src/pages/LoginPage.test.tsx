@@ -106,7 +106,7 @@ describe("LoginPage", () => {
     const message = within(composer).getByRole<HTMLTextAreaElement>("textbox");
     await userEvent.type(message, "登录后的对话草稿");
     expect(message.value).toBe("登录后的对话草稿");
-    const conversationLink = within(screen.getByRole("navigation", { name: "Main navigation" })).getByRole("link", { name: "对话", exact: true });
+    const conversationLink = within(screen.getByRole("navigation", { name: "Main navigation" })).getByRole("link", { name: /^对话$/ });
     expect(conversationLink.getAttribute("href")).toBe("/");
     expect(conversationLink.getAttribute("aria-current")).toBe("page");
   });
@@ -143,7 +143,7 @@ describe("LoginPage", () => {
     const message = within(composer).getByRole<HTMLTextAreaElement>("textbox");
     await userEvent.type(message, "初始化后的对话草稿");
     expect(message.value).toBe("初始化后的对话草稿");
-    const conversationLink = within(screen.getByRole("navigation", { name: "Main navigation" })).getByRole("link", { name: "对话", exact: true });
+    const conversationLink = within(screen.getByRole("navigation", { name: "Main navigation" })).getByRole("link", { name: /^对话$/ });
     expect(conversationLink.getAttribute("href")).toBe("/");
     expect(conversationLink.getAttribute("aria-current")).toBe("page");
   });

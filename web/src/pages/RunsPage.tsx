@@ -3,7 +3,7 @@ import { Fragment, FormEvent, type ReactNode, useEffect, useMemo, useRef, useSta
 import { createPortal } from "react-dom";
 import { Link, useLocation, useNavigate } from "react-router-dom";
 import { z } from "zod";
-import { ArrowUp, FolderClock, MoreHorizontal, Paperclip, Plus } from "lucide-react";
+import { ArrowUp, FolderClock, MoreHorizontal } from "lucide-react";
 
 import { ApiError, api, formatApiError, type AttachmentUpload, type Conversation, type ConversationMetadata, type ConversationQueueItem, type ModelDeployment, type ProjectWorkspace, type RunDetail, type RunListItem, type Skill, type SkillArchiveUpload, type SubmittedRun, type WebPreview, type WorkspaceDirectoryList, type WorkspaceFileList } from "../api/client";
 import { APP_BRAND_NAME } from "../app/brand";
@@ -21,6 +21,7 @@ import { repairActionLabel, repairErrorCodeLabel, repairFailureKindLabel, repair
 import { useCapabilityApprovalDecisions } from "./useCapabilityApprovalDecisions";
 import { useAuth } from "../auth/AuthProvider";
 import { PermissionSelector, type PermissionMode } from "../components/PermissionSelector";
+import { ComposerModeMenu, ComposerMoreMenu } from "../components/ComposerMenus";
 import { resolvePermissionSelection, sandboxPermissions, type SupportedPermissionMode } from "./permissionSelection";
 
 const RUN_MODES = [
@@ -6595,6 +6596,8 @@ export function RunsPage() {
   const [configOpen, setConfigOpen] = useState(false);
   const configDialogRef = useRef<HTMLElement>(null);
   const configTriggerRef = useRef<HTMLButtonElement>(null);
+  const attachmentPickerRef = useRef<HTMLInputElement>(null);
+  const imagePickerRef = useRef<HTMLInputElement>(null);
   const [directModel, setDirectModel] = useState("");
   const [historyOpen, setHistoryOpen] = useState(false);
   const [managedProjectId, setManagedProjectId] = useState("");
@@ -7218,7 +7221,7 @@ export function RunsPage() {
       return api.createRun({
         ...projectInput,
         message: runMessage,
-        mode: "auto",
+        mode: override?.mode ?? "auto",
         reference_workflow_id: workflowId || null,
         allow_workflow_adjustment: false,
         agent_ids: [],
@@ -7240,7 +7243,8 @@ export function RunsPage() {
       setSelectedRunId(run.id);
       if (run.conversation_id) setConversationId(run.conversation_id);
       const selection = modeSelectionFromSubmittedRun(run);
-      const submittedMode: RunMode = "auto";
+      const submittedMode: RunMode = override?.mode ?? "auto";
+      setMode("auto");
       if (selection && submittedMode !== "auto") {
         setTemporaryApproval(null);
         setScheduleApproval(null);
@@ -7586,7 +7590,7 @@ export function RunsPage() {
     },
     onSuccess: async (run) => {
       setModeSelection(null);
-      if (run.mode) setMode(run.mode as RunMode);
+      setMode("auto");
       setSubmitNotice(explainActualMode(run));
       await refreshRunSurfaces(run);
     },
@@ -8078,7 +8082,7 @@ export function RunsPage() {
       }
       setMessage("");
       setSubmitNotice(`已选择“${choice.option.label}”，正在按你的选择继续。`);
-      setMode(choice.option.value as RunMode);
+      setMode("auto");
       chooseMode.mutate({
         chosenMode: choice.option.value as ManualRunMode,
         operatorNote: choice.note || undefined,
@@ -8097,7 +8101,7 @@ export function RunsPage() {
       queueMessage.mutate(trimmed);
       return;
     }
-    createRun.mutate({ message: trimmed, mode: "auto" });
+    createRun.mutate({ message: trimmed, mode });
   }
 
   function clearConversationTransientState() {
@@ -8267,7 +8271,7 @@ export function RunsPage() {
       setUsageOpen(false);
       setConfigOpen(true);
       setMessage("");
-      setSubmitNotice("已打开本轮运行设置，可调整参考方案、执行环境和沙箱权限。");
+      setSubmitNotice("已打开本轮运行设置，可调整运行模式、参考方案、执行环境和沙箱权限。");
       return;
     }
     if (commandId === "memory") {
@@ -8903,12 +8907,25 @@ export function RunsPage() {
           <div className="composer-config-summary" aria-label="本次运行设置概览">
             <strong>本次运行配置</strong>
             <div>
-              <span>主 Agent 自动</span>
+              <span>{mode === "auto" ? "主 Agent 自动" : `本次${displayMode(mode)}`}</span>
               <span>{selectedSandboxLabel}</span>
               <span>{executionBackendLabel}</span>
               <span>{workflowId ? `参考 ${selectedWorkflow?.name ?? workflowId}` : "无参考方案"}</span>
             </div>
           </div>
+          <label htmlFor="run-mode">
+            运行模式
+            <select
+              id="run-mode"
+              value={mode}
+              disabled={canStopLatestRun || createRun.isPending}
+              onChange={(event) => setMode(event.target.value as RunMode)}
+            >
+              {RUN_MODES.map((item) => (
+                <option key={item.value} value={item.value}>{item.label}</option>
+              ))}
+            </select>
+          </label>
           <div className="conversation-workspace-summary">
             <span className="field-label">本次工作目录</span>
             <strong>{activeConversation.data?.project_label?.trim() || projectLabel || projectId}</strong>
@@ -9036,7 +9053,7 @@ export function RunsPage() {
             <div className="mode-help">
               <span className="eyebrow">当前设置</span>
               <p>
-                工作区：{workspacePreviewPath(activeWorkspaceProjectId, selectedRunWorkspaceSessionId)} · 主 Agent 自动 · {selectedSandboxLabel} ·
+                工作区：{workspacePreviewPath(activeWorkspaceProjectId, selectedRunWorkspaceSessionId)} · {mode === "auto" ? "主 Agent 自动" : `本次${displayMode(mode)}`} · {selectedSandboxLabel} ·
                 {executionBackendLabel}
               </p>
               {settings.isLoading ? <p>正在加载默认运行设置...</p> : null}
@@ -9733,20 +9750,38 @@ export function RunsPage() {
             />
             <div className="composer-actions">
               <div className={`composer-tool-row${handoffActive ? " composer-tool-row-reference" : ""}`} aria-label="消息工具">
-                <label className="composer-upload-button">
-                  <Paperclip size={17} aria-hidden="true" />
-                  <span>附件</span>
-                  <input
-                    aria-label="上传文件或 Skill 压缩包"
-                    type="file"
-                    accept={ATTACHMENT_ACCEPT}
-                    disabled={uploadSkillArchive.isPending || uploadAttachment.isPending}
-                    onChange={(event) => {
-                      handleAttachmentUpload(event.currentTarget.files);
-                      event.currentTarget.value = "";
-                    }}
-                  />
-                </label>
+                <input
+                  ref={attachmentPickerRef}
+                  hidden
+                  aria-label="上传文件或 Skill 压缩包"
+                  type="file"
+                  accept={ATTACHMENT_ACCEPT}
+                  disabled={uploadSkillArchive.isPending || uploadAttachment.isPending}
+                  onChange={(event) => {
+                    handleAttachmentUpload(event.currentTarget.files);
+                    event.currentTarget.value = "";
+                  }}
+                />
+                <input
+                  ref={imagePickerRef}
+                  hidden
+                  aria-label="上传照片"
+                  type="file"
+                  accept="image/*"
+                  disabled={uploadSkillArchive.isPending || uploadAttachment.isPending}
+                  onChange={(event) => {
+                    handleAttachmentUpload(event.currentTarget.files);
+                    event.currentTarget.value = "";
+                  }}
+                />
+                <ComposerMoreMenu
+                  triggerRef={configTriggerRef}
+                  uploadsDisabled={uploadSkillArchive.isPending || uploadAttachment.isPending}
+                  onImages={() => imagePickerRef.current?.click()}
+                  onFiles={() => attachmentPickerRef.current?.click()}
+                  onSettings={() => setConfigOpen(true)}
+                  onPlugins={() => navigate("/mcp")}
+                />
                 {handoffActive ? (
                   <button
                     type="button"
@@ -9758,16 +9793,6 @@ export function RunsPage() {
                     取消引用
                   </button>
                 ) : null}
-                <button
-                  ref={configTriggerRef}
-                  type="button"
-                  className="composer-plus-button"
-                  aria-label={configOpen ? "收起本次运行配置" : "打开本次运行配置"}
-                  aria-pressed={configOpen}
-                  onClick={() => setConfigOpen((current) => !current)}
-                >
-                  <Plus size={18} aria-hidden="true" />
-                </button>
                 <PermissionSelector
                   value={permissionMode}
                   onChange={selectPermissionMode}
@@ -9777,16 +9802,11 @@ export function RunsPage() {
                   permissionSupportNotice={supportedPermissionModes.length === 0
                     ? "沿用当前工作区边界与系统审批策略；运行级权限需更新服务器后启用。" : undefined}
                 />
-              </div>
-              <div className="composer-status-line" role="status">
-                <span>
-                  {[
-                    "主 Agent 自动",
-                    selectedSandboxLabel,
-                    workflowId ? `参考 ${selectedWorkflow?.name ?? workflowId}` : null,
-                    referenceConversationId.trim() ? "已引用" : null,
-                  ].filter(Boolean).join(" · ")}
-                </span>
+                <ComposerModeMenu
+                  value={mode}
+                  onChange={setMode}
+                  disabled={canStopLatestRun || createRun.isPending}
+                />
               </div>
               <div className="composer-send-row">
                 {canStopLatestRun && latestVisibleRun ? (

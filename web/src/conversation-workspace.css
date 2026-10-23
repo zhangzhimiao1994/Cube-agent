@@ -117,10 +117,11 @@ body:has(.conversation-workspace)::after { display: none; }
 }
 .conversation-workspace .chat-composer textarea::placeholder { color: #7b8491; }
 .conversation-workspace .composer-actions {
-  align-items: center; display: grid; gap: 12px; grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center; display: grid; gap: 8px; grid-template-columns: minmax(0, 1fr) auto;
   max-width: none; width: 100%;
 }
-.conversation-workspace .composer-tool-row { display: flex; gap: 4px; }
+.conversation-workspace .composer-tool-row { display: flex; flex-wrap: nowrap; gap: 4px; min-width: 0; }
+.conversation-workspace .composer-tool-row > input[hidden] { display: none; }
 .conversation-workspace .composer-status-line { background: none; border: 0; color: #646b78; font-size: 12px; font-weight: 400; min-height: 0; padding: 0; text-align: right; }
 .conversation-workspace .composer-upload-button,
 .conversation-workspace .composer-plus-button {
@@ -240,6 +241,10 @@ body:has(.conversation-workspace) .mode-choice-grid small { color: #646b78; }
   .conversation-workspace .chat-composer { gap: 8px; margin-bottom: max(10px, env(safe-area-inset-bottom)); max-height: 48dvh; padding: 10px; width: calc(100% - 24px); }
   .conversation-workspace .chat-composer textarea { font-size: 16px; min-height: 60px; }
   .conversation-workspace .composer-actions { gap: 6px; }
+  .conversation-workspace .composer-tool-row-reference { flex-wrap: wrap; }
+  .conversation-workspace .composer-tool-row-reference .composer-reference-button { order: 1; }
+  .conversation-workspace .composer-tool-row .permission-selector-trigger { flex: 0 0 auto; gap: 4px; padding: 6px; }
+  .conversation-workspace .composer-actions:has(.composer-stop-button) { grid-template-columns: minmax(0, 1fr); }
   .conversation-workspace .composer-status-line { font-size: 11px; line-height: 1.5; }
   .conversation-workspace .composer-send-row button { min-width: 44px; padding: 6px 9px; }
   .conversation-workspace .message-table :is(th, td) { font-size: 14px; padding: 9px 10px; }
