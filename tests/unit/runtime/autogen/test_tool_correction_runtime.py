@@ -8,6 +8,7 @@ from uuid import UUID
 
 import pytest
 
+from agent_hub.models.capacity import CapacityWaitTimeout
 from agent_hub.models.gateway import GatewayCompletion, GatewayRejectedOutput
 from agent_hub.models.types import ModelRequest, ModelResponse, RejectedOutputEvidence, TokenUsage
 from agent_hub.runtime.artifacts import ArtifactReference
@@ -91,6 +92,24 @@ async def test_known_tool_rejection_is_corrected_and_delivered_with_actual_final
     assert len(final) == 1 and final[0].content["text"] == REPORT
     saved = await runtime.save_checkpoint()
     assert saved.state[POLICY] == 1 and "PRIVATE_REJECTED_BODY" not in str(saved.to_payload())
+
+
+async def test_correction_capacity_failure_reports_current_fault_not_first_rejection() -> None:
+    class CapacityFailure(CorrectingModel):
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+            if request.required_tool == "project_inspect" and self.rejected:
+                self.requests.append(request)
+                raise CapacityWaitTimeout("model capacity wait timeout")
+            return await super().complete_with_context(request)
+
+    ctx, model = correction_context(), CapacityFailure()
+    tools = backend(ctx)
+    runtime = AutoGenDiscussionRuntime(model, configuration(), capability_gateway=tools)
+    events = [event async for event in runtime.run(ctx)]
+    assert events[-1].kind is EventKind.RUNTIME_FAILED
+    assert events[-1].reason is not None and "capacity" in events[-1].reason
+    assert "invalid_tool" not in events[-1].reason
+    assert not tools.calls
 
 
 @pytest.mark.parametrize("boundary", ["rejection", "correction_intent", "accepted_correction"])

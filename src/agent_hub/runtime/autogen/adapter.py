@@ -527,6 +527,11 @@ class _DiscussionDurability:
                 validate_rejected_model_rows(self.model_entries, run_id=self._context_run_id,
                     tenant_id=self._context_tenant_id, repair_enabled=True)
             await self._checkpoint()
+            if correction_for is not None:
+                # The stopped receipt remains in the ledger; active diagnostics
+                # now belong to this acknowledged attempt, including failures.
+                self.failure_reason = None
+                self.failure_payload = {}
             return None
         except BaseException:
             if self._model_lock.locked():
@@ -2235,8 +2240,17 @@ class GatewayChatCompletionClient(ChatCompletionClient):
                 raise stopped from None
             # A second rejection escapes this handler. No unchanged request,
             # terminal-run reset, third attempt or permission expansion occurs.
-            return await self._complete_model_attempt(corrected, tool_names, cancellation_token,
-                                                       correction_for=record.position)
+            assert record.usage is not None
+            self._total = RequestUsage(
+                prompt_tokens=self._total.prompt_tokens + record.usage.prompt_tokens,
+                completion_tokens=self._total.completion_tokens + record.usage.completion_tokens,
+            )
+            completion, usage = await self._complete_model_attempt(
+                corrected, tool_names, cancellation_token, correction_for=record.position)
+            usage = RequestUsage(prompt_tokens=record.usage.prompt_tokens + usage.prompt_tokens,
+                                 completion_tokens=record.usage.completion_tokens + usage.completion_tokens)
+            self._actual = usage
+            return completion, usage
 
     async def _complete_model_attempt(
         self, request: ModelRequest, tool_names: Mapping[str, str],

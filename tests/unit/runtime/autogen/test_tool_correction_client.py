@@ -6,6 +6,8 @@ from typing import cast
 from uuid import UUID, uuid4
 
 import pytest
+from autogen_core.models import UserMessage
+from autogen_core.tools import ToolSchema
 
 from agent_hub.models.gateway import (
     GatewayCompletion,
@@ -69,17 +71,18 @@ class Journal:
 
 class Model:
     def __init__(self, journal: Journal, *, kind: str = "invalid_tool", always_reject: bool = False,
-                 forbidden: bool = False) -> None:
+                 forbidden: bool = False, tool_names: dict[str, str] | None = None) -> None:
         self.journal, self.kind = journal, kind
         self.always_reject, self.forbidden = always_reject, forbidden
         self.requests: list[ModelRequest] = []
+        self.tool_names = TOOLS if tool_names is None else tool_names
 
     async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
         assert not self.forbidden, "known result or UNKNOWN may not call the model again"
         self.requests.append(request)
         rows = self.journal.snapshots[-1]
         assert rows[-1]["status"] == "running"
-        assert rows[-1]["request_hash"] == _DiscussionDurability.request_hash(request, tool_names=TOOLS)
+        assert rows[-1]["request_hash"] == _DiscussionDurability.request_hash(request, tool_names=self.tool_names)
         if len(self.requests) == 1 or self.always_reject:
             known = self.kind != "missing"
             status: RejectedOutputStatus = (
@@ -201,3 +204,28 @@ async def test_running_correction_is_unknown_and_cannot_be_reissued() -> None:
     with pytest.raises(RuntimeExecutionError, match="model outcome is uncertain"):
         await client(other, restored, usage)._complete_model_request(request(), TOOLS, None)
     assert not other.requests and journal.snapshots[-1] == accepted and usage.tokens == 13
+
+
+async def test_public_create_reports_both_attempts_without_recounting_durable_usage_on_replay() -> None:
+    journal, usage = Journal(), DiscussionUsage()
+    aliases = {"workspace.list": "workspace.list", "workspace_list": "workspace.list"}
+    model = Model(journal, tool_names=aliases)
+    tools: list[ToolSchema] = [{"name": "workspace.list", "description": "List the current workspace",
+              "parameters": {"type": "object", "additionalProperties": False, "properties": {}}}]
+
+    def public_client(provider: Model, durability: _DiscussionDurability) -> GatewayChatCompletionClient:
+        return GatewayChatCompletionClient(provider, "shared", usage, durability=durability,
+            supports_tool_calls=True, tool_correction_enabled=True,
+            engineering_action=lambda force: "workspace.list",
+            engineering_budget=lambda: (100 - usage.tokens, 5.0))
+
+    first = public_client(model, journal.durability())
+    result = await first.create([UserMessage(content="Build the project", source="user")], tools=tools)
+    assert (result.usage.prompt_tokens, result.usage.completion_tokens) == (9, 4)
+    assert first.actual_usage() == first.total_usage() == result.usage
+    assert usage.tokens == 13
+    other = Model(journal, forbidden=True)
+    restored = public_client(other, journal.durability(models=tuple(dict(row) for row in journal.snapshots[-1])))
+    replay = await restored.create([UserMessage(content="Build the project", source="user")], tools=tools)
+    assert replay.usage == result.usage and restored.total_usage() == replay.usage
+    assert usage.tokens == 13 and not other.requests
