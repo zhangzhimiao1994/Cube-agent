@@ -105,7 +105,17 @@ from agent_hub.runtime.autogen.engineering_delivery import (
     engineering_evidence_limits,
     engineering_progress,
 )
-from agent_hub.runtime.autogen.model_rejection import rejection_record, validate_rejection
+from agent_hub.runtime.autogen.model_rejection import (
+    RejectedModelRecord,
+    rejection_record,
+    validate_rejection,
+)
+from agent_hub.runtime.autogen.model_tool_correction import (
+    TOOL_CORRECTION_POLICY,
+    eligible_tool_rejection,
+    tool_correction_request,
+    validate_rejected_model_rows,
+)
 from agent_hub.runtime.autogen.termination import CompositeDiscussionTermination, DiscussionUsage
 from agent_hub.runtime.contracts import (
     Artifact,
@@ -339,6 +349,12 @@ class RuntimeExecutionError(RuntimeError):
     """Stable discussion runtime failure."""
 
 
+class _StoppedModelResponse(RuntimeExecutionError):
+    def __init__(self, record: RejectedModelRecord) -> None:
+        super().__init__(record.failure_reason())
+        self.record = record
+
+
 class _AutoGenCleanupIncomplete(ProcessCleanupIncomplete):
     """Owned framework cleanup failed; stream closure must not hide that fact."""
 
@@ -381,6 +397,7 @@ class _DiscussionDurability:
         *,
         run_id: UUID,
         tenant_id: UUID | None = None,
+        tool_correction_enabled: bool = False,
         model_entries: tuple[_LedgerEntry, ...] = (),
         tool_entries: tuple[_LedgerEntry, ...] = (),
         artifacts: tuple[Artifact, ...] = (),
@@ -392,6 +409,7 @@ class _DiscussionDurability:
         self._finalize = finalize
         self._context_run_id = run_id
         self._context_tenant_id = tenant_id
+        self._tool_correction_enabled = tool_correction_enabled
         self.model_entries = [dict(entry) for entry in model_entries]
         self.tool_entries = [dict(entry) for entry in tool_entries]
         self._artifacts = {str(artifact.id): artifact for artifact in artifacts}
@@ -452,7 +470,8 @@ class _DiscussionDurability:
         tool_names: Mapping[str, str] | None = None,
         bounded_no_tool: bool = False,
         report_binding: Mapping[str, JsonValue] | None = None,
-    ) -> GatewayCompletion | None:
+        correction_for: int | None = None,
+    ) -> GatewayCompletion | RejectedModelRecord | None:
         if self.failure_reason == _GENERATED_DRAFT_NO_PROGRESS:
             raise RuntimeExecutionError(_GENERATED_DRAFT_NO_PROGRESS)
         await self._model_lock.acquire()
@@ -460,6 +479,9 @@ class _DiscussionDurability:
         try:
             if self._model_cursor < len(self.model_entries):
                 entry = self.model_entries[self._model_cursor]
+                if (entry.get("correction_for") != correction_for
+                        or (correction_for is not None and type(entry.get("correction_for")) is not int)):
+                    raise RuntimeExecutionError("durable tool correction binding mismatch")
                 if report_binding is not None:
                     saved_binding = entry.get("report_binding")
                     if (not isinstance(saved_binding, Mapping) or set(saved_binding) != set(report_binding)
@@ -473,6 +495,16 @@ class _DiscussionDurability:
                     self.failure_reason = "model_outcome_uncertain"
                     self.failure_payload = {}
                     raise ModelOutcomeUncertain("model outcome is uncertain")
+                if status == "rejected" and self._tool_correction_enabled:
+                    assert self._context_tenant_id is not None
+                    validate_rejected_model_rows(self.model_entries, run_id=self._context_run_id,
+                        tenant_id=self._context_tenant_id, repair_enabled=True)
+                    record = validate_rejection(cast(Mapping[str, JsonValue], entry["rejection"]),
+                        run_id=self._context_run_id, tenant_id=self._context_tenant_id,
+                        position=self._model_cursor, request_hash=request_hash)
+                    self._model_cursor += 1
+                    self._model_lock.release()
+                    return record
                 if status != "succeeded":
                     raise RuntimeExecutionError("durable model ledger is invalid")
                 artifact_id = cast(str, entry["artifact_id"])
@@ -487,7 +519,13 @@ class _DiscussionDurability:
                 "required_tool": request.required_tool, "max_output_tokens": request.max_output_tokens,
                 "timeout_seconds": request.timeout_seconds,
             } if request.required_tool is not None or bounded_no_tool else {}),
-                **({"report_binding": dict(report_binding)} if report_binding is not None else {})})
+                **({"report_binding": dict(report_binding)} if report_binding is not None else {}),
+                **({"correction_for": correction_for} if correction_for is not None else {})})
+            if correction_for is not None:
+                if not self._tool_correction_enabled or self._context_tenant_id is None:
+                    raise RuntimeExecutionError("tool correction policy is unavailable")
+                validate_rejected_model_rows(self.model_entries, run_id=self._context_run_id,
+                    tenant_id=self._context_tenant_id, repair_enabled=True)
             await self._checkpoint()
             return None
         except BaseException:
@@ -533,6 +571,9 @@ class _DiscussionDurability:
             self.fail_model()
             raise
         self._finalize(write_id)
+        if "correction_for" in entry:
+            self.failure_reason = None
+            self.failure_payload = {}
         self._model_lock.release()
         return artifact
 
@@ -550,7 +591,7 @@ class _DiscussionDurability:
     async def reject_model(
         self, request: ModelRequest, rejected: GatewayRejectedOutput, *,
         usage: DiscussionUsage, tool_names: Mapping[str, str],
-    ) -> None:
+    ) -> RejectedModelRecord:
         entry = self.model_entries[self._model_cursor]
         previous, tokens, cost = dict(entry), usage.tokens, usage.cost_usd
         try:
@@ -578,6 +619,7 @@ class _DiscussionDurability:
         self.failure_reason = record.failure_reason()
         self.failure_payload = runtime_failure_diagnostic_from_reason(self.failure_reason)
         self._model_lock.release()
+        return record
 
     async def before_tool(
         self,
@@ -2001,6 +2043,7 @@ class GatewayChatCompletionClient(ChatCompletionClient):
         bounded_no_tool: bool = False,
         report_binding: Callable[[], Mapping[str, JsonValue]] | None = None,
         report_evidence: Callable[[], str] | None = None,
+        tool_correction_enabled: bool = False,
     ) -> None:
         self._gateway = gateway
         self._logical_model = logical_model
@@ -2016,6 +2059,7 @@ class GatewayChatCompletionClient(ChatCompletionClient):
         self._bounded_no_tool = bounded_no_tool
         self._report_binding = report_binding
         self._report_evidence = report_evidence
+        self._tool_correction_enabled = tool_correction_enabled
         self._actual = RequestUsage(prompt_tokens=0, completion_tokens=0)
         self._total = RequestUsage(prompt_tokens=0, completion_tokens=0)
 
@@ -2161,13 +2205,53 @@ class GatewayChatCompletionClient(ChatCompletionClient):
         self, request: ModelRequest, tool_names: Mapping[str, str],
         cancellation_token: CancellationToken | None,
     ) -> tuple[GatewayCompletion, RequestUsage]:
+        try:
+            return await self._complete_model_attempt(request, tool_names, cancellation_token)
+        except _StoppedModelResponse as stopped:
+            record = stopped.record
+            durability = self._durability
+            if (not self._tool_correction_enabled or durability is None
+                    or self._engineering_budget is None or request.required_tool is None
+                    or not eligible_tool_rejection(record)):
+                raise
+            if durability._model_cursor < len(durability.model_entries):
+                saved = durability.model_entries[durability._model_cursor]
+                if type(saved.get("correction_for")) is not int or saved.get("correction_for") != record.position:
+                    raise RuntimeExecutionError("durable tool correction binding mismatch") from None
+                tokens, seconds = saved.get("max_output_tokens"), saved.get("timeout_seconds")
+            else:
+                tokens, seconds = self._engineering_budget()
+                if self._request_timeout is not None:
+                    seconds = min(seconds, self._request_timeout())
+                if (type(tokens) is not int or isinstance(seconds, bool)
+                    or not isinstance(seconds, int | float) or not math.isfinite(seconds)):
+                    raise stopped from None
+                tokens = min(tokens, request.max_output_tokens)
+                seconds = min(seconds, request.timeout_seconds)
+            try:
+                corrected = tool_correction_request(request, record,
+                    max_output_tokens=cast(int, tokens), timeout_seconds=cast(float, seconds))
+            except (TypeError, ValueError):
+                raise stopped from None
+            # A second rejection escapes this handler. No unchanged request,
+            # terminal-run reset, third attempt or permission expansion occurs.
+            return await self._complete_model_attempt(corrected, tool_names, cancellation_token,
+                                                       correction_for=record.position)
+
+    async def _complete_model_attempt(
+        self, request: ModelRequest, tool_names: Mapping[str, str],
+        cancellation_token: CancellationToken | None, *, correction_for: int | None = None,
+    ) -> tuple[GatewayCompletion, RequestUsage]:
         completion = (
             await self._durability.before_model(request, tool_names=tool_names,
                 bounded_no_tool=self._bounded_no_tool,
-                report_binding=self._report_binding() if self._report_binding is not None else None)
+                report_binding=self._report_binding() if self._report_binding is not None else None,
+                correction_for=correction_for)
             if self._durability is not None
             else None
         )
+        if isinstance(completion, RejectedModelRecord):
+            raise _StoppedModelResponse(completion)
         replayed = completion is not None
         if completion is None:
             try:
@@ -2192,8 +2276,8 @@ class GatewayChatCompletionClient(ChatCompletionClient):
                 raise
             except GatewayRejectedOutput as error:
                 if self._durability is not None:
-                    await self._durability.reject_model(request, error, usage=self._usage, tool_names=tool_names)
-                    raise RuntimeExecutionError(self._durability.failure_reason) from None
+                    record = await self._durability.reject_model(request, error, usage=self._usage, tool_names=tool_names)
+                    raise _StoppedModelResponse(record) from None
                 raise RuntimeExecutionError(safe_model_gateway_failure_reason(error)
                     or "model gateway failed: model response rejected") from None
             except Exception as error:
@@ -2417,6 +2501,8 @@ class AutoGenDiscussionRuntime:
         engineering = engineering_delivery_required(context, allowed_tools)
         reports = (engineering and type(context.routing_decision.get(FINAL_REPORT_POLICY)) is int
                    and context.routing_decision.get(FINAL_REPORT_POLICY) == 1)
+        corrections = (engineering and type(context.routing_decision.get(TOOL_CORRECTION_POLICY)) is int
+                       and context.routing_decision.get(TOOL_CORRECTION_POLICY) == 1)
         report_model = context.routing_decision.get(
             "main_agent_model", self._plan.participants[0].logical_model,
         )
@@ -2624,12 +2710,21 @@ class AutoGenDiscussionRuntime:
                 sequence = cast(int, restored.state["next_sequence"])
                 rejected_rows = [(index, entry) for index, entry in enumerate(
                     self._restored_ledger(restored, "model_ledger")) if entry.get("status") == "rejected"]
-                if rejected_rows:
-                    position, entry = rejected_rows[0]
+                if rejected_rows and self._restored_ledger(restored, "model_ledger")[-1].get("status") == "rejected":
+                    position, entry = rejected_rows[-1]
                     record = validate_rejection(cast(Mapping[str, JsonValue], entry["rejection"]),
                         run_id=context.run_id, tenant_id=context.tenant_id,
                         position=position, request_hash=entry.get("request_hash"))
-                    failure = record.failure_reason()
+                    if not (corrections and eligible_tool_rejection(record)
+                            and "correction_for" not in entry and isinstance(entry.get("required_tool"), str)):
+                        failure = record.failure_reason()
+                        yield RunEvent(kind=EventKind.RUNTIME_FAILED, sequence=sequence,
+                            run_id=context.run_id, reason=failure,
+                            payload=runtime_failure_diagnostic_from_reason(failure))
+                        return
+                if corrections and any("correction_for" in row and row.get("status") == "running"
+                    for row in self._restored_ledger(restored, "model_ledger")):
+                    failure = "model outcome is uncertain"
                     yield RunEvent(kind=EventKind.RUNTIME_FAILED, sequence=sequence,
                         run_id=context.run_id, reason=failure,
                         payload=runtime_failure_diagnostic_from_reason(failure))
@@ -2747,6 +2842,7 @@ class AutoGenDiscussionRuntime:
                 finalize_ledger_artifact,
                 run_id=context.run_id,
                 tenant_id=context.tenant_id,
+                tool_correction_enabled=corrections,
                 model_entries=self._restored_ledger(restored, "model_ledger"),
                 tool_entries=self._restored_ledger(restored, "tool_ledger"),
                 artifacts=ledger_artifacts,
@@ -2795,7 +2891,11 @@ class AutoGenDiscussionRuntime:
                             engineering_tool_prefix=durability.engineering_tool_prefix)
                         self._pending_artifact_writes.pop(write_id, None)
                 else:
-                    if any(row.get("status") != "succeeded" for row in durability.model_entries):
+                    if any(row.get("status") != "succeeded" and not (
+                        row.get("status") == "rejected" and index + 1 < len(durability.model_entries)
+                        and durability.model_entries[index + 1].get("status") == "succeeded"
+                        and durability.model_entries[index + 1].get("correction_for") == index)
+                        for index, row in enumerate(durability.model_entries)):
                         raise ModelOutcomeUncertain("model outcome is uncertain")
                     if any("report_binding" in row for row in durability.model_entries):
                         raise RuntimeExecutionError("durable final report phase is invalid")
@@ -2839,6 +2939,7 @@ class AutoGenDiscussionRuntime:
                     engineering_budget=action_budget if actions and participant.id == owner else None,
                     request_timeout=request_timeout,
                     acceptance_first=continuation and participant.id == owner,
+                    tool_correction_enabled=corrections and participant.id == owner,
                 )
                 for participant in self._plan.participants
             }
@@ -3755,6 +3856,9 @@ class AutoGenDiscussionRuntime:
             **({FINAL_REPORT_POLICY: 1} if engineering
                and type(context.routing_decision.get(FINAL_REPORT_POLICY)) is int
                and context.routing_decision.get(FINAL_REPORT_POLICY) == 1 else {}),
+            **({TOOL_CORRECTION_POLICY: 1} if engineering
+               and type(context.routing_decision.get(TOOL_CORRECTION_POLICY)) is int
+               and context.routing_decision.get(TOOL_CORRECTION_POLICY) == 1 else {}),
         }
         if engineering:
             while True:
@@ -3819,7 +3923,7 @@ class AutoGenDiscussionRuntime:
             )
         optional_state = (
             {"remaining_absolute_timeout_seconds", "engineering_tool_prefix", "engineering_action_version",
-             ENGINEERING_CONTINUATION_POLICY, _CHECKPOINT_ACK_POLICY, FINAL_REPORT_POLICY}
+             ENGINEERING_CONTINUATION_POLICY, _CHECKPOINT_ACK_POLICY, FINAL_REPORT_POLICY, TOOL_CORRECTION_POLICY}
             if checkpoint.runtime_version == _RUNTIME_VERSION
             else set()
         )
@@ -3856,6 +3960,12 @@ class AutoGenDiscussionRuntime:
                 type(state[FINAL_REPORT_POLICY]) is not int or state[FINAL_REPORT_POLICY] != 1))):
             raise RuntimeExecutionError("runtime checkpoint is incompatible")
         registry = state["artifact_registry"]
+        corrections = (engineering and type(context.routing_decision.get(TOOL_CORRECTION_POLICY)) is int
+                       and context.routing_decision.get(TOOL_CORRECTION_POLICY) == 1)
+        if ((TOOL_CORRECTION_POLICY in state) != corrections
+            or (TOOL_CORRECTION_POLICY in state and (
+                type(state[TOOL_CORRECTION_POLICY]) is not int or state[TOOL_CORRECTION_POLICY] != 1))):
+            raise RuntimeExecutionError("runtime checkpoint is incompatible")
         usage = state["usage"]
         model_ledger = state["model_ledger"]
         tool_ledger = state["tool_ledger"]
@@ -3973,20 +4083,12 @@ class AutoGenDiscussionRuntime:
             raise RuntimeExecutionError("runtime checkpoint artifacts are invalid")
         by_id = {str(artifact.id): artifact for artifact in artifacts}
         models = self._restored_ledger(checkpoint, "model_ledger")
-        for position, model_entry in enumerate(models):
-            if model_entry.get("status") != "rejected" and "rejection" not in model_entry:
-                continue
-            try:
-                required = {"status", "request_hash", "rejection"}
-                optional = {"required_tool", "max_output_tokens", "timeout_seconds", "report_binding"}
-                if (model_entry.get("status") != "rejected" or position != len(models) - 1
-                        or not required <= set(model_entry) <= required | optional
-                        or not isinstance(model_entry["rejection"], Mapping)):
-                    raise ValueError("rejection ledger schema is invalid")
-                validate_rejection(model_entry["rejection"], run_id=context.run_id, tenant_id=context.tenant_id,
-                    position=position, request_hash=model_entry.get("request_hash"))
-            except (ArithmeticError, KeyError, TypeError, ValueError):
-                raise RuntimeExecutionError("durable model rejection is invalid") from None
+        try:
+            validate_rejected_model_rows(models, run_id=context.run_id, tenant_id=context.tenant_id,
+                repair_enabled=type(context.routing_decision.get(TOOL_CORRECTION_POLICY)) is int
+                    and context.routing_decision.get(TOOL_CORRECTION_POLICY) == 1)
+        except (ArithmeticError, KeyError, TypeError, ValueError):
+            raise RuntimeExecutionError("durable model rejection is invalid") from None
         allowed_by_actor = {participant.id: participant.allowed_tools for participant in self._plan.participants}
         draft_observations: set[str] = set()
         for entry in cast(tuple[Mapping[str, JsonValue], ...], checkpoint.state["tool_ledger"]):

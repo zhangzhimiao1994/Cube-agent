@@ -29,7 +29,9 @@ async def test_fresh_generated_discuss_pins_continuation_without_changing_other_
     assert len(runtime.contexts) == 1
     actual = runtime.contexts[0].routing_decision
     assert (actual.get("engineering_writer_continuation_version") == 1) is expected
-    assert (actual.get("engineering_checkpoint_ack_version") == 1) is expected
+    # All fresh Discuss engineering calls now need ACK before a correction can
+    # enter the provider; writer-continuation remains generated-project only.
+    assert (actual.get("engineering_checkpoint_ack_version") == 1) is (mode is TaskMode.DISCUSS)
     assert (repository.row.routing_decision.get("engineering_writer_continuation_version") == 1) is expected
 
 

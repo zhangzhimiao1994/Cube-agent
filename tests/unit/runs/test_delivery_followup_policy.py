@@ -26,6 +26,12 @@ async def test_fresh_execution_pins_followup_guidance(mode):
     assert (runtime.contexts[0].routing_decision.get("engineering_final_report_version") == 1) is (
         mode is TaskMode.DISCUSS
     )
+    assert (runtime.contexts[0].routing_decision.get("engineering_tool_correction_version") == 1) is (
+        mode is TaskMode.DISCUSS
+    )
+    assert (runtime.contexts[0].routing_decision.get("engineering_checkpoint_ack_version") == 1) is (
+        mode is TaskMode.DISCUSS
+    )
 
 
 @pytest.mark.parametrize("mode", [mode for mode in TaskMode if mode is not TaskMode.AUTO])
@@ -42,6 +48,7 @@ async def test_recovery_keeps_existing_followup_policy(mode, version):
     route = {"source": "manual"}
     if version is not None:
         route["delivery_followup_version"] = version
+        route["engineering_tool_correction_version"] = version
     repository = CheckpointRepository(routing_decision=route)
     repository.row.mode = mode.value
     runtime = ContextRecordingRuntime()
@@ -52,3 +59,5 @@ async def test_recovery_keeps_existing_followup_policy(mode, version):
     assert submitted.status is RunStatus.COMPLETED
     assert runtime.contexts[0].routing_decision.get("delivery_followup_version") == version
     assert "engineering_final_report_version" not in runtime.contexts[0].routing_decision
+    assert runtime.contexts[0].routing_decision.get("engineering_tool_correction_version") == version
+    assert "engineering_checkpoint_ack_version" not in runtime.contexts[0].routing_decision
