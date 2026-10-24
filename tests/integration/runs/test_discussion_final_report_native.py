@@ -73,6 +73,9 @@ class OfflineReportGateway(ReportGateway):
     def __init__(self, *, report: str = REPORT, forbidden: bool = False) -> None:
         super().__init__(report=report)
         self.forbidden = forbidden
+        # The real driver selects required milestones. A second scripted tool
+        # sequence would request verification twice rather than test that path.
+        self.actions.clear()
 
     async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
         if self.forbidden:
