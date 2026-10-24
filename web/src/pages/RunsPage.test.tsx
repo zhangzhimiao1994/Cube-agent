@@ -729,6 +729,60 @@ describe("conversation ordering", () => {
     ]);
   });
 
+  it.each(["main", "final_synthesizer"])("prefers an explicit final answer over upstream %s and later reviewers or attachments", (title) => {
+    const run: RunDetail = {
+      ...baseRun,
+      status: "completed",
+      artifacts: [
+        { id: "upstream", kind: "text", title, text: "Upstream draft." },
+        { id: "report", kind: "text", title: "delivery_main_agent", presentation: "final_answer",
+          text: "## Delivery\n\nThe requested changes are ready. Checks passed." },
+        { id: "review", kind: "text", title: "quality_reviewer", text: "Later review notes." },
+        { id: "attachment", kind: "tool_result", title: "main", text: "Project archive ready.",
+          presentation: "final_attachment", filename: "project.zip", mime_type: "application/zip",
+          download_url: "/api/v1/runs/run/artifacts/attachment/download" },
+      ],
+    };
+
+    const reply = conversationMessages([run]).find((message) => message.title === "回复");
+
+    expect(reply?.id).toContain("report");
+    expect(reply?.body).toContain("The requested changes are ready.");
+    expect(reply?.body).not.toContain("Upstream draft");
+    expect(reply?.body).not.toContain("Later review notes");
+    expect(reply?.body).not.toContain("Project archive ready");
+  });
+
+  it("preserves explicit final answer identity when its text duplicates an upstream draft", () => {
+    const run: RunDetail = { ...baseRun, artifacts: [
+      { id: "upstream", kind: "text", title: "main", text: "Delivered and checked." },
+      { id: "report", kind: "text", title: "delivery_main_agent", text: "Delivered and checked.", presentation: "final_answer" },
+      { id: "later", kind: "text", title: "main", text: "Later process note." },
+    ] };
+    const reply = conversationMessages([run]).find((message) => message.title === "回复");
+    expect(reply?.id).toContain("report");
+    expect(reply?.body).toContain("Delivered and checked.");
+  });
+
+  it.each([undefined, "", " \n\t "])("ignores empty final answer text (%s) while retaining legacy replies", (text) => {
+    const run: RunDetail = { ...baseRun, artifacts: [
+      { id: "ordinary", kind: "text", title: "main", text: "An ordinary reply." },
+      { id: "empty-final", kind: "text", title: "delivery_main_agent", text, presentation: "final_answer" },
+      { id: "review", kind: "text", title: "reviewer", text: "Later review." },
+    ] };
+    expect(conversationMessages([run]).find((message) => message.title === "回复")?.body)
+      .toContain("An ordinary reply.");
+  });
+
+  it.each(["main", "final_synthesizer", "domain_expert", "copywriter", "assistant"])("retains ordinary and legacy %s replies without explicit final presentation", (title) => {
+    const run: RunDetail = { ...baseRun, artifacts: [
+      { id: "ordinary", kind: "text", title, text: "An ordinary reply." },
+      { id: "review", kind: "text", title: "reviewer", text: "Later review." },
+    ] };
+    expect(conversationMessages([run]).find((message) => message.title === "回复")?.body)
+      .toContain("An ordinary reply.");
+  });
+
   it("does not render download-only main artifacts as standalone attachment replies", () => {
     const run: RunDetail = {
       ...baseRun,

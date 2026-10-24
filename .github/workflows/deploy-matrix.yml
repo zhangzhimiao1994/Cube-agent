@@ -2,6 +2,9 @@ name: deploy-matrix
 
 on:
   workflow_dispatch:
+  push:
+    tags:
+      - 'harness-stage-*'
 
 jobs:
   compose:

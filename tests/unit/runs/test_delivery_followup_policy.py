@@ -23,6 +23,9 @@ async def test_fresh_execution_pins_followup_guidance(mode):
     assert submitted.status is RunStatus.COMPLETED
     assert runtime.contexts[0].routing_decision.get("delivery_followup_version") == 2
     assert repository.row.routing_decision.get("delivery_followup_version") == 2
+    assert (runtime.contexts[0].routing_decision.get("engineering_final_report_version") == 1) is (
+        mode is TaskMode.DISCUSS
+    )
 
 
 @pytest.mark.parametrize("mode", [mode for mode in TaskMode if mode is not TaskMode.AUTO])
@@ -48,3 +51,4 @@ async def test_recovery_keeps_existing_followup_policy(mode, version):
     submitted = await service.execute(repository.run_id)
     assert submitted.status is RunStatus.COMPLETED
     assert runtime.contexts[0].routing_decision.get("delivery_followup_version") == version
+    assert "engineering_final_report_version" not in runtime.contexts[0].routing_decision

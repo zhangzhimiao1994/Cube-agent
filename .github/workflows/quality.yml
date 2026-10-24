@@ -2,6 +2,9 @@ name: quality
 
 on:
   workflow_dispatch:
+  push:
+    tags:
+      - 'harness-stage-*'
 
 jobs:
   python-web-shell:

@@ -2786,9 +2786,13 @@ function toolFailureSummary(event: RunDetail["events"][number]) {
 
 function dedupeTextArtifacts(artifacts: RunDetail["artifacts"]) {
   const seen = new Set<string>();
+  const finalTexts = new Set(artifacts
+    .filter((artifact) => artifact.presentation === "final_answer")
+    .map((artifact) => artifact.text?.trim()));
   return artifacts.filter((artifact) => {
     const text = artifact.text?.trim();
     if (!text || isGenericArtifactText(text) || seen.has(text)) return false;
+    if (artifact.presentation !== "final_answer" && finalTexts.has(text)) return false;
     seen.add(text);
     return true;
   });
@@ -2798,6 +2802,7 @@ function preferredReplyArtifact(artifacts: RunDetail["artifacts"]) {
   const preferredTitles = new Set(["main", "final_synthesizer", "domain_expert", "copywriter"]);
   const internalTitles = new Set(["decision_recorder", "quality_reviewer", "reviewer"]);
   return (
+    [...artifacts].reverse().find((artifact) => artifact.presentation === "final_answer" && artifact.text?.trim()) ??
     [...artifacts].reverse().find((artifact) => preferredTitles.has(artifact.title)) ??
     [...artifacts].reverse().find((artifact) => !internalTitles.has(artifact.title)) ??
     null

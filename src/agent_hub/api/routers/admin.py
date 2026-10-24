@@ -17650,6 +17650,18 @@ def _artifact_presentation(
     content = artifact.get("content")
     containers: list[Mapping[str, object]] = []
     if isinstance(content, Mapping):
+        report = content.get("engineering_report")
+        if (
+            artifact.get("type") == "text"
+            and artifact.get("producer") == "delivery_main_agent"
+            and content.get("presentation") == "final_answer"
+            and _artifact_text(content) is not None
+            and isinstance(report, Mapping)
+            and type(report.get("version")) is int
+            and report.get("version") == 1
+            and report.get("owner") == "delivery_main_agent"
+        ):
+            return "final_answer"
         containers.append(content)
         result = content.get("result")
         if isinstance(result, Mapping):
