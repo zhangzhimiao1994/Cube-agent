@@ -58,7 +58,7 @@ Boundary = Literal["correction_intent", "accepted_correction", "inspection_inten
 
 def inspection_hash(request: ModelRequest) -> str:
     return _DiscussionDurability.request_hash(
-        request, tool_names={"project_inspect": "project.inspect"},
+        request, tool_names={"project.inspect": "project.inspect", "project_inspect": "project.inspect"},
     )
 
 

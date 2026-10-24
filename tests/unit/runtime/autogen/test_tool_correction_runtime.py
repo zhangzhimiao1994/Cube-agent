@@ -142,7 +142,10 @@ async def test_cold_boundaries_keep_unknown_stopped_and_reuse_known_corrected_ou
         if boundary == "rejection":
             assert len(inspections) == 1
             rejected = cast(tuple[Mapping[str, JsonValue], ...], saved.state["model_ledger"])[-1]
-            assert _DiscussionDurability.request_hash(inspections[0], tool_names={"project_inspect": "project.inspect"}) != rejected["request_hash"]
+            aliases = {"project.inspect": "project.inspect", "project_inspect": "project.inspect"}
+            original = next(request for request in model.requests if request.required_tool == "project_inspect")
+            assert _DiscussionDurability.request_hash(original, tool_names=aliases) == rejected["request_hash"]
+            assert _DiscussionDurability.request_hash(inspections[0], tool_names=aliases) != rejected["request_hash"]
         else:
             assert not inspections
         previous_usage = cast(Mapping[str, JsonValue], saved.state["usage"])
