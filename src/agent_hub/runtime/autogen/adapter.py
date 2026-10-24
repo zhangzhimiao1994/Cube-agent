@@ -2615,16 +2615,6 @@ class AutoGenDiscussionRuntime:
             elif context.checkpoint is not None:
                 raise RuntimeExecutionError("runtime checkpoint was not restored")
 
-            yield RunEvent(
-                kind=EventKind.DISCUSSION_STARTED,
-                sequence=sequence,
-                run_id=context.run_id,
-                actor=self._plan.participants[0].id,
-                session_id=str(context.run_id),
-                participants=(*self.participant_ids, *((FINAL_REPORT_ACTOR,) if reports else ())),
-                inputs=context.artifacts,
-            )
-            sequence += 1
             usage = self._restored_usage(restored)
             discussion_control = (
                 _DiscussionControl.from_state(
@@ -2851,6 +2841,16 @@ class AutoGenDiscussionRuntime:
                 async for report_event in finish_report(recovered_report, "delivery_reported"):
                     yield report_event
                 return
+            yield RunEvent(
+                kind=EventKind.DISCUSSION_STARTED,
+                sequence=sequence,
+                run_id=context.run_id,
+                actor=self._plan.participants[0].id,
+                session_id=str(context.run_id),
+                participants=(*self.participant_ids, *((FINAL_REPORT_ACTOR,) if reports else ())),
+                inputs=context.artifacts,
+            )
+            sequence += 1
             selector = GatewayChatCompletionClient(
                 self._gateway,
                 self._plan.selector_model,

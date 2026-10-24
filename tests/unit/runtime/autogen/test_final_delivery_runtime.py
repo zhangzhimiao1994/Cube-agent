@@ -332,3 +332,92 @@ async def test_native_offline_fixture_authors_one_write_and_leaves_required_chec
     events = [event async for event in runner.run(ctx)]
     assert events[-1].kind is EventKind.RUNTIME_COMPLETED, events[-1].reason
     assert backend.calls == TOOL_CALLS and len(gateway.final_requests) == 1
+
+
+async def test_service_batches_public_report_with_its_durable_checkpoint() -> None:
+    from agent_hub.runs.service import _delivery_publication_batches
+
+    gateway, ctx = ReportGateway(), report_context()
+    runner = AutoGenDiscussionRuntime(gateway, replace(plan(), max_turns=16),
+                                     capability_gateway=Capabilities())
+    batches = [batch async for batch in _delivery_publication_batches(runner.run(ctx), ctx)]
+    flat = [event for batch in batches for event in batch]
+    assert flat[-1].kind is EventKind.RUNTIME_COMPLETED
+    report_batch = next(batch for batch in batches if any(
+        event.kind is EventKind.MESSAGE_CREATED and event.actor == ACTOR for event in batch))
+    assert [event.kind for event in report_batch] == [
+        EventKind.MESSAGE_CREATED, EventKind.ARTIFACT_CREATED, EventKind.CHECKPOINT_SAVED]
+    final_batch = next(batch for batch in batches if any(
+        event.kind == "discussion.completed" for event in batch))
+    assert [event.kind for event in final_batch] == ["discussion.completed", EventKind.CHECKPOINT_SAVED]
+
+
+async def test_planning_discussion_without_report_keeps_single_event_transactions() -> None:
+    from agent_hub.runs.service import _delivery_publication_batches
+
+    ctx = report_context()
+    event = RunEvent(kind="discussion.completed", sequence=1, run_id=ctx.run_id,
+                     payload={"summary": "Planning only"})
+
+    async def planning() -> AsyncGenerator[RunEvent, None]:
+        yield event
+
+    assert [batch async for batch in _delivery_publication_batches(planning(), ctx)] == [(event,)]
+
+
+async def test_planning_participant_named_like_final_actor_is_not_a_report() -> None:
+    from agent_hub.runs.service import _delivery_publication_batches
+
+    ctx = report_context()
+    artifact = Artifact(id=UUID(int=2), type="text", producer=ACTOR,
+                        content={"text": "Ordinary planning"})
+    events = [RunEvent(kind=EventKind.MESSAGE_CREATED, sequence=1, run_id=ctx.run_id,
+                       actor=ACTOR, message="Ordinary planning"),
+              RunEvent(kind=EventKind.ARTIFACT_CREATED, sequence=2, run_id=ctx.run_id,
+                       artifact=artifact)]
+
+    async def planning() -> AsyncGenerator[RunEvent, None]:
+        for event in events:
+            yield event
+
+    assert [batch async for batch in _delivery_publication_batches(planning(), ctx)] == [
+        (event,) for event in events]
+
+
+@pytest.mark.parametrize("fault", ["eof", "exception", "tool", "foreign", "missing_report"])
+async def test_incomplete_report_publication_never_leaks_a_partial_batch(fault: str) -> None:
+    from agent_hub.runs.service import _delivery_publication_batches
+
+    ctx, gateway = report_context(), ReportGateway()
+    runner = AutoGenDiscussionRuntime(gateway, replace(plan(), max_turns=16),
+                                     capability_gateway=Capabilities())
+    events = [event async for event in runner.run(ctx)]
+    start = next(index for index, event in enumerate(events)
+                 if event.kind is EventKind.MESSAGE_CREATED and event.actor == ACTOR)
+    saved = next(event.checkpoint for event in reversed(events[:start])
+                 if event.checkpoint is not None)
+    ctx = ctx.model_copy(update={"checkpoint": saved})
+    report = events[start:start + 3]
+    assert report[-1].checkpoint is not None
+    if fault == "tool":
+        report[1] = next(event for event in events if event.kind is EventKind.TOOL_COMPLETED)
+    elif fault == "foreign":
+        report[-1] = report[-1].model_copy(update={"run_id": UUID(int=1)})
+    elif fault == "missing_report":
+        report[-1] = next(event for event in events
+                          if event.kind is EventKind.CHECKPOINT_SAVED)
+
+    async def broken() -> AsyncGenerator[RunEvent, None]:
+        yield report[0]
+        if fault == "eof":
+            return
+        if fault == "exception":
+            raise RuntimeError("simulated publication loss")
+        yield report[1]
+        yield report[2]
+
+    published: list[tuple[RunEvent, ...]] = []
+    with pytest.raises(RuntimeError):
+        async for batch in _delivery_publication_batches(broken(), ctx):
+            published.append(batch)
+    assert published == []

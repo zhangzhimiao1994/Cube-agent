@@ -138,6 +138,7 @@ class SimulatedWorkerLoss(BaseException):
 
 class CrashBeforeReportPublication(RunRepository):
     report: Artifact | None = None
+    phase = "before_artifact"
 
     async def persist_event(
         self, session: AsyncSession, *, tenant_id: UUID, run_id: UUID, event: RunEvent,
@@ -145,8 +146,14 @@ class CrashBeforeReportPublication(RunRepository):
         if (event.kind is EventKind.ARTIFACT_CREATED and event.artifact is not None
                 and event.artifact.producer == FINAL_REPORT_ACTOR):
             self.report = event.artifact
-            raise SimulatedWorkerLoss("offline worker lost before public report transaction")
+            if self.phase == "before_artifact":
+                raise SimulatedWorkerLoss("offline worker lost before public report transaction")
         await super().persist_event(session, tenant_id=tenant_id, run_id=run_id, event=event)
+        if self.report is not None and (
+            self.phase == "after_artifact" and event.kind is EventKind.ARTIFACT_CREATED
+            or self.phase == "after_checkpoint" and event.kind is EventKind.CHECKPOINT_SAVED
+        ):
+            raise SimulatedWorkerLoss("offline worker lost inside public report transaction")
 
 
 @dataclass
@@ -168,11 +175,14 @@ class Scenario:
     run_id: UUID | None = None
     stacks: list[Stack] = field(default_factory=list)
 
-    def open(self, *, report: str = REPORT, crash: bool = False, forbidden: bool = False) -> Stack:
+    def open(self, *, report: str = REPORT, crash: bool = False, forbidden: bool = False,
+             crash_phase: str = "before_artifact") -> Stack:
         database = build_database(self.database_url)
         assert database.engine.url.get_backend_name() == "postgresql"
         runs = (CrashBeforeReportPublication(database.session_factory) if crash
                 else RunRepository(database.session_factory))
+        if isinstance(runs, CrashBeforeReportPublication):
+            runs.phase = crash_phase
         gateway = OfflineReportGateway(report=report, forbidden=forbidden)
         tools = OfflineCapabilities(database, self, forbidden=forbidden)
         runtime = AutoGenDiscussionRuntime(
@@ -354,10 +364,11 @@ async def test_operator_final_report_is_publicly_persisted_with_native_model_bin
                                request_count=len(stack.gateway.requests))
 
 
+@pytest.mark.parametrize("phase", ["before_artifact", "after_artifact", "after_checkpoint"])
 async def test_cold_service_recovery_before_public_report_reuses_committed_native_outcomes(
-    scenario: Scenario,
+    scenario: Scenario, phase: str,
 ) -> None:
-    first = scenario.open(crash=True)
+    first = scenario.open(crash=True, crash_phase=phase)
     run_id = await scenario.submit(first)
     with pytest.raises(SimulatedWorkerLoss):
         await asyncio.wait_for(first.service.execute(run_id), timeout=30)
@@ -401,8 +412,7 @@ async def test_cold_service_recovery_before_public_report_reuses_committed_nativ
     )
     recovered = await assert_public_report(fresh, scenario, final_request=final_request,
                                           request_count=request_count)
-    # An unpublished text envelope may be rebuilt with a new UUID from the same
-    # durable model outcome. The exact content/source binding must stay stable.
+    assert recovered.id == interrupted_report.id
     assert recovered.content_sha256 == interrupted_report.content_sha256
     assert len(first.gateway.requests) == request_count and first.tools.calls == TOOL_CALLS
 
