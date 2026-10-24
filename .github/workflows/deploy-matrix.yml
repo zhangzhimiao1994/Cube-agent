@@ -9,6 +9,8 @@ on:
 jobs:
   compose:
     runs-on: ubuntu-24.04
+    env:
+      AGENT_HUB_PUBLIC_URL: https://agent.example.test
     steps:
       - uses: actions/checkout@v4
       - run: docker compose -f deploy/compose/docker-compose.yml config --quiet
@@ -20,6 +22,11 @@ jobs:
       fail-fast: false
       matrix:
         distro: [ubuntu, debian, rocky, almalinux]
+    env:
+      AGENT_HUB_INSTALL_ROOT: ${{ runner.temp }}/native-detect-${{ matrix.distro }}/opt
+      AGENT_HUB_CONFIG_DIR: ${{ runner.temp }}/native-detect-${{ matrix.distro }}/etc
+      AGENT_HUB_STATE_DIR: ${{ runner.temp }}/native-detect-${{ matrix.distro }}/state
+      AGENT_HUB_PUBLIC_URL: https://agent.example.test
     steps:
       - uses: actions/checkout@v4
       - run: bash deploy/native/install-packages.sh --detect tests/install/fixtures/os-release-${{ matrix.distro }}
