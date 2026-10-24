@@ -117,6 +117,8 @@ _OPTIONAL_FAILURE_DIAGNOSTIC_KEYS = frozenset(
     {
         "status_code", "hybrid_child_mode", "orchestration_recovery_hint", "step_id", "actor",
         "compression_trigger", "termination_reason",
+        "runtime_timeout_kind", "remaining_soft_timeout_seconds", "remaining_absolute_timeout_seconds",
+        "engineering_work_progress_units",
     }
 ) | frozenset(_CAPACITY_DIAGNOSTIC_ENUMS)
 _FAILURE_DIAGNOSTIC_KEYS = _REQUIRED_FAILURE_DIAGNOSTIC_KEYS | _OPTIONAL_FAILURE_DIAGNOSTIC_KEYS
@@ -276,6 +278,28 @@ def _validate_failure_diagnostic(payload: Mapping[str, JsonValue]) -> None:
         or payload["retryable"] is not False
     ):
         raise ValueError("runtime failure diagnostic termination reason is invalid")
+    wall_keys = {"runtime_timeout_kind", "remaining_soft_timeout_seconds", "remaining_absolute_timeout_seconds"}
+    if payload.keys() & (wall_keys | {"engineering_work_progress_units"}):
+        if not wall_keys <= payload.keys() or payload.get("termination_reason") != "wall_time":
+            raise ValueError("runtime timeout diagnostic fields are invalid")
+        timeout_kind = payload["runtime_timeout_kind"]
+        if type(timeout_kind) is not str or timeout_kind not in {"soft", "absolute", "explicit"}:
+            raise ValueError("runtime timeout diagnostic kind is invalid")
+        for name in ("remaining_soft_timeout_seconds", "remaining_absolute_timeout_seconds"):
+            remaining = payload[name]
+            if (type(remaining) not in (int, float) or not isinstance(remaining, int | float)
+                or not math.isfinite(remaining) or not 0 <= remaining <= 3600):
+                raise ValueError("runtime timeout diagnostic remaining time is invalid")
+        soft_remaining = payload["remaining_soft_timeout_seconds"]
+        absolute_remaining = payload["remaining_absolute_timeout_seconds"]
+        if (not isinstance(soft_remaining, int | float) or not isinstance(absolute_remaining, int | float)
+            or soft_remaining > absolute_remaining
+            or (timeout_kind != "soft" and soft_remaining != absolute_remaining)):
+            raise ValueError("runtime timeout diagnostic classification is invalid")
+        if "engineering_work_progress_units" in payload:
+            units = payload["engineering_work_progress_units"]
+            if type(units) is not int or not 0 <= units < 2**63:
+                raise ValueError("runtime timeout diagnostic work count is invalid")
     if "status_code" in payload:
         status_code = payload["status_code"]
         if type(status_code) is not int or not 100 <= status_code <= 599:

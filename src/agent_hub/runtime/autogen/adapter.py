@@ -104,6 +104,7 @@ from agent_hub.runtime.autogen.engineering_delivery import (
     engineering_delivery_required,
     engineering_evidence_limits,
     engineering_progress,
+    engineering_work_progress,
 )
 from agent_hub.runtime.autogen.model_rejection import (
     RejectedModelRecord,
@@ -2690,6 +2691,12 @@ class AutoGenDiscussionRuntime:
             return min(budget.remaining(now=now), budget.absolute_remaining(now=now))
 
         def wall_failure_payload() -> dict[str, JsonValue]:
+            budget = self._wall_budget
+            now = asyncio.get_running_loop().time()
+            absolute_remaining = budget.absolute_remaining(now=now) if budget is not None else 0.0
+            kind = ("explicit" if context.routing_decision.get("runtime_timeout_source")
+                != "project_scale_soft_budget" else "absolute" if budget is not None
+                and budget.deadline >= budget.absolute_deadline else "soft")
             return {
                 **runtime_failure_diagnostic_from_reason("engineering_delivery_missing"),
                 "termination_reason": "wall_time",
@@ -2699,6 +2706,13 @@ class AutoGenDiscussionRuntime:
                 "error_summary": "工程任务已用尽运行时限，尚未完成交付。",
                 "retryable": False,
                 "suggested_action": "先核查容量与调用阶段，保留已有输出；不要盲目重试或扩大预算。",
+                "runtime_timeout_kind": kind,
+                "remaining_soft_timeout_seconds": budget.remaining(now=now) if budget is not None else 0.0,
+                "remaining_absolute_timeout_seconds": absolute_remaining,
+                **({"engineering_work_progress_units": budget.progress_units}
+                    if budget is not None
+                    and type(context.routing_decision.get("engineering_progress_budget_version")) is int
+                    and context.routing_decision.get("engineering_progress_budget_version") == 1 else {}),
                 **(durability.failure_payload if durability is not None else {}),
             }
 
@@ -2813,7 +2827,12 @@ class AutoGenDiscussionRuntime:
                 now=loop_time,
                 initial_seconds=max(0.001, wall_seconds),
                 restored_absolute_seconds=restored_absolute_seconds,
-                progress_units=discussion_control.progress_units,
+                progress_units=(len(engineering_work_progress(context,
+                    tool_entries=self._restored_ledger(restored, "tool_ledger"),
+                    artifacts=ledger_artifacts, allowed_tools=allowed_tools))
+                    if engineering and type(context.routing_decision.get("engineering_progress_budget_version")) is int
+                    and context.routing_decision.get("engineering_progress_budget_version") == 1
+                    else discussion_control.progress_units),
             )
             self._wall_deadline = self._wall_budget.deadline
 
@@ -3812,11 +3831,21 @@ class AutoGenDiscussionRuntime:
             raise RuntimeExecutionError("discussion wall deadline is unavailable")
         wall_budget = self._wall_budget
         loop_time = asyncio.get_running_loop().time()
+        allowed_tools = {participant.id: participant.allowed_tools for participant in self._plan.participants}
+        engineering = engineering_delivery_required(context, allowed_tools)
+        work_budget = (engineering
+            and type(context.routing_decision.get("engineering_progress_budget_version")) is int
+            and context.routing_decision.get("engineering_progress_budget_version") == 1)
         if wall_budget is not None:
-            wall_budget.observe(
-                progress_units=discussion_control.progress_units,
-                now=loop_time,
-            )
+            if work_budget:
+                soft = context.routing_decision.get("runtime_timeout_soft_seconds")
+                runway = (float(soft) if isinstance(soft, int | float) and not isinstance(soft, bool)
+                    and math.isfinite(soft) and soft > 0 else min(self._plan.wall_time_seconds, context.timeout_seconds))
+                wall_budget.renew_for_progress(progress_units=len(engineering_work_progress(context,
+                    tool_entries=tool_ledger, artifacts=artifacts, allowed_tools=allowed_tools)),
+                    now=loop_time, runway_seconds=runway)
+            else:
+                wall_budget.observe(progress_units=discussion_control.progress_units, now=loop_time)
             wall_deadline = wall_budget.deadline
             self._wall_deadline = wall_deadline
             remaining_absolute_timeout_seconds = wall_budget.absolute_remaining(
@@ -3824,9 +3853,6 @@ class AutoGenDiscussionRuntime:
             )
         else:
             remaining_absolute_timeout_seconds = max(0.0, wall_deadline - loop_time)
-        engineering = engineering_delivery_required(
-            context, {participant.id: participant.allowed_tools for participant in self._plan.participants},
-        )
         checkpoint_artifacts = _bounded_checkpoint_artifacts(artifacts)
         required: tuple[Artifact, ...] = ()
         optional: tuple[Artifact, ...] = ()
@@ -3866,6 +3892,7 @@ class AutoGenDiscussionRuntime:
                and context.routing_decision.get("engineering_action_version") == 1 else {}),
             **({ENGINEERING_CONTINUATION_POLICY: 1} if engineering
                and engineering_continuation_selected(context) else {}),
+            **({"engineering_progress_budget_version": 1} if work_budget else {}),
             **({_CHECKPOINT_ACK_POLICY: 1} if engineering and _checkpoint_ack_selected(context) else {}),
             **({FINAL_REPORT_POLICY: 1} if engineering
                and type(context.routing_decision.get(FINAL_REPORT_POLICY)) is int
@@ -3937,7 +3964,8 @@ class AutoGenDiscussionRuntime:
             )
         optional_state = (
             {"remaining_absolute_timeout_seconds", "engineering_tool_prefix", "engineering_action_version",
-             ENGINEERING_CONTINUATION_POLICY, _CHECKPOINT_ACK_POLICY, FINAL_REPORT_POLICY, TOOL_CORRECTION_POLICY}
+             ENGINEERING_CONTINUATION_POLICY, _CHECKPOINT_ACK_POLICY, FINAL_REPORT_POLICY, TOOL_CORRECTION_POLICY,
+             "engineering_progress_budget_version"}
             if checkpoint.runtime_version == _RUNTIME_VERSION
             else set()
         )
@@ -3960,6 +3988,12 @@ class AutoGenDiscussionRuntime:
             or (ENGINEERING_CONTINUATION_POLICY in state and (
                 type(state[ENGINEERING_CONTINUATION_POLICY]) is not int
                 or state[ENGINEERING_CONTINUATION_POLICY] != 1))):
+            raise RuntimeExecutionError("runtime checkpoint is incompatible")
+        work_policy = "engineering_progress_budget_version"
+        work_budget = (engineering and type(context.routing_decision.get(work_policy)) is int
+                       and context.routing_decision.get(work_policy) == 1)
+        if ((work_policy in state) != work_budget or (work_policy in state and (
+            type(state[work_policy]) is not int or state[work_policy] != 1))):
             raise RuntimeExecutionError("runtime checkpoint is incompatible")
         checkpoint_ack = engineering and _checkpoint_ack_selected(context)
         if ((_CHECKPOINT_ACK_POLICY in state) != checkpoint_ack

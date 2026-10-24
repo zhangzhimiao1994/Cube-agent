@@ -83,6 +83,23 @@ class AdaptiveDeadline:
     def remaining(self, *, now: float) -> float:
         return max(0.0, self.deadline - float(now))
 
+    def renew_for_progress(self, *, progress_units: int, now: float, runway_seconds: float) -> bool:
+        """Renew one work window, without multiplying it by file count or reviving expiry."""
+        if type(progress_units) is not int or progress_units < 0:
+            raise ValueError("progress_units must be a non-negative integer")
+        current = float(now)
+        if not math.isfinite(current):
+            raise ValueError("now must be finite")
+        runway = _positive_finite(runway_seconds, name="runway_seconds")
+        if progress_units <= self.progress_units:
+            return False
+        self.progress_units = progress_units
+        if current >= min(self.deadline, self.absolute_deadline):
+            return False
+        previous = self.deadline
+        self.deadline = min(self.absolute_deadline, max(previous, current + runway))
+        return self.deadline > previous
+
     def absolute_remaining(self, *, now: float) -> float:
         return max(0.0, self.absolute_deadline - float(now))
 

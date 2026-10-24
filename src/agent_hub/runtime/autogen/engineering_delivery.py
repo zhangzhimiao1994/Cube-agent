@@ -366,3 +366,76 @@ def engineering_progress(
         verification_failed_current=failed_current, bundle_current=bundle, uncertain=uncertain,
         completion_proposed=completion_proposed, recovering=recovering,
     )
+
+
+def engineering_work_progress(
+    context: TaskContext, *, tool_entries: Sequence[Mapping[str, JsonValue]],
+    artifacts: Sequence[Artifact], allowed_tools: Mapping[str, Sequence[str]],
+) -> frozenset[str]:
+    """Derive replay-stable budget hints from completed causal prefixes, never authority."""
+    by_id = {str(item.id): item for item in artifacts}
+    credits: set[str] = set()
+    # Trusted baseline bytes suppress no-op writes without earning work credit.
+    seen_writes = {item[:2] for item in python_initial_files(context).values()}
+    for position, row in enumerate(tool_entries):
+        if row.get("status") not in ("succeeded", "failed"):
+            break
+        progress = engineering_progress(
+            context, tool_entries=tool_entries[:position + 1], artifacts=artifacts,
+            allowed_tools=allowed_tools,
+        )
+        if progress.uncertain:
+            break
+        if row.get("status") != "succeeded":
+            continue
+        artifact_id = row.get("artifact_id")
+        assert isinstance(artifact_id, str)
+        result = by_id[artifact_id].content["result"]
+        assert isinstance(result, Mapping)
+        name = row.get("name")
+        semantic: object
+        if name == "project.inspect":
+            manifests = result.get("manifests")
+            if isinstance(manifests, tuple | list):
+                for manifest in manifests:
+                    if isinstance(manifest, Mapping) and manifest.get("status") == "observed":
+                        item = _file_metadata({"path": manifest.get("path"), "sha256": manifest.get("sha256"),
+                                               "size_bytes": manifest.get("observed_bytes")})
+                        if item is not None:
+                            seen_writes.add(item[:2])
+            continue
+        if name == "workspace.write_text":
+            files = result.get("workspace_files")
+            item = (_file_metadata(files[0]) if isinstance(files, tuple | list) and len(files) == 1
+                    else _file_metadata(result))
+            assert item is not None
+            if item[:2] in seen_writes:
+                continue
+            seen_writes.add(item[:2])
+            semantic = item[:2]
+        elif name == "project.verify" and progress.verification_current:
+            source = _successful_source(result, context=context)
+            if source is None or not original_contract_binding_matches(context, result, source):
+                continue
+            receipt = result.get("verification")
+            assert isinstance(receipt, Mapping)
+            # Execution ids, log output and wall time describe attempts, not new work.
+            semantic = (source, {key: receipt[key] for key in (
+                "schema_version", "kind", "status", "recipe_sha256",
+                "environment_input_sha256", "environment_sha256", "runtime",
+                "generated_acceptance_sha256", "test_count",
+            ) if key in receipt})
+        elif name == "workspace.bundle" and progress.verification_current and progress.bundle_current:
+            files = result.get("workspace_files")
+            assert isinstance(files, tuple | list)
+            metadata = [_file_metadata(item) for item in files]
+            assert all(item is not None for item in metadata)
+            semantic = (result.get("verification_source_sha256"), sorted(
+                item for item in metadata if item is not None))
+        else:
+            continue
+        digest = hashlib.sha256(json.dumps(
+            semantic, default=dict, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+        ).encode("ascii")).hexdigest()
+        credits.add(f"{name}:{digest}")
+    return frozenset(credits)
