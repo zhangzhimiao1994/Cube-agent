@@ -142,14 +142,24 @@ class OfflineCapabilities(Capabilities):
 
 class RejectWriterGateway(OfflineReportGateway):
     async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
-        if request.required_tool == "workspace_write_text":
-            self.requests.append(request)
+        result = await super().complete_with_context(request)
+        if any(call.name in {"workspace_write_text", "workspace.write_text"}
+               for call in result.response.tool_calls):
             raise GatewayRejectedOutput(evidence=RejectedOutputEvidence(
                 final_text="PRIVATE_REJECTED_BODY_NOT_A_DELIVERY", usage=TokenUsage(7, 3, 10),
                 usage_status="known", status="completed", reason="invalid_tool"),
                 logical_model=request.logical_model, deployment_id="shared",
                 provider_id="test", provider_model="test/model", cost_usd=Decimal("0.002"))
-        return await super().complete_with_context(request)
+        return result
+
+
+async def test_rejection_fixture_targets_selected_writer_not_only_required_tool() -> None:
+    gateway = RejectWriterGateway()
+    request = ModelRequest(logical_model="shared", messages=())
+    with pytest.raises(GatewayRejectedOutput) as failure:
+        await gateway.complete_with_context(request)
+    assert len(gateway.requests) == 1
+    assert failure.value.evidence is not None and failure.value.evidence.reason == "invalid_tool"
 
 
 class SimulatedWorkerLoss(BaseException):
