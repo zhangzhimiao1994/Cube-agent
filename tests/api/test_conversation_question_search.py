@@ -20,6 +20,11 @@ class StubAuthService:
             raise InvalidCredentials("bad token")
         return AuthenticatedPrincipal(USER_ID, TENANT_ID, Role.SUPER_ADMIN)
 
+    async def validate_principal(self, principal: AuthenticatedPrincipal) -> AuthenticatedPrincipal:
+        if principal != self.authenticate_token("valid-token"):
+            raise InvalidCredentials("fixture actor changed")
+        return principal
+
 
 class SearchService:
     def __init__(self) -> None:

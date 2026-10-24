@@ -8,7 +8,7 @@ import pytest
 from redis.asyncio import Redis
 
 from agent_hub.app import create_app
-from agent_hub.auth.models import AuthenticatedPrincipal, AuthResult, Role
+from agent_hub.auth.models import AuthenticatedPrincipal, AuthResult, InvalidCredentials, Role
 from agent_hub.auth.rate_limit import RedisAuthRateLimiter
 from agent_hub.settings import Settings
 from tests.api.test_foundation_api import (
@@ -27,6 +27,11 @@ class AuthStub:
     def authenticate_token(self, token: str) -> AuthenticatedPrincipal:
         del token
         return self.principal
+
+    async def validate_principal(self, principal: AuthenticatedPrincipal) -> AuthenticatedPrincipal:
+        if principal != self.principal:
+            raise InvalidCredentials("fixture actor changed")
+        return principal
 
 
 @pytest.fixture

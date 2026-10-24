@@ -9,6 +9,8 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from agent_hub.api.errors import PublicAPIError
 from agent_hub.auth.models import (
     AuthenticatedPrincipal,
+    AuthenticationOperationError,
+    AuthenticationPersistenceError,
     Authorizer,
     InvalidCredentials,
     PermissionDenied,
@@ -22,6 +24,8 @@ _BEARER_SCHEME = HTTPBearer(auto_error=False, scheme_name="BearerAuth")
 
 class TokenAuthenticator(Protocol):
     def authenticate_token(self, token: str) -> AuthenticatedPrincipal: ...
+
+    async def validate_principal(self, principal: AuthenticatedPrincipal) -> AuthenticatedPrincipal: ...
 
 
 def get_auth_service(request: Request) -> TokenAuthenticator:
@@ -39,7 +43,7 @@ def _authorization_values(request: Request) -> list[str]:
     ]
 
 
-def current_principal(
+async def current_principal(
     request: Request,
     auth_service: Annotated[TokenAuthenticator, Depends(get_auth_service)],
     documented_credentials: Annotated[
@@ -60,9 +64,23 @@ def current_principal(
         raise _invalid_token_error()
     token = parts[1]
     try:
-        return auth_service.authenticate_token(token)
+        principal = auth_service.authenticate_token(token)
+        validator = getattr(auth_service, "validate_principal", None)
+        if not callable(validator):
+            raise PublicAPIError(503, "service_unavailable", "service unavailable")
+        try:
+            current = await validator(principal)
+        except (InvalidTokenError, InvalidCredentials):
+            raise
+        except Exception:  # noqa: BLE001 - unavailable live identity never falls back to JWT claims.
+            raise PublicAPIError(503, "service_unavailable", "service unavailable") from None
+        if not isinstance(current, AuthenticatedPrincipal) or current != principal:
+            raise PublicAPIError(503, "service_unavailable", "service unavailable")
+        return current
     except (InvalidTokenError, InvalidCredentials):
         raise _invalid_token_error() from None
+    except (AuthenticationOperationError, AuthenticationPersistenceError):
+        raise PublicAPIError(503, "service_unavailable", "service unavailable") from None
     finally:
         del token
 

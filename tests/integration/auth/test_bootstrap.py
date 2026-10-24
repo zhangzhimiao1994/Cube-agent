@@ -8,9 +8,13 @@ import pytest
 from argon2 import PasswordHasher
 from argon2.exceptions import HashingError
 from argon2.low_level import Type
-from sqlalchemy import func, select
+from fastapi import FastAPI
+from httpx import ASGITransport, AsyncClient
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from agent_hub.api.errors import PublicAPIError, public_error_handler
+from agent_hub.api.routers.auth import router as auth_router
 from agent_hub.auth.feishu_oauth import ProtectedUserError
 from agent_hub.auth.models import (
     AuthenticationOperationError,
@@ -187,6 +191,49 @@ def _service(
         AccessTokenService(b"t" * 32, clock=effective_clock),
         clock=effective_clock,
     )
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("change", ("disabled", "deleted", "demoted", "tenant"))
+async def test_live_principal_http_rejects_old_jwt_after_committed_user_change(
+    auth_session_factory: async_sessionmaker[AsyncSession], change: str,
+) -> None:
+    tenant_id = await _tenant(auth_session_factory)
+    service = _service(auth_session_factory, tenant_id)
+    owner = await service.consume_bootstrap_code(
+        await service.issue_bootstrap_code(), "live-owner", "synthetic owner password 123",
+    )
+    users = PersistentUserAdminService(auth_session_factory)
+    target = await users.create_user(
+        owner.principal, username="live-operator", password="synthetic operator password 123",
+        role=Role.OPERATOR,
+    )
+    login = await service.login(tenant_id, "live-operator", "synthetic operator password 123")
+    app = FastAPI()
+    app.state.auth_service = service
+    app.add_exception_handler(PublicAPIError, public_error_handler)
+    app.include_router(auth_router)
+    headers = {"Authorization": f"Bearer {login.access_token}"}
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://auth.test") as api:
+        before = await api.get("/api/v1/auth/me", headers=headers)
+        assert before.status_code == 200
+        assert before.json()["user_id"] == str(target.id)
+        if change == "disabled":
+            await users.set_disabled(owner.principal, target.id, True)
+        elif change == "deleted":
+            await users.delete_user(owner.principal, target.id)
+        elif change == "demoted":
+            await users.change_role(owner.principal, target.id, Role.VIEWER)
+        else:
+            other_tenant = await _tenant(auth_session_factory, slug="live-other")
+            async with auth_session_factory() as session, session.begin():
+                await session.execute(update(UserRow).where(UserRow.id == target.id).values(tenant_id=other_tenant))
+        # This compatibility API is deliberately decode-only; HTTP is not.
+        assert service.authenticate_token(login.access_token) == login.principal
+        after = await api.get("/api/v1/auth/me", headers=headers)
+        assert after.status_code == 401
+        assert after.headers["www-authenticate"] == "Bearer"
+        assert after.json() == {"error": {"code": "invalid_token", "message": "invalid access token"}}
 
 
 @pytest.mark.integration

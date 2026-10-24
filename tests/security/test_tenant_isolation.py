@@ -20,6 +20,11 @@ class TenantAuth:
             Role.OPERATOR,
         )
 
+    async def validate_principal(self, principal: AuthenticatedPrincipal) -> AuthenticatedPrincipal:
+        if principal != self.authenticate_token("valid-token"):
+            raise InvalidCredentials("fixture actor changed")
+        return principal
+
 
 class TenantScopedRunService(StubRunService):
     async def get(

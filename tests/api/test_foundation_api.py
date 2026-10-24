@@ -304,6 +304,11 @@ class StubAuthService:
             raise InvalidCredentials("internal token detail")
         return self.principal
 
+    async def validate_principal(self, principal: AuthenticatedPrincipal) -> AuthenticatedPrincipal:
+        if principal != self.principal:
+            raise InvalidCredentials("fixture actor changed")
+        return principal
+
 
 @dataclass(frozen=True)
 class LimitDecision:

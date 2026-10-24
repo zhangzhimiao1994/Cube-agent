@@ -21,6 +21,12 @@ class Auth:
             raise InvalidCredentials("unknown test token")
         return AuthenticatedPrincipal(_A, tenant, Role.SUPER_ADMIN)
 
+    async def validate_principal(self, principal: AuthenticatedPrincipal) -> AuthenticatedPrincipal:
+        if principal not in (AuthenticatedPrincipal(_A, _A, Role.SUPER_ADMIN),
+                             AuthenticatedPrincipal(_A, _B, Role.SUPER_ADMIN)):
+            raise InvalidCredentials("fixture actor changed")
+        return principal
+
 
 @pytest.mark.parametrize("tenant,token", [(_A, "tenant-a"), (_B, "tenant-b")])
 def test_activation_uses_authenticated_tenant_scoped_preflight(tenant: UUID, token: str) -> None:

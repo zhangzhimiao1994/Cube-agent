@@ -3985,12 +3985,22 @@ class StubAuthService:
             raise InvalidCredentials("bad token")
         return AuthenticatedPrincipal(USER_ID, TENANT_ID, Role.SUPER_ADMIN)
 
+    async def validate_principal(self, principal: AuthenticatedPrincipal) -> AuthenticatedPrincipal:
+        if principal != self.authenticate_token("valid-token"):
+            raise InvalidCredentials("fixture actor changed")
+        return principal
+
 
 class OtherTenantAuthService:
     def authenticate_token(self, token: str) -> AuthenticatedPrincipal:
         if token != "valid-token":
             raise InvalidCredentials("bad token")
         return AuthenticatedPrincipal(USER_ID, OTHER_TENANT_ID, Role.SUPER_ADMIN)
+
+    async def validate_principal(self, principal: AuthenticatedPrincipal) -> AuthenticatedPrincipal:
+        if principal != self.authenticate_token("valid-token"):
+            raise InvalidCredentials("fixture actor changed")
+        return principal
 
 
 async def accept_plugin_activation(plugin: PluginResourceResponse) -> None:
@@ -5241,6 +5251,11 @@ def test_capability_manifest_endpoint_reads_mcp_config_for_principal_tenant() ->
                 raise InvalidCredentials("bad token")
             return AuthenticatedPrincipal(USER_ID, OTHER_TENANT_ID, Role.SUPER_ADMIN)
 
+        async def validate_principal(self, principal: AuthenticatedPrincipal) -> AuthenticatedPrincipal:
+            if principal != self.authenticate_token("valid-token"):
+                raise InvalidCredentials("fixture actor changed")
+            return principal
+
     class RecordingMcpService:
         def __init__(self) -> None:
             self.tenant_ids: list[UUID | None] = []
@@ -5283,6 +5298,11 @@ def test_plugin_admin_endpoints_read_plugin_config_for_principal_tenant() -> Non
             if token != "valid-token":
                 raise InvalidCredentials("bad token")
             return AuthenticatedPrincipal(USER_ID, OTHER_TENANT_ID, Role.SUPER_ADMIN)
+
+        async def validate_principal(self, principal: AuthenticatedPrincipal) -> AuthenticatedPrincipal:
+            if principal != self.authenticate_token("valid-token"):
+                raise InvalidCredentials("fixture actor changed")
+            return principal
 
     class TenantScopedPluginService:
         def __init__(self) -> None:
@@ -5395,6 +5415,11 @@ def test_plugin_admin_write_endpoints_scope_writes_to_principal_tenant_and_actor
             if token != "valid-token":
                 raise InvalidCredentials("bad token")
             return AuthenticatedPrincipal(USER_ID, OTHER_TENANT_ID, Role.SUPER_ADMIN)
+
+        async def validate_principal(self, principal: AuthenticatedPrincipal) -> AuthenticatedPrincipal:
+            if principal != self.authenticate_token("valid-token"):
+                raise InvalidCredentials("fixture actor changed")
+            return principal
 
     class RecordingPluginWriteService(InMemoryAdminResourceService):
         def __init__(self) -> None:
@@ -10490,6 +10515,11 @@ def test_plugin_package_approval_mutations_forbid_non_approver() -> None:
             if token != "valid-token":
                 raise InvalidCredentials("bad token")
             return AuthenticatedPrincipal(USER_ID, TENANT_ID, Role.OPERATOR)
+
+        async def validate_principal(self, principal: AuthenticatedPrincipal) -> AuthenticatedPrincipal:
+            if principal != self.authenticate_token("valid-token"):
+                raise InvalidCredentials("fixture actor changed")
+            return principal
 
     app = create_app(auth_service=OperatorAuthService(), rate_limiter=object())
     app.state.admin_resource_service = InMemoryAdminResourceService()
@@ -18611,6 +18641,11 @@ def test_skill_strategy_upload_and_activation_require_approval_permission() -> N
             if token != "operator-token":
                 raise InvalidCredentials("bad token")
             return AuthenticatedPrincipal(USER_ID, TENANT_ID, Role.OPERATOR)
+
+        async def validate_principal(self, principal: AuthenticatedPrincipal) -> AuthenticatedPrincipal:
+            if principal != self.authenticate_token("operator-token"):
+                raise InvalidCredentials("fixture actor changed")
+            return principal
 
     resource_service = InMemoryAdminResourceService()
     admin_app = create_app(auth_service=StubAuthService(), rate_limiter=object())

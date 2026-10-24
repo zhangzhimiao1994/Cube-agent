@@ -61,10 +61,18 @@ OTHER_TENANT_ID = UUID("00000000-0000-4000-8000-000000000002")
 
 
 class StubAuthService:
+    def __init__(self) -> None:
+        self.principal = AuthenticatedPrincipal(uuid4(), TENANT_ID, Role.SUPER_ADMIN)
+
     def authenticate_token(self, token: str) -> AuthenticatedPrincipal:
         if token != "valid-token":
             raise InvalidCredentials("bad token")
-        return AuthenticatedPrincipal(uuid4(), TENANT_ID, Role.SUPER_ADMIN)
+        return self.principal
+
+    async def validate_principal(self, principal: AuthenticatedPrincipal) -> AuthenticatedPrincipal:
+        if principal != self.principal:
+            raise InvalidCredentials("fixture actor changed")
+        return principal
 
 
 class StubRateLimiter:

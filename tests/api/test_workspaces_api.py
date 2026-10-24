@@ -30,6 +30,11 @@ class StubAuthService:
             raise InvalidCredentials("bad token")
         return self.principal
 
+    async def validate_principal(self, principal: AuthenticatedPrincipal) -> AuthenticatedPrincipal:
+        if principal != self.principal:
+            raise InvalidCredentials("fixture actor changed")
+        return principal
+
 
 def bearer() -> dict[str, str]:
     return {"Authorization": "Bearer valid-token"}
