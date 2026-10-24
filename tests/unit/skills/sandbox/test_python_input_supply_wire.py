@@ -1,5 +1,7 @@
 import asyncio
 import json
+from collections.abc import Awaitable
+from typing import Protocol, cast
 from uuid import UUID
 
 import pytest
@@ -13,33 +15,37 @@ from agent_hub.skills.sandbox.python_project_protocol import PythonProjectProbeI
 
 
 class Writer:
-    def __init__(self):
+    def __init__(self) -> None:
         self.data = bytearray()
         self.closed = False
 
-    def write(self, value):
+    def write(self, value: bytes) -> None:
         self.data.extend(value)
 
-    async def drain(self):
+    async def drain(self) -> None:
         pass
 
-    def close(self):
+    def close(self) -> None:
         self.closed = True
 
-    async def wait_closed(self):
+    async def wait_closed(self) -> None:
         pass
 
 
-def request():
+class SupplyHandler(Protocol):
+    def __call__(self, item: PythonInputSupplyRequest, *, peer_uid: int) -> Awaitable[PythonInputSupplyResponse]: ...
+
+
+def request() -> PythonInputSupplyRequest:
     return PythonInputSupplyRequest(action="plan_python_project_inputs",
-        invocation=PythonProjectProbeInvocation(execution_id="supply_wire_1",
-            tenant_id=UUID(int=1), run_id=UUID(int=2), project_id="project", session_id="session",
-            sandbox_profile="workspace_write", timeout_seconds=30,
-            original_reference={"schema_version": 1, "contract_sha256": "a" * 64,
-                                "input_source_sha256": "b" * 64, "file_count": 6}))
+        invocation=PythonProjectProbeInvocation.model_validate({"execution_id": "supply_wire_1",
+            "tenant_id": UUID(int=1), "run_id": UUID(int=2), "project_id": "project", "session_id": "session",
+            "sandbox_profile": "workspace_write", "timeout_seconds": 30,
+            "original_reference": {"schema_version": 1, "contract_sha256": "a" * 64,
+                                "input_source_sha256": "b" * 64, "file_count": 6}}))
 
 
-async def serve(monkeypatch, payload, handler):
+async def serve(monkeypatch: pytest.MonkeyPatch, payload: dict[str, object], handler: SupplyHandler) -> dict[str, object]:
     broker = api.SkillBroker(api.BrokerPolicy())
     monkeypatch.setattr(broker, "handle_input_supply", handler, raising=False)
     monkeypatch.setattr(api, "_peer_uid", lambda writer: 10001)
@@ -47,16 +53,18 @@ async def serve(monkeypatch, payload, handler):
     body = json.dumps(payload).encode()
     reader.feed_data(len(body).to_bytes(4) + body)
     reader.feed_eof()
-    await api._serve_client(reader, writer, broker)
+    await api._serve_client(reader, cast(asyncio.StreamWriter, writer), broker)
     assert writer.closed
-    return json.loads(writer.data[4:])
+    result: object = json.loads(writer.data[4:])
+    assert isinstance(result, dict)
+    return result
 
 
 @pytest.mark.asyncio
-async def test_v5_routes_to_supply_handler_without_changing_v4(monkeypatch):
+async def test_v5_routes_to_supply_handler_without_changing_v4(monkeypatch: pytest.MonkeyPatch) -> None:
     calls = []
 
-    async def handle(item, *, peer_uid):
+    async def handle(item: PythonInputSupplyRequest, *, peer_uid: int) -> PythonInputSupplyResponse:
         calls.append((item, peer_uid))
         return PythonInputSupplyResponse(action=item.action,
             execution_id=item.invocation.execution_id, ok=False, error="input_supply_configuration_missing")
@@ -68,8 +76,8 @@ async def test_v5_routes_to_supply_handler_without_changing_v4(monkeypatch):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("version", [5, 4, "5", True, 5.0])
-async def test_invalid_v5_does_not_echo_untrusted_payload_or_route(monkeypatch, version):
-    async def forbidden(*args, **kwargs):
+async def test_invalid_v5_does_not_echo_untrusted_payload_or_route(monkeypatch: pytest.MonkeyPatch, version: object) -> None:
+    async def forbidden(*args: object, **kwargs: object) -> PythonInputSupplyResponse:
         pytest.fail("invalid request reached privileged handler")
 
     result = await serve(monkeypatch, request().model_dump(mode="json") | {"version": version,
@@ -79,8 +87,8 @@ async def test_invalid_v5_does_not_echo_untrusted_payload_or_route(monkeypatch, 
 
 
 @pytest.mark.asyncio
-async def test_cancelled_v5_has_typed_failure_not_legacy_success(monkeypatch):
-    async def cancelled(*args, **kwargs):
+async def test_cancelled_v5_has_typed_failure_not_legacy_success(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def cancelled(*args: object, **kwargs: object) -> PythonInputSupplyResponse:
         raise asyncio.CancelledError
 
     result = await serve(monkeypatch, request().model_dump(mode="json"), cancelled)

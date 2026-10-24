@@ -3,13 +3,16 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import sys
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable
 from pathlib import Path
+from typing import TypeVar, cast
 
 import pytest
 
 from agent_hub.skills.sandbox.base import SkillInvocation, run_subprocess_with_limits
 from agent_hub.subprocess_cleanup import ProcessCleanupIncomplete, drain_and_reap_process
+
+T = TypeVar("T")
 
 
 def invocation(tmp_path: Path, *, output_limit: int = 1024) -> SkillInvocation:
@@ -59,7 +62,7 @@ async def test_invalid_backend_cleanup_budget_never_launches(
 ) -> None:
     with pytest.raises(ValueError, match="cleanup grace"):
         await run_subprocess_with_limits((sys.executable, "-c", "pass"), invocation(tmp_path),
-            process_started=processes.append, termination_grace_seconds=grace)
+            process_started=processes.append, termination_grace_seconds=cast(float, grace))
     assert not processes
 
 
@@ -69,7 +72,7 @@ async def test_backend_can_supply_a_distinct_cleanup_budget(
     original = asyncio.wait_for
     observed = []
 
-    async def wait_for(awaitable: object, timeout: float) -> object:
+    async def wait_for(awaitable: Awaitable[T], timeout: float) -> T:
         observed.append(timeout)
         return await original(awaitable, timeout)
 

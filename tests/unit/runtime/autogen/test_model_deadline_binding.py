@@ -1,8 +1,10 @@
 """New AutoGen calls use live deadlines without reopening durable outcomes."""
 
 import asyncio
+from collections.abc import AsyncGenerator, Callable
 from dataclasses import replace
 from decimal import Decimal
+from typing import TypedDict, cast
 
 import pytest
 from autogen_core import CancellationToken
@@ -20,11 +22,16 @@ from agent_hub.runtime.autogen.adapter import (
     _DiscussionDurability,
 )
 from agent_hub.runtime.autogen.termination import DiscussionUsage
-from agent_hub.runtime.contracts import EventKind
+from agent_hub.runtime.contracts import Artifact, EventKind, JsonValue, RunEvent
 from tests.integration.runtime.test_autogen_adapter import ScriptedGateway
 from tests.unit.runtime.autogen.test_dynamic_limits import _context, _plan
 from tests.unit.runtime.autogen.test_model_milestones import Gateway
 from tests.unit.runtime.autogen.test_model_tool_bridge import _durability, _tool
+
+
+class EngineeringOptions(TypedDict, total=False):
+    engineering_action: Callable[[bool], str | None]
+    engineering_budget: Callable[[], tuple[int, float]]
 
 
 async def test_real_runtime_binds_selector_and_participant_to_live_budget() -> None:
@@ -91,10 +98,13 @@ async def test_required_call_rechecks_deadline_after_durable_checkpoint(
     gateway, durable = Gateway(), _durability()
     publish = durable._publish
 
-    async def delayed_publish(*args) -> None:
+    async def delayed_publish(
+        artifacts: tuple[Artifact, ...], model_entries: tuple[dict[str, JsonValue], ...],
+        tool_entries: tuple[dict[str, JsonValue], ...],
+    ) -> None:
         nonlocal remaining
         remaining = after_checkpoint
-        await publish(*args)
+        await publish(artifacts, model_entries, tool_entries)
 
     durable._publish = delayed_publish
     client = GatewayChatCompletionClient(gateway, "shared", DiscussionUsage(),
@@ -139,7 +149,7 @@ async def test_followup_uses_remaining_deadline_without_rebilling_first_completi
 @pytest.mark.parametrize("required", [False, True])
 async def test_old_success_replays_even_when_current_deadline_is_expired(required: bool) -> None:
     gateway, durable, usage = Gateway(), _durability(), DiscussionUsage()
-    options = ({"engineering_action": lambda proposed: "project.inspect",
+    options: EngineeringOptions = ({"engineering_action": lambda proposed: "project.inspect",
                 "engineering_budget": lambda: (100, 5.0)} if required else {})
     messages = [UserMessage(content="build", source="user")]
     tools = [_tool("project.inspect")] if required else []
@@ -191,7 +201,7 @@ async def test_cold_runtime_uses_tighter_budget_without_repeating_old_messages()
         ("analyst", 1, Decimal(0)), ("Retained observation", 2, Decimal(0)),
     ])
     first = AutoGenDiscussionRuntime(first_gateway, plan, artifact_repository=repository)
-    stream = first.run(context)
+    stream = cast(AsyncGenerator[RunEvent, None], first.run(context))
     checkpoint = None
     try:
         while checkpoint is None:

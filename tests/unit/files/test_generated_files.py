@@ -375,6 +375,73 @@ def test_delete_run_removes_only_that_runs_generated_files(tmp_path: Path) -> No
     assert store.resolve(sibling_metadata.storage_key).read_bytes() == b"pptx"
 
 
+def test_delete_run_handles_long_descendants_below_short_run_path(tmp_path: Path) -> None:
+    tenant_id, run_id, artifact_id = uuid4(), uuid4(), uuid4()
+    sibling_run_id, sibling_tenant_id = uuid4(), uuid4()
+    base = tmp_path / "workspace-" / "generated" / str(tenant_id) / str(run_id)
+    padding = 240 - len(str(base))
+    assert padding >= 0, "use a short pytest basetemp for this path-boundary regression"
+    root = tmp_path / ("workspace-" + "a" * padding) / "generated"
+    store = GeneratedFileStore(root)
+    metadata = store.store_bytes(
+        tenant_id, run_id, artifact_id, "report.docx", DOCX_MIME, b"remove me"
+    )
+    sibling = store.store_bytes(
+        tenant_id, sibling_run_id, uuid4(), "report.docx", DOCX_MIME, b"sibling run"
+    )
+    other_tenant = store.store_bytes(
+        sibling_tenant_id, run_id, uuid4(), "report.docx", DOCX_MIME, b"other tenant"
+    )
+    run_path = root / str(tenant_id) / str(run_id)
+    assert len(str(run_path)) == 240
+    assert len(str((root / metadata.storage_key).parent)) > 260
+
+    store.delete_run(tenant_id, run_id)
+
+    assert not run_path.exists()
+    with pytest.raises(FileNotFoundError):
+        store.resolve(metadata.storage_key)
+    assert store.resolve(sibling.storage_key).read_bytes() == b"sibling run"
+    assert store.resolve(other_tenant.storage_key).read_bytes() == b"other tenant"
+    store.delete_run(tenant_id, run_id)
+
+
+def test_delete_run_rejects_resolved_path_outside_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "generated"
+    store = GeneratedFileStore(root)
+    tenant_id, run_id = uuid4(), uuid4()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    sentinel = outside / "keep.txt"
+    sentinel.write_bytes(b"outside generated root")
+    run_path = root / str(tenant_id) / str(run_id)
+    original_resolve = Path.resolve
+
+    def redirected_resolve(path: Path, strict: bool = False) -> Path:
+        return outside if path == run_path else original_resolve(path, strict=strict)
+
+    monkeypatch.setattr(Path, "resolve", redirected_resolve)
+
+    with pytest.raises(ValueError, match="run path escapes generated artifact root"):
+        store.delete_run(tenant_id, run_id)
+
+    assert sentinel.read_bytes() == b"outside generated root"
+
+
+def test_delete_run_rejects_existing_file_instead_of_run_directory(tmp_path: Path) -> None:
+    tenant_id, run_id = uuid4(), uuid4()
+    run_path = tmp_path / str(tenant_id) / str(run_id)
+    run_path.parent.mkdir()
+    run_path.write_bytes(b"not a directory")
+
+    with pytest.raises(ValueError, match="run path is not a directory"):
+        GeneratedFileStore(tmp_path).delete_run(tenant_id, run_id)
+
+    assert run_path.read_bytes() == b"not a directory"
+
+
 def test_delete_run_ignores_missing_generated_directory(tmp_path: Path) -> None:
     GeneratedFileStore(tmp_path).delete_run(uuid4(), uuid4())
 

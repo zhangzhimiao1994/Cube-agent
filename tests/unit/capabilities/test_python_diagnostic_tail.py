@@ -2,10 +2,13 @@
 
 import hashlib
 import importlib
+from collections.abc import Mapping
+from typing import cast
 
 import pytest
 
 from agent_hub.capabilities.execution_diagnostics import ExecutionDiagnostic
+from agent_hub.runtime.contracts import JsonValue
 from agent_hub.skills.sandbox.base import SkillResult
 from tests.unit.capabilities.test_python_project_reports import decode, fail, fixture
 
@@ -29,10 +32,12 @@ def test_tail_preview_preserves_full_sanitized_hash_and_existing_metadata_budget
     result = SkillResult(exit_code=1, timed_out=False, stdout='', stderr=raw)
     legacy = ExecutionDiagnostic('systemd', result).to_payload()
     tail = ExecutionDiagnostic('systemd', result, retain_tail=True).to_payload()
-    assert legacy['stderr_metadata']['sha256'] == tail['stderr_metadata']['sha256']
-    assert 4093 <= tail['stderr_metadata']['returned_bytes'] <= 4096
-    assert tail['stderr'].endswith(character)
-    assert legacy['stderr'].endswith('[truncated]')
+    legacy_metadata = cast(Mapping[str, JsonValue], legacy['stderr_metadata'])
+    tail_metadata = cast(Mapping[str, JsonValue], tail['stderr_metadata'])
+    assert legacy_metadata['sha256'] == tail_metadata['sha256']
+    assert 4093 <= cast(int, tail_metadata['returned_bytes']) <= 4096
+    assert cast(str, tail['stderr']).endswith(character)
+    assert cast(str, legacy['stderr']).endswith('[truncated]')
 
 
 def test_tail_is_sanitized_before_clipping_even_when_credential_is_after_budget() -> None:
@@ -40,5 +45,5 @@ def test_tail_is_sanitized_before_clipping_even_when_credential_is_after_budget(
     payload = ExecutionDiagnostic('systemd', SkillResult(exit_code=1, timed_out=False,
         stdout='', stderr=raw), retain_tail=True).to_payload()
     assert 'secret-sentinel' not in repr(payload)
-    assert payload['stderr'].endswith('RealError: value mismatch\n')
-    assert payload['stderr_metadata']['redacted_lines'] == 1
+    assert cast(str, payload['stderr']).endswith('RealError: value mismatch\n')
+    assert cast(Mapping[str, JsonValue], payload['stderr_metadata'])['redacted_lines'] == 1

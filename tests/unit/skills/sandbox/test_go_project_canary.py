@@ -67,7 +67,7 @@ def test_overlay_has_exact_virtual_paths_and_no_existing_source_edits(api: Any) 
     ('source_sha256', 'invalid'), ('protected_sha256', 'D' * 64),
 ])
 def test_invalid_identity_and_shell_fragments_are_rejected(api: Any, field: str, value: object) -> None:
-    payload = {'project_execution_id': 'go-project-1', 'execution_id': 'go-canary-1',
+    payload: dict[str, object] = {'project_execution_id': 'go-project-1', 'execution_id': 'go-canary-1',
         'module_path': 'example.invalid/app', 'nonce': 'a' * 64,
         'source_sha256': 'b' * 64, 'protected_sha256': 'c' * 64}
     payload[field] = value

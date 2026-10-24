@@ -3,13 +3,15 @@
 import asyncio
 import hashlib
 import json
-from collections.abc import Mapping
+from collections.abc import AsyncGenerator, Mapping
 from decimal import Decimal
-from uuid import uuid4
+from typing import cast
+from uuid import UUID, uuid4
 
 import pytest
 
-from agent_hub.harness.types import HarnessToolCallResult
+from agent_hub.auth.models import Role
+from agent_hub.harness.types import HarnessToolCallRequest, HarnessToolCallResult
 from agent_hub.models.gateway import GatewayCompletion
 from agent_hub.models.types import ModelRequest, ModelResponse, TokenUsage, ToolCall
 from agent_hub.runtime.artifacts import InMemoryArtifactRepository
@@ -22,7 +24,14 @@ from agent_hub.runtime.autogen.engineering_delivery import (
     engineering_delivery_ready,
     engineering_progress,
 )
-from agent_hub.runtime.contracts import Artifact, EventKind, JsonValue, TaskContext, _mutable_json
+from agent_hub.runtime.contracts import (
+    Artifact,
+    EventKind,
+    JsonValue,
+    RunEvent,
+    TaskContext,
+    _mutable_json,
+)
 from agent_hub.runtime.engineering_actions import required_engineering_action
 from tests.unit.runtime.test_generated_draft_autogen import (
     EMPTY_HASH,
@@ -43,7 +52,8 @@ def action_context() -> TaskContext:
     }})
 
 
-def append(ctx, rows, artifacts, artifact, *, status="succeeded") -> None:
+def append(ctx: TaskContext, rows: list[dict[str, JsonValue]], artifacts: list[Artifact],
+           artifact: Artifact, *, status: str = "succeeded") -> None:
     position = len(rows)
     name = artifact.content["tool_name"]
     args = artifact.content["arguments_sha256"]
@@ -63,9 +73,10 @@ def result(name: str, value: dict[str, JsonValue]) -> Artifact:
     })
 
 
-def draft_case():
+def draft_case() -> tuple[TaskContext, list[dict[str, JsonValue]], list[Artifact]]:
     ctx = action_context()
-    rows, artifacts = [], []
+    rows: list[dict[str, JsonValue]] = []
+    artifacts: list[Artifact] = []
     append(ctx, rows, artifacts, result("project.inspect", {
         "schema_version": 1, "scope": {"tenant_id": str(ctx.tenant_id),
             "run_id": str(ctx.run_id), "project_id": "draft-project",
@@ -77,7 +88,12 @@ def draft_case():
     }))
     draft = draft_artifact(ctx)
     content = _mutable_json(draft.content)
-    content["result"]["generated_draft_rejection"].update(
+    assert isinstance(content, dict)
+    observed = content["result"]
+    assert isinstance(observed, dict)
+    rejection = observed["generated_draft_rejection"]
+    assert isinstance(rejection, dict)
+    rejection.update(
         reason="generated_acceptance_manifest_required", issues=["manifest_missing"])
     draft = Artifact(id=draft.id, type=draft.type, producer=draft.producer, content=content)
     append(ctx, rows, artifacts, draft, status="failed")
@@ -120,7 +136,11 @@ def test_corrupt_draft_never_becomes_recoverable_progress(defect: str) -> None:
     ctx, rows, artifacts = draft_case()
     original = artifacts[-1]
     content = _mutable_json(original.content)
-    rejection = content["result"]["generated_draft_rejection"]
+    assert isinstance(content, dict)
+    observed = content["result"]
+    assert isinstance(observed, dict)
+    rejection = observed["generated_draft_rejection"]
+    assert isinstance(rejection, dict)
     fields = {"actor": "proposer_actor", "tenant": "tenant_id", "user": "user_id",
               "run": "run_id", "request": "request_sha256", "project": "project_id",
               "session": "session_id"}
@@ -134,11 +154,11 @@ def test_corrupt_draft_never_becomes_recoverable_progress(defect: str) -> None:
         rows[-1]["idempotency_key"] = hashlib.sha256(
             f"{ctx.run_id}:implementer:2:project.verify:{'d' * 64}".encode()).hexdigest()
     elif defect == "truncated":
-        content["result"]["truncated"] = True
+        observed["truncated"] = True
     elif defect in {"execution_started", "phase"}:
         rejection[defect] = True if defect == "execution_started" else "captured"
     elif defect == "extra":
-        content["result"]["approval_id"] = str(uuid4())
+        observed["approval_id"] = str(uuid4())
     elif defect in {"succeeded", "running", "UNKNOWN"}:
         rows[-1]["status"] = defect
     changed = Artifact(id=original.id, type=original.type,
@@ -162,24 +182,32 @@ async def test_real_action_v1_runtime_receives_manifest_missing_then_writes_corr
     correction_seen = False
 
     class NativeDraftGateway(DraftGateway):
-        def is_available(self, tenant_id, name):
+        def is_available(self, tenant_id: UUID, name: str) -> bool:
             return tenant_id == ctx.tenant_id and name in ALLOWED["implementer"]
 
-        async def invoke(self, tenant_id, request, *, user_id=None, role=None):
+        async def invoke(
+            self, tenant_id: UUID, request: HarnessToolCallRequest, *,
+            user_id: UUID | None = None, role: Role | None = None,
+        ) -> HarnessToolCallResult:
             assert tenant_id == ctx.tenant_id and user_id == ctx.actor_id and role == ctx.actor_role
             if request.tool_name == "project.verify":
                 row = await super().invoke(tenant_id, request, user_id=user_id, role=role)
                 payload = _mutable_json(row.payload)
-                payload["generated_draft_rejection"].update(
+                assert isinstance(payload, dict)
+                rejection = payload["generated_draft_rejection"]
+                assert isinstance(rejection, dict)
+                rejection.update(
                     reason="generated_acceptance_manifest_required", issues=["manifest_missing"])
                 return HarnessToolCallResult(call_id=row.call_id, tool_name=row.tool_name,
                     status=row.status, failure_reason=row.failure_reason, payload=payload)
             self.calls.append(request)
             if request.tool_name == "project.inspect":
                 payload = _mutable_json(draft_case_for_context(ctx))
+                assert isinstance(payload, dict)
             else:
                 assert request.tool_name == "workspace.write_text"
                 text = request.arguments["content"]
+                assert isinstance(text, str)
                 payload = {"path": request.arguments["path"],
                            "sha256": hashlib.sha256(text.encode()).hexdigest(),
                            "size_bytes": len(text.encode())}
@@ -187,8 +215,8 @@ async def test_real_action_v1_runtime_receives_manifest_missing_then_writes_corr
                                          status="succeeded", payload=payload)
 
     class Model:
-        def __init__(self):
-            self.requests = []
+        def __init__(self) -> None:
+            self.requests: list[ModelRequest] = []
             self.stage = 0
 
         async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
@@ -206,6 +234,7 @@ async def test_real_action_v1_runtime_receives_manifest_missing_then_writes_corr
                     for message in request.messages:
                         prefix = "UNTRUSTED_CAPABILITY_RESULTS_JSON="
                         if message.role == "user" and str(message.content).startswith(prefix):
+                            assert isinstance(message.content, str)
                             for item in json.loads(message.content[len(prefix):]):
                                 try:
                                     value = json.loads(item["content"].removeprefix("Error: "))
@@ -234,7 +263,7 @@ async def test_real_action_v1_runtime_receives_manifest_missing_then_writes_corr
     ), selector_model="selector", max_turns=8, token_budget=500), capability_gateway=gateway,
         harness_tool_gateway=gateway, artifact_repository=InMemoryArtifactRepository())
     events = []
-    stream = runner.run(ctx)
+    stream = cast(AsyncGenerator[RunEvent, None], runner.run(ctx))
     try:
         async with asyncio.timeout(10):
             async for event in stream:

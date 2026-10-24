@@ -33,7 +33,7 @@ def client(monkeypatch: pytest.MonkeyPatch) -> Any:
     return module
 
 
-def request(action: str = 'run_go_project', **changes: Any) -> protocol.GoProjectRequest:
+def request(action: protocol.GoProjectAction = 'run_go_project', **changes: Any) -> protocol.GoProjectRequest:
     return protocol.GoProjectRequest(action=action, invocation=invocation(protocol, **changes))
 
 
@@ -85,7 +85,7 @@ def connect_wire(
 
 @pytest.mark.parametrize('action', ['run_go_project', 'inspect_go_project_environment'])
 async def test_actions_keep_exact_v8_invocation_and_separate_outcomes(
-    client: Any, monkeypatch: pytest.MonkeyPatch, action: str,
+    client: Any, monkeypatch: pytest.MonkeyPatch, action: protocol.GoProjectAction,
 ) -> None:
     call = request(action, output_limit_bytes=32 * 1024**2, source_kind='candidate')
     reply = response(protocol, call, stdout='{"passed":true,"environment":"untrusted"}')
@@ -251,13 +251,13 @@ async def test_public_job_rejects_forged_invocation_with_constant_before_io(
     client: Any, monkeypatch: pytest.MonkeyPatch, method: str, damage: str,
 ) -> None:
     inv = request().invocation
-    changes = {
+    updates: dict[str, dict[str, object]] = {
         'mismatch': {'scope': inv.scope.model_copy(update={'project_id': 'other'})},
         'missing-scope': {'scope': None},
         'raw-scope': {'scope': '/private/secret'},
         'raw-sdk': {'toolchain': '/private/secret'},
-    }[damage]
-    inv = inv.model_copy(update=changes)
+    }
+    inv = inv.model_copy(update=updates[damage])
 
     async def forbidden(*args: Any, **kwargs: Any) -> Any:
         pytest.fail('invalid invocation opened transport')
@@ -302,7 +302,7 @@ async def test_os_failures_never_expose_socket_or_host_diagnostics(
 @pytest.mark.parametrize('action', ['run_go_project', 'inspect_go_project_environment'])
 @pytest.mark.parametrize('code', ['go_project_scope_changed', 'go_project_cleanup_incomplete'])
 async def test_root_failure_cannot_become_success(
-    client: Any, monkeypatch: pytest.MonkeyPatch, action: str, code: str,
+    client: Any, monkeypatch: pytest.MonkeyPatch, action: protocol.GoProjectAction, code: str,
 ) -> None:
     call = request(action)
     reply = response(protocol, call, ok=False).model_copy(update={'error': code})
@@ -346,7 +346,7 @@ async def test_strict_termination_accepts_only_empty_success_outcome(
 @pytest.mark.parametrize('damage', ['eof', 'json', 'reset', 'binding', 'overlong', 'write', 'drain', 'close'])
 @pytest.mark.parametrize('ack_ok', [True, False])
 async def test_submitted_failure_requires_confirmed_termination_before_propagating(
-    client: Any, monkeypatch: pytest.MonkeyPatch, action: str, damage: str, ack_ok: bool,
+    client: Any, monkeypatch: pytest.MonkeyPatch, action: protocol.GoProjectAction, damage: str, ack_ok: bool,
 ) -> None:
     call = request(action)
     payload = response(protocol, call).model_dump(mode='json')
@@ -476,7 +476,7 @@ async def test_late_success_during_termination_cannot_erase_cancellation(
 @pytest.mark.parametrize('action', ['run_go_project', 'inspect_go_project_environment'])
 @pytest.mark.parametrize('interrupt', ['cancel', 'timeout', 'cleanup-failure'])
 async def test_interruption_terminates_same_job_and_drains_both_connections(
-    client: Any, monkeypatch: pytest.MonkeyPatch, action: str, interrupt: str,
+    client: Any, monkeypatch: pytest.MonkeyPatch, action: protocol.GoProjectAction, interrupt: str,
 ) -> None:
     sent, closing, release_close = asyncio.Event(), asyncio.Event(), asyncio.Event()
     call = request(action)
@@ -560,7 +560,9 @@ async def test_stalled_writer_close_is_bounded_and_never_reports_cancel_success(
         transport = Transport()
 
         async def wait_closed(self) -> None:
-            closing_tasks.add(asyncio.current_task())
+            current = asyncio.current_task()
+            assert current is not None
+            closing_tasks.add(current)
             closing.set()
             try:
                 await release_close.wait()
@@ -579,7 +581,7 @@ async def test_stalled_writer_close_is_bounded_and_never_reports_cancel_success(
     if stalled == 'operation':
         async def drain() -> None:
             sent.set()
-        operation_writer.drain = drain
+        monkeypatch.setattr(operation_writer, 'drain', drain)
     terminate_writer = StalledWriter() if stalled == 'termination' else Writer()
     connections = 0
 
@@ -644,7 +646,9 @@ async def test_direct_termination_has_hard_bound_even_if_transport_ignores_cance
     operations: set[asyncio.Task[Any]] = set()
 
     async def stuck(*args: Any, **kwargs: Any) -> Any:
-        operations.add(asyncio.current_task())
+        current = asyncio.current_task()
+        assert current is not None
+        operations.add(current)
         started.set()
         try:
             await release.wait()

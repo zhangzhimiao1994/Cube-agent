@@ -3,11 +3,12 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 from types import ModuleType
-from typing import Any, cast
+from typing import Any, TypedDict, cast
 from uuid import UUID
 
 import pytest
 from fastapi.testclient import TestClient
+from redis.asyncio import Redis
 
 from agent_hub import app as app_module
 from agent_hub.api.routers.admin import InMemoryAdminResourceService
@@ -21,6 +22,7 @@ from agent_hub.runs.project_verification_receipts import (
     ProjectVerificationReceiptRepository,
 )
 from agent_hub.runtime import worker
+from agent_hub.runtime.registry import RuntimeRegistry
 from tests.unit.capabilities.test_verification_cold_recovery import Fixture
 from tests.unit.test_app_wiring import (
     TENANT_ID,
@@ -31,6 +33,10 @@ from tests.unit.test_app_wiring import (
     StubRateLimiter,
     valid_settings,
 )
+
+
+class ReceiptOptions(TypedDict, total=False):
+    receipt_repository: ProjectVerificationReceiptRepository
 
 
 class RuntimeAdapter:
@@ -138,7 +144,7 @@ def test_capability_stack_forwards_optional_receipt_repository(
     database = FakeDatabase()
     artifacts = PostgresArtifactRepository(cast(Any, database.session_factory))
     receipts = ProjectVerificationReceiptRepository(cast(Any, database.session_factory))
-    options = {"receipt_repository": receipts} if durable else {}
+    options: ReceiptOptions = {"receipt_repository": receipts} if durable else {}
     stack = build_runtime_capability_stack(
         tenant_id=TENANT_ID,
         run_repository=object(),
@@ -149,7 +155,9 @@ def test_capability_stack_forwards_optional_receipt_repository(
         **options,
     )
     verifier = stack.runtime_gateway._project_verification
+    assert verifier is not None
     if durable:
+        assert verifier._durable is not None
         assert verifier._durable.receipts is receipts
         assert verifier._durable.artifacts is artifacts
     else:
@@ -229,7 +237,7 @@ def _build_worker(
     database = FakeDatabase()
     settings = _settings(tmp_path)
     monkeypatch.setattr(worker, "build_database", lambda url: database)
-    monkeypatch.setattr(worker.Redis, "from_url", lambda url: FakeRedis())
+    monkeypatch.setattr(Redis, "from_url", lambda url: FakeRedis())
     monkeypatch.setattr(worker, "ConfigService", lambda factory: StubConfigService())
     monkeypatch.setattr(worker, "RuntimeMcpService", lambda **kwargs: RuntimeAdapter())
     monkeypatch.setattr(worker, "RuntimePluginService", lambda **kwargs: RuntimeAdapter())
@@ -294,6 +302,9 @@ def test_injected_services_do_not_construct_or_start_runtime_stacks(
     def unexpected(*args: Any, **kwargs: Any) -> Any:
         pytest.fail("injected services must not initialize runtime resources")
 
+    async def redis_probe() -> None:
+        return None
+
     for name in (
         "build_runtime_capability_stack", "configured_runtime_registry",
         "PostgresArtifactRepository", "build_runtime_mcp_service", "build_runtime_plugin_service",
@@ -307,7 +318,7 @@ def test_injected_services_do_not_construct_or_start_runtime_stacks(
         auth_service=StubAuthService(), rate_limiter=StubRateLimiter(),
         config_service=StubConfigService(), admin_resource_service=InMemoryAdminResourceService(),
         user_admin_service=object(), run_service=injected_service,
-        runtime_registry=injected_registry, redis_probe=lambda: True,
+        runtime_registry=cast(RuntimeRegistry, injected_registry), redis_probe=redis_probe,
     )
     with TestClient(application):
         assert application.state.run_service is injected_service

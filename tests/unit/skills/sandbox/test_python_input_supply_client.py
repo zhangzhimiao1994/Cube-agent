@@ -1,4 +1,5 @@
 import asyncio
+from typing import Never
 from uuid import UUID
 
 import pytest
@@ -8,20 +9,20 @@ from agent_hub.skills.sandbox.python_input_supply_protocol import PythonInputSup
 from agent_hub.skills.sandbox.python_project_protocol import PythonProjectProbeInvocation
 
 
-def invocation():
-    return PythonProjectProbeInvocation(execution_id="supply_" + "1" * 32,
-        tenant_id=UUID(int=1), run_id=UUID(int=2), project_id="project", session_id="session",
-        sandbox_profile="workspace_write", timeout_seconds=1,
-        original_reference={"schema_version": 1, "contract_sha256": "1" * 64,
-                            "input_source_sha256": "2" * 64, "file_count": 6})
+def invocation() -> PythonProjectProbeInvocation:
+    return PythonProjectProbeInvocation.model_validate({"execution_id": "supply_" + "1" * 32,
+        "tenant_id": UUID(int=1), "run_id": UUID(int=2), "project_id": "project", "session_id": "session",
+        "sandbox_profile": "workspace_write", "timeout_seconds": 1,
+        "original_reference": {"schema_version": 1, "contract_sha256": "1" * 64,
+                            "input_source_sha256": "2" * 64, "file_count": 6}})
 
 
 @pytest.mark.asyncio
-async def test_invalid_constructed_request_never_contacts_transport(monkeypatch):
+async def test_invalid_constructed_request_never_contacts_transport(monkeypatch: pytest.MonkeyPatch) -> None:
     client = PythonInputSupplySandbox()
     calls = []
 
-    async def exchange(*args, **kwargs):
+    async def exchange(*args: object, **kwargs: object) -> Never:
         calls.append(1)
         raise AssertionError
 
@@ -33,17 +34,18 @@ async def test_invalid_constructed_request_never_contacts_transport(monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_cancel_drains_same_execution_and_never_resends(monkeypatch):
+async def test_cancel_drains_same_execution_and_never_resends(monkeypatch: pytest.MonkeyPatch) -> None:
     client = PythonInputSupplySandbox()
     entered = asyncio.Event()
-    calls, stops = [], []
+    calls: list[str] = []
+    stops: list[str] = []
 
-    async def exchange(request, **kwargs):
+    async def exchange(request: PythonInputSupplyRequest, **kwargs: object) -> None:
         calls.append(request.invocation.execution_id)
         entered.set()
         await asyncio.Event().wait()
 
-    async def terminate(execution_id):
+    async def terminate(execution_id: str) -> None:
         stops.append(execution_id)
 
     monkeypatch.setattr("agent_hub.skills.sandbox.python_input_supply_client.request_input_supply_broker", exchange)

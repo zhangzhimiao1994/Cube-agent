@@ -135,6 +135,8 @@ def test_stage_rejects_conflicts_bad_version_and_deadlines(api: Any, tmp_path: P
 
 
 def test_many_directories_need_depth_bounded_not_tree_sized_descriptors(api: Any, tmp_path: Path) -> None:
+    if sys.platform == "win32":
+        pytest.skip("resource limits require a POSIX runtime")
     native()
     import resource
 

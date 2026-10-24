@@ -1,13 +1,15 @@
 """Runtime routing and delivery gates; mocked services are not execution proof."""
 
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from uuid import UUID
 
 import pytest
 
 from agent_hub.capabilities.runtime import RuntimeCapabilityError, RuntimeCapabilityGateway
 from agent_hub.capabilities.types import CapabilityRequest
+from agent_hub.runtime.contracts import JsonValue
 from tests.unit.capabilities.test_project_verification import Executor, gateway
 from tests.unit.capabilities.test_scoped_read import RUN, TENANT, project_path, write_file
 
@@ -52,7 +54,7 @@ async def test_runtime_does_not_silently_fallback_on_recipe_resolution_error(tmp
             raise ValueError('private recipe data')
     backend._project_verification = Service()  # type: ignore[assignment]
     with pytest.raises(ValueError):
-        await backend.project_verification_authorization(object())
+        await backend.project_verification_authorization(cast(CapabilityRequest, object()))
 
 
 @pytest.mark.asyncio
@@ -80,7 +82,7 @@ async def test_workspace_python_project_requires_receipt_even_without_original_m
 @pytest.mark.asyncio
 async def test_no_project_verifier_preserves_non_project_authorization(tmp_path: Path) -> None:
     backend = RuntimeCapabilityGateway(skill_store_dir=tmp_path / 'skills')
-    assert await backend.project_verification_authorization(object()) is None
+    assert await backend.project_verification_authorization(cast(CapabilityRequest, object())) is None
 
 
 @pytest.mark.asyncio
@@ -188,7 +190,8 @@ async def test_real_default_policy_waits_for_exact_recipe_then_gateway_executes_
     assert allowed.status == 'succeeded'
     await observed(verifier, repository, invocation)
     failed = await gateway.invoke(invocation.tenant_id, call, **identity)
-    assert failed.status == 'failed' and failed.payload['python_verification_failure']['schema_version'] == 2
-    assert 'AssertionError' in failed.payload['execution_diagnostic']['stderr']
+    assert failed.status == 'failed' and cast(Mapping[str, JsonValue], failed.payload['python_verification_failure'])['schema_version'] == 2
+    diagnostic = cast(Mapping[str, JsonValue], failed.payload['execution_diagnostic'])
+    assert 'AssertionError' in cast(str, diagnostic['stderr'])
     assert 'verification_failure' not in failed.payload
     assert len(pending) == 1 and len(executor.calls) == 2

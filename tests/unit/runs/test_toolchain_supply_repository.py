@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib
 import importlib.util
 import json
+from collections.abc import Callable, Mapping
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -13,6 +14,7 @@ from uuid import uuid4
 
 import pytest
 from sqlalchemy.dialects import postgresql
+from sqlalchemy.engine import Dialect
 
 from agent_hub.auth.models import Role
 from agent_hub.capabilities.approvals import capability_approval_scope
@@ -20,7 +22,7 @@ from agent_hub.capabilities.toolchain_preparation import toolchain_supply_bindin
 from agent_hub.db.models import RunApprovalRow, RunRow, UserRow
 from agent_hub.domain.runs import TaskMode
 from agent_hub.runs.repository import RunConflict, RunNotFound, RunRepository
-from agent_hub.runtime.contracts import TaskContext
+from agent_hub.runtime.contracts import JsonValue, TaskContext
 from tests.unit.capabilities.test_toolchain_preparation import case as case  # noqa: PLC0414
 from tests.unit.capabilities.test_toolchain_preparation import (
     free_changed,
@@ -34,6 +36,11 @@ def api() -> Any:
     return importlib.import_module(name)
 
 
+def object_dict(value: object) -> dict[str, object]:
+    assert isinstance(value, dict)
+    return cast(dict[str, object], value)
+
+
 class SupplyDB:
     def __init__(self, case: Any) -> None:
         self.case = case
@@ -42,7 +49,7 @@ class SupplyDB:
             mode='dispatch', status='running', version=4, created_at=datetime.now(UTC),
             routing_decision=deepcopy(case.row.routing_decision), worker_id='worker-go',
             worker_lease_token=uuid4(), worker_lease_expires_at=datetime.now(UTC) + timedelta(minutes=5))
-        self.row.routing_decision['unrelated'] = {'keep': [1, False, 'value']}
+        self.route['unrelated'] = {'keep': [1, False, 'value']}
         self.approvals: list[RunApprovalRow] = []
         self.user = UserRow(id=self.row.actor_id, tenant_id=self.row.tenant_id,
                             username='operator_go', role='operator', disabled=False)
@@ -53,14 +60,22 @@ class SupplyDB:
         self.repository = RunRepository(cast(Any, lambda: Session(self)))
         self.bound = api().ToolchainSupplyAuthority.from_context(self.context(), worker_id='worker-go')
 
+    @property
+    def route(self) -> dict[str, object]:
+        assert self.row.routing_decision is not None
+        return self.row.routing_decision
+
     def context(self) -> TaskContext:
         row = self.row
+        assert row.actor_role is not None and row.mode is not None
         return TaskContext(tenant_id=row.tenant_id, run_id=row.id, actor_id=row.actor_id,
             actor_role=Role(row.actor_role), execution_token=row.worker_lease_token,
-            request=row.request, mode=TaskMode(row.mode), routing_decision=row.routing_decision)
+            request=row.request, mode=TaskMode(row.mode),
+            routing_decision=cast(Mapping[str, JsonValue], self.route))
 
     def approve(self) -> None:
         record = RunRepository._record(self.row)
+        assert record.routing_decision is not None
         record.routing_decision['toolchain_supply'] = state_for(self.case)
         request = toolchain_supply_binding(record, planned=True)
         self.approvals.append(RunApprovalRow(id=uuid4(), tenant_id=self.row.tenant_id,
@@ -91,8 +106,10 @@ class Transaction:
         session = self.session
         session.active = False
         if error is None:
+            assert session.row.routing_decision is not None
             state = session.row.routing_decision.get('toolchain_supply')
-            phase = None if state is None else state['phase']
+            phase = None if state is None else object_dict(state)['phase']
+            assert phase is None or isinstance(phase, str)
             if session.db.fail_phase is not None and phase == session.db.fail_phase:
                 raise OSError('simulated commit failure')
             session.db.row = deepcopy(session.row)
@@ -115,7 +132,7 @@ class Session:
 
     async def scalar(self, statement: Any) -> Any:
         assert self.active
-        compiled = statement.compile(dialect=postgresql.dialect())
+        compiled = statement.compile(dialect=cast(Callable[[], Dialect], postgresql.dialect)())
         assert 'FOR UPDATE' in str(compiled)
         tables = {item.name for item in statement.get_final_froms()}
         params = compiled.params
@@ -149,6 +166,7 @@ def db(case: Any) -> SupplyDB:
 async def test_planned_access_needs_no_grant_and_preserves_other_routing(case: Any) -> None:
     db = SupplyDB(case)
     before = deepcopy(db.row.routing_decision)
+    assert before is not None
     assert await db.read() is None
     planned = state_for(db.case)
     result = await db.write(None, planned)
@@ -173,7 +191,7 @@ async def test_exact_grant_allows_only_forward_transitions(db: SupplyDB) -> None
     'status', 'request', 'mode', 'project', 'session', 'permissions', 'permission_added', 'profile',
     'backend', 'capture', 'capture_phase', 'capture_version', 'contract_version', 'input'])
 async def test_every_access_rechecks_bound_authority(db: SupplyDB, operation: str, defect: str) -> None:
-    row, route = db.row, db.row.routing_decision
+    row, route = db.row, db.route
     if defect in {'actor', 'token'}:
         setattr(row, 'actor_id' if defect == 'actor' else 'worker_lease_token', uuid4())
     elif defect in {'role', 'worker', 'status', 'request', 'mode'}:
@@ -186,16 +204,21 @@ async def test_every_access_rechecks_bound_authority(db: SupplyDB, operation: st
         route[{'project': 'project_id', 'session': 'workspace_session_id',
                'profile': 'sandbox_profile', 'backend': 'execution_backend'}[defect]] = 'other'
     elif defect in {'permissions', 'permission_added'}:
+        permissions = route['requested_permissions']
+        assert isinstance(permissions, list)
         route['requested_permissions'] = ['workspace.read'] if defect == 'permissions' else [
-            *route['requested_permissions'], 'network.read']
+            *permissions, 'network.read']
     elif defect == 'input':
-        route['project_input']['editable_paths'] = ['other.go']
+        object_dict(route['project_input'])['editable_paths'] = ['other.go']
     elif defect == 'contract_version':
         route['project_input_contract_version'] = True
     else:
-        capture = route['project_input_preparation']
+        capture = object_dict(route['project_input_preparation'])
         if defect == 'capture':
-            capture['reference']['file_count'] += 1
+            reference = object_dict(capture['reference'])
+            count = reference['file_count']
+            assert isinstance(count, int)
+            reference['file_count'] = count + 1
         elif defect == 'capture_phase':
             capture['phase'] = 'observed'
         else:
@@ -210,7 +233,7 @@ async def test_every_access_rechecks_bound_authority(db: SupplyDB, operation: st
                                'generated_project_preparation'])
 @pytest.mark.parametrize('value', [None, False, {}])
 async def test_mixed_authority_is_rejected_by_key_presence(db: SupplyDB, key: str, value: Any) -> None:
-    db.row.routing_decision[key] = value
+    db.route[key] = value
     with pytest.raises(RunConflict):
         await db.read()
     with pytest.raises(RunConflict):
@@ -223,7 +246,7 @@ async def test_mixed_authority_is_rejected_by_key_presence(db: SupplyDB, key: st
 async def test_privileged_access_requires_live_exact_db_grant(
     db: SupplyDB, phase: str, defect: str,
 ) -> None:
-    db.row.routing_decision['toolchain_supply'] = state_for(db.case, phase)
+    db.route['toolchain_supply'] = state_for(db.case, phase)
     db.approve()
     approval = db.approvals[0]
     if defect == 'missing':
@@ -231,11 +254,13 @@ async def test_privileged_access_requires_live_exact_db_grant(
     elif defect in {'pending', 'denied'}:
         approval.status = defect
     elif defect == 'binding':
-        approval.payload['toolchain_input_binding']['artifact_sha256'] = '0' * 64
+        object_dict(approval.payload['toolchain_input_binding'])['artifact_sha256'] = '0' * 64
     elif defect == 'boolean':
-        approval.payload['toolchain_input_binding']['schema_version'] = True
+        object_dict(approval.payload['toolchain_input_binding'])['schema_version'] = True
     elif defect == 'scope':
-        approval.payload['approval_scope'] += '/extra'
+        scope = approval.payload['approval_scope']
+        assert isinstance(scope, str)
+        approval.payload['approval_scope'] = scope + '/extra'
     elif defect == 'python':
         approval.payload['python_input_binding'] = None
     else:
@@ -245,7 +270,7 @@ async def test_privileged_access_requires_live_exact_db_grant(
             await db.write(state_for(db.case), state_for(db.case, 'executing'))
         else:
             await db.read()
-    assert db.row.routing_decision['toolchain_supply'] == state_for(db.case, phase)
+    assert db.route['toolchain_supply'] == state_for(db.case, phase)
 
 
 @pytest.mark.parametrize('before,after', [
@@ -255,7 +280,7 @@ async def test_privileged_access_requires_live_exact_db_grant(
 async def test_no_deletion_skipping_rollback_or_noop(db: SupplyDB, before: Any, after: Any) -> None:
     previous = None if before is None else state_for(db.case, before)
     if previous is not None:
-        db.row.routing_decision['toolchain_supply'] = deepcopy(previous)
+        db.route['toolchain_supply'] = deepcopy(previous)
     db.approve()
     with pytest.raises((RunConflict, TypeError)):
         await db.write(previous, None if after is None else state_for(db.case, after))
@@ -264,9 +289,10 @@ async def test_no_deletion_skipping_rollback_or_noop(db: SupplyDB, before: Any, 
 
 @pytest.mark.parametrize('defect', ['partial', 'boolean', 'capacity', 'stale'])
 async def test_expected_is_full_and_type_sensitive(db: SupplyDB, defect: str) -> None:
-    db.row.routing_decision['toolchain_supply'] = state_for(db.case)
+    db.route['toolchain_supply'] = state_for(db.case)
     db.approve()
-    expected = state_for(db.case)
+    expected: dict[str, object] | None = state_for(db.case)
+    assert expected is not None
     if defect == 'partial':
         expected.pop('original_reference')
     elif defect == 'boolean':
@@ -281,7 +307,7 @@ async def test_expected_is_full_and_type_sensitive(db: SupplyDB, defect: str) ->
 
 @pytest.mark.parametrize('defect', ['plan', 'capacity', 'execution', 'receipt', 'reference', 'extra'])
 async def test_forward_cas_cannot_replace_fixed_binding(db: SupplyDB, defect: str) -> None:
-    db.row.routing_decision['toolchain_supply'] = state_for(db.case, 'executing')
+    db.route['toolchain_supply'] = state_for(db.case, 'executing')
     db.approve()
     after = state_for(db.case, 'supplied')
     if defect == 'plan':
@@ -310,7 +336,7 @@ async def test_lease_expiring_during_approval_query_cannot_write(db: SupplyDB) -
     db.before_approval = lambda row: setattr(row, 'worker_lease_expires_at', datetime.now(UTC))
     with pytest.raises(RunConflict):
         await db.write(state_for(db.case), state_for(db.case, 'executing'))
-    assert db.row.routing_decision['toolchain_supply']['phase'] == 'planned'
+    assert object_dict(db.route['toolchain_supply'])['phase'] == 'planned'
 
 
 async def test_stale_expected_loses_after_another_commit(db: SupplyDB) -> None:
@@ -337,7 +363,7 @@ async def test_commit_failure_never_returns_success_or_changes_state(db: SupplyD
     db.fail_phase = 'planned'
     with pytest.raises(OSError, match='commit failure'):
         await db.write(None, state_for(db.case))
-    assert 'toolchain_supply' not in db.row.routing_decision and db.row.version == 4
+    assert 'toolchain_supply' not in db.route and db.row.version == 4
 
 
 @pytest.mark.parametrize('operation', ['read', 'write'])
@@ -347,7 +373,7 @@ async def test_live_user_disabled_or_downgraded_cannot_use_old_run_or_grant(
     db: SupplyDB, operation: str, phase: Any, defect: str,
 ) -> None:
     if phase is not None:
-        db.row.routing_decision['toolchain_supply'] = state_for(db.case, phase)
+        db.route['toolchain_supply'] = state_for(db.case, phase)
     db.approve()
     if defect == 'disabled':
         db.user.disabled = True
@@ -368,7 +394,7 @@ async def test_absent_backend_uses_existing_systemd_default(case: Any) -> None:
     case.row.routing_decision.pop('execution_backend', None)
     db = SupplyDB(case)
     await db.write(None, state_for(db.case))
-    assert 'execution_backend' not in db.row.routing_decision
+    assert 'execution_backend' not in db.route
 
 
 @pytest.mark.parametrize('defect', ['missing', 'tenant', 'id', 'invalid_role', 'disabled_null'])
@@ -380,7 +406,7 @@ async def test_missing_or_invalid_current_user_is_rejected(db: SupplyDB, defect:
     elif defect == 'invalid_role':
         db.user.role = 'engineer'
     else:
-        db.user.disabled = None
+        db.user.disabled = cast(bool, None)
     with pytest.raises(RunConflict):
         await db.read()
 
@@ -394,7 +420,7 @@ async def test_malformed_run_identity_is_a_scoped_conflict(db: SupplyDB, defect:
 
 @pytest.mark.parametrize('value', [None, False, {}, {'schema_version': True}])
 async def test_existing_invalid_supply_is_never_treated_as_absent(db: SupplyDB, value: Any) -> None:
-    db.row.routing_decision['toolchain_supply'] = value
+    db.route['toolchain_supply'] = value
     with pytest.raises(RunConflict):
         await db.read()
     with pytest.raises(RunConflict):
@@ -414,5 +440,6 @@ async def test_authority_and_returned_state_are_detached_immutable_snapshots(db:
     with pytest.raises(TypeError):
         read['plan']['scope']['actor_role'] = 'admin'
     with pytest.raises(TypeError):
-        db.bound.binding['project_input']['editable_paths'][0] = 'other.go'
-    assert db.row.routing_decision['toolchain_supply']['plan']['scope']['actor_role'] == 'operator'
+        cast(dict[str, list[str]], db.bound.binding['project_input'])['editable_paths'][0] = 'other.go'
+    plan = object_dict(object_dict(db.route['toolchain_supply'])['plan'])
+    assert object_dict(plan['scope'])['actor_role'] == 'operator'

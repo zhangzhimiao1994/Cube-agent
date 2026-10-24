@@ -1,10 +1,13 @@
 """Explicit Python recipe observations remain pure data, never install authority."""
 
 import hashlib
+from collections.abc import Mapping
 from pathlib import Path
+from typing import cast
 
 import pytest
 
+from agent_hub.runtime.contracts import JsonValue
 from tests.unit.capabilities.test_project_inspection import backend, inspect, observations
 from tests.unit.capabilities.test_python_project_recipe import LOCK, MANIFEST
 from tests.unit.capabilities.test_scoped_read import project_path, write_file
@@ -23,7 +26,7 @@ async def test_explicit_recipe_reports_build_and_test_declarations_without_probe
     result = await inspect(backend(tmp_path))
     assert result['operations'] == {'build':'declared', 'test':'declared'}
     assert result['python_recipe'] == {'kind':'python_offline_wheel_v1', 'status':'declared'}
-    assert result['environment']['readiness'] == 'not_probed'
+    assert cast(Mapping[str, JsonValue], result['environment'])['readiness'] == 'not_probed'
     assert result['install_plan_state'] == 'requires_environment_probe'
     assert observations(result)['requirements.lock']['sha256'] == hashlib.sha256(LOCK).hexdigest()
 
@@ -37,7 +40,7 @@ async def test_invalid_or_missing_lock_cannot_advertise_supported_recipe(
     result = await inspect(backend(tmp_path))
     assert result['install_plan_state'] == 'blocked'
     assert result['operations'] == {'build':'unknown', 'test':'unknown'}
-    assert result['python_recipe']['status'] == 'unavailable'
+    assert cast(Mapping[str, JsonValue], result['python_recipe'])['status'] == 'unavailable'
     assert 'SECRET' not in repr(result)
 
 
@@ -46,7 +49,7 @@ async def test_unknown_recipe_never_falls_back_to_supported_python(tmp_path: Pat
     write_inputs(tmp_path, manifest=MANIFEST.replace(b'python_offline_wheel_v1', b'shell'))
     result = await inspect(backend(tmp_path))
     assert result['install_plan_state'] == 'blocked'
-    assert result['python_recipe']['status'] == 'unavailable'
+    assert cast(Mapping[str, JsonValue], result['python_recipe'])['status'] == 'unavailable'
 
 
 @pytest.mark.asyncio

@@ -15,6 +15,7 @@ from autogen_core.models import UserMessage
 from agent_hub.models.capacity import CapacityLease
 from agent_hub.models.gateway import (
     CapacityController,
+    GatewayCompletion,
     GatewayScopeDiagnostic,
     ModelGateway,
     ScopeIncompletePhase,
@@ -22,7 +23,7 @@ from agent_hub.models.gateway import (
     get_gateway_scope_diagnostic,
 )
 from agent_hub.models.registry import ModelRegistry
-from agent_hub.models.types import Deployment
+from agent_hub.models.types import Deployment, ModelRequest
 from agent_hub.runtime.autogen.adapter import (
     AutoGenDiscussionRuntime,
     GatewayChatCompletionClient,
@@ -223,6 +224,38 @@ async def test_engineering_wall_time_stays_failed_with_budget_and_wait_metadata(
     assert context.timeout_seconds == 0.5 and context.token_budget == 100
 
 
+@pytest.mark.parametrize("source,absolute,expected", [
+    ("project_scale_soft_budget", 10.0, "soft"),
+    ("project_scale_soft_budget", 0.15, "absolute"),
+    ("explicit", 10.0, "explicit"),
+])
+async def test_wall_failure_identifies_soft_absolute_or_explicit_limit(
+    source: str, absolute: float, expected: str,
+) -> None:
+    fixture = WaitFixture("transport")
+    runtime, context = engineering_runtime(fixture, 0.15)
+    class BlockedModel:
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+            await asyncio.Event().wait()
+            raise AssertionError("the runtime must cancel the pending model")
+
+    runtime._gateway = BlockedModel()
+    context = context.model_copy(update={"routing_decision": {**context.routing_decision,
+        "engineering_progress_budget_version": 1, "runtime_timeout_source": source,
+        "runtime_timeout_soft_seconds": 0.15, "runtime_timeout_absolute_seconds": absolute}})
+    events: list[RunEvent] = []
+    await asyncio.wait_for(collect(runtime, context, events), timeout=5)
+    failure = next(event for event in events if event.kind is EventKind.RUNTIME_FAILED)
+    assert failure.reason == "engineering_delivery_missing", failure.reason
+    assert failure.payload.get("runtime_timeout_kind") == expected, failure.to_payload()
+    soft_remaining = failure.payload.get("remaining_soft_timeout_seconds")
+    assert isinstance(soft_remaining, float) and 0 <= soft_remaining <= 0.02
+    remaining = failure.payload.get("remaining_absolute_timeout_seconds")
+    assert isinstance(remaining, float)
+    assert (remaining > 8) if expected == "soft" else 0 <= remaining <= 0.02
+    assert failure.payload.get("engineering_work_progress_units") == 0
+
+
 @pytest.mark.parametrize("phase,entered", [("capacity", 0), ("transport", 1)])
 async def test_user_cancel_keeps_cancelled_identity_without_budget_failure(
     phase: Phase, entered: int,
@@ -319,6 +352,34 @@ def test_wall_budget_metadata_rejects_mismatched_classification(key: str, value:
     with pytest.raises(ValueError):
         RunEvent(kind=valid.kind, sequence=1, run_id=valid.run_id,
                  reason=valid.reason, payload={**payload, key: value})
+
+
+@pytest.mark.parametrize("key,value", [
+    ("runtime_timeout_kind", True), ("runtime_timeout_kind", "upstream"),
+    ("remaining_soft_timeout_seconds", True), ("remaining_soft_timeout_seconds", -1),
+    ("remaining_soft_timeout_seconds", 100), ("remaining_absolute_timeout_seconds", "300"),
+    ("remaining_absolute_timeout_seconds", 3601), ("remaining_absolute_timeout_seconds", -1),
+    ("engineering_work_progress_units", True), ("engineering_work_progress_units", -1),
+    ("engineering_work_progress_units", 2**63), ("termination_reason", None),
+])
+def test_timeout_diagnostic_rejects_unbounded_or_inconsistent_values(key: str, value: JsonValue) -> None:
+    payload: dict[str, JsonValue] = {
+        "termination_reason": "wall_time", "error_code": "runtime.discussion_budget_exhausted",
+        "error_stage": "runtime_budget", "error_category": "budget_exhausted",
+        "error_summary": "Soft budget expired", "suggested_action": "Inspect progress", "retryable": False,
+        "runtime_timeout_kind": "soft", "remaining_soft_timeout_seconds": 0.0,
+        "remaining_absolute_timeout_seconds": 60.0, "engineering_work_progress_units": 1,
+    }
+    valid = RunEvent(kind=EventKind.RUNTIME_FAILED, sequence=1, run_id=_context().run_id,
+        reason="engineering_delivery_missing", payload=payload)
+    assert RunEvent.from_payload(valid.to_payload()) == valid
+    with pytest.raises(ValueError):
+        RunEvent(kind=valid.kind, sequence=1, run_id=valid.run_id,
+            reason=valid.reason, payload={**payload, key: value})
+    for missing in ("runtime_timeout_kind", "remaining_soft_timeout_seconds", "remaining_absolute_timeout_seconds"):
+        with pytest.raises(ValueError):
+            RunEvent(kind=valid.kind, sequence=1, run_id=valid.run_id, reason=valid.reason,
+                payload={name: item for name, item in payload.items() if name != missing})
 
 
 @pytest.mark.parametrize("key,value", [

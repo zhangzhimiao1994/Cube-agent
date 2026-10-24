@@ -2,23 +2,27 @@
 
 import asyncio
 import hashlib
-from collections.abc import Mapping
+from collections.abc import AsyncGenerator, Mapping
 from decimal import Decimal
+from typing import cast
+from uuid import UUID
 
 import pytest
 
+from agent_hub.auth.models import Role
 from agent_hub.capabilities.runtime import _builtin_input_schema
-from agent_hub.harness.types import HarnessToolCallResult
+from agent_hub.harness.types import HarnessToolCallRequest, HarnessToolCallResult
 from agent_hub.models.gateway import GatewayCompletion
 from agent_hub.models.types import ModelRequest, ModelResponse, TokenUsage, ToolCall
-from agent_hub.runtime.artifacts import InMemoryArtifactRepository
+from agent_hub.runtime.artifacts import ArtifactRepository, InMemoryArtifactRepository
 from agent_hub.runtime.autogen.adapter import (
     AutoGenDiscussionRuntime,
+    CapabilityGateway,
     DiscussionParticipant,
     DiscussionPlan,
     RuntimeExecutionError,
 )
-from agent_hub.runtime.contracts import EventKind
+from agent_hub.runtime.contracts import EventKind, JsonValue, RunEvent, TaskContext
 from tests.unit.runtime.autogen.test_draft_action_progress import (
     action_context,
     draft_case_for_context,
@@ -28,24 +32,36 @@ POLICY = "engineering_writer_continuation_version"
 TOOLS = ("project.inspect", "workspace.list", "workspace.write_text", "project.verify", "workspace.bundle")
 
 
-async def exercise_writer_continuation(*, artifact_repository=None, restore_repository=None, context=None) -> None:
+async def exercise_writer_continuation(
+    *, artifact_repository: ArtifactRepository | None = None,
+    restore_repository: ArtifactRepository | None = None, context: TaskContext | None = None,
+    work_budget: bool = False,
+) -> None:
     ctx = context or action_context()
     ctx = ctx.model_copy(update={"routing_decision": {**ctx.routing_decision, POLICY: 1}})
+    if work_budget:
+        ctx = ctx.model_copy(update={"routing_decision": {**ctx.routing_decision,
+            "engineering_progress_budget_version": 1, "engineering_checkpoint_ack_version": 1,
+            "runtime_timeout_source": "project_scale_soft_budget",
+            "runtime_timeout_soft_seconds": 300.0, "runtime_timeout_absolute_seconds": 3600.0}})
 
     class Backend:
-        def __init__(self):
-            self.calls = []
+        def __init__(self) -> None:
+            self.calls: list[HarnessToolCallRequest] = []
 
-        def is_available(self, tenant_id, name):
+        def is_available(self, tenant_id: UUID, name: str) -> bool:
             return tenant_id == ctx.tenant_id and name in TOOLS
 
-        def is_replay_safe(self, name):
+        def is_replay_safe(self, name: str) -> bool:
             return False
 
-        def manifest(self, tenant_id):
+        def manifest(self, tenant_id: UUID) -> tuple[Mapping[str, JsonValue], ...]:
             return tuple({"name": name, "input_schema": _builtin_input_schema(name)} for name in TOOLS)
 
-        async def invoke(self, tenant_id, request, *, user_id=None, role=None):
+        async def invoke(
+            self, tenant_id: UUID, request: HarnessToolCallRequest, *,
+            user_id: UUID | None = None, role: Role | None = None,
+        ) -> HarnessToolCallResult:
             assert tenant_id == ctx.tenant_id and user_id == ctx.actor_id and role == ctx.actor_role
             self.calls.append(request)
             if request.tool_name == "project.inspect":
@@ -55,17 +71,18 @@ async def exercise_writer_continuation(*, artifact_repository=None, restore_repo
             else:
                 assert request.tool_name == "workspace.write_text"
                 text = request.arguments["content"]
+                assert isinstance(text, str)
                 payload = {"workspace_files": ({"path": request.arguments["path"],
                     "sha256": hashlib.sha256(text.encode()).hexdigest(), "size_bytes": len(text.encode())},)}
             return HarnessToolCallResult(call_id=request.call_id, tool_name=request.tool_name,
                 status="succeeded", payload=payload)
 
     class Model:
-        def __init__(self):
+        def __init__(self) -> None:
             self.requests: list[ModelRequest] = []
             self.stage = 0
 
-        async def complete_with_context(self, request):
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
             self.requests.append(request)
             if request.logical_model == "selector":
                 response = ModelResponse(text="implementer", usage=TokenUsage(1, 1, 2))
@@ -75,13 +92,18 @@ async def exercise_writer_continuation(*, artifact_repository=None, restore_repo
                 if stage >= 4:
                     await asyncio.Event().wait()
                 names = ("project.inspect", "workspace.list", "workspace.write_text")
+                calls: tuple[ToolCall, ...]
                 if stage < 3:
                     name = names[stage]
                     assert request.required_tool == name.replace(".", "_")
+                    assert request.required_tool is not None
                     arguments = ({"path": "ACCEPTANCE.json", "content": "planned executable criteria"}
                                  if stage == 2 else {})
                     calls = (ToolCall(id=f"step-{stage}", name=request.required_tool, arguments=arguments),)
                 else:
+                    if work_budget:
+                        assert runner._wall_budget is not None
+                        assert runner._wall_budget.progress_units == 1
                     calls = tuple(ToolCall(id=f"file-{index}", name="workspace_write_text",
                         arguments={"path": path, "content": f"model authored {path}"})
                         for index, path in enumerate(("package.json", "tests/app.test.cjs", "src/app.cjs")))
@@ -94,10 +116,11 @@ async def exercise_writer_continuation(*, artifact_repository=None, restore_repo
         DiscussionParticipant(id="implementer", role="Engineer", goal="Build", logical_model="writer",
                               allowed_tools=TOOLS),
         DiscussionParticipant(id="reviewer", role="Reviewer", goal="Review", logical_model="reviewer"),
-    ), selector_model="selector", max_turns=8, token_budget=500), capability_gateway=backend,
+    ), selector_model="selector", max_turns=8, token_budget=500),
+        capability_gateway=cast(CapabilityGateway, backend),
         harness_tool_gateway=backend, artifact_repository=artifact_repository or InMemoryArtifactRepository())
     events = []
-    stream = runner.run(ctx)
+    stream = cast(AsyncGenerator[RunEvent, None], runner.run(ctx))
     try:
         async with asyncio.timeout(10):
             async for event in stream:
@@ -117,6 +140,9 @@ async def exercise_writer_continuation(*, artifact_repository=None, restore_repo
         "ACCEPTANCE.json", "package.json", "tests/app.test.cjs", "src/app.cjs"]
     assert sum(request.logical_model == "selector" for request in model.requests) == 1
     saved = next(event.checkpoint for event in reversed(events) if event.checkpoint is not None)
+    if work_budget:
+        assert saved.state["engineering_progress_budget_version"] == 1
+        assert runner._wall_budget is None, "closing the stream must release its live budget"
     assert saved.state[POLICY] == 1
     assert not any(event.kind is EventKind.RUNTIME_COMPLETED for event in events)
     assert all(call.actor == "implementer" and call.run_id == ctx.run_id for call in backend.calls)
@@ -132,11 +158,17 @@ async def exercise_writer_continuation(*, artifact_repository=None, restore_repo
             runner._validate_checkpoint(saved, ctx.model_copy(update={"routing_decision": route}))
 
     class ResumeModel:
-        def __init__(self):
-            self.requests = []
+        def __init__(self) -> None:
+            self.requests: list[ModelRequest] = []
 
-        async def complete_with_context(self, request):
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
             self.requests.append(request)
+            if work_budget:
+                assert restored._wall_budget is not None
+                assert restored._wall_budget.progress_units == 4
+                remaining = saved.state["remaining_timeout_seconds"]
+                assert isinstance(remaining, float)
+                assert request.timeout_seconds <= remaining + 0.05, "cold writes must not be credited again"
             if request.logical_model == "selector":
                 response = ModelResponse(text="implementer", usage=TokenUsage(1, 1, 2))
             elif len([item for item in self.requests if item.logical_model != "selector"]) == 1:
@@ -150,10 +182,11 @@ async def exercise_writer_continuation(*, artifact_repository=None, restore_repo
                 provider_id="test", provider_model="test/model", cost_usd=Decimal(0))
 
     resumed_model = ResumeModel()
-    restored = AutoGenDiscussionRuntime(resumed_model, runner._plan, capability_gateway=backend,
+    restored = AutoGenDiscussionRuntime(resumed_model, runner._plan,
+        capability_gateway=cast(CapabilityGateway, backend),
         harness_tool_gateway=backend, artifact_repository=restore_repository or runner._repository)
     await restored.restore_checkpoint(saved)
-    stream = restored.run(ctx.model_copy(update={"checkpoint": saved}))
+    stream = cast(AsyncGenerator[RunEvent, None], restored.run(ctx.model_copy(update={"checkpoint": saved})))
     try:
         async with asyncio.timeout(10):
             async for event in stream:
@@ -170,16 +203,20 @@ async def test_new_policy_authors_acceptance_before_multiple_files_without_resel
     await exercise_writer_continuation()
 
 
+async def test_real_ack_runtime_counts_work_and_cold_restore_does_not_recredit_it() -> None:
+    await exercise_writer_continuation(work_budget=True)
+
+
 @pytest.mark.parametrize("reserved_writer", [False, True])
 @pytest.mark.parametrize("multiple_writers", [False, True])
 async def test_reserved_user_participant_is_rejected_before_any_model_or_publication_wait(
-    reserved_writer, multiple_writers,
-):
+    reserved_writer: bool, multiple_writers: bool,
+) -> None:
     ctx = action_context()
     ctx = ctx.model_copy(update={"routing_decision": {**ctx.routing_decision, POLICY: 1}})
 
     class NoModel:
-        async def complete_with_context(self, request):
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
             raise AssertionError("reserved participants must be rejected before model dispatch")
 
     plan = DiscussionPlan(participants=(
@@ -188,7 +225,7 @@ async def test_reserved_user_participant_is_rejected_before_any_model_or_publica
         DiscussionParticipant(id="reviewer" if reserved_writer else "user", role="Reviewer",
             goal="Review", logical_model="reviewer", allowed_tools=TOOLS if multiple_writers else ()),
     ), selector_model="selector", max_turns=8, token_budget=500, wall_time_seconds=0.1)
-    runner = AutoGenDiscussionRuntime(NoModel(), plan, capability_gateway=object())
+    runner = AutoGenDiscussionRuntime(NoModel(), plan, capability_gateway=cast(CapabilityGateway, object()))
     async with asyncio.timeout(2):
         events = [event async for event in runner.run(ctx)]
     assert events[-1].kind is EventKind.RUNTIME_FAILED

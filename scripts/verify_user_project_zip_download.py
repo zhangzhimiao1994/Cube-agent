@@ -26,6 +26,11 @@ class _StubAuthService:
             raise InvalidCredentials("bad token")
         return self.principal
 
+    async def validate_principal(self, principal: AuthenticatedPrincipal) -> AuthenticatedPrincipal:
+        if principal != self.principal:
+            raise InvalidCredentials("bad principal")
+        return self.principal
+
 
 def run_verification(root: Path) -> dict[str, str | list[str]]:
     root.mkdir(parents=True, exist_ok=True)

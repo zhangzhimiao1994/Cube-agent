@@ -38,6 +38,7 @@ def envelope(**patch: Any) -> Any:
 
 @pytest.mark.parametrize('status', list(CapabilityStatus))
 async def test_private_entry_uses_pure_recipe_request_without_discover_or_execute(db: GoDB, status: Any) -> None:
+    assert db.row.actor_id is not None
     policy = Policy(status)
     gateway = HarnessToolGateway(NoRuntime(), policy_gateway=policy)
     authority = db.current_authority()
@@ -57,6 +58,7 @@ async def test_private_entry_uses_pure_recipe_request_without_discover_or_execut
 @pytest.mark.parametrize('patch', [{'arguments': {'approved': True}}, {'actor': 'subagent'},
     {'sandbox': 'restricted'}, {'run_id': uuid4()}])
 async def test_untrusted_envelope_cannot_reach_policy(db: GoDB, patch: Any) -> None:
+    assert db.row.actor_id is not None
     policy = Policy(CapabilityStatus.ALLOWED)
     gateway = HarnessToolGateway(NoRuntime(), policy_gateway=policy)
     result = await gateway.authorize_project_go_recipe(db.row.tenant_id, envelope(**patch),
@@ -65,6 +67,7 @@ async def test_untrusted_envelope_cannot_reach_policy(db: GoDB, patch: Any) -> N
 
 
 async def test_missing_authority_and_public_invoke_fail_closed(db: GoDB) -> None:
+    assert db.row.actor_id is not None
     policy = Policy(CapabilityStatus.ALLOWED)
     gateway = HarnessToolGateway(NoRuntime(), policy_gateway=policy)
     assert (await gateway.authorize_project_go_recipe(db.row.tenant_id, envelope(), user_id=db.row.actor_id,

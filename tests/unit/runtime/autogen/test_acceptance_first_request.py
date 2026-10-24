@@ -20,6 +20,7 @@ class Gateway:
 
     async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
         self.requests.append(request)
+        assert request.required_tool is not None
         return GatewayCompletion(response=ModelResponse(
             text=None, tool_calls=(ToolCall(id="bootstrap", name=request.required_tool,
                 arguments={"path": self.path, "content": "model authored acceptance"}),),
@@ -43,8 +44,12 @@ async def test_bootstrap_narrows_only_model_authored_acceptance_write() -> None:
     schema = request.tools[0].parameters
     properties = schema["properties"]
     assert isinstance(properties, Mapping)
-    assert properties["path"]["enum"] == ("ACCEPTANCE.json",)
-    assert set(schema["required"]) == {"path", "content"}
+    path = properties["path"]
+    assert isinstance(path, Mapping)
+    assert path["enum"] == ("ACCEPTANCE.json",)
+    required = schema["required"]
+    assert isinstance(required, tuple)
+    assert set(required) == {"path", "content"}
     assert any("ACCEPTANCE.json" in message.content for message in request.messages)
     assert dict(tool) == original
     assert isinstance(result.content, list) and result.content[0].name == "workspace.write_text"

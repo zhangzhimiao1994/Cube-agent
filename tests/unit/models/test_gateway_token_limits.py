@@ -1,6 +1,7 @@
 """Unsatisfiable token reservations must not spend a model's whole deadline."""
 import asyncio
 from dataclasses import replace
+from typing import cast
 from uuid import uuid4
 
 import pytest
@@ -38,13 +39,15 @@ async def test_request_token_limit_skips_to_configured_fallback(streaming: bool)
         if streaming:
             events = [event async for event in gateway.stream_openai_compatible_events(request())]
             assert any(event.kind == "model.text_delta" for event in events)
+            assert isinstance(transport, StreamingTransportStub)
             assert [call[0].id for call in transport.stream_calls] == ["backup-key"]
         else:
             result = await gateway.complete_with_context(request())
             assert result.logical_model == "backup" and result.fallback_used
             assert result.fallback_reason == "capacity_unavailable"
             assert [call[0].id for call in transport.calls] == ["backup-key"]
-    assert len([event for event in capacity.events if event[0] == "acquire"]) == 2
+    assert len([event for event in capacity.events
+                if cast(tuple[object, ...], event)[0] == "acquire"]) == 2
     assert [value.deployment_id for value in capacity.releases] == ["backup-key"]
 
 
@@ -60,7 +63,8 @@ async def test_all_request_token_limits_fail_without_retrying_capacity(streaming
                 _events = [event async for event in gateway.stream_openai_compatible_events(request())]
             else:
                 await gateway.complete_with_context(request())
-    assert len([event for event in capacity.events if event[0] == "acquire"]) == 1
+    assert len([event for event in capacity.events
+                if cast(tuple[object, ...], event)[0] == "acquire"]) == 1
     assert not transport.calls and not capacity.releases
     if not streaming:
         scope = get_gateway_scope_diagnostic(failure.value)
@@ -107,5 +111,6 @@ async def test_request_token_limit_does_not_override_disabled_fallback(streaming
             _events = [event async for event in gateway.stream_openai_compatible_events(request(allow_fallback=False))]
         else:
             await gateway.complete_with_context(request(allow_fallback=False))
-    assert len([event for event in capacity.events if event[0] == "acquire"]) == 1
+    assert len([event for event in capacity.events
+                if cast(tuple[object, ...], event)[0] == "acquire"]) == 1
     assert not transport.calls and not capacity.releases

@@ -1,6 +1,8 @@
 """Checkpoint publication must fence producers until the receiver acknowledges."""
 
 import asyncio
+from collections.abc import Awaitable
+from typing import cast
 from uuid import uuid4
 
 import pytest
@@ -35,7 +37,7 @@ async def test_publish_waits_for_explicit_acknowledgement_and_build_is_deferred(
         assert not sender.done(), "building a checkpoint is not a persistence acknowledgement"
         assert pending.acknowledge() is True
         assert pending.acknowledge() is False
-        assert await sender is None
+        assert await cast(Awaitable[object], sender) is None
     finally:
         publications.close()
         await asyncio.gather(sender, return_exceptions=True)
@@ -183,7 +185,7 @@ async def test_close_does_not_revoke_an_already_successful_acknowledgement() -> 
     assert pending.acknowledge() is True
     publications.close()
     assert not pending.cancelled and pending.acknowledge() is False
-    assert await sender is None
+    assert await cast(Awaitable[object], sender) is None
 
 
 async def test_no_background_tasks_remain_after_close() -> None:

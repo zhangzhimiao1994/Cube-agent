@@ -5676,8 +5676,10 @@ def test_mcp_reload_callback_failure_does_not_fail_saved_config() -> None:
     assert "secret token" not in response.text
 
 
-def test_plugin_upsert_lifecycle_and_delete_trigger_runtime_reload_callback() -> None:
-    api = client()
+def test_plugin_upsert_lifecycle_and_delete_trigger_runtime_reload_callback(
+    tmp_path: Path,
+) -> None:
+    api = client_with_settings(Settings.model_construct(plugin_package_store_dir=tmp_path))
     reloaded: list[UUID] = []
 
     async def reload_plugin_runtime_config(tenant_id: UUID) -> None:
@@ -8625,8 +8627,8 @@ def test_plugin_signing_keys_are_tenant_scoped() -> None:
     assert other_tenant.json() == []
 
 
-def test_plugin_archive_install_records_signature_trust_expiry() -> None:
-    api = client()
+def test_plugin_archive_install_records_signature_trust_expiry(tmp_path: Path) -> None:
+    api = client_with_settings(Settings.model_construct(plugin_package_store_dir=tmp_path))
     private_key = ed25519.Ed25519PrivateKey.generate()
     not_after = datetime.now(UTC) + timedelta(days=30)
     api.post(
@@ -8654,6 +8656,58 @@ def test_plugin_archive_install_records_signature_trust_expiry() -> None:
     metadata = response.json()["plugin"]["package_metadata"]
     assert metadata["signature_verification"] == "verified"
     assert datetime.fromisoformat(metadata["signature_trust_expires_at"]) == not_after
+
+
+@pytest.mark.parametrize("operation", ("install", "uninstall"))
+def test_plugin_package_store_pin_failure_still_fails_closed(
+    operation: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agent_hub.plugins import handover_confirmation
+
+    api = client_with_settings(Settings.model_construct(plugin_package_store_dir=tmp_path))
+    private_key = ed25519.Ed25519PrivateKey.generate()
+    assert api.post(
+        "/api/v1/admin/plugins/signing-keys",
+        headers=headers(),
+        json={
+            "key_id": "calendar-prod",
+            "algorithm": "ed25519",
+            "public_key": plugin_public_key_value(private_key),
+        },
+    ).status_code == 200
+    if operation == "uninstall":
+        assert api.post(
+            "/api/v1/admin/plugins",
+            headers=headers(),
+            json={"id": "calendar", "name": "Calendar"},
+        ).status_code == 200
+
+    def unavailable(*args: object, **kwargs: object) -> NoReturn:
+        raise PermissionError("fixture-private-native-error")
+
+    monkeypatch.setattr(handover_confirmation, "_PinnedDirectory", unavailable)
+    if operation == "install":
+        response = api.post(
+            "/api/v1/admin/plugins/install",
+            headers={
+                **headers(),
+                "Content-Type": "application/zip",
+                "X-Agent-Hub-Plugin-Filename": "calendar.zip",
+            },
+            content=signed_plugin_archive(private_key),
+        )
+        expected_code = "plugin_package_store_unavailable"
+    else:
+        response = api.post("/api/v1/admin/plugins/calendar/uninstall", headers=headers())
+        expected_code = "plugin_uninstall_cleanup_unavailable"
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == expected_code
+    assert "fixture-private-native-error" not in response.text
+    service = cast(InMemoryAdminResourceService, cast(Any, api.app).state.admin_resource_service)
+    assert ("calendar" in service.plugins) is (operation == "uninstall")
 
 
 def test_plugin_signing_key_upsert_and_delete_trigger_runtime_reload_callback() -> None:
@@ -8732,8 +8786,9 @@ def test_plugin_signing_key_mutations_require_plugin_approval_permission(
 def test_plugin_archive_install_does_not_verify_inactive_signing_key(
     key_id: str,
     window: dict[str, str],
+    tmp_path: Path,
 ) -> None:
-    api = client()
+    api = client_with_settings(Settings.model_construct(plugin_package_store_dir=tmp_path))
     private_key = ed25519.Ed25519PrivateKey.generate()
     api.post(
         "/api/v1/admin/plugins/signing-keys",
@@ -8764,6 +8819,7 @@ def test_plugin_archive_install_does_not_verify_inactive_signing_key(
 
 def test_plugin_listing_revalidates_future_signing_key_after_not_before(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     class FrozenDateTime(datetime):
         current = datetime(2026, 9, 9, 4, 0, tzinfo=UTC)
@@ -8775,7 +8831,7 @@ def test_plugin_listing_revalidates_future_signing_key_after_not_before(
             return cls.fromtimestamp(cls.current.timestamp())
 
     monkeypatch.setattr(admin_router, "datetime", FrozenDateTime)
-    api = client()
+    api = client_with_settings(Settings.model_construct(plugin_package_store_dir=tmp_path))
     private_key = ed25519.Ed25519PrivateKey.generate()
     not_before = FrozenDateTime.current + timedelta(seconds=10)
     api.post(
@@ -8866,8 +8922,10 @@ def test_plugin_signing_key_delete_revokes_future_package_trust() -> None:
     assert install.json()["plugin"]["package_metadata"]["signature_verification"] == "untrusted_key"
 
 
-def test_plugin_listing_downgrades_verified_package_after_signing_key_delete() -> None:
-    api = client()
+def test_plugin_listing_downgrades_verified_package_after_signing_key_delete(
+    tmp_path: Path,
+) -> None:
+    api = client_with_settings(Settings.model_construct(plugin_package_store_dir=tmp_path))
     private_key = ed25519.Ed25519PrivateKey.generate()
     api.post(
         "/api/v1/admin/plugins/signing-keys",
@@ -8903,8 +8961,10 @@ def test_plugin_listing_downgrades_verified_package_after_signing_key_delete() -
     assert metadata["activation_reason"] == "package signature key is not trusted for this tenant"
 
 
-def test_plugin_listing_downgrades_verified_package_after_signing_key_expiry() -> None:
-    api = client()
+def test_plugin_listing_downgrades_verified_package_after_signing_key_expiry(
+    tmp_path: Path,
+) -> None:
+    api = client_with_settings(Settings.model_construct(plugin_package_store_dir=tmp_path))
     private_key = ed25519.Ed25519PrivateKey.generate()
     public_key = plugin_public_key_value(private_key)
     active_window = {
@@ -8953,6 +9013,7 @@ def test_plugin_listing_downgrades_verified_package_after_signing_key_expiry() -
 
 def test_plugin_listing_downgrades_verified_package_when_signing_key_expires_without_mutation(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     class FrozenDateTime(datetime):
         current = datetime(2026, 9, 9, 4, 0, tzinfo=UTC)
@@ -8964,7 +9025,7 @@ def test_plugin_listing_downgrades_verified_package_when_signing_key_expires_wit
             return cls.fromtimestamp(cls.current.timestamp())
 
     monkeypatch.setattr(admin_router, "datetime", FrozenDateTime)
-    api = client()
+    api = client_with_settings(Settings.model_construct(plugin_package_store_dir=tmp_path))
     private_key = ed25519.Ed25519PrivateKey.generate()
     public_key = plugin_public_key_value(private_key)
     not_after = FrozenDateTime.current + timedelta(seconds=10)
@@ -9002,8 +9063,8 @@ def test_plugin_listing_downgrades_verified_package_when_signing_key_expires_wit
     assert metadata["activation_reason"] == "package signature key is not trusted for this tenant"
 
 
-def test_scan_only_adapter_package_lifecycle_fails_closed() -> None:
-    api = client()
+def test_scan_only_adapter_package_lifecycle_fails_closed(tmp_path: Path) -> None:
+    api = client_with_settings(Settings.model_construct(plugin_package_store_dir=tmp_path))
     private_key = ed25519.Ed25519PrivateKey.generate()
     api.post(
         "/api/v1/admin/plugins/signing-keys",
@@ -9047,8 +9108,8 @@ def test_scan_only_adapter_package_lifecycle_fails_closed() -> None:
     assert enabled.json()["error"]["code"] == "plugin_package_not_eligible"
 
 
-def test_scan_only_adapter_package_install_does_not_inherit_running_status() -> None:
-    api = client()
+def test_scan_only_adapter_package_install_does_not_inherit_running_status(tmp_path: Path) -> None:
+    api = client_with_settings(Settings.model_construct(plugin_package_store_dir=tmp_path))
     private_key = ed25519.Ed25519PrivateKey.generate()
     api.post(
         "/api/v1/admin/plugins/signing-keys",
@@ -9087,8 +9148,8 @@ def test_scan_only_adapter_package_install_does_not_inherit_running_status() -> 
     assert install.json()["plugin"]["health"] == "stopped"
 
 
-def test_plugin_package_approval_updates_metadata_and_keeps_scan_only_closed() -> None:
-    api = client()
+def test_plugin_package_approval_updates_metadata_and_keeps_scan_only_closed(tmp_path: Path) -> None:
+    api = client_with_settings(Settings.model_construct(plugin_package_store_dir=tmp_path))
     reloaded: list[UUID] = []
 
     async def reload_plugin_runtime_config(tenant_id: UUID) -> None:
@@ -9367,7 +9428,7 @@ def test_runtime_registered_adapter_package_rejects_unsupported_activation_contr
     assert response.json()["error"]["details"]["reason"] == expected_reason
 
 
-def test_runtime_registered_adapter_package_can_be_approved_and_started() -> None:
+def test_runtime_registered_adapter_package_can_be_approved_and_started(tmp_path: Path) -> None:
     class CalendarPluginService(AcceptingRuntimePluginService):
         def adapter_descriptors(self) -> tuple[Mapping[str, object], ...]:
             return (
@@ -9387,7 +9448,7 @@ def test_runtime_registered_adapter_package_can_be_approved_and_started() -> Non
                 },
             )
 
-    api = client()
+    api = client_with_settings(Settings.model_construct(plugin_package_store_dir=tmp_path))
     cast(Any, api.app).state.plugin_service = CalendarPluginService()
     private_key = ed25519.Ed25519PrivateKey.generate()
     api.post(
@@ -9439,7 +9500,9 @@ def test_runtime_registered_adapter_package_can_be_approved_and_started() -> Non
     assert started.json()["status"] == "running"
 
 
-def test_runtime_registered_adapter_package_approval_rechecks_registered_adapter() -> None:
+def test_runtime_registered_adapter_package_approval_rechecks_registered_adapter(
+    tmp_path: Path,
+) -> None:
     class CalendarPluginService(AcceptingRuntimePluginService):
         def adapter_descriptors(self) -> tuple[Mapping[str, object], ...]:
             return (
@@ -9459,7 +9522,7 @@ def test_runtime_registered_adapter_package_approval_rechecks_registered_adapter
                 },
             )
 
-    api = client()
+    api = client_with_settings(Settings.model_construct(plugin_package_store_dir=tmp_path))
     cast(Any, api.app).state.plugin_service = CalendarPluginService()
     private_key = ed25519.Ed25519PrivateKey.generate()
     api.post(
@@ -9506,7 +9569,9 @@ def test_runtime_registered_adapter_package_approval_rechecks_registered_adapter
     )
 
 
-def test_runtime_registered_adapter_package_approval_rechecks_effective_trust() -> None:
+def test_runtime_registered_adapter_package_approval_rechecks_effective_trust(
+    tmp_path: Path,
+) -> None:
     class CalendarPluginService(AcceptingRuntimePluginService):
         def adapter_descriptors(self) -> tuple[Mapping[str, object], ...]:
             return (
@@ -9526,7 +9591,7 @@ def test_runtime_registered_adapter_package_approval_rechecks_effective_trust() 
                 },
             )
 
-    api = client()
+    api = client_with_settings(Settings.model_construct(plugin_package_store_dir=tmp_path))
     cast(Any, api.app).state.plugin_service = CalendarPluginService()
     private_key = ed25519.Ed25519PrivateKey.generate()
     api.post(
@@ -9575,7 +9640,9 @@ def test_runtime_registered_adapter_package_approval_rechecks_effective_trust() 
     assert approved.json()["error"]["message"] == "package signature key is not trusted for this tenant"
 
 
-def test_runtime_registered_adapter_package_start_rechecks_registered_adapter() -> None:
+def test_runtime_registered_adapter_package_start_rechecks_registered_adapter(
+    tmp_path: Path,
+) -> None:
     class CalendarPluginService(AcceptingRuntimePluginService):
         def adapter_descriptors(self) -> tuple[Mapping[str, object], ...]:
             return (
@@ -9595,7 +9662,7 @@ def test_runtime_registered_adapter_package_start_rechecks_registered_adapter() 
                 },
             )
 
-    api = client()
+    api = client_with_settings(Settings.model_construct(plugin_package_store_dir=tmp_path))
     cast(Any, api.app).state.plugin_service = CalendarPluginService()
     private_key = ed25519.Ed25519PrivateKey.generate()
     api.post(
@@ -9644,7 +9711,7 @@ def test_runtime_registered_adapter_package_start_rechecks_registered_adapter() 
     )
 
 
-def test_runtime_registered_adapter_package_start_rechecks_effective_trust() -> None:
+def test_runtime_registered_adapter_package_start_rechecks_effective_trust(tmp_path: Path) -> None:
     class CalendarPluginService(AcceptingRuntimePluginService):
         def adapter_descriptors(self) -> tuple[Mapping[str, object], ...]:
             return (
@@ -9664,7 +9731,7 @@ def test_runtime_registered_adapter_package_start_rechecks_effective_trust() -> 
                 },
             )
 
-    api = client()
+    api = client_with_settings(Settings.model_construct(plugin_package_store_dir=tmp_path))
     cast(Any, api.app).state.plugin_service = CalendarPluginService()
     private_key = ed25519.Ed25519PrivateKey.generate()
     api.post(
@@ -9719,6 +9786,7 @@ def test_runtime_registered_adapter_package_start_rechecks_effective_trust() -> 
 @pytest.mark.parametrize("endpoint", ("enable", "reload"))
 def test_runtime_registered_adapter_package_lifecycle_rechecks_registered_adapter(
     endpoint: str,
+    tmp_path: Path,
 ) -> None:
     class CalendarPluginService(AcceptingRuntimePluginService):
         def adapter_descriptors(self) -> tuple[Mapping[str, object], ...]:
@@ -9739,7 +9807,7 @@ def test_runtime_registered_adapter_package_lifecycle_rechecks_registered_adapte
                 },
             )
 
-    api = client()
+    api = client_with_settings(Settings.model_construct(plugin_package_store_dir=tmp_path))
     cast(Any, api.app).state.plugin_service = CalendarPluginService()
     private_key = ed25519.Ed25519PrivateKey.generate()
     api.post(
@@ -9791,6 +9859,7 @@ def test_runtime_registered_adapter_package_lifecycle_rechecks_registered_adapte
 @pytest.mark.parametrize("endpoint", ("enable", "reload"))
 def test_runtime_registered_adapter_package_lifecycle_rechecks_effective_trust(
     endpoint: str,
+    tmp_path: Path,
 ) -> None:
     class CalendarPluginService(AcceptingRuntimePluginService):
         def adapter_descriptors(self) -> tuple[Mapping[str, object], ...]:
@@ -9811,7 +9880,7 @@ def test_runtime_registered_adapter_package_lifecycle_rechecks_effective_trust(
                 },
             )
 
-    api = client()
+    api = client_with_settings(Settings.model_construct(plugin_package_store_dir=tmp_path))
     cast(Any, api.app).state.plugin_service = CalendarPluginService()
     private_key = ed25519.Ed25519PrivateKey.generate()
     api.post(
@@ -9868,6 +9937,7 @@ def test_runtime_registered_adapter_package_lifecycle_rechecks_effective_trust(
 @pytest.mark.parametrize("endpoint", ("start", "enable", "reload"))
 def test_runtime_registered_adapter_package_lifecycle_rechecks_dependencies(
     endpoint: str,
+    tmp_path: Path,
 ) -> None:
     class CalendarPluginService(AcceptingRuntimePluginService):
         def adapter_descriptors(self) -> tuple[Mapping[str, object], ...]:
@@ -9888,7 +9958,7 @@ def test_runtime_registered_adapter_package_lifecycle_rechecks_dependencies(
                 },
             )
 
-    api = client()
+    api = client_with_settings(Settings.model_construct(plugin_package_store_dir=tmp_path))
     cast(Any, api.app).state.plugin_service = CalendarPluginService()
     private_key = ed25519.Ed25519PrivateKey.generate()
     api.post(
@@ -10127,7 +10197,7 @@ def test_runtime_registered_adapter_package_with_ready_offline_dependencies_can_
     assert started.json()["status"] == "running"
 
 
-def test_capability_manifest_rechecks_runtime_registered_adapter_descriptor() -> None:
+def test_capability_manifest_rechecks_runtime_registered_adapter_descriptor(tmp_path: Path) -> None:
     class CalendarPluginService(AcceptingRuntimePluginService):
         def adapter_descriptors(self) -> tuple[Mapping[str, object], ...]:
             return (
@@ -10147,7 +10217,7 @@ def test_capability_manifest_rechecks_runtime_registered_adapter_descriptor() ->
                 },
             )
 
-    api = client()
+    api = client_with_settings(Settings.model_construct(plugin_package_store_dir=tmp_path))
     cast(Any, api.app).state.runtime_capability_gateway = FakeRuntimeCapabilityGateway()
     cast(Any, api.app).state.plugin_service = CalendarPluginService()
     private_key = ed25519.Ed25519PrivateKey.generate()
@@ -10199,7 +10269,7 @@ def test_capability_manifest_rechecks_runtime_registered_adapter_descriptor() ->
     )
 
 
-def test_capability_manifest_rechecks_runtime_registered_adapter_dependencies() -> None:
+def test_capability_manifest_rechecks_runtime_registered_adapter_dependencies(tmp_path: Path) -> None:
     dependency_lock_hash = hashlib.sha256(b"python pypi requests==2.32.0\n").hexdigest()
 
     class CalendarPluginService(AcceptingRuntimePluginService):
@@ -10221,7 +10291,7 @@ def test_capability_manifest_rechecks_runtime_registered_adapter_dependencies() 
                 },
             )
 
-    api = client()
+    api = client_with_settings(Settings.model_construct(plugin_package_store_dir=tmp_path))
     cast(Any, api.app).state.runtime_capability_gateway = FakeRuntimeCapabilityGateway()
     cast(Any, api.app).state.plugin_service = CalendarPluginService()
     private_key = ed25519.Ed25519PrivateKey.generate()
@@ -10303,7 +10373,7 @@ def test_capability_manifest_rechecks_runtime_registered_adapter_dependencies() 
     }
 
 
-def test_plugin_listing_rechecks_runtime_registered_adapter_descriptor() -> None:
+def test_plugin_listing_rechecks_runtime_registered_adapter_descriptor(tmp_path: Path) -> None:
     class CalendarPluginService(AcceptingRuntimePluginService):
         def adapter_descriptors(self) -> tuple[Mapping[str, object], ...]:
             return (
@@ -10323,7 +10393,7 @@ def test_plugin_listing_rechecks_runtime_registered_adapter_descriptor() -> None
                 },
             )
 
-    api = client()
+    api = client_with_settings(Settings.model_construct(plugin_package_store_dir=tmp_path))
     cast(Any, api.app).state.plugin_service = CalendarPluginService()
     private_key = ed25519.Ed25519PrivateKey.generate()
     api.post(
@@ -10373,7 +10443,7 @@ def test_plugin_listing_rechecks_runtime_registered_adapter_descriptor() -> None
     )
 
 
-def test_plugin_listing_rechecks_runtime_registered_adapter_dependencies() -> None:
+def test_plugin_listing_rechecks_runtime_registered_adapter_dependencies(tmp_path: Path) -> None:
     class CalendarPluginService(AcceptingRuntimePluginService):
         def adapter_descriptors(self) -> tuple[Mapping[str, object], ...]:
             return (
@@ -10393,7 +10463,7 @@ def test_plugin_listing_rechecks_runtime_registered_adapter_dependencies() -> No
                 },
             )
 
-    api = client()
+    api = client_with_settings(Settings.model_construct(plugin_package_store_dir=tmp_path))
     cast(Any, api.app).state.plugin_service = CalendarPluginService()
     private_key = ed25519.Ed25519PrivateKey.generate()
     api.post(
@@ -10459,6 +10529,7 @@ def test_plugin_listing_rechecks_runtime_registered_adapter_dependencies() -> No
 
 def test_plugin_package_approval_mutations_require_plugin_approval_permission(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     required_permissions: list[str] = []
 
@@ -10472,7 +10543,7 @@ def test_plugin_package_approval_mutations_require_plugin_approval_permission(
             return principal
 
     monkeypatch.setattr(admin_router, "Authorizer", RecordingAuthorizer)
-    api = client()
+    api = client_with_settings(Settings.model_construct(plugin_package_store_dir=tmp_path))
     private_key = ed25519.Ed25519PrivateKey.generate()
     api.post(
         "/api/v1/admin/plugins/signing-keys",
@@ -10712,8 +10783,10 @@ async def test_persistent_plugin_package_approval_is_tenant_scoped_and_audited()
     assert other_tenant_audits == []
 
 
-def test_plugin_listing_downgrades_verified_package_after_signing_key_rotation() -> None:
-    api = client()
+def test_plugin_listing_downgrades_verified_package_after_signing_key_rotation(
+    tmp_path: Path,
+) -> None:
+    api = client_with_settings(Settings.model_construct(plugin_package_store_dir=tmp_path))
     private_key = ed25519.Ed25519PrivateKey.generate()
     rotated_private_key = ed25519.Ed25519PrivateKey.generate()
     api.post(
@@ -10765,8 +10838,8 @@ def test_plugin_signing_key_delete_missing_key_returns_not_found() -> None:
     assert response.json()["error"]["code"] == "not_found"
 
 
-def test_plugin_archive_install_verifies_trusted_ed25519_signature() -> None:
-    api = client()
+def test_plugin_archive_install_verifies_trusted_ed25519_signature(tmp_path: Path) -> None:
+    api = client_with_settings(Settings.model_construct(plugin_package_store_dir=tmp_path))
     private_key = ed25519.Ed25519PrivateKey.generate()
     api.post(
         "/api/v1/admin/plugins/signing-keys",
@@ -12761,7 +12834,9 @@ async def test_plugin_admin_runtime_in_process_adapter_acceptance_records_safe_a
 
 
 @pytest.mark.asyncio
-async def test_plugin_admin_runtime_delete_reload_fails_closed_for_existing_service() -> None:
+async def test_plugin_admin_runtime_delete_reload_fails_closed_for_existing_service(
+    tmp_path: Path,
+) -> None:
     adapter_calls: list[dict[str, object]] = []
 
     class InProcessAdapter:
@@ -12805,7 +12880,7 @@ async def test_plugin_admin_runtime_delete_reload_fails_closed_for_existing_serv
                 },
             }
 
-    api = client()
+    api = client_with_settings(Settings.model_construct(plugin_package_store_dir=tmp_path))
     admin_service = cast(
         InMemoryAdminResourceService,
         cast(Any, api.app).state.admin_resource_service,
@@ -12867,7 +12942,7 @@ async def test_plugin_admin_runtime_delete_reload_fails_closed_for_existing_serv
 
 
 @pytest.mark.asyncio
-async def test_plugin_uninstall_removes_runtime_capability_before_success() -> None:
+async def test_plugin_uninstall_removes_runtime_capability_before_success(tmp_path: Path) -> None:
     class InProcessAdapter:
         async def invoke(
             self,
@@ -12897,7 +12972,7 @@ async def test_plugin_uninstall_removes_runtime_capability_before_success() -> N
                 "argument_schema": {"type": "object", "additionalProperties": True},
             }
 
-    api = client()
+    api = client_with_settings(Settings.model_construct(plugin_package_store_dir=tmp_path))
     admin_service = cast(
         InMemoryAdminResourceService,
         cast(Any, api.app).state.admin_resource_service,

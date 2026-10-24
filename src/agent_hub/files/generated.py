@@ -205,7 +205,7 @@ class GeneratedFileStore:
         run_path = (self._root / str(tenant_id) / str(run_id)).resolve()
         if not run_path.is_relative_to(self._root):
             raise ValueError("run path escapes generated artifact root")
-        run_path = _native_io_path(run_path)
+        run_path = _native_io_path(run_path, recursive=True)
         if not run_path.exists():
             return
         if not run_path.is_dir():
@@ -240,10 +240,11 @@ class GeneratedFileStore:
         return parsed_tenant_id, parsed_run_id, parsed_artifact_id, safe_filename
 
 
-def _native_io_path(path: Path) -> Path:
+def _native_io_path(path: Path, *, recursive: bool = False) -> Path:
     # Keep scope checks on canonical paths; opt into Win32 long paths only for I/O.
+    # Recursive deletion can exceed MAX_PATH even when its root is short.
     value = str(path)
-    if os.name != "nt" or value.startswith("\\\\?\\") or len(value) < 248:
+    if os.name != "nt" or value.startswith("\\\\?\\") or (not recursive and len(value) < 248):
         return path
     if value.startswith("\\\\"):
         return Path("\\\\?\\UNC\\" + value[2:])

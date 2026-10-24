@@ -5,7 +5,7 @@ import asyncio
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Protocol, TypedDict, cast
 from uuid import UUID, uuid4
 
 import pytest
@@ -21,6 +21,20 @@ from tests.unit.capabilities.test_project_verification import Executor, gateway
 
 Kind = Literal['node_plain', 'node_original', 'node_generated']
 KINDS: tuple[Kind, ...] = ('node_plain', 'node_original', 'node_generated')
+
+
+class MutableRun(Protocol):
+    routing_decision: dict[str, object]
+    request: str
+
+
+class MutableRepository(Protocol):
+    async def get(self, tenant_id: UUID, run_id: UUID) -> MutableRun: ...
+
+
+class PlainPayload(TypedDict):
+    verification: dict[str, object]
+    summary: str
 
 
 class NoExecution:
@@ -89,7 +103,7 @@ async def test_cold_node_receipt_restores_without_execution_or_writes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: Kind,
 ) -> None:
     case = await cold_case(tmp_path, kind, monkeypatch)
-    record = await case.owner.repository.get(*case.key)
+    record = await cast(MutableRepository, case.owner.repository).get(*case.key)
     route = json.dumps(record.routing_decision, default=dict, sort_keys=True)
     files = {p: p.read_bytes() for p in case.owner.root.rglob('*') if p.is_file()}
     await case.restore()
@@ -148,8 +162,8 @@ async def test_current_permissions_are_rechecked_before_restoring(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: Kind,
 ) -> None:
     case = await cold_case(tmp_path, kind, monkeypatch)
-    record = await case.owner.repository.get(*case.key)
-    record.routing_decision['requested_permissions'].remove('command.run')
+    record = await cast(MutableRepository, case.owner.repository).get(*case.key)
+    cast(list[str], record.routing_decision['requested_permissions']).remove('command.run')
     with pytest.raises(ProjectVerificationError):
         await case.restore()
     assert all(case.key not in cache for cache in caches(case.owner))
@@ -207,9 +221,9 @@ async def test_selected_generated_cannot_downgrade_when_capture_is_missing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     case = await cold_case(tmp_path, 'node_generated', monkeypatch)
-    record = await case.owner.repository.get(*case.key)
+    record = await cast(MutableRepository, case.owner.repository).get(*case.key)
     record.routing_decision.pop('generated_project_preparation')
-    plain = {'verification': dict(case.payload['verification']), 'summary': 'historical success'}
+    plain: PlainPayload = {'verification': dict(case.payload['verification']), 'summary': 'historical success'}
     plain['verification'].pop('generated_acceptance_sha256')
     with pytest.raises(ProjectVerificationError):
         await case.restore(kind='node_plain', payload=plain)
@@ -240,7 +254,7 @@ async def test_generated_authority_change_during_final_check_clears_receipt(
         nonlocal calls
         calls += 1
         if calls == 2:
-            record = await case.owner.repository.get(*case.key)
+            record = await cast(MutableRepository, case.owner.repository).get(*case.key)
             record.request = 'changed authoritative request'
         await current(context, actor)
 

@@ -182,7 +182,7 @@ def test_lossy_capture_is_withheld_in_diagnostics_without_changing_observation(
     api: Any, case: Any, boundary: Any,
 ) -> None:
     boundary.result = replace(boundary.result, stdout='OK', stdout_observed_bytes=3)
-    collected = []
+    collected: list[PythonPhaseProcessResult] = []
     observation = api.run_go_business_case(case, **boundary.options, on_collected=collected.append)
     assert observation.reason == 'output_incomplete' and not observation.stdout_truncated
     assert observation.stdout_sha256 is None

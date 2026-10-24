@@ -14,7 +14,12 @@ from agent_hub.runtime.action_direct import _binding, _check_guidance
 from agent_hub.runtime.artifacts import InMemoryArtifactRepository
 from agent_hub.runtime.contracts import EventKind, JsonValue, TaskContext
 from agent_hub.runtime.direct import DirectRuntime, RuntimeExecutionError
-from agent_hub.runtime.role_planner import RolePlanner, RolePlanningRequest, TaskProfile
+from agent_hub.runtime.role_planner import (
+    RoleAssignment,
+    RolePlanner,
+    RolePlanningRequest,
+    TaskProfile,
+)
 from tests.contracts.test_runtime_contract import FakeGateway
 from tests.unit.runtime.test_action_direct import Backend, Policy
 from tests.unit.runtime.test_action_direct_recovery_regressions import pause_at_write, runtime
@@ -82,7 +87,7 @@ async def test_direct_does_not_add_model_calls_or_mutate_identity_and_budget() -
     assert ctx.to_payload() == original
 
 
-def roles(ctx: TaskContext, mode: TaskMode):
+def roles(ctx: TaskContext, mode: TaskMode) -> tuple[RoleAssignment, ...]:
     return RolePlanner().plan(RolePlanningRequest(
         task=ctx.request, mode=mode, profile=TaskProfile.SOFTWARE, default_model="main",
     )).roles

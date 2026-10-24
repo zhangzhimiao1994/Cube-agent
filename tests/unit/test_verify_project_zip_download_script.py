@@ -5,6 +5,10 @@ import zipfile
 from pathlib import Path
 from typing import Any
 
+import pytest
+
+from agent_hub.auth.models import AuthenticatedPrincipal, InvalidCredentials
+
 
 def load_verifier() -> Any:
     module_path = Path("scripts/verify_user_project_zip_download.py")
@@ -24,6 +28,40 @@ def test_verify_project_zip_download_script_runs_user_flow(tmp_path: Path) -> No
     assert set(result["archive_members"]) == {"README.md", "main.py"}
     assert result["main_py_output"] == "hello from Hello Python"
     assert Path(result["downloaded_zip"]).is_file()
+
+
+@pytest.mark.parametrize("defect,expected_status", [
+    ("missing", 503), ("unavailable", 503), ("revoked", 401), ("changed", 503),
+])
+def test_verify_project_zip_download_script_keeps_identity_fail_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, defect: str, expected_status: int,
+) -> None:
+    module = load_verifier()
+
+    async def validate_principal(
+        self: Any, principal: AuthenticatedPrincipal,
+    ) -> AuthenticatedPrincipal:
+        if defect == "unavailable":
+            raise RuntimeError("identity backend unavailable")
+        if defect == "revoked":
+            raise InvalidCredentials("identity revoked")
+        return AuthenticatedPrincipal(principal.user_id, principal.tenant_id, principal.role)
+
+    if defect == "changed":
+        from uuid import uuid4
+
+        async def changed_principal(
+            self: Any, principal: AuthenticatedPrincipal,
+        ) -> AuthenticatedPrincipal:
+            return AuthenticatedPrincipal(uuid4(), principal.tenant_id, principal.role)
+
+        monkeypatch.setattr(module._StubAuthService, "validate_principal", changed_principal,
+                            raising=False)
+    else:
+        monkeypatch.setattr(module._StubAuthService, "validate_principal",
+                            None if defect == "missing" else validate_principal, raising=False)
+    with pytest.raises(RuntimeError, match=f"workspace zip download failed: HTTP {expected_status}"):
+        module.run_verification(tmp_path)
 
 
 def test_verify_project_zip_download_script_rejects_unsafe_zip_members(tmp_path: Path) -> None:

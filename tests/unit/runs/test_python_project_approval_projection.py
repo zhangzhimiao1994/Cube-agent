@@ -171,7 +171,8 @@ async def test_python_captured_dao_workflow_matches_normal_approval_api(dao: Any
     history = await dao.repository.capability_approval_events(
         dao.run.tenant_id, dao.run.id, actor_id=dao.run.actor_id)
     assert history[0] == events[0]
-    assert history[1]['decision'] == 'approved' and history[1]['payload'] == {}
+    assert history[1]['decision'] == 'approved'
+    assert history[1]['payload'] == {'decision_scope': 'once'}
     assert not await dao.repository.capability_approval_ready(
         dao.run.tenant_id, dao.run.id, actor_id=dao.run.actor_id)
 
@@ -195,8 +196,10 @@ async def test_python_projection_keeps_recipe_binding_private_and_public_shape_u
     assert approval.payload['python_binding'] == arguments()
     assert set(events[0]) == {'kind', 'sequence', 'run_id', 'approval_id', 'actor',
                               'action', 'reason', 'payload', 'created_at'}
-    assert events[0]['payload']['resource'] == 'workspace/current/project-verification/python/' + 'c' * 64
-    assert set(events[0]['payload']) == {'run_id', 'version', 'capability', 'operation', 'resource', 'approval_scope'}
+    payload = events[0]['payload']
+    assert isinstance(payload, dict)
+    assert payload['resource'] == 'workspace/current/project-verification/python/' + 'c' * 64
+    assert set(payload) == {'run_id', 'version', 'capability', 'operation', 'resource', 'approval_scope'}
     assert 'PRIVATE' not in str(events) and 'grant' not in str(events)
     assert approval.payload == before
 

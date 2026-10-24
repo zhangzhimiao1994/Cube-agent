@@ -5,7 +5,7 @@ Handlers and serializers run in process; no HTTP/provider/SQL network is used.
 from __future__ import annotations
 
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from copy import deepcopy
 from dataclasses import dataclass
 from decimal import Decimal
@@ -36,7 +36,7 @@ from agent_hub.harness.types import HarnessToolCallRequest
 from agent_hub.runs.project_verification_receipts import RECEIPT_KEY, VerificationRecord
 from agent_hub.runs.repository import RunRecord, RunRepository
 from agent_hub.runs.service import RunService, TaskQueue, _submitted
-from agent_hub.runtime.contracts import TaskContext
+from agent_hub.runtime.contracts import JsonValue, TaskContext
 from agent_hub.runtime.direct import DirectRuntime
 from agent_hub.runtime.project_scale_artifact import project_scale_artifact_zip_arguments
 from agent_hub.runtime.registry import RuntimeRegistry
@@ -63,7 +63,8 @@ class IndexedRun:
         return TaskContext(run_id=record.id, tenant_id=record.tenant_id,
             actor_id=record.actor_id, actor_role=record.actor_role,
             execution_token=record.worker_lease_token, mode=record.mode,
-            request=record.request, routing_decision=record.routing_decision or {})
+            request=record.request,
+            routing_decision=cast(Mapping[str, JsonValue], record.routing_decision or {}))
 
 
 @pytest.fixture
@@ -80,7 +81,9 @@ async def indexed_run() -> AsyncIterator[IndexedRun]:
     original = deepcopy(db.row.routing_decision)
     yield IndexedRun(db, issued, RunRepository._record(db.row))
     assert db.row.routing_decision == original
-    assert RunRepository._record(db.row).routing_decision[RECEIPT_KEY] == issued.to_payload()
+    route = RunRepository._record(db.row).routing_decision
+    assert route is not None
+    assert route[RECEIPT_KEY] == issued.to_payload()
     assert await db.repository().load(db.authority()) == issued
 
 

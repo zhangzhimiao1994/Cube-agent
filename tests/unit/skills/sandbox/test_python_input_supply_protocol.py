@@ -1,4 +1,5 @@
 import copy
+from typing import TypedDict
 from uuid import UUID
 
 import pytest
@@ -15,22 +16,27 @@ from agent_hub.skills.sandbox.python_input_supply_protocol import (
 from agent_hub.skills.sandbox.python_project_protocol import PythonProjectProbeInvocation
 
 
-def invocation():
-    return PythonProjectProbeInvocation(
-        execution_id="supply_" + "1" * 32,
-        tenant_id=UUID(int=1), run_id=UUID(int=2), project_id="project", session_id="session",
-        sandbox_profile="workspace_write", timeout_seconds=30,
-        original_reference={"schema_version": 1, "input_source_sha256": "1" * 64,
+class SupplyParameters(TypedDict):
+    invocation: PythonProjectProbeInvocation
+    expected_plan_sha256: str
+
+
+def invocation() -> PythonProjectProbeInvocation:
+    return PythonProjectProbeInvocation.model_validate({
+        "execution_id": "supply_" + "1" * 32,
+        "tenant_id": UUID(int=1), "run_id": UUID(int=2), "project_id": "project", "session_id": "session",
+        "sandbox_profile": "workspace_write", "timeout_seconds": 30,
+        "original_reference": {"schema_version": 1, "input_source_sha256": "1" * 64,
                             "contract_sha256": "2" * 64, "file_count": 6},
-    )
+    })
 
 
-def artifact():
+def artifact() -> PythonInputSupplyArtifact:
     return PythonInputSupplyArtifact(filename="packaging-26.0-py3-none-any.whl", name="packaging",
         version="26.0", sha256="4" * 64, size_bytes=123)
 
 
-def test_supply_request_is_separate_v5_and_has_no_model_selected_sources():
+def test_supply_request_is_separate_v5_and_has_no_model_selected_sources() -> None:
     value = PythonInputSupplyRequest(action="plan_python_project_inputs", invocation=invocation())
     assert value.version == 5
     assert value.invocation.install_allowed is False
@@ -40,8 +46,8 @@ def test_supply_request_is_separate_v5_and_has_no_model_selected_sources():
             PythonInputSupplyRequest.model_validate(value.model_dump() | change, strict=True)
 
 
-def test_supply_and_status_require_exact_plan_and_separate_execution_id():
-    data = {"invocation": invocation(), "expected_plan_sha256": "5" * 64}
+def test_supply_and_status_require_exact_plan_and_separate_execution_id() -> None:
+    data: SupplyParameters = {"invocation": invocation(), "expected_plan_sha256": "5" * 64}
     value = PythonInputSupplyRequest(action="supply_python_project_inputs", **data)
     assert value.expected_plan_sha256 == "5" * 64
     with pytest.raises(ValidationError):
@@ -54,17 +60,17 @@ def test_supply_and_status_require_exact_plan_and_separate_execution_id():
             supply_execution_id=invocation().execution_id, **data)
 
 
-def plan():
+def plan() -> PythonInputSupplyPlan:
     scope = {name: getattr(invocation(), name) for name in (
         "tenant_id", "run_id", "project_id", "session_id", "original_reference")}
-    return PythonInputSupplyPlan(scope=scope, declaration_sha256="5" * 64,
-        manifest_sha256="6" * 64, lock_sha256="7" * 64, catalog_sha256="8" * 64,
-        interpreter={"implementation": "cpython", "version": "3.12.14", "abi": "cp312",
+    return PythonInputSupplyPlan.model_validate({"scope": scope, "declaration_sha256": "5" * 64,
+        "manifest_sha256": "6" * 64, "lock_sha256": "7" * 64, "catalog_sha256": "8" * 64,
+        "interpreter": {"implementation": "cpython", "version": "3.12.14", "abi": "cp312",
                      "platform": "linux_x86_64", "binary_sha256": "9" * 64,
-                     "base_runtime_sha256": "a" * 64}, artifacts=(artifact(),))
+                     "base_runtime_sha256": "a" * 64}, "artifacts": (artifact(),)})
 
 
-def test_plan_digest_binds_scope_catalog_original_and_all_selected_artifacts():
+def test_plan_digest_binds_scope_catalog_original_and_all_selected_artifacts() -> None:
     value = plan()
     assert len(value.sha256) == 64
     assert value.sha256 == PythonInputSupplyPlan.model_validate_json(value.model_dump_json(), strict=True).sha256
@@ -79,7 +85,7 @@ def test_plan_digest_binds_scope_catalog_original_and_all_selected_artifacts():
         PythonInputSupplyPlan.model_validate(value.model_dump() | {"artifacts": (artifact(), artifact())}, strict=True)
 
 
-def test_artifact_cannot_hide_path_native_wheel_or_boolean_size():
+def test_artifact_cannot_hide_path_native_wheel_or_boolean_size() -> None:
     for change in ({"filename": "../packaging-26.0-py3-none-any.whl"},
                    {"filename": "packaging-26.0-cp312-cp312-linux_x86_64.whl"},
                    {"size_bytes": True}, {"url": "https://example.com"}):
@@ -87,7 +93,7 @@ def test_artifact_cannot_hide_path_native_wheel_or_boolean_size():
             PythonInputSupplyArtifact.model_validate(artifact().model_dump() | change, strict=True)
 
 
-def test_receipt_requires_complete_disjoint_partition_and_strict_version():
+def test_receipt_requires_complete_disjoint_partition_and_strict_version() -> None:
     value = PythonInputSupplyReceipt(plan=plan(), supply_execution_id=invocation().execution_id,
         published=(artifact().filename,), reused=())
     for change in ({"published": ()}, {"reused": value.published},
@@ -96,7 +102,7 @@ def test_receipt_requires_complete_disjoint_partition_and_strict_version():
             PythonInputSupplyReceipt.model_validate(value.model_dump() | change, strict=True)
 
 
-def test_response_exclusivity_binds_same_run_and_exact_supply_execution():
+def test_response_exclusivity_binds_same_run_and_exact_supply_execution() -> None:
     item = PythonInputSupplyRequest(action="supply_python_project_inputs", invocation=invocation(),
                                   expected_plan_sha256=plan().sha256)
     receipt = PythonInputSupplyReceipt(plan=plan(), supply_execution_id=invocation().execution_id,
@@ -114,7 +120,7 @@ def test_response_exclusivity_binds_same_run_and_exact_supply_execution():
         response.model_copy(update={"execution_id": "other_1"}).require_for(item)
 
 
-def test_status_receipt_requires_matching_plan_and_original_execution():
+def test_status_receipt_requires_matching_plan_and_original_execution() -> None:
     receipt = PythonInputSupplyReceipt(plan=plan(), supply_execution_id=invocation().execution_id,
         published=(artifact().filename,), reused=())
     value = PythonInputSupplyStatus(state="supplied", plan_sha256=plan().sha256,

@@ -1,4 +1,5 @@
 """Ordered, private Direct observations are data, not execution authority."""
+from collections.abc import Mapping
 from dataclasses import replace
 from uuid import uuid4
 
@@ -50,10 +51,15 @@ async def test_rejected_native_response_and_protocol_correction_keep_separate_po
     assert loaded.replay_complete
     assert len(calls) == 2
     from agent_hub.runtime.continuation_artifacts import load_continuation
-    saved = await load_continuation(repo, tenant_id=tenant, run_id=run, reference=refs[0])
-    assert 'native_assistant' not in saved['response']
-    assert 'reasoning_content' not in saved['response']
-    assert saved['response']['text'] is None
+    reference = refs[0]
+    assert isinstance(reference, Mapping)
+    saved = await load_continuation(repo, tenant_id=tenant, run_id=run, reference=reference)
+    assert isinstance(saved, Mapping)
+    response = saved['response']
+    assert isinstance(response, Mapping)
+    assert 'native_assistant' not in response
+    assert 'reasoning_content' not in response
+    assert response['text'] is None
 
 
 async def test_large_legal_response_lives_in_segments_not_checkpoint_strings() -> None:

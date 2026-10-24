@@ -1,4 +1,7 @@
+from typing import Protocol, cast
+
 import pytest
+from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 from agent_hub.api.routers.admin import (
@@ -7,33 +10,44 @@ from agent_hub.api.routers.admin import (
     SystemSettingsResponse,
     _persisted_system_settings_payload,
 )
-from tests.api.test_runs_api import _client, bearer
+from agent_hub.auth.models import AuthenticatedPrincipal
+from tests.api.test_runs_api import StubRunService, _client, bearer
 
 
-def test_settings_permission_contract_and_response_only_capabilities():
+class _PermissionClient(Protocol):
+    def __call__(
+        self, *, settings_service: InMemoryAdminResourceService | None = None,
+    ) -> tuple[TestClient, StubRunService, AuthenticatedPrincipal]: ...
+
+
+# The shared helper forwards the service unchanged despite its narrower stub annotation.
+_permission_client = cast(_PermissionClient, _client)
+
+
+def test_settings_permission_contract_and_response_only_capabilities() -> None:
     settings = SystemSettingsResponse()
     assert settings.default_permission_mode == "default"
     assert settings.default_sandbox_profile == "workspace_write"
     assert settings.supported_permission_modes == ("default", "auto_review", "read_only")
     assert "supported_permission_modes" not in _persisted_system_settings_payload(settings)
     with pytest.raises(ValidationError):
-        SystemSettingsRequest(supported_permission_modes=["default"])
+        SystemSettingsRequest.model_validate({"supported_permission_modes": ["default"]})
 
 
 @pytest.mark.parametrize("field,value", [
     ("default_permission_mode", "full_access"), ("default_sandbox_profile", "full_access"),
 ])
-def test_settings_reject_unsupported_permissions(field, value):
+def test_settings_reject_unsupported_permissions(field: str, value: str) -> None:
     with pytest.raises(ValidationError):
-        SystemSettingsRequest(**{field: value})
+        SystemSettingsRequest.model_validate({field: value})
 
 
 @pytest.mark.parametrize("mode,profile", [("default", "restricted"), ("auto_review", "none"),
                                          ("read_only", "read_only")])
-def test_explicit_queue_mode_resolves_configured_profile(mode, profile):
+def test_explicit_queue_mode_resolves_configured_profile(mode: str, profile: str) -> None:
     settings = InMemoryAdminResourceService()
     settings.settings = SystemSettingsResponse(default_sandbox_profile="restricted")
-    client, service, _ = _client(settings_service=settings)
+    client, service, _ = _permission_client(settings_service=settings)
     payload = {"message": "inspect", "mode": "direct", "permission_mode": mode}
     if mode == "auto_review":
         payload["sandbox_profile"] = profile
@@ -53,7 +67,9 @@ def test_explicit_queue_mode_resolves_configured_profile(mode, profile):
     {"permission_mode": "read_only", "requested_permissions": ["command.run"]},
 ])
 @pytest.mark.parametrize("path", ["/api/v1/runs", "/api/v1/admin/conversations/conv-permission/queue"])
-def test_api_rejects_unsupported_or_mismatched_permission_modes(payload, path):
+def test_api_rejects_unsupported_or_mismatched_permission_modes(
+    payload: dict[str, object], path: str,
+) -> None:
     client, service, _ = _client()
     response = client.post(path, headers={**bearer(), "Idempotency-Key": "bad-mode"},
                            json={"message": "inspect", "mode": "direct", **payload})
@@ -61,11 +77,11 @@ def test_api_rejects_unsupported_or_mismatched_permission_modes(payload, path):
     assert not service.submitted and not service.queued_submit_options
 
 
-def test_legacy_queue_does_not_receive_new_kwargs_or_settings_defaults():
+def test_legacy_queue_does_not_receive_new_kwargs_or_settings_defaults() -> None:
     settings = InMemoryAdminResourceService()
     settings.settings = SystemSettingsResponse(default_permission_mode="read_only",
                                               default_sandbox_profile="read_only")
-    client, service, _ = _client(settings_service=settings)
+    client, service, _ = _permission_client(settings_service=settings)
     response = client.post("/api/v1/admin/conversations/conv-permission/queue",
                            headers={**bearer(), "Idempotency-Key": "legacy-mode"},
                            json={"message": "inspect", "mode": "direct"})
@@ -78,6 +94,6 @@ def test_legacy_queue_does_not_receive_new_kwargs_or_settings_defaults():
     {"default_permission_mode": "read_only", "default_sandbox_profile": "workspace_write"},
     {"default_permission_mode": "auto_review", "tool_approval_mode": "ask"},
 ])
-def test_settings_reject_conflicting_permission_defaults(values):
+def test_settings_reject_conflicting_permission_defaults(values: dict[str, str]) -> None:
     with pytest.raises(ValidationError):
-        SystemSettingsRequest(**values)
+        SystemSettingsRequest.model_validate(values)

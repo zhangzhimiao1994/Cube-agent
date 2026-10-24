@@ -284,9 +284,11 @@ def binary_boundary(api: Any, monkeypatch: pytest.MonkeyPatch) -> Any:
             return 0
         if command == 1034:
             assert fd == 62
-            return state.seals
+            seals: int = state.seals
+            return seals
         assert fd == 63 and command == 3
-        return state.read_flags
+        read_flags: int = state.read_flags
+        return read_flags
 
     monkeypatch.setattr(api, '_pin_directory', pin)
     monkeypatch.setattr(api, 'os', SimpleNamespace(stat=checked_stat, open=opened, fstat=info_for,

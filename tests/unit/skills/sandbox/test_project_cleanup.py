@@ -285,6 +285,8 @@ def test_links_are_skipped_without_touching_targets(tmp_path: Path) -> None:
 
 @pytest.mark.skipif(sys.platform != 'linux', reason='real Linux FD traversal only')
 def test_linux_rejects_fifo_without_open_or_mutation(tmp_path: Path) -> None:
+    if sys.platform == 'win32':
+        pytest.skip('FIFO fixtures require a POSIX runtime')
     stage = tmp_path / 'stage'
     stage.mkdir(mode=0o700)
     fifo = stage / 'pipe'

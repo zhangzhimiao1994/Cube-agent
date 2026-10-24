@@ -246,6 +246,8 @@ def test_runtime_peak_keeps_verified_archive_for_future_independent_measurement(
     plan = api.plan_toolchain_supply(config, declaration(), scope(api), spaces(api, split=True),
                                      execution_bytes=4096)
     runtime = next(p for p in plan.filesystems if p.device == 2)
+    assert isinstance(entry["archive_bytes"], int)
+    assert isinstance(entry["unpacked_bytes_limit"], int)
     assert runtime.required_bytes >= entry["archive_bytes"] + entry["unpacked_bytes_limit"]
 
 

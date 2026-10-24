@@ -1,41 +1,52 @@
 """Concrete Direct actions pause after model output, never at startup."""
+from collections.abc import Mapping
 from pathlib import Path
+from typing import cast
+from uuid import UUID
 
 import pytest
 
+from agent_hub.auth.models import Role
 from agent_hub.capabilities.gateway import CapabilityResult, CapabilityStatus
 from agent_hub.capabilities.runtime import RuntimeCapabilityGateway
+from agent_hub.capabilities.types import CapabilityRequest
 from agent_hub.harness.tool_gateway import HarnessToolGateway
+from agent_hub.harness.types import HarnessToolCallRequest, HarnessToolCallResult
 from agent_hub.runtime.action_direct import ActionApprovedDirectRuntime
 from agent_hub.runtime.artifacts import InMemoryArtifactRepository
-from agent_hub.runtime.contracts import EventKind
+from agent_hub.runtime.contracts import EventKind, JsonValue, TaskContext
+from agent_hub.runtime.project_scale_artifact import HarnessToolInvoker
 from tests.unit.capabilities.test_scoped_read import FakeRunRepository, stored_run
 from tests.unit.runtime.test_direct_project_verification import Model, batch, context
 
 
 class Backend(RuntimeCapabilityGateway):
-    def __init__(self, root, ctx, repo):
+    def __init__(self, root: Path, ctx: TaskContext, repo: InMemoryArtifactRepository) -> None:
         super().__init__(skill_store_dir=root/'skills', project_workspace_dir=root/'workspaces',
             generated_artifact_dir=root/'generated', artifact_repository=repo,
             run_repository=FakeRunRepository(stored_run(tenant=ctx.tenant_id, run=ctx.run_id,
                 project_id='direct-verification', session='same-task')))
         self.root = root/'workspaces'/str(ctx.tenant_id)/'projects'/'direct-verification'/'sessions'/'same-task'
-        self.calls = []
+        self.calls: list[str] = []
 
-    def is_available(self, tenant_id, name):
+    def is_available(self, tenant_id: UUID, name: str) -> bool:
         return False if name == 'project.verify' else super().is_available(tenant_id, name)
 
-    async def execute(self, *, name, **kwargs):
+    async def execute(
+        self, *, name: str, tenant_id: UUID, run_id: UUID, actor: str,
+        arguments: Mapping[str, JsonValue], idempotency_key: str,
+    ) -> Mapping[str, JsonValue]:
         self.calls.append(name)
-        return await super().execute(name=name, **kwargs)
+        return await super().execute(name=name, tenant_id=tenant_id, run_id=run_id,
+            actor=actor, arguments=arguments, idempotency_key=idempotency_key)
 
 
 class Policy:
     def __init__(self) -> None:
         self.allowed: set[str] = set()
-        self.requests = []
+        self.requests: list[CapabilityRequest] = []
 
-    async def invoke(self, request, *, role):
+    async def invoke(self, request: CapabilityRequest, *, role: Role) -> CapabilityResult:
         self.requests.append(request)
         if request.operation in self.allowed:
             return CapabilityResult(CapabilityStatus.ALLOWED, request.run_id)
@@ -49,7 +60,7 @@ async def test_pause_at_actual_write_then_bundle_without_repeating_model_or_writ
     backend = Backend(tmp_path, ctx, repo)
     gateway = HarnessToolGateway(backend, policy_gateway=policy, require_actor_identity=True)
     model = Model(batch({'README.md': 'Actual content'}))
-    def runtime():
+    def runtime() -> ActionApprovedDirectRuntime:
         return ActionApprovedDirectRuntime(model, logical_model='main', capability_gateway=backend,
                                            harness_tool_gateway=gateway, artifact_repository=repo)
     original = runtime()
@@ -138,7 +149,6 @@ async def test_one_runtime_can_start_another_run_without_replaying_previous_acti
 async def test_generated_inspection_keeps_published_identity_across_approval_resume(
     tmp_path: Path, native_first: bool,
 ) -> None:
-    from agent_hub.harness.types import HarnessToolCallResult
     from agent_hub.models.types import ToolCall
     from tests.unit.runtime.test_direct_generated_entry import Harness, Model, batch, response
     from tests.unit.runtime.test_generated_project_history import evidence
@@ -150,7 +160,7 @@ async def test_generated_inspection_keeps_published_identity_across_approval_res
     class PausingHarness(Harness):
         allowed = False
 
-        async def action_preparation_snapshot(self, context):
+        async def action_preparation_snapshot(self, context: TaskContext) -> dict[str, JsonValue]:
             from agent_hub.capabilities.action_preparation import CONTRACT_ROUTE_KEYS
 
             # Transport double only: this scene tests published inspection identity,
@@ -160,9 +170,12 @@ async def test_generated_inspection_keeps_published_identity_across_approval_res
                                   for key in CONTRACT_ROUTE_KEYS if key in context.routing_decision},
                     'workspace_sha256': 'd' * 64}
 
-        async def invoke(self, tenant, request, **kwargs):
+        async def invoke(
+            self, tenant: UUID, request: HarnessToolCallRequest, *,
+            user_id: UUID | None = None, role: Role | None = None, **kwargs: object,
+        ) -> HarnessToolCallResult:
             if request.tool_name in {'project.inspect', 'read_context'}:
-                return await super().invoke(tenant, request, **kwargs)
+                return await super().invoke(tenant, request, user_id=user_id, role=role, **kwargs)
             if request.tool_name == 'workspace.write_text' and not self.allowed:
                 return HarnessToolCallResult(call_id=request.call_id, tool_name=request.tool_name,
                     status='failed', failure_reason='capability requires approval',
@@ -175,9 +188,9 @@ async def test_generated_inspection_keeps_published_identity_across_approval_res
     first = (response(None, tools=(ToolCall('call-inspect', 'project.inspect', {}),)),) if native_first else ()
     model = Model(*first, response(batch()))
 
-    def runtime():
+    def runtime() -> ActionApprovedDirectRuntime:
         return ActionApprovedDirectRuntime(model, logical_model='fixture', capability_gateway=harness,
-            harness_tool_gateway=harness, artifact_repository=repo)
+            harness_tool_gateway=cast(HarnessToolInvoker, harness), artifact_repository=repo)
 
     initial = runtime()
     before = [event async for event in initial.run(ctx)]
@@ -193,6 +206,7 @@ async def test_generated_inspection_keeps_published_identity_across_approval_res
     final = next(event.artifact for event in after if event.artifact is not None
         and 'generated_event_layout' in event.artifact.content)
     layout = final.content['generated_event_layout']
+    assert isinstance(layout, Mapping)
     assert layout['inspection_artifact_id'] == str(published[0].id)
     assert layout['inspection_artifact_sha256'] == published[0].content_sha256
     assert len(model.requests) == (2 if native_first else 1)

@@ -51,7 +51,7 @@ def test_native_recipe_decoder_keeps_baseline_and_environment_inputs_distinct(st
 @pytest.mark.parametrize('change', ['tenant', 'run', 'project', 'session', 'recipe', 'environment', 'original'])
 def test_native_recipe_rejects_changed_trusted_invocation_binding(staging: Any, change: str) -> None:
     _expected, invocation, original, raw = fixture()
-    updates = {'tenant': {'tenant_id': UUID(int=99)}, 'run': {'run_id': UUID(int=99)},
+    updates: dict[str, dict[str, object]] = {'tenant': {'tenant_id': UUID(int=99)}, 'run': {'run_id': UUID(int=99)},
         'project': {'project_id': 'sibling'}, 'session': {'session_id': 'sibling'},
         'recipe': {'recipe_sha256': 'a' * 64}, 'environment': {'environment_input_sha256': 'a' * 64},
         'original': {'original_reference': invocation.original_reference.model_copy(update={'contract_sha256': 'a' * 64})}}

@@ -15,6 +15,7 @@ async def test_multifile_continuation_restores_through_fresh_postgres_pool(datab
     original, fresh = build_database(database_url), build_database(database_url)
     try:
         context = action_context()
+        assert context.actor_id is not None
         service = RunService(RunRepository(original.session_factory),
             runtime_registry=default_runtime_registry(), router=None, task_queue=RecordingQueue())
         submitted = await service.submit(tenant_id=context.tenant_id, actor_id=context.actor_id,

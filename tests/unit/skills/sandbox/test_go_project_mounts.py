@@ -19,6 +19,8 @@ from typing import Any
 
 import pytest
 
+from agent_hub.skills.sandbox.project_contract_mounts import _File
+
 
 @pytest.fixture
 def mounts() -> Any:
@@ -259,7 +261,7 @@ def test_canary_overlay_files_are_sealed_without_writable_source(
 
     canary = GoOverlayCanary('project', 'canary', 'example.invalid/app',
                               'a' * 64, 'b' * 64, 'a' * 64)
-    sealed = []
+    sealed: list[_File] = []
 
     def seal(file: Any, stack: Any) -> int:
         fd = 91 + len(sealed)

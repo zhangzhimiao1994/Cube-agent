@@ -4,18 +4,20 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import replace
-from typing import Any
+from typing import Any, cast
 from uuid import UUID, uuid4
 
 import pytest
 
 from agent_hub.auth.models import Role
 from agent_hub.capabilities.gateway import CapabilityResult, CapabilityStatus
+from agent_hub.capabilities.project_baselines import ProjectBaselineReference
 from agent_hub.capabilities.types import CapabilityRequest
 from agent_hub.domain.runs import TaskMode
 from agent_hub.harness.tool_gateway import HarnessToolGateway
 from agent_hub.harness.types import HarnessToolCallRequest, JsonValue
 from agent_hub.runs.toolchain_supply import ToolchainSupplyAuthority
+from agent_hub.skills.sandbox.toolchain_catalog import ToolchainSupplyPlan
 from tests.unit.capabilities.test_toolchain_preparation import case as case  # noqa: PLC0414
 
 
@@ -140,8 +142,8 @@ async def test_identity_and_plan_mismatch_fail_before_policy(
     user: Any = None if defect == 'no_user' else uuid4() if defect == 'user' else UUID(int=2)
     role: Any = 'operator' if defect == 'role_string' else Role.ADMIN if defect == 'role' else Role.OPERATOR
     result = await gateway.authorize_project_toolchain(tenant, request, user_id=user, role=role,
-        plan=object() if defect == 'plan' else case.plan,
-        original_reference=object() if defect == 'reference' else case.ref, authority=authority)
+        plan=cast(ToolchainSupplyPlan, object()) if defect == 'plan' else case.plan,
+        original_reference=cast(ProjectBaselineReference, object()) if defect == 'reference' else case.ref, authority=authority)
     assert result.status == 'failed' and not result.payload and not policy.seen
 
 

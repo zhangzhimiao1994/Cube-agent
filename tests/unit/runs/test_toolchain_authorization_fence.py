@@ -34,13 +34,13 @@ from agent_hub.runs.toolchain_supply import ToolchainSupplyAuthority
 from tests.unit.capabilities.test_toolchain_preparation import case as case  # noqa: PLC0414
 from tests.unit.capabilities.test_toolchain_preparation import state_for
 from tests.unit.harness.test_toolchain_supply_gateway import NoRuntime, envelope
-from tests.unit.runs.test_toolchain_supply_repository import SupplyDB
+from tests.unit.runs.test_toolchain_supply_repository import SupplyDB, object_dict
 
 
 class ApprovalDB(SupplyDB):
     def __init__(self, case: Any) -> None:
         super().__init__(case)
-        self.row.routing_decision['toolchain_supply'] = state_for(case)
+        self.route['toolchain_supply'] = state_for(case)
         self.before_lock: Any = None
         self.reads = 0
         self.locks: list[str] = []
@@ -138,6 +138,7 @@ async def admit(db: ApprovalDB, authority: ToolchainSupplyAuthority | None,
                 gateway: DefaultRuntimeCapabilityPolicyGateway | None = None, *,
                 key: str = 'sdk-admission') -> Any:
     harness = HarnessToolGateway(NoRuntime(), policy_gateway=policy(db) if gateway is None else gateway)
+    assert db.row.actor_id is not None
     return await harness.authorize_project_toolchain(db.row.tenant_id, replace(envelope(), idempotency_key=key),
         user_id=db.row.actor_id, role=Role.OPERATOR, plan=db.case.plan, original_reference=db.case.ref,
         authority=authority)
@@ -217,7 +218,7 @@ async def test_valid_authority_waits_and_persists_exact_binding(case: Any) -> No
     result = await admit(db, db.bound)
     assert result.status == 'failed' and result.payload.get('approval_id') is not None
     assert db.row.status == 'waiting_approval' and db.row.worker_lease_token is None
-    assert db.approvals[0].payload['toolchain_input_binding']['plan_sha256'] == case.plan.sha256
+    assert object_dict(db.approvals[0].payload['toolchain_input_binding'])['plan_sha256'] == case.plan.sha256
     assert db.locks == ['run', 'user']
 
 

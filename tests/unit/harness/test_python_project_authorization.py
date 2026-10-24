@@ -19,7 +19,7 @@ class RecipeBackend(FakeRuntimeCapabilityGateway):
     ) -> None:
         super().__init__()
         self.changes, self.error, self.node = changes or {}, error, node
-        self.resolutions = []
+        self.resolutions: list[CapabilityRequest] = []
 
     async def project_verification_authorization(
         self, request: CapabilityRequest

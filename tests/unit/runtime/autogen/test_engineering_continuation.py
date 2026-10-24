@@ -34,9 +34,10 @@ def metadata(path: str = "src/lib/intsum.cjs", digest: str = "a", size: int = 10
     return {"path": path, "sha256": digest * 64, "size_bytes": size}
 
 
-def inspected(*, existing: bool = False):
+def inspected(*, existing: bool = False) -> tuple[TaskContext, list[dict[str, JsonValue]], list[Artifact]]:
     current = ctx()
-    rows, artifacts = [], []
+    rows: list[dict[str, JsonValue]] = []
+    artifacts: list[Artifact] = []
     append_result(rows, artifacts, "project.inspect", {
         "schema_version": 1, "scope": {"tenant_id": str(current.tenant_id), "run_id": str(RUN),
             "project_id": "draft-project", "workspace_session_id": "draft-session"},
@@ -47,15 +48,16 @@ def inspected(*, existing: bool = False):
     return current, rows, artifacts
 
 
-def listed(rows, artifacts, *files) -> None:
+def listed(rows: list[dict[str, JsonValue]], artifacts: list[Artifact], *files: JsonValue) -> None:
     append_result(rows, artifacts, "workspace.list", {"workspace_files": files})
 
 
-def written(rows, artifacts, file) -> None:
+def written(rows: list[dict[str, JsonValue]], artifacts: list[Artifact], file: JsonValue) -> None:
     append_result(rows, artifacts, "workspace.write_text", {"workspace_files": (file,)})
 
 
-def draft(current, rows, artifacts, *, observation="a") -> None:
+def draft(current: TaskContext, rows: list[dict[str, JsonValue]], artifacts: list[Artifact],
+          *, observation: str = "a") -> None:
     value = rejection(current, actor="engineer", observation=observation * 64)
     value.update(reason="generated_acceptance_manifest_required", issues=("manifest_missing",))
     append_result(rows, artifacts, "project.verify", {
@@ -76,7 +78,7 @@ def draft(current, rows, artifacts, *, observation="a") -> None:
     ("engineering_writer_continuation_version", None), ("engineering_writer_continuation_version", True),
     ("engineering_writer_continuation_version", "1"), ("engineering_writer_continuation_version", 2),
 ])
-def test_only_exact_new_policy_is_selected(field, value) -> None:
+def test_only_exact_new_policy_is_selected(field: str, value: JsonValue) -> None:
     current, rows, artifacts = inspected()
     current = current.model_copy(update={"routing_decision": {**current.routing_decision, field: value}})
     assert not engineering_continuation_selected(current)
@@ -113,7 +115,7 @@ def test_latest_list_is_authoritative_and_never_overwrites_existing_acceptance()
 
 
 @pytest.mark.parametrize("state", ["uninspected", "existing", "verification", "prepared"])
-def test_no_forced_draft_after_existing_project_capture_or_verification(state) -> None:
+def test_no_forced_draft_after_existing_project_capture_or_verification(state: str) -> None:
     current, rows, artifacts = inspected(existing=state == "existing")
     if state == "uninspected":
         rows, artifacts = [], []
@@ -175,7 +177,7 @@ def test_bundle_ends_and_other_or_multiple_writers_do_not_continue() -> None:
     {"path": "ACCEPTANCE.json", "sha256": "a" * 64, "size_bytes": -1},
     "ACCEPTANCE.json",
 ])
-def test_invalid_inventory_is_fail_closed(file) -> None:
+def test_invalid_inventory_is_fail_closed(file: JsonValue) -> None:
     current, rows, artifacts = inspected()
     listed(rows, artifacts, file)
     for call in (lambda: draft_action(current, rows, artifacts, TOOLS),
@@ -185,7 +187,7 @@ def test_invalid_inventory_is_fail_closed(file) -> None:
 
 
 @pytest.mark.parametrize("defect", ["running", "UNKNOWN", "position", "hash", "scope", "duplicate"])
-def test_malformed_or_uncertain_prefix_never_yields_an_action(defect) -> None:
+def test_malformed_or_uncertain_prefix_never_yields_an_action(defect: str) -> None:
     current, rows, artifacts = inspected()
     if defect in {"running", "UNKNOWN"}:
         rows[-1]["status"] = defect
@@ -214,7 +216,7 @@ def test_malformed_or_uncertain_prefix_never_yields_an_action(defect) -> None:
     {"workspace_files": (), "truncated": True},
     {"workspace_files": (), "truncated": 0},
 ])
-def test_inventory_must_be_complete_unique_path_metadata(result) -> None:
+def test_inventory_must_be_complete_unique_path_metadata(result: Mapping[str, JsonValue]) -> None:
     current, rows, artifacts = inspected()
     append_result(rows, artifacts, "workspace.list", result)
     with pytest.raises(ValueError):
@@ -266,7 +268,7 @@ def test_changed_inventory_and_other_writer_tail_are_distinct() -> None:
 
 
 @pytest.mark.parametrize("result", [{"path": "src/a.cjs"}, {"path": "src/a.cjs", "text": 1}])
-def test_malformed_read_result_is_rejected_consistently(result) -> None:
+def test_malformed_read_result_is_rejected_consistently(result: Mapping[str, JsonValue]) -> None:
     current, rows, artifacts = inspected()
     append_result(rows, artifacts, "workspace.read", result)
     with pytest.raises(ValueError):

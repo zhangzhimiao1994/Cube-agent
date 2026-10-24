@@ -379,9 +379,12 @@ def test_legacy_diagnostic_responses_keep_receipt_optional(api: Any, action: str
 def test_new_diagnostic_serializer_is_accepted_by_previous_strict_wire_shape(
     api: Any, action: str, ok: bool,
 ) -> None:
+    fields: dict[str, Any] = {
+        name: (field.annotation, field) for name, field in api.GoProjectResponse.model_fields.items()
+        if name != 'receipt'
+    }
     legacy = create_model('LegacyV8Response', __config__=ConfigDict(extra='forbid', strict=True),
-        **{name: (field.annotation, field) for name, field in api.GoProjectResponse.model_fields.items()
-           if name != 'receipt'})
+        **fields)
     reply = response(api, request(api, action), ok=ok)
     raw = reply.model_dump_json()
     assert 'receipt' not in json.loads(raw)

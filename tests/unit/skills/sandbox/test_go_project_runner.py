@@ -14,7 +14,7 @@ from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, TextIO
 
 import pytest
 
@@ -669,7 +669,8 @@ def cli(api: Any, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
             self.name = name
 
         def write(self, value: str) -> int:
-            return getattr(sys, self.name).write(value)
+            stream: TextIO = getattr(sys, self.name)
+            return stream.write(value)
 
     monkeypatch.setattr(api, 'sys', SimpleNamespace(argv=['go_project_runner'],
         stdout=Stream('stdout'), stderr=Stream('stderr')))

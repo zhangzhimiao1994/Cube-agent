@@ -6,7 +6,7 @@ import importlib.util
 import json
 import struct
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -64,7 +64,7 @@ async def test_v7_dispatch_is_distinct_and_passes_authenticated_peer(
 
     fake = SimpleNamespace(_policy=BrokerPolicy(), handle_toolchain=handle)
     monkeypatch.setattr(broker, "_peer_uid", lambda w: 10001)
-    await broker._serve_client(reader, writer, fake)
+    await broker._serve_client(reader, cast(asyncio.StreamWriter, writer), cast(broker.SkillBroker, fake))
     assert called == [(request, 10001)]
     size = struct.unpack("!I", writer.data[:4])[0]
     response = toolchain_protocol.parse_toolchain_response(bytes(writer.data[4 : 4 + size]))
@@ -86,7 +86,7 @@ async def test_reserved_action_with_wrong_version_cannot_fall_back_to_old_protoc
     writer = Writer()
     monkeypatch.setattr(broker, "_peer_uid", lambda w: 10001)
     fake = SimpleNamespace(_policy=BrokerPolicy())
-    await broker._serve_client(reader, writer, fake)
+    await broker._serve_client(reader, cast(asyncio.StreamWriter, writer), cast(broker.SkillBroker, fake))
     assert b"toolchain_request_invalid" in writer.data
     assert b"input_supply_request_invalid" not in writer.data
 
@@ -103,7 +103,8 @@ async def test_unhashable_action_is_a_closed_invalid_request(
     reader.feed_eof()
     writer = Writer()
     monkeypatch.setattr(broker, "_peer_uid", lambda w: 10001)
-    await broker._serve_client(reader, writer, SimpleNamespace(_policy=BrokerPolicy()))
+    await broker._serve_client(reader, cast(asyncio.StreamWriter, writer),
+                               cast(broker.SkillBroker, SimpleNamespace(_policy=BrokerPolicy())))
     assert writer.closed
     assert b'"ok":false' in writer.data
 
@@ -137,7 +138,7 @@ async def test_normal_response_wait_includes_the_sdk_two_unit_cleanup_grace(
 
     monkeypatch.setattr(toolchain_client, "_systemd_supported", lambda: True)
     monkeypatch.setattr(toolchain_client, "request_toolchain_broker", exchange)
-    monkeypatch.setattr(toolchain_client.asyncio, "timeout", timeout)
+    monkeypatch.setattr(asyncio, "timeout", timeout)
     assert await toolchain_client.ToolchainSandbox()._exchange(request) == response
     assert budgets == [
         request.invocation.timeout_seconds + toolchain_protocol.TOOLCHAIN_TERMINATION_SECONDS

@@ -5,10 +5,11 @@ from __future__ import annotations
 import importlib
 import importlib.util
 import json
+from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, cast
 from uuid import UUID, uuid4
 
 import pytest
@@ -232,7 +233,7 @@ async def test_supply_public_history_survives_recipe_observed(helper: Any, dao: 
 
 
 async def test_real_postgres_uuid_type_keeps_supply_approval_details(helper: Any, dao: Any) -> None:
-    from asyncpg.pgproto.pgproto import UUID as DatabaseUUID
+    DatabaseUUID = cast(Callable[[str], UUID], importlib.import_module('asyncpg.pgproto.pgproto').UUID)
 
     from agent_hub.runs.repository import _public_plugin_approval_events
 

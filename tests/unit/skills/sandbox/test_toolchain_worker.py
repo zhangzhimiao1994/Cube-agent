@@ -4,11 +4,12 @@ import importlib
 import importlib.util
 from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
 from agent_hub.capabilities.project_contracts import build_project_check_contract
+from agent_hub.skills.sandbox.toolchain_catalog import FilesystemRole
 from tests.unit.skills.sandbox.test_toolchain_protocol import invocation, plan, reference
 
 
@@ -188,7 +189,7 @@ def test_source_copy_capacity_is_checked_before_copy(api: Any) -> None:
     config = ToolchainCatalog.from_payload(catalog())
     low = tuple(
         FilesystemSpace(
-            role=role,
+            role=cast(FilesystemRole, role),
             device=1,
             allocation_unit=4096,
             available_bytes=config.min_free_bytes + call.source_limit_bytes,
@@ -218,7 +219,7 @@ def test_worker_rejects_low_space_before_any_original_copy(
     config = ToolchainCatalog.from_payload(catalog())
     low = tuple(
         FilesystemSpace(
-            role=role,
+            role=cast(FilesystemRole, role),
             device=1,
             allocation_unit=4096,
             available_bytes=config.min_free_bytes + call.source_limit_bytes,

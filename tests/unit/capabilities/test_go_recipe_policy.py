@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Any
+from typing import Any, TypedDict, cast
 
 import pytest
 
@@ -35,6 +35,12 @@ from tests.unit.runs.test_go_project_admission import (
 from tests.unit.runs.test_go_project_admission import api as api  # noqa: PLC0414
 from tests.unit.runs.test_go_project_admission import db as db  # noqa: PLC0414
 from tests.unit.runs.test_toolchain_authorization_fence import Reviewer
+
+
+class ApprovalOptions(TypedDict):
+    approval_id: str
+    approval_fingerprint: str
+    approval_scope: str | None
 
 
 def policy(db: GoDB, outcome: Any = None) -> DefaultRuntimeCapabilityPolicyGateway:
@@ -72,7 +78,7 @@ async def test_preflight_then_takeover_before_approval_row_lock(db: GoDB, outcom
 async def test_repository_go_scope_requires_private_authority(db: GoDB, operation: str) -> None:
     await bind(db)
     before = snapshot(db)
-    options = {'approval_id': 'generic', 'approval_fingerprint': 'generic',
+    options: ApprovalOptions = {'approval_id': 'generic', 'approval_fingerprint': 'generic',
                'approval_scope': capability_approval_scope(go_recipe_binding(db.row))}
     with pytest.raises(RunConflict):
         if operation == 'waiting':
@@ -116,6 +122,7 @@ async def test_valid_authority_waits_or_persists_separate_review(db: GoDB, outco
     assert result.status is (CapabilityStatus.ALLOWED if outcome is ApprovalReviewOutcome.ALLOW
                              else CapabilityStatus.WAITING_APPROVAL if outcome is None else CapabilityStatus.DENIED)
     assert len(db.approvals) == 1
+    assert db.row.routing_decision is not None
     assert db.approvals[0].payload['go_recipe_binding'] == db.row.routing_decision['go_project_recipe']
     assert 'toolchain_input_binding' not in db.approvals[0].payload
     assert str(authority.lease_token) not in str(db.approvals[0].payload)
@@ -172,16 +179,20 @@ async def test_new_revalidation_after_preflight(db: GoDB, defect: str) -> None:
     before: list[Any] = []
 
     def change(live: GoDB) -> None:
+        assert live.row.routing_decision is not None
         if defect == 'disabled':
             live.user.disabled = True
         elif defect == 'role':
             live.user.role = 'admin'
         elif defect == 'capture':
-            live.row.routing_decision['project_input_preparation']['schema_version'] = True
+            cast(dict[str, object], live.row.routing_decision['project_input_preparation'])['schema_version'] = True
         elif defect == 'supply':
-            live.row.routing_decision['toolchain_supply']['receipt']['environment']['tree_sha256'] = '0' * 64
+            supply = cast(dict[str, object], live.row.routing_decision['toolchain_supply'])
+            receipt = cast(dict[str, object], supply['receipt'])
+            cast(dict[str, object], receipt['environment'])['tree_sha256'] = '0' * 64
         else:
-            live.row.routing_decision['go_project_recipe']['file_limit'] += 1
+            recipe = cast(dict[str, object], live.row.routing_decision['go_project_recipe'])
+            recipe['file_limit'] = cast(int, recipe['file_limit']) + 1
         before.append(snapshot(live))
 
     db.before_lock = change
@@ -244,7 +255,9 @@ async def test_marker_changes_after_grant_read_before_approval_write(db: GoDB, o
     class MarkerChangingReviewer:
         async def review(self, request: Any) -> ApprovalReviewDecision:
             assert db.locks[-3:] == ['run', 'user', 'approval']
-            db.row.routing_decision['go_project_recipe']['file_limit'] += 1
+            assert db.row.routing_decision is not None
+            recipe = cast(dict[str, object], db.row.routing_decision['go_project_recipe'])
+            recipe['file_limit'] = cast(int, recipe['file_limit']) + 1
             expected.append(snapshot(db))
             return ApprovalReviewDecision(outcome, 'controlled', 'Go recipe review')
 
@@ -280,4 +293,5 @@ async def test_service_can_reject_or_expire_after_user_change(db: GoDB, change: 
     assert resolved is not None and resolved.status == ('rejected' if action == 'reject' else 'expired')
     assert db.row.status == 'cancelled' and db.approvals[0].status == 'rejected'
     assert not await approvals._store.list_pending()
+    assert db.row.routing_decision is not None
     assert 'go_project_execution' not in db.row.routing_decision

@@ -5,11 +5,15 @@ import hashlib
 import importlib.util
 import json
 import os
+import pathlib
 import stat
 import subprocess
 import sys
+from collections.abc import Callable
+from os import stat_result
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
+from typing import Protocol, cast
 from unittest.mock import Mock
 
 import pytest
@@ -17,7 +21,32 @@ import pytest
 _TEST_INTERPRETER = sys.executable
 
 
-def test_phase_script_can_be_loaded_with_only_stdlib_dependencies():
+class SubprocessBoundary(Protocol):
+    run: Mock
+
+
+class PhaseModule(Protocol):
+    _RUNTIME: Path
+    _ENVIRONMENT: Path
+    _WHEELHOUSE: Path
+    _WORKSPACE: Path
+    _OUTPUT: Path
+    sys: ModuleType
+    os: ModuleType
+    importlib: ModuleType
+    unittest: ModuleType
+    subprocess: SubprocessBoundary
+    Path: type[Path]
+    PhaseError: type[Exception]
+
+    def run_phase(self, phase: str, *, import_module: str,
+                  generated_manifest_sha256: str | None = None) -> dict[str, object]: ...
+    def _stamp(self, info: stat_result) -> tuple[int, ...]: ...
+    def _regular(self, path: pathlib.Path, *, sealed_input: bool = False) -> stat_result: ...
+    def main(self, argv: list[str]) -> int: ...
+
+
+def test_phase_script_can_be_loaded_with_only_stdlib_dependencies() -> None:
     path = (Path(__file__).parents[4] / 'src/agent_hub/skills/sandbox'
             / 'python_project_phase.py')
     assert path.is_file(), 'isolated Python phase script is missing'
@@ -26,22 +55,24 @@ def test_phase_script_can_be_loaded_with_only_stdlib_dependencies():
         if isinstance(node, ast.Import):
             assert all(alias.name.split('.')[0] in sys.stdlib_module_names for alias in node.names)
         elif isinstance(node, ast.ImportFrom):
+            assert node.module is not None
             assert node.level == 0 and node.module.split('.')[0] in sys.stdlib_module_names
 
 
 @pytest.fixture
-def phase_module():
+def phase_module() -> PhaseModule:
     path = (Path(__file__).parents[4] / 'src/agent_hub/skills/sandbox'
             / 'python_project_phase.py')
     assert path.is_file(), 'isolated Python phase script is missing'
     spec = importlib.util.spec_from_file_location('isolated_phase_under_test', path)
+    assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    return module
+    return cast(PhaseModule, module)
 
 
 @pytest.fixture
-def isolated(phase_module, tmp_path, monkeypatch):
+def isolated(phase_module: PhaseModule, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> PhaseModule:
     module = phase_module
     for name in ('RUNTIME', 'ENVIRONMENT', 'WHEELHOUSE', 'WORKSPACE', 'OUTPUT'):
         path = tmp_path / name.lower()
@@ -68,8 +99,8 @@ def isolated(phase_module, tmp_path, monkeypatch):
     ('win32', '1'), ('darwin', '1'), ('linux', None), ('linux', 'true'), ('linux', '0'),
 ])
 def test_unisolated_entry_has_no_filesystem_import_or_process_side_effects(
-    phase_module, monkeypatch, platform, marker,
-):
+    phase_module: PhaseModule, monkeypatch: pytest.MonkeyPatch, platform: str, marker: str | None,
+) -> None:
     module = phase_module
     monkeypatch.setattr(module.sys, 'platform', platform)
     if marker is None:
@@ -88,21 +119,22 @@ def test_unisolated_entry_has_no_filesystem_import_or_process_side_effects(
 
 @pytest.mark.parametrize('name', ['', '../sample', 'a/b', 'a..b', 'a;id', 'a-b',
                                   'https://example.invalid', 'class', 'a.else', 'a\n'])
-def test_module_selection_rejects_paths_and_non_identifiers(isolated, name):
+def test_module_selection_rejects_paths_and_non_identifiers(isolated: PhaseModule, name: str) -> None:
     with pytest.raises(isolated.PhaseError):
         isolated.run_phase('install', import_module=name)
     isolated.subprocess.run.assert_not_called()
 
 
-def test_phase_and_api_cannot_select_commands(isolated):
+def test_phase_and_api_cannot_select_commands(isolated: PhaseModule) -> None:
     with pytest.raises(isolated.PhaseError):
         isolated.run_phase('shell', import_module='sample')
     with pytest.raises(TypeError):
-        isolated.run_phase('install', import_module='sample', cwd='/other')
+        cast(Callable[..., dict[str, object]], isolated.run_phase)(
+            'install', import_module='sample', cwd='/other')
     isolated.subprocess.run.assert_not_called()
 
 
-def test_mount_roots_cannot_overlap(isolated, monkeypatch):
+def test_mount_roots_cannot_overlap(isolated: PhaseModule, monkeypatch: pytest.MonkeyPatch) -> None:
     nested = isolated._WORKSPACE / 'nested-output'
     nested.mkdir()
     monkeypatch.setattr(isolated, '_OUTPUT', nested)
@@ -111,7 +143,7 @@ def test_mount_roots_cannot_overlap(isolated, monkeypatch):
     isolated.subprocess.run.assert_not_called()
 
 
-def test_install_bootstraps_then_installs_hash_locked_binary_closure(isolated):
+def test_install_bootstraps_then_installs_hash_locked_binary_closure(isolated: PhaseModule) -> None:
     module = isolated
     result = module.run_phase('install', import_module='sample.api')
     commands = [call.args[0] for call in module.subprocess.run.call_args_list]
@@ -134,7 +166,7 @@ def test_install_bootstraps_then_installs_hash_locked_binary_closure(isolated):
     assert result['phase'] == 'install'
 
 
-def test_reused_environment_is_checked_without_venv_or_install(isolated):
+def test_reused_environment_is_checked_without_venv_or_install(isolated: PhaseModule) -> None:
     result = isolated.run_phase('check_environment', import_module='sample.api')
     assert result == {'phase': 'check_environment', 'evidence': 'native_process_only',
         'requires_dist_check': 'completed'}
@@ -142,7 +174,7 @@ def test_reused_environment_is_checked_without_venv_or_install(isolated):
         [str(isolated._ENVIRONMENT / 'bin/python'), '-I', '-B', '-m', 'pip', '--isolated', 'check']]
 
 
-def test_reused_environment_cannot_check_with_an_unrelated_interpreter(isolated, monkeypatch):
+def test_reused_environment_cannot_check_with_an_unrelated_interpreter(isolated: PhaseModule, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(isolated.sys, 'prefix', '/unrelated')
     with pytest.raises(isolated.PhaseError):
         isolated.run_phase('check_environment', import_module='sample')
@@ -150,9 +182,9 @@ def test_reused_environment_cannot_check_with_an_unrelated_interpreter(isolated,
 
 
 @pytest.mark.parametrize('target', ['environment', 'output'])
-def test_dirty_owned_directories_are_not_reused(isolated, target):
+def test_dirty_owned_directories_are_not_reused(isolated: PhaseModule, target: str) -> None:
     module = isolated
-    root = getattr(module, '_' + target.upper())
+    root = cast(Path, getattr(module, '_' + target.upper()))
     (root / 'stale').write_text('do not delete')
     with pytest.raises(module.PhaseError):
         module.run_phase('install' if target == 'environment' else 'build', import_module='sample')
@@ -160,21 +192,21 @@ def test_dirty_owned_directories_are_not_reused(isolated, target):
     module.subprocess.run.assert_not_called()
 
 
-def test_mount_alias_is_rejected_before_execution(isolated, monkeypatch):
+def test_mount_alias_is_rejected_before_execution(isolated: PhaseModule, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(isolated, '_ENVIRONMENT', isolated._OUTPUT)
     with pytest.raises(isolated.PhaseError):
         isolated.run_phase('install', import_module='sample')
     isolated.subprocess.run.assert_not_called()
 
 
-def test_owned_environment_is_required(isolated, monkeypatch):
+def test_owned_environment_is_required(isolated: PhaseModule, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(isolated.os, 'getuid', lambda: -1)
     with pytest.raises(isolated.PhaseError):
         isolated.run_phase('install', import_module='sample')
     isolated.subprocess.run.assert_not_called()
 
 
-def test_installer_failure_stops_phase_without_fallback(isolated):
+def test_installer_failure_stops_phase_without_fallback(isolated: PhaseModule) -> None:
     isolated.subprocess.run.side_effect = subprocess.CalledProcessError(1, ['private/path'])
     with pytest.raises(module_error := isolated.PhaseError) as caught:
         isolated.run_phase('install', import_module='sample')
@@ -183,15 +215,16 @@ def test_installer_failure_stops_phase_without_fallback(isolated):
     assert isolated.subprocess.run.call_count == 1
 
 
-def test_dependency_closure_failure_is_not_install_success(isolated):
+def test_dependency_closure_failure_is_not_install_success(isolated: PhaseModule) -> None:
     isolated.subprocess.run.side_effect = [None, None, subprocess.CalledProcessError(1, ['pip'])]
     with pytest.raises(isolated.PhaseError):
         isolated.run_phase('install', import_module='sample')
     assert isolated.subprocess.run.call_count == 3
 
 
-def fake_backend(module, monkeypatch, producer=None):
-    def build_wheel(directory):
+def fake_backend(module: PhaseModule, monkeypatch: pytest.MonkeyPatch,
+                 producer: Callable[[Path], str | None] | None = None) -> Mock:
+    def build_wheel(directory: str) -> str | None:
         assert Path.cwd() == module._OUTPUT / 'source'
         assert directory == str(module._OUTPUT / 'wheels')
         if producer:
@@ -205,7 +238,7 @@ def fake_backend(module, monkeypatch, producer=None):
     return loader
 
 
-def test_build_copies_snapshot_and_installs_only_validated_wheel(isolated, monkeypatch):
+def test_build_copies_snapshot_and_installs_only_validated_wheel(isolated: PhaseModule, monkeypatch: pytest.MonkeyPatch) -> None:
     module = isolated
     (module._WORKSPACE / 'sample.py').write_text('not executed')
     loader = fake_backend(module, monkeypatch)
@@ -217,6 +250,7 @@ def test_build_copies_snapshot_and_installs_only_validated_wheel(isolated, monke
     wheel = module._OUTPUT / 'wheels/sample-1-py3-none-any.whl'
     assert result['wheel'] == {'filename': wheel.name, 'sha256': hashlib.sha256(
         b'actual wheel').hexdigest(), 'size': 12}
+    assert module.subprocess.run.call_args is not None
     assert module.subprocess.run.call_args.args[0] == [
         str(module._ENVIRONMENT / 'bin/python'), '-I', '-B', '-m', 'pip', '--isolated',
         'install', '--no-index', '--no-deps', '--no-cache-dir', '--no-compile',
@@ -225,7 +259,7 @@ def test_build_copies_snapshot_and_installs_only_validated_wheel(isolated, monke
 
 
 @pytest.mark.parametrize('phase', ['build', 'test'])
-def test_build_and_test_require_environment_interpreter(isolated, monkeypatch, phase):
+def test_build_and_test_require_environment_interpreter(isolated: PhaseModule, monkeypatch: pytest.MonkeyPatch, phase: str) -> None:
     monkeypatch.setattr(isolated.sys, 'executable', '/runtime/bin/python3.12')
     loader = Mock(side_effect=AssertionError('backend must not import'))
     monkeypatch.setattr(isolated.importlib, 'import_module', loader)
@@ -236,8 +270,8 @@ def test_build_and_test_require_environment_interpreter(isolated, monkeypatch, p
 
 @pytest.mark.parametrize('returned', ['../escape.whl', '/escape.whl', 'x\\y.whl',
                                      'sample.tar.gz', '', None])
-def test_backend_cannot_select_arbitrary_artifact(isolated, monkeypatch, returned):
-    def produce(directory):
+def test_backend_cannot_select_arbitrary_artifact(isolated: PhaseModule, monkeypatch: pytest.MonkeyPatch, returned: str | None) -> None:
+    def produce(directory: Path) -> str | None:
         (directory / 'sample-1-py3-none-any.whl').write_bytes(b'wheel')
         return returned
     fake_backend(isolated, monkeypatch, produce)
@@ -247,8 +281,8 @@ def test_backend_cannot_select_arbitrary_artifact(isolated, monkeypatch, returne
 
 
 @pytest.mark.parametrize('artifact', ['extra', 'directory', 'hardlink', 'symlink'])
-def test_build_rejects_extra_or_aliased_wheel_outputs(isolated, monkeypatch, artifact):
-    def produce(directory):
+def test_build_rejects_extra_or_aliased_wheel_outputs(isolated: PhaseModule, monkeypatch: pytest.MonkeyPatch, artifact: str) -> None:
+    def produce(directory: Path) -> str:
         wheel = directory / 'sample-1-py3-none-any.whl'
         if artifact == 'directory':
             wheel.mkdir()
@@ -262,7 +296,7 @@ def test_build_rejects_extra_or_aliased_wheel_outputs(isolated, monkeypatch, art
                 wheel.unlink()
                 # Mock link metadata, since Windows symlink privileges vary.
                 original = Path.lstat
-                def lstat(path, *args, **kwargs):
+                def lstat(path: Path, *args: bool, **kwargs: bool) -> os.stat_result | SimpleNamespace:
                     if path == wheel:
                         return SimpleNamespace(st_mode=stat.S_IFLNK | 0o777, st_nlink=1)
                     return original(path, *args, **kwargs)
@@ -275,11 +309,11 @@ def test_build_rejects_extra_or_aliased_wheel_outputs(isolated, monkeypatch, art
     isolated.subprocess.run.assert_not_called()
 
 
-def test_source_symlink_is_rejected_instead_of_dereferenced(isolated, monkeypatch):
+def test_source_symlink_is_rejected_instead_of_dereferenced(isolated: PhaseModule, monkeypatch: pytest.MonkeyPatch) -> None:
     source = isolated._WORKSPACE / 'link.py'
     source.write_text('private content')
     original = Path.lstat
-    def lstat(path, *args, **kwargs):
+    def lstat(path: Path, *args: bool, **kwargs: bool) -> os.stat_result | SimpleNamespace:
         if path == source:
             return SimpleNamespace(st_mode=stat.S_IFLNK | 0o777, st_nlink=1)
         return original(path, *args, **kwargs)
@@ -291,10 +325,10 @@ def test_source_symlink_is_rejected_instead_of_dereferenced(isolated, monkeypatc
     assert not (isolated._OUTPUT / 'source/link.py').exists()
 
 
-def test_readonly_sealed_source_may_be_unlinked_memfd_but_wheel_outputs_may_not(isolated, monkeypatch):
+def test_readonly_sealed_source_may_be_unlinked_memfd_but_wheel_outputs_may_not(isolated: PhaseModule, monkeypatch: pytest.MonkeyPatch) -> None:
     path = isolated._WORKSPACE / 'requirements.lock'
     real_lstat = Path.lstat
-    def lstat(item, *args, **kwargs):
+    def lstat(item: Path, *args: bool, **kwargs: bool) -> os.stat_result | SimpleNamespace:
         if item == path:
             return SimpleNamespace(st_mode=stat.S_IFREG | 0o444, st_nlink=0)
         return real_lstat(item, *args, **kwargs)
@@ -303,7 +337,7 @@ def test_readonly_sealed_source_may_be_unlinked_memfd_but_wheel_outputs_may_not(
     with pytest.raises(isolated.PhaseError):
         isolated._regular(path)
     outside = isolated._WHEELHOUSE / 'unlinked.whl'
-    def unlinked(item, *args, **kwargs):
+    def unlinked(item: Path, *args: bool, **kwargs: bool) -> SimpleNamespace:
         return SimpleNamespace(st_mode=stat.S_IFREG | 0o444, st_nlink=0)
     monkeypatch.setattr(Path, 'lstat', unlinked)
     with pytest.raises(isolated.PhaseError):
@@ -312,9 +346,9 @@ def test_readonly_sealed_source_may_be_unlinked_memfd_but_wheel_outputs_may_not(
 
 @pytest.mark.parametrize('output', ['raw_fd', 'child_process'])
 @pytest.mark.parametrize('fail', [False, True])
-def test_backend_native_output_cannot_corrupt_final_json(isolated, monkeypatch, capfd, output, fail):
+def test_backend_native_output_cannot_corrupt_final_json(isolated: PhaseModule, monkeypatch: pytest.MonkeyPatch, capfd: pytest.CaptureFixture[str], output: str, fail: bool) -> None:
     marker = b'backend-native-progress\n'
-    def produce(directory):
+    def produce(directory: Path) -> str:
         if output == 'raw_fd':
             os.write(1, marker)
         else:
@@ -334,14 +368,14 @@ def test_backend_native_output_cannot_corrupt_final_json(isolated, monkeypatch, 
 
 
 @pytest.mark.parametrize('kind', ['hardlink', 'fifo'])
-def test_source_rejects_shared_files_and_special_nodes(isolated, monkeypatch, kind):
+def test_source_rejects_shared_files_and_special_nodes(isolated: PhaseModule, monkeypatch: pytest.MonkeyPatch, kind: str) -> None:
     source = isolated._WORKSPACE / 'shared'
     source.write_bytes(b'fixture')
     if kind == 'hardlink':
         os.link(source, isolated._WHEELHOUSE / 'alias')
     else:
         original = Path.lstat
-        def lstat(path, *args, **kwargs):
+        def lstat(path: Path, *args: bool, **kwargs: bool) -> os.stat_result | SimpleNamespace:
             if path == source:
                 return SimpleNamespace(st_mode=stat.S_IFIFO | 0o600, st_nlink=1)
             return original(path, *args, **kwargs)
@@ -352,7 +386,7 @@ def test_source_rejects_shared_files_and_special_nodes(isolated, monkeypatch, ki
     loader.assert_not_called()
 
 
-def test_backend_exception_restores_cwd_and_does_not_install(isolated, monkeypatch):
+def test_backend_exception_restores_cwd_and_does_not_install(isolated: PhaseModule, monkeypatch: pytest.MonkeyPatch) -> None:
     loader = fake_backend(isolated, monkeypatch)
     loader.return_value.build_wheel = Mock(side_effect=RuntimeError('private build details'))
     before = Path.cwd()
@@ -363,7 +397,8 @@ def test_backend_exception_restores_cwd_and_does_not_install(isolated, monkeypat
     isolated.subprocess.run.assert_not_called()
 
 
-def fake_tests(module, monkeypatch, *, count=2, success=True, origin=None):
+def fake_tests(module: PhaseModule, monkeypatch: pytest.MonkeyPatch, *, count: int = 2,
+               success: bool = True, origin: str | None = None) -> tuple[Mock, Mock, Mock]:
     site = module._OUTPUT / 'project-site'
     site.mkdir()
     (site / 'sample').mkdir()
@@ -380,7 +415,7 @@ def fake_tests(module, monkeypatch, *, count=2, success=True, origin=None):
     return loader, discovery, run
 
 
-def test_tests_use_original_readonly_snapshot_and_import_from_installed_site(isolated, monkeypatch):
+def test_tests_use_original_readonly_snapshot_and_import_from_installed_site(isolated: PhaseModule, monkeypatch: pytest.MonkeyPatch) -> None:
     module = isolated
     loader, discovery, run = fake_tests(module, monkeypatch)
     before = list(module.sys.path)
@@ -396,7 +431,7 @@ def test_tests_use_original_readonly_snapshot_and_import_from_installed_site(iso
 
 
 @pytest.mark.parametrize(('count', 'success'), [(0, True), (2, False)])
-def test_empty_or_failing_suite_is_a_failed_phase(isolated, monkeypatch, count, success):
+def test_empty_or_failing_suite_is_a_failed_phase(isolated: PhaseModule, monkeypatch: pytest.MonkeyPatch, count: int, success: bool) -> None:
     fake_tests(isolated, monkeypatch, count=count, success=success)
     with pytest.raises(isolated.PhaseError):
         isolated.run_phase('test', import_module='sample')
@@ -404,7 +439,7 @@ def test_empty_or_failing_suite_is_a_failed_phase(isolated, monkeypatch, count, 
 
 @pytest.mark.parametrize('origin', ['/workspace/sample.py', '/output/project-site-other/a.py',
                                    'built-in', None])
-def test_import_requires_actual_site_origin(isolated, monkeypatch, origin):
+def test_import_requires_actual_site_origin(isolated: PhaseModule, monkeypatch: pytest.MonkeyPatch, origin: str | None) -> None:
     loader, discovery, _ = fake_tests(isolated, monkeypatch)
     loader.return_value.__spec__.origin = origin
     with pytest.raises(isolated.PhaseError):
@@ -412,9 +447,9 @@ def test_import_requires_actual_site_origin(isolated, monkeypatch, origin):
     discovery.assert_not_called()
 
 
-def test_test_import_is_fresh_and_site_precedes_snapshot(isolated, monkeypatch):
+def test_test_import_is_fresh_and_site_precedes_snapshot(isolated: PhaseModule, monkeypatch: pytest.MonkeyPatch) -> None:
     loader, discovery, _ = fake_tests(isolated, monkeypatch)
-    def imported(name):
+    def imported(name: str) -> object:
         assert isolated.sys.path[0] == str(isolated._OUTPUT / 'project-site')
         return loader.return_value
     loader.side_effect = imported
@@ -422,7 +457,7 @@ def test_test_import_is_fresh_and_site_precedes_snapshot(isolated, monkeypatch):
     discovery.assert_called_once()
 
 
-def test_cached_selected_module_is_rejected_without_reusing_old_import(isolated, monkeypatch):
+def test_cached_selected_module_is_rejected_without_reusing_old_import(isolated: PhaseModule, monkeypatch: pytest.MonkeyPatch) -> None:
     loader, discovery, _ = fake_tests(isolated, monkeypatch)
     monkeypatch.setitem(isolated.sys.modules, 'sample', loader.return_value)
     with pytest.raises(isolated.PhaseError):
@@ -431,14 +466,14 @@ def test_cached_selected_module_is_rejected_without_reusing_old_import(isolated,
     discovery.assert_not_called()
 
 
-def test_skipped_execution_cannot_report_discovered_tests_as_run(isolated, monkeypatch):
+def test_skipped_execution_cannot_report_discovered_tests_as_run(isolated: PhaseModule, monkeypatch: pytest.MonkeyPatch) -> None:
     _, _, run = fake_tests(isolated, monkeypatch)
     run.return_value.testsRun = 0
     with pytest.raises(isolated.PhaseError):
         isolated.run_phase('test', import_module='sample')
 
 
-def test_entrypoint_failure_emits_only_sanitized_json(phase_module, monkeypatch, capsys):
+def test_entrypoint_failure_emits_only_sanitized_json(phase_module: PhaseModule, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
     module = phase_module
     monkeypatch.setattr(module.sys, 'platform', 'linux')
     monkeypatch.setenv('AGENT_HUB_PYTHON_PROJECT_ISOLATED', '1')
@@ -449,14 +484,14 @@ def test_entrypoint_failure_emits_only_sanitized_json(phase_module, monkeypatch,
     assert 'private' not in captured.out + captured.err
 
 
-def test_cli_install_success_reports_native_process_evidence(isolated, capsys):
+def test_cli_install_success_reports_native_process_evidence(isolated: PhaseModule, capsys: pytest.CaptureFixture[str]) -> None:
     assert isolated.main(['install', '--import-module', 'sample']) == 0
     report = json.loads(capsys.readouterr().out)
     assert report == {'status': 'completed', 'phase': 'install',
                       'evidence': 'native_process_only', 'requires_dist_check': 'completed'}
 
 
-def test_unisolated_cli_never_dispatches(phase_module, monkeypatch, capsys):
+def test_unisolated_cli_never_dispatches(phase_module: PhaseModule, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
     monkeypatch.setattr(phase_module.sys, 'platform', 'win32')
     dispatch = Mock(side_effect=AssertionError('must not run'))
     monkeypatch.setattr(phase_module, 'run_phase', dispatch)
@@ -465,8 +500,8 @@ def test_unisolated_cli_never_dispatches(phase_module, monkeypatch, capsys):
     dispatch.assert_not_called()
 
 
-def test_backend_stdout_does_not_corrupt_json_report(isolated, monkeypatch, capsys):
-    def produce(directory):
+def test_backend_stdout_does_not_corrupt_json_report(isolated: PhaseModule, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    def produce(directory: Path) -> str:
         print('backend progress')
         (directory / 'sample-1-py3-none-any.whl').write_bytes(b'wheel')
         return 'sample-1-py3-none-any.whl'
@@ -477,9 +512,9 @@ def test_backend_stdout_does_not_corrupt_json_report(isolated, monkeypatch, caps
     assert 'backend progress' in captured.err
 
 
-def test_source_open_rejects_changed_file_identity(isolated, monkeypatch):
+def test_source_open_rejects_changed_file_identity(isolated: PhaseModule, monkeypatch: pytest.MonkeyPatch) -> None:
     original = isolated.os.fstat
-    def fstat(descriptor):
+    def fstat(descriptor: int) -> SimpleNamespace:
         info = original(descriptor)
         return SimpleNamespace(st_dev=info.st_dev, st_ino=info.st_ino + 1,
                                st_mode=info.st_mode, st_nlink=info.st_nlink,
@@ -497,7 +532,7 @@ def test_source_open_rejects_changed_file_identity(isolated, monkeypatch):
     ['test', '--import-module', 'sample', '--cwd', '/host'],
     ['install', '--import-module', 'sample', '--command', 'id'],
 ])
-def test_cli_rejects_extra_controls_without_running(phase_module, monkeypatch, capsys, args):
+def test_cli_rejects_extra_controls_without_running(phase_module: PhaseModule, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], args: list[str]) -> None:
     module = phase_module
     monkeypatch.setattr(module.sys, 'platform', 'linux')
     monkeypatch.setenv('AGENT_HUB_PYTHON_PROJECT_ISOLATED', '1')

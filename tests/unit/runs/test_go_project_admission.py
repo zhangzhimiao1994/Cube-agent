@@ -6,6 +6,7 @@ import hashlib
 import importlib
 import importlib.util
 import json
+from collections.abc import Awaitable, Callable
 from copy import deepcopy
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -29,6 +30,7 @@ from tests.unit.capabilities.test_toolchain_preparation import case as case  # n
 from tests.unit.capabilities.test_toolchain_preparation import state_for
 from tests.unit.runs.test_toolchain_authorization_fence import ApprovalDB
 from tests.unit.runs.test_toolchain_authorization_fence import Session as ApprovalSession
+from tests.unit.runs.test_toolchain_supply_repository import object_dict
 
 
 class Repository(RunRepository):
@@ -39,6 +41,10 @@ class Repository(RunRepository):
 
 
 class Session(ApprovalSession):
+    def __init__(self, db: GoDB) -> None:
+        super().__init__(db)
+        self.db: GoDB = db
+
     async def scalars(self, statement: Any) -> Any:
         if statement._for_update_arg is not None:
             self.db.locks.append('approval')
@@ -77,12 +83,13 @@ class GoDB(ApprovalDB):
     def __init__(self, case: Any, inputs: Any) -> None:
         super().__init__(case)
         self.inputs = inputs
-        self.row.routing_decision['toolchain_supply'] = state_for(case, 'supplied')
+        self.route['toolchain_supply'] = state_for(case, 'supplied')
         self.repository = Repository(cast(Any, lambda: Session(self)))
         self.fail_write = False
-        self.during_approval_lock: Any = None
+        self.during_approval_lock: Callable[[Session], None] | None = None
 
     def current_authority(self) -> ToolchainSupplyAuthority:
+        assert self.row.worker_id is not None
         return ToolchainSupplyAuthority.from_context(self.context(), worker_id=self.row.worker_id)
 
 
@@ -151,9 +158,9 @@ def test_go_recipe_has_its_own_approval_scope(db: GoDB) -> None:
 async def test_bind_preserves_capture_and_stores_only_compact_recipe(db: GoDB, api: Any) -> None:
     before = deepcopy(db.row.routing_decision)
     await bind(db)
-    route = db.row.routing_decision
+    route = db.route
     assert {key: value for key, value in route.items() if key != 'go_project_recipe'} == before
-    marker = route['go_project_recipe']
+    marker = object_dict(route['go_project_recipe'])
     assert set(marker) == {'schema_version', 'binding', 'toolchain', 'supply_plan_sha256',
                            'source_limit_bytes', 'file_limit'}
     assert 'source_files' not in str(marker) and 'main_test.go' not in str(marker)
@@ -167,18 +174,21 @@ async def test_bind_preserves_capture_and_stores_only_compact_recipe(db: GoDB, a
 
 @pytest.mark.parametrize('defect', ['sdk', 'not_supplied', 'bool_schema', 'generated', 'python', 'capture'])
 async def test_binding_requires_real_persisted_supply_and_original_capture(db: GoDB, defect: str) -> None:
-    route = db.row.routing_decision
+    route = db.route
     if defect == 'sdk':
         db.inputs = replace(db.inputs,
             toolchain=db.inputs.toolchain.model_copy(update={'tree_sha256': '0' * 64}))
     elif defect == 'not_supplied':
         route['toolchain_supply'] = state_for(db.case)
     elif defect == 'bool_schema':
-        route['project_input_preparation']['schema_version'] = True
+        object_dict(route['project_input_preparation'])['schema_version'] = True
     elif defect in {'generated', 'python'}:
         route['generated_project_preparation' if defect == 'generated' else 'python_input_supply'] = None
     else:
-        route['project_input_preparation']['reference']['file_count'] += 1
+        reference = object_dict(object_dict(route['project_input_preparation'])['reference'])
+        count = reference['file_count']
+        assert isinstance(count, int)
+        reference['file_count'] = count + 1
     before = snapshot(db)
     with pytest.raises((RunConflict, ValueError)):
         await bind(db)
@@ -218,9 +228,9 @@ async def test_original_reservation_commits_once_and_retry_returns_metadata(db: 
     first = await db.repository.reserve_go_project_execution(db.row.tenant_id, db.row.id,
         authority=db.current_authority(), invocation=invocation(db))
     assert first.disposition == 'created' and db.row.version == version + 1
-    assert first.state == db.row.routing_decision['go_project_execution']
+    assert first.state == db.route['go_project_execution']
     assert first.state['source_sha256'] == db.inputs.scope.source_sha256
-    assert {k: v for k, v in db.row.routing_decision.items() if k != 'go_project_execution'} == before
+    assert {k: v for k, v in db.route.items() if k != 'go_project_execution'} == before
     again = await db.repository.reserve_go_project_execution(db.row.tenant_id, db.row.id,
         authority=db.current_authority(), invocation=invocation(db))
     assert again.disposition == 'existing' and again.state == first.state
@@ -248,8 +258,10 @@ async def test_reservation_rejects_candidate_changed_limits_or_retry(db: GoDB, a
 async def test_generic_grant_getters_cannot_bypass_private_admission(db: GoDB, api: Any, getter: str) -> None:
     request = await seed_grant(db, api)
     if getter == 'scope':
+        scope = capability_approval_scope(request)
+        assert scope is not None
         approved = await db.repository.is_capability_approval_scope_approved(
-            db.row.tenant_id, db.row.id, capability_approval_scope(request))
+            db.row.tenant_id, db.row.id, scope)
     else:
         approved = await db.repository.is_capability_approval_approved(
             db.row.tenant_id, db.row.id, fingerprint_capability_request(request))
@@ -261,20 +273,24 @@ async def test_generic_grant_getters_cannot_bypass_private_admission(db: GoDB, a
 @pytest.mark.parametrize('defect', ['marker_schema', 'binding_schema', 'sdk_count', 'scope', 'binding', 'supply'])
 async def test_canonical_types_and_exact_binding_cannot_reuse_old_grant(db: GoDB, api: Any, defect: str) -> None:
     request = await seed_grant(db, api)
-    route = db.row.routing_decision
-    marker = route['go_project_recipe']
+    route = db.route
+    marker = object_dict(route['go_project_recipe'])
     if defect == 'marker_schema':
         marker['schema_version'] = True
     elif defect == 'binding_schema':
-        marker['binding']['schema_version'] = True
+        object_dict(marker['binding'])['schema_version'] = True
     elif defect == 'sdk_count':
-        marker['toolchain']['file_count'] = True
+        object_dict(marker['toolchain'])['file_count'] = True
     elif defect == 'scope':
-        db.approvals[0].payload['approval_scope'] += '/nested'
+        scope = db.approvals[0].payload['approval_scope']
+        assert isinstance(scope, str)
+        db.approvals[0].payload['approval_scope'] = scope + '/nested'
     elif defect == 'binding':
-        db.approvals[0].payload['go_recipe_binding']['binding']['schema_version'] = True
+        binding = object_dict(db.approvals[0].payload['go_recipe_binding'])
+        object_dict(binding['binding'])['schema_version'] = True
     else:
-        route['toolchain_supply']['receipt']['environment']['tree_sha256'] = '0' * 64
+        receipt = object_dict(object_dict(route['toolchain_supply'])['receipt'])
+        object_dict(receipt['environment'])['tree_sha256'] = '0' * 64
     before = snapshot(db)
     with pytest.raises((RunConflict, ValueError)):
         await db.repository.require_go_project_recipe_approval(db.row.tenant_id, db.row.id,
@@ -300,24 +316,27 @@ async def test_manual_approval_revalidates_without_old_worker_lease(
     await pending(db, api)
     assert db.row.worker_lease_token is None
     if defect == 'binding':
-        db.approvals[0].payload['go_recipe_binding']['binding']['recipe_sha256'] = '0' * 64
+        binding = object_dict(db.approvals[0].payload['go_recipe_binding'])
+        object_dict(binding['binding'])['recipe_sha256'] = '0' * 64
     elif defect == 'disabled':
         db.user.disabled = True
     elif defect == 'role':
         db.user.role = 'admin'
     elif defect == 'already_reserved':
-        db.row.routing_decision['go_project_execution'] = {'approved': True}
+        db.route['go_project_execution'] = {'approved': True}
     elif defect == 'scope_removed':
-        db.row.routing_decision.pop('approval_scope')
+        db.route.pop('approval_scope')
     before = snapshot(db)
 
     async def resolve() -> Any:
         if manual == 'enqueue':
             return await db.repository.approve_capability_and_enqueue(tenant_id=db.row.tenant_id,
                 run_id=db.row.id, actor_id=db.row.actor_id, approval_id='approval_go_recipe', version=db.row.version)
+        fingerprint = db.approvals[0].payload['approval_fingerprint']
+        assert isinstance(fingerprint, str)
         return await db.repository.resolve_capability_approval(db.row.tenant_id, db.row.id,
             RunStatus.RUNNING, approval_id='approval_go_recipe',
-            approval_fingerprint=db.approvals[0].payload['approval_fingerprint'])
+            approval_fingerprint=fingerprint)
 
     if defect != 'none':
         with pytest.raises(RunConflict):
@@ -335,12 +354,12 @@ async def test_manual_approval_revalidates_without_old_worker_lease(
 
 async def test_go_manual_reject_keeps_capture_and_never_grants(db: GoDB, api: Any) -> None:
     await pending(db, api)
-    capture = deepcopy(db.row.routing_decision['project_input_preparation'])
+    capture = deepcopy(db.route['project_input_preparation'])
     await db.repository.reject_capability_approval(tenant_id=db.row.tenant_id, run_id=db.row.id,
         actor_id=db.row.actor_id, approval_id='approval_go_recipe', version=db.row.version)
     assert db.approvals[0].status == 'rejected'
-    assert db.row.routing_decision['project_input_preparation'] == capture
-    assert 'go_project_execution' not in db.row.routing_decision
+    assert db.route['project_input_preparation'] == capture
+    assert 'go_project_execution' not in db.route
 
 
 async def test_public_go_approval_evidence_is_compact_and_precise(db: GoDB, api: Any) -> None:
@@ -354,7 +373,7 @@ async def test_public_go_approval_evidence_is_compact_and_precise(db: GoDB, api:
 
 @pytest.mark.parametrize('marker', [None, True, {}])
 async def test_binding_does_not_replace_malformed_existing_marker(db: GoDB, marker: Any) -> None:
-    db.row.routing_decision['go_project_recipe'] = marker
+    db.route['go_project_recipe'] = marker
     before = snapshot(db)
     with pytest.raises(RunConflict):
         await bind(db)
@@ -376,7 +395,7 @@ async def test_non_grant_resolution_survives_current_user_changes(db: GoDB, api:
     db.user.disabled = change == 'disabled'
     if change == 'role':
         db.user.role = 'admin'
-    capture = deepcopy(db.row.routing_decision['project_input_preparation'])
+    capture = deepcopy(db.route['project_input_preparation'])
     if action == 'reject':
         await db.repository.reject_capability_approval(tenant_id=db.row.tenant_id, run_id=db.row.id,
             actor_id=db.row.actor_id, approval_id='approval_go_recipe', version=db.row.version)
@@ -384,15 +403,16 @@ async def test_non_grant_resolution_survives_current_user_changes(db: GoDB, api:
         await db.repository.resolve_capability_approval(db.row.tenant_id, db.row.id, RunStatus.CANCELLED,
             approval_id='approval_go_recipe', approval_fingerprint=fingerprint_capability_request(request))
     assert db.row.status == 'cancelled' and db.approvals[0].status == 'rejected'
-    assert db.row.routing_decision['project_input_preparation'] == capture
-    assert 'go_project_execution' not in db.row.routing_decision
+    assert db.route['project_input_preparation'] == capture
+    assert 'go_project_execution' not in db.route
 
 
 @pytest.mark.parametrize('action', ['reject', 'cancel'])
 async def test_non_grant_resolution_still_requires_exact_pending_binding(db: GoDB, api: Any, action: str) -> None:
     request = await pending(db, api)
     db.user.disabled = True
-    db.approvals[0].payload['go_recipe_binding']['binding']['schema_version'] = True
+    binding = object_dict(db.approvals[0].payload['go_recipe_binding'])
+    object_dict(binding['binding'])['schema_version'] = True
     before = snapshot(db)
     with pytest.raises(RunConflict):
         if action == 'reject':
@@ -431,15 +451,17 @@ async def test_reservation_lease_digest_is_private_and_heartbeat_stable(db: GoDB
     version = db.row.version
     first = await db.repository.reserve_go_project_execution(db.row.tenant_id, db.row.id,
         authority=authority, invocation=invocation(db))
+    assert db.row.mode is not None
     binding = {'schema_version': 1, 'kind': 'go_project_execution_lease_v1',
         'tenant_id': str(db.row.tenant_id), 'run_id': str(db.row.id), 'user_id': str(db.row.actor_id),
         'actor_role': 'operator', 'worker_id': db.row.worker_id, 'lease_token': str(authority.lease_token),
         'mode': TaskMode(db.row.mode).value,
         'request_sha256': hashlib.sha256(api.encoded(db.row.request)).hexdigest(),
-        'capture_sha256': hashlib.sha256(api.encoded(db.row.routing_decision['project_input_preparation'])).hexdigest()}
+        'capture_sha256': hashlib.sha256(api.encoded(db.route['project_input_preparation'])).hexdigest()}
     assert first.state['lease_binding_sha256'] == hashlib.sha256(api.encoded(binding)).hexdigest()
     assert set(first.state) == {'schema_version', 'phase', 'source_kind', 'execution_id', 'recipe_sha256',
                                'environment_input_sha256', 'source_sha256', 'invocation_sha256', 'lease_binding_sha256'}
+    assert db.row.worker_lease_expires_at is not None
     db.row.worker_lease_expires_at += timedelta(minutes=5)
     db.row.worker_heartbeat_at = datetime.now(UTC)
     again = await db.repository.reserve_go_project_execution(db.row.tenant_id, db.row.id,
@@ -454,7 +476,7 @@ async def test_unbound_legacy_intent_cannot_be_adopted(db: GoDB, api: Any) -> No
     await seed_grant(db, api)
     await db.repository.reserve_go_project_execution(db.row.tenant_id, db.row.id,
         authority=db.current_authority(), invocation=invocation(db))
-    db.row.routing_decision['go_project_execution'].pop('lease_binding_sha256', None)
+    object_dict(db.route['go_project_execution']).pop('lease_binding_sha256', None)
     before = snapshot(db)
     with pytest.raises(RunConflict):
         await db.repository.reserve_go_project_execution(db.row.tenant_id, db.row.id,
@@ -484,6 +506,7 @@ async def test_same_token_mode_change_cannot_adopt_existing_intent(db: GoDB, api
     token = db.row.worker_lease_token
     first = await db.repository.reserve_go_project_execution(db.row.tenant_id, db.row.id,
         authority=db.current_authority(), invocation=original)
+    assert db.row.mode is not None
     db.row.mode = TaskMode(db.row.mode)
     normalized = await db.repository.reserve_go_project_execution(db.row.tenant_id, db.row.id,
         authority=db.current_authority(), invocation=original)
@@ -511,14 +534,16 @@ async def test_require_execution_is_locked_readonly_and_heartbeat_stable(
     request = await seed_execution(db, api)
     authority = db.current_authority()
     if heartbeat:
+        assert db.row.worker_lease_expires_at is not None
         db.row.worker_lease_expires_at += timedelta(minutes=5)
         db.row.worker_heartbeat_at = datetime.now(UTC)
     before = snapshot(db)
     db.locks.clear()
     db.reads = 0
     db.fail_write = True
-    assert await db.repository.require_go_project_execution(db.row.tenant_id, db.row.id,
-        authority=authority, inputs=db.inputs, invocation=request) is None
+    assert await cast(Awaitable[object], db.repository.require_go_project_execution(
+        db.row.tenant_id, db.row.id,
+        authority=authority, inputs=db.inputs, invocation=request)) is None
     assert db.locks == ['run', 'user', 'approval'] and db.reads == 0
     assert snapshot(db) == before
 
@@ -529,7 +554,7 @@ async def test_require_execution_does_not_create_missing_intent(db: GoDB, api: A
     with pytest.raises(RunConflict, match='go_project_recipe_changed'):
         await db.repository.require_go_project_execution(db.row.tenant_id, db.row.id,
             authority=db.current_authority(), inputs=db.inputs, invocation=invocation(db))
-    assert snapshot(db) == before and 'go_project_execution' not in db.row.routing_decision
+    assert snapshot(db) == before and 'go_project_execution' not in db.route
 
 
 @pytest.mark.parametrize('defect', [
@@ -567,13 +592,16 @@ async def test_require_execution_rejects_changed_live_binding_without_mutation(
     elif defect == 'invocation':
         request = invocation(db, timeout_seconds=301)
     elif defect == 'capture':
-        db.row.routing_decision['project_input_preparation']['reference']['file_count'] += 1
+        reference = object_dict(object_dict(db.route['project_input_preparation'])['reference'])
+        count = reference['file_count']
+        assert isinstance(count, int)
+        reference['file_count'] = count + 1
     elif defect == 'marker':
-        db.row.routing_decision['go_project_recipe']['binding']['recipe_sha256'] = '0' * 64
+        object_dict(object_dict(db.route['go_project_recipe'])['binding'])['recipe_sha256'] = '0' * 64
     elif defect == 'legacy_intent':
-        db.row.routing_decision['go_project_execution'].pop('lease_binding_sha256')
+        object_dict(db.route['go_project_execution']).pop('lease_binding_sha256')
     elif defect == 'intent':
-        db.row.routing_decision['go_project_execution']['schema_version'] = True
+        object_dict(db.route['go_project_execution'])['schema_version'] = True
     else:
         payload = request.model_dump(mode='json')
         payload['scope']['source_sha256'] = 'f' * 64
@@ -621,9 +649,9 @@ async def test_require_execution_rejects_rebound_marker_even_with_matching_grant
     db.inputs = replace(db.inputs, file_limit=db.inputs.file_limit + 1)
     request = invocation(db)
     marker = api.go_recipe_marker(db.inputs,
-        supply_plan_sha256=db.row.routing_decision['toolchain_supply']['plan_sha256'])
-    db.row.routing_decision['go_project_recipe'] = marker
-    db.row.routing_decision['go_project_execution'] = api.go_reservation_state(db.row, request)
+        supply_plan_sha256=object_dict(db.route['toolchain_supply'])['plan_sha256'])
+    db.route['go_project_recipe'] = marker
+    db.route['go_project_execution'] = api.go_reservation_state(db.row, request)
     db.approvals[0].payload = {**db.approvals[0].payload,
         'approval_scope': capability_approval_scope(api.go_recipe_binding(db.row)),
         'go_recipe_binding': deepcopy(marker)}

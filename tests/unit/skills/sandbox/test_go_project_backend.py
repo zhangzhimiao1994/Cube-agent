@@ -72,8 +72,8 @@ def prepared(tmp_path: Path, request: pytest.FixtureRequest) -> Any:
         source_limit_bytes=inputs.source_limit_bytes, file_limit=inputs.file_limit,
         output_limit_bytes=2 * 1024**2)
     policy = replace(BrokerPolicy(), toolchain_runtime_root=Path(catalog.stage_root))
-    request = GoProjectRequest(action='run_go_project', invocation=inv)
-    return SimpleNamespace(fixture=fixture, inputs=inputs, invocation=inv, request=request,
+    broker_request = GoProjectRequest(action='run_go_project', invocation=inv)
+    return SimpleNamespace(fixture=fixture, inputs=inputs, invocation=inv, request=broker_request,
         catalog=catalog, artifact=artifact, policy=policy,
         stage=Path(catalog.stage_root) / 'one')
 

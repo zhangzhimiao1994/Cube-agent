@@ -1,11 +1,15 @@
 """Only fresh generated Discuss executions opt into writer scheduling changes."""
 
+from collections.abc import AsyncIterator
+from typing import cast
+
 import pytest
 
 from agent_hub.domain.runs import RunStatus, TaskMode
-from agent_hub.runs.service import RunService
+from agent_hub.runs.repository import RunRepository
+from agent_hub.runs.service import RunService, TaskQueue
 from agent_hub.runtime.autogen.adapter import _AutoGenCleanupIncomplete
-from agent_hub.runtime.contracts import RunEvent
+from agent_hub.runtime.contracts import RunEvent, TaskContext
 from agent_hub.runtime.registry import RuntimeRegistry
 from tests.unit.runs.test_terminal_hooks import ContextRecordingRuntime, ExecutableFakeRepository
 
@@ -14,16 +18,19 @@ from tests.unit.runs.test_terminal_hooks import ContextRecordingRuntime, Executa
     (TaskMode.DISCUSS, 1, True), (TaskMode.DISCUSS, True, False),
     (TaskMode.DISCUSS, None, False), (TaskMode.DISPATCH, 1, False),
 ])
-async def test_fresh_generated_discuss_pins_continuation_without_changing_other_modes(mode, generated, expected):
-    route = {"source": "manual"}
+async def test_fresh_generated_discuss_pins_continuation_without_changing_other_modes(
+    mode: TaskMode, generated: int | None, expected: bool,
+) -> None:
+    route: dict[str, object] = {"source": "manual"}
     if generated is not None:
         route["generated_project_contract_version"] = generated
     repository = ExecutableFakeRepository(routing_decision=route)
     repository.row.mode = mode.value
     runtime = ContextRecordingRuntime()
     runtime.mode = mode
-    service = RunService(repository, runtime_registry=RuntimeRegistry((runtime,)),
-                         router=None, task_queue=object())
+    service = RunService(cast(RunRepository, repository),
+                         runtime_registry=RuntimeRegistry((runtime,)),
+                         router=None, task_queue=cast(TaskQueue, object()))
     submitted = await service.execute(repository.run_id)
     assert submitted.status is RunStatus.COMPLETED
     assert len(runtime.contexts) == 1
@@ -32,22 +39,25 @@ async def test_fresh_generated_discuss_pins_continuation_without_changing_other_
     # All fresh Discuss engineering calls now need ACK before a correction can
     # enter the provider; writer-continuation remains generated-project only.
     assert (actual.get("engineering_checkpoint_ack_version") == 1) is (mode is TaskMode.DISCUSS)
+    assert (actual.get("engineering_progress_budget_version") == 1) is (mode is TaskMode.DISCUSS)
+    assert repository.row.routing_decision is not None
     assert (repository.row.routing_decision.get("engineering_writer_continuation_version") == 1) is expected
 
 
-async def test_incomplete_discussion_cleanup_preserves_worker_execution_fence():
+async def test_incomplete_discussion_cleanup_preserves_worker_execution_fence() -> None:
     class FailedCleanupRuntime(ContextRecordingRuntime):
         mode = TaskMode.DISCUSS
 
-        async def run(self, context):
+        async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
             yield RunEvent(kind="runtime.cleanup_probe", sequence=1, run_id=context.run_id,
                            payload={"phase": "cleanup"})
             raise _AutoGenCleanupIncomplete("AutoGen runtime cleanup incomplete")
 
     repository = ExecutableFakeRepository(routing_decision={"source": "manual"})
     repository.row.mode = TaskMode.DISCUSS.value
-    service = RunService(repository, runtime_registry=RuntimeRegistry((FailedCleanupRuntime(),)),
-                         router=None, task_queue=object())
+    service = RunService(cast(RunRepository, repository),
+                         runtime_registry=RuntimeRegistry((FailedCleanupRuntime(),)),
+                         router=None, task_queue=cast(TaskQueue, object()))
     submitted = await service.execute(repository.run_id)
     assert submitted.status is RunStatus.FAILED
     assert repository.row.worker_id is not None
