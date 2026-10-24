@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import cast
+from uuid import uuid4
 
 import pytest
 
@@ -11,12 +12,21 @@ from agent_hub.models.capacity import (
     CapacityUnavailable,
     CapacityWaitTimeout,
 )
-from agent_hub.models.gateway import ModelGatewayError
+from agent_hub.models.gateway import (
+    GatewayNegotiatedRejectedOutput,
+    GatewayRejectedOutput,
+    GatewayResponseCancelled,
+    ModelGatewayError,
+)
 from agent_hub.models.litellm_client import ModelResponseError, ModelTransportError
 from agent_hub.models.registry import NoCapableDeployment
+from agent_hub.models.types import RejectedOutputEvidence, TokenUsage
+from agent_hub.runtime.contracts import EventKind, RunEvent
 from agent_hub.runtime.failure_reason import (
+    MAX_FAILURE_REASON_LENGTH,
     ORCHESTRATION_CHECKPOINT_FAILURE_REASON,
     runtime_failure_diagnostic_from_reason,
+    safe_model_gateway_failure_reason,
     safe_runtime_failure_diagnostic,
     safe_runtime_failure_reason,
 )
@@ -605,3 +615,124 @@ def test_arbitrary_incomplete_response_text_does_not_authorize_recovery() -> Non
     assert diagnostic["error_code"] == "runtime.failed"
     assert diagnostic["retryable"] is False
     assert "compression_trigger" not in diagnostic
+
+
+def _rejected_gateway_error(
+    evidence: RejectedOutputEvidence | None,
+    error_type: type[GatewayRejectedOutput] = GatewayRejectedOutput,
+) -> GatewayRejectedOutput:
+    error = error_type(evidence=evidence, deployment_id="PRIVATE_DEPLOYMENT",
+                       logical_model="PRIVATE_LOGICAL_MODEL", provider_id="PRIVATE_PROVIDER",
+                       provider_model="PRIVATE_PROVIDER_MODEL")
+    error.args = ((
+        'GatewayRejectedOutput model response rejected\n'
+        'Traceback (most recent call last):\n  File "PRIVATE_PATH", line 1\n'
+        'PRIVATE_RAW_EXCEPTION'
+    ),)
+    return error
+
+
+@pytest.mark.parametrize("reason,status,usage_status", [
+    ("output_limit", "incomplete", "known"),
+    ("schema_mismatch", "completed", "known"),
+    ("invalid_tool", "completed", "missing"),
+    ("usage_invalid", "unknown", "invalid"),
+    ("refusal", "refused", "missing"),
+])
+def test_typed_gateway_rejection_projects_only_finite_evidence(
+    reason: str, status: str, usage_status: str,
+) -> None:
+    evidence = RejectedOutputEvidence(
+        final_text="UNPUBLISHED_FINAL_TEXT" if status == "completed" else None,
+        usage=TokenUsage(1, 2, 3) if usage_status == "known" else None,
+        usage_status=usage_status, status=status, reason=reason,  # type: ignore[arg-type]
+    )
+    error = _rejected_gateway_error(evidence)
+    expected = ("model gateway failed: model response rejected "
+                f"(reason={reason}; status={status}; usage_status={usage_status})")
+    assert safe_model_gateway_failure_reason(error) == expected
+    assert safe_runtime_failure_reason(error) == expected
+    assert len(expected) <= MAX_FAILURE_REASON_LENGTH
+    diagnostic = safe_runtime_failure_diagnostic(error)
+    assert diagnostic["error_code"] == "model.response_rejected"
+    assert diagnostic["error_stage"] == "model_response"
+    assert diagnostic["retryable"] is False
+    assert diagnostic["error_summary"] == expected
+    assert runtime_failure_diagnostic_from_reason(expected) == diagnostic
+    event = RunEvent(kind=EventKind.RUNTIME_FAILED, sequence=1, run_id=uuid4(),
+                     reason=expected, payload=diagnostic)
+    assert event.payload["retryable"] is False
+    assert "compression_trigger" not in diagnostic
+    for private in ("UNPUBLISHED_FINAL_TEXT", "PRIVATE_", "Traceback", "24576"):
+        assert private not in expected + str(diagnostic)
+
+
+@pytest.mark.parametrize("defect", ["absent", "duck_type", "subclass", "reason", "status", "usage_status"])
+def test_rejected_diagnostic_requires_exact_finite_evidence(defect: str) -> None:
+    evidence = RejectedOutputEvidence(final_text=None, usage=None, usage_status="missing",
+                                      status="unknown", reason="invalid_output")
+    if defect == "absent":
+        invalid: object = None
+    elif defect == "duck_type":
+        from types import SimpleNamespace
+        invalid = SimpleNamespace(reason="output_limit", status="incomplete", usage_status="known")
+    elif defect == "subclass":
+        class DerivedEvidence(RejectedOutputEvidence):
+            pass
+        invalid = DerivedEvidence(final_text=None, usage=None, usage_status="missing",
+                                  status="unknown", reason="invalid_output")
+    else:
+        object.__setattr__(evidence, defect, "PRIVATE_UNTRUSTED_FIELD")
+        invalid = evidence
+    error = _rejected_gateway_error(cast(RejectedOutputEvidence | None, invalid))
+    expected = "model gateway failed: model response rejected"
+    assert safe_model_gateway_failure_reason(error) == expected
+    diagnostic = safe_runtime_failure_diagnostic(error)
+    assert diagnostic["error_summary"] == expected
+    assert diagnostic["error_code"] == "model.response_rejected"
+    assert diagnostic["retryable"] is False
+    assert not any(key.startswith("rejected_") for key in diagnostic)
+    assert "PRIVATE_" not in str(diagnostic)
+
+
+def test_negotiated_rejection_retains_stop_boundary_and_safe_evidence() -> None:
+    evidence = RejectedOutputEvidence(final_text=None, usage=TokenUsage(1, 2, 3),
+        usage_status="known", status="incomplete", reason="output_limit")
+    error = _rejected_gateway_error(evidence, GatewayNegotiatedRejectedOutput)
+    expected = "model gateway failed: model parameter negotiation exhausted"
+    assert safe_model_gateway_failure_reason(error) == expected
+    assert safe_runtime_failure_reason(error) == expected
+    diagnostic = safe_runtime_failure_diagnostic(error)
+    assert diagnostic["error_code"] == "model.request_negotiation_exhausted"
+    assert diagnostic["retryable"] is False
+    assert "reason=output_limit" in str(diagnostic["error_summary"])
+    assert "status=incomplete" in str(diagnostic["error_summary"])
+    assert "usage_status=known" in str(diagnostic["error_summary"])
+    event = RunEvent(kind=EventKind.RUNTIME_FAILED, sequence=1, run_id=uuid4(),
+                     reason=expected, payload=diagnostic)
+    assert event.payload["error_code"] == "model.request_negotiation_exhausted"
+    assert "PRIVATE_" not in str(diagnostic)
+    assert runtime_failure_diagnostic_from_reason(expected)["retryable"] is False
+
+
+def test_rejected_cancellation_is_not_unwrapped_into_a_model_failure() -> None:
+    error = GatewayResponseCancelled(receipt=_rejected_gateway_error(None))
+    assert not isinstance(error, Exception)
+    assert safe_model_gateway_failure_reason(error) is None  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("wrapper", [RuntimeError, ModelGatewayError])
+def test_untyped_framework_traceback_is_redacted_without_inventing_rejection(
+    wrapper: type[Exception],
+) -> None:
+    error = wrapper('GatewayRejectedOutput model response rejected\n'
+                    'Traceback (most recent call last):\n  File "LOCAL_PATH", line 2\n'
+                    'UNPUBLISHED_MODEL_TEXT')
+    error.__cause__ = _rejected_gateway_error(None)
+    assert safe_model_gateway_failure_reason(error) is None
+    assert safe_runtime_failure_reason(error, fallback="framework_failed") == "framework_failed"
+    diagnostic = safe_runtime_failure_diagnostic(error)
+    assert diagnostic["error_summary"] == "runtime_failed"
+    assert diagnostic["error_code"] == "runtime.failed"
+    assert "Traceback" not in str(diagnostic)
+    assert "LOCAL_PATH" not in str(diagnostic)

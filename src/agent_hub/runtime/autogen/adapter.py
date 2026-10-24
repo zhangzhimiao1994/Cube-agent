@@ -62,7 +62,7 @@ from agent_hub.domain.runs import TaskMode
 from agent_hub.harness import HarnessToolGateway
 from agent_hub.harness.events import safe_tool_event_payload
 from agent_hub.harness.types import HarnessToolCallRequest, HarnessToolCallResult
-from agent_hub.models.gateway import GatewayCompletion
+from agent_hub.models.gateway import GatewayCompletion, GatewayRejectedOutput
 from agent_hub.models.types import (
     ModelCapability,
     ModelMessage,
@@ -105,6 +105,7 @@ from agent_hub.runtime.autogen.engineering_delivery import (
     engineering_evidence_limits,
     engineering_progress,
 )
+from agent_hub.runtime.autogen.model_rejection import rejection_record, validate_rejection
 from agent_hub.runtime.autogen.termination import CompositeDiscussionTermination, DiscussionUsage
 from agent_hub.runtime.contracts import (
     Artifact,
@@ -379,6 +380,7 @@ class _DiscussionDurability:
         finalize: _ArtifactFinalizer,
         *,
         run_id: UUID,
+        tenant_id: UUID | None = None,
         model_entries: tuple[_LedgerEntry, ...] = (),
         tool_entries: tuple[_LedgerEntry, ...] = (),
         artifacts: tuple[Artifact, ...] = (),
@@ -389,6 +391,7 @@ class _DiscussionDurability:
         self._abort = abort
         self._finalize = finalize
         self._context_run_id = run_id
+        self._context_tenant_id = tenant_id
         self.model_entries = [dict(entry) for entry in model_entries]
         self.tool_entries = [dict(entry) for entry in tool_entries]
         self._artifacts = {str(artifact.id): artifact for artifact in artifacts}
@@ -543,6 +546,38 @@ class _DiscussionDurability:
             )
         if self._model_lock.locked():
             self._model_lock.release()
+
+    async def reject_model(
+        self, request: ModelRequest, rejected: GatewayRejectedOutput, *,
+        usage: DiscussionUsage, tool_names: Mapping[str, str],
+    ) -> None:
+        entry = self.model_entries[self._model_cursor]
+        previous, tokens, cost = dict(entry), usage.tokens, usage.cost_usd
+        try:
+            if (self._context_tenant_id is None or entry.get("status") != "running"
+                    or entry.get("request_hash") != self.request_hash(request, tool_names=tool_names)):
+                raise ValueError("rejection ledger identity is invalid")
+            record = rejection_record(rejected, run_id=self._context_run_id,
+                tenant_id=self._context_tenant_id, position=self._model_cursor,
+                request=request, request_hash=cast(str, entry["request_hash"]))
+            entry.update(status="rejected", rejection=record.to_payload())
+            # Account only the actually observed output. Missing values remain
+            # explicit in the receipt, never zero estimates or retry authority.
+            if record.usage is not None:
+                usage.tokens += record.usage.total_tokens
+            if record.cost_usd is not None:
+                usage.cost_usd += Decimal(record.cost_usd)
+            await self._checkpoint()
+        except BaseException:
+            entry.clear()
+            entry.update(previous)
+            usage.tokens, usage.cost_usd = tokens, cost
+            self.fail_model("model_outcome_uncertain")
+            raise
+        self._model_cursor += 1
+        self.failure_reason = record.failure_reason()
+        self.failure_payload = runtime_failure_diagnostic_from_reason(self.failure_reason)
+        self._model_lock.release()
 
     async def before_tool(
         self,
@@ -2155,6 +2190,12 @@ class GatewayChatCompletionClient(ChatCompletionClient):
                 if self._durability is not None:
                     self._durability.fail_model(source=error)
                 raise
+            except GatewayRejectedOutput as error:
+                if self._durability is not None:
+                    await self._durability.reject_model(request, error, usage=self._usage, tool_names=tool_names)
+                    raise RuntimeExecutionError(self._durability.failure_reason) from None
+                raise RuntimeExecutionError(safe_model_gateway_failure_reason(error)
+                    or "model gateway failed: model response rejected") from None
             except Exception as error:
                 if self._durability is not None:
                     self._durability.fail_model(safe_model_gateway_failure_reason(error), source=error)
@@ -2581,6 +2622,18 @@ class AutoGenDiscussionRuntime:
                     artifact for artifact in hydrated if artifact.type != "text"
                 )
                 sequence = cast(int, restored.state["next_sequence"])
+                rejected_rows = [(index, entry) for index, entry in enumerate(
+                    self._restored_ledger(restored, "model_ledger")) if entry.get("status") == "rejected"]
+                if rejected_rows:
+                    position, entry = rejected_rows[0]
+                    record = validate_rejection(cast(Mapping[str, JsonValue], entry["rejection"]),
+                        run_id=context.run_id, tenant_id=context.tenant_id,
+                        position=position, request_hash=entry.get("request_hash"))
+                    failure = record.failure_reason()
+                    yield RunEvent(kind=EventKind.RUNTIME_FAILED, sequence=sequence,
+                        run_id=context.run_id, reason=failure,
+                        payload=runtime_failure_diagnostic_from_reason(failure))
+                    return
                 if restored.state["terminal"] is True:
                     restored_reason = cast(str, restored.state["reason"])
                     progress = engineering_progress(
@@ -2693,6 +2746,7 @@ class AutoGenDiscussionRuntime:
                 abort_ledger_artifact,
                 finalize_ledger_artifact,
                 run_id=context.run_id,
+                tenant_id=context.tenant_id,
                 model_entries=self._restored_ledger(restored, "model_ledger"),
                 tool_entries=self._restored_ledger(restored, "tool_ledger"),
                 artifacts=ledger_artifacts,
@@ -3401,7 +3455,9 @@ class AutoGenDiscussionRuntime:
             error.__context__ = None
             error.__cause__ = None
             del error
-            if delivery_ready() and _can_complete_with_partial_discussion(message_artifacts, failure_reason):
+            if (delivery_ready() and not (durability is not None and any(
+                    entry.get("status") == "rejected" for entry in durability.model_entries))
+                    and _can_complete_with_partial_discussion(message_artifacts, failure_reason)):
                 checkpoint = self._checkpoint(
                     context,
                     next_sequence=sequence + 2,
@@ -3916,6 +3972,21 @@ class AutoGenDiscussionRuntime:
         ):
             raise RuntimeExecutionError("runtime checkpoint artifacts are invalid")
         by_id = {str(artifact.id): artifact for artifact in artifacts}
+        models = self._restored_ledger(checkpoint, "model_ledger")
+        for position, model_entry in enumerate(models):
+            if model_entry.get("status") != "rejected" and "rejection" not in model_entry:
+                continue
+            try:
+                required = {"status", "request_hash", "rejection"}
+                optional = {"required_tool", "max_output_tokens", "timeout_seconds", "report_binding"}
+                if (model_entry.get("status") != "rejected" or position != len(models) - 1
+                        or not required <= set(model_entry) <= required | optional
+                        or not isinstance(model_entry["rejection"], Mapping)):
+                    raise ValueError("rejection ledger schema is invalid")
+                validate_rejection(model_entry["rejection"], run_id=context.run_id, tenant_id=context.tenant_id,
+                    position=position, request_hash=model_entry.get("request_hash"))
+            except (ArithmeticError, KeyError, TypeError, ValueError):
+                raise RuntimeExecutionError("durable model rejection is invalid") from None
         allowed_by_actor = {participant.id: participant.allowed_tools for participant in self._plan.participants}
         draft_observations: set[str] = set()
         for entry in cast(tuple[Mapping[str, JsonValue], ...], checkpoint.state["tool_ledger"]):

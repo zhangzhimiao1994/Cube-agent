@@ -18,6 +18,8 @@ from agent_hub.models.capacity import (
     capacity_backend_diagnostic_payload,
 )
 from agent_hub.models.gateway import (
+    GatewayNegotiatedRejectedOutput,
+    GatewayRejectedOutput,
     ModelGatewayError,
     get_gateway_scope_diagnostic,
     is_model_negotiation_exhausted,
@@ -27,6 +29,7 @@ from agent_hub.models.litellm_client import (
     ModelTransportError,
 )
 from agent_hub.models.registry import NoCapableDeployment
+from agent_hub.models.types import RejectedOutputEvidence
 
 MAX_FAILURE_REASON_LENGTH = 240
 RuntimeFailureDiagnostic = dict[str, str | int | bool]
@@ -35,6 +38,16 @@ SENSITIVE_FAILURE_REASON = re.compile(
     re.IGNORECASE,
 )
 _STATUS_CODE = re.compile(r"\(status=(?P<status>[1-5][0-9]{2})\)")
+_TRACEBACK = re.compile(r"\btraceback\b", re.IGNORECASE)
+_REJECTED_OUTPUT_ERRORS = (GatewayRejectedOutput, GatewayNegotiatedRejectedOutput)
+_REJECTED_OUTPUT_BASE = "model gateway failed: model response rejected"
+_REJECTED_OUTPUT_FAILURE = re.compile(
+    re.escape(_REJECTED_OUTPUT_BASE)
+    + r"(?: \(reason=(?P<rejected_output_reason>invalid_json|schema_mismatch|output_limit|"
+    r"invalid_output|invalid_tool|incomplete|refusal|usage_missing|usage_invalid|configuration_error); "
+    r"status=(?P<rejected_output_status>completed|incomplete|refused|unknown); "
+    r"usage_status=(?P<rejected_usage_status>known|missing|invalid)\))?"
+)
 _CREWAI_STEP_TIMEOUT = re.compile(
     r"^CrewAI step timed out: step=(?P<step>[A-Za-z0-9_.-]{1,128}) actor=(?P<actor>[A-Za-z0-9_.-]{1,128})$"
 )
@@ -79,6 +92,19 @@ ORCHESTRATION_CHECKPOINT_FAILURE_REASON = (
 )
 
 
+def _rejected_output_failure_reason(error: GatewayRejectedOutput) -> str:
+    evidence = error.evidence
+    if type(evidence) is not RejectedOutputEvidence:
+        return _REJECTED_OUTPUT_BASE
+    # Read only finite fields; provider text, provenance and exception args stay private.
+    parts = tuple(getattr(evidence, key, None) for key in ("reason", "status", "usage_status"))
+    if not all(type(value) is str and len(value) <= 32 for value in parts):
+        return _REJECTED_OUTPUT_BASE
+    candidate = (f"{_REJECTED_OUTPUT_BASE} (reason={parts[0]}; "
+                 f"status={parts[1]}; usage_status={parts[2]})")
+    return candidate if _REJECTED_OUTPUT_FAILURE.fullmatch(candidate) else _REJECTED_OUTPUT_BASE
+
+
 def safe_model_gateway_failure_reason(error: Exception) -> str | None:
     """Return a stable model-gateway diagnostic that is safe to show in the UI."""
 
@@ -86,6 +112,8 @@ def safe_model_gateway_failure_reason(error: Exception) -> str | None:
         reason = f"{GENERIC_MODEL_GATEWAY_FAILURE}: model parameter negotiation exhausted"
         status = error.status_code if isinstance(error, ModelTransportError) else None
         return reason if status is None else f"{reason} (status={status})"
+    if isinstance(error, GatewayRejectedOutput) and type(error) in _REJECTED_OUTPUT_ERRORS:
+        return _rejected_output_failure_reason(error)
     if isinstance(error, ModelTransportError):
         base = (
             "model response failed"
@@ -166,8 +194,15 @@ def safe_runtime_failure_diagnostic(
 
     reason = safe_runtime_failure_reason(error, fallback=fallback)
     status_code = error.status_code if isinstance(error, ModelTransportError) else None
-    return {**runtime_failure_diagnostic_from_reason(reason, status_code=status_code),
-            **gateway_scope_failure_payload(error)}
+    diagnostic = runtime_failure_diagnostic_from_reason(reason, status_code=status_code)
+    if type(error) is GatewayNegotiatedRejectedOutput:
+        # Keep the stop reason and existing event schema; finite facts fit in its summary.
+        match = _REJECTED_OUTPUT_FAILURE.fullmatch(_rejected_output_failure_reason(error))
+        if match is not None and match["rejected_output_reason"] is not None:
+            diagnostic["error_summary"] = (
+                reason + match[0][len(_REJECTED_OUTPUT_BASE):]
+            )[:MAX_FAILURE_REASON_LENGTH]
+    return {**diagnostic, **gateway_scope_failure_payload(error)}
 
 
 def gateway_scope_failure_payload(
@@ -711,6 +746,17 @@ def _model_gateway_diagnostic(
             suggested_action="模型参数兼容协商已用尽；保留真实失败与未知结果，核查协议配置后再创建新运行，不自动重发或切换模型。",
             status_code=status_code,
         )
+    rejection = _REJECTED_OUTPUT_FAILURE.fullmatch(reason)
+    if rejection is not None:
+        diagnostic = _base_diagnostic(
+            reason,
+            error_stage="model_response",
+            error_category="rejected_output",
+            error_code="model.response_rejected",
+            retryable=False,
+            suggested_action="模型输出已被网关拒绝；仅保留已确认的拒绝诊断，核查私有回执和输出契约，不自动重放未知请求。",
+        )
+        return diagnostic
     if "model response text is empty" in lowered or "model response is empty" in lowered:
         return _base_diagnostic(
             reason,
@@ -948,7 +994,8 @@ def normalize_failure_reason(reason: str) -> str:
 
 
 def is_safe_failure_reason(reason: str) -> bool:
-    return bool(reason) and SENSITIVE_FAILURE_REASON.search(reason) is None
+    return (bool(reason) and SENSITIVE_FAILURE_REASON.search(reason) is None
+            and _TRACEBACK.search(reason) is None)
 
 
 def is_legacy_generic_failure_reason(reason: str | None) -> bool:

@@ -27,8 +27,14 @@ from agent_hub.db.models import RunArtifactRow, RunCheckpointRow, RunEventRow, R
 from agent_hub.db.session import Database, build_database
 from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.harness.types import HarnessToolCallRequest, HarnessToolCallResult
-from agent_hub.models.gateway import GatewayCompletion
-from agent_hub.models.types import ModelRequest, ModelResponse, TokenUsage, ToolCall
+from agent_hub.models.gateway import GatewayCompletion, GatewayRejectedOutput
+from agent_hub.models.types import (
+    ModelRequest,
+    ModelResponse,
+    RejectedOutputEvidence,
+    TokenUsage,
+    ToolCall,
+)
 from agent_hub.runs.artifacts import PostgresArtifactRepository
 from agent_hub.runs.repository import RunRepository
 from agent_hub.runs.service import RunService
@@ -134,6 +140,18 @@ class OfflineCapabilities(Capabilities):
                                      status="succeeded", payload=result)
 
 
+class RejectWriterGateway(OfflineReportGateway):
+    async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+        if request.required_tool == "workspace_write_text":
+            self.requests.append(request)
+            raise GatewayRejectedOutput(evidence=RejectedOutputEvidence(
+                final_text="PRIVATE_REJECTED_BODY_NOT_A_DELIVERY", usage=TokenUsage(7, 3, 10),
+                usage_status="known", status="completed", reason="invalid_tool"),
+                logical_model=request.logical_model, deployment_id="shared",
+                provider_id="test", provider_model="test/model", cost_usd=Decimal("0.002"))
+        return await super().complete_with_context(request)
+
+
 class SimulatedWorkerLoss(BaseException):
     """Abrupt process loss must escape RunService's normal Exception-to-failed path."""
 
@@ -158,6 +176,15 @@ class CrashBeforeReportPublication(RunRepository):
             raise SimulatedWorkerLoss("offline worker lost inside public report transaction")
 
 
+class CrashBeforeRejectionFailure(RunRepository):
+    async def persist_event(
+        self, session: AsyncSession, *, tenant_id: UUID, run_id: UUID, event: RunEvent,
+    ) -> None:
+        if event.kind is EventKind.RUNTIME_FAILED and "model response rejected" in (event.reason or ""):
+            raise SimulatedWorkerLoss("offline worker lost after rejection checkpoint commit")
+        await super().persist_event(session, tenant_id=tenant_id, run_id=run_id, event=event)
+
+
 @dataclass
 class Stack:
     database: Database
@@ -178,14 +205,16 @@ class Scenario:
     stacks: list[Stack] = field(default_factory=list)
 
     def open(self, *, report: str = REPORT, crash: bool = False, forbidden: bool = False,
-             crash_phase: str = "before_artifact") -> Stack:
+             crash_phase: str = "before_artifact", reject_writer: bool = False) -> Stack:
         database = build_database(self.database_url)
         assert database.engine.url.get_backend_name() == "postgresql"
         runs = (CrashBeforeReportPublication(database.session_factory) if crash
+                else CrashBeforeRejectionFailure(database.session_factory) if reject_writer
                 else RunRepository(database.session_factory))
         if isinstance(runs, CrashBeforeReportPublication):
             runs.phase = crash_phase
-        gateway = OfflineReportGateway(report=report, forbidden=forbidden)
+        gateway = (RejectWriterGateway(report=report, forbidden=forbidden) if reject_writer
+                   else OfflineReportGateway(report=report, forbidden=forbidden))
         tools = OfflineCapabilities(database, self, forbidden=forbidden)
         runtime = AutoGenDiscussionRuntime(
             gateway, native_plan(), capability_gateway=tools, harness_tool_gateway=tools,
@@ -439,3 +468,42 @@ async def test_completed_tool_delivery_without_final_report_cannot_complete(
             RunArtifactRow.tenant_id == scenario.tenant, RunArtifactRow.run_id == run_id,
             RunArtifactRow.producer == FINAL_REPORT_ACTOR,
         )) is None
+
+
+async def test_rejected_model_checkpoint_survives_process_loss_without_paid_or_tool_replay(
+    scenario: Scenario,
+) -> None:
+    first = scenario.open(reject_writer=True)
+    run_id = await scenario.submit(first)
+    with pytest.raises(SimulatedWorkerLoss):
+        await asyncio.wait_for(first.service.execute(run_id), timeout=30)
+    assert first.tools.calls == ["project.inspect"]
+    calls = len(first.gateway.requests)
+    assert calls == 2 and first.gateway.final_requests == []
+    async with first.database.session_factory() as session, session.begin():
+        saved = await first.runs.latest_checkpoint(session, tenant_id=scenario.tenant, run_id=run_id)
+        assert saved is not None and saved.state["terminal"] is False
+        entries = ledger(saved, "model_ledger")
+        assert entries[-1]["status"] == "rejected"
+        assert cast(Mapping[str, JsonValue], entries[-1]["rejection"])["reason"] == "invalid_tool"
+        assert "PRIVATE_REJECTED_BODY" not in str(saved.to_payload())
+        usage = cast(Mapping[str, JsonValue], saved.state["usage"])
+        assert usage["tokens"] == 12 and Decimal(str(usage["cost_usd"])) == Decimal("0.002")
+        row = await first.runs.get_for_update(session, run_id)
+        assert row.status == RunStatus.RUNNING.value and row.worker_lease_token is not None
+        row.worker_lease_expires_at = datetime.now(UTC) - timedelta(seconds=1)
+    await first.runtime.cancel()
+    await first.database.dispose()
+    fresh = scenario.open(forbidden=True)
+    await asyncio.wait_for(fresh.service.execute(run_id, allow_running_recovery=True), timeout=30)
+    record = await fresh.runs.get(scenario.tenant, run_id, actor_id=scenario.actor)
+    assert record.status is RunStatus.FAILED and record.worker_lease_token is None
+    assert not fresh.gateway.requests and not fresh.tools.calls
+    events = await fresh.runs.raw_events(scenario.tenant, run_id)
+    failed = [event for event in events if event.kind is EventKind.RUNTIME_FAILED]
+    assert len(failed) == 1 and "invalid_tool" in (failed[0].reason or "")
+    assert "Traceback" not in str(failed[0].to_payload())
+    assert not any(event.kind is EventKind.RUNTIME_COMPLETED for event in events)
+    async with fresh.database.session_factory() as session:
+        restored = await fresh.runs.latest_checkpoint(session, tenant_id=scenario.tenant, run_id=run_id)
+        assert restored is not None and restored.state["usage"] == saved.state["usage"]
