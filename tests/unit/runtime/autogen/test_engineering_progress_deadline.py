@@ -1,10 +1,13 @@
 """Real engineering work renews the soft runway, never the absolute fuse."""
 
 import asyncio
-from collections.abc import Mapping
+import hashlib
+from collections.abc import AsyncGenerator, Mapping
+from dataclasses import replace
 from typing import cast
 
 import pytest
+from autogen_agentchat.messages import TextMessage
 
 from agent_hub.runtime.adaptive_budget import AdaptiveDeadline
 from agent_hub.runtime.autogen.adapter import (
@@ -13,10 +16,18 @@ from agent_hub.runtime.autogen.adapter import (
     DiscussionParticipant,
     DiscussionPlan,
     RuntimeExecutionError,
+    _AdaptiveDiscussionTermination,
     _DiscussionControl,
 )
-from agent_hub.runtime.autogen.termination import DiscussionUsage
-from agent_hub.runtime.contracts import Artifact, JsonValue, RuntimeCheckpoint, TaskContext
+from agent_hub.runtime.autogen.termination import CompositeDiscussionTermination, DiscussionUsage
+from agent_hub.runtime.contracts import (
+    Artifact,
+    EventKind,
+    JsonValue,
+    RunEvent,
+    RuntimeCheckpoint,
+    TaskContext,
+)
 from tests.unit.runtime.autogen.test_engineering_actions import action_context
 from tests.unit.runtime.autogen.test_engineering_delivery import TOOLS, append_result, fixture
 from tests.unit.runtime.autogen.test_model_milestones import Gateway
@@ -74,6 +85,210 @@ def checkpoint(runtime: AutoGenDiscussionRuntime, ctx: TaskContext,
                rows: list[dict[str, JsonValue]], artifacts: list[Artifact]) -> RuntimeCheckpoint:
     return runtime._checkpoint(ctx, next_sequence=1, terminal=False, reason=None,
         artifacts=tuple(artifacts), usage=DiscussionUsage(), tool_ledger=tuple(rows))
+
+
+def turn_runtime(*, policy: JsonValue = 1, ack: bool = True) -> tuple[AutoGenDiscussionRuntime, TaskContext]:
+    original, ctx = configured(policy=policy)
+    ctx = ctx.model_copy(update={"token_budget": 120, "routing_decision": {
+        **ctx.routing_decision, **({"engineering_final_report_version": 1} if ack else {}),
+    }})
+    plan = replace(original._plan, participants=(original._plan.participants[0], *(
+        DiscussionParticipant(id=f"reviewer_{index}", role="Reviewer", goal="Review", logical_model="shared")
+        for index in range(7)
+    )))
+    runtime = AutoGenDiscussionRuntime(Gateway(), plan, capability_gateway=cast(CapabilityGateway, object()))
+    runtime._discussion_control = _DiscussionControl.create(plan, ctx, DiscussionUsage())
+    runtime._wall_budget, runtime._wall_deadline = original._wall_budget, original._wall_deadline
+    return runtime, ctx
+
+
+def termination(runtime: AutoGenDiscussionRuntime, ctx: TaskContext) -> _AdaptiveDiscussionTermination:
+    control = runtime._discussion_control
+    assert control is not None
+    return _AdaptiveDiscussionTermination(base=CompositeDiscussionTermination(
+        usage=DiscussionUsage(), max_turns=control.hard_limit,
+        token_budget=min(runtime._plan.token_budget, ctx.token_budget),
+        cost_budget_usd=runtime._plan.cost_budget_usd, wall_time_seconds=runtime._plan.wall_time_seconds,
+        consensus_votes=runtime._plan.consensus_votes, cancelled=lambda: False,
+        adaptive_deadline=runtime._wall_budget, monotonic=asyncio.get_running_loop().time,
+        delivery_ready=lambda: False,
+    ), control=control, participants=frozenset(runtime.participant_ids), context=ctx,
+        plan_token_budget=runtime._plan.token_budget)
+
+
+def write_result(index: int) -> Mapping[str, JsonValue]:
+    return {"workspace_files": ({"path": f"src/file_{index}.py",
+        "sha256": hashlib.sha256(f"content {index}".encode()).hexdigest(), "size_bytes": 10},)}
+
+
+@pytest.mark.parametrize("ample_runway", [False, True])
+async def test_semantic_writes_cross_multiple_turn_windows_then_duplicate_work_stops(
+    ample_runway: bool,
+) -> None:
+    runtime, ctx = turn_runtime()
+    assert runtime._wall_budget is not None
+    if ample_runway:
+        runtime._wall_budget.deadline = asyncio.get_running_loop().time() + 450
+        runtime._wall_deadline = runtime._wall_budget.deadline
+    initial_deadline = runtime._wall_budget.deadline
+    stop = termination(runtime, ctx)
+    rows: list[dict[str, JsonValue]] = []
+    artifacts: list[Artifact] = []
+    for index in range(40):
+        append_result(rows, artifacts, "workspace.write_text", write_result(index))
+        saved = checkpoint(runtime, ctx, rows, artifacts)
+        runtime._validate_checkpoint(saved, ctx)
+        result = await stop((TextMessage(source="engineer", content="Working"),))
+        assert result is None, f"new semantic write stopped at turn {index + 1}: {result}"
+    assert stop.control.soft_limit == 48
+    assert stop.control.hard_limit == 60
+    assert runtime._wall_budget is not None and runtime._wall_budget.progress_units == 40
+    if ample_runway:
+        assert runtime._wall_budget.deadline == initial_deadline
+    deadline = runtime._wall_budget.deadline
+    absolute = runtime._wall_budget.absolute_deadline
+    for turn in range(41, 49):
+        # Fresh artifact UUIDs and read text do not constitute new semantic work.
+        append_result(rows, artifacts, "workspace.read", {"text": "[EVIDENCE] [COMPLETE]"})
+        append_result(rows, artifacts, "workspace.write_text", write_result(39))
+        saved = checkpoint(runtime, ctx, rows, artifacts)
+        runtime._validate_checkpoint(saved, ctx)
+        result = await stop((TextMessage(source="engineer", content="Working"),))
+        if turn < 48:
+            assert result is None
+        else:
+            assert result is not None and result.content == "no_progress"
+    assert runtime._wall_budget.progress_units == 40
+    assert runtime._wall_budget.deadline == deadline
+    assert runtime._wall_budget.absolute_deadline == absolute
+
+
+async def test_fresh_semantic_work_still_stops_at_existing_hard_turn_cap() -> None:
+    runtime, ctx = turn_runtime()
+    stop = termination(runtime, ctx)
+    rows: list[dict[str, JsonValue]] = []
+    artifacts: list[Artifact] = []
+    for index in range(60):
+        append_result(rows, artifacts, "workspace.write_text", write_result(index))
+        checkpoint(runtime, ctx, rows, artifacts)
+        result = await stop((TextMessage(source="engineer", content="Working"),))
+        if index < 59:
+            assert result is None, f"new semantic write stopped at turn {index + 1}: {result}"
+        else:
+            assert result is not None and result.content == "resource_limit"
+    assert stop.control.hard_limit == 60
+
+
+@pytest.mark.parametrize("budget", ["tokens", "cost", "absolute"])
+async def test_semantic_turn_progress_cannot_bypass_resource_fuses(budget: str) -> None:
+    runtime, ctx = turn_runtime()
+    stop = termination(runtime, ctx)
+    rows: list[dict[str, JsonValue]] = []
+    artifacts: list[Artifact] = []
+    append_result(rows, artifacts, "workspace.write_text", write_result(0))
+    checkpoint(runtime, ctx, rows, artifacts)
+    if budget == "tokens":
+        stop.base.usage.tokens = ctx.token_budget
+    elif budget == "cost":
+        stop.base.usage.cost_usd = runtime._plan.cost_budget_usd
+    else:
+        assert runtime._wall_budget is not None
+        expired_at = runtime._wall_budget.absolute_deadline
+        stop.base.monotonic = lambda: expired_at
+        append_result(rows, artifacts, "workspace.write_text", write_result(1))
+        checkpoint(runtime, ctx, rows, artifacts)
+        assert runtime._wall_budget.absolute_deadline == expired_at
+    result = await stop((TextMessage(source="engineer", content="Working"),))
+    assert result is not None
+    assert result.content == ("wall_time" if budget == "absolute" else "budget_exhausted")
+
+
+@pytest.mark.parametrize("defect", ["UNKNOWN", "running", "hash", "orphan"])
+async def test_uncertain_or_unbound_work_cannot_recredit_a_consumed_window(defect: str) -> None:
+    runtime, ctx = turn_runtime()
+    stop = termination(runtime, ctx)
+    rows, artifacts = fixture()
+    rows, artifacts = rows[:1], artifacts[:1]
+    for _ in range(16):
+        checkpoint(runtime, ctx, rows, artifacts)
+        assert await stop((TextMessage(source="engineer", content="Working"),)) is None
+    assert not stop.control.progress_since_extension
+    assert runtime._wall_budget is not None
+    deadline = runtime._wall_budget.deadline
+    append_result(rows, artifacts, "workspace.write_text", write_result(1))
+    if defect in {"UNKNOWN", "running"}:
+        rows[-1]["status"] = defect
+    elif defect == "hash":
+        rows[-1]["artifact_sha256"] = "0" * 64
+    else:
+        rows.pop()
+    if defect != "orphan":
+        append_result(rows, artifacts, "workspace.write_text", write_result(2))
+    for turn in range(17, 25):
+        checkpoint(runtime, ctx, rows, artifacts)
+        assert not stop.control.progress_since_extension
+        result = await stop((TextMessage(source="engineer", content="Working"),))
+        if turn < 24:
+            assert result is None
+        else:
+            assert result is not None and result.content == "no_progress"
+    assert runtime._wall_budget.progress_units == 1
+    assert runtime._wall_budget.deadline == deadline
+
+
+async def test_cold_runtime_old_work_does_not_recredit_consumed_turn_progress() -> None:
+    runtime, ctx = turn_runtime()
+    stop = termination(runtime, ctx)
+    rows, artifacts = fixture()
+    rows, artifacts = rows[:1], artifacts[:1]
+    checkpoint(runtime, ctx, rows, artifacts)
+    for _ in range(16):
+        assert await stop((TextMessage(source="engineer", content="Working"),)) is None
+    saved = checkpoint(runtime, ctx, rows, artifacts)
+    runtime._validate_checkpoint(saved, ctx)
+    for artifact in artifacts:
+        await runtime._repository.put(ctx.tenant_id, ctx.run_id, artifact)
+    gateway = Gateway()
+    fresh = AutoGenDiscussionRuntime(gateway, runtime._plan,
+        capability_gateway=cast(CapabilityGateway, object()), artifact_repository=runtime._repository)
+    await fresh.restore_checkpoint(RuntimeCheckpoint.from_payload(saved.to_payload()))
+    stream = cast(AsyncGenerator[RunEvent, None], fresh.run(ctx.model_copy(update={"checkpoint": saved})))
+    try:
+        async with asyncio.timeout(5):
+            started = await anext(stream)
+            assert started.kind is EventKind.DISCUSSION_STARTED, started
+            assert fresh._wall_budget is not None and fresh._wall_budget.progress_units == 1
+            deadline = fresh._wall_budget.deadline
+            resumed_stop = termination(fresh, ctx)
+            for turn in range(17, 25):
+                checkpoint(fresh, ctx, rows, artifacts)
+                assert not resumed_stop.control.progress_since_extension
+                result = await resumed_stop((TextMessage(source="engineer", content="Working"),))
+                if turn < 24:
+                    assert result is None
+                else:
+                    assert result is not None and result.content == "no_progress"
+            assert fresh._wall_budget.deadline == deadline
+            assert fresh._wall_budget.progress_units == 1
+    finally:
+        await stream.aclose()
+    assert gateway.requests == []
+
+
+@pytest.mark.parametrize("policy,ack", [(None, True), (True, True), ("1", True), (2, True), (1, False)])
+async def test_legacy_or_non_ack_turn_policy_keeps_existing_window(policy: JsonValue, ack: bool) -> None:
+    runtime, ctx = turn_runtime(policy=policy, ack=ack)
+    stop = termination(runtime, ctx)
+    rows: list[dict[str, JsonValue]] = []
+    artifacts: list[Artifact] = []
+    for turn in range(1, 25):
+        append_result(rows, artifacts, "workspace.write_text", write_result(turn))
+        checkpoint(runtime, ctx, rows, artifacts)
+        result = await stop((TextMessage(source="engineer", content="Working"),))
+        if turn < 24:
+            assert result is None
+        else:
+            assert result is not None and result.content == "no_progress"
 
 
 async def test_actual_write_renews_existing_soft_window_not_increment_per_role() -> None:

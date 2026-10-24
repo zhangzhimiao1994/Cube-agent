@@ -3841,8 +3841,11 @@ class AutoGenDiscussionRuntime:
                 soft = context.routing_decision.get("runtime_timeout_soft_seconds")
                 runway = (float(soft) if isinstance(soft, int | float) and not isinstance(soft, bool)
                     and math.isfinite(soft) and soft > 0 else min(self._plan.wall_time_seconds, context.timeout_seconds))
-                wall_budget.renew_for_progress(progress_units=len(engineering_work_progress(context,
-                    tool_entries=tool_ledger, artifacts=artifacts, allowed_tools=allowed_tools)),
+                work_units = len(engineering_work_progress(context,
+                    tool_entries=tool_ledger, artifacts=artifacts, allowed_tools=allowed_tools))
+                if _checkpoint_ack_selected(context) and work_units > wall_budget.progress_units:
+                    discussion_control.progress_since_extension = True
+                wall_budget.renew_for_progress(progress_units=work_units,
                     now=loop_time, runway_seconds=runway)
             else:
                 wall_budget.observe(progress_units=discussion_control.progress_units, now=loop_time)
