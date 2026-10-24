@@ -8,7 +8,7 @@ import { ArrowUp, Copy, FolderClock, MoreHorizontal } from "lucide-react";
 import { ApiError, api, formatApiError, type AttachmentUpload, type Conversation, type ConversationMetadata, type ConversationQueueItem, type ModelDeployment, type ProjectWorkspace, type RunDetail, type RunListItem, type Skill, type SkillArchiveUpload, type SubmittedRun, type WebPreview, type WorkspaceDirectoryList, type WorkspaceFileList } from "../api/client";
 import { APP_BRAND_NAME } from "../app/brand";
 import { PreviewFrame } from "../preview/PreviewFrame";
-import { BoundedTextBlock, OutputContent, copyOutputText as copyTextToClipboard, hasStructuredOutput, isMarkdownOutputFile, outputFileLanguage } from "../components/OutputContent";
+import { BoundedTextBlock, OutputContent, copyOutputText as copyTextToClipboard, hasStructuredOutput, isMarkdownOutputFile, outputFileLanguage, outputMachineLanguage } from "../components/OutputContent";
 import {
   ArtifactFileCard,
   artifactFileName,
@@ -5262,7 +5262,13 @@ function progressFeedbackSummary(text: string, ...sourceTexts: (string | null | 
   if (sources.some((value) => /Traceback \(most recent call last\)|\b(?:TypeError|ValueError|RuntimeError|SyntaxError|Exception):/.test(value))) {
     return "记录到运行异常；完整异常见真实调度记录。";
   }
-  if (sources.some((value) => prettyJsonValue(value.trim()) !== null)) return "记录了结构化反馈；完整内容见真实调度记录。";
+  if (outputMachineLanguage(text) !== null
+    && /["']generated_draft_rejection["']\s*:\s*\{/.test(text)
+    && /["']execution_started["']\s*:\s*(?:false|False)\s*[,}]/.test(text)
+    && /["']issues["']\s*:\s*\[\s*["']scaffold_incomplete["']\s*\]/.test(text)) {
+    return "反馈报告验收准备不完整，尚未开始构建与测试；完整信息见真实调度记录。";
+  }
+  if (sources.some((value) => outputMachineLanguage(value) !== null)) return "记录了结构化反馈；完整内容见真实调度记录。";
   return text.trim() || "未提供公开正文";
 }
 
@@ -5417,11 +5423,11 @@ function AgentWorkbenchDrawer({
             </section>
             {publicTexts.length ? <section className="process-public-artifacts" aria-label="公开文本产物">
               {publicTexts.map((artifact) => {
-                const isToolJson = artifact.kind === "tool_result" && prettyJsonValue(artifact.text!.trim()) !== null;
+                const toolLanguage = artifact.kind === "tool_result" ? outputMachineLanguage(artifact.text!) : null;
                 return <article key={artifact.id}>
                   <h4>{artifact.title}</h4><small>公开产物 · 来源绑定未提供</small>
-                  <BoundedTextBlock label={isToolJson ? "json" : "公开文本"} language={isToolJson ? "json" : undefined}
-                    text={artifact.text!} shouldCollapse copyAriaLabel={isToolJson ? "复制工具 JSON" : "复制公开文本"} />
+                  <BoundedTextBlock label={toolLanguage ?? "公开文本"} language={toolLanguage ?? undefined}
+                    text={artifact.text!} shouldCollapse copyAriaLabel={toolLanguage === "json" ? "复制工具 JSON" : toolLanguage ? `复制工具 ${toolLanguage}` : "复制公开文本"} />
                 </article>;
               })}
             </section> : null}

@@ -371,12 +371,15 @@ def engineering_progress(
 def engineering_work_progress(
     context: TaskContext, *, tool_entries: Sequence[Mapping[str, JsonValue]],
     artifacts: Sequence[Artifact], allowed_tools: Mapping[str, Sequence[str]],
+    include_draft_diagnoses: bool = False,
 ) -> frozenset[str]:
     """Derive replay-stable budget hints from completed causal prefixes, never authority."""
     by_id = {str(item.id): item for item in artifacts}
     credits: set[str] = set()
     # Trusted baseline bytes suppress no-op writes without earning work credit.
     seen_writes = {item[:2] for item in python_initial_files(context).values()}
+    seen_diagnoses: set[str] = set()
+    productive_since_diagnosis = False
     for position, row in enumerate(tool_entries):
         if row.get("status") not in ("succeeded", "failed"):
             break
@@ -386,13 +389,25 @@ def engineering_work_progress(
         )
         if progress.uncertain:
             break
-        if row.get("status") != "succeeded":
-            continue
         artifact_id = row.get("artifact_id")
         assert isinstance(artifact_id, str)
-        result = by_id[artifact_id].content["result"]
+        artifact = by_id[artifact_id]
+        result = artifact.content["result"]
         assert isinstance(result, Mapping)
         name = row.get("name")
+        if row.get("status") != "succeeded":
+            feedback = (generated_draft_artifact_feedback(artifact, context=context, actor=artifact.producer)
+                        if include_draft_diagnoses is True else None)
+            if feedback is not None:
+                rejection = feedback["generated_draft_rejection"]
+                assert isinstance(rejection, Mapping)
+                observation = cast(str, rejection["observation_sha256"])
+                # One diagnosis window per productive draft, not a verification pass.
+                if productive_since_diagnosis and observation not in seen_diagnoses:
+                    credits.add(f"draft.diagnosis:{observation}")
+                seen_diagnoses.add(observation)
+                productive_since_diagnosis = False
+            continue
         semantic: object
         if name == "project.inspect":
             manifests = result.get("manifests")
@@ -412,6 +427,7 @@ def engineering_work_progress(
             if item[:2] in seen_writes:
                 continue
             seen_writes.add(item[:2])
+            productive_since_diagnosis = True
             semantic = item[:2]
         elif name == "project.verify" and progress.verification_current:
             source = _successful_source(result, context=context)

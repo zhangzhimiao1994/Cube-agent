@@ -12,6 +12,22 @@ afterEach(() => {
 });
 
 describe("shared output rendering", () => {
+  it("keeps Python-style tool mappings and internal envelopes out of prose", async () => {
+    const user = userEvent.setup();
+    const copy = vi.spyOn(navigator.clipboard, "writeText").mockResolvedValue();
+    const text = "{'generated_draft_rejection': {'execution_started': False, 'issues': ['scaffold_incomplete']}}";
+    const { rerender, container } = render(<OutputContent title="技术反馈" text={text} />);
+    expect(screen.getByLabelText("python完整内容").textContent).toBe(text);
+    expect(container.querySelector(".message-paragraph")).toBeNull();
+    await user.click(screen.getByRole("button", { name: "复制 python 代码" }));
+    await waitFor(() => expect(copy).toHaveBeenCalledWith(text));
+    const protocol = 'EXPLICIT_CAPABILITY_CALLS_JSON=[{"name":"project.verify"}]';
+    rerender(<OutputContent title="技术反馈" text={protocol} />);
+    expect(screen.getByLabelText("text完整内容").textContent).toBe(protocol);
+    await user.click(screen.getByRole("button", { name: "复制 text 代码" }));
+    await waitFor(() => expect(copy).toHaveBeenLastCalledWith(protocol));
+  });
+
   it("shows complete machine JSON in an editor while copying the original source", async () => {
     const user = userEvent.setup();
     const copy = vi.spyOn(navigator.clipboard, "writeText").mockResolvedValue();
@@ -32,13 +48,19 @@ describe("shared output rendering", () => {
     expect(container.querySelector("script")).toBeNull();
   });
 
-  it("preserves machine numeric precision and does not reinterpret malformed JSON", () => {
+  it("preserves numeric precision and shows incomplete JSON without repairing it", () => {
     const text = '{"id":900719925474099312345,"ratio":1e-30}';
     const { rerender } = render(<OutputContent title="技术详情" text={text} />);
     expect(screen.getByLabelText("json完整内容").textContent).toBe(text);
     rerender(<OutputContent title="回复" text={'{"unfinished":'} />);
-    expect(screen.queryByLabelText("json完整内容")).toBeNull();
-    expect(screen.getByText('{"unfinished":')).toBeTruthy();
+    expect(screen.getByLabelText("json完整内容").textContent).toBe('{"unfinished":');
+  });
+
+  it("keeps a server-truncated JSON envelope in the code reader without inventing its missing tail", () => {
+    const text = '{"generated_draft_rejection":{"execution_started":false,"issues":["scaffold_incomplete"],"kind":"generated_project_draft_rejection","phase":"before_capture","project_id":"';
+    const { container } = render(<OutputContent title="公开记录" text={text} />);
+    expect(screen.getByLabelText("json完整内容").textContent).toBe(text);
+    expect(container.querySelector(".message-paragraph")).toBeNull();
   });
 
   it("does not treat natural-language braces or primitive values as machine reports", () => {

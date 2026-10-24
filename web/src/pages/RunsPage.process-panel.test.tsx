@@ -72,6 +72,44 @@ async function mount(mode?: string, empty = false, overrides: Partial<RunDetail>
 }
 
 describe("one process panel with summary and genuine records", () => {
+  it("summarizes a server-truncated draft receipt instead of leaking partial JSON", async () => {
+    const detail = fixture("discuss");
+    const text = '{"generated_draft_rejection":{"execution_started":false,"issues":["scaffold_incomplete"],"project_id":"';
+    const { panel } = await mount("discuss", false, { status: "running", events: [{ ...detail.events[2], sequence: 8, message: text }] });
+    const summary = within(panel).getByRole("region", { name: "进展摘要" });
+    expect(summary.textContent).toContain("验收准备不完整");
+    expect(summary.textContent).not.toContain('"generated_draft_rejection"');
+  });
+
+  it("preserves a natural repair explanation that mentions old draft error codes", async () => {
+    const detail = fixture("discuss");
+    const text = "已修复 generated_draft_rejection 中的 scaffold_incomplete。构建和测试已经执行，但测试失败，不能交付。";
+    const { panel } = await mount("discuss", false, { status: "running", events: [{ ...detail.events[2], sequence: 8, message: text }] });
+    expect(within(panel).getByRole("region", { name: "进展摘要" }).textContent).toContain(text);
+  });
+
+  it("keeps the current exception ahead of an old scaffold summary", async () => {
+    const detail = fixture("discuss");
+    const { panel } = await mount("discuss", false, { status: "running", events: [{ ...detail.events[2], sequence: 8,
+      message: "TypeError: current execution failed", summary: "generated_draft_rejection scaffold_incomplete" }] });
+    const text = within(panel).getByRole("region", { name: "进展摘要" }).textContent;
+    expect(text).toContain("运行异常");
+    expect(text).not.toContain("尚未开始构建与测试");
+  });
+
+  it("explains the actual Python-style draft rejection without displaying its machine mapping", async () => {
+    const detail = fixture("discuss");
+    const text = "{'generated_draft_rejection': {'execution_started': False, 'issues': ['scaffold_incomplete']}}";
+    const events = [{ ...detail.events[2], sequence: 8, message: text }];
+    const { user, panel } = await mount("discuss", false, { status: "running", events });
+    const summary = within(panel).getByRole("region", { name: "进展摘要" });
+    expect(summary.textContent).toContain("验收准备不完整");
+    expect(summary.textContent).toContain("尚未开始构建与测试");
+    expect(summary.textContent).not.toMatch(/generated_draft_rejection|scaffold_incomplete|execution_started/);
+    await user.click(within(panel).getByRole("tab", { name: "真实调度记录" }));
+    expect(within(panel).getByRole("tabpanel").textContent).toContain("generated_draft_rejection");
+  });
+
   it("keeps empty workspace tool JSON in its source reader and out of the running conversation reply", async () => {
     const text = JSON.stringify({ result: { summary: "Workspace contains 0 files.", workspace_files: [],
       bundle_download_url: "/api/v1/workspaces/projects/fixture/sessions/main/bundle/download" } });

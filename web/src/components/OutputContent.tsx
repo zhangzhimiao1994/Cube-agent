@@ -232,6 +232,7 @@ function tokenizeOutput(text: string): Token[] | null {
 }
 
 export function hasStructuredOutput(text: string): boolean {
+  if (outputMachineLanguage(text) !== null) return true;
   function contains(items: Token[]): boolean {
     return items.some((token) => token.type === "code" || token.type === "table"
       || (token.type === "blockquote" && contains(token.tokens ?? []))
@@ -241,6 +242,20 @@ export function hasStructuredOutput(text: string): boolean {
   return tokens !== null && contains(tokens);
 }
 
+export function outputMachineLanguage(text: string): "json" | "python" | "text" | null {
+  if (/^\s*(?:EXPLICIT_CAPABILITY_CALLS_JSON|UNTRUSTED_CAPABILITY_RESULTS_JSON)\s*=/.test(text)) return "text";
+  if (!/^\s*[\[{]/.test(text)) return null;
+  try {
+    const value: unknown = JSON.parse(text);
+    if (typeof value === "object" && value !== null) return "json";
+  } catch {
+    // Public events may truncate a mapping. Display the exact prefix, never evaluate or repair it.
+    const prefix = text.match(/^\s*\{\s*(["'])[^"'\r\n]+\1\s*:/);
+    if (prefix) return prefix[1] === "'" ? "python" : "json";
+  }
+  return null;
+}
+
 export function OutputContent({ text, title, format = "markdown", language = "text", copyAriaLabel }: {
   text: string;
   title: string;
@@ -248,18 +263,10 @@ export function OutputContent({ text, title, format = "markdown", language = "te
   language?: string;
   copyAriaLabel?: string;
 }) {
-  const machineJson = useMemo(() => {
-    if (format !== "markdown" || !/^[\s]*[\[{]/.test(text)) return false;
-    try {
-      const value: unknown = JSON.parse(text);
-      return typeof value === "object" && value !== null;
-    } catch {
-      return false;
-    }
-  }, [format, text]);
-  const tokens = useMemo(() => format === "markdown" && !machineJson ? tokenizeOutput(text) : [], [format, machineJson, text]);
+  const machineLanguage = useMemo(() => format === "markdown" ? outputMachineLanguage(text) : null, [format, text]);
+  const tokens = useMemo(() => format === "markdown" && !machineLanguage ? tokenizeOutput(text) : [], [format, machineLanguage, text]);
   if (!text) return null;
-  if (machineJson) return <BoundedTextBlock label="json" language="json" text={text} copyAriaLabel="复制 json 代码" />;
+  if (machineLanguage) return <BoundedTextBlock label={machineLanguage} language={machineLanguage} text={text} copyAriaLabel={`复制 ${machineLanguage} 代码`} />;
   if (tokens === null) return <BoundedTextBlock label="text" text={text} copyAriaLabel="复制全文" />;
   if (format === "code") return <BoundedTextBlock label={language} language={language} text={text}
     copyAriaLabel={copyAriaLabel ?? `复制 ${language} 代码`} />;
