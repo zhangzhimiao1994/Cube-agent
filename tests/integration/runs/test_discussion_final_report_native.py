@@ -489,16 +489,21 @@ async def test_rejected_model_checkpoint_survives_process_loss_without_paid_or_t
         await asyncio.wait_for(first.service.execute(run_id), timeout=30)
     assert first.tools.calls == ["project.inspect"]
     calls = len(first.gateway.requests)
-    assert calls == 2 and first.gateway.final_requests == []
+    # The real selector also has billed ledger rows; retain its observed calls
+    # rather than assuming an engineering run bypasses role selection.
+    assert calls >= 2 and first.gateway.final_requests == []
     async with first.database.session_factory() as session, session.begin():
         saved = await first.runs.latest_checkpoint(session, tenant_id=scenario.tenant, run_id=run_id)
         assert saved is not None and saved.state["terminal"] is False
         entries = ledger(saved, "model_ledger")
+        assert len(entries) == calls
+        assert all(entry["status"] == "succeeded" for entry in entries[:-1])
         assert entries[-1]["status"] == "rejected"
         assert cast(Mapping[str, JsonValue], entries[-1]["rejection"])["reason"] == "invalid_tool"
         assert "PRIVATE_REJECTED_BODY" not in str(saved.to_payload())
         usage = cast(Mapping[str, JsonValue], saved.state["usage"])
-        assert usage["tokens"] == 12 and Decimal(str(usage["cost_usd"])) == Decimal("0.002")
+        assert usage["tokens"] == 2 * (calls - 1) + 10
+        assert Decimal(str(usage["cost_usd"])) == Decimal("0.002")
         row = await first.runs.get_for_update(session, run_id)
         assert row.status == RunStatus.RUNNING.value and row.worker_lease_token is not None
         row.worker_lease_expires_at = datetime.now(UTC) - timedelta(seconds=1)
