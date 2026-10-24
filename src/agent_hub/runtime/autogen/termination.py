@@ -35,6 +35,7 @@ class CompositeDiscussionTermination(TerminationCondition):
     completion_marker: str = "[COMPLETE]"
     consensus_marker: str = "[CONSENSUS]"
     delivery_ready: Callable[[], bool] | None = None
+    absolute_deadline_only: bool = False
     reason: str | None = field(default=None, init=False)
     _started_at: float = field(default=0.0, init=False)
     _turns: int = field(default=0, init=False)
@@ -62,7 +63,8 @@ class CompositeDiscussionTermination(TerminationCondition):
         if self.cancelled():
             self.reason = "cancelled"
         elif (
-            self.adaptive_deadline.remaining(now=self.monotonic()) <= 0
+            (self.adaptive_deadline.absolute_remaining(now=self.monotonic())
+             if self.absolute_deadline_only else self.adaptive_deadline.remaining(now=self.monotonic())) <= 0
             if self.adaptive_deadline is not None
             else self.monotonic() - self._started_at >= self.wall_time_seconds
         ):

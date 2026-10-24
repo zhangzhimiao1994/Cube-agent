@@ -166,6 +166,15 @@ _AUTOGEN_STREAM_POLL_SECONDS = 1.0
 _AUTOGEN_SHUTDOWN_GRACE_SECONDS = 2.0
 _GENERATED_DRAFT_NO_PROGRESS = "generated draft correction made no progress"
 _CHECKPOINT_ACK_POLICY = "engineering_checkpoint_ack_version"
+_SOFT_ADMISSION_POLICY = "engineering_soft_admission_version"
+
+
+def _soft_admission_selected(context: TaskContext) -> bool:
+    policies = (_SOFT_ADMISSION_POLICY, _CHECKPOINT_ACK_POLICY, "engineering_action_version",
+                "engineering_progress_budget_version")
+    return (context.routing_decision.get("runtime_timeout_source") == "project_scale_soft_budget"
+            and all(type(context.routing_decision.get(key)) is int
+                    and context.routing_decision.get(key) == 1 for key in policies))
 
 
 def _checkpoint_ack_selected(context: TaskContext) -> bool:
@@ -420,7 +429,7 @@ class _DiscussionDurability:
         self._model_lock = asyncio.Lock()
         self._tool_lock = asyncio.Lock()
         self.failure_reason: str | None = None
-        self.failure_payload: dict[str, str | int | bool] = {}
+        self.failure_payload: Mapping[str, JsonValue] = {}
 
     @property
     def artifacts(self) -> tuple[Artifact, ...]:
@@ -2045,6 +2054,7 @@ class GatewayChatCompletionClient(ChatCompletionClient):
         engineering_action: Callable[[bool], str | None] | None = None,
         engineering_budget: Callable[[], tuple[int, float]] | None = None,
         request_timeout: Callable[[], float] | None = None,
+        model_admission: Callable[[], None] | None = None,
         acceptance_first: bool = False,
         bounded_no_tool: bool = False,
         report_binding: Callable[[], Mapping[str, JsonValue]] | None = None,
@@ -2061,6 +2071,7 @@ class GatewayChatCompletionClient(ChatCompletionClient):
         self._engineering_action = engineering_action
         self._engineering_budget = engineering_budget
         self._request_timeout = request_timeout
+        self._model_admission = model_admission
         self._acceptance_first = acceptance_first
         self._bounded_no_tool = bounded_no_tool
         self._report_binding = report_binding
@@ -2257,6 +2268,11 @@ class GatewayChatCompletionClient(ChatCompletionClient):
         self, request: ModelRequest, tool_names: Mapping[str, str],
         cancellation_token: CancellationToken | None, *, correction_for: int | None = None,
     ) -> tuple[GatewayCompletion, RequestUsage]:
+        # Cached results need no new admission; UNKNOWN is checked by durability.
+        fresh = (self._durability is None
+                 or self._durability._model_cursor >= len(self._durability.model_entries))
+        if fresh and self._model_admission is not None:
+            self._model_admission()
         completion = (
             await self._durability.before_model(request, tool_names=tool_names,
                 bounded_no_tool=self._bounded_no_tool,
@@ -2270,6 +2286,8 @@ class GatewayChatCompletionClient(ChatCompletionClient):
         replayed = completion is not None
         if completion is None:
             try:
+                if self._model_admission is not None:
+                    self._model_admission()
                 # Replayed outcomes need no new deadline; durable publication may
                 # consume time, so bind new transport calls at the last boundary.
                 if self._request_timeout is not None:
@@ -2530,6 +2548,7 @@ class AutoGenDiscussionRuntime:
                         and sum("workspace.write_text" in tools for tools in allowed_tools.values()) == 1)
         round_published = asyncio.Event()
         checkpoint_ack = engineering and _checkpoint_ack_selected(context)
+        soft_admission = engineering and _soft_admission_selected(context)
         publications = CheckpointPublications() if checkpoint_ack else None
         publication_task: asyncio.Task[PendingCheckpoint] | None = None
 
@@ -2677,8 +2696,13 @@ class AutoGenDiscussionRuntime:
                 durability.artifacts, allowed_tools,
             ) else None
 
+        def execution_deadline() -> float | None:
+            if soft_admission and self._wall_budget is not None:
+                return self._wall_budget.absolute_deadline
+            return self._wall_deadline
+
         def action_budget() -> tuple[int, float]:
-            deadline = self._wall_deadline
+            deadline = execution_deadline()
             return (max(0, min(self._plan.token_budget, context.token_budget) - usage.tokens)
                     if usage.cost_usd < self._plan.cost_budget_usd else 0,
                     max(0.0, deadline - asyncio.get_running_loop().time()) if deadline is not None else 0.0)
@@ -2688,7 +2712,18 @@ class AutoGenDiscussionRuntime:
             if budget is None:
                 raise RuntimeExecutionError("discussion wall deadline is unavailable")
             now = asyncio.get_running_loop().time()
+            if soft_admission:
+                return budget.absolute_remaining(now=now)
             return min(budget.remaining(now=now), budget.absolute_remaining(now=now))
+
+        def admit_model() -> None:
+            budget = self._wall_budget
+            now = asyncio.get_running_loop().time()
+            if budget is None or min(budget.remaining(now=now), budget.absolute_remaining(now=now)) <= 0:
+                if durability is not None:
+                    durability.failure_reason = "engineering_delivery_missing"
+                    durability.failure_payload = wall_failure_payload()
+                raise RuntimeExecutionError("engineering model admission deadline exhausted")
 
         def wall_failure_payload() -> dict[str, JsonValue]:
             budget = self._wall_budget
@@ -2696,7 +2731,7 @@ class AutoGenDiscussionRuntime:
             absolute_remaining = budget.absolute_remaining(now=now) if budget is not None else 0.0
             kind = ("explicit" if context.routing_decision.get("runtime_timeout_source")
                 != "project_scale_soft_budget" else "absolute" if budget is not None
-                and budget.deadline >= budget.absolute_deadline else "soft")
+                and (budget.deadline >= budget.absolute_deadline or absolute_remaining <= 0) else "soft")
             return {
                 **runtime_failure_diagnostic_from_reason("engineering_delivery_missing"),
                 "termination_reason": "wall_time",
@@ -2834,6 +2869,8 @@ class AutoGenDiscussionRuntime:
                     and context.routing_decision.get("engineering_progress_budget_version") == 1
                     else discussion_control.progress_units),
             )
+            if soft_admission and wall_seconds <= 0:
+                self._wall_budget.deadline = loop_time
             self._wall_deadline = self._wall_budget.deadline
 
             async def publish_ledger_checkpoint(
@@ -2948,6 +2985,7 @@ class AutoGenDiscussionRuntime:
                     consensus_votes=self._plan.consensus_votes,
                     cancelled=cancelled,
                     adaptive_deadline=self._wall_budget,
+                    absolute_deadline_only=soft_admission,
                     monotonic=asyncio.get_running_loop().time,
                     delivery_ready=(lambda: tools_ready() and (not reports or observed_report is not None))
                     if engineering else None,
@@ -2971,6 +3009,7 @@ class AutoGenDiscussionRuntime:
                     engineering_action=next_action if actions and participant.id == owner else None,
                     engineering_budget=action_budget if actions and participant.id == owner else None,
                     request_timeout=request_timeout,
+                    model_admission=admit_model if soft_admission else None,
                     acceptance_first=continuation and participant.id == owner,
                     tool_correction_enabled=corrections and participant.id == owner,
                 )
@@ -2987,6 +3026,7 @@ class AutoGenDiscussionRuntime:
                     max_output_tokens=self._plan.participants[0].max_output_tokens,
                     durability=durability, compaction_window=compaction_window,
                     engineering_budget=action_budget, request_timeout=request_timeout,
+                    model_admission=admit_model if soft_admission else None,
                     bounded_no_tool=True,
                     report_binding=report_binding,
                     report_evidence=report_evidence,
@@ -3047,6 +3087,7 @@ class AutoGenDiscussionRuntime:
                 durability=durability,
                 compaction_window=compaction_window,
                 request_timeout=request_timeout,
+                model_admission=admit_model if soft_admission else None,
             )
             tool_records: list[_ToolRecord] = []
 
@@ -3195,7 +3236,7 @@ class AutoGenDiscussionRuntime:
                 if self._cancel_event is not None:
                     self._cancel_event.set()
 
-            deadline = self._wall_deadline
+            deadline = execution_deadline()
             if deadline is None:
                 raise RuntimeExecutionError("discussion wall deadline is unavailable")
             wall_budget = self._wall_budget
@@ -3238,7 +3279,7 @@ class AutoGenDiscussionRuntime:
                             # Resumption follows the driver's committed event transaction.
                             publication.acknowledge()
                             continue
-                        deadline = self._wall_deadline
+                        deadline = execution_deadline()
                         if deadline is None:
                             raise RuntimeExecutionError(
                                 "discussion wall deadline is unavailable"
@@ -3846,7 +3887,8 @@ class AutoGenDiscussionRuntime:
                 if _checkpoint_ack_selected(context) and work_units > wall_budget.progress_units:
                     discussion_control.progress_since_extension = True
                 wall_budget.renew_for_progress(progress_units=work_units,
-                    now=loop_time, runway_seconds=runway)
+                    now=loop_time, runway_seconds=runway,
+                    admitted_completion=_soft_admission_selected(context))
             else:
                 wall_budget.observe(progress_units=discussion_control.progress_units, now=loop_time)
             wall_deadline = wall_budget.deadline
@@ -3896,6 +3938,7 @@ class AutoGenDiscussionRuntime:
             **({ENGINEERING_CONTINUATION_POLICY: 1} if engineering
                and engineering_continuation_selected(context) else {}),
             **({"engineering_progress_budget_version": 1} if work_budget else {}),
+            **({_SOFT_ADMISSION_POLICY: 1} if engineering and _soft_admission_selected(context) else {}),
             **({_CHECKPOINT_ACK_POLICY: 1} if engineering and _checkpoint_ack_selected(context) else {}),
             **({FINAL_REPORT_POLICY: 1} if engineering
                and type(context.routing_decision.get(FINAL_REPORT_POLICY)) is int
@@ -3915,7 +3958,8 @@ class AutoGenDiscussionRuntime:
                         token_budget=min(self._plan.token_budget, context.token_budget),
                         used_tokens=usage.tokens,
                         timeout_seconds=min(self._plan.wall_time_seconds, context.timeout_seconds),
-                        remaining_seconds=max(0.0, wall_deadline - loop_time),
+                        remaining_seconds=(remaining_absolute_timeout_seconds if _soft_admission_selected(context)
+                                           else max(0.0, wall_deadline - loop_time)),
                         max_turns=self._plan.max_turns, tool_fanout=_MAX_TOOL_CALLS_PER_RESPONSE,
                     )
                     break
@@ -3968,7 +4012,7 @@ class AutoGenDiscussionRuntime:
         optional_state = (
             {"remaining_absolute_timeout_seconds", "engineering_tool_prefix", "engineering_action_version",
              ENGINEERING_CONTINUATION_POLICY, _CHECKPOINT_ACK_POLICY, FINAL_REPORT_POLICY, TOOL_CORRECTION_POLICY,
-             "engineering_progress_budget_version"}
+             "engineering_progress_budget_version", _SOFT_ADMISSION_POLICY}
             if checkpoint.runtime_version == _RUNTIME_VERSION
             else set()
         )
@@ -3999,6 +4043,12 @@ class AutoGenDiscussionRuntime:
             type(state[work_policy]) is not int or state[work_policy] != 1))):
             raise RuntimeExecutionError("runtime checkpoint is incompatible")
         checkpoint_ack = engineering and _checkpoint_ack_selected(context)
+        soft_admission = engineering and _soft_admission_selected(context)
+        if ((_SOFT_ADMISSION_POLICY in state) != soft_admission
+            or (_SOFT_ADMISSION_POLICY in state and (
+                type(state[_SOFT_ADMISSION_POLICY]) is not int or state[_SOFT_ADMISSION_POLICY] != 1))
+            or (soft_admission and "remaining_absolute_timeout_seconds" not in state)):
+            raise RuntimeExecutionError("runtime checkpoint is incompatible")
         if ((_CHECKPOINT_ACK_POLICY in state) != checkpoint_ack
             or (_CHECKPOINT_ACK_POLICY in state and (
                 type(state[_CHECKPOINT_ACK_POLICY]) is not int
@@ -4095,7 +4145,9 @@ class AutoGenDiscussionRuntime:
                     token_budget=min(self._plan.token_budget, context.token_budget),
                     used_tokens=usage["tokens"],
                     timeout_seconds=min(self._plan.wall_time_seconds, context.timeout_seconds),
-                    remaining_seconds=(float(remaining_timeout_seconds)
+                    remaining_seconds=(float(remaining_absolute_timeout_seconds)
+                                       if soft_admission and isinstance(remaining_absolute_timeout_seconds, int | float)
+                                       else float(remaining_timeout_seconds)
                                        if isinstance(remaining_timeout_seconds, int | float)
                                        else min(self._plan.wall_time_seconds, context.timeout_seconds)),
                     max_turns=self._plan.max_turns, tool_fanout=_MAX_TOOL_CALLS_PER_RESPONSE,

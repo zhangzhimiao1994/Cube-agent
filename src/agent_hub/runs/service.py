@@ -1982,6 +1982,11 @@ class RunService:
                         routing_decision["engineering_tool_correction_version"] = 1
                         routing_decision["engineering_checkpoint_ack_version"] = 1
                         routing_decision["engineering_progress_budget_version"] = 1
+                        if (not allow_running_recovery
+                                and "engineering_action_version" not in (row.routing_decision or {})
+                                and routing_decision.get("runtime_timeout_source")
+                                == "project_scale_soft_budget"):
+                            routing_decision.setdefault("engineering_soft_admission_version", 1)
                     if (mode is TaskMode.DISCUSS
                             and type(routing_decision.get("generated_project_contract_version")) is int
                             and routing_decision["generated_project_contract_version"] == 1):
