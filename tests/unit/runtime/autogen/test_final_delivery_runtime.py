@@ -310,3 +310,25 @@ async def test_recovery_republishes_same_report_id_after_original_publication() 
     assert repeated.id == original.id
     assert repeated.content_sha256 == original.content_sha256
     assert unused.requests == [] and len(backend.calls) == 3
+
+
+async def test_native_offline_fixture_authors_one_write_and_leaves_required_checks_to_driver() -> None:
+    from tests.integration.runs.test_discussion_final_report_native import (
+        TOOL_CALLS,
+        OfflineReportGateway,
+        native_plan,
+    )
+
+    ctx = report_context()
+    ctx = ctx.model_copy(update={"routing_decision": {**ctx.routing_decision,
+        "engineering_action_version": 1, "project_id": "fixture", "workspace_session_id": "main"}})
+    gateway, backend = OfflineReportGateway(), Capabilities()
+    backend.results["project.inspect"] = {
+        "schema_version": 1, "scope": {"tenant_id": str(ctx.tenant_id), "run_id": str(ctx.run_id),
+            "project_id": "fixture", "workspace_session_id": "main"},
+        "manifests": (), "operations": {}, "issues": (),
+    }
+    runner = AutoGenDiscussionRuntime(gateway, native_plan(), capability_gateway=backend)
+    events = [event async for event in runner.run(ctx)]
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED, events[-1].reason
+    assert backend.calls == TOOL_CALLS and len(gateway.final_requests) == 1
