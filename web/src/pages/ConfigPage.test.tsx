@@ -96,10 +96,9 @@ describe("ConfigPage", () => {
           return jsonResponse(principal);
         }
         if (path === "/api/v1/admin/settings") {
-          if (method === "PUT") return jsonResponse({
-            ...JSON.parse(String(init?.body)),
-            supported_permission_modes: currentSettings.supported_permission_modes,
-          });
+          if (method === "PUT") {
+            currentSettings = { ...currentSettings, ...JSON.parse(String(init?.body)) };
+          }
           return jsonResponse(currentSettings);
         }
         if (path === "/api/v1/admin/execution-backends") {
@@ -488,16 +487,44 @@ describe("ConfigPage", () => {
     expect((within(group).getByLabelText("默认沙箱边界") as HTMLSelectElement).value).toBe("workspace_write");
   });
 
-  it("requires both server support and global rule review to choose auto review", async () => {
+  it("enables rule review when choosing an advertised auto review default and preserves it after reload", async () => {
     currentSettings.tool_approval_mode = "ask";
     const user = userEvent.setup();
-    render(<TestApp initialPath="/config" />);
+    const view = render(<TestApp initialPath="/config" />);
     const group = await screen.findByRole("group", { name: "沙箱权限" });
     const mode = within(group).getByLabelText("默认权限模式");
     const auto = within(mode).getByRole("option", { name: /自动审查/ }) as HTMLOptionElement;
-    expect(auto.disabled).toBe(true);
-    await user.selectOptions(screen.getByLabelText("工具审批模式"), "auto_review");
     expect(auto.disabled).toBe(false);
+    await user.selectOptions(mode, "auto_review");
+    expect((mode as HTMLSelectElement).value).toBe("auto_review");
+    expect((screen.getByLabelText("工具审批模式") as HTMLSelectElement).value).toBe("auto_review");
+    expect((screen.getByLabelText("高风险工具调用必须审批") as HTMLInputElement).checked).toBe(true);
+    expect(auto.textContent).toContain("仅规则审查，非独立模型");
+    expect(requests.some((request) => request.path === "/api/v1/admin/settings")).toBe(false);
+    await user.click(screen.getByRole("button", { name: "保存系统设置" }));
+    expect((await screen.findByRole("status")).textContent).toContain("系统设置已保存");
+    const writes = requests.filter((request) => request.path === "/api/v1/admin/settings");
+    expect(writes).toHaveLength(1);
+    expect(writes[0]).toMatchObject({
+      method: "PUT",
+      body: {
+        default_permission_mode: "auto_review", tool_approval_mode: "auto_review",
+        require_approval_for_tools: true, default_sandbox_profile: "workspace_write",
+      },
+    });
+    expect(writes[0].body).not.toHaveProperty("supported_permission_modes");
+
+    view.unmount();
+    render(<TestApp initialPath="/config" />);
+    expect((await screen.findByLabelText("默认权限模式") as HTMLSelectElement).value).toBe("auto_review");
+    expect((screen.getByLabelText("工具审批模式") as HTMLSelectElement).value).toBe("auto_review");
+    expect((screen.getByLabelText("高风险工具调用必须审批") as HTMLInputElement).checked).toBe(true);
+  });
+
+  it("rejects saving an auto review default after rule review is manually disabled", async () => {
+    const user = userEvent.setup();
+    render(<TestApp initialPath="/config" />);
+    const mode = await screen.findByLabelText("默认权限模式");
     await user.selectOptions(mode, "auto_review");
     await user.selectOptions(screen.getByLabelText("工具审批模式"), "ask");
     await user.click(screen.getByRole("button", { name: "保存系统设置" }));
@@ -505,11 +532,15 @@ describe("ConfigPage", () => {
     expect(requests.some((request) => request.path === "/api/v1/admin/settings")).toBe(false);
   });
 
-  it("disables an unadvertised mode even when global rule review is enabled", async () => {
+  it.each(["ask", "auto_review"])("disables an unadvertised mode with %s rule review", async (approvalMode) => {
     currentSettings.supported_permission_modes = ["default", "read_only"];
+    currentSettings.tool_approval_mode = approvalMode;
     render(<TestApp initialPath="/config" />);
     const group = await screen.findByRole("group", { name: "沙箱权限" });
     expect((within(group).getByRole("option", { name: /自动审查/ }) as HTMLOptionElement).disabled).toBe(true);
+    fireEvent.change(within(group).getByLabelText("默认权限模式"), { target: { value: "auto_review" } });
+    expect((within(group).getByLabelText("默认权限模式") as HTMLSelectElement).value).toBe("default");
+    expect((screen.getByLabelText("工具审批模式") as HTMLSelectElement).value).toBe(approvalMode);
   });
 
   it("disables new defaults for old services and saves only the legacy payload", async () => {

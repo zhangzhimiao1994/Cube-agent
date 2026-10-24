@@ -363,7 +363,8 @@ async def test_gateway_capability_tool_routes_through_harness_with_actor_identit
 
     result = await tool.run_json({"query": "evidence"}, CancellationToken(), call_id="call_1")
 
-    assert result.result == {"items": ("source-a",)}
+    assert result.result == {"items": ["source-a"]}
+    assert durability.artifacts[-1].content["result"]["items"] == ("source-a",)
     assert len(harness_gateway.calls) == 1
     tenant_id, request, user_id, role = harness_gateway.calls[0]
     assert tenant_id == ctx.tenant_id

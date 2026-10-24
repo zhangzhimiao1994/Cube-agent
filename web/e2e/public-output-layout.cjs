@@ -54,6 +54,61 @@ async function open(viewport, route) {
 for (const [device, viewport] of [
   ['desktop', { width: 1280, height: 900 }], ['mobile', { width: 390, height: 844 }],
 ]) {
+  test(`${device}: workbench summary explains errors and retains original records`, async () => {
+    const { context, page, errors } = await open(viewport, '/conversation?feedback=1');
+    try {
+      await page.getByRole('button', { name: /Agent 工作席/ }).click();
+      const dialog = page.getByRole('dialog', { name: 'Agent 工作席详情', exact: true });
+      const summary = dialog.getByRole('region', { name: '进展摘要', exact: true });
+      await expect(summary).toContainText('数据序列化错误');
+      await expect(summary).not.toContainText('EXPLICIT_CAPABILITY_CALLS_JSON');
+      await expect(summary).not.toContainText('mappingproxy');
+      await screenshot(page, `${device}-workbench-readable-summary`);
+      await dialog.getByRole('tab', { name: '真实调度记录', exact: true }).click();
+      await expect(dialog.getByRole('tabpanel')).toContainText('mappingproxy');
+      await screenshot(page, `${device}-workbench-original-records`);
+      await dialog.getByRole('button', { name: '关闭', exact: true }).click();
+      await expect(dialog).toHaveCount(0);
+      assert.deepEqual(errors, []);
+    } finally { await context.close(); }
+  });
+
+  test(`${device}: machine JSON is a bounded editor rather than prose`, async () => {
+    const { context, page, errors } = await open(viewport, '/?machine=1');
+    try {
+      const message = page.locator('.chat-message.assistant');
+      const code = message.locator('.code-block-editor');
+      await expect(code).toBeVisible();
+      const pre = code.getByLabel('json完整内容');
+      await expect(pre).toContainText('Workspace contains 0 files.');
+      assert.equal(await message.locator('.message-paragraph').count(), 0);
+      await code.getByRole('button', { name: '换行', exact: true }).click();
+      await expect(code.getByRole('button', { name: '不换行', exact: true })).toHaveAttribute('aria-pressed', 'true');
+      assert(await pre.evaluate(el => el.scrollWidth <= el.clientWidth + 1));
+      await screenshot(page, `${device}-machine-json-editor`);
+      assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1));
+      assert.deepEqual(errors, []);
+    } finally { await context.close(); }
+  });
+
+  test(`${device}: auto review can be selected directly and saved consistently`, async () => {
+    const { context, page, errors } = await open(viewport, '/config');
+    try {
+      const mode = page.getByRole('combobox', { name: '默认权限模式', exact: true });
+      await expect(mode).toBeVisible();
+      await expect(page.getByRole('combobox', { name: '工具审批模式', exact: true })).toHaveValue('ask');
+      await mode.selectOption('auto_review');
+      await expect(mode).toHaveValue('auto_review');
+      await expect(page.getByRole('combobox', { name: '工具审批模式', exact: true })).toHaveValue('auto_review');
+      await expect(page.getByRole('checkbox', { name: '高风险工具调用必须审批', exact: true })).toBeChecked();
+      await page.getByRole('button', { name: '保存系统设置', exact: true }).click();
+      await expect(mode).toHaveValue('auto_review');
+      await screenshot(page, `${device}-auto-review-selected`);
+      assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1));
+      assert.deepEqual(errors, []);
+    } finally { await context.close(); }
+  });
+
   test(`${device}: delivery links and preview prioritize the complete filename`, async () => {
     const { context, page, errors } = await open(viewport, '/conversation?files=1');
     try {

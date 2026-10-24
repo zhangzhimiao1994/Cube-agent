@@ -12,6 +12,41 @@ afterEach(() => {
 });
 
 describe("shared output rendering", () => {
+  it("shows complete machine JSON in an editor while copying the original source", async () => {
+    const user = userEvent.setup();
+    const copy = vi.spyOn(navigator.clipboard, "writeText").mockResolvedValue();
+    const text = '{"result":{"summary":"Workspace contains 0 files.","workspace_files":[]}}';
+    const { container } = render(<OutputContent title="历史输出" text={text} />);
+    const pre = screen.getByLabelText("json完整内容");
+    expect(pre.querySelector("code")?.textContent).toBe(text);
+    expect(pre.querySelector(".hljs-attr")).toBeTruthy();
+    expect(container.querySelector(".message-paragraph")).toBeNull();
+    await user.click(screen.getByRole("button", { name: "复制 json 代码" }));
+    await waitFor(() => expect(copy).toHaveBeenCalledWith(text));
+  });
+
+  it("keeps JSON arrays structured without interpreting their HTML strings", () => {
+    const text = '[{"output":"<script>window.PWNED=1</script>","count":0}]';
+    const { container } = render(<OutputContent title="技术详情" text={text} />);
+    expect(screen.getByLabelText("json完整内容").textContent).toBe(text);
+    expect(container.querySelector("script")).toBeNull();
+  });
+
+  it("preserves machine numeric precision and does not reinterpret malformed JSON", () => {
+    const text = '{"id":900719925474099312345,"ratio":1e-30}';
+    const { rerender } = render(<OutputContent title="技术详情" text={text} />);
+    expect(screen.getByLabelText("json完整内容").textContent).toBe(text);
+    rerender(<OutputContent title="回复" text={'{"unfinished":'} />);
+    expect(screen.queryByLabelText("json完整内容")).toBeNull();
+    expect(screen.getByText('{"unfinished":')).toBeTruthy();
+  });
+
+  it("does not treat natural-language braces or primitive values as machine reports", () => {
+    const { container } = render(<OutputContent title="回复" text={'{说明：保留这个占位符}\n\n123\n\n完成。'} />);
+    expect(container.querySelector("pre")).toBeNull();
+    expect(container.querySelectorAll("p")).toHaveLength(3);
+  });
+
   it("renders Markdown heading levels, inline emphasis and separate paragraphs instead of source markers", () => {
     const { container } = render(<OutputContent title="回复" text={
       "# 调查结果\n\n第一段 **重点**、*说明*和 `config.json`。\n\n第二段。\n\n## 下一步\n\n### 验证\n\n---"

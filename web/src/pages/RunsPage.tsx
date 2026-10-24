@@ -2612,6 +2612,7 @@ function detailMessages(detail: RunDetail | undefined): ChatMessage[] {
           .map(downloadArtifactMessage),
       ]
     : detail.artifacts
+        .filter((artifact) => !isIntermediateToolArtifact(artifact))
         .filter((artifact) => !artifact.text?.trim())
         .filter((artifact) => !isFinalDownloadableArtifact(artifact) || shouldShowStandaloneDownloadMessage(artifact))
         .map(artifactMessage);
@@ -2784,12 +2785,17 @@ function toolFailureSummary(event: RunDetail["events"][number]) {
     .join("；");
 }
 
+function isIntermediateToolArtifact(artifact: RunDetail["artifacts"][number]) {
+  return artifact.kind === "tool_result" && artifact.presentation !== "final_answer" && !isFinalDownloadableArtifact(artifact);
+}
+
 function dedupeTextArtifacts(artifacts: RunDetail["artifacts"]) {
+  const replyArtifacts = artifacts.filter((artifact) => !isIntermediateToolArtifact(artifact));
   const seen = new Set<string>();
-  const finalTexts = new Set(artifacts
+  const finalTexts = new Set(replyArtifacts
     .filter((artifact) => artifact.presentation === "final_answer")
     .map((artifact) => artifact.text?.trim()));
-  return artifacts.filter((artifact) => {
+  return replyArtifacts.filter((artifact) => {
     const text = artifact.text?.trim();
     if (!text || isGenericArtifactText(text) || seen.has(text)) return false;
     if (artifact.presentation !== "final_answer" && finalTexts.has(text)) return false;
@@ -5245,12 +5251,33 @@ function recordOriginLabel(item: ProcessDetailTarget) {
   return "系统记录";
 }
 
+function progressFeedbackSummary(text: string, ...sourceTexts: (string | null | undefined)[]) {
+  const sources = [text, ...sourceTexts].filter((value): value is string => typeof value === "string");
+  if (sources.some((value) => /not JSON serializable/i.test(value))) {
+    return "记录到数据序列化错误；完整异常见真实调度记录。";
+  }
+  if (sources.some((value) => /\b(?:EXPLICIT_CAPABILITY_CALLS_JSON|UNTRUSTED_CAPABILITY_RESULTS_JSON)\s*=/.test(value))) {
+    return "记录了内部工具调用协议；是否执行以工具事件为准。";
+  }
+  if (sources.some((value) => /Traceback \(most recent call last\)|\b(?:TypeError|ValueError|RuntimeError|SyntaxError|Exception):/.test(value))) {
+    return "记录到运行异常；完整异常见真实调度记录。";
+  }
+  if (sources.some((value) => prettyJsonValue(value.trim()) !== null)) return "记录了结构化反馈；完整内容见真实调度记录。";
+  return text.trim() || "未提供公开正文";
+}
+
 function RunProgressSummary({ detail, agentId, items }: {
   detail?: RunDetail; agentId?: string | null; items: ProcessDetailTarget[];
 }) {
   const actual = actualWorkbenchItems(items);
   const excerpts = detail ? orderedRunEvents(detail.events).filter((event) =>
     event.kind === "message.created" && (!agentId || event.actor === agentId)) : [];
+  const visibleExcerpts = excerpts.slice(-3);
+  const latest = actual.at(-1);
+  const latestEvent = detail?.events.find((event) => event.sequence === latest?.sourceSequence && event.kind === latest?.sourceKind);
+  const latestText = latestEvent?.kind === "message.created"
+    ? latestEvent.message === latestEvent.kind ? latestEvent.summary || "未提供公开正文" : latestEvent.message
+    : latest?.message || "暂无真实调度记录";
   const status = detail ? ({
     completed: "本轮已结束", failed: "本轮中断", cancelled: "本轮已取消",
     waiting_approval: "等待确认", queued: "排队中", waiting_capacity: "等待模型容量", running: "进行中",
@@ -5259,22 +5286,22 @@ function RunProgressSummary({ detail, agentId, items }: {
     event.kind === "step.completed" && (!agentId || event.actor === agentId)).length ?? 0;
   const blocker = detail?.status === "failed" ? failureSummaryForChat(detail)
     : detail?.status === "waiting_approval" ? "等待本轮确认后继续。" : null;
-  return <section className="process-progress-summary" aria-label="进展摘要">
+  return <section className="process-progress-summary" aria-label="进展摘要" style={{ whiteSpace: "normal", overflowWrap: "anywhere" }}>
     <dl className="process-progress-facts">
       <div><dt>当前进展</dt><dd>{status}</dd></div>
       <div><dt>已记录完成</dt><dd>{completed ? `${completed} 个步骤` : "暂无步骤完成记录"}</dd></div>
-      <div><dt>最近记录</dt><dd>{actual.at(-1)?.message ?? "暂无真实调度记录"}</dd></div>
-      {blocker ? <div><dt>阻塞</dt><dd>{blocker}</dd></div> : null}
+      <div><dt>最近记录</dt><dd>{progressFeedbackSummary(latestText, latestEvent?.message, latestEvent?.summary)}</dd></div>
+      {blocker ? <div><dt>阻塞</dt><dd>{progressFeedbackSummary(blocker)}</dd></div> : null}
     </dl>
     <section className="process-public-excerpts" aria-label="公开发言摘录">
       <h4>公开记录摘录</h4>
-      {excerpts.length ? excerpts.map((event) => <article key={event.sequence}>
-        <small>{event.actor || "系统"} · 来源类型未标注</small>
-        <BoundedTextBlock label="公开反馈" text={event.message === event.kind
-          ? event.summary || "未提供公开正文" : event.message} shouldCollapse
-          copyAriaLabel="复制公开反馈" />
+      {visibleExcerpts.length ? visibleExcerpts.map((event) => <article key={event.sequence}>
+        <small>{event.actor || "系统"} · 公开消息事件</small>
+        <p>{progressFeedbackSummary(event.message === event.kind ? event.summary || "未提供公开正文" : event.message,
+          event.message, event.summary)}</p>
         <time dateTime={event.created_at}>{event.created_at}</time>
       </article>) : <p>暂无公开发言记录</p>}
+      {excerpts.length > visibleExcerpts.length ? <p>另有 {excerpts.length - visibleExcerpts.length} 条公开消息保留在真实调度记录中。</p> : null}
     </section>
     <p className="process-minutes-unavailable">未生成会议纪要</p>
   </section>;
@@ -5389,10 +5416,14 @@ function AgentWorkbenchDrawer({
               </div>) : <p>暂无真实调度记录</p>}
             </section>
             {publicTexts.length ? <section className="process-public-artifacts" aria-label="公开文本产物">
-              {publicTexts.map((artifact) => <article key={artifact.id}>
-                <h4>{artifact.title}</h4><small>公开产物 · 来源绑定未提供</small>
-                <BoundedTextBlock label="公开文本" text={artifact.text!} shouldCollapse copyAriaLabel="复制公开文本" />
-              </article>)}
+              {publicTexts.map((artifact) => {
+                const isToolJson = artifact.kind === "tool_result" && prettyJsonValue(artifact.text!.trim()) !== null;
+                return <article key={artifact.id}>
+                  <h4>{artifact.title}</h4><small>公开产物 · 来源绑定未提供</small>
+                  <BoundedTextBlock label={isToolJson ? "json" : "公开文本"} language={isToolJson ? "json" : undefined}
+                    text={artifact.text!} shouldCollapse copyAriaLabel={isToolJson ? "复制工具 JSON" : "复制公开文本"} />
+                </article>;
+              })}
             </section> : null}
             <RunFailureDiagnosticsPanel diagnostics={failureDiagnostics} />
             <RunExecutionIntentsPanel intents={executionIntents} />

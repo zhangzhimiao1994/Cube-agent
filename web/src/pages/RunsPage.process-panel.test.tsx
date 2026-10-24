@@ -40,10 +40,11 @@ function fixture(mode = "discuss"): RunDetail {
   };
 }
 
-async function mount(mode?: string, empty = false) {
+async function mount(mode?: string, empty = false, overrides: Partial<RunDetail> = {}) {
   const user = userEvent.setup();
   const run = fixture(mode);
   if (empty) run.events = [];
+  Object.assign(run, overrides);
   const conversation: Conversation = {
     conversation_id: "conv-panel", title: "Panel fixture", project_id: "fixture", project_label: "Fixture",
     workspace_path: "main", archived_at: null, created_at: run.created_at, updated_at: run.created_at, runs: [run],
@@ -67,10 +68,122 @@ async function mount(mode?: string, empty = false) {
   </MemoryRouter></AuthProvider></QueryClientProvider>);
   const stream = await screen.findByRole("region", { name: "主对话内容" });
   await user.click(await within(stream).findByRole("button", { name: /Agent 工作席/ }));
-  return { user, panel: screen.getByRole("dialog", { name: "Agent 工作席详情" }) };
+  return { user, stream, run, panel: screen.getByRole("dialog", { name: "Agent 工作席详情" }) };
 }
 
 describe("one process panel with summary and genuine records", () => {
+  it("keeps empty workspace tool JSON in its source reader and out of the running conversation reply", async () => {
+    const text = JSON.stringify({ result: { summary: "Workspace contains 0 files.", workspace_files: [],
+      bundle_download_url: "/api/v1/workspaces/projects/fixture/sessions/main/bundle/download" } });
+    const artifacts = [{ id: "workspace-list", kind: "tool_result", title: "project_engineer", text,
+      presentation: "step_detail" }];
+    const { user, stream, run, panel } = await mount("direct", false, { status: "running", artifacts });
+    expect(stream.querySelectorAll(".chat-message.assistant")).toHaveLength(0);
+    await user.click(within(panel).getByRole("tab", { name: "真实调度记录" }));
+    const evidence = within(panel).getByRole("region", { name: "公开文本产物" });
+    const reader = within(evidence).getByLabelText("json完整内容");
+    expect(reader.querySelector("code")?.textContent).toBe(text);
+    expect(reader.querySelector("code")?.getAttribute("data-language")).toBe("json");
+    expect(reader.querySelector("input,textarea,[contenteditable=true]")).toBeNull();
+    expect(within(evidence).getByRole("button", { name: "复制工具 JSON" })).toBeTruthy();
+    expect(run.artifacts).toEqual(artifacts);
+  });
+
+  it.each([
+    ["Object of type mappingproxy is not JSON serializable", "数据序列化错误"],
+    ['EXPLICIT_CAPABILITY_CALLS_JSON=[{"name":"workspace.list","arguments":{}}]', "内部工具调用协议"],
+  ])("summarizes %s honestly while preserving its original event in real records", async (text, summary) => {
+    const detail = fixture("direct");
+    const event = { ...detail.events[2], sequence: 8, message: text };
+    const events = [...detail.events.filter((item) => !["message.created", "runtime.failed"].includes(item.kind)), event];
+    const { user, run, panel } = await mount("direct", false, { status: "running", events });
+    const progress = within(panel).getByRole("region", { name: "进展摘要" });
+    expect(progress.textContent).toContain("进行中");
+    expect(progress.textContent).toContain(summary);
+    expect(progress.textContent).not.toMatch(/mappingproxy|EXPLICIT_CAPABILITY_CALLS_JSON|not JSON serializable/);
+    expect(progress.textContent).not.toContain("本轮已结束");
+    await user.click(within(panel).getByRole("tab", { name: "真实调度记录" }));
+    const records = within(panel).getByRole("tabpanel");
+    await user.click(within(records).getAllByRole("button", { name: /展开记录/ }).at(-1)!);
+    expect(within(records).getByRole("region", { name: "记录详情" }).textContent).toContain(text);
+    expect(run.events).toEqual(events);
+  });
+
+  it("explains a recorded serialization failure in Chinese without removing the failed outcome", async () => {
+    const detail = fixture("direct");
+    const events = detail.events.map((event) => event.kind === "runtime.failed"
+      ? { ...event, message: "Object of type mappingproxy is not JSON serializable" } : event);
+    const { panel } = await mount("direct", false, { events });
+    const progress = within(panel).getByRole("region", { name: "进展摘要" });
+    expect(progress.textContent).toContain("本轮中断");
+    expect(progress.textContent).toContain("数据序列化错误");
+    expect(progress.textContent).not.toContain("mappingproxy");
+  });
+
+  it("detects a protocol marker in the full summary when the message is an event placeholder", async () => {
+    const detail = fixture("direct");
+    const summary = '工具调用仍待确认，请以真实工具事件判断是否已执行。EXPLICIT_CAPABILITY_CALLS_JSON=[{"name":"workspace.list"}]';
+    const events = [{ ...detail.events[2], message: "message.created", summary }];
+    const { user, panel, run } = await mount("direct", false, { status: "running", events });
+    const progress = within(panel).getByRole("region", { name: "进展摘要" });
+    const latest = within(progress).getByText("最近记录").nextElementSibling!;
+    expect(latest.textContent).toContain("内部工具调用协议");
+    expect(progress.textContent).not.toContain("EXPLICIT_CAPABILITY_CALLS_JSON");
+    await user.click(within(panel).getByRole("tab", { name: "真实调度记录" }));
+    await user.click(within(panel).getByRole("button", { name: /展开记录/ }));
+    expect(within(panel).getByRole("region", { name: "记录详情" }).textContent).toContain(summary);
+    expect(run.events).toEqual(events);
+  });
+
+  it("checks the full summary for protocol even when the visible message contains ordinary prose", async () => {
+    const detail = fixture("direct");
+    const events = [{ ...detail.events[2], message: "已收到反馈，工具执行情况仍待确认。",
+      summary: 'UNTRUSTED_CAPABILITY_RESULTS_JSON=[{"status":"failed"}]' }];
+    const { panel } = await mount("direct", false, { status: "running", events });
+    const progress = within(panel).getByRole("region", { name: "进展摘要" });
+    const latest = within(progress).getByText("最近记录").nextElementSibling!;
+    const excerpts = within(progress).getByRole("region", { name: "公开发言摘录" });
+    expect(latest.textContent).toContain("内部工具调用协议");
+    expect(excerpts.textContent).toContain("内部工具调用协议");
+    expect(progress.textContent).not.toContain("UNTRUSTED_CAPABILITY_RESULTS_JSON");
+  });
+
+  it("retains failure, limitation and unknown facts after the first sentence in recent feedback and excerpts", async () => {
+    const detail = fixture("direct");
+    const text = "文件已写入。\n验证失败：2 tests failed，exit code 1。\n限制：离线环境未运行浏览器验证。\n未知：部署结果尚未确认。";
+    const events = [{ ...detail.events[2], message: text, summary: "文件已写入。" }];
+    const { panel, run } = await mount("direct", false, { status: "running", events });
+    const progress = within(panel).getByRole("region", { name: "进展摘要" });
+    const latest = within(progress).getByText("最近记录").nextElementSibling!;
+    const excerpts = within(progress).getByRole("region", { name: "公开发言摘录" });
+    expect(latest.textContent).toBe(text);
+    expect(excerpts.querySelector("article p")?.textContent).toBe(text);
+    expect(progress.textContent).toContain("进行中");
+    expect(progress.textContent).not.toContain("本轮已结束");
+    expect(run.events).toEqual(events);
+  });
+
+  it("bounds the progress excerpt list while retaining the complete event history", async () => {
+    const detail = fixture("direct");
+    const events = Array.from({ length: 5 }, (_, index) => ({ ...detail.events[2], sequence: index + 1,
+      message: `PUBLIC_FEEDBACK_${index}` }));
+    const { panel, run } = await mount("direct", false, { status: "running", events });
+    const excerpts = within(panel).getByRole("region", { name: "公开发言摘录" });
+    expect(excerpts.querySelectorAll("article")).toHaveLength(3);
+    expect(excerpts.textContent).not.toContain("PUBLIC_FEEDBACK_0");
+    expect(excerpts.textContent).toContain("另有 2 条公开消息");
+    expect(run.events).toEqual(events);
+  });
+
+  it("keeps the existing safe tool summary instead of exposing a raw tool message", async () => {
+    const detail = fixture("direct");
+    const event = { ...detail.events[3], sequence: 8, message: "PRIVATE_TOOL_COMMAND" };
+    const { panel } = await mount("direct", false, { status: "running", events: [event] });
+    const progress = within(panel).getByRole("region", { name: "进展摘要" });
+    expect(progress.textContent).not.toContain("PRIVATE_TOOL_COMMAND");
+    expect(progress.textContent).toContain("编辑文件完成");
+  });
+
   it.each(["direct", "dispatch", "discuss", "hybrid"])("keeps the same two tabs for %s and an individual agent", async (mode) => {
     const { user, panel } = await mount(mode);
     expect(within(panel).getByRole("tab", { name: "摘要" }).getAttribute("aria-selected")).toBe("true");
