@@ -264,7 +264,7 @@ def test_negative_reads_inspection_and_model_text_never_earn_credit(name: str) -
     ("position", True), ("position", 1), ("position", -1), ("actor", "other"),
     ("name", "workspace.read"), ("arguments_hash", "d" * 64),
     ("arguments_hash", "bad"), ("idempotency_key", "d" * 64),
-    ("artifact_id", str(uuid4())), ("artifact_sha256", "d" * 64),
+    pytest.param("artifact_id", str(uuid4()), id="artifact_id-unrelated"), ("artifact_sha256", "d" * 64),
     ("status", {"unexpected": "mapping"}),
 ])
 def test_negative_corrupt_first_row_cannot_borrow_later_success(

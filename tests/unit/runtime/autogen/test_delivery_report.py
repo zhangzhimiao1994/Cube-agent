@@ -229,7 +229,7 @@ def test_producer_or_tool_summary_cannot_impersonate_model(producer: str, kind: 
 
 @pytest.mark.parametrize("field,value", [
     ("request_hash", "invalid"), ("request_hash", None),
-    ("artifact_id", str(uuid4())), ("artifact_sha256", "d" * 64),
+    pytest.param("artifact_id", str(uuid4()), id="artifact_id-unrelated"), ("artifact_sha256", "d" * 64),
 ])
 def test_model_ledger_reference_must_match_actual_artifact(field: str, value: JsonValue) -> None:
     evidence = fixture()
@@ -256,7 +256,7 @@ def test_hash_only_and_orphaned_artifacts_are_insufficient() -> None:
 @pytest.mark.parametrize("field,value", [
     ("name", "workspace.read"), ("actor", "outsider"), ("position", True),
     ("arguments_hash", "d" * 64), ("idempotency_key", "d" * 64),
-    ("artifact_sha256", "d" * 64), ("artifact_id", str(uuid4())),
+    ("artifact_sha256", "d" * 64), pytest.param("artifact_id", str(uuid4()), id="artifact_id-unrelated"),
 ])
 def test_last_tool_row_must_be_current_run_bundle(field: str, value: JsonValue) -> None:
     evidence = fixture()
