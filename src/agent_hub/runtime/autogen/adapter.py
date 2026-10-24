@@ -1951,7 +1951,7 @@ class GatewayCapabilityTool(BaseTool[_DynamicToolArguments, _DynamicToolResult])
                     )
                 )
                 await self._durability.succeed_tool(artifact)
-                return _DynamicToolResult(result=dict(reusable_result))
+                return _DynamicToolResult(result=cast(dict[str, object], _mutable_json(reusable_result)))
             self._records.append(
                 _ToolRecord(
                     EventKind.TOOL_FAILED,
@@ -1997,7 +1997,7 @@ class GatewayCapabilityTool(BaseTool[_DynamicToolArguments, _DynamicToolResult])
             )
         )
         await self._durability.succeed_tool(artifact)
-        return _DynamicToolResult(result=cast(dict[str, object], dict(tool_result.payload)))
+        return _DynamicToolResult(result=cast(dict[str, object], _mutable_json(tool_result.payload)))
 
 
 def _model_tool_definitions(

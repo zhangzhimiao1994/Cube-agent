@@ -383,15 +383,16 @@ function IdentityConfigPage() {
                 disabled={settings.supported_permission_modes.length === 0}
                 onChange={(event) => {
                   const next = event.target.value as SystemSettings["default_permission_mode"];
-                  if (!settings.supported_permission_modes.includes(next) || (next === "auto_review" && settings.tool_approval_mode !== "auto_review")) return;
+                  if (!settings.supported_permission_modes.includes(next)) return;
                   updateSettings({
                     default_permission_mode: next,
+                    ...(next === "auto_review" ? { tool_approval_mode: "auto_review" as const } : {}),
                     default_sandbox_profile: next === "read_only" ? "read_only"
                       : settings.default_sandbox_profile === "read_only" ? "workspace_write" : settings.default_sandbox_profile,
                   });
                 }}>
                 <option value="default" disabled={!settings.supported_permission_modes.includes("default")}>默认权限：边界内操作，需审批时人工确认</option>
-                <option value="auto_review" disabled={!settings.supported_permission_modes.includes("auto_review") || settings.tool_approval_mode !== "auto_review"}>自动审查：仅规则审查，非独立模型</option>
+                <option value="auto_review" disabled={!settings.supported_permission_modes.includes("auto_review")}>自动审查：仅规则审查，非独立模型</option>
                 <option value="read_only" disabled={!settings.supported_permission_modes.includes("read_only")}>只读</option>
               </select>
             </label>

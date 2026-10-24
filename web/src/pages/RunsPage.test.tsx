@@ -764,6 +764,53 @@ describe("conversation ordering", () => {
     expect(reply?.body).toContain("Delivered and checked.");
   });
 
+  it.each(["running", "completed"])("keeps intermediate tool JSON out of %s replies without inventing delivery", (status) => {
+    const text = JSON.stringify({ result: { summary: "Workspace contains 0 files.", workspace_files: [],
+      bundle_download_url: "/api/v1/workspaces/projects/fixture/sessions/main/bundle/download" } });
+    const run: RunDetail = { ...baseRun, status, artifacts: [
+      { id: "workspace-list", kind: "tool_result", title: "main", text },
+    ] };
+    const original = JSON.stringify(run);
+    const messages = conversationMessages([run]);
+    expect(messages.some((message) => message.title === "回复")).toBe(false);
+    expect(messages.some((message) => message.body.includes(text))).toBe(false);
+    if (status === "running") expect(messages.map((message) => message.title)).toEqual(["你"]);
+    else expect(messages.find((message) => message.title === "暂无交付结果")?.body).toContain("不能据此确认项目完成");
+    expect(JSON.stringify(run)).toBe(original);
+  });
+
+  it.each(["main", "implementer"])("does not let a later %s tool result replace or deduplicate a real reply", (title) => {
+    const text = "The workspace is still empty; delivery is not ready.";
+    const run: RunDetail = { ...baseRun, artifacts: [
+      { id: "tool-before", kind: "tool_result", title, text, presentation: "step_detail" },
+      { id: "answer", kind: "text", title: "main", text },
+      { id: "tool-after", kind: "tool_result", title, text: "Workspace contains 0 files." },
+    ] };
+    const reply = conversationMessages([run]).find((message) => message.title === "回复");
+    expect(reply?.id).toContain("answer");
+    expect(reply?.body).toBe(text);
+  });
+
+  it("does not turn a textless intermediate tool result into an attachment reply", () => {
+    const running: RunDetail = { ...baseRun, artifacts: [
+      { id: "workspace-list", kind: "tool_result", title: "main" },
+    ] };
+    expect(conversationMessages([running]).map((message) => message.title)).toEqual(["你"]);
+    expect(conversationMessages([{ ...running, status: "completed" }]).map((message) => message.title))
+      .toEqual(["你", "暂无交付结果"]);
+  });
+
+  it.each(["text", "tool_result"])("preserves a %s JSON final answer as upstream evidence rather than inventing a successful summary", (kind) => {
+    const text = JSON.stringify({ result: { summary: "Workspace contains 0 files.", workspace_files: [] } });
+    const run: RunDetail = { ...baseRun, status: "completed", artifacts: [
+      { id: "final-json", kind, title: "delivery_main_agent", text, presentation: "final_answer" },
+      { id: "later-tool", kind: "tool_result", title: "main", text: "Later tool output." },
+    ] };
+    const reply = conversationMessages([run]).find((message) => message.title === "回复");
+    expect(reply?.id).toContain("final-json");
+    expect(reply?.body).toBe(text);
+  });
+
   it.each([undefined, "", " \n\t "])("ignores empty final answer text (%s) while retaining legacy replies", (text) => {
     const run: RunDetail = { ...baseRun, artifacts: [
       { id: "ordinary", kind: "text", title: "main", text: "An ordinary reply." },

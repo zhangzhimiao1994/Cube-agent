@@ -42,6 +42,7 @@ async def test_direct_delivery_preserves_explicit_summary_without_changing_file_
     before = deepcopy(artifact)
     projected = _admin_run_artifact(artifact, run_id=uuid4())
     assert projected.text == SUMMARY
+    assert projected.presentation == 'final_attachment'
     assert projected.filename == 'project.zip' and projected.sha256 == 'a' * 64
     assert projected.download_url is not None
     assert artifact == before
@@ -82,7 +83,9 @@ def test_non_direct_or_malformed_summary_is_not_promoted(defect: str) -> None:
     else:
         content['summary'] = {'summary_object': {'raw': 'PRIVATE_LOG'}, 'summary_blank': ' ',
                               'summary_secret': 'password=PRIVATE_SECRET'}[defect]
-    assert _admin_run_artifact(artifact, run_id=uuid4()).text is None
+    projected = _admin_run_artifact(artifact, run_id=uuid4())
+    assert projected.text is None
+    assert projected.presentation != 'final_answer'
 
 
 def test_arbitrary_summary_and_raw_tool_or_model_content_stay_private() -> None:

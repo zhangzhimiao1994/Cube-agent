@@ -1,9 +1,6 @@
 import { createRoot } from "react-dom/client";
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { MemoryRouter, Route, Routes } from "react-router-dom";
 
-import { conversationMessages, MessageBody, RunsPage } from "../../src/pages/RunsPage";
-import { RunDetailPage } from "../../src/pages/RunDetailPage";
+import { conversationMessages, MessageBody } from "../../src/pages/RunsPage";
 import type { RunDetail } from "../../src/api/client";
 import { useVisibleViewport } from "../../src/app/useVisibleViewport";
 import { TestApp } from "../../src/app/router";
@@ -26,6 +23,10 @@ const payload = Object.fromEntries(Array.from({ length: count }, (_, i) => [`fie
 const longText = `## 长回复\n\n**关键结论**与 \`settings.json\`：${"长回复正文需要保留一致的文字层级。".repeat(80)}末尾完整内容。`;
 const artifact = { id: "reply", title: "main", kind: "markdown",
   text: new URLSearchParams(location.search).has("long") ? longText : mixed };
+if (new URLSearchParams(location.search).has("machine")) {
+  artifact.text = JSON.stringify({ result: { summary: "Workspace contains 0 files.", workspace_files: [],
+    bundle_download_url: "/api/v1/workspaces/projects/example/sessions/main/bundle/download" } });
+}
 const run = {
   id: "55555555-5555-4555-8555-555555555555", status: "completed", mode: "dispatch", version: 1,
   conversation_id: "layout-conversation", request: "检查结果和排版", created_at: "2026-10-22T00:00:00Z",
@@ -36,6 +37,13 @@ const run = {
   model_outcome_summary: { completion_count: 0, fallback_used: false, fallback_attempt_count: 0,
     requested_logical_models: [], actual_logical_models: [], attempted_logical_models: [], provider_ids: [] },
 } as unknown as RunDetail;
+
+if (new URLSearchParams(location.search).has("feedback")) {
+  run.events.push(...["Object of type mappingproxy is not JSON serializable",
+    'EXPLICIT_CAPABILITY_CALLS_JSON=[{"name":"project.verify","arguments":{}}]'].map((message, index) => ({
+      sequence: index + 2, kind: "message.created", message, actor: "writer", participants: [], payload: {}, created_at: run.created_at!,
+    })));
+}
 
 if (new URLSearchParams(location.search).has("files")) {
   const codeFile = new URLSearchParams(location.search).has("codefile");
@@ -51,9 +59,20 @@ if (new URLSearchParams(location.search).has("files")) {
 // Supply only local fixture data; the components and message selection are production code.
 const conversation = { conversation_id: run.conversation_id, title: "排版回归", project_id: "default",
   project_label: "默认项目", workspace_path: "layout-conversation", created_at:"2026-10-22T00:00:00Z", archived_at: null, runs: [run] };
+let settingsDraft: Record<string, unknown> = { default_mode: "auto", default_workflow_id: null, default_agent_ids: [], log_level: "warning",
+  hermes_enabled: false, safe_tools_enabled: true, require_approval_for_tools: true, tool_approval_mode: "ask",
+  default_permission_mode: "default", default_sandbox_profile: "workspace_write",
+  supported_permission_modes: ["default", "auto_review", "read_only"], channel_entry: "main_agent",
+  default_execution_backend: "systemd", attachment_retention_days: 7, attachment_max_mb: 25 };
 window.fetch = async (input, init) => {
-  if (init?.method && init.method !== "GET") throw new Error("Layout fixture is read-only");
   const url = new URL(String(input), location.origin), path = url.pathname;
+  if (init?.method && init.method !== "GET") {
+    if (location.pathname === "/config" && path === "/api/v1/admin/settings" && init.method === "PUT") {
+      settingsDraft = { ...settingsDraft, ...JSON.parse(String(init.body)) };
+      return new Response(JSON.stringify(settingsDraft), { headers: { "Content-Type": "application/json" } });
+    }
+    throw new Error("Only local fixture settings may be saved");
+  }
   const data = path === "/api/v1/auth/me" ? {user_id:"11111111-1111-4111-8111-111111111111",
     tenant_id:"00000000-0000-4000-8000-000000000001",username:"test",role:"super_admin",permissions:["*"]}
     : path === "/api/v1/admin/runs" ? [run]
@@ -70,31 +89,29 @@ window.fetch = async (input, init) => {
       configured_root: "/fixture/workspaces", logical_root: "projects/default", directories: ["main"], native_picker_available: false }
     : path.endsWith("/execution-backends") ? [{id:"systemd",name:"本机 systemd 隔离",adapter:"SystemdSkillSandbox",
       description:"本地只读布局夹具中的可用执行器状态",available:true,reason:null,isolation:"严格隔离",cost:"本机资源",supported_sandbox_profiles:["none","read_only","restricted","workspace_write"]}]
-    : path.endsWith("/settings") ? { default_mode: "auto", default_workflow_id: null, default_agent_ids: [], log_level: "warning",
-      hermes_enabled: false, safe_tools_enabled: true, require_approval_for_tools: true,
-      channel_entry: "main_agent", default_execution_backend:"systemd", attachment_retention_days: 7, attachment_max_mb: 25 }
+    : path === "/api/v1/config/current" ? { id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", version: 1, status: "published",
+      document: { models: {}, agents: [] }, created_by: "11111111-1111-4111-8111-111111111111", created_at: run.created_at }
+    : path.endsWith("/settings") ? settingsDraft
     : path.endsWith("/main-agent") ? { model: null, control_mode: "supervisor", decision_policy: "", hermes_policy: "off", max_review_rounds: 2 }
     : [];
   return new Response(JSON.stringify(data), { headers: { "Content-Type": "application/json" } });
 };
-const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
 const messages = conversationMessages([run]);
 function FixtureRoot() {
   useVisibleViewport();
+  if (location.pathname === "/config") {
+    sessionStorage.setItem("agent_hub_access_token", "local-layout-fixture");
+    return <TestApp initialPath="/config" />;
+  }
   if (location.pathname === "/shell") {
     sessionStorage.setItem("agent_hub_access_token", "local-readonly-layout-fixture");
     return <TestApp initialPath="/?conversation=layout-conversation" />;
   }
-  return location.pathname === "/detail"
-  ? <QueryClientProvider client={client}><MemoryRouter initialEntries={[`/runs/${run.id}`]}>
-    <Routes><Route path="/runs/:runId" element={<RunDetailPage />} /></Routes>
-  </MemoryRouter></QueryClientProvider>
-  : location.pathname === "/conversation" ? <QueryClientProvider client={client}>
-    <MemoryRouter initialEntries={["/?conversation=layout-conversation"]}><Routes>
-      <Route path="/" element={<RunsPage />} />
-    </Routes></MemoryRouter>
-  </QueryClientProvider>
-  : <main className="chat-stream" style={{ maxWidth: 960, margin: "0 auto" }}>
+  if (location.pathname === "/detail" || location.pathname === "/conversation") {
+    sessionStorage.setItem("agent_hub_access_token", "local-layout-fixture");
+    return <TestApp initialPath={location.pathname === "/detail" ? `/runs/${run.id}` : "/?conversation=layout-conversation"} />;
+  }
+  return <main className="chat-stream" style={{ maxWidth: 960, margin: "0 auto" }}>
     {messages.map((message) => <article key={message.id} className={`chat-message ${message.role}`}>
       <span className="eyebrow">{message.role === "user" ? "你" : "Mofang"}</span>
       <h3>{message.title}</h3><MessageBody text={message.body} title={message.title} />

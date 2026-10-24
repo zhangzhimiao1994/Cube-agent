@@ -17647,6 +17647,8 @@ def _admin_run_artifacts(
 def _artifact_presentation(
     artifact: Mapping[str, object], *, file_metadata: Mapping[str, str | int]
 ) -> str | None:
+    if _direct_delivery_summary(artifact) is not None:
+        return "final_attachment" if file_metadata else "final_answer"
     content = artifact.get("content")
     containers: list[Mapping[str, object]] = []
     if isinstance(content, Mapping):

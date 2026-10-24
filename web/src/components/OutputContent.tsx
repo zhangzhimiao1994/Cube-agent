@@ -248,8 +248,18 @@ export function OutputContent({ text, title, format = "markdown", language = "te
   language?: string;
   copyAriaLabel?: string;
 }) {
-  const tokens = useMemo(() => format === "markdown" ? tokenizeOutput(text) : [], [format, text]);
+  const machineJson = useMemo(() => {
+    if (format !== "markdown" || !/^[\s]*[\[{]/.test(text)) return false;
+    try {
+      const value: unknown = JSON.parse(text);
+      return typeof value === "object" && value !== null;
+    } catch {
+      return false;
+    }
+  }, [format, text]);
+  const tokens = useMemo(() => format === "markdown" && !machineJson ? tokenizeOutput(text) : [], [format, machineJson, text]);
   if (!text) return null;
+  if (machineJson) return <BoundedTextBlock label="json" language="json" text={text} copyAriaLabel="复制 json 代码" />;
   if (tokens === null) return <BoundedTextBlock label="text" text={text} copyAriaLabel="复制全文" />;
   if (format === "code") return <BoundedTextBlock label={language} language={language} text={text}
     copyAriaLabel={copyAriaLabel ?? `复制 ${language} 代码`} />;
