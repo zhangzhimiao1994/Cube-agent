@@ -12,6 +12,7 @@ from typing import cast
 from uuid import UUID
 
 from agent_hub.domain.runs import TaskMode
+from agent_hub.runtime.autogen.model_rejection import validate_rejection
 from agent_hub.runtime.contracts import (
     _MAX_JSON_BYTES,
     _MAX_JSON_NODES,
@@ -72,9 +73,9 @@ def engineering_evidence_limits(
 ) -> EngineeringEvidenceLimits:
     """Derive a soft evidence window without raising any execution or JSON budget.
 
-    Completed, hash-bound outcomes are retention progress, not extra authority.
-    Their references remain in the original repository. Pending outcomes require
-    remaining execution budget. Every extension is capped by the measured JSON
+    Completed, hash-bound outcomes and validated rejection receipts are retention
+    progress, not extra authority. Pending outcomes require remaining execution
+    budget. Every extension is capped by the measured JSON
     metadata-node and complete-envelope-byte headroom, then checked by contracts.
     """
     if (any(type(value) is not int or value < 0 for value in (token_budget, used_tokens))
@@ -101,6 +102,20 @@ def engineering_evidence_limits(
         and registry.get(row["artifact_id"]) == row["artifact_sha256"]
         for row in rows
     )
+    for position, row in enumerate(state["model_ledger"]):
+        if row.get("status") != "rejected" and "rejection" not in row:
+            continue
+        required = {"status", "request_hash", "rejection"}
+        optional = {"required_tool", "max_output_tokens", "timeout_seconds", "report_binding"}
+        if (row.get("status") != "rejected" or position != len(state["model_ledger"]) - 1
+                or not required <= set(row) <= required | optional
+                or not isinstance(row["rejection"], Mapping)):
+            raise ValueError("engineering rejection evidence is invalid")
+        validate_rejection(row["rejection"], run_id=UUID(plain["run_id"]),
+            tenant_id=UUID(plain["tenant_id"]), position=position,
+            request_hash=row.get("request_hash"))
+        # This admits only the stopped receipt itself, never another pending call.
+        completed += 1
     state_nodes, _ = _json_footprint(state)
     _, envelope_bytes = _json_footprint(plain)
     # A future row and its content-addressed reference use the actual observed
