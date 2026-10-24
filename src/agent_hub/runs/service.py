@@ -1979,6 +1979,8 @@ class RunService:
                     routing_decision["delivery_followup_version"] = 2
                     if mode is TaskMode.DISCUSS:
                         routing_decision["engineering_final_report_version"] = 1
+                        routing_decision["engineering_tool_correction_version"] = 1
+                        routing_decision["engineering_checkpoint_ack_version"] = 1
                     if (mode is TaskMode.DISCUSS
                             and type(routing_decision.get("generated_project_contract_version")) is int
                             and routing_decision["generated_project_contract_version"] == 1):

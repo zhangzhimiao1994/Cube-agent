@@ -12,7 +12,10 @@ from typing import cast
 from uuid import UUID
 
 from agent_hub.domain.runs import TaskMode
-from agent_hub.runtime.autogen.model_rejection import validate_rejection
+from agent_hub.runtime.autogen.model_tool_correction import (
+    TOOL_CORRECTION_POLICY,
+    validate_rejected_model_rows,
+)
 from agent_hub.runtime.contracts import (
     _MAX_JSON_BYTES,
     _MAX_JSON_NODES,
@@ -102,20 +105,13 @@ def engineering_evidence_limits(
         and registry.get(row["artifact_id"]) == row["artifact_sha256"]
         for row in rows
     )
-    for position, row in enumerate(state["model_ledger"]):
-        if row.get("status") != "rejected" and "rejection" not in row:
-            continue
-        required = {"status", "request_hash", "rejection"}
-        optional = {"required_tool", "max_output_tokens", "timeout_seconds", "report_binding"}
-        if (row.get("status") != "rejected" or position != len(state["model_ledger"]) - 1
-                or not required <= set(row) <= required | optional
-                or not isinstance(row["rejection"], Mapping)):
-            raise ValueError("engineering rejection evidence is invalid")
-        validate_rejection(row["rejection"], run_id=UUID(plain["run_id"]),
-            tenant_id=UUID(plain["tenant_id"]), position=position,
-            request_hash=row.get("request_hash"))
-        # This admits only the stopped receipt itself, never another pending call.
-        completed += 1
+    repair_version = state.get(TOOL_CORRECTION_POLICY)
+    if TOOL_CORRECTION_POLICY in state and (type(repair_version) is not int or repair_version != 1):
+        raise ValueError("engineering tool correction policy is invalid")
+    records = validate_rejected_model_rows(state["model_ledger"], run_id=UUID(plain["run_id"]),
+        tenant_id=UUID(plain["tenant_id"]), repair_enabled=repair_version == 1)
+    # This admits only stopped receipts, never another pending call.
+    completed += len(records)
     state_nodes, _ = _json_footprint(state)
     _, envelope_bytes = _json_footprint(plain)
     # A future row and its content-addressed reference use the actual observed
