@@ -25,11 +25,10 @@ async def test_real_managed_client_discovers_and_invokes_peer(tmp_path: Path) ->
         r"""
 import json, sys
 while True:
-    header = sys.stdin.buffer.readline()
-    if not header: break
-    length = int(header.decode().split(':',1)[1])
-    assert sys.stdin.buffer.readline() == b'\r\n'
-    request = json.loads(sys.stdin.buffer.read(length))
+    line = sys.stdin.buffer.readline()
+    if not line: break
+    assert line.endswith(b'\n')
+    request = json.loads(line)
     method = request['method']
     if method == 'notifications/initialized': continue
     if method == 'tools/list':
@@ -38,7 +37,7 @@ while True:
         result = {'content':[{'type':'text','text':request['params']['arguments']['text']}]}
     else: result = {}
     raw = json.dumps({'jsonrpc':'2.0','id':request['id'],'result':result}).encode()
-    sys.stdout.buffer.write(f'Content-Length: {len(raw)}\r\n\r\n'.encode()+raw)
+    sys.stdout.buffer.write(raw + b'\n')
     sys.stdout.buffer.flush()
 """,
         encoding="utf-8",
@@ -190,11 +189,10 @@ elif role == 'child':
     spawn('grandchild')
 mark(role + '.pid', str(os.getpid()))
 if role == 'root':
-    header = sys.stdin.buffer.readline()
-    length = int(header.decode('ascii').split(':', 1)[1])
-    if sys.stdin.buffer.readline() != b'\r\n':
+    line = sys.stdin.buffer.readline()
+    if not line.endswith(b'\n'):
         raise RuntimeError('controlled peer received invalid framing')
-    request = json.loads(sys.stdin.buffer.read(length))
+    request = json.loads(line)
     if request['method'] != 'initialize':
         raise RuntimeError('controlled peer expected initialize')
     mark('request-read')
@@ -205,7 +203,7 @@ if role == 'root':
         sys.stdout.buffer.flush()
     elif mode == 'root-exit':
         raw = json.dumps({'jsonrpc': '2.0', 'id': request['id'], 'result': {}}).encode()
-        sys.stdout.buffer.write(f'Content-Length: {len(raw)}\r\n\r\n'.encode() + raw)
+        sys.stdout.buffer.write(raw + b'\n')
         sys.stdout.buffer.flush()
     sys.stdin.buffer.read()
     mark('stdin-eof')
@@ -357,7 +355,7 @@ async def test_managed_malformed_frame_reaps_family_and_preserves_error(tmp_path
         await peer.capture_family()
         started = asyncio.get_running_loop().time()
         (tmp_path / "go").touch()
-        with pytest.raises(RuntimeError, match="^MCP Content-Length is invalid$"):
+        with pytest.raises(RuntimeError, match="Content-Length framing is not supported"):
             await peer.result()
         assert asyncio.get_running_loop().time() - started >= 0.8, "MCP grace was bypassed"
         await peer.assert_family_exited()

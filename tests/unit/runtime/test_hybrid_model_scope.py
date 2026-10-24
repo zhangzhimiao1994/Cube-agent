@@ -492,17 +492,24 @@ async def test_hybrid_success_boundary_rejects_unsealed_scope(
 
 
 @pytest.mark.parametrize("checkpoint", [False, True])
-async def test_hybrid_success_boundary_accepts_complete_scope_shards(checkpoint: bool) -> None:
+@pytest.mark.parametrize("has_delivery", [False, True])
+async def test_hybrid_success_boundary_accepts_complete_scope_shards(
+    checkpoint: bool, has_delivery: bool,
+) -> None:
     parent_id, child_id, tenant_id = uuid4(), uuid4(), uuid4()
     original = completed_scope_events(child_id, tenant_id, variant="valid", checkpoint=checkpoint)
     runtime = HybridRuntime(
         ScopeRuntime(TaskMode.DISPATCH, original), MultiArtifactRuntime(TaskMode.DISCUSS, ()),
-        MultiArtifactRuntime(TaskMode.DIRECT, ()),
+        MultiArtifactRuntime(TaskMode.DIRECT, (Artifact(
+            id=uuid4(), type="text", producer="main", content={"text": "Final result."},
+        ),) if has_delivery else ()),
     )
     events = [event async for event in runtime.run(TaskContext(
         run_id=parent_id, tenant_id=tenant_id, mode=TaskMode.HYBRID, request="answer",
     ))]
-    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert events[-1].kind is (
+        EventKind.RUNTIME_COMPLETED if has_delivery else EventKind.RUNTIME_FAILED
+    )
     assert sum(event.kind == "model.failure_receipt" for event in events) == 2
     assert [event.sequence for event in events] == list(range(1, len(events) + 1))
     for source in original:

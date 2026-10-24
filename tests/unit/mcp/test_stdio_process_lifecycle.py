@@ -76,7 +76,7 @@ async def test_protocol_failure_preserves_error_and_reaps_real_child(
     script = tmp_path / "error_mcp.py"
     script.write_text(
         "import sys, time\n"
-        'sys.stdout.write(\'{"jsonrpc":"2.0","id":1,"error":{"message":"controlled error"}}\\n\')\n'
+        'sys.stdout.write(\'{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"controlled error"}}\\n\')\n'
         "sys.stdout.flush()\n"
         "time.sleep(30)\n",
         encoding="utf-8",
@@ -127,8 +127,7 @@ async def test_extra_stdout_cannot_block_mcp_reaping(
     script = tmp_path / "flooding_mcp.py"
     script.write_text(
         "import os, time\n"
-        "os.write(1, b'Content-Length: 36\\r\\n\\r\\n'"
-        ' b\'{"jsonrpc":"2.0","id":1,"result":{}}\')\n'
+        'os.write(1, b\'{"jsonrpc":"2.0","id":1,"result":{}}\\n\')\n'
         "os.write(1, b'x' * 1_000_000)\n"
         "time.sleep(30)\n",
         encoding="utf-8",
@@ -176,8 +175,7 @@ async def test_inherited_stdout_reports_incomplete_cleanup_without_waiting_for_d
         f"subprocess.Popen([sys.executable, '-I', '-u', '-c', {descendant!r}], "
         "stdin=subprocess.DEVNULL, stdout=sys.stdout, stderr=subprocess.DEVNULL)\n"
         f"while not pathlib.Path({str(ready)!r}).exists(): time.sleep(0.01)\n"
-        "sys.stdout.buffer.write(b'Content-Length: 36\\r\\n\\r\\n'"
-        ' b\'{"jsonrpc":"2.0","id":1,"result":{}}\')\n'
+        'sys.stdout.buffer.write(b\'{"jsonrpc":"2.0","id":1,"result":{}}\\n\')\n'
         "sys.stdout.buffer.flush()\n"
         "time.sleep(30)\n",
         encoding="utf-8",

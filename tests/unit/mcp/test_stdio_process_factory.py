@@ -77,13 +77,12 @@ async def test_injected_factory_runs_real_peer_with_exact_argv_and_pipes(tmp_pat
 import sys
 
 assert sys.argv[1:] == ['argument with spaces', '--factory-check']
-header = sys.stdin.buffer.readline()
-length = int(header.decode('ascii').split(':', 1)[1].strip())
-assert sys.stdin.buffer.readline() == b'\r\n'
-request = json.loads(sys.stdin.buffer.read(length))
+line = sys.stdin.buffer.readline()
+assert line.endswith(b'\n')
+request = json.loads(line)
 assert request['method'] == 'initialize'
 reply = json.dumps({'jsonrpc': '2.0', 'id': request['id'], 'result': {}}).encode()
-sys.stdout.buffer.write(f'Content-Length: {len(reply)}\r\n\r\n'.encode() + reply)
+sys.stdout.buffer.write(reply + b'\n')
 sys.stdout.buffer.flush()
 sys.stdin.buffer.read()
 """,

@@ -17551,6 +17551,52 @@ def _is_sensitive_event_detail_key(key: str) -> bool:
     return any(sensitive in lowered for sensitive in _SENSITIVE_EVENT_DETAIL_KEYS)
 
 
+def _direct_delivery_summary(artifact: Mapping[str, object]) -> str | None:
+    content = artifact.get('content')
+    common = {'artifact_origin', 'summary'}
+    if (artifact.get('type') != 'tool_result' or artifact.get('producer') != 'main'
+            or not isinstance(content, dict) or not common <= content.keys()
+            or content.get('artifact_origin') not in (
+                'incremental_workspace_delivery', 'model_workspace_bundle')):
+        return None
+    if (content.keys() == common | {'workspace_bundle'}
+            and content['artifact_origin'] == 'model_workspace_bundle'):
+        # This legacy branch stores a 240-character model preview, not prose.
+        # Only a complete envelope's explicit summary is safe; never its files.
+        preview = content['summary']
+        bundle = content['workspace_bundle']
+        if (not isinstance(bundle, Mapping) or not isinstance(bundle.get('files'), Mapping)
+                or not bundle['files'] or type(preview) is not str or len(preview) > 240):
+            return None
+        try:
+            envelope = json.loads(preview)
+        except (TypeError, ValueError):
+            return None
+        if (not isinstance(envelope, dict) or envelope.keys() != {'summary', 'workspace_bundle'}
+                or envelope['workspace_bundle'] != bundle):
+            return None
+        return _artifact_text({'text': envelope['summary']})
+    required = common | {'workspace_delivery'}
+    if not required <= content.keys() <= required | {'generated_event_layout'}:
+        return None
+    delivery = content['workspace_delivery']
+    if not isinstance(delivery, Mapping) or delivery.get('presentation') != 'final_attachment':
+        return None
+    file = delivery.get('file')
+    if (not isinstance(file, Mapping) or file.get('mime_type') != 'application/zip'
+            or type(file.get('filename')) is not str
+            or type(file.get('sha256')) is not str
+            or re.fullmatch('[a-f0-9]{64}', file['sha256']) is None
+            or type(file.get('size_bytes')) is not int or file['size_bytes'] <= 0):
+        return None
+    try:
+        validate_generated_filename(file['filename'], 'application/zip')
+    except (TypeError, ValueError):
+        return None
+    # Never extract text from the tool envelope, file content, manifests or logs.
+    return _artifact_text({'text': content['summary']})
+
+
 def _admin_run_artifact(
     artifact: dict[str, object], *, run_id: UUID | None = None
 ) -> RunArtifactResponse:
@@ -17559,7 +17605,7 @@ def _admin_run_artifact(
     producer = artifact.get("producer")
     content = artifact.get("content")
     title = producer if type(producer) is str and producer else artifact_id
-    text = _artifact_text(content)
+    text = _artifact_text(content) or _direct_delivery_summary(artifact)
     file_metadata = _artifact_file_metadata(artifact, run_id=run_id)
     filename = file_metadata.get("filename")
     mime_type = file_metadata.get("mime_type")

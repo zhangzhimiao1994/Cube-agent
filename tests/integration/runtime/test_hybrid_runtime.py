@@ -141,6 +141,10 @@ async def test_hybrid_child_context_preserves_actor_identity_and_routing_decisio
 
 async def test_dispatch_to_hybrid_upgrade_does_not_repeat_existing_artifacts() -> None:
     existing = artifact("researcher", "already complete")
+    ctx = context((existing,))
+    dispatch_events = tuple([event async for event in RecordingRuntime(
+        TaskMode.DISPATCH, existing,
+    ).run(ctx.model_copy(update={"mode": TaskMode.DISPATCH}))])
     dispatch = RecordingRuntime(TaskMode.DISPATCH, artifact("researcher", "duplicate"))
     discussion = RecordingRuntime(TaskMode.DISCUSS, artifact("critic", "review"))
     synthesis = RecordingRuntime(TaskMode.DIRECT, artifact("main", "answer"))
@@ -149,9 +153,10 @@ async def test_dispatch_to_hybrid_upgrade_does_not_repeat_existing_artifacts() -
         discussion,
         synthesis,
         plan=HybridPlan(upgrade=HybridUpgrade.DISPATCH_TO_HYBRID),
+        dispatch_events=dispatch_events,
     )
 
-    await collect(runtime, context((existing,)))
+    await collect(runtime, ctx)
 
     assert dispatch.contexts == []
     assert discussion.contexts[0].artifacts == (existing,)

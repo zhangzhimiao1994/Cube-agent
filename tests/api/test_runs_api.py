@@ -739,37 +739,42 @@ def bearer() -> dict[str, str]:
 
 
 @pytest.mark.parametrize("ready", [False, True])
+@pytest.mark.parametrize("conversation_available", [False, True])
 def test_capability_approval_readiness_is_actor_scoped(
-    monkeypatch: pytest.MonkeyPatch, ready: bool,
+    monkeypatch: pytest.MonkeyPatch, ready: bool, conversation_available: bool,
 ) -> None:
+    from agent_hub.runs.repository import CapabilityApprovalSnapshot
+
     client, _service, principal = _client()
     run_id = uuid4()
     calls: list[str] = []
 
-    async def events(
+    available = ready and conversation_available
+    items: tuple[dict[str, object], ...] = ({
+        "kind": "approval.requested", "run_id": str(run_id), "approval_id": "approval-current",
+        "sequence": 5, "payload": {},
+    },)
+
+    async def snapshot(
         self: StubRunService, tenant_id: UUID, requested_run: UUID, *, actor_id: UUID,
-    ) -> tuple[dict[str, object], ...]:
+    ) -> CapabilityApprovalSnapshot:
         assert (tenant_id, requested_run, actor_id) == (
             principal.tenant_id, run_id, principal.user_id,
         )
-        calls.append("events")
-        return ()
+        calls.append("snapshot")
+        return CapabilityApprovalSnapshot(items=items, ready=ready, conversation_approval_available=available,
+            conversation_approval_id="approval-current" if available else None,
+            conversation_approval_version=7 if available else None)
 
-    async def readiness(
-        self: StubRunService, tenant_id: UUID, requested_run: UUID, *, actor_id: UUID,
-    ) -> bool:
-        assert (tenant_id, requested_run, actor_id) == (
-            principal.tenant_id, run_id, principal.user_id,
-        )
-        calls.append("ready")
-        return ready
-
-    monkeypatch.setattr(StubRunService, "capability_approval_events", events, raising=False)
-    monkeypatch.setattr(StubRunService, "capability_approval_ready", readiness, raising=False)
+    monkeypatch.setattr(StubRunService, "capability_approval_snapshot", snapshot, raising=False)
     response = client.get(f"/api/v1/runs/{run_id}/capability-approvals", headers=bearer())
     assert response.status_code == 200
-    assert response.json() == {"items": [], "ready": ready}
-    assert calls == ["events", "ready"]
+    assert response.json() == {
+        "items": list(items), "ready": ready, "conversation_approval_available": available,
+        "conversation_approval_id": "approval-current" if available else None,
+        "conversation_approval_version": 7 if available else None,
+    }
+    assert calls == ["snapshot"]
 
 
 def test_conversation_queue_supports_list_edit_redirect_and_cancel() -> None:
@@ -1968,6 +1973,30 @@ def test_approve_capability_queues_waiting_run_safely() -> None:
     assert response.status_code == 202
     assert response.json()["status"] == "queued"
     assert response.json()["mode"] == "dispatch"
+
+
+@pytest.mark.parametrize("scope", (None, "once", "conversation"))
+def test_capability_approval_scope_contract(scope: str | None, monkeypatch: pytest.MonkeyPatch) -> None:
+    client, service, _ = _client()
+    original = type(service).approve_capability
+    calls: list[dict[str, object]] = []
+
+    async def approve(self: StubRunService, **kwargs: object) -> SubmittedRun:
+        calls.append(dict(kwargs))
+        kwargs.pop("scope", None)
+        return await original(self, tenant_id=cast(UUID, kwargs["tenant_id"]),
+            actor_id=cast(UUID, kwargs["actor_id"]), run_id=cast(UUID, kwargs["run_id"]),
+            approval_id=cast(str, kwargs["approval_id"]), version=cast(int, kwargs["version"]))
+
+    monkeypatch.setattr(type(service), "approve_capability", approve)
+    body: dict[str, object] = {"approval_id": "capability_approval_1", "version": 3}
+    if scope is not None:
+        body["scope"] = scope
+    response = client.post(f"/api/v1/runs/{uuid4()}/approve-capability", headers=bearer(), json=body)
+    assert response.status_code == 202
+    assert calls[0].get("scope", "once") == (scope or "once")
+    if scope != "conversation":
+        assert "scope" not in calls[0]
 
 
 def test_capability_approval_does_not_enqueue_when_preview_stop_fails(

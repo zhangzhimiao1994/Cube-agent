@@ -14,6 +14,7 @@ from agent_hub.capabilities.gateway import (
 )
 from agent_hub.capabilities.policy import CapabilityPolicy, CapabilityRule
 from agent_hub.capabilities.types import PolicyEffect
+from agent_hub.domain.runs import RunStatus
 from tests.unit.capabilities.test_defaults import (
     RUN_ID,
     TENANT_ID,
@@ -32,7 +33,8 @@ class ModeRepository(RecordingApprovalRepository):
                      requested_permissions=["workspace.read"])
         stored = stored_run(tenant=TENANT_ID, run=RUN_ID, actor_id=actor, **route)
         self.record = SimpleNamespace(tenant_id=stored.tenant_id, id=stored.id, actor_id=stored.actor_id,
-                                      actor_role=Role.OPERATOR, routing_decision=stored.routing_decision)
+                                      actor_role=Role.OPERATOR, status=RunStatus.RUNNING,
+                                      routing_decision=stored.routing_decision)
 
     async def get(self, tenant_id, run_id):
         return self.record

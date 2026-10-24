@@ -1423,7 +1423,7 @@ async def test_cancel_during_instruction_context_load_releases_claimed_worker() 
 
 
 @pytest.mark.asyncio
-async def test_silent_runtime_finishes_status_before_releasing_worker_ownership() -> None:
+async def test_silent_runtime_fails_status_before_releasing_worker_ownership() -> None:
     repository = CoordinatedWorkerReleaseRepository(routing_decision={"source": "manual"})
     service = RunService(
         repository,  # type: ignore[arg-type]
@@ -1441,13 +1441,14 @@ async def test_silent_runtime_finishes_status_before_releasing_worker_ownership(
     submitted = await asyncio.wait_for(execute_task, timeout=1)
 
     assert cancel_could_commit is False
-    assert repository.completed_atomically is True
-    assert submitted.status is RunStatus.COMPLETED
+    assert repository.completed_atomically is False
+    assert submitted.status is RunStatus.FAILED
 
 
 @pytest.mark.asyncio
-async def test_stale_worker_release_conflict_does_not_fail_new_owner() -> None:
-    repository = OwnershipTransferredBeforeReleaseRepository(
+async def test_stale_worker_eof_failure_conflict_does_not_fail_new_owner() -> None:
+    # EOF now fails through the same ownership fence before a lease can be released.
+    repository = OwnershipTransferredBeforeFailureRepository(
         routing_decision={"source": "manual"}
     )
     service = RunService(

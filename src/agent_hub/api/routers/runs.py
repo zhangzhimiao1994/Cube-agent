@@ -35,7 +35,7 @@ from agent_hub.runs.conversation_queue import (
     ConversationQueueNotFound,
 )
 from agent_hub.runs.conversations import ConversationArchived
-from agent_hub.runs.repository import RunConflict, RunNotFound
+from agent_hub.runs.repository import CapabilityApprovalSnapshot, RunConflict, RunNotFound
 from agent_hub.runs.self_repair import repair_proposal_projection
 from agent_hub.runs.service import RunSummary, SubmittedRun, VibeCodingUnavailable
 from agent_hub.runs.workspace import (
@@ -183,6 +183,7 @@ class RunServiceProtocol(Protocol):
         run_id: UUID,
         approval_id: str,
         version: int,
+        scope: Literal["once", "conversation"] = "once",
     ) -> SubmittedRun: ...
 
     async def reject_capability(
@@ -210,6 +211,10 @@ class RunServiceProtocol(Protocol):
     async def capability_approval_ready(
         self, tenant_id: UUID, run_id: UUID, *, actor_id: UUID,
     ) -> bool: ...
+
+    async def capability_approval_snapshot(
+        self, tenant_id: UUID, run_id: UUID, *, actor_id: UUID,
+    ) -> CapabilityApprovalSnapshot: ...
 
     async def pause(self, tenant_id: UUID, run_id: UUID) -> RunSummary: ...
 
@@ -495,6 +500,7 @@ class CapabilityApprovalRequest(BaseModel):
 
     approval_id: str = Field(min_length=1, max_length=128)
     version: int = Field(ge=1)
+    scope: Literal["once", "conversation"] = "once"
 
 
 class SubmittedRunResponse(BaseModel):
@@ -618,6 +624,9 @@ class RunEventsResponse(BaseModel):
 
 
 class RunCapabilityApprovalsResponse(RunEventsResponse):
+    conversation_approval_available: bool = False
+    conversation_approval_id: str | None = Field(default=None, min_length=1)
+    conversation_approval_version: int | None = Field(default=None, ge=1)
     ready: bool
 
 
@@ -1754,6 +1763,7 @@ async def approve_capability(
             run_id=run_id,
             approval_id=body.approval_id,
             version=body.version,
+            **({"scope": body.scope} if body.scope == "conversation" else {}),
         )
     except RunNotFound as error:
         raise _run_not_found() from error
@@ -1836,17 +1846,17 @@ async def run_capability_approvals(
 ) -> RunCapabilityApprovalsResponse:
     """Trusted approval history with its own sequence, independent of runtime events/SSE."""
     try:
-        events = await service.capability_approval_events(
-            principal.tenant_id, run_id, actor_id=principal.user_id,
-        )
-        ready = await service.capability_approval_ready(
+        snapshot = await service.capability_approval_snapshot(
             principal.tenant_id, run_id, actor_id=principal.user_id,
         )
     except RunNotFound as error:
         raise _run_not_found() from error
     except RunConflict as error:
         raise _run_conflict(error) from error
-    return RunCapabilityApprovalsResponse(items=events, ready=ready)
+    return RunCapabilityApprovalsResponse(items=snapshot.items, ready=snapshot.ready,
+        conversation_approval_available=snapshot.conversation_approval_available,
+        conversation_approval_id=snapshot.conversation_approval_id,
+        conversation_approval_version=snapshot.conversation_approval_version)
 
 
 @router.get("/{run_id}/details", response_model=RunSummaryResponse)
