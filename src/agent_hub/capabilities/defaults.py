@@ -12,6 +12,7 @@ from agent_hub.capabilities.approvals import (
     ApprovalService,
     InMemoryApprovalStore,
     capability_approval_scope,
+    exact_capability_approval,
     fingerprint_capability_request,
 )
 from agent_hub.capabilities.gateway import (
@@ -27,6 +28,8 @@ from agent_hub.capabilities.gateway import (
 from agent_hub.capabilities.permission_modes import (
     read_only_capability_allowed,
     run_permission_mode,
+    run_permission_policy,
+    submission_capability_allowed,
 )
 from agent_hub.capabilities.policy import CapabilityPolicy, CapabilityRule, normalize_resource
 from agent_hub.capabilities.python_project_lifecycle import (
@@ -134,7 +137,9 @@ class DefaultRuntimeCapabilityPolicyGateway:
         toolchain_authority: ToolchainSupplyAuthority | None = None,
     ) -> CapabilityResult:
         try:
-            permission_mode = await run_permission_mode(self._run_repository, request, role=role)
+            permission_mode, concrete_approval = await run_permission_policy(
+                self._run_repository, request, role=role,
+            )
         except Exception:  # noqa: BLE001 - trusted run policy must fail closed.
             return CapabilityResult(CapabilityStatus.DENIED, request.run_id, reason="capability denied")
         if permission_mode == "read_only" and not read_only_capability_allowed(request):
@@ -175,9 +180,18 @@ class DefaultRuntimeCapabilityPolicyGateway:
             )
         if explicit_plugin_effect is PolicyEffect.ALLOW and project_effect is None:
             return CapabilityResult(CapabilityStatus.ALLOWED, request.run_id)
+        if (permission_mode in {"default", "auto_review"}
+            and project_effect in {None, PolicyEffect.ALLOW} and explicit_plugin_effect is None
+            and self._approval_reviewer is None
+            and await submission_capability_allowed(self._run_repository, request, role=role)):
+            return CapabilityResult(CapabilityStatus.ALLOWED, request.run_id)
         if toolchain_authority is None and await _has_approved_capability_request(self._run_repository, request):
             return CapabilityResult(CapabilityStatus.ALLOWED, request.run_id)
-        if await _has_approved_capability_scope(self._run_repository, request):
+        conversation_grant = getattr(self._run_repository, "is_conversation_capability_approved", None)
+        if (toolchain_authority is None and callable(conversation_grant)
+            and await conversation_grant(request, role=role) is True):
+            return CapabilityResult(CapabilityStatus.ALLOWED, request.run_id)
+        if not concrete_approval and await _has_approved_capability_scope(self._run_repository, request):
             return CapabilityResult(CapabilityStatus.ALLOWED, request.run_id)
         gateway = CapabilityGateway(
             policy,
@@ -187,6 +201,9 @@ class DefaultRuntimeCapabilityPolicyGateway:
             plugin_policy_source=self._plugin_policy_rules,
             toolchain_authority=toolchain_authority,
         )
+        if concrete_approval or permission_mode is not None:
+            with exact_capability_approval(request):
+                return await gateway.invoke(request, role=role)
         return await gateway.invoke(request, role=role)
 
     async def _tool_approval_required(self, tenant_id: UUID) -> bool:
@@ -307,6 +324,8 @@ async def _has_approved_capability_request(repository: object, request: Capabili
             request.tenant_id,
             request.run_id,
             fingerprint_capability_request(request),
+            **({"tool_origin": request.tool_origin}
+               if getattr(repository, "supports_conversation_capability_approval", False) is True else {}),
         )
     )
 

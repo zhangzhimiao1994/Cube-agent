@@ -1,0 +1,70 @@
+.capability-approval-card[role="status"] {
+  background: #fffcf5;
+  border: 1px solid #e5d9b9;
+  border-left: 3px solid #af863e;
+  border-radius: 6px;
+  box-shadow: none;
+  color: #343b45;
+  display: grid;
+  flex: 0 0 auto;
+  gap: 10px;
+  font-weight: 400;
+  line-height: 1.65;
+  margin: 0;
+  min-width: 0;
+  padding: 14px 16px;
+  text-align: left;
+}
+.capability-approval-card::before,
+.capability-approval-card::after { display: none; }
+.capability-approval-card > header { align-items: center; display: flex; gap: 8px; }
+.capability-approval-card > header svg { color: #8c6527; flex: 0 0 auto; }
+.capability-approval-card > header strong { color: #594723; font-size: 14px; }
+.capability-approval-card p { color: #343b45; font-size: 14px; line-height: 1.65; margin: 0; overflow-wrap: anywhere; }
+.capability-approval-card .capability-approval-action { font-weight: 600; }
+.capability-approval-card small { color: #666b74; font-size: 12px; overflow-wrap: anywhere; }
+.capability-approval-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.capability-approval-card .capability-approval-actions button {
+  background: #fff;
+  border: 1px solid #d9caa6;
+  border-radius: 4px;
+  box-shadow: none;
+  color: #594723;
+  font-size: 13px;
+  font-weight: 500;
+  min-height: 36px;
+  padding: 6px 12px;
+}
+.capability-approval-card .capability-approval-actions button:last-child { border-color: #d4d8df; color: #515b68; }
+.capability-approval-card .capability-approval-actions button:hover { background: #f7f1e5; transform: none; }
+.capability-approval-card .capability-approval-actions button:focus-visible { outline: 2px solid #8c6527; outline-offset: 2px; }
+.capability-approval-card .capability-approval-actions button:disabled { opacity: 0.6; }
+.capability-approval-card [role="alert"] { background: none; border: 0; border-radius: 0; color: #a32638; font-weight: 400; padding: 0; }
+.conversation-workspace .run-approval-result,
+.run-approval-result {
+  align-items: center;
+  background: #f6f8fb;
+  border: 1px solid #dce2ea;
+  border-left: 3px solid #98a7bb;
+  border-radius: 6px;
+  box-shadow: none;
+  color: #5b6573;
+  display: flex;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  font-size: 12px;
+  gap: 4px 10px;
+  line-height: 1.6;
+  margin: 0;
+  max-width: 100%;
+  padding: 9px 12px;
+}
+.conversation-workspace .run-approval-result::before,
+.run-approval-result::before { display: none; }
+.run-approval-result svg { color: #52677e; flex: 0 0 16px; }
+.conversation-workspace .run-approval-result strong,
+.run-approval-result strong { color: #3e4a59; font-size: 12px; }
+.run-approval-result[data-decision="rejected"] { background: #fcf7f7; border-color: #e9dadd; border-left-color: #bb929b; }
+.run-approval-result[data-decision="rejected"] svg { color: #955563; }
+.run-approval-result .approval-record-label { color: #596779; font-size: 11px; }
+.run-approval-result code { font-size: 12px; overflow-wrap: anywhere; }

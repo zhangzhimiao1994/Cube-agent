@@ -4,8 +4,10 @@ import asyncio
 import hashlib
 import json
 import re
-from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass
+from collections.abc import Awaitable, Callable, Iterator, Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Protocol
 from uuid import UUID, uuid4
@@ -28,6 +30,32 @@ class ApprovalExpired(RuntimeError):
 
 class ApprovalRejected(RuntimeError):
     pass
+
+
+@dataclass(slots=True)
+class _ExactApprovalBinding:
+    fingerprint: str
+    active: bool = True
+
+
+_exact_approval_binding: ContextVar[_ExactApprovalBinding | None] = ContextVar(
+    "exact_capability_approval", default=None,
+)
+
+
+@contextmanager
+def exact_capability_approval(request: CapabilityRequest) -> Iterator[None]:
+    """Default policy establishes this only after checking the persisted run policy."""
+    inherited = _exact_approval_binding.get()
+    if inherited is not None and not inherited.active:
+        raise ApprovalMismatch("approval context is unavailable")
+    binding = _ExactApprovalBinding(fingerprint_capability_request(request))
+    token = _exact_approval_binding.set(binding)
+    try:
+        yield
+    finally:
+        binding.active = False
+        _exact_approval_binding.reset(token)
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,6 +118,7 @@ class RunStatusRepository(Protocol):
         toolchain_authority: ToolchainSupplyAuthority | None = None,
         go_recipe_authority: ToolchainSupplyAuthority | None = None,
         expected_go_recipe: Mapping[str, object] | None = None,
+        approval_request: CapabilityRequest | None = None,
     ) -> object: ...
 
     async def resolve_capability_approval(
@@ -329,11 +358,17 @@ class ApprovalService:
 
     async def _create_unlocked(self, request: CapabilityRequest, *, publish: bool = True) -> ApprovalRecord:
         fingerprint = _fingerprint_request(request)
+        binding = _exact_approval_binding.get()
+        if binding is not None and (not binding.active or binding.fingerprint != fingerprint):
+            raise ApprovalMismatch("approval context is unavailable")
+        exact_only = binding is not None
         existing = await self._store.get_pending_by_fingerprint(fingerprint)
-        if existing is not None:
+        if existing is not None and (not exact_only or self._clock() < existing.expires_at):
             return existing
+        if existing is not None and exact_only:
+            await self._store.replace(replace(existing, status="expired"))
         request_scope = capability_approval_scope(request)
-        if request_scope is not None:
+        if request_scope is not None and not exact_only:
             existing = await self._store.get_pending_by_scope(request_scope)
             if existing is not None:
                 return existing

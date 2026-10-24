@@ -33,7 +33,9 @@ from agent_hub.runtime.contracts import (
 )
 from agent_hub.runtime.direct import _original_project_terminal_artifact_matches
 from agent_hub.runtime.failure_reason import (
+    MAX_FAILURE_REASON_LENGTH,
     gateway_scope_failure_payload,
+    is_safe_failure_reason,
     runtime_failure_diagnostic_from_reason,
     safe_runtime_failure_reason,
 )
@@ -75,6 +77,10 @@ class _ChildRuntimeFailure(RuntimeExecutionError):
         self.failure_payload = {
             key: value for key, value in validated.payload.items() if key in _CAPACITY_FAILURE_KEYS
         } if "capacity_operation" in validated.payload else {}
+        for key in ("error_code", "error_stage", "error_category", "status_code", "retryable"):
+            value = validated.payload.get(key)
+            if value is not None and (not isinstance(value, str) or is_safe_failure_reason(value)):
+                self.failure_payload[key] = value
 
 
 class RuntimeBusy(RuntimeExecutionError):
@@ -137,6 +143,7 @@ class _StageBudget:
     checkpoint_token_baseline: int = 0
     artifact_tokens: int = 0
     accounted_artifact_ids: set[UUID] = field(default_factory=set)
+    input_artifact_ids: set[UUID] = field(default_factory=set)
     model_scope: _ModelScopeBoundary = field(default_factory=_ModelScopeBoundary)
 
     @property
@@ -161,6 +168,7 @@ class HybridRuntime:
         *,
         plan: HybridPlan | None = None,
         artifact_repository: ArtifactRepository | None = None,
+        dispatch_events: tuple[RunEvent, ...] = (),
     ) -> None:
         if (
             dispatch.mode is not TaskMode.DISPATCH
@@ -172,6 +180,10 @@ class HybridRuntime:
         self._discussion = discussion
         self._synthesizer = synthesizer
         self._plan = plan or HybridPlan()
+        self._explicit_dispatch_upgrade = (
+            plan is not None and plan.upgrade is HybridUpgrade.DISPATCH_TO_HYBRID
+        )
+        self._dispatch_events = dispatch_events
         self._repository = artifact_repository or InMemoryArtifactRepository()
         self._active_task: asyncio.Task[object] | None = None
         self._active_child: ChildRuntime | None = None
@@ -193,6 +205,8 @@ class HybridRuntime:
         sequence = 1
         artifacts = list(context.artifacts)
         known = {artifact.id for artifact in artifacts}
+        output_ids: set[UUID] = set()
+        input_ids = known - output_ids
         token_source = TokenBudgetSource.from_context(context)
         remaining_tokens = token_source.limit
         spent_tokens = 0
@@ -213,11 +227,24 @@ class HybridRuntime:
         )
         try:
             restored = self._restored
+            if restored is None:
+                output_ids = self._transferred_dispatch_outputs(context)
+                input_ids -= output_ids
             if restored is not None:
                 self._validate_checkpoint(restored, context)
                 if context.checkpoint is None or context.checkpoint.id != restored.id:
                     raise RuntimeExecutionError("runtime checkpoint mismatch")
                 restored_artifacts = await self._hydrate_checkpoint(restored, context)
+                output_registry = restored.state.get("output_artifact_registry")
+                output_ids = {
+                    artifact.id for artifact in restored_artifacts
+                    if not _is_context_artifact(artifact) and (
+                        str(artifact.id) in output_registry
+                        if isinstance(output_registry, Mapping)
+                        else False
+                    )
+                }
+                input_ids = (known | {item.id for item in restored_artifacts}) - output_ids
                 if original_terminal_replay:
                     deliveries = tuple(artifact for artifact in restored_artifacts
                         if artifact.type == "tool_result" and (
@@ -240,11 +267,14 @@ class HybridRuntime:
                         known.add(artifact.id)
                 sequence = cast(int, restored.state["next_sequence"])
                 if restored.state["terminal"] is True:
+                    if not _delivery_artifacts(artifacts, output_ids):
+                        raise RuntimeExecutionError("hybrid completed without displayable output")
                     yield RunEvent(
                         kind=EventKind.RUNTIME_COMPLETED,
                         sequence=cast(int, restored.state["next_sequence"]),
                         run_id=context.run_id,
                         reason=cast(str, restored.state["reason"]),
+                        payload=self._terminal_diagnostic_payload(restored),
                     )
                     return
                 next_stage = cast(int, restored.state["next_stage"])
@@ -319,8 +349,8 @@ class HybridRuntime:
             deadline = adaptive_deadline.deadline
             if (
                 restored is None
-                and self._plan.upgrade is HybridUpgrade.DISPATCH_TO_HYBRID
-                and artifacts
+                and self._explicit_dispatch_upgrade
+                and _delivery_artifacts(artifacts, output_ids)
             ):
                 next_stage = 1
 
@@ -359,6 +389,7 @@ class HybridRuntime:
                         if child_checkpoint is not None
                         else set()
                     ),
+                    input_artifact_ids=input_ids,
                 )
                 stage_budget.token_source = token_source.remaining(
                     spent=spent_tokens,
@@ -445,6 +476,7 @@ class HybridRuntime:
                             in_stage_checkpoint = self._checkpoint(
                                 context,
                                 artifacts=tuple(artifacts),
+                                output_ids=output_ids,
                                 next_sequence=sequence,
                                 next_stage=stage_index,
                                 terminal=False,
@@ -475,6 +507,7 @@ class HybridRuntime:
                             )
                             artifacts.append(event.artifact)
                             known.add(event.artifact.id)
+                            output_ids.add(event.artifact.id)
                         yield event
                 remaining_tokens = max(0, token_source.limit - spent_tokens)
                 if stage_budget.consumed_tokens > remaining_tokens:
@@ -491,6 +524,7 @@ class HybridRuntime:
                 stage_checkpoint = self._checkpoint(
                     context,
                     artifacts=tuple(artifacts),
+                    output_ids=output_ids,
                     next_sequence=sequence + 1,
                     next_stage=stage_index + 1,
                     terminal=False,
@@ -514,9 +548,12 @@ class HybridRuntime:
                     checkpoint=stage_checkpoint,
                 )
                 sequence += 1
+            if not _delivery_artifacts(artifacts, output_ids):
+                raise RuntimeExecutionError("hybrid completed without displayable output")
             checkpoint = self._checkpoint(
                 context,
                 artifacts=tuple(artifacts),
+                output_ids=output_ids,
                 next_sequence=sequence + 1,
                 next_stage=len(stages),
                 terminal=True,
@@ -559,6 +596,12 @@ class HybridRuntime:
                 error.failure_payload if isinstance(error, _ChildRuntimeFailure)
                 else gateway_scope_failure_payload(error)
             )
+            diagnostic = {
+                **runtime_failure_diagnostic_from_reason(failure_reason),
+                **failure_payload,
+            }
+            if failure_reason == "hybrid completed without displayable output":
+                diagnostic.update(error_code="runtime.hybrid_output_missing", error_stage="hybrid_delivery")
             partial_reason = (
                 None if (
                     original_terminal_replay
@@ -566,16 +609,24 @@ class HybridRuntime:
                     or runtime_failure_diagnostic_from_reason(failure_reason).get("error_code")
                     == "model.request_negotiation_exhausted"
                 )
-                else _partial_hybrid_completion_reason(artifacts, failure_reason)
+                else _partial_hybrid_completion_reason(
+                    _delivery_artifacts(artifacts, output_ids), failure_reason,
+                )
             )
             if partial_reason is not None:
                 checkpoint = self._checkpoint(
                     context,
                     artifacts=tuple(artifacts),
+                    output_ids=output_ids,
                     next_sequence=sequence + 1,
                     next_stage=len(self._stages()),
                     terminal=True,
                     reason=partial_reason,
+                    terminal_diagnostic={
+                        "schema_version": 1,
+                        "reason": failure_reason,
+                        "payload": diagnostic,
+                    },
                     remaining_tokens=remaining_tokens,
                     token_budget_grant=token_source.limit,
                     token_budget_spent=spent_tokens,
@@ -606,6 +657,7 @@ class HybridRuntime:
                     sequence=sequence,
                     run_id=context.run_id,
                     reason=partial_reason,
+                    payload=diagnostic,
                 )
                 return
             closure_artifact = _empty_model_response_closure_artifact(context, failure_reason)
@@ -624,10 +676,9 @@ class HybridRuntime:
                 sequence=sequence,
                 run_id=context.run_id,
                 reason=failure_reason,
-                payload={
-                    **runtime_failure_diagnostic_from_reason(failure_reason),
-                    **failure_payload,
-                } if failure_payload else {},
+                payload=diagnostic if failure_payload or (
+                    failure_reason == "hybrid completed without displayable output"
+                ) else {},
             )
         finally:
             self._active_child = None
@@ -646,6 +697,30 @@ class HybridRuntime:
             (self._discussion, TaskMode.DISCUSS, True),
             (self._synthesizer, TaskMode.DIRECT, False),
         )
+
+    def _transferred_dispatch_outputs(self, context: TaskContext) -> set[UUID]:
+        if not self._explicit_dispatch_upgrade or not self._dispatch_events:
+            return set()
+        outputs: dict[UUID, str] = {}
+        sequence = 0
+        completed = False
+        for original in self._dispatch_events:
+            event = RunEvent.from_payload(original.to_payload())
+            if event.run_id != context.run_id or event.sequence <= sequence or completed:
+                raise RuntimeExecutionError("hybrid dispatch upgrade evidence is invalid")
+            sequence = event.sequence
+            if event.kind in {EventKind.RUNTIME_FAILED, EventKind.RUNTIME_CANCELLED}:
+                raise RuntimeExecutionError("hybrid dispatch upgrade evidence is invalid")
+            if event.kind is EventKind.ARTIFACT_CREATED and event.artifact is not None:
+                outputs[event.artifact.id] = event.artifact.content_sha256
+            completed = event.kind is EventKind.RUNTIME_COMPLETED
+        if not completed:
+            raise RuntimeExecutionError("hybrid dispatch upgrade evidence is incomplete")
+        return {
+            artifact.id for artifact in context.artifacts
+            if outputs.get(artifact.id) == artifact.content_sha256
+            and not _is_context_artifact(artifact)
+        }
 
     async def _run_discussion(
         self,
@@ -738,6 +813,13 @@ class HybridRuntime:
             )
             async with closing_runtime_events(child_stream) as events:
                 async for item in events:
+                    if item.artifact is not None and (
+                        item.artifact.id in stage_budget.input_artifact_ids
+                        or _is_context_artifact(item.artifact)
+                    ):
+                        if item.kind is EventKind.ARTIFACT_CREATED:
+                            continue
+                        item = item.model_copy(update={"artifact": None})
                     scope_artifact = _validate_child_model_scope_event(
                         item, parent.tenant_id, model_starts, scope_artifacts,
                     )
@@ -801,6 +883,7 @@ class HybridRuntime:
         context: TaskContext,
         *,
         artifacts: tuple[Artifact, ...],
+        output_ids: set[UUID] | None = None,
         next_sequence: int,
         next_stage: int,
         terminal: bool,
@@ -813,8 +896,12 @@ class HybridRuntime:
         timeout_progress_units: int,
         last_child_progress_fingerprint: str | None,
         child_checkpoint: RuntimeCheckpoint | None,
+        terminal_diagnostic: Mapping[str, JsonValue] | None = None,
     ) -> RuntimeCheckpoint:
         checkpoint_artifacts = _bounded_handoff_artifacts(artifacts)
+        # Private checkpoint builders may explicitly supply an owned output registry.
+        if output_ids is None:
+            output_ids = {item.id for item in artifacts if not _is_context_artifact(item)}
         return RuntimeCheckpoint(
             id=uuid4(),
             runtime_type=_RUNTIME_TYPE,
@@ -827,6 +914,10 @@ class HybridRuntime:
                 "artifact_registry": {
                     str(artifact.id): artifact.content_sha256
                     for artifact in checkpoint_artifacts
+                },
+                "output_artifact_registry": {
+                    str(artifact.id): artifact.content_sha256
+                    for artifact in checkpoint_artifacts if artifact.id in output_ids
                 },
                 "next_sequence": next_sequence,
                 "next_stage": next_stage,
@@ -844,6 +935,8 @@ class HybridRuntime:
                     if child_checkpoint is None
                     else cast(JsonValue, child_checkpoint.to_payload())
                 ),
+                **({"terminal_diagnostic": dict(terminal_diagnostic)}
+                   if terminal_diagnostic is not None else {}),
             },
         )
 
@@ -904,6 +997,12 @@ class HybridRuntime:
                 or state.get("remaining_token_budget") != max(0, grant - spent)
             ):
                 raise RuntimeExecutionError("runtime checkpoint is incompatible")
+        allowed_state |= {keys | {"output_artifact_registry"} for keys in allowed_state}
+        if checkpoint.runtime_version == _RUNTIME_VERSION:
+            allowed_state |= {
+                keys | {"terminal_diagnostic"} for keys in allowed_state
+                if "output_artifact_registry" in keys
+            }
         if (
             frozenset(state) not in allowed_state
             or not isinstance(registry, Mapping)
@@ -962,8 +1061,14 @@ class HybridRuntime:
                 if type(artifact_id) is not str or type(sha256) is not str:
                     raise ValueError
                 ArtifactReference(id=UUID(artifact_id), sha256=sha256)
+            outputs = state.get("output_artifact_registry", {})
+            if not isinstance(outputs, Mapping) or any(
+                key not in registry or registry[key] != value for key, value in outputs.items()
+            ):
+                raise ValueError
         except (TypeError, ValueError):
             raise RuntimeExecutionError("runtime checkpoint is incompatible") from None
+        self._terminal_diagnostic_payload(checkpoint)
         child_checkpoint = _child_checkpoint_from_state(checkpoint)
         next_stage = cast(int, state["next_stage"])
         if child_checkpoint is not None and (
@@ -975,6 +1080,46 @@ class HybridRuntime:
             or child_checkpoint.mode is not self._stages()[next_stage][1]
         ):
             raise RuntimeExecutionError("runtime checkpoint is incompatible")
+
+    def _terminal_diagnostic_payload(self, checkpoint: RuntimeCheckpoint) -> Mapping[str, JsonValue]:
+        if "terminal_diagnostic" not in checkpoint.state:
+            return {}
+        envelope = checkpoint.state["terminal_diagnostic"]
+        if (
+            checkpoint.runtime_version != _RUNTIME_VERSION
+            or checkpoint.state.get("terminal") is not True
+            or checkpoint.state.get("next_stage") != len(self._stages())
+            or checkpoint.state.get("reason") not in {
+                "partial_hybrid_after_final_attachment",
+                "partial_hybrid_after_discussion_failure",
+                "partial_hybrid_after_synthesis_failure",
+            }
+            or not isinstance(envelope, Mapping)
+            or set(envelope) != {"schema_version", "reason", "payload"}
+            or type(envelope.get("schema_version")) is not int
+            or envelope["schema_version"] != 1
+        ):
+            raise RuntimeExecutionError("runtime checkpoint is incompatible")
+        reason, payload = envelope["reason"], envelope["payload"]
+        if (
+            type(reason) is not str or len(reason) > MAX_FAILURE_REASON_LENGTH
+            or not is_safe_failure_reason(reason) or not isinstance(payload, Mapping)
+            or any(isinstance(value, str) and not is_safe_failure_reason(value)
+                   for value in payload.values())
+        ):
+            raise RuntimeExecutionError("runtime checkpoint is incompatible")
+        canonical = runtime_failure_diagnostic_from_reason(reason)
+        if any(payload.get(key) != canonical[key] for key in ("error_summary", "suggested_action")):
+            raise RuntimeExecutionError("runtime checkpoint is incompatible")
+        try:
+            validated = RunEvent.from_payload({
+                "kind": EventKind.RUNTIME_FAILED.value, "sequence": 1,
+                "run_id": str(checkpoint.run_id), "reason": reason,
+                "payload": _mutable_json_value(payload),
+            })
+        except (TypeError, ValueError):
+            raise RuntimeExecutionError("runtime checkpoint is incompatible") from None
+        return validated.payload
 
     async def _hydrate_checkpoint(
         self, checkpoint: RuntimeCheckpoint, context: TaskContext
@@ -1291,6 +1436,33 @@ def _discussion_handoff_artifacts(artifacts: tuple[Artifact, ...]) -> tuple[Arti
         for artifact in artifacts
         if not (artifact.type == "model_response" and str(artifact.id) in wrapped_source_ids)
     )
+
+
+def _is_context_artifact(artifact: Artifact) -> bool:
+    return artifact.content.get("trust") == "internal_conversation_summary"
+
+
+def _delivery_artifacts(artifacts: list[Artifact], output_ids: set[UUID]) -> list[Artifact]:
+    return [
+        artifact for artifact in artifacts
+        if artifact.id in output_ids and artifact.type != "model_attempt"
+        and not _is_context_artifact(artifact)
+        and (
+            isinstance(artifact.content.get("text"), str)
+            and bool(cast(str, artifact.content["text"]).strip())
+            or _has_final_attachment(artifact)
+        )
+    ]
+
+
+def _has_final_attachment(artifact: Artifact) -> bool:
+    if final_attachment_result((artifact,)) is not None:
+        return True
+    delivery = artifact.content.get("workspace_delivery")
+    if not isinstance(delivery, Mapping):
+        return False
+    view = artifact.model_copy(update={"content": {"result": delivery}})
+    return final_attachment_result((view,)) is not None
 
 
 def _partial_hybrid_completion_reason(

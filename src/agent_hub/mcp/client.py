@@ -384,13 +384,13 @@ class _StdioJsonRpcMcpClient:
                 raise RuntimeError("stdio MCP pipes are unavailable")
             next_id = 1
             if initialize:
-                await _write_framed_json(
+                await _write_stdio_json(
                     process.stdin,
                     _jsonrpc(next_id, "initialize", _initialize_params()),
                 )
-                await _read_jsonrpc_result(process.stdout)
+                await _read_jsonrpc_result(process.stdout, expected_id=next_id)
                 next_id += 1
-                await _write_framed_json(
+                await _write_stdio_json(
                     process.stdin,
                     {
                         "jsonrpc": "2.0",
@@ -398,8 +398,8 @@ class _StdioJsonRpcMcpClient:
                         "params": {},
                     },
                 )
-            await _write_framed_json(process.stdin, _jsonrpc(next_id, method, params))
-            return await _read_jsonrpc_result(process.stdout)
+            await _write_stdio_json(process.stdin, _jsonrpc(next_id, method, params))
+            return await _read_jsonrpc_result(process.stdout, expected_id=next_id)
         finally:
             await _cleanup_stdio_process(process)
 
@@ -584,43 +584,87 @@ def _jsonrpc(request_id: int, method: str, params: Mapping[str, object]) -> dict
     return {"jsonrpc": "2.0", "id": request_id, "method": method, "params": dict(params)}
 
 
-async def _write_framed_json(
+async def _write_stdio_json(
     writer: asyncio.StreamWriter,
     payload: Mapping[str, object],
 ) -> None:
     encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    writer.write(f"Content-Length: {len(encoded)}\r\n\r\n".encode("ascii") + encoded)
+    writer.write(encoded + b"\n")
     await writer.drain()
 
 
-async def _read_jsonrpc_result(reader: asyncio.StreamReader) -> Mapping[str, object]:
-    message = await _read_framed_or_line_json(reader)
-    error = message.get("error")
-    if isinstance(error, Mapping):
-        message_text = error.get("message")
-        raise RuntimeError(str(message_text or "MCP JSON-RPC error"))  # noqa: TRY004
+_MAX_STDIO_NOTIFICATIONS = 32
+
+
+async def _read_jsonrpc_result(
+    reader: asyncio.StreamReader, *, expected_id: int
+) -> Mapping[str, object]:
+    notifications = 0
+    while True:
+        message = await _read_stdio_json(reader)
+        if message.get("jsonrpc") != "2.0":
+            raise McpProtocolError("MCP stdio message requires JSON-RPC 2.0")
+        if "method" not in message:
+            break
+        if "id" in message:
+            raise McpProtocolError("MCP stdio server requests are not supported")
+        method = message["method"]
+        if (
+            not isinstance(method, str)
+            or not method.startswith("notifications/")
+            or method == "notifications/"
+            or "result" in message
+            or "error" in message
+            or ("params" in message and not isinstance(message["params"], Mapping))
+        ):
+            raise McpProtocolError("MCP stdio notification is invalid")
+        notifications += 1
+        if notifications > _MAX_STDIO_NOTIFICATIONS:
+            raise McpProtocolError("MCP stdio notification limit exceeded")
+    if type(message.get("id")) is not int or message["id"] != expected_id:
+        raise McpProtocolError("MCP stdio response id does not match request")
+    if ("result" in message) == ("error" in message):
+        raise McpProtocolError("MCP stdio response requires exactly one result or error")
+    if "error" in message:
+        error = message["error"]
+        if (
+            not isinstance(error, Mapping)
+            or type(error.get("code")) is not int
+            or not isinstance(error.get("message"), str)
+        ):
+            raise McpProtocolError("MCP stdio error response is invalid")
+        raise RuntimeError(error["message"] or "MCP JSON-RPC error")
     result = message.get("result")
     if not isinstance(result, Mapping):
         raise McpProtocolError("MCP JSON-RPC response is missing result")
     return result
 
 
-async def _read_framed_or_line_json(reader: asyncio.StreamReader) -> dict[str, object]:
-    first = await reader.readline()
-    if not first:
-        raise RuntimeError("MCP server closed stdout")
-    if first.lower().startswith(b"content-length:"):
+_MAX_STDIO_MESSAGE_BYTES = 2_000_000
+
+
+async def _read_stdio_json(reader: asyncio.StreamReader) -> dict[str, object]:
+    # Consume long standard lines in bounded pieces without changing a scoped factory's pipes.
+    raw = bytearray()
+    while True:
         try:
-            length = int(first.decode("ascii").split(":", 1)[1].strip())
-        except (UnicodeDecodeError, ValueError) as exc:
-            raise RuntimeError("MCP Content-Length is invalid") from exc
-        while True:
-            line = await reader.readline()
-            if line in {b"\r\n", b"\n", b""}:
-                break
-        raw = await reader.readexactly(length)
-        return _json_object(raw)
-    return _json_object(first)
+            chunk = await reader.readuntil(b"\n")
+        except asyncio.LimitOverrunError as error:
+            chunk = await reader.readexactly(
+                min(error.consumed, _MAX_STDIO_MESSAGE_BYTES + 1 - len(raw))
+            )
+        except asyncio.IncompleteReadError as error:
+            if not raw and not error.partial:
+                raise RuntimeError("MCP server closed stdout") from error
+            raise RuntimeError("MCP stdio message must end with newline") from error
+        raw.extend(chunk)
+        if len(raw) > _MAX_STDIO_MESSAGE_BYTES:
+            raise McpResponseTooLarge("MCP stdio response is too large")
+        if chunk.endswith(b"\n"):
+            break
+    if raw.lower().startswith(b"content-length:"):
+        raise RuntimeError("MCP stdio Content-Length framing is not supported; use newline JSON")
+    return _json_object(bytes(raw))
 
 
 def _jsonrpc_http_payload(response: McpHttpResponse) -> dict[str, object]:

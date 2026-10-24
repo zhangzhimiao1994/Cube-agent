@@ -356,6 +356,7 @@ class AuthService:
             )
 
     def authenticate_token(self, token: str) -> AuthenticatedPrincipal:
+        """Decode signed claims only; API authorization also requires live validation."""
         principal = None
         try:
             principal = _try_decode_principal(self._tokens, token)
@@ -364,6 +365,30 @@ class AuthService:
         if principal is None:
             _raise_invalid_token()
         return principal
+
+    async def validate_principal(self, principal: AuthenticatedPrincipal) -> AuthenticatedPrincipal:
+        """Require an existing, enabled actor with the token's current tenant and role."""
+        outcome = await self._try_validate_principal(principal)
+        if outcome is _Failure.PERSISTENCE:
+            _raise_authentication_persistence("authentication state could not be read")
+        if outcome is not True:
+            _raise_invalid_token()
+        return principal
+
+    async def _try_validate_principal(self, principal: AuthenticatedPrincipal) -> bool | _Failure:
+        try:
+            async with self._session_factory() as session:
+                result = await session.execute(select(
+                    UserRow.id, UserRow.tenant_id, UserRow.role, UserRow.disabled,
+                ).where(UserRow.id == principal.user_id, UserRow.tenant_id == principal.tenant_id))
+                current = result.one_or_none()
+                return bool(current is not None
+                    and current.id == principal.user_id
+                    and current.tenant_id == principal.tenant_id
+                    and current.role == principal.role.value
+                    and current.disabled is False)
+        except SQLAlchemyError:
+            return _Failure.PERSISTENCE
 
 
 async def _lock_bootstrap(session: AsyncSession) -> None:

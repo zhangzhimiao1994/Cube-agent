@@ -48,6 +48,7 @@ from agent_hub.runs.conversation_queue import (
 from agent_hub.runs.conversations import ConversationArchived, ConversationRecord
 from agent_hub.runs.observer import ObserverDecision, ObserverPolicy, RunMonitor
 from agent_hub.runs.repository import (
+    CapabilityApprovalSnapshot,
     RunAlreadyActive,
     RunConflict,
     RunRecord,
@@ -1457,6 +1458,7 @@ class RunService:
         run_id: UUID,
         approval_id: str,
         version: int,
+        scope: Literal["once", "conversation"] = "once",
     ) -> SubmittedRun:
         await self._repository.get(tenant_id, run_id, actor_id=actor_id)
         await self._stop_run_preview(tenant_id, run_id)
@@ -1466,6 +1468,7 @@ class RunService:
             approval_id=approval_id,
             version=version,
             actor_id=actor_id,
+            **({"scope": scope} if scope == "conversation" else {}),
         )
         return _submitted(record)
 
@@ -1650,6 +1653,11 @@ class RunService:
         return await self._repository.capability_approval_ready(
             tenant_id, run_id, actor_id=actor_id,
         )
+
+    async def capability_approval_snapshot(
+        self, tenant_id: UUID, run_id: UUID, *, actor_id: UUID,
+    ) -> CapabilityApprovalSnapshot:
+        return await self._repository.capability_approval_snapshot(tenant_id, run_id, actor_id=actor_id)
 
     async def pause(self, tenant_id: UUID, run_id: UUID) -> RunSummary:
         record = await self._repository.update_control_status(tenant_id, run_id, RunStatus.PAUSED)
@@ -2413,6 +2421,12 @@ class RunService:
                         if _required_approval_checkpoint_id(record) is not None:
                             approval_drain.observe(record)
                             raise RuntimeError("runtime ended before approval checkpoint was saved")
+                        if terminal is RunStatus.RUNNING and record.status is RunStatus.RUNNING:
+                            if (record.worker_id != self._worker_id
+                                    or record.worker_lease_token != worker_lease_token):
+                                lease_lost = True
+                            else:
+                                raise RuntimeError("runtime ended without terminal event")
             finally:
                 approval_drain.timeout = None
                 heartbeat_stop.set()

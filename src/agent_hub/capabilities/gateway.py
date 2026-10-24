@@ -205,6 +205,8 @@ class CapabilityGateway:
             if go_recipe:
                 identity_args['go_recipe_authority'] = self._go_recipe_authority
                 identity_args['expected_go_recipe'] = expected_go_recipe
+            if getattr(self._run_repository, "supports_conversation_capability_approval", False) is True:
+                identity_args["approval_request"] = request
             await before_action_approval(request, approval.id)
             await self._run_repository.begin_capability_approval(  # type: ignore[attr-defined]
                 request.tenant_id,

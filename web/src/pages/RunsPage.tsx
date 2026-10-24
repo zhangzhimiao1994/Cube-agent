@@ -3,7 +3,7 @@ import { Fragment, FormEvent, type ReactNode, useEffect, useMemo, useRef, useSta
 import { createPortal } from "react-dom";
 import { Link, useLocation, useNavigate } from "react-router-dom";
 import { z } from "zod";
-import { ArrowUp, FolderClock, MoreHorizontal } from "lucide-react";
+import { ArrowUp, Copy, FolderClock, MoreHorizontal } from "lucide-react";
 
 import { ApiError, api, formatApiError, type AttachmentUpload, type Conversation, type ConversationMetadata, type ConversationQueueItem, type ModelDeployment, type ProjectWorkspace, type RunDetail, type RunListItem, type Skill, type SkillArchiveUpload, type SubmittedRun, type WebPreview, type WorkspaceDirectoryList, type WorkspaceFileList } from "../api/client";
 import { APP_BRAND_NAME } from "../app/brand";
@@ -19,9 +19,13 @@ import {
 } from "../components/ArtifactFileCard";
 import { repairActionLabel, repairErrorCodeLabel, repairFailureKindLabel, repairRecoveryStrategyLabel } from "./repairLabels";
 import { useCapabilityApprovalDecisions } from "./useCapabilityApprovalDecisions";
+import { RunApprovalHistory } from "./RunApprovalHistory";
+import { useRunCapabilityApprovals } from "./useRunCapabilityApprovals";
+import { CapabilityApprovalCard } from "../components/CapabilityApprovalCard";
 import { useAuth } from "../auth/AuthProvider";
 import { PermissionSelector, type PermissionMode } from "../components/PermissionSelector";
 import { ComposerModeMenu, ComposerMoreMenu } from "../components/ComposerMenus";
+import { ProcessPanelTabs } from "../components/ProcessPanelTabs";
 import { resolvePermissionSelection, sandboxPermissions, type SupportedPermissionMode } from "./permissionSelection";
 
 const RUN_MODES = [
@@ -2627,6 +2631,13 @@ function detailMessages(detail: RunDetail | undefined): ChatMessage[] {
           },
         ]
       : [];
+  const emptyDelivery: ChatMessage[] = detail.status === "completed" && !replyArtifact
+    && downloadableArtifacts.length === 0 && artifactMessages.length === 0 && !internalNotice
+    ? [{
+        id: "empty-delivery", role: "assistant", title: "暂无交付结果",
+        body: "本轮已结束，但未提供最终回复或交付文件；不能据此确认项目完成。",
+      }]
+    : [];
   return [
     {
       id: "request",
@@ -2697,6 +2708,7 @@ function detailMessages(detail: RunDetail | undefined): ChatMessage[] {
       : []),
     ...(internalNotice ? [internalNotice] : []),
     ...artifactMessages,
+    ...emptyDelivery,
     ...failureMessages,
   ];
 }
@@ -4495,18 +4507,9 @@ function discussionDisagreementSignal(event: RunEvent) {
 }
 
 function discussionMinutesSummary(event: RunEvent, agentNames: Map<string, string>) {
-  const consensus = discussionConsensusSignal(event);
-  const disagreement = discussionDisagreementSignal(event);
-  const judgement = eventDecisionSignal(event);
+  const excerpt = discussionConsensusSignal(event);
   const participants = displayEventParticipants(event.participants, agentNames) ?? displayPayloadParticipants(event.payload, agentNames);
-  const conciseDiscussionText = (value: string, fallback: string) => conciseProcessText(value, fallback).replace(/[。.!?！？]+$/u, "");
-  const parts = [
-    consensus ? `共识 ${conciseDiscussionText(consensus, "已形成阶段共识")}` : "",
-    disagreement ? `分歧 ${conciseDiscussionText(disagreement, "存在待裁决分歧")}` : "",
-    !consensus && judgement ? `结论 ${conciseDiscussionText(judgement, "已完成裁决")}` : "",
-  ].filter(Boolean);
-  if (parts.length > 0) return `讨论纪要：${parts.join("；")}`;
-  return `讨论纪要：${participants || "多角色"}已完成讨论`;
+  return excerpt ? `讨论结束：记录摘录 ${conciseProcessText(excerpt, "")}` : `${participants || "多角色"}讨论已结束`;
 }
 
 function discussionMinutesRows(event: RunEvent, agentNames: Map<string, string>) {
@@ -4514,17 +4517,13 @@ function discussionMinutesRows(event: RunEvent, agentNames: Map<string, string>)
   const consensus = discussionConsensusSignal(event);
   const disagreement = discussionDisagreementSignal(event);
   const judgement = eventDecisionSignal(event);
-  const minutes = [
-    consensus ? `共识：${consensus}` : "",
-    disagreement ? `分歧：${disagreement}` : "",
-    judgement ? `结论：${judgement}` : "",
-  ].filter(Boolean);
-  if (minutes.length > 0) rows.push({ label: "会议纪要", value: minutes.join("；") });
+  if (consensus) rows.push({ label: "讨论记录摘录", value: consensus });
+  if (disagreement) rows.push({ label: "事件报告的分歧", value: disagreement });
   eventOpinionEntries(event, agentNames).forEach((opinion) => {
-    rows.push({ label: `${opinion.actor}意见`, value: opinion.value });
+    rows.push({ label: `附带记录（来源未核实）· ${opinion.actor}`, value: opinion.value });
   });
-  rows.push(...discussionTraceRows(event, agentNames));
-  if (judgement) rows.push({ label: "主 Agent 裁决", value: judgement });
+  rows.push(...discussionTraceRows(event, agentNames).map((row) => ({ ...row, label: `计划记录 · ${row.label}` })));
+  if (judgement) rows.push({ label: "事件报告的决策", value: judgement });
   return rows;
 }
 
@@ -5175,10 +5174,12 @@ function WorkbenchActionRow({
   onOpen: (target: ProcessDetailTarget) => void;
   onOpenFile: (file: WorkbenchFileItem) => void;
 }) {
+  const [expanded, setExpanded] = useState(false);
   const descriptor = workbenchActionDescriptor(item, files);
   return (
     <article className="agent-workbench-action-row">
-      <button type="button" className="run-process-toggle process-intermediate-card" onClick={() => onOpen(item)}>
+      <button type="button" className="run-process-toggle process-intermediate-card"
+        aria-label={`展开记录 ${item.message}`} aria-expanded={expanded} onClick={() => setExpanded((current) => !current)}>
         <span aria-hidden="true">›</span>
         <small className="process-card-badge">{descriptor.operation}</small>
         <strong>{descriptor.target}</strong>
@@ -5192,6 +5193,10 @@ function WorkbenchActionRow({
         ) : null}
         {item.artifact ? <small>{artifactDisplayName(item.artifact)}</small> : null}
       </button>
+      {expanded ? <div className="process-record-expanded" role="region" aria-label="记录详情">
+        <ProcessDetailCards target={item} />
+        {item.artifact ? <ArtifactFileCard artifact={item.artifact} compact /> : null}
+      </div> : null}
       {files.length > 0 ? (
         <div className="agent-workbench-action-files" aria-label={`${item.message}关联文件`}>
           {files.map((file) => (
@@ -5211,18 +5216,70 @@ function WorkbenchActionRow({
   );
 }
 
+function actualWorkbenchItems(items: ProcessDetailTarget[]) {
+  const actual = items.filter((item) => item.sourceSequence !== undefined
+    && item.sourceKind !== "main_agent.plan" && item.sourceKind !== "model.reasoning_delta");
+  // Reasoning bodies stay excluded; expose only numeric streaming counters.
+  const counters = items.filter((item) => item.sourceKind === "model.reasoning_delta" && item.sourceSequence !== undefined)
+    .map((item): ProcessDetailTarget => ({
+      id: item.id, runId: item.runId, conversationId: item.conversationId,
+      title: "模型流元数据", message: "模型流元数据：推理流计数已记录", badge: "模型流元数据",
+      createdAt: item.createdAt, sourceKind: item.sourceKind, sourceSequence: item.sourceSequence,
+      sourceActor: item.sourceActor, sourceStepId: item.sourceStepId,
+      rows: [{ label: "Delta 类型", value: "reasoning" }, ...item.rows.filter((row) =>
+        ["分片数", "内容字节数"].includes(row.label) && /^\d+$/.test(row.value))],
+    }));
+  return [...actual, ...counters].sort((left, right) => (left.sourceSequence ?? 0) - (right.sourceSequence ?? 0));
+}
+
+function recordOriginLabel(item: ProcessDetailTarget) {
+  if (item.sourceKind?.startsWith("tool.")) return "工具反馈";
+  if (item.sourceKind === "message.created") return "公开反馈（来源类型未标注）";
+  if (item.sourceKind === "artifact.created") return "公开产物";
+  if (item.sourceKind?.startsWith("model.")) return "模型调用记录";
+  return "系统记录";
+}
+
+function RunProgressSummary({ detail, agentId, items }: {
+  detail?: RunDetail; agentId?: string | null; items: ProcessDetailTarget[];
+}) {
+  const actual = actualWorkbenchItems(items);
+  const excerpts = detail ? orderedRunEvents(detail.events).filter((event) =>
+    event.kind === "message.created" && (!agentId || event.actor === agentId)) : [];
+  const status = detail ? ({
+    completed: "本轮已结束", failed: "本轮中断", cancelled: "本轮已取消",
+    waiting_approval: "等待确认", queued: "排队中", waiting_capacity: "等待模型容量", running: "进行中",
+  }[detail.status] ?? "状态已记录") : "状态记录";
+  const completed = detail?.events.filter((event) =>
+    event.kind === "step.completed" && (!agentId || event.actor === agentId)).length ?? 0;
+  const blocker = detail?.status === "failed" ? failureSummaryForChat(detail)
+    : detail?.status === "waiting_approval" ? "等待本轮确认后继续。" : null;
+  return <section className="process-progress-summary" aria-label="进展摘要">
+    <dl className="process-progress-facts">
+      <div><dt>当前进展</dt><dd>{status}</dd></div>
+      <div><dt>已记录完成</dt><dd>{completed ? `${completed} 个步骤` : "暂无步骤完成记录"}</dd></div>
+      <div><dt>最近记录</dt><dd>{actual.at(-1)?.message ?? "暂无真实调度记录"}</dd></div>
+      {blocker ? <div><dt>阻塞</dt><dd>{blocker}</dd></div> : null}
+    </dl>
+    <section className="process-public-excerpts" aria-label="公开发言摘录">
+      <h4>公开记录摘录</h4>
+      {excerpts.length ? excerpts.map((event) => <article key={event.sequence}>
+        <small>{event.actor || "系统"} · 来源类型未标注</small>
+        <BoundedTextBlock label="公开反馈" text={event.message === event.kind
+          ? event.summary || "未提供公开正文" : event.message} shouldCollapse
+          copyAriaLabel="复制公开反馈" />
+        <time dateTime={event.created_at}>{event.created_at}</time>
+      </article>) : <p>暂无公开发言记录</p>}
+    </section>
+    <p className="process-minutes-unavailable">未生成会议纪要</p>
+  </section>;
+}
+
 function AgentWorkbenchDrawer({
-  dispatchCards,
-  executionIntents,
-  failureDiagnostics,
-  files,
-  initialAgentId,
-  items,
-  taskChain,
-  onClose,
-  onOpen,
-  webPreviewScope,
+  detail, dispatchCards, executionIntents, failureDiagnostics, files, initialAgentId,
+  items, taskChain, onClose, onOpen, webPreviewScope,
 }: {
+  detail: RunDetail;
   dispatchCards: AgentDispatchCard[];
   executionIntents: RunExecutionIntent[];
   failureDiagnostics: RunFailureDiagnostic[];
@@ -5234,285 +5291,127 @@ function AgentWorkbenchDrawer({
   onOpen: (target: ProcessDetailTarget) => void;
   webPreviewScope?: WebPreviewScope | null;
 }) {
-  const [showAllActions, setShowAllActions] = useState(false);
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(initialAgentId ?? null);
-  const [activeView, setActiveView] = useState<"overview" | "actions">("overview");
   const [selectedFileId, setSelectedFileId] = useState<string | null>(null);
-  const previewPaneRef = useRef<HTMLElement | null>(null);
+  const [selectedSource, setSelectedSource] = useState<ProcessDetailTarget | null>(null);
+  const [showAllRecords, setShowAllRecords] = useState(false);
   const selectedAgent = dispatchCards.find((card) => card.id === selectedAgentId) ?? null;
-  const coordinationItems = items.filter(isWorkbenchCoordinationItem);
-  const actionItems = items.filter((item) => !isWorkbenchCoordinationItem(item));
-  const coordinationSections = coordinationEvidenceSections(coordinationItems);
-  const selectedAgentItems = selectedAgent ? agentActivityItems(selectedAgent, items) : [];
-  const actionPreview = recentPreview(selectedAgentItems, WORKBENCH_ACTION_PREVIEW_LIMIT, showAllActions);
-  const recoveryCount = failureDiagnostics.length + executionIntents.length;
-  const defaultFile = files.find(isTextPreviewCandidate) ?? files[0] ?? null;
-  const selectedFile = files.find((file) => file.id === selectedFileId) ?? defaultFile;
+  const eventItems = detail.events.flatMap((event, index) => {
+    if (!["message.created", "runtime.started", "runtime.completed", "runtime.cancelled", "queued", "run.queued"].includes(event.kind)
+      || items.some((item) => item.sourceKind === event.kind && item.sourceSequence === event.sequence)) return [];
+    return processItemsForEvent(detail, event, index, new Map(dispatchCards.map((card) => [card.id, card.name])), null);
+  });
+  const recordItems = [...items, ...eventItems].sort((left, right) => (left.sourceSequence ?? 0) - (right.sourceSequence ?? 0));
+  const visibleItems = selectedAgent ? agentActivityItems(selectedAgent, recordItems) : recordItems;
+  const records = actualWorkbenchItems(visibleItems);
+  const displayedRecords = showAllRecords ? records : records.slice(-12);
+  const publicTexts = detail.artifacts.filter((artifact) => artifact.text?.trim()
+    && ["text", "markdown", "model_response", "tool_result"].includes(artifact.kind)
+    && !["conversation_history", "conversation_history_compacted", "retrieval_context"].includes(artifact.title)
+    && (!selectedAgent || artifact.title === selectedAgent.id || artifact.title === selectedAgent.name));
+  const selectedFile = files.find((file) => file.id === selectedFileId) ?? null;
   const filesBySourceId = new Map<string, WorkbenchFileItem[]>();
   files.forEach((file) => {
-    if (!file.source) return;
-    filesBySourceId.set(file.source.id, [...(filesBySourceId.get(file.source.id) ?? []), file]);
+    if (file.source) filesBySourceId.set(file.source.id, [...(filesBySourceId.get(file.source.id) ?? []), file]);
   });
-  const filesForAction = (item: ProcessDetailTarget) => filesBySourceId.get(item.id) ?? [];
-  const openFile = (file: WorkbenchFileItem) => {
-    setSelectedFileId(file.id);
-    if (selectedAgentId) {
-      setSelectedAgentId(null);
-      setActiveView("actions");
-    }
-  };
   useEffect(() => {
     setSelectedAgentId(initialAgentId ?? null);
-    setActiveView("overview");
-    setShowAllActions(false);
+    setSelectedSource(null);
+    setShowAllRecords(false);
   }, [initialAgentId]);
-  useEffect(() => {
-    if (!selectedFileId || !previewPaneRef.current) return;
-    if (typeof window === "undefined" || typeof window.matchMedia !== "function") return;
-    if (!window.matchMedia("(max-width: 980px)").matches) return;
-    previewPaneRef.current.scrollIntoView({ block: "start", inline: "nearest" });
-  }, [selectedFileId, activeView]);
-  const actionWorkspaceItems = activeView === "actions" ? actionItems : [];
-  const actionWorkspaceLabel = "动作与文件";
-  const actionWorkspaceAria = "过程轨迹";
-  const actionWorkspaceEmpty = "暂无动作或文件记录";
+  const agentHeading = selectedAgent ? <div className="agent-workbench-actions-header">
+    <strong>{agentDisplayTitle(selectedAgent)}工作调度</strong>
+    <button type="button" className="secondary-action" onClick={() => setSelectedAgentId(null)}>返回调度总览</button>
+  </div> : null;
   return createPortal(
     <div className="process-drawer-backdrop" role="presentation" onClick={onClose}>
-      <section
-        className="process-drawer agent-workbench-drawer"
-        role="dialog"
-        aria-label="Agent 工作席详情"
-        aria-modal="true"
-        onClick={(event) => event.stopPropagation()}
-      >
+      <section className="process-drawer agent-workbench-drawer" role="dialog" aria-label="Agent 工作席详情"
+        aria-modal="true" onClick={(event) => event.stopPropagation()}>
         <div className="process-drawer-handle" aria-hidden="true" />
         <div className="process-drawer-header">
-          <div>
-            <span className="eyebrow">Agent workbench</span>
-            <h3>Agent 工作席</h3>
-          </div>
-          <button type="button" className="secondary-action" onClick={onClose}>
-            关闭
-          </button>
+          <div><span className="eyebrow">Agent workbench</span><h3>Agent 工作席</h3></div>
+          <button type="button" className="secondary-action" onClick={onClose}>关闭</button>
         </div>
         <div className="agent-workbench-detail">
-          {selectedAgent ? (
-            <section className="agent-workbench-actions" aria-label={`${agentDisplayTitle(selectedAgent)}工作调度`}>
-              <div className="agent-workbench-actions-header">
-                <strong>{agentDisplayTitle(selectedAgent)}工作调度</strong>
-                <small>{selectedAgentItems.length} 个动作</small>
-                <button
-                  type="button"
-                  className="secondary-action"
-                  onClick={() => {
-                    setSelectedAgentId(null);
-                    setShowAllActions(false);
-                  }}
-                >
-                  返回调度总览
-                </button>
-                {selectedAgentItems.length > WORKBENCH_ACTION_PREVIEW_LIMIT ? (
-                  <button type="button" className="secondary-action" onClick={() => setShowAllActions((current) => !current)}>
-                    {showAllActions ? "收起动作" : "显示全部动作"}
-                  </button>
-                ) : null}
-              </div>
-              {actionPreview.hiddenCount > 0 ? (
-                <p className="agent-workbench-compressed-note">已折叠 {actionPreview.hiddenCount} 个较早动作</p>
-              ) : null}
-              <div className="agent-cluster-actions">
-                {actionPreview.visible.map((item) => (
-                  <WorkbenchActionRow
-                    key={item.id}
-                    files={filesForAction(item)}
-                    item={item}
-                    onOpen={onOpen}
-                    onOpenFile={openFile}
-                  />
-                ))}
-              </div>
+          <ProcessPanelTabs summary={<>
+            {agentHeading}
+            <RunProgressSummary detail={detail} agentId={selectedAgentId} items={visibleItems} />
+            {!selectedAgent ? <div className="agent-workbench-list" aria-label="计划参与角色">
+              {dispatchCards.map((card) => <button key={card.id} type="button"
+                className={`agent-workbench-agent-card status-${card.status}`}
+                aria-label={`打开${agentDisplayTitle(card)}工作调度`} onClick={() => setSelectedAgentId(card.id)}>
+                <div className="agent-workbench-agent-header">
+                  <div className="agent-workbench-avatar" aria-hidden="true">{card.name.slice(0, 1)}</div>
+                  <div><strong>{agentDisplayTitle(card)}</strong><span>{card.status}</span></div>
+                </div>
+                <p>{card.summary}</p>
+                <small>{agentActivityItems(card, recordItems).length} 条，点击查看</small>
+                {card.model ? <small>配置模型：{card.model}</small> : null}
+                <div className="agent-workbench-inputs">
+                  {card.purpose ? <span>职责 {card.purpose}</span> : null}
+                  {card.taskInputs.map((input, index) => <span key={`task-${index}`}>任务 {input}</span>)}
+                  {card.dependencyInputs.map((input, index) => <span key={`dependency-${index}`}>依赖 {input}</span>)}
+                  {card.toolInputs.map((input, index) => <span key={`tool-${index}`}>工具 {input}</span>)}
+                </div>
+              </button>)}
+            </div> : null}
+            {taskChain.length ? <section className="process-planned-chain" aria-label="执行计划">
+              <h4>执行计划</h4>
+              <small>{taskChain.length} 个步骤</small>
+              {taskChain.map((step, index) => <div key={`${step.id}-${index}`}>
+                <strong>{step.agentName}</strong><span>{step.status}</span><p>{step.summary || "未提供计划说明"}</p>
+              </div>)}
+            </section> : null}
+            {items.some((item) => item.badge === "调度判断" && item.sourceSequence === undefined) ? (
+              <details className="process-plan-settings">
+                <summary>计划与配置</summary>
+                {items.filter((item) => item.badge === "调度判断" && item.sourceSequence === undefined)
+                  .map((item) => <ProcessDetailCards key={item.id} target={item} />)}
+              </details>
+            ) : null}
+          </>} records={<>
+            {agentHeading}
+            <section className="process-actual-records" role="region" aria-label="过程轨迹">
+              {!showAllRecords && records.length > displayedRecords.length ? <div>
+                <span>已折叠 {records.length - displayedRecords.length} 个较早动作</span>
+                <button type="button" onClick={() => setShowAllRecords(true)}>显示全部动作</button>
+              </div> : null}
+              {displayedRecords.length ? displayedRecords.map((item) => <div key={item.id} className="process-record">
+                <div className="process-record-origin"><small>{recordOriginLabel(item)}</small>
+                  {item.createdAt ? <time dateTime={item.createdAt}>{item.createdAt}</time> : null}</div>
+                <WorkbenchActionRow item={item} files={filesBySourceId.get(item.id) ?? []}
+                  onOpen={onOpen} onOpenFile={(file) => setSelectedFileId(file.id)} />
+              </div>) : <p>暂无真实调度记录</p>}
             </section>
-          ) : (
-            <>
-              <div className="agent-workbench-tabs" aria-label="工作席视图">
-                <button
-                  type="button"
-                  aria-label="助手总览"
-                  aria-pressed={activeView === "overview"}
-                  className={activeView === "overview" ? "active" : ""}
-                  onClick={() => setActiveView("overview")}
-                >
-                  总览
-                  <small>{dispatchCards.length} 个 Agent</small>
-                </button>
-                <button
-                  type="button"
-                  aria-label="动作与文件"
-                  aria-pressed={activeView === "actions"}
-                  className={activeView === "actions" ? "active" : ""}
-                  onClick={() => setActiveView("actions")}
-                >
-                  动作与文件
-                  <small>{actionItems.length + files.length + recoveryCount} 条</small>
-                </button>
+            {publicTexts.length ? <section className="process-public-artifacts" aria-label="公开文本产物">
+              {publicTexts.map((artifact) => <article key={artifact.id}>
+                <h4>{artifact.title}</h4><small>公开产物 · 来源绑定未提供</small>
+                <BoundedTextBlock label="公开文本" text={artifact.text!} shouldCollapse copyAriaLabel="复制公开文本" />
+              </article>)}
+            </section> : null}
+            <RunFailureDiagnosticsPanel diagnostics={failureDiagnostics} />
+            <RunExecutionIntentsPanel intents={executionIntents} />
+            {files.length ? <section className="agent-workbench-files-inline" aria-label="文件窗口">
+              <h4>公开文件与产物</h4>
+              <div className="agent-workbench-file-list compact">
+                {files.map((file) => <button key={file.id} type="button" aria-pressed={selectedFile?.id === file.id}
+                  onClick={() => setSelectedFileId(file.id)}><small>{file.operation}</small>
+                  <strong>{file.path || file.filename}</strong><span>{[file.kind, file.size].filter(Boolean).join(" · ")}</span>
+                </button>)}
               </div>
-              {activeView === "overview" ? (
-                <>
-                  {coordinationItems.length > 0 ? <AgentCoordinationEvidence sections={coordinationSections} onOpen={onOpen} /> : null}
-                  <div className="agent-workbench-list">
-                    {dispatchCards.map((card) => {
-                      const activityItems = agentActivityItems(card, items);
-                      return (
-                        <button
-                          key={card.id}
-                          type="button"
-                          className={`agent-workbench-agent-card status-${card.status}`}
-                          aria-label={`打开${agentDisplayTitle(card)}工作调度`}
-                          onClick={() => {
-                            setSelectedAgentId(card.id);
-                            setShowAllActions(false);
-                          }}
-                        >
-                  <div className="agent-workbench-agent-header">
-                    <div className="agent-workbench-avatar" aria-hidden="true">
-                      {card.name.slice(0, 1)}
-                    </div>
-                    <div>
-                      <strong>{agentDisplayTitle(card)}</strong>
-                      <small>{card.model}</small>
-                    </div>
-                    <span>{card.status}</span>
-                  </div>
-                  <p>{card.summary}</p>
-                  {card.purpose || card.taskInputs.length > 0 || card.dependencyInputs.length > 0 || card.toolInputs.length > 0 ? (
-                    <div className="agent-workbench-inputs" aria-label={`${agentDisplayTitle(card)}调度输入`}>
-                      {card.purpose ? <span>职责 {card.purpose}</span> : null}
-                      {card.taskInputs.map((item) => (
-                        <span key={`task-${item}`}>任务 {item}</span>
-                      ))}
-                      {card.dependencyInputs.map((item) => (
-                        <span key={`dependency-${item}`}>依赖 {item}</span>
-                      ))}
-                      {card.toolInputs.map((item) => (
-                        <span key={`tool-${item}`}>工具 {item}</span>
-                      ))}
-                    </div>
-                  ) : null}
-                  {activityItems.length > 0 ? (
-                    <div className="agent-workbench-activity">
-                      <small>活动轨迹</small>
-                      <p>{activityItems.length} 条，点击查看</p>
-                    </div>
-                  ) : null}
-                        </button>
-                      );
-                    })}
-                  </div>
-                  {taskChain.length > 0 ? (
-                    <section className="run-task-chain" aria-label="任务链路">
-                      <div className="run-task-chain-header">
-                        <span aria-hidden="true">⌁</span>
-                        <strong>任务链路</strong>
-                        <small>{taskChain.length} 个步骤</small>
-                      </div>
-                      <div className="run-task-chain-list">
-                        {taskChain.map((step, index) => (
-                          <article key={`${step.id}-${step.agentId}-${index}`} className={`run-task-chain-step step-${step.status}`}>
-                            <small>第 {index + 1} 步</small>
-                            <div>
-                              <strong>{step.agentName}</strong>
-                              <span>{step.status}</span>
-                            </div>
-                            <p>{step.summary || "等待执行"}</p>
-                          </article>
-                        ))}
-                      </div>
-                    </section>
-                  ) : null}
-                </>
-              ) : null}
-              {activeView === "actions" ? (
-                <section
-                  className="agent-workbench-action-workspace"
-                  aria-label={`${actionWorkspaceLabel}工作区`}
-                >
-                  <section className="agent-workbench-action-list-pane" aria-label="动作列表">
-                    <div className="agent-workbench-actions-header">
-                      <strong>{actionWorkspaceLabel}</strong>
-                      <small>{actionWorkspaceItems.length} 条</small>
-                    </div>
-                    <div className="agent-cluster-actions" role="region" aria-label={actionWorkspaceAria}>
-                      {actionWorkspaceItems.map((item) => (
-                        <WorkbenchActionRow
-                          key={item.id}
-                          files={filesForAction(item)}
-                          item={item}
-                          onOpen={onOpen}
-                          onOpenFile={openFile}
-                        />
-                      ))}
-                    </div>
-                    {actionWorkspaceItems.length === 0 ? <p className="agent-workbench-compressed-note">{actionWorkspaceEmpty}</p> : null}
-                    {files.length > 0 ? (
-                      <section className="agent-workbench-files-inline" aria-label="文件窗口">
-                        <div className="agent-workbench-actions-header">
-                          <strong>文件</strong>
-                          <small>{files.length} 个文件/产物</small>
-                        </div>
-                        <div className="agent-workbench-file-list compact" aria-label="文件操作列表">
-                          {files.map((file) => (
-                            <button
-                              key={file.id}
-                              type="button"
-                              className={selectedFile?.id === file.id ? "active" : ""}
-                              aria-pressed={selectedFile?.id === file.id}
-                              onClick={() => setSelectedFileId(file.id)}
-                            >
-                              <small>{file.operation}</small>
-                              <strong>{file.path || file.filename}</strong>
-                              <span>{[file.kind, file.size].filter(Boolean).join(" · ") || "文件"}</span>
-                            </button>
-                          ))}
-                        </div>
-                      </section>
-                    ) : null}
-                    {recoveryCount > 0 ? (
-                      <div className="agent-workbench-recovery-inline">
-                        <RunFailureDiagnosticsPanel diagnostics={failureDiagnostics} />
-                        <RunExecutionIntentsPanel intents={executionIntents} />
-                      </div>
-                    ) : null}
-                  </section>
-                  <section
-                    className={`agent-workbench-preview-pane${selectedFile ? " is-selected" : ""}`}
-                    ref={previewPaneRef}
-                    aria-label="关联文件预览"
-                  >
-                    <div className="agent-workbench-actions-header">
-                      <strong>关联文件预览</strong>
-                      <small>{selectedFile ? selectedFile.path || selectedFile.filename : `${files.length} 个文件/产物`}</small>
-                    </div>
-                    {selectedFile ? (
-                      <WorkbenchFilePreview
-                        key={selectedFile.id}
-                        file={selectedFile}
-                        webPreviewScope={webPreviewScope}
-                        onOpenSource={(target) => {
-                          onOpen(target);
-                        }}
-                      />
-                    ) : (
-                      <p className="agent-workbench-compressed-note">点击动作里的文件，可在这里直接预览内容。</p>
-                    )}
-                  </section>
-                </section>
-              ) : null}
-            </>
-          )}
+            </section> : null}
+            {selectedFile ? <section className="agent-workbench-preview-pane is-selected" aria-label="关联文件预览">
+              <h4>{selectedFile.path || selectedFile.filename}</h4>
+              <WorkbenchFilePreview file={selectedFile} webPreviewScope={webPreviewScope}
+                onOpenSource={(target) => setSelectedSource(target)} />
+            </section> : null}
+            {selectedSource ? <section className="process-record-expanded" aria-label="来源记录">
+              <h4>{selectedSource.title}</h4><ProcessDetailCards target={selectedSource} />
+            </section> : null}
+          </>} />
         </div>
       </section>
-    </div>,
-    document.body,
+    </div>, document.body,
   );
 }
 
@@ -5658,6 +5557,7 @@ function RunProcessSummary({
           </button>
           {isWorkbenchOpen ? (
             <AgentWorkbenchDrawer
+              detail={detail}
               dispatchCards={dispatchCards}
               executionIntents={executionIntents}
               failureDiagnostics={failureDiagnostics}
@@ -5798,71 +5698,25 @@ function ProcessDetailValueBlock({ row }: { row: { label: string; value: string 
 }
 
 function ProcessDetailCards({ target }: { target: ProcessDetailTarget }) {
-  const [openGroupKey, setOpenGroupKey] = useState<string | null>(null);
   const groups = processDetailGroups(target.rows);
-  if (groups.length === 0) return null;
-  const openGroup = groups.find((group) => group.key === openGroupKey) ?? null;
-  return (
-    <>
-      <div className="process-detail-card-grid" role="group" aria-label="运行详情摘要">
-        {groups.map((group) => (
-          <button
-            key={`${target.id}-${group.key}`}
-            type="button"
-            className={`process-detail-card process-detail-card-${group.key}`}
-            onClick={() => setOpenGroupKey(group.key)}
-            aria-label={`${group.label}：${processDetailGroupSummary(group)}`}
-          >
-            <span>{group.label}</span>
-            <small>{group.rows.length} 项</small>
-            <strong>{processDetailGroupSummary(group)}</strong>
-          </button>
-        ))}
-      </div>
-      {openGroup
-        ? createPortal(
-            <div className="process-detail-modal-backdrop" role="presentation" onClick={() => setOpenGroupKey(null)}>
-              <section
-                className="process-detail-modal"
-                role="dialog"
-                aria-label={`${openGroup.label}详情`}
-                aria-modal="true"
-                onClick={(event) => event.stopPropagation()}
-              >
-                <div className="process-detail-modal-header">
-                  <div>
-                    <span className="eyebrow">{target.badge}</span>
-                    <h4>{openGroup.label}</h4>
-                  </div>
-                  <button type="button" className="secondary-action" onClick={() => setOpenGroupKey(null)}>
-                    关闭
-                  </button>
-                </div>
-                <dl tabIndex={0} aria-label={`${openGroup.label}详情内容`}>
-                  {openGroup.rows.map((row, index) => (
-                    <Fragment key={`${target.id}-${openGroup.key}-${row.label}-${index}`}>
-                      <dt>{row.label}</dt>
-                      <dd>
-                        <ProcessDetailValueBlock row={row} />
-                      </dd>
-                    </Fragment>
-                  ))}
-                </dl>
-              </section>
-            </div>,
-            document.body,
-          )
-        : null}
-    </>
-  );
+  return <div className="process-detail-flat" role="group" aria-label="运行详情摘要">
+    {groups.map((group) => <section key={group.key} aria-label={`${group.label}详情内容`}>
+      <h4>{group.label}</h4>
+      <dl>{group.rows.map((row, index) => <Fragment key={`${row.label}-${index}`}>
+        <dt>{row.label}</dt><dd><ProcessDetailValueBlock row={row} /></dd>
+      </Fragment>)}</dl>
+    </section>)}
+  </div>;
 }
 
-function RunProcessDrawer({
+export function RunProcessDrawer({
   target,
   onClose,
+  detail,
 }: {
   target: ProcessDetailTarget;
   onClose: () => void;
+  detail?: RunDetail;
 }) {
   return createPortal(
     <div className="process-drawer-backdrop" role="presentation" onClick={onClose}>
@@ -5884,7 +5738,11 @@ function RunProcessDrawer({
           </button>
         </div>
         <div className="run-process-detail">
-          <article>
+          <ProcessPanelTabs summary={<>
+            <RunProgressSummary detail={detail} items={[target]} />
+            {target.artifact ? <ArtifactFileCard artifact={target.artifact} compact /> : null}
+          </>} records={<article>
+            <small>{recordOriginLabel(target)}</small>
             <p>{target.message}</p>
             {target.artifact ? (
               <div className="artifact-download-list" aria-label="中间产物">
@@ -5893,7 +5751,7 @@ function RunProcessDrawer({
             ) : null}
             <ProcessDetailCards target={target} />
             {target.createdAt ? <small>{target.createdAt}</small> : null}
-          </article>
+          </article>} />
         </div>
       </section>
     </div>,
@@ -6506,6 +6364,13 @@ export function MessageBody({ text, title }: { text: string; title: string }) {
   return <OutputContent text={text} title={title} />;
 }
 export function RunsPage() {
+  const auth = useAuth();
+  if (auth.loading) return <p>正在确认身份...</p>;
+  if (!auth.user || !auth.hasPermission("run:read")) return <p role="alert">当前身份无法查看会话</p>;
+  return <RunsPageForActor key={JSON.stringify([auth.user.tenant_id, auth.user.user_id, auth.user.role])} />;
+}
+
+function RunsPageForActor() {
   const { user: permissionActor } = useAuth();
   const permissionActorKey = [permissionActor?.tenant_id, permissionActor?.user_id, permissionActor?.role];
   const queryClient = useQueryClient();
@@ -6625,6 +6490,7 @@ export function RunsPage() {
     };
   });
   const [conversationMenuOpen, setConversationMenuOpen] = useState(false);
+  const [conversationCopyNotice, setConversationCopyNotice] = useState<"copied" | "failed" | null>(null);
   const conversationMenuAnchorRef = useRef<HTMLDivElement>(null);
   const conversationMenuTriggerRef = useRef<HTMLButtonElement>(null);
   const conversationMenuRef = useRef<HTMLDivElement>(null);
@@ -6712,12 +6578,7 @@ export function RunsPage() {
     proposal: RepairProposal;
   } | null>(null);
   const [capabilityApprovalCandidate, setCapabilityApproval] = useState<CapabilityApproval | null>(null);
-  const capabilityDecisions = useCapabilityApprovalDecisions((run, approval, decision) => {
-    if (capabilityApprovalRun?.id === approval.runId) {
-      setSubmitNotice(decision === "approve"
-        ? "已允许本次沙箱工具调用，当前任务已重新排队继续执行。"
-        : "已拒绝本次沙箱工具调用，当前任务已取消。");
-    }
+  const capabilityDecisions = useCapabilityApprovalDecisions((run, approval) => {
     void refreshRunSurfaces({
       id: approval.runId,
       conversation_id: run.conversation_id ?? queryClient.getQueryData<RunDetail>(["run", approval.runId])?.conversation_id,
@@ -6752,11 +6613,14 @@ export function RunsPage() {
 
   const selectedRunConversationId = runConversationId(selectedRun.data);
   const activeConversationId = conversationId.trim();
+  const conversationIdRef = useRef(activeConversationId);
+  conversationIdRef.current = activeConversationId;
   useEffect(() => {
     if (conversationMenuRef.current?.contains(document.activeElement)) {
       conversationMenuTriggerRef.current?.focus();
     }
     setConversationMenuOpen(false);
+    setConversationCopyNotice(null);
   }, [activeConversationId]);
 
   useEffect(() => {
@@ -6837,6 +6701,7 @@ export function RunsPage() {
     ? capabilityApprovalCandidate
     : null;
   const capabilityPending = capabilityDecision?.status === "pending";
+  const capabilityHistory = useRunCapabilityApprovals(capabilityApproval ? capabilityApprovalRun : undefined);
   const activeWorkspaceProjectId =
     activeConversation.data?.project_id?.trim() || listedConversationMetadata?.project_id?.trim() || projectId.trim() || "default";
   const activeWorkspaceSessionId =
@@ -6867,6 +6732,10 @@ export function RunsPage() {
   });
 
   async function refreshRunSurfaces(run: { id: string; conversation_id?: string | null }) {
+    await queryClient.invalidateQueries({ queryKey: [
+      "capability-approval-history", permissionActor?.tenant_id, permissionActor?.user_id,
+      permissionActor?.role, run.id,
+    ] });
     await queryClient.invalidateQueries({ queryKey: ["runs"] });
     await queryClient.invalidateQueries({ queryKey: ["run", run.id] });
     await queryClient.invalidateQueries({ queryKey: ["hermes"] });
@@ -8059,11 +7928,11 @@ export function RunsPage() {
       }
       setMessage("");
       if (choice.option.value === "approve") {
-        setSubmitNotice("已选择允许一次，正在重新排队继续执行。");
+        setSubmitNotice(null);
         capabilityDecisions.approve(capabilityApproval);
         return;
       }
-      setSubmitNotice("已选择拒绝，本次任务会取消。");
+      setSubmitNotice(null);
       capabilityDecisions.reject(capabilityApproval);
       return;
     }
@@ -8525,7 +8394,9 @@ export function RunsPage() {
   const currentConversationListItem = items.find((item) => item.conversation_id === activeConversationId);
   const currentConversationTitle =
     activeConversation.data?.title?.trim() ||
-    (currentConversationListItem ? conversationTitle(currentConversationListItem, items) : activeConversationKnown ? conversationId : "新会话");
+    listedConversationMetadata?.title?.trim() ||
+    currentConversationListItem?.conversation_title?.trim() ||
+    (activeConversationKnown ? "未命名会话" : "新会话");
   const currentConversationArchived = Boolean(activeConversation.data?.archived_at);
   const currentConversationPersisted = Boolean(
     activeConversation.data?.created_at || listedConversationMetadata?.created_at,
@@ -9114,18 +8985,20 @@ export function RunsPage() {
                     type="button"
                     className="conversation-menu-trigger"
                     aria-label="会话操作"
-                    title={currentConversationPersisted ? `会话操作：重命名、${currentConversationArchived ? "恢复" : "归档"}` : "开始会话后可重命名或归档"}
+                    title={currentConversationPersisted ? `会话操作：重命名、${currentConversationArchived ? "恢复" : "归档"}` : "会话操作：复制会话 ID"}
                     aria-haspopup="menu"
                     aria-expanded={conversationMenuOpen}
-                    disabled={!currentConversationPersisted}
+                    disabled={!activeConversationKnown || !activeConversationId}
                     onClick={() => {
                       conversationMenuInitialFocusRef.current = "first";
+                      setConversationCopyNotice(null);
                       setConversationMenuOpen((current) => !current);
                     }}
                     onKeyDown={(event) => {
                       if (!["ArrowDown", "ArrowUp", "Enter", " "].includes(event.key)) return;
                       event.preventDefault();
                       conversationMenuInitialFocusRef.current = event.key === "ArrowUp" ? "last" : "first";
+                      setConversationCopyNotice(null);
                       setConversationMenuOpen(true);
                     }}
                   >
@@ -9158,6 +9031,7 @@ export function RunsPage() {
                         type="button"
                         role="menuitem"
                         tabIndex={-1}
+                        disabled={!currentConversationPersisted}
                         onClick={() => {
                           setRenameConversationTitle(currentConversationTitle);
                           updateConversation.reset();
@@ -9171,7 +9045,7 @@ export function RunsPage() {
                         type="button"
                         role="menuitem"
                         tabIndex={-1}
-                        disabled={updateConversation.isPending}
+                        disabled={!currentConversationPersisted || updateConversation.isPending}
                         onClick={() =>
                           updateConversation.mutate({
                             conversationId: activeConversationId,
@@ -9181,6 +9055,29 @@ export function RunsPage() {
                       >
                         {currentConversationArchived ? "恢复" : "归档"}
                       </button>
+                      <div className="conversation-menu-identity">
+                        <div><small>会话 ID</small><code>{activeConversationId}</code></div>
+                      <button
+                        type="button"
+                        role="menuitem"
+                        tabIndex={-1}
+                        aria-label="复制会话 ID"
+                        title="复制会话 ID"
+                        onClick={async () => {
+                          const copiedId = activeConversationId;
+                          try {
+                            await copyTextToClipboard(copiedId);
+                            if (conversationIdRef.current === copiedId) setConversationCopyNotice("copied");
+                          } catch {
+                            if (conversationIdRef.current === copiedId) setConversationCopyNotice("failed");
+                          }
+                        }}
+                      >
+                        <Copy size={16} aria-hidden="true" />
+                      </button>
+                      </div>
+                      {conversationCopyNotice === "copied" ? <span role="status">已复制</span> : null}
+                      {conversationCopyNotice === "failed" ? <span role="alert">复制失败，请重试</span> : null}
                     </div>
                   ) : null}
                 </div>
@@ -9281,6 +9178,7 @@ export function RunsPage() {
                 </article>
                 {item.id.endsWith("-request") && item.run ? (
                   <>
+                    <RunApprovalHistory run={item.run} />
                     {automaticRepairInProgress(item.run) ? null : <RunInteractionSummaryInline
                       run={item.run}
                       agentNames={agentNameMap}
@@ -9309,6 +9207,16 @@ export function RunsPage() {
                 onPreviewFile={setConversationPreviewFile}
               />
             )}
+            {capabilityApproval ? (
+              <CapabilityApprovalCard approval={capabilityApproval} decision={capabilityDecision}
+                sessionAvailable={capabilityHistory.sessionAvailable}
+                sessionUnavailableReason={capabilityHistory.sessionUnavailableReason}
+                onApprove={() => capabilityDecisions.approve(capabilityApproval)}
+                onApproveConversation={() => {
+                  if (capabilityHistory.sessionAvailable) capabilityDecisions.approveConversation(capabilityApproval);
+                }}
+                onReject={() => capabilityDecisions.reject(capabilityApproval)} />
+            ) : null}
           </div>
           {conversationPreviewFile ? (
             <ConversationFilePreviewDrawer
@@ -9329,6 +9237,7 @@ export function RunsPage() {
           {refreshedProcessDetailTarget ? (
             <RunProcessDrawer
               target={refreshedProcessDetailTarget}
+              detail={refreshedRunForProcessDetail ?? undefined}
               onClose={() => setProcessDetailTarget(null)}
             />
           ) : null}
@@ -9454,34 +9363,6 @@ export function RunsPage() {
                   </button>
                   <button type="button" className="secondary-action" disabled={approveProjectPreflight.isPending} onClick={cancelProjectPreflightApproval}>
                     取消预检
-                  </button>
-                </div>
-              </aside>
-            ) : null}
-            {capabilityApproval ? (
-              <aside className="composer-attachment-card" role="status" aria-label="沙箱权限确认">
-                <div>
-                  <span className="eyebrow">沙箱权限待确认</span>
-                  <strong>{capabilityApproval.toolName ?? "工具调用需要授权"}</strong>
-                  <small>审批 {capabilityApproval.approvalId}</small>
-                </div>
-                <p>{capabilityApproval.summary}</p>
-                {capabilityDecision?.error ? <p role="alert">{capabilityDecision.error}</p> : null}
-                <div className="composer-card-actions">
-                  <button
-                    type="button"
-                    disabled={capabilityPending}
-                    onClick={() => capabilityDecisions.approve(capabilityApproval)}
-                  >
-                    {capabilityPending && capabilityDecision.decision === "approve" ? "允许中..." : "允许一次"}
-                  </button>
-                  <button
-                    type="button"
-                    className="secondary-action"
-                    disabled={capabilityPending}
-                    onClick={() => capabilityDecisions.reject(capabilityApproval)}
-                  >
-                    {capabilityPending && capabilityDecision.decision === "reject" ? "拒绝中..." : "拒绝"}
                   </button>
                 </div>
               </aside>
@@ -9745,7 +9626,7 @@ export function RunsPage() {
             <textarea
               value={message}
               onChange={(event) => setMessage(event.target.value)}
-              placeholder="输入消息，继续当前对话。例如：这个方案继续往更玄幻一点改。"
+              aria-label="消息"
               required
             />
             <div className="composer-actions">

@@ -297,6 +297,7 @@ describe("RunDetailPage", () => {
 
   afterEach(() => {
     cleanup();
+    vi.restoreAllMocks();
     vi.unstubAllGlobals();
     window.sessionStorage.clear();
   });
@@ -359,6 +360,10 @@ describe("RunDetailPage", () => {
   });
 
   it("keeps the original failure page when the first run fetch has no cached data", async () => {
+    vi.spyOn(api, "me").mockResolvedValue({
+      user_id: "11111111-1111-4111-8111-111111111111", tenant_id: "33333333-3333-4333-8333-333333333333",
+      username: "operator", role: "operator", permissions: ["run:read"],
+    });
     const fetchMock = vi.fn(async (_input: RequestInfo | URL) => jsonResponse({ error: {
       code: "service_unavailable", message: "initial run read unavailable",
     } }, { status: 503 }));
@@ -375,7 +380,7 @@ describe("RunDetailPage", () => {
       expect(alert.textContent).toContain("initial run read unavailable");
       expect(screen.queryByRole("heading", { name: "运行详情" })).toBeNull();
       expect(screen.queryByRole("button", { name: "插件安装计划" })).toBeNull();
-      expect(client.getQueryData(["run", runId])).toBeUndefined();
+      expect(client.getQueryCache().find({ queryKey: ["run", runId] })?.state.data).toBeUndefined();
       expect(fetchMock.mock.calls.filter(([input]) =>
         new URL(String(input), "https://agent-hub.test").pathname === `/api/v1/admin/runs/${runId}`,
       )).toHaveLength(1);
@@ -449,9 +454,9 @@ describe("RunDetailPage", () => {
         if (closed) await user.click(screen.getByRole("button", { name: "关闭安装计划" }));
 
         pollFailure = true;
-        await waitFor(() => expect(client.getQueryState(["run", runId])?.status).toBe("error"),
+        await waitFor(() => expect(client.getQueryCache().find({ queryKey: ["run", runId], exact: false })?.state?.status).toBe("error"),
           { timeout: 2500 });
-        expect(client.getQueryData(["run", runId])).toEqual(currentDetail);
+        expect(client.getQueryCache().find({ queryKey: ["run", runId], exact: false })?.state.data).toEqual(currentDetail);
         expect(screen.getByRole("heading", { name: "运行详情" })).not.toBeNull();
         expect(screen.getByRole("button", { name: "插件安装计划" })).toBe(originalEntry);
         expect(screen.getByRole("alert", { name: "运行详情刷新失败" }).textContent)
@@ -461,7 +466,7 @@ describe("RunDetailPage", () => {
         expect(creates).toHaveLength(1);
 
         pollFailure = false;
-        await waitFor(() => expect(client.getQueryState(["run", runId])?.status).toBe("success"),
+        await waitFor(() => expect(client.getQueryCache().find({ queryKey: ["run", runId], exact: false })?.state?.status).toBe("success"),
           { timeout: 2500 });
         await waitFor(() => expect(screen.queryByRole("alert", { name: "运行详情刷新失败" })).toBeNull());
         expect(creates).toHaveLength(1);
@@ -2872,7 +2877,7 @@ describe("RunDetailPage", () => {
 
     const card = await screen.findByRole("status", { name: "沙箱权限确认" });
     expect(within(card).getByText("project.generate_zip 需要沙箱权限。")).not.toBeNull();
-    await user.click(within(card).getByRole("button", { name: "允许一次" }));
+    await user.click(within(card).getByRole("button", { name: "批准" }));
 
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining("/approve-capability"), expect.any(Object)));
   });

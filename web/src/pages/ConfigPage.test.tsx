@@ -1,5 +1,6 @@
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { QueryClient, QueryClientProvider, useQueryClient } from "@tanstack/react-query";
+import { useEffect } from "react";
 import userEvent from "@testing-library/user-event";
 import { readFileSync } from "node:fs";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -54,15 +55,20 @@ function jsonResponse(payload: unknown, init: ResponseInit = {}) {
   });
 }
 
-function IdentityControls() {
+function IdentityControls({ onClient }: { onClient(client: QueryClient): void }) {
   const { login } = useAuth();
+  const client = useQueryClient();
+  useEffect(() => onClient(client), [client, onClient]);
   return <button onClick={() => void login("next", "password")}>切换设置身份</button>;
 }
 
 function renderScopedConfig(client: QueryClient) {
-  return render(<QueryClientProvider client={client}><AuthProvider><MemoryRouter>
-    <IdentityControls /><ConfigPage />
+  let activeClient = client;
+  const onClient = (current: QueryClient) => { activeClient = current; };
+  const view = render(<QueryClientProvider client={client}><AuthProvider><MemoryRouter>
+    <IdentityControls onClient={onClient} /><ConfigPage />
   </MemoryRouter></AuthProvider></QueryClientProvider>);
+  return { ...view, getClient: () => activeClient };
 }
 
 describe("ConfigPage", () => {
@@ -367,7 +373,7 @@ describe("ConfigPage", () => {
     const client = new QueryClient({ defaultOptions: { queries: { retry: false, staleTime: Infinity } } });
     client.setQueryData(["settings"], { ...nextSettings, default_permission_mode: "read_only" });
     const user = userEvent.setup();
-    renderScopedConfig(client);
+    const view = renderScopedConfig(client);
     const mode = await screen.findByLabelText("默认权限模式");
     expect((mode as HTMLSelectElement).value).toBe("default");
     await user.selectOptions(mode, "read_only");
@@ -379,7 +385,15 @@ describe("ConfigPage", () => {
     await act(async () => resolveSettings({ ...nextSettings, default_permission_mode: "default", default_sandbox_profile: "restricted" }));
     expect((await screen.findByLabelText("默认权限模式") as HTMLSelectElement).value).toBe("default");
     expect((screen.getByLabelText("默认沙箱边界") as HTMLSelectElement).value).toBe("restricted");
-    expect(client.getQueryData(["settings", nextIdentity.tenant_id, nextIdentity.user_id, nextIdentity.role])).toBeTruthy();
+    const activeClient = view.getClient();
+    const nextKey = ["settings", nextIdentity.tenant_id, nextIdentity.user_id, nextIdentity.role];
+    expect(activeClient).not.toBe(client);
+    expect(activeClient.getQueryData(nextKey)).toMatchObject({
+      default_permission_mode: "default", default_sandbox_profile: "restricted",
+    });
+    expect(activeClient.getQueryData(["settings", identity.tenant_id, identity.user_id, identity.role])).toBeUndefined();
+    expect(client.getQueryData(nextKey)).toBeUndefined();
+    expect(client.getQueryData(["settings"])).toBeUndefined();
   });
 
   it("does not permit editing or saving stale settings after a failed scoped refresh", async () => {
