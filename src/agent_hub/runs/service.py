@@ -7,7 +7,7 @@ import json
 import logging
 import math
 import re
-from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import aclosing
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -1977,6 +1977,8 @@ class RunService:
                     routing_decision["engineering_delivery_contract_version"] = 1
                     routing_decision["engineering_action_version"] = 1
                     routing_decision["delivery_followup_version"] = 2
+                    if mode is TaskMode.DISCUSS:
+                        routing_decision["engineering_final_report_version"] = 1
                     if (mode is TaskMode.DISCUSS
                             and type(routing_decision.get("generated_project_contract_version")) is int
                             and routing_decision["generated_project_contract_version"] == 1):
@@ -2310,11 +2312,13 @@ class RunService:
                 )
                 async with asyncio.timeout(None) as approval_timeout, aclosing(runtime_events):
                     approval_drain.timeout = approval_timeout
-                    async for event in runtime_events:
+                    async for event_batch in _delivery_publication_batches(runtime_events, context):
+                        event = event_batch[0]
                         cancel_runtime = False
                         stop_runtime_loop = False
                         persist_waiting_approval_checkpoint = False
                         draining_approval = False
+                        committed_events: list[RunEvent] = []
                         async with await self._repository.run_transaction() as session, session.begin():
                             locked = await self._repository.get_for_update(session, run_id)
                             current_status = RunStatus(locked.status)
@@ -2378,15 +2382,13 @@ class RunService:
                                 lease_lost = True
                                 stop_runtime_loop = True
                             if not stop_runtime_loop or persist_waiting_approval_checkpoint:
-                                sequence = await self._repository.next_event_sequence(session, run_id)
-                                event = _event_at_sequence(event, run_id=run_id, sequence=sequence)
-                                await self._repository.persist_event(
-                                    session, tenant_id=tenant_id, run_id=run_id, event=event,
-                                )
-                                observed_events.append(event)
-                                observer_decision = monitor.observe(event)
-                                if observer_decision is not None:
-                                    observer_decisions.append(observer_decision)
+                                for candidate in event_batch:
+                                    sequence = await self._repository.next_event_sequence(session, run_id)
+                                    event = _event_at_sequence(candidate, run_id=run_id, sequence=sequence)
+                                    await self._repository.persist_event(
+                                        session, tenant_id=tenant_id, run_id=run_id, event=event,
+                                    )
+                                    committed_events.append(event)
                                 if event.kind is EventKind.RUNTIME_COMPLETED:
                                     terminal = RunStatus.COMPLETED
                                 elif event.kind is EventKind.RUNTIME_CANCELLED:
@@ -2401,6 +2403,11 @@ class RunService:
                                     locked.version += 1
                                 if draining_approval and terminal is not RunStatus.WAITING_APPROVAL:
                                     stop_runtime_loop = True
+                        for committed_event in committed_events:
+                            observed_events.append(committed_event)
+                            observer_decision = monitor.observe(committed_event)
+                            if observer_decision is not None:
+                                observer_decisions.append(observer_decision)
                         if stop_runtime_loop:
                             approval_drain.complete = True
                             approval_timeout.reschedule(None)
@@ -5531,6 +5538,95 @@ def _with_runtime_token_budget_policy(
                 ) or initial_timeout
             decision["runtime_plan_timeout_seconds"] = plan_timeout
     return decision
+
+
+async def _delivery_publication_batches(
+    events: AsyncIterator[RunEvent], context: TaskContext,
+) -> AsyncGenerator[tuple[RunEvent, ...], None]:
+    """Commit the selected no-effect report envelope and its checkpoint atomically."""
+    from agent_hub.runtime.autogen.delivery_report import FINAL_REPORT_ACTOR, FINAL_REPORT_POLICY
+
+    selected = (context.mode is TaskMode.DISCUSS
+                and type(context.routing_decision.get(FINAL_REPORT_POLICY)) is int
+                and context.routing_decision.get(FINAL_REPORT_POLICY) == 1)
+
+    def report_phase(checkpoint: RuntimeCheckpoint | None) -> bool:
+        if (checkpoint is None or checkpoint.run_id != context.run_id
+                or checkpoint.tenant_id != context.tenant_id or checkpoint.mode is not context.mode
+                or checkpoint.runtime_type != "autogen" or checkpoint.runtime_version != "2"
+                or type(checkpoint.state.get(FINAL_REPORT_POLICY)) is not int
+                or checkpoint.state.get(FINAL_REPORT_POLICY) != 1
+                or checkpoint.state_sha256 != checkpoint.recompute_state_sha256()):
+            return False
+        ledger = checkpoint.state.get("model_ledger")
+        row = ledger[-1] if isinstance(ledger, tuple | list) and ledger else None
+        binding = row.get("report_binding") if isinstance(row, Mapping) else None
+        return (isinstance(row, Mapping) and row.get("status") == "succeeded"
+                and isinstance(binding, Mapping) and type(binding.get("version")) is int
+                and binding.get("version") == 1 and binding.get("run_id") == str(context.run_id)
+                and binding.get("tenant_id") == str(context.tenant_id)
+                and binding.get("owner") == FINAL_REPORT_ACTOR)
+
+    enabled = selected and report_phase(context.checkpoint)
+    pending: list[RunEvent] = []
+    expected: tuple[str, ...] = ()
+    report: Artifact | None = None
+    report_id: str | None = None
+    report_sha: str | None = None
+    async for event in events:
+        if not pending:
+            if selected and event.kind is EventKind.CHECKPOINT_SAVED:
+                enabled = report_phase(event.checkpoint)
+            if enabled and event.kind is EventKind.MESSAGE_CREATED and event.actor == FINAL_REPORT_ACTOR:
+                expected = (EventKind.ARTIFACT_CREATED, EventKind.CHECKPOINT_SAVED)
+            elif (enabled and event.kind is EventKind.ARTIFACT_CREATED and event.artifact is not None
+                  and event.artifact.producer == FINAL_REPORT_ACTOR):
+                report = event.artifact
+                expected = ("discussion.completed", EventKind.CHECKPOINT_SAVED)
+            elif (enabled and event.kind == "discussion.completed"
+                  and "final_answer_artifact_id" in event.payload):
+                expected = (EventKind.CHECKPOINT_SAVED,)
+            else:
+                yield (event,)
+                continue
+        else:
+            if not expected or event.kind != expected[0]:
+                raise RuntimeError("final report publication order is invalid")
+            expected = expected[1:]
+        if event.run_id != context.run_id:
+            raise RuntimeError("final report publication scope is invalid")
+        pending.append(event)
+        if event.artifact is not None:
+            report = event.artifact
+            if (report.type != "text" or report.producer != FINAL_REPORT_ACTOR
+                    or report.content.get("presentation") != "final_answer"
+                    or pending[0].kind is EventKind.MESSAGE_CREATED
+                    and pending[0].message != report.content.get("text")):
+                raise RuntimeError("final report publication artifact is invalid")
+            report_id, report_sha = str(report.id), report.content_sha256
+        if event.kind == "discussion.completed":
+            reference, digest = event.payload.get("final_answer_artifact_id"), event.payload.get("final_answer_sha256")
+            if (not isinstance(reference, str) or not isinstance(digest, str)
+                    or report_id is not None and (reference != report_id or digest != report_sha)):
+                raise RuntimeError("final report publication reference is invalid")
+            report_id, report_sha = reference, digest
+        if expected:
+            continue
+        checkpoint = event.checkpoint
+        registry = None if checkpoint is None else checkpoint.state.get("artifact_registry")
+        if (event.kind is not EventKind.CHECKPOINT_SAVED or checkpoint is None
+                or checkpoint.run_id != context.run_id or checkpoint.tenant_id != context.tenant_id
+                or checkpoint.mode is not context.mode
+                or type(checkpoint.state.get(FINAL_REPORT_POLICY)) is not int
+                or checkpoint.state.get(FINAL_REPORT_POLICY) != 1
+                or checkpoint.state_sha256 != checkpoint.recompute_state_sha256()
+                or not isinstance(registry, Mapping) or report_id is None
+                or registry.get(report_id) != report_sha):
+            raise RuntimeError("final report publication checkpoint is invalid")
+        yield tuple(pending)
+        pending, report, report_id, report_sha = [], None, None, None
+    if pending:
+        raise RuntimeError("final report publication ended before checkpoint")
 
 
 async def _adaptive_runtime_events(
