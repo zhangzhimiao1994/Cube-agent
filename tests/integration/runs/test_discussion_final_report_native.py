@@ -63,7 +63,9 @@ def native_plan() -> DiscussionPlan:
     engineer = replace(original.participants[0], allowed_tools=(
         "project.inspect", *original.participants[0].allowed_tools,
     ))
-    return replace(original, participants=(engineer, original.participants[1]),
+    participants = (engineer, original.participants[1], *(replace(
+        original.participants[1], id=f"reviewer{index}") for index in range(2, 8)))
+    return replace(original, participants=participants,
                    max_turns=24, token_budget=5000, wall_time_seconds=30)
 
 

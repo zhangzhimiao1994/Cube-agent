@@ -384,6 +384,21 @@ async def test_planning_participant_named_like_final_actor_is_not_a_report() -> 
         (event,) for event in events]
 
 
+async def test_eight_discussion_roles_still_receive_an_independent_final_report() -> None:
+    original = plan()
+    participants = (*original.participants, *(replace(original.participants[1], id=f"reviewer{index}")
+                                             for index in range(2, 8)))
+    runtime_plan = replace(original, participants=participants, max_turns=24)
+    gateway = ReportGateway()
+    runner = AutoGenDiscussionRuntime(gateway, runtime_plan, capability_gateway=Capabilities())
+    events = [event async for event in runner.run(report_context())]
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED, events[-1].reason
+    started = next(event for event in events if event.kind is EventKind.DISCUSSION_STARTED)
+    assert started.participants == tuple(participant.id for participant in participants)
+    assert len(gateway.final_requests) == 1
+    assert any(event.artifact is not None and event.artifact.producer == ACTOR for event in events)
+
+
 @pytest.mark.parametrize("fault", ["eof", "exception", "tool", "foreign", "missing_report"])
 async def test_incomplete_report_publication_never_leaks_a_partial_batch(fault: str) -> None:
     from agent_hub.runs.service import _delivery_publication_batches

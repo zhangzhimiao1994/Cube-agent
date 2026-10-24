@@ -2847,7 +2847,7 @@ class AutoGenDiscussionRuntime:
                 run_id=context.run_id,
                 actor=self._plan.participants[0].id,
                 session_id=str(context.run_id),
-                participants=(*self.participant_ids, *((FINAL_REPORT_ACTOR,) if reports else ())),
+                participants=self.participant_ids,
                 inputs=context.artifacts,
             )
             sequence += 1
