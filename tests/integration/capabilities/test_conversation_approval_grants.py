@@ -456,7 +456,7 @@ async def test_checkpoint_progress_returns_current_version_and_preserves_submit_
         run.version += 1
         session.add(RunCheckpointRow(id=checkpoint.id, tenant_id=request.tenant_id, run_id=request.run_id,
             sequence=1, runtime_type=checkpoint.runtime_type, runtime_version=checkpoint.runtime_version,
-            mode=checkpoint.mode.value, state=checkpoint.state, state_sha256=checkpoint.state_sha256,
+            mode=checkpoint.mode.value, state=checkpoint.to_payload()["state"], state_sha256=checkpoint.state_sha256,
             payload=checkpoint.to_payload()))
     async with pg_grants.independent_repository() as fresh:
         public = await _public(fresh, request)
