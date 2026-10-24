@@ -83,8 +83,11 @@ class AdaptiveDeadline:
     def remaining(self, *, now: float) -> float:
         return max(0.0, self.deadline - float(now))
 
-    def renew_for_progress(self, *, progress_units: int, now: float, runway_seconds: float) -> bool:
-        """Renew one work window, without multiplying it by file count or reviving expiry."""
+    def renew_for_progress(self, *, progress_units: int, now: float, runway_seconds: float,
+                           admitted_completion: bool = False) -> bool:
+        """Renew one work window; admitted work may cross soft, never absolute."""
+        if type(admitted_completion) is not bool:
+            raise TypeError("admitted_completion must be a boolean")
         if type(progress_units) is not int or progress_units < 0:
             raise ValueError("progress_units must be a non-negative integer")
         current = float(now)
@@ -94,7 +97,7 @@ class AdaptiveDeadline:
         if progress_units <= self.progress_units:
             return False
         self.progress_units = progress_units
-        if current >= min(self.deadline, self.absolute_deadline):
+        if current >= self.absolute_deadline or (current >= self.deadline and not admitted_completion):
             return False
         previous = self.deadline
         self.deadline = min(self.absolute_deadline, max(previous, current + runway))
