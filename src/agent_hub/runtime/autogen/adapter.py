@@ -2865,7 +2865,8 @@ class AutoGenDiscussionRuntime:
                 progress_units=(len(engineering_work_progress(context,
                     tool_entries=self._restored_ledger(restored, "tool_ledger"),
                     artifacts=ledger_artifacts, allowed_tools=allowed_tools,
-                    include_draft_diagnoses=soft_admission))
+                    include_draft_diagnoses=soft_admission,
+                    include_bootstrap_observations=soft_admission and continuation))
                     if engineering and type(context.routing_decision.get("engineering_progress_budget_version")) is int
                     and context.routing_decision.get("engineering_progress_budget_version") == 1
                     else discussion_control.progress_units),
@@ -3885,7 +3886,10 @@ class AutoGenDiscussionRuntime:
                     and math.isfinite(soft) and soft > 0 else min(self._plan.wall_time_seconds, context.timeout_seconds))
                 work_units = len(engineering_work_progress(context,
                     tool_entries=tool_ledger, artifacts=artifacts, allowed_tools=allowed_tools,
-                    include_draft_diagnoses=_soft_admission_selected(context)))
+                    include_draft_diagnoses=_soft_admission_selected(context),
+                    include_bootstrap_observations=(_soft_admission_selected(context)
+                        and engineering_continuation_selected(context)
+                        and sum("workspace.write_text" in tools for tools in allowed_tools.values()) == 1)))
                 if _checkpoint_ack_selected(context) and work_units > wall_budget.progress_units:
                     discussion_control.progress_since_extension = True
                 wall_budget.renew_for_progress(progress_units=work_units,

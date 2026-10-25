@@ -868,6 +868,7 @@ class RuntimeCapabilityGateway:
         return {
             "summary": f"Workspace contains {len(public)} files.",
             "workspace_files": public,
+            "truncated": False,
             "bundle_download_url": store.bundle_download_url(project_id, session_id),
         }
 

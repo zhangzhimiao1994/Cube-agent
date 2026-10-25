@@ -19,6 +19,7 @@ from agent_hub.capabilities.tools.builtin_contracts import (
 )
 from agent_hub.capabilities.tools.http_read import HttpReader, HttpReadResult
 from agent_hub.capabilities.tools.registry import CompositeCapabilityManifestSource, ToolRegistry
+from agent_hub.files.generated import GeneratedFileStore
 from agent_hub.runtime.contracts import JsonValue
 from agent_hub.skills.sandbox.base import SkillInvocation, SkillResult
 from tests.unit.capabilities.test_scoped_read import FakeRunRepository, stored_run
@@ -586,13 +587,8 @@ async def test_runtime_gateway_generates_docx_file_artifact(tmp_path: Path) -> N
     assert file_payload["size_bytes"] > 0
     assert result["presentation"] == "step_detail"
     assert gateway.is_available(TENANT_ID, "document.generate_docx") is True
-    stored_path = (
-        generated_dir
-        / str(TENANT_ID)
-        / str(RUN_ID)
-        / str(result["artifact_id"])
-        / file_payload["filename"]
-    )
+    storage_key = f"{TENANT_ID}/{RUN_ID}/{result['artifact_id']}/{file_payload['filename']}"
+    stored_path = GeneratedFileStore(generated_dir).resolve(storage_key)
     assert stored_path.is_file()
 
 
@@ -624,13 +620,8 @@ async def test_runtime_gateway_generates_pptx_file_artifact(tmp_path: Path) -> N
     assert file_payload["size_bytes"] > 0
     assert result["presentation"] == "step_detail"
     assert gateway.is_available(TENANT_ID, "presentation.generate_pptx") is True
-    stored_path = (
-        generated_dir
-        / str(TENANT_ID)
-        / str(RUN_ID)
-        / str(result["artifact_id"])
-        / file_payload["filename"]
-    )
+    storage_key = f"{TENANT_ID}/{RUN_ID}/{result['artifact_id']}/{file_payload['filename']}"
+    stored_path = GeneratedFileStore(generated_dir).resolve(storage_key)
     assert stored_path.is_file()
 
 
@@ -687,13 +678,8 @@ async def test_runtime_gateway_generates_project_zip_final_artifact(tmp_path: Pa
     assert re.fullmatch(r"hello-world_\d{8}T\d{12}Z\.zip", file_payload["filename"])
     assert file_payload["mime_type"] == "application/zip"
     assert result["presentation"] == "final_attachment"
-    stored_path = (
-        generated_dir
-        / str(TENANT_ID)
-        / str(RUN_ID)
-        / str(result["artifact_id"])
-        / file_payload["filename"]
-    )
+    storage_key = f"{TENANT_ID}/{RUN_ID}/{result['artifact_id']}/{file_payload['filename']}"
+    stored_path = GeneratedFileStore(generated_dir).resolve(storage_key)
     assert stored_path.is_file()
     with ZipFile(stored_path) as archive:
         assert archive.namelist() == [
@@ -822,6 +808,7 @@ async def test_runtime_gateway_builds_large_project_incrementally_in_workspace(
     )
     listed_files = cast(tuple[JsonValue, ...], listing["workspace_files"])
     assert len(listed_files) == 9
+    assert listing["truncated"] is False
 
     bundle = await gateway.execute(
         tenant_id=TENANT_ID,
@@ -838,13 +825,8 @@ async def test_runtime_gateway_builds_large_project_incrementally_in_workspace(
     assert re.fullmatch(r"large-project_\d{8}T\d{12}Z\.zip", filename)
     bundled_files = cast(tuple[JsonValue, ...], bundle["workspace_files"])
     assert len(bundled_files) == 9
-    stored_path = (
-        generated_dir
-        / str(TENANT_ID)
-        / str(RUN_ID)
-        / str(bundle["artifact_id"])
-        / filename
-    )
+    storage_key = f"{TENANT_ID}/{RUN_ID}/{bundle['artifact_id']}/{filename}"
+    stored_path = GeneratedFileStore(generated_dir).resolve(storage_key)
     with ZipFile(stored_path) as archive:
         assert len(archive.namelist()) == 9
         assert archive.read("src/chunk-8.txt") == content.encode("utf-8")
@@ -946,6 +928,7 @@ async def test_workspace_list_allows_read_only_authorized_run(tmp_path: Path) ->
 
     listed_files = cast(tuple[Mapping[str, JsonValue], ...], listing["workspace_files"])
     assert tuple(item["path"] for item in listed_files) == ("README.md",)
+    assert listing["truncated"] is False
 
 
 async def test_workspace_prune_uses_run_scope_and_removes_only_obsolete_files(
@@ -1023,13 +1006,8 @@ async def test_runtime_gateway_accepts_common_project_zip_files_item_wrapper(
     file_payload = cast(Mapping[str, JsonValue], result["file"])
     filename = cast(str, file_payload["filename"])
     assert re.fullmatch(r"mofang-hello-python_\d{8}T\d{12}Z\.zip", filename)
-    stored_path = (
-        generated_dir
-        / str(TENANT_ID)
-        / str(RUN_ID)
-        / str(result["artifact_id"])
-        / filename
-    )
+    storage_key = f"{TENANT_ID}/{RUN_ID}/{result['artifact_id']}/{filename}"
+    stored_path = GeneratedFileStore(generated_dir).resolve(storage_key)
     assert stored_path.is_file()
     with ZipFile(stored_path) as archive:
         assert archive.namelist() == ["main.py"]
@@ -1064,13 +1042,8 @@ async def test_runtime_gateway_accepts_common_project_zip_files_list(
     file_payload = cast(Mapping[str, JsonValue], result["file"])
     filename = cast(str, file_payload["filename"])
     assert re.fullmatch(r"mofang-hello_\d{8}T\d{12}Z\.zip", filename)
-    stored_path = (
-        generated_dir
-        / str(TENANT_ID)
-        / str(RUN_ID)
-        / str(result["artifact_id"])
-        / filename
-    )
+    storage_key = f"{TENANT_ID}/{RUN_ID}/{result['artifact_id']}/{filename}"
+    stored_path = GeneratedFileStore(generated_dir).resolve(storage_key)
     assert stored_path.is_file()
     with ZipFile(stored_path) as archive:
         assert archive.namelist() == ["main.py"]

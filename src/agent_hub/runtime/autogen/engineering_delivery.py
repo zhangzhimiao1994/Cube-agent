@@ -372,6 +372,7 @@ def engineering_work_progress(
     context: TaskContext, *, tool_entries: Sequence[Mapping[str, JsonValue]],
     artifacts: Sequence[Artifact], allowed_tools: Mapping[str, Sequence[str]],
     include_draft_diagnoses: bool = False,
+    include_bootstrap_observations: bool = False,
 ) -> frozenset[str]:
     """Derive replay-stable budget hints from completed causal prefixes, never authority."""
     by_id = {str(item.id): item for item in artifacts}
@@ -380,6 +381,17 @@ def engineering_work_progress(
     seen_writes = {item[:2] for item in python_initial_files(context).values()}
     seen_diagnoses: set[str] = set()
     productive_since_diagnosis = False
+    bootstrap_enabled = include_bootstrap_observations is True
+    if bootstrap_enabled and "generated_project_preparation" in context.routing_decision:
+        completed_end = next((index for index, row in enumerate(tool_entries)
+                              if row.get("status") not in ("succeeded", "failed")), len(tool_entries))
+        historical = engineering_progress(context, tool_entries=tool_entries[:completed_end],
+            artifacts=artifacts, allowed_tools=allowed_tools)
+        # Captured contexts may reconstruct an earlier draft, not start a new bootstrap.
+        historical_keys = engineering_work_progress(context, tool_entries=tool_entries[:completed_end],
+            artifacts=artifacts, allowed_tools=allowed_tools)
+        bootstrap_enabled = not historical.uncertain and any(
+            key.startswith("workspace.write_text:") for key in historical_keys)
     for position, row in enumerate(tool_entries):
         if row.get("status") not in ("succeeded", "failed"):
             break
@@ -418,6 +430,21 @@ def engineering_work_progress(
                                                "size_bytes": manifest.get("observed_bytes")})
                         if item is not None:
                             seen_writes.add(item[:2])
+            if (bootstrap_enabled and not progress.has_writes
+                    and not progress.existing_project and not progress.verification_seen
+                    and result.get("dependencies_truncated") is False):
+                credits.add("bootstrap.project.inspect")
+            continue
+        if name == "workspace.list":
+            files = result.get("workspace_files")
+            if (bootstrap_enabled and not progress.has_writes
+                    and not progress.existing_project and not progress.verification_seen
+                    and "bootstrap.project.inspect" in credits
+                    and result.get("truncated") is False and isinstance(files, tuple | list)):
+                metadata = [_file_metadata(item) for item in files]
+                if (all(item is not None for item in metadata)
+                        and len({item[0] for item in metadata if item is not None}) == len(metadata)):
+                    credits.add("bootstrap.workspace.list")
             continue
         if name == "workspace.write_text":
             files = result.get("workspace_files")
