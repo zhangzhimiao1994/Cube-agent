@@ -119,6 +119,8 @@ from agent_hub.runtime.autogen.model_tool_correction import (
 )
 from agent_hub.runtime.autogen.termination import CompositeDiscussionTermination, DiscussionUsage
 from agent_hub.runtime.contracts import (
+    _CAPACITY_DIAGNOSTIC_ENUMS,
+    _GATEWAY_SCOPE_DIAGNOSTIC_KEYS,
     Artifact,
     EventKind,
     JsonValue,
@@ -2243,6 +2245,7 @@ class GatewayChatCompletionClient(ChatCompletionClient):
         report_binding: Callable[[], Mapping[str, JsonValue]] | None = None,
         report_evidence: Callable[[], str] | None = None,
         tool_correction_enabled: bool = False,
+        admitted_tool_correction: bool = False,
     ) -> None:
         self._gateway = gateway
         self._logical_model = logical_model
@@ -2260,6 +2263,7 @@ class GatewayChatCompletionClient(ChatCompletionClient):
         self._report_binding = report_binding
         self._report_evidence = report_evidence
         self._tool_correction_enabled = tool_correction_enabled
+        self._admitted_tool_correction = admitted_tool_correction is True
         self._actual = RequestUsage(prompt_tokens=0, completion_tokens=0)
         self._total = RequestUsage(prompt_tokens=0, completion_tokens=0)
 
@@ -2441,20 +2445,52 @@ class GatewayChatCompletionClient(ChatCompletionClient):
                 completion_tokens=self._total.completion_tokens + record.usage.completion_tokens,
             )
             completion, usage = await self._complete_model_attempt(
-                corrected, tool_names, cancellation_token, correction_for=record.position)
+                corrected, tool_names, cancellation_token, correction_for=record.position,
+                admitted_request=request)
             usage = RequestUsage(prompt_tokens=record.usage.prompt_tokens + usage.prompt_tokens,
                                  completion_tokens=record.usage.completion_tokens + usage.completion_tokens)
             self._actual = usage
             return completion, usage
 
+    def _continues_tool_admission(
+        self, request: ModelRequest, tool_names: Mapping[str, str], *,
+        correction_for: int | None, admitted_request: ModelRequest | None,
+    ) -> bool:
+        if not self._admitted_tool_correction or admitted_request is None or self._request_timeout is None:
+            return False
+        durable = self._durability
+        if (not self._tool_correction_enabled or durable is None
+                or type(correction_for) is not int or not 0 <= correction_for < len(durable.model_entries)
+                or durable._model_cursor != len(durable.model_entries)
+                or durable._model_cursor != correction_for + 1
+                or durable._context_tenant_id is None):
+            raise RuntimeExecutionError('durable tool correction admission mismatch')
+        row = durable.model_entries[correction_for]
+        if row.get('status') != 'rejected' or 'correction_for' in row:
+            raise RuntimeExecutionError('durable tool correction admission mismatch')
+        try:
+            record = validate_rejection(cast(Mapping[str, JsonValue], row['rejection']),
+                run_id=durable._context_run_id, tenant_id=durable._context_tenant_id,
+                position=correction_for, request_hash=durable.request_hash(admitted_request, tool_names=tool_names))
+            expected = tool_correction_request(admitted_request, record,
+                max_output_tokens=request.max_output_tokens, timeout_seconds=request.timeout_seconds)
+            if expected != request:
+                raise ValueError
+        except (KeyError, TypeError, ValueError):
+            raise RuntimeExecutionError('durable tool correction admission mismatch') from None
+        return True
+
     async def _complete_model_attempt(
         self, request: ModelRequest, tool_names: Mapping[str, str],
         cancellation_token: CancellationToken | None, *, correction_for: int | None = None,
+        admitted_request: ModelRequest | None = None,
     ) -> tuple[GatewayCompletion, RequestUsage]:
         # Cached results need no new admission; UNKNOWN is checked by durability.
         fresh = (self._durability is None
                  or self._durability._model_cursor >= len(self._durability.model_entries))
-        if fresh and self._model_admission is not None:
+        continued = fresh and self._continues_tool_admission(request, tool_names,
+            correction_for=correction_for, admitted_request=admitted_request)
+        if fresh and self._model_admission is not None and not continued:
             self._model_admission()
         completion = (
             await self._durability.before_model(request, tool_names=tool_names,
@@ -2469,7 +2505,7 @@ class GatewayChatCompletionClient(ChatCompletionClient):
         replayed = completion is not None
         if completion is None:
             try:
-                if self._model_admission is not None:
+                if self._model_admission is not None and not continued:
                     self._model_admission()
                 # Replayed outcomes need no new deadline; durable publication may
                 # consume time, so bind new transport calls at the last boundary.
@@ -2931,7 +2967,9 @@ class AutoGenDiscussionRuntime:
                     if budget is not None
                     and type(context.routing_decision.get("engineering_progress_budget_version")) is int
                     and context.routing_decision.get("engineering_progress_budget_version") == 1 else {}),
-                **(durability.failure_payload if durability is not None else {}),
+                **({key: value for key, value in durability.failure_payload.items()
+                    if key in _GATEWAY_SCOPE_DIAGNOSTIC_KEYS or key in _CAPACITY_DIAGNOSTIC_ENUMS}
+                   if durability is not None else {}),
             }
 
         wall_expired = asyncio.Event()
@@ -3200,6 +3238,7 @@ class AutoGenDiscussionRuntime:
                     model_admission=admit_model if soft_admission else None,
                     acceptance_first=continuation and participant.id == owner,
                     tool_correction_enabled=corrections and participant.id == owner,
+                    admitted_tool_correction=soft_admission and participant.id == owner,
                 )
                 for participant in self._plan.participants
             }
