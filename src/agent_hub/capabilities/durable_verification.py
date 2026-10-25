@@ -11,6 +11,10 @@ from typing import TYPE_CHECKING, Literal, cast
 from uuid import UUID, uuid4
 
 from agent_hub.capabilities.execution_authority import get_verification_authority
+from agent_hub.capabilities.project_prerequisites import (
+    ProjectPrerequisiteObservation,
+    validated_project_prerequisite_payload,
+)
 from agent_hub.runs.project_verification_receipts import (
     RECEIPT_KEY,
     ProjectVerificationReceiptRepository,
@@ -22,7 +26,10 @@ from agent_hub.runtime.contracts import Artifact, JsonValue, _freeze_object
 from agent_hub.subprocess_cleanup import ProcessCleanupIncomplete
 
 if TYPE_CHECKING:
-    from agent_hub.capabilities.project_verification import ProjectVerificationService
+    from agent_hub.capabilities.project_verification import (
+        ProjectVerificationError,
+        ProjectVerificationService,
+    )
 
 Kind = Literal['node_plain', 'node_original', 'node_generated', 'python_original', 'python_generated']
 _TYPE = 'project_verification_receipt'
@@ -44,6 +51,20 @@ class _Attempt:
 class _Recovery:
     scope: tuple[UUID, UUID]
     active: bool = True
+
+
+def _known_manifest_rejection(error: ProjectVerificationError, issued: VerificationRecord) -> bool:
+    observation = error.project_prerequisite
+    if (type(observation) is not ProjectPrerequisiteObservation or error.diagnostic is not None
+            or error.project_failure is not None or error.python_project_failure is not None):
+        return False
+    report = validated_project_prerequisite_payload(observation.to_payload())
+    return (report is not None
+            and observation.source_sha256 == issued.source_sha256 == report['source_sha256']
+            and observation.reason == report['reason'] == 'invalid_package_manifest'
+            and observation.category == report['category'] == 'integrity'
+            and report['checks'] == tuple({'phase': phase, 'status': 'not_run'}
+                                         for phase in ('install', 'build', 'test')))
 
 
 class DurableVerification:
@@ -178,7 +199,9 @@ class DurableVerification:
         except BaseException as error:
             self.owner._clear_receipts(tenant_id, run_id)
             if (attempt.issued is not None and isinstance(error, ProjectVerificationError)
-                    and (error.project_failure is not None or error.python_project_failure is not None)):
+                    and ((error.project_prerequisite is None
+                          and (error.project_failure is not None or error.python_project_failure is not None))
+                         or _known_manifest_rejection(error, attempt.issued))):
                 try:
                     await self.receipts.complete(attempt.issued.authority, expected=attempt.issued, status='failed')
                 except Exception:  # noqa: BLE001 - failed CAS is UNKNOWN, not an alternate failure result.
