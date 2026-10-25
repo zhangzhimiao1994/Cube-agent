@@ -109,6 +109,7 @@ def _log_capacity_failure(error: BaseException) -> None:
 
 
 class ScopeIncompletePhase(StrEnum):
+    PRETRANSPORT_CONTEXT = "pretransport_context"
     PRETRANSPORT_CAPACITY = "pretransport_capacity"
     PRETRANSPORT_CREDENTIALS = "pretransport_credentials"
     OUTER_DEADLINE = "outer_deadline"
@@ -121,6 +122,7 @@ class ScopeIncompletePhase(StrEnum):
 
 
 class ScopeIncompleteReason(StrEnum):
+    CONTEXT_WINDOW_EXCEEDED = "context_window_exceeded"
     CAPACITY_UNAVAILABLE = "capacity_unavailable"
     CAPACITY_BACKEND_FAILURE = "capacity_backend_failure"
     CREDENTIAL_RESOLUTION_FAILED = "credential_resolution_failed"
@@ -207,6 +209,13 @@ def preserve_gateway_scope_diagnostic(target: BaseException, source: object) -> 
 
 class ModelGatewayError(RuntimeError):
     """Stable, redacted failure at the model gateway boundary."""
+
+
+class ModelContextWindowExceeded(ModelGatewayError):
+    """No authorized candidate has room for the request's input."""
+
+    def __init__(self, message: str = "model context window exceeded") -> None:
+        super().__init__(message)
 
 
 class GatewayNegotiatedClientError(ModelGatewayError):
@@ -603,7 +612,7 @@ class ConservativeTokenEstimator:
                 "name": request.response_schema.name,
                 "schema": self._mutable_json(request.response_schema.schema),
             }
-        if request.native_tool_continuation and request.tools:
+        if request.tools:
             payload["tools"] = [{"type": "function", "function": {
                 "name": tool.name, "description": tool.description,
                 "parameters": self._mutable_json(tool.parameters),
@@ -770,6 +779,9 @@ class ModelGateway:
             elif isinstance(error, asyncio.CancelledError):
                 failure_history.mark_incomplete(ScopeIncompletePhase.CANCELLATION,
                                                 ScopeIncompleteReason.CANCELLED)
+            elif isinstance(error, ModelContextWindowExceeded):
+                failure_history.mark_incomplete(ScopeIncompletePhase.PRETRANSPORT_CONTEXT,
+                                                ScopeIncompleteReason.CONTEXT_WINDOW_EXCEEDED)
             elif isinstance(error, CapacityRequestTooLarge):
                 failure_history.mark_incomplete(ScopeIncompletePhase.PRETRANSPORT_CAPACITY,
                                                 ScopeIncompleteReason.CAPACITY_UNAVAILABLE)
@@ -810,10 +822,13 @@ class ModelGateway:
             for _logical_model, candidates in candidate_groups
             for deployment in candidates
         )
+        input_tokens = self._estimated_input_tokens(request, relevant_deployments)
+        if not any(self._context_compatible_candidates(items, input_tokens) for _, items in candidate_groups):
+            raise ModelContextWindowExceeded()
         scoped = getattr(self._capacity, "scoped", None)
         capacity = self._capacity if scoped is None else scoped(relevant_deployments)
-        input_tokens = self._estimated_input_tokens(request, relevant_deployments)
         last_retryable_error: BaseException | None = None
+        last_admission_error: CapacityWaitTimeout | CapacityQueueFull | None = None
         token_limit_error: CapacityRequestTooLarge | None = None
         only_token_limits = True
         for group_index, (logical_model, candidates) in enumerate(candidate_groups):
@@ -853,8 +868,14 @@ class ModelGateway:
                     fallback_from_logical_model = logical_model
                     fallback_reason = "capacity_unavailable"
                 continue
-            except (TimeoutError, CapacityWaitTimeout, CapacityQueueFull):
+            except (TimeoutError, CapacityWaitTimeout, CapacityQueueFull) as error:
                 only_token_limits = False
+                if isinstance(error, CapacityWaitTimeout | CapacityQueueFull):
+                    last_admission_error = (
+                        CapacityQueueFull("model capacity unavailable")
+                        if isinstance(error, CapacityQueueFull)
+                        else CapacityWaitTimeout("model capacity unavailable")
+                    )
                 failure_history.mark_incomplete(ScopeIncompletePhase.PRETRANSPORT_CAPACITY,
                                                 ScopeIncompleteReason.CAPACITY_UNAVAILABLE)
                 if fallback_from_logical_model is None:
@@ -940,6 +961,8 @@ class ModelGateway:
             raise last_retryable_error from None
         if only_token_limits and token_limit_error is not None:
             raise CapacityRequestTooLarge("model request exceeds capacity token limit") from None
+        if last_admission_error is not None and failure_history.entered_count == 0:
+            raise last_admission_error from None
         raise CapacityUnavailable("model capacity unavailable") from None
 
     async def stream_openai_compatible_events(
@@ -948,6 +971,7 @@ class ModelGateway:
         request_deadline = asyncio.get_running_loop().time() + request.timeout_seconds
         streaming_transport = self._streaming_transport()
         last_retryable_error: BaseException | None = None
+        last_admission_error: CapacityWaitTimeout | CapacityQueueFull | None = None
         token_limit_error: CapacityRequestTooLarge | None = None
         only_token_limits = True
         (
@@ -961,9 +985,11 @@ class ModelGateway:
             for _logical_model, candidates in candidate_groups
             for deployment in candidates
         )
+        input_tokens = self._estimated_input_tokens(request, relevant_deployments)
+        if not any(self._context_compatible_candidates(items, input_tokens) for _, items in candidate_groups):
+            raise ModelContextWindowExceeded()
         scoped = getattr(self._capacity, "scoped", None)
         capacity = self._capacity if scoped is None else scoped(relevant_deployments)
-        input_tokens = self._estimated_input_tokens(request, relevant_deployments)
         for group_index, (logical_model, candidates) in enumerate(candidate_groups):
             remaining_seconds = request_deadline - asyncio.get_running_loop().time()
             if remaining_seconds <= 0:
@@ -1011,8 +1037,14 @@ class ModelGateway:
                 fallback_from_logical_model = logical_model
                 fallback_reason = "capacity_unavailable"
                 continue
-            except (TimeoutError, CapacityWaitTimeout, CapacityQueueFull):
+            except (TimeoutError, CapacityWaitTimeout, CapacityQueueFull) as error:
                 only_token_limits = False
+                if isinstance(error, CapacityWaitTimeout | CapacityQueueFull):
+                    last_admission_error = (
+                        CapacityQueueFull("model capacity unavailable")
+                        if isinstance(error, CapacityQueueFull)
+                        else CapacityWaitTimeout("model capacity unavailable")
+                    )
                 fallback_from_logical_model = logical_model
                 fallback_reason = "capacity_unavailable"
                 continue
@@ -1084,6 +1116,8 @@ class ModelGateway:
             raise last_retryable_error from None
         if only_token_limits and token_limit_error is not None:
             raise CapacityRequestTooLarge("model request exceeds capacity token limit") from None
+        if last_admission_error is not None:
+            raise last_admission_error from None
         raise CapacityUnavailable("model capacity unavailable") from None
 
     async def _acquire_capacity(
@@ -1226,6 +1260,17 @@ class ModelGateway:
         if len(unique_estimates) == 1:
             return next(iter(unique_estimates))
         return MappingProxyType(estimates)
+
+    def context_window_tokens(self, request: ModelRequest) -> int | None:
+        """Read the conservative finite window across the authorized candidate chain.
+
+        Include candidates whose input is currently too large: callers need the
+        bound before compression. This does not reserve capacity or authorize a call.
+        """
+        groups, _, _, _ = self._capable_candidate_groups(request)
+        windows = [item.context_window_tokens for _, items in groups for item in items
+                   if item.context_window_tokens is not None]
+        return min(windows) if windows else None
 
     def supports_native_tool_continuation(self, request: ModelRequest) -> bool:
         """Opt in without removing an existing protocol or fallback candidate."""

@@ -62,7 +62,12 @@ from agent_hub.domain.runs import TaskMode
 from agent_hub.harness import HarnessToolGateway
 from agent_hub.harness.events import safe_tool_event_payload
 from agent_hub.harness.types import HarnessToolCallRequest, HarnessToolCallResult
-from agent_hub.models.gateway import GatewayCompletion, GatewayRejectedOutput
+from agent_hub.models.gateway import (
+    ConservativeTokenEstimator,
+    GatewayCompletion,
+    GatewayRejectedOutput,
+    ModelContextWindowExceeded,
+)
 from agent_hub.models.types import (
     ModelCapability,
     ModelMessage,
@@ -84,6 +89,7 @@ from agent_hub.runtime.autogen.checkpoint_publication import (
     CheckpointPublications,
     PendingCheckpoint,
 )
+from agent_hub.runtime.autogen.context_budget import ContextBudgetExceeded, fit_request_history
 from agent_hub.runtime.autogen.delivery_report import (
     FINAL_REPORT_ACTOR,
     FINAL_REPORT_POLICY,
@@ -287,6 +293,7 @@ def _compact_llm_messages(
     messages: Sequence[LLMMessage],
     *,
     window: _MessageCompactionWindow = _DEFAULT_MESSAGE_COMPACTION_WINDOW,
+    preserve_tool_pairs: bool = False,
 ) -> tuple[LLMMessage, ...]:
     history = tuple(messages)
     if len(history) <= window.watermark:
@@ -311,6 +318,13 @@ def _compact_llm_messages(
         if index not in head_index_set
     ][:tail_count]
     tail_indexes.reverse()
+    if preserve_tool_pairs and tail_indexes:
+        first_tail = tail_indexes[0]
+        if (first_tail > 0 and isinstance(history[first_tail], FunctionExecutionResultMessage)
+                and isinstance(history[first_tail - 1], AssistantMessage)
+                and isinstance(history[first_tail - 1].content, list)
+                and first_tail - 1 not in head_index_set):
+            tail_indexes.insert(0, first_tail - 1)
     retained_tail = tuple(history[index] for index in tail_indexes)
     retained_indexes = head_index_set | set(tail_indexes)
     compacted = tuple(
@@ -706,10 +720,10 @@ class _DiscussionDurability:
     def fail_model(self, reason: str | None = None, *, source: object = None) -> None:
         if reason and self.failure_reason is None:
             self.failure_reason = reason
-            self.failure_payload = gateway_scope_failure_payload(source)
+            self.failure_payload = gateway_scope_failure_payload(source, include_noncapacity=True)
         elif self.failure_reason is None and not self.failure_payload:
             self.failure_payload = gateway_scope_failure_payload(
-                source, include_noncapacity=isinstance(source, asyncio.CancelledError),
+                source, include_noncapacity=True,
             )
         if self._model_lock.locked():
             self._model_lock.release()
@@ -2246,6 +2260,7 @@ class GatewayChatCompletionClient(ChatCompletionClient):
         report_evidence: Callable[[], str] | None = None,
         tool_correction_enabled: bool = False,
         admitted_tool_correction: bool = False,
+        engineering_context_compaction: bool = False,
     ) -> None:
         self._gateway = gateway
         self._logical_model = logical_model
@@ -2264,6 +2279,7 @@ class GatewayChatCompletionClient(ChatCompletionClient):
         self._report_evidence = report_evidence
         self._tool_correction_enabled = tool_correction_enabled
         self._admitted_tool_correction = admitted_tool_correction is True
+        self._engineering_context_compaction = engineering_context_compaction is True
         self._actual = RequestUsage(prompt_tokens=0, completion_tokens=0)
         self._total = RequestUsage(prompt_tokens=0, completion_tokens=0)
 
@@ -2292,6 +2308,13 @@ class GatewayChatCompletionClient(ChatCompletionClient):
         compacted_messages = _compact_llm_messages(
             messages,
             window=self._compaction_window,
+            preserve_tool_pairs=self._engineering_context_compaction,
+        )
+        legacy_messages = (
+            _compact_llm_messages(messages, window=self._compaction_window)
+            if self._engineering_context_compaction and self._durability is not None
+            and self._durability._model_cursor < len(self._durability.model_entries)
+            else None
         )
         normalized = tuple(self._message(message) for message in compacted_messages)
         if (
@@ -2331,6 +2354,13 @@ class GatewayChatCompletionClient(ChatCompletionClient):
         action = self._engineering_action(False) if self._engineering_action is not None else None
         if action is not None:
             request, tool_names = self._required_request(request, tool_names, action)
+        if legacy_messages is not None and self._durability is not None:
+            legacy = replace(request, messages=tuple(self._message(message) for message in legacy_messages))
+            if action is not None:
+                legacy, _ = self._required_request(legacy, tool_names, action)
+            saved = self._durability.model_entries[self._durability._model_cursor]
+            if saved.get("request_hash") == self._durability.request_hash(legacy, tool_names=tool_names):
+                request = legacy
         completion, usage = await self._complete_model_request(request, tool_names, cancellation_token)
         response = completion.response
         if not response.tool_calls and self._engineering_action is not None:
@@ -2409,6 +2439,7 @@ class GatewayChatCompletionClient(ChatCompletionClient):
         self, request: ModelRequest, tool_names: Mapping[str, str],
         cancellation_token: CancellationToken | None,
     ) -> tuple[GatewayCompletion, RequestUsage]:
+        request = self._fit_context_request(request, tool_names)
         try:
             return await self._complete_model_attempt(request, tool_names, cancellation_token)
         except _StoppedModelResponse as stopped:
@@ -2480,6 +2511,36 @@ class GatewayChatCompletionClient(ChatCompletionClient):
             raise RuntimeExecutionError('durable tool correction admission mismatch') from None
         return True
 
+    def _context_window(self, request: ModelRequest) -> int | None:
+        if not self._engineering_context_compaction:
+            return None
+        query = getattr(self._gateway, "context_window_tokens", None)
+        if not callable(query):
+            return None
+        window = query(request)
+        if window is not None and (type(window) is not int or window <= 0):
+            raise RuntimeExecutionError("model context window configuration is invalid")
+        return window
+
+    def _fit_context_request(
+        self, request: ModelRequest, tool_names: Mapping[str, str],
+    ) -> ModelRequest:
+        if not self._engineering_context_compaction:
+            return request
+        durable = self._durability
+        if durable is not None and durable._model_cursor < len(durable.model_entries):
+            # A cached legacy shape keeps its original hash, including UNKNOWN.
+            row = durable.model_entries[durable._model_cursor]
+            if row.get("request_hash") == durable.request_hash(request, tool_names=tool_names):
+                return request
+        window = self._context_window(request)
+        if window is None:
+            return request
+        try:
+            return fit_request_history(request, context_window_tokens=window)
+        except ContextBudgetExceeded:
+            raise ModelContextWindowExceeded() from None
+
     async def _complete_model_attempt(
         self, request: ModelRequest, tool_names: Mapping[str, str],
         cancellation_token: CancellationToken | None, *, correction_for: int | None = None,
@@ -2490,6 +2551,10 @@ class GatewayChatCompletionClient(ChatCompletionClient):
                  or self._durability._model_cursor >= len(self._durability.model_entries))
         continued = fresh and self._continues_tool_admission(request, tool_names,
             correction_for=correction_for, admitted_request=admitted_request)
+        if fresh:
+            window = self._context_window(request)
+            if window is not None and ConservativeTokenEstimator().estimate_input(request) >= window:
+                raise ModelContextWindowExceeded()
         if fresh and self._model_admission is not None and not continued:
             self._model_admission()
         completion = (
@@ -3239,6 +3304,7 @@ class AutoGenDiscussionRuntime:
                     acceptance_first=continuation and participant.id == owner,
                     tool_correction_enabled=corrections and participant.id == owner,
                     admitted_tool_correction=soft_admission and participant.id == owner,
+                    engineering_context_compaction=soft_admission,
                 )
                 for participant in self._plan.participants
             }
@@ -3255,6 +3321,7 @@ class AutoGenDiscussionRuntime:
                     engineering_budget=action_budget, request_timeout=request_timeout,
                     model_admission=admit_model if soft_admission else None,
                     bounded_no_tool=True,
+                    engineering_context_compaction=soft_admission,
                     report_binding=report_binding,
                     report_evidence=report_evidence,
                 )

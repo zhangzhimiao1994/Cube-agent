@@ -20,6 +20,7 @@ from agent_hub.models.capacity import (
 from agent_hub.models.gateway import (
     GatewayNegotiatedRejectedOutput,
     GatewayRejectedOutput,
+    ModelContextWindowExceeded,
     ModelGatewayError,
     get_gateway_scope_diagnostic,
     is_model_negotiation_exhausted,
@@ -71,6 +72,7 @@ LEGACY_GENERIC_FAILURES = frozenset(
 )
 SAFE_MODEL_GATEWAY_FAILURES = frozenset(
     {
+        "model context window exceeded",
         "model capacity unavailable",
         "model transport failed",
         "model outcome recording failed",
@@ -125,6 +127,8 @@ def safe_model_gateway_failure_reason(error: Exception) -> str | None:
         return f"{GENERIC_MODEL_GATEWAY_FAILURE}: {base}"
     if isinstance(error, NoCapableDeployment):
         return f"{GENERIC_MODEL_GATEWAY_FAILURE}: no capable deployment"
+    if isinstance(error, ModelContextWindowExceeded):
+        return f"{GENERIC_MODEL_GATEWAY_FAILURE}: model context window exceeded"
     if isinstance(error, CapacityRequestTooLarge):
         return f"{GENERIC_MODEL_GATEWAY_FAILURE}: model request exceeds capacity token limit"
     if isinstance(error, CapacityQueueFull):
@@ -775,6 +779,15 @@ def _model_gateway_diagnostic(
             error_code="model.no_capable_deployment",
             retryable=False,
             suggested_action="在模型配置中为当前能力补齐可用部署，或调整 Agent/工作流使用的逻辑模型。",
+        )
+    if "model context window exceeded" in lowered:
+        return _base_diagnostic(
+            reason,
+            error_stage="model_context",
+            error_category="context_window_exceeded",
+            error_code="model.context_window_exceeded",
+            retryable=False,
+            suggested_action="先压缩输入和工具历史，使其符合已配置的上下文窗口，再发起新调用；不原样重复请求或放宽窗口限制。",
         )
     if "model request exceeds capacity token limit" in lowered:
         return _base_diagnostic(

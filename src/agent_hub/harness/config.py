@@ -13,7 +13,12 @@ _GENERATION_CAPABILITIES = frozenset(
 def provider_profiles_from_config(config: PlatformConfig) -> tuple[ProviderCapabilityProfile, ...]:
     profiles: list[ProviderCapabilityProfile] = []
     for logical_model, definition in sorted(config.models.items()):
-        for deployment in definition.deployments:
+        for index, deployment in enumerate(definition.deployments, 1):
+            context_window_tokens = deployment.to_deployment(
+                deployment_id=f"{logical_model}_{index}", logical_model=logical_model,
+            ).context_window_tokens
+            if context_window_tokens is None:
+                raise ValueError("deployment context window is unavailable")
             provider = deployment.provider.casefold()
             effective_capabilities = effective_capabilities_for_api_base(
                 (ModelCapability(capability) for capability in deployment.capabilities),
@@ -39,7 +44,7 @@ def provider_profiles_from_config(config: PlatformConfig) -> tuple[ProviderCapab
                     and not is_generation_only,
                     supports_long_running_tasks=_supports_long_running(provider)
                     and not is_generation_only,
-                    max_context_tokens=_max_context_tokens(provider, deployment.model),
+                    max_context_tokens=context_window_tokens,
                     cost_latency_tier=_cost_latency_tier(provider),
                     sandbox_modes=_sandbox_modes(capabilities),
                 )
@@ -76,19 +81,6 @@ def _supports_prefix_cache(provider: str, model: str) -> bool:
 
 def _supports_long_running(provider: str) -> bool:
     return provider in {"anthropic", "openai"}
-
-
-def _max_context_tokens(provider: str, model: str) -> int:
-    value = f"{provider}/{model}".casefold()
-    if "gpt-5" in value or "codex" in value:
-        return 400_000
-    if "deepseek" in value:
-        return 128_000
-    if "claude" in value:
-        return 200_000
-    if "kimi" in value:
-        return 128_000
-    return 64_000
 
 
 def _cost_latency_tier(provider: str) -> str:
