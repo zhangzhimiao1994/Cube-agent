@@ -395,6 +395,110 @@ type _ArtifactAborter = Callable[[UUID], Awaitable[bool]]
 type _ArtifactFinalizer = Callable[[UUID], None]
 
 
+def _waiting_tool_receipt(entry: Mapping[str, JsonValue], *, run_id: UUID, position: int) -> bool:
+    return bool(
+        set(entry) == {'status', 'replay_safe', 'actor', 'position', 'name',
+                       'arguments_hash', 'idempotency_key', 'approval_id'}
+        and entry.get('status') == 'waiting_approval'
+        and type(entry.get('replay_safe')) is bool
+        and type(entry.get('position')) is int and entry['position'] == position
+        and all(isinstance(entry.get(key), str) and re.fullmatch(pattern, cast(str, entry[key]))
+                for key, pattern in (
+                    ('actor', r'[a-z0-9][a-z0-9_.-]{0,127}'),
+                    ('name', r'[A-Za-z0-9_.-]{1,128}'),
+                    ('arguments_hash', r'[a-f0-9]{64}'),
+                    ('approval_id', r'approval_[A-Za-z0-9_-]{1,100}')))
+        and entry.get('idempotency_key') == hashlib.sha256(
+            f"{run_id}:{entry['actor']}:{position}:{entry['name']}:{entry['arguments_hash']}".encode()
+        ).hexdigest()
+    )
+
+
+def _pending_approval_call(
+    durability: _DiscussionDurability, participant_models: Mapping[str, str],
+) -> tuple[str, tuple[Mapping[str, JsonValue], ...], int] | None:
+    batch = durability.approval_batch
+    if batch is None:
+        return None
+    if (set(batch) != {'model_artifact_id', 'model_artifact_sha256', 'actor',
+                       'start_position', 'next_index', 'calls_sha256'}
+            or type(batch['start_position']) is not int or type(batch['next_index']) is not int
+            or batch['start_position'] < 0 or batch['next_index'] < 0
+            or not isinstance(batch['actor'], str) or batch['actor'] not in participant_models):
+        raise RuntimeExecutionError('durable capability approval batch is invalid')
+    start, cursor = batch['start_position'], batch['next_index']
+    if any(entry.get('status') not in {'succeeded', 'failed'}
+           for entry in durability.tool_entries[:start + cursor]):
+        raise ToolOutcomeUncertain('capability outcome is uncertain')
+    if any(entry.get('status') != 'succeeded' and not (
+            entry.get('status') == 'rejected' and index + 1 < len(durability.model_entries)
+            and durability.model_entries[index + 1].get('status') == 'succeeded'
+            and durability.model_entries[index + 1].get('correction_for') == index)
+            for index, entry in enumerate(durability.model_entries)):
+        raise ModelOutcomeUncertain('model outcome is uncertain')
+    last = durability.model_entries[-1] if durability.model_entries else {}
+    artifact = durability._artifacts.get(cast(str, batch['model_artifact_id']))
+    if (last.get('status') != 'succeeded' or artifact is None or artifact.type != 'model_result'
+            or str(artifact.id) != last.get('artifact_id')
+            or artifact.producer != 'agent_hub' or artifact.content_sha256 != last.get('artifact_sha256')
+            or artifact.content_sha256 != batch['model_artifact_sha256']
+            or artifact.recompute_content_sha256() != artifact.content_sha256):
+        raise RuntimeExecutionError('durable capability approval model binding is invalid')
+    calls = artifact.content.get('tool_calls')
+    content = artifact.content
+    expected_model = participant_models[batch['actor']]
+    origin = content.get('fallback_from_logical_model') if content.get('fallback_used') is True else content.get('logical_model')
+    if (origin != expected_model or any(not isinstance(content.get(key), str) or not cast(str, content[key]).strip()
+            for key in ('deployment_id', 'logical_model', 'provider_id', 'provider_model'))
+            or type(content.get('fallback_used', False)) is not bool):
+        raise RuntimeExecutionError('durable capability approval model binding is invalid')
+    try:
+        completion = durability._completion_from_artifact(artifact)
+        if (completion.response.usage is None or completion.cost_usd is None
+                or not completion.cost_usd.is_finite() or completion.cost_usd < 0):
+            raise ValueError
+    except (ArithmeticError, KeyError, TypeError, ValueError):
+        raise RuntimeExecutionError('durable capability approval model binding is invalid') from None
+    if (not isinstance(calls, tuple) or not 1 <= len(calls) <= _MAX_TOOL_CALLS_PER_RESPONSE
+            or cursor > len(calls) or start + cursor > len(durability.tool_entries)
+            or len(durability.tool_entries) not in {start + cursor, start + cursor + 1}
+            or hashlib.sha256(json.dumps(_mutable_json(calls), ensure_ascii=False, allow_nan=False,
+                sort_keys=True, separators=(',', ':')).encode()).hexdigest() != batch['calls_sha256']):
+        raise RuntimeExecutionError('durable capability approval batch is invalid')
+    identifiers: set[str] = set()
+    halted = False
+    for index, call in enumerate(calls):
+        if (not isinstance(call, Mapping) or set(call) != {'id', 'name', 'arguments'}
+                or not isinstance(call['arguments'], Mapping) or not isinstance(call['id'], str)
+                or not isinstance(call['name'], str) or call['id'] in identifiers):
+            raise RuntimeExecutionError('durable capability approval model binding is invalid')
+        _safe_id(call['id'], 'tool call id')
+        identifiers.add(call['id'])
+        if index >= cursor and start + index >= len(durability.tool_entries):
+            continue
+        if index >= cursor + 1:
+            raise RuntimeExecutionError('durable capability approval batch is invalid')
+        row = durability.tool_entries[start + index]
+        raw = json.dumps(_mutable_json(call['arguments']), ensure_ascii=False, allow_nan=False,
+                         sort_keys=True, separators=(',', ':')).encode()
+        row_name = row.get('name')
+        if (row.get('actor') != batch['actor'] or not isinstance(row_name, str)
+                or call['name'] not in {row_name, row_name.replace('.', '_')}
+                or hashlib.sha256(raw).hexdigest() != row.get('arguments_hash')
+                or type(row.get('position')) is not int or row['position'] != start + index):
+            raise RuntimeExecutionError('durable capability approval model binding is invalid')
+        if index == cursor and not _waiting_tool_receipt(row, run_id=durability._context_run_id, position=start + index):
+            raise ToolOutcomeUncertain('capability outcome is uncertain')
+        if index < cursor and row.get('status') == 'failed':
+            if index != cursor - 1 or len(durability.tool_entries) != start + cursor:
+                raise RuntimeExecutionError('durable capability approval batch is invalid')
+            halted = True
+    if cursor == len(calls) and len(durability.tool_entries) != start + cursor:
+        raise RuntimeExecutionError('durable capability approval batch is invalid')
+    retained_calls = calls[:cursor] if halted else calls
+    return batch['actor'], cast(tuple[Mapping[str, JsonValue], ...], retained_calls), cursor
+
+
 class _DiscussionDurability:
     """Small write-ahead ledgers whose large outcomes live only in Artifacts."""
 
@@ -412,6 +516,7 @@ class _DiscussionDurability:
         tool_entries: tuple[_LedgerEntry, ...] = (),
         artifacts: tuple[Artifact, ...] = (),
         engineering_tool_prefix: int = 0,
+        approval_batch: Mapping[str, JsonValue] | None = None,
     ) -> None:
         self._publish = publish
         self._store = store
@@ -430,6 +535,8 @@ class _DiscussionDurability:
         self._tool_lock = asyncio.Lock()
         self.failure_reason: str | None = None
         self.failure_payload: Mapping[str, JsonValue] = {}
+        self.approval_pending = False
+        self.approval_batch = dict(approval_batch) if approval_batch is not None else None
 
     @property
     def artifacts(self) -> tuple[Artifact, ...]:
@@ -482,6 +589,8 @@ class _DiscussionDurability:
         report_binding: Mapping[str, JsonValue] | None = None,
         correction_for: int | None = None,
     ) -> GatewayCompletion | RejectedModelRecord | None:
+        if self.approval_pending:
+            raise RuntimeExecutionError('capability requires approval')
         if self.failure_reason == _GENERATED_DRAFT_NO_PROGRESS:
             raise RuntimeExecutionError(_GENERATED_DRAFT_NO_PROGRESS)
         await self._model_lock.acquire()
@@ -645,6 +754,8 @@ class _DiscussionDurability:
         replay_safe: bool,
         server_context: TaskContext | None = None,
     ) -> tuple[Mapping[str, JsonValue] | None, str]:
+        if self.approval_pending:
+            raise RuntimeExecutionError('capability requires approval')
         if self.failure_reason == _GENERATED_DRAFT_NO_PROGRESS:
             raise RuntimeExecutionError(_GENERATED_DRAFT_NO_PROGRESS)
         position = self._tool_cursor
@@ -663,6 +774,21 @@ class _DiscussionDurability:
             if any(entry.get(key) != value for key, value in identity.items()):
                 raise RuntimeExecutionError("durable capability request mismatch")
             status = entry.get("status")
+            if status == 'waiting_approval':
+                if (not _waiting_tool_receipt(entry, run_id=self._context_run_id, position=position)
+                        or entry['replay_safe'] is not replay_safe
+                        or position != len(self.tool_entries) - 1):
+                    raise RuntimeExecutionError('durable capability approval receipt is invalid')
+                previous = dict(entry)
+                entry.update(status='running')
+                del entry['approval_id']
+                try:
+                    await self._checkpoint()
+                except BaseException:
+                    entry.clear()
+                    entry.update(previous)
+                    raise
+                return None, idempotency_key
             if status == "running":
                 generated_verify = (
                     name == "project.verify" and server_context is not None
@@ -694,6 +820,39 @@ class _DiscussionDurability:
         await self._checkpoint()
         return None, idempotency_key
 
+    async def wait_for_approval(self, approval_id: str, *, call_id: str) -> None:
+        entry = self.tool_entries[self._tool_cursor]
+        previous = dict(entry)
+        previous_batch = None if self.approval_batch is None else dict(self.approval_batch)
+        if entry.get('status') != 'running' or self._tool_cursor != len(self.tool_entries) - 1:
+            raise RuntimeExecutionError('durable capability approval boundary is invalid')
+        entry.update(status='waiting_approval', approval_id=approval_id)
+        try:
+            if self.approval_batch is None and self.model_entries:
+                model = self.model_entries[-1]
+                artifact = self._artifacts.get(cast(str, model.get('artifact_id')))
+                calls = None if artifact is None else artifact.content.get('tool_calls')
+                if (model.get('status') != 'succeeded' or artifact is None or not isinstance(calls, tuple)):
+                    raise RuntimeExecutionError('durable capability approval model binding is invalid')
+                indexes = [index for index, item in enumerate(calls)
+                           if isinstance(item, Mapping) and item.get('id') == call_id]
+                if len(indexes) != 1 or indexes[0] > self._tool_cursor:
+                    raise RuntimeExecutionError('durable capability approval model binding is invalid')
+                self.approval_batch = {'model_artifact_id': str(artifact.id),
+                    'model_artifact_sha256': artifact.content_sha256, 'actor': entry['actor'],
+                    'start_position': self._tool_cursor - indexes[0], 'next_index': indexes[0],
+                    'calls_sha256': hashlib.sha256(json.dumps(_mutable_json(calls), ensure_ascii=False,
+                        allow_nan=False, sort_keys=True, separators=(',', ':')).encode()).hexdigest()}
+            if not _waiting_tool_receipt(entry, run_id=self._context_run_id, position=self._tool_cursor):
+                raise RuntimeExecutionError('durable capability approval receipt is invalid')
+            await self._checkpoint()
+        except BaseException:
+            entry.clear()
+            entry.update(previous)
+            self.approval_batch = previous_batch
+            raise
+        self.approval_pending = True
+
     async def succeed_tool(self, artifact: Artifact) -> None:
         await self._finish_tool(artifact, status="succeeded")
 
@@ -706,6 +865,7 @@ class _DiscussionDurability:
         entry = self.tool_entries[self._tool_cursor]
         write_id = await self._store(artifact)
         previous = dict(entry)
+        previous_batch = None if self.approval_batch is None else dict(self.approval_batch)
         self._artifacts[str(artifact.id)] = artifact
         entry.update(
             status=status,
@@ -714,11 +874,17 @@ class _DiscussionDurability:
         )
         self._tool_cursor += 1
         try:
+            if self.approval_batch is not None:
+                expected = cast(int, self.approval_batch['start_position']) + cast(int, self.approval_batch['next_index'])
+                if self._tool_cursor - 1 != expected:
+                    raise RuntimeExecutionError('durable capability approval batch is invalid')
+                self.approval_batch['next_index'] = cast(int, self.approval_batch['next_index']) + 1
             await self._checkpoint()
         except BaseException:
             self._tool_cursor -= 1
             entry.clear()
             entry.update(previous)
+            self.approval_batch = previous_batch
             self._artifacts.pop(str(artifact.id), None)
             await self._abort(write_id)
             raise
@@ -727,6 +893,7 @@ class _DiscussionDurability:
     async def compact(self, *, preserve_engineering: bool = False) -> None:
         async with self._model_lock:
             self.model_entries.clear()
+            self.approval_batch = None
             if preserve_engineering:
                 self.engineering_tool_prefix = self._tool_cursor
             else:
@@ -1663,7 +1830,9 @@ class GatewayCapabilityTool(BaseTool[_DynamicToolArguments, _DynamicToolResult])
             await acquired
             if cancellation_token.is_cancelled():
                 raise asyncio.CancelledError
-            if any(row.get("status") not in ("succeeded", "failed")
+            if self._durability.approval_pending:
+                raise RuntimeExecutionError('capability requires approval')
+            if any(row.get("status") not in ("succeeded", "failed", "waiting_approval")
                    for row in self._durability.tool_entries[self._durability._tool_cursor:]):
                 raise ToolOutcomeUncertain("capability outcome is uncertain")
             return await self._execute_ordered(args, cancellation_token, call_id=call_id)
@@ -1865,6 +2034,20 @@ class GatewayCapabilityTool(BaseTool[_DynamicToolArguments, _DynamicToolResult])
                 )
             )
             raise RuntimeExecutionError("capability outcome is uncertain") from None
+        approval_id = tool_result.payload.get('approval_id')
+        if (tool_result.status == 'failed' and tool_result.failure_reason == 'capability requires approval'
+                and tool_result.call_id == tool_request.call_id and tool_result.tool_name == self.name
+                and not tool_result.truncated and set(tool_result.payload) == {'approval_id'}
+                and isinstance(approval_id, str) and re.fullmatch(r'approval_[A-Za-z0-9_-]{1,100}', approval_id)):
+            await self._durability.wait_for_approval(approval_id, call_id=safe_call_id)
+            self._records.append(_ToolRecord(
+                EventKind.TOOL_FAILED, self._actor, safe_call_id, self.name,
+                payload={**safe_tool_event_payload(name=self.name, status='waiting_approval',
+                    arguments=cast(Mapping[str, JsonValue], arguments), sandbox=tool_sandbox,
+                    replay_safe=replay_safe, failure_kind='waiting_approval'), 'approval_id': approval_id},
+                reason='capability requires approval',
+            ))
+            raise RuntimeExecutionError('capability requires approval')
         has_draft = "generated_draft_rejection" in tool_result.payload
         draft_feedback = (
             generated_draft_feedback(tool_result, context=self._server_context, request=tool_request)
@@ -2891,6 +3074,7 @@ class AutoGenDiscussionRuntime:
                         model_ledger=model_entries,
                         tool_ledger=tool_entries,
                         engineering_tool_prefix=(durability.engineering_tool_prefix if durability is not None else 0),
+                        approval_batch=durability.approval_batch if durability is not None else None,
                     )
 
                 if publications is not None:
@@ -2920,6 +3104,8 @@ class AutoGenDiscussionRuntime:
                 artifacts=ledger_artifacts,
                 engineering_tool_prefix=cast(int, restored.state.get("engineering_tool_prefix", 0))
                 if engineering and restored is not None else 0,
+                approval_batch=cast(Mapping[str, JsonValue] | None, restored.state.get('approval_batch'))
+                if restored is not None else None,
             )
             if restored is not None and reports and tools_ready():
                 # A verified tool prefix is a phase boundary, not permission to
@@ -3259,11 +3445,49 @@ class AutoGenDiscussionRuntime:
             framework_timed_out = False
             item_task: asyncio.Task[Any] | None = None
             stream: Any = None
-            try:
-                stream = team.run_stream(
+
+            async def stream_after_approval() -> AsyncIterator[Any]:
+                assert durability is not None
+                pending = _pending_approval_call(durability, participant_models) if restored is not None else None
+                if pending is not None:
+                    actor, calls, cursor = pending
+                    participant = next((item for item in self._plan.participants if item.id == actor), None)
+                    if participant is None:
+                        raise RuntimeExecutionError('durable capability approval actor binding is invalid')
+                    facades = [item for item in participant_tools(participant) or ()
+                               if isinstance(item, GatewayCapabilityTool)]
+                    matched = []
+                    for call in calls:
+                        candidates = [item for item in facades if call['name'] in {item.name, item.name.replace('.', '_')}]
+                        if len(candidates) != 1:
+                            raise RuntimeExecutionError('durable capability approval tool is unavailable')
+                        matched.append(candidates[0])
+                    if self._cancel_token is None:
+                        raise RuntimeExecutionError('durable capability approval tool is unavailable')
+                    assert durability.approval_batch is not None
+                    durability._tool_cursor = cast(int, durability.approval_batch['start_position']) + cursor
+                    for index in range(cursor, len(calls)):
+                        try:
+                            await matched[index].run_json(
+                                cast(dict[str, JsonValue], _mutable_json(calls[index]['arguments'])),
+                                self._cancel_token, call_id=cast(str, calls[index]['id']))
+                        except _ExecutionObservationError:
+                            # A diagnosed check failure ends the batch, not the repair loop.
+                            break
+                    await durability.compact(preserve_engineering=True)
+                    await durability._checkpoint()
+                child_stream = team.run_stream(
                     task=self._task_text(context, tuple(message_artifacts)),
                     cancellation_token=self._cancel_token,
                 )
+                try:
+                    async for item in child_stream:
+                        yield item
+                finally:
+                    await child_stream.aclose()
+
+            try:
+                stream = stream_after_approval()
                 while True:
                     item_task = asyncio.create_task(anext(stream))
                     while not item_task.done() or (publication_task is not None and publication_task.done()):
@@ -3865,6 +4089,7 @@ class AutoGenDiscussionRuntime:
         model_ledger: tuple[_LedgerEntry, ...] = (),
         tool_ledger: tuple[_LedgerEntry, ...] = (),
         engineering_tool_prefix: int = 0,
+        approval_batch: Mapping[str, JsonValue] | None = None,
     ) -> RuntimeCheckpoint:
         discussion_control = self._discussion_control
         if discussion_control is None:
@@ -3937,6 +4162,7 @@ class AutoGenDiscussionRuntime:
             "remaining_absolute_timeout_seconds": remaining_absolute_timeout_seconds,
             "model_ledger": model_ledger,
             "tool_ledger": tool_ledger,
+            **({'approval_batch': approval_batch} if approval_batch is not None else {}),
             **({"engineering_tool_prefix": engineering_tool_prefix} if engineering else {}),
             **({"engineering_action_version": 1} if engineering
                and type(context.routing_decision.get("engineering_action_version")) is int
@@ -4018,7 +4244,7 @@ class AutoGenDiscussionRuntime:
         optional_state = (
             {"remaining_absolute_timeout_seconds", "engineering_tool_prefix", "engineering_action_version",
              ENGINEERING_CONTINUATION_POLICY, _CHECKPOINT_ACK_POLICY, FINAL_REPORT_POLICY, TOOL_CORRECTION_POLICY,
-             "engineering_progress_budget_version", _SOFT_ADMISSION_POLICY}
+             "engineering_progress_budget_version", _SOFT_ADMISSION_POLICY, 'approval_batch'}
             if checkpoint.runtime_version == _RUNTIME_VERSION
             else set()
         )
@@ -4127,6 +4353,15 @@ class AutoGenDiscussionRuntime:
             ))
         ):
             raise RuntimeExecutionError("runtime checkpoint is incompatible")
+        for index, row in enumerate(cast(tuple[Mapping[str, JsonValue], ...], tool_ledger)):
+            if row.get('status') == 'waiting_approval' and (
+                    state['terminal'] is not False or index != len(tool_ledger) - 1
+                    or 'approval_batch' not in state
+                    or not _waiting_tool_receipt(row, run_id=context.run_id, position=index)):
+                raise RuntimeExecutionError('durable capability approval receipt is invalid')
+        if 'approval_batch' in state and (
+                not engineering or state['terminal'] is not False or not isinstance(state['approval_batch'], Mapping)):
+            raise RuntimeExecutionError('durable capability approval batch is invalid')
         try:
             cost = Decimal(cast(str, usage["cost_usd"]))
             for artifact_id, sha256 in registry.items():
@@ -4201,6 +4436,11 @@ class AutoGenDiscussionRuntime:
         allowed_by_actor = {participant.id: participant.allowed_tools for participant in self._plan.participants}
         draft_observations: set[str] = set()
         for entry in cast(tuple[Mapping[str, JsonValue], ...], checkpoint.state["tool_ledger"]):
+            if entry.get('status') == 'waiting_approval':
+                if (entry.get('name') not in allowed_by_actor.get(cast(str, entry.get('actor')), ())
+                        or entry.get('artifact_id') is not None):
+                    raise RuntimeExecutionError('durable capability approval receipt is invalid')
+                continue
             artifact = by_id.get(cast(str, entry.get("artifact_id")))
             result = None if artifact is None else artifact.content.get("result")
             draft = isinstance(result, Mapping) and "generated_draft_rejection" in result
