@@ -2,11 +2,20 @@
 from __future__ import annotations
 
 import copy
+import hashlib
+from uuid import UUID, uuid4
 
 import pytest
 
-from agent_hub.runtime.autogen.project_repair_phase import prefix_digest, prepare, validate
-from agent_hub.runtime.contracts import _mutable_json
+from agent_hub.runtime.artifacts import ArtifactReference
+from agent_hub.runtime.autogen.engineering_delivery import engineering_progress
+from agent_hub.runtime.autogen.project_repair_phase import (
+    prefix_digest,
+    prepare,
+    productive_boundary,
+    validate,
+)
+from agent_hub.runtime.contracts import Artifact, RuntimeCheckpoint, _mutable_json
 from tests.unit.runs.test_project_auto_repair_runtime import (
     BoundaryFailure,
     ContinuationRepository,
@@ -162,3 +171,149 @@ def test_final_report_retains_bound_correction_chain_without_hiding_unknown() ->
     evidence.models[1]['status'] = 'running'
     with pytest.raises(ValueError):
         evidence.metadata()
+
+
+async def late_case(fault='after_bundle'):
+    journey = ProjectJourney()
+    repo = ContinuationRepository(journey)
+    runtime = BoundaryFailure(journey)
+    service = RunService(repo, runtime_registry=RuntimeRegistry((runtime,)), router=None, task_queue=object())
+    await service.execute(repo.run_id)
+    runtime.second_fault = 'after_write'
+    await service.execute(repo.run_id)
+    route = _mutable_json(repo.row.routing_decision)
+    runtime.second_fault = fault
+    await service.execute(repo.run_id)
+    saved = repo.checkpoint
+    context = journey.context.model_copy(update={'checkpoint': saved, 'routing_decision': route})
+    refs = tuple(ArtifactReference(id=UUID(k), sha256=v) for k, v in saved.state['artifact_registry'].items())
+    artifacts = await journey.artifacts.get_many(context.tenant_id, context.run_id, refs)
+    return context, saved, [a for a in artifacts if a.type == 'tool_result']
+
+
+def boundary_checkpoint(saved, state):
+    return RuntimeCheckpoint(id=saved.id, runtime_type='autogen', runtime_version='2',
+        run_id=saved.run_id, tenant_id=saved.tenant_id, mode=saved.mode, state=state)
+
+
+def bind_tool_artifact(state, artifacts, position, content, *, producer=None):
+    row = state['tool_ledger'][position]
+    original = next(a for a in artifacts if str(a.id) == row['artifact_id'])
+    artifact = Artifact(id=original.id, type=original.type,
+        producer=original.producer if producer is None else producer,
+        content=content, source_ids=original.source_ids)
+    artifacts[artifacts.index(original)] = artifact
+    row['artifact_sha256'] = artifact.content_sha256
+    state['artifact_registry'][str(artifact.id)] = artifact.content_sha256
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('defect', [
+    'missing_receipt', 'artifact_hash', 'producer', 'arguments', 'idempotency',
+    'verify_scope', 'zip_source', 'zip_receipt', 'zip_manifest', 'zip_presentation',
+    'invalidated_zip', 'unknown_model', 'unknown_tool', 'permission', 'hard_tokens',
+    'tokens_reset', 'cost_reset', 'absolute_reset', 'uncommitted_models', 'uncommitted_tools',
+])
+async def test_late_progress_rejects_forged_stale_or_unsafe_evidence(defect: str) -> None:
+    context, saved, artifacts = await late_case()
+    state = _mutable_json(saved.state)
+    route = _mutable_json(context.routing_decision)
+    tools = state['tool_ledger']
+    last = tools[-1]
+    artifact = next(a for a in artifacts if str(a.id) == last['artifact_id'])
+    content = _mutable_json(artifact.content)
+    if defect == 'missing_receipt':
+        artifacts.remove(artifact)
+    elif defect == 'artifact_hash':
+        last['artifact_sha256'] = 'f' * 64
+    elif defect == 'producer':
+        bind_tool_artifact(state, artifacts, len(tools) - 1, content, producer='reviewer')
+    elif defect == 'arguments':
+        content['arguments_sha256'] = 'f' * 64
+        bind_tool_artifact(state, artifacts, len(tools) - 1, content)
+    elif defect == 'idempotency':
+        last['idempotency_key'] = 'f' * 64
+    elif defect == 'verify_scope':
+        verify = next(a for a in artifacts if str(a.id) == tools[-2]['artifact_id'])
+        changed = _mutable_json(verify.content)
+        changed['result']['generated_project_acceptance']['run_id'] = str(uuid4())
+        bind_tool_artifact(state, artifacts, len(tools) - 2, changed)
+    elif defect.startswith('zip_'):
+        result = content['result']
+        key = {'zip_source': 'verification_source_sha256', 'zip_receipt': 'verification_receipt_sha256',
+               'zip_manifest': 'workspace_files', 'zip_presentation': 'presentation'}[defect]
+        result[key] = [] if defect == 'zip_manifest' else 'f' * 64
+        bind_tool_artifact(state, artifacts, len(tools) - 1, content)
+    elif defect == 'invalidated_zip':
+        write = next(a for a in artifacts if a.content.get('tool_name') == 'workspace.write_text')
+        row = dict(tools[2])
+        row.update(position=len(tools), artifact_id=str(uuid4()))
+        row['idempotency_key'] = hashlib.sha256(
+            f"{context.run_id}:{row['actor']}:{row['position']}:{row['name']}:{row['arguments_hash']}".encode()).hexdigest()
+        stale = Artifact(id=UUID(row['artifact_id']), type=write.type, producer=write.producer,
+            content=write.content)
+        row['artifact_sha256'] = stale.content_sha256
+        tools.append(row)
+        artifacts.append(stale)
+        state['artifact_registry'][str(stale.id)] = stale.content_sha256
+        state['engineering_tool_prefix'] = len(tools)
+    elif defect == 'unknown_model':
+        state['model_ledger'][-1]['status'] = 'running'
+    elif defect == 'unknown_tool':
+        last['status'] = 'running'
+    elif defect == 'permission':
+        route['requested_permissions'] = ['host_write']
+    elif defect == 'hard_tokens':
+        route['runtime_token_absolute_tokens'] += 1
+    elif defect == 'tokens_reset':
+        state['usage']['tokens'] = 0
+    elif defect == 'cost_reset':
+        state['usage']['cost_usd'] = '0'
+    elif defect == 'uncommitted_models':
+        state['project_repair_phase']['model_floor'] -= 1
+    elif defect == 'uncommitted_tools':
+        state['engineering_tool_prefix'] -= 1
+    else:
+        state['remaining_absolute_timeout_seconds'] += 1
+    context = context.model_copy(update={'routing_decision': route})
+    with pytest.raises(ValueError):
+        productive_boundary(context, boundary_checkpoint(saved, state), artifacts)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('fault', ['after_verify', 'after_bundle'])
+async def test_repeated_delivery_semantics_cannot_buy_another_continuation(fault: str) -> None:
+    context, saved, artifacts = await late_case(fault)
+    progress = productive_boundary(context, saved, artifacts)
+    context = context.model_copy(update={'routing_decision': {
+        **context.routing_decision, 'self_repair_episode_progress': progress}})
+    state = _mutable_json(saved.state)
+    tools = state['tool_ledger']
+    row = dict(tools[-1])
+    original = next(a for a in artifacts if str(a.id) == row['artifact_id'])
+    content = _mutable_json(original.content)
+    if fault == 'after_verify':
+        diagnostic = content['result']['verification']['checks'][0]['execution_diagnostic']
+        output = 'same source verified again\n'
+        diagnostic['stdout'] = output
+        diagnostic['stdout_metadata'].update(sanitized_bytes=len(output), returned_bytes=len(output),
+            sha256=hashlib.sha256(output.encode()).hexdigest())
+    else:
+        content['result']['artifact_id'] = str(uuid4())
+        content['result']['file']['filename'] = 'another-attempt.zip'
+    duplicate = Artifact(id=uuid4(), type=original.type, producer=original.producer, content=content)
+    row.update(position=len(tools), artifact_id=str(duplicate.id), artifact_sha256=duplicate.content_sha256)
+    row['idempotency_key'] = hashlib.sha256(
+        f"{context.run_id}:{row['actor']}:{row['position']}:{row['name']}:{row['arguments_hash']}".encode()).hexdigest()
+    tools.append(row)
+    artifacts.append(duplicate)
+    state['artifact_registry'][str(duplicate.id)] = duplicate.content_sha256
+    state['engineering_tool_prefix'] = len(tools)
+    stopped = boundary_checkpoint(saved, state)
+    current = engineering_progress(context, tool_entries=stopped.state['tool_ledger'], artifacts=artifacts,
+        allowed_tools={'implementer': ('project.inspect', 'workspace.list', 'workspace.write_text',
+                                      'project.verify', 'workspace.bundle')})
+    assert not current.uncertain and current.verification_current
+    assert fault == 'after_verify' or current.bundle_current
+    with pytest.raises(ValueError):
+        productive_boundary(context, stopped, artifacts)

@@ -1531,7 +1531,8 @@ class RunRepository:
             row.version += 1
             session.add(RunOutboxRow(id=uuid4(), tenant_id=tenant_id, run_id=run_id,
                 task_name='agent_hub.runs.execute',
-                idempotency_key=f'{tenant_id}:{run_id}:repair-progress:{checkpoint_sha256}',
+                idempotency_key='repair-progress:' + hashlib.sha256(
+                    f'{tenant_id}:{run_id}:{checkpoint_sha256}'.encode()).hexdigest(),
                 payload={'run_id': str(run_id)}))
             await session.flush()
             return self._record(row)

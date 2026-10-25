@@ -231,7 +231,7 @@ async def test_autogen_unknown_replaces_reason_and_clears_previous_capacity_payl
 
 
 @pytest.mark.parametrize("mode", [TaskMode.DIRECT, TaskMode.DISCUSS])
-async def test_noncapacity_issued_scope_adds_no_public_failure_fields(mode: TaskMode) -> None:
+async def test_noncapacity_scope_preserves_default_and_validates_explicit_diagnostics(mode: TaskMode) -> None:
     gateway = make_gateway(OutcomesTransport([ModelTransportError(PRIVATE)]),
                            CapacityStub([lease("primary")]))
     if mode is TaskMode.DIRECT:
@@ -243,12 +243,21 @@ async def test_noncapacity_issued_scope_adds_no_public_failure_fields(mode: Task
         assert gateway_scope_failure_payload(caught.value) == {}
         assert safe_runtime_failure_diagnostic(caught.value) == runtime_failure_diagnostic_from_reason(
             str(caught.value))
+        assert PRIVATE not in str(caught.value)
     else:
         discussion = AutoGenDiscussionRuntime(gateway, plan())
         events = [event async for event in discussion.run(context(mode))]
         assert events[-1].kind is EventKind.RUNTIME_FAILED
         assert events[-1].reason == "model gateway failed: model transport failed"
-        assert dict(events[-1].payload) == {}
+        assert dict(events[-1].payload) == {
+            **runtime_failure_diagnostic_from_reason(events[-1].reason),
+            "gateway_scope_phase": "transport",
+            "gateway_scope_reason": "missing_status",
+            "gateway_scope_transport_entered_count": 1,
+            "gateway_scope_failure_attempt_count": 1,
+        }
+        assert not any(key.startswith("capacity_") for key in events[-1].payload)
+        assert PRIVATE not in json.dumps(events[-1].to_payload())
 
 
 class FailureEventRuntime(MultiArtifactRuntime):

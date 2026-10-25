@@ -1240,7 +1240,7 @@ async def test_config_backed_direct_runtime_does_not_fallback_past_harness_selec
         transport=transport,
     )
 
-    with pytest.raises(RuntimeExecutionError, match="model capacity unavailable"):
+    with pytest.raises(RuntimeExecutionError, match="model capacity queue timeout"):
         _ = [
             event
             async for event in runtime.run(
@@ -1324,7 +1324,7 @@ async def test_config_backed_direct_runtime_disables_fallback_from_harness_polic
         transport=transport,
     )
 
-    with pytest.raises(RuntimeExecutionError, match="model capacity unavailable"):
+    with pytest.raises(RuntimeExecutionError, match="model capacity queue timeout"):
         _ = [
             event
             async for event in runtime.run(

@@ -11,7 +11,10 @@ from typing import cast
 from uuid import UUID
 
 from agent_hub.domain.runs import TaskMode
-from agent_hub.runtime.autogen.engineering_delivery import engineering_work_progress
+from agent_hub.runtime.autogen.engineering_delivery import (
+    engineering_progress,
+    engineering_work_progress,
+)
 from agent_hub.runtime.autogen.model_tool_correction import (
     TOOL_CORRECTION_POLICY,
     validate_rejected_model_rows,
@@ -257,7 +260,7 @@ def _budget_not_replenished(metadata: Mapping[str, JsonValue], state: Mapping[st
 
 def productive_boundary(context: TaskContext, checkpoint: RuntimeCheckpoint,
                         artifacts: Sequence[Artifact]) -> dict[str, JsonValue]:
-    """A new confirmed write may continue an episode, never replay an unknown call."""
+    """New confirmed write or delivery progress may continue an episode, never UNKNOWN."""
     state = checkpoint.state
     _need(checkpoint.runtime_type == 'autogen' and checkpoint.runtime_version == '2'
         and checkpoint.state_sha256 == checkpoint.recompute_state_sha256()
@@ -319,6 +322,29 @@ def productive_boundary(context: TaskContext, checkpoint: RuntimeCheckpoint,
             if position >= lower and pair not in observed:
                 productive.append(file)
             observed.add(pair)
+    if not productive:
+        _need(phase['model_floor'] == len(models)
+              and state.get('engineering_tool_prefix') == len(tools))
+        allowed: dict[str, tuple[str, ...]] = {}
+        for row in tools:
+            actor, name = row.get('actor'), row.get('name')
+            if isinstance(actor, str) and isinstance(name, str):
+                allowed[actor] = (*allowed.get(actor, ()), name)
+        current = engineering_progress(context, tool_entries=tools, artifacts=artifacts,
+                                       allowed_tools=allowed)
+        latest = next((row for row in reversed(tools) if row.get('name') in {
+            'workspace.write_text', 'project.verify', 'workspace.bundle'}), {})
+        name = latest.get('name')
+        _need(not current.uncertain and latest.get('status') == 'succeeded' and (
+            name == 'project.verify' and current.verification_current
+            or name == 'workspace.bundle' and current.bundle_current))
+        before = engineering_work_progress(context, tool_entries=tools[:lower], artifacts=artifacts,
+                                           allowed_tools=allowed)
+        after = engineering_work_progress(context, tool_entries=tools, artifacts=artifacts,
+                                          allowed_tools=allowed)
+        # Attempt ids and old phase receipts cannot buy another continuation.
+        productive.extend({'work_progress': key} for key in sorted(after - before)
+                          if key.startswith(f'{name}:'))
     _need(bool(productive))
     return {'checkpoint_sha256': checkpoint.state_sha256, 'checkpoint_id': str(checkpoint.id),
             'checkpoint_metadata': cast(JsonValue, _mutable_json({k: v for k, v in state.items()

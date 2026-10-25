@@ -22,6 +22,7 @@ from typing import NamedTuple
 _CHUNK = 1024 * 1024
 _REPARSE = 0x400
 _SYMLINK_TAG = 0xA000000C
+_WINDOWS_DIRECTORY_ENUM_BIT = 0x10000000
 _Parts = tuple[str, ...]
 
 
@@ -60,16 +61,19 @@ def _identity(info: os.stat_result) -> tuple[int, int, int, int]:
 
 def _stat_key(info: os.stat_result, *, descriptor: bool = False) -> tuple[int, ...]:
     # Python 3.12 Windows lstat uses birth time for ctime, whereas fstat may use
-    # change time. Compare ctime between path stats, not across those two APIs.
+    # change time and omit file attributes. Keep same-API comparisons complete.
+    attributes = int(getattr(info, "st_file_attributes", 0))
     return (
         *_identity(info), info.st_mode, info.st_nlink, info.st_uid, info.st_gid,
         info.st_size, info.st_mtime_ns,
         0 if descriptor and sys.platform == "win32" else info.st_ctime_ns,
-        int(getattr(info, "st_file_attributes", 0)),
+        0 if descriptor and sys.platform == "win32" else attributes,
     )
 
 
 def _unchanged(actual: os.stat_result, expected: os.stat_result, *, fd: bool = False) -> None:
+    if fd and sys.platform == "win32" and _kind(actual) != _kind(expected):
+        raise RuntimeError("validation tree source kind changed")
     if _stat_key(actual, descriptor=fd) != _stat_key(expected, descriptor=fd):
         raise RuntimeError("validation tree source identity/stat changed")
 
@@ -127,11 +131,25 @@ class _Tree:
 
     def names(self, parts: _Parts) -> list[str]:
         with self.directory(parts) as fd:
+            path = self.root.joinpath(*parts)
+            before = path.lstat() if sys.platform == "win32" else None
+            if before is not None:
+                _unchanged(before, self.directories[parts])
             names: list[str] = []
-            with os.scandir(self.root.joinpath(*parts) if fd is None else fd) as entries:
+            with os.scandir(path if fd is None else fd) as entries:
                 for entry in entries:
                     _check_deadline(self.deadline)
                     names.append(entry.name)
+            if before is not None:
+                after = path.lstat()
+                old, new = _stat_key(before), _stat_key(after)
+                # Observed only across our scandir: permit this one-way bit
+                # clear, never grant a general meaning to this undocumented bit.
+                cleared = (old[:-1] == new[:-1] and bool(old[-1] & _WINDOWS_DIRECTORY_ENUM_BIT)
+                           and new[-1] == old[-1] & ~_WINDOWS_DIRECTORY_ENUM_BIT)
+                if old != new and not cleared:
+                    raise RuntimeError("validation tree directory changed during enumeration")
+                self.directories[parts] = after
             names.sort()
             _check_deadline(self.deadline)
             return names
@@ -158,7 +176,8 @@ def _read_file(
     digest = hashlib.sha256()
     total = 0
     with tree.open_file(parts, os.O_RDONLY) as fd:
-        _unchanged(os.fstat(fd), info, fd=True)
+        opened = os.fstat(fd)
+        _unchanged(opened, info, fd=True)
         while True:
             _check_deadline(tree.deadline)
             chunk = os.read(fd, _CHUNK)
@@ -177,7 +196,7 @@ def _read_file(
                     if written <= 0:
                         raise OSError("validation tree copy made no write progress")
                     remaining = remaining[written:]
-        _unchanged(os.fstat(fd), info, fd=True)
+        _unchanged(os.fstat(fd), opened)
     _unchanged(tree.lstat(parts), info)
     if total != info.st_size:
         raise RuntimeError("validation tree file size changed while reading")
@@ -281,8 +300,11 @@ def _snapshot(tree: _Tree, reject_hardlinks: bool) -> dict[_Parts, _Entry]:
         kind = _kind(info)
         value = ""
         if kind == "directory":
+            if sys.platform == "win32" and parts in tree.directories:
+                _unchanged(info, tree.directories[parts])
             tree.directories[parts] = info
             pending.extend((*parts, name) for name in reversed(tree.names(parts)))
+            info = tree.directories[parts]
         elif kind == "file":
             if reject_hardlinks and info.st_nlink > 1:
                 raise ValueError("hardlinked validation tree source file")
@@ -345,6 +367,35 @@ def _populate(
                 owned[parts] = info
                 if entry.kind == "directory":
                     target.directories[parts] = info
+                    if sys.platform == "win32":
+                        if target.names(parts):
+                            raise RuntimeError("validation tree new target directory is not empty")
+                        owned[parts] = target.directories[parts]
+
+
+def _refresh_owned_directories(target: _Tree, owned: dict[_Parts, os.stat_result]) -> None:
+    # Only our completed population may change target directory size/mtime.
+    # Stage all checks before rebasing; keep the creation ledger for rollback.
+    directories: dict[_Parts, os.stat_result] = {}
+    for parts, info in owned.items():
+        _check_deadline(target.deadline)
+        if _kind(info) == "directory":
+            directories[parts] = info
+    if directories.keys() != target.directories.keys():
+        raise RuntimeError("validation tree target directory ownership changed")
+    refreshed: dict[_Parts, os.stat_result] = {}
+    for parts, expected in directories.items():
+        _check_deadline(target.deadline)
+        _unchanged(target.directories[parts], expected)
+        actual = target.lstat(parts)
+        if (_kind(actual) != "directory" or _identity(actual) != _identity(expected)
+                or any(getattr(actual, field, 0) != getattr(expected, field, 0) for field in (
+                    "st_mode", "st_nlink", "st_uid", "st_gid", "st_ctime_ns", "st_file_attributes",
+                ))):
+            raise RuntimeError("validation tree owned directory identity/stat changed")
+        refreshed[parts] = actual
+    _check_deadline(target.deadline)
+    target.directories.update(refreshed)
 
 
 def _cleanup(target: _Tree, owned: dict[_Parts, os.stat_result]) -> None:
@@ -409,7 +460,13 @@ def copy_validation_tree(
     dst = _Tree(target, target_info, deadline)
     owned: dict[_Parts, os.stat_result] = {(): target_info}
     try:
+        if sys.platform == "win32":
+            if dst.names(()):
+                raise RuntimeError("validation tree new target directory is not empty")
+            owned[()] = dst.directories[()]
         _populate(src, dst, before, owned)
+        if sys.platform == "win32":
+            _refresh_owned_directories(dst, owned)
         copied = _snapshot(dst, True)
         if _summary(copied, deadline) != result:
             raise RuntimeError("validation tree source/target digest mismatch")

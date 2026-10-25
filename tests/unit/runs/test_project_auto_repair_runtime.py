@@ -8,7 +8,7 @@ import json
 import zipfile
 from collections.abc import AsyncIterator
 from contextlib import aclosing
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from types import SimpleNamespace
@@ -19,7 +19,7 @@ from uuid import UUID, uuid4
 import pytest
 
 from agent_hub.auth.models import Role
-from agent_hub.db.models import RunRow, RuntimeArtifactRow
+from agent_hub.db.models import RunOutboxRow, RunRow, RuntimeArtifactRow
 from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.harness.types import HarnessToolCallResult
 from agent_hub.models.gateway import GatewayCompletion
@@ -360,6 +360,19 @@ class BoundaryFailure:
                         except StopAsyncIteration:
                             return
                         yield event
+                        late_tool = {'after_verify': 'project.verify', 'after_bundle': 'workspace.bundle',
+                                     'after_bundle_list': 'workspace.list'}.get(
+                            getattr(self, 'second_fault', None))
+                        if not self.initial and late_tool is not None and event.checkpoint is not None:
+                            state = event.checkpoint.state
+                            tools, models = state['tool_ledger'], state['model_ledger']
+                            phase = state.get('project_repair_phase', {})
+                            if (tools and tools[-1]['name'] == late_tool and tools[-1]['status'] == 'succeeded'
+                                    and state['engineering_tool_prefix'] == len(tools)
+                                    and phase.get('model_floor') == len(models)):
+                                # The service has persisted and ACKed a complete round, before the report starts.
+                                await self.runner.cancel()
+                                break
                 finally:
                     stop.cancel()
                     if item is not None and not item.done():
@@ -488,6 +501,172 @@ async def test_second_fault_preserves_phase_and_cold_restore_never_replays_unkno
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('faults,pending_tools,pending_models', [
+    (['after_verify'], ['workspace.bundle'], ['selector', 'writer', 'main_report']),
+    (['after_bundle'], [], ['main_report']),
+    (['after_verify', 'after_bundle'], [], ['main_report']),
+])
+async def test_late_delivery_progress_continues_after_write_credit_is_consumed(
+    faults: list[str], pending_tools: list[str], pending_models: list[str],
+) -> None:
+    journey = ProjectJourney()
+    repo = ContinuationRepository(journey)
+    runtime = BoundaryFailure(journey)
+    service = RunService(repo, runtime_registry=RuntimeRegistry((runtime,)), router=None, task_queue=object())
+    assert (await service.execute(repo.run_id)).status is RunStatus.QUEUED
+    runtime.second_fault = 'after_write'
+    assert (await service.execute(repo.run_id)).status is RunStatus.QUEUED
+    for index, fault in enumerate(faults):
+        consumed = dict(repo.row.routing_decision['self_repair_episode_progress'])
+        runtime.second_fault = fault
+        continued = await service.execute(repo.run_id)
+        stopped = repo.checkpoint
+        before = stopped.to_payload()
+        assert journey.write_count == 2 and journey.verify_count == 2
+        assert all(row['status'] == 'succeeded' for row in stopped.state['model_ledger'])
+        assert all(row['status'] in {'succeeded', 'failed'} for row in stopped.state['tool_ledger'])
+        assert stopped.state['project_repair_phase']['model_floor'] == len(stopped.state['model_ledger'])
+        assert stopped.state['engineering_tool_prefix'] == len(stopped.state['tool_ledger'])
+        expected = ['project.verify'] if fault == 'after_verify' else (
+            ['workspace.bundle'] if index else ['project.verify', 'workspace.bundle'])
+        assert [row['name'] for row in stopped.state['tool_ledger'][consumed['tool_count']:]] == expected
+        assert not any('report_binding' in row for row in stopped.state['model_ledger'])
+        assert continued.status is RunStatus.QUEUED, repo.continuation_errors
+    assert repo.accept_count == 1 and len(repo.outbox) == 2 + len(faults)
+    calls, models = len(journey.calls), len(journey.requests)
+    runtime.second_fault = None
+    assert (await service.execute(repo.run_id)).status is RunStatus.COMPLETED
+    assert [call.tool_name for call in journey.calls[calls:]] == pending_tools
+    assert [('main_report' if any(m.role == 'system' and 'Main Agent final delivery' in str(m.content)
+                                 for m in request.messages) else request.logical_model)
+            for request in journey.requests[models:]] == pending_models
+    assert journey.write_count == 2 and journey.verify_count == 2
+    assert sum(call.tool_name == 'workspace.bundle' for call in journey.calls) == 1
+    assert sum(any(m.role == 'system' and 'Main Agent final delivery' in str(m.content)
+                   for m in request.messages) for request in journey.requests) == 1
+    final = [event.artifact for event in repo.event_log if event.artifact is not None
+             and event.artifact.content.get('presentation') == 'final_answer']
+    assert len(final) == 1 and final[0].content['text'] == journey.report
+    assert stopped.to_payload() == before
+    assert repo.checkpoint.state['model_ledger'][:len(stopped.state['model_ledger'])] == stopped.state['model_ledger']
+    assert repo.checkpoint.state['tool_ledger'][:len(stopped.state['tool_ledger'])] == stopped.state['tool_ledger']
+    assert repo.row.routing_decision['self_repair_attempt'] == 1
+    assert repo.row.routing_decision['runtime_token_absolute_tokens'] == 500
+    assert repo.row.routing_decision['runtime_timeout_absolute_seconds'] == 20.0
+    assert repo.checkpoint.state['usage']['tokens'] >= stopped.state['usage']['tokens']
+    assert Decimal(repo.checkpoint.state['usage']['cost_usd']) >= Decimal(stopped.state['usage']['cost_usd'])
+    assert repo.checkpoint.state['remaining_absolute_timeout_seconds'] <= stopped.state['remaining_absolute_timeout_seconds']
+    with zipfile.ZipFile(io.BytesIO(journey.bundle_bytes)) as archive:
+        assert archive.read('ACCEPTANCE.json') == b'repaired draft'
+
+
+@pytest.mark.asyncio
+async def test_repair_progress_outbox_key_fits_orm_and_binds_stable_full_scope() -> None:
+    journey = ProjectJourney()
+    repo = ContinuationRepository(journey)
+    runtime = BoundaryFailure(journey)
+    service = RunService(repo, runtime_registry=RuntimeRegistry((runtime,)), router=None, task_queue=object())
+    assert (await service.execute(repo.run_id)).status is RunStatus.QUEUED
+    runtime.second_fault = 'after_write'
+    assert (await service.execute(repo.run_id)).status is RunStatus.QUEUED
+    stopped = repo.checkpoint
+    original = repo.outbox[-1]
+    assert isinstance(original, RunOutboxRow)
+    assert len(original.idempotency_key.encode('ascii')) <= RunOutboxRow.__table__.c.idempotency_key.type.length
+    route = {k: v for k, v in repo.row.routing_decision.items() if k != 'self_repair_episode_progress'}
+    state = stopped.to_payload()['state']
+    state['remaining_timeout_seconds'] -= 0.01
+    later = RuntimeCheckpoint(id=uuid4(), runtime_type='autogen', runtime_version='2',
+        run_id=stopped.run_id, tenant_id=stopped.tenant_id, mode=stopped.mode, state=state)
+    assert later.state_sha256 != stopped.state_sha256
+    keys = []
+    # Reset only this synthetic in-memory fixture to inspect deterministic enqueue encoding.
+    for checkpoint in (stopped, stopped, later):
+        repo.row.status = RunStatus.FAILED.value
+        repo.row.routing_decision = dict(route)
+        repo.checkpoint = checkpoint
+        await repo.continue_project_repair_and_enqueue(tenant_id=repo.row.tenant_id,
+            run_id=repo.run_id, version=repo.row.version, checkpoint_sha256=checkpoint.state_sha256)
+        entry = repo.outbox[-1]
+        assert entry.tenant_id == checkpoint.tenant_id and entry.run_id == checkpoint.run_id
+        expected = 'repair-progress:' + hashlib.sha256(
+            f'{checkpoint.tenant_id}:{checkpoint.run_id}:{checkpoint.state_sha256}'.encode()).hexdigest()
+        assert entry.idempotency_key == expected
+        assert len(entry.idempotency_key) == len(entry.idempotency_key.encode('ascii')) == 80
+        assert entry.payload == {'run_id': str(checkpoint.run_id)}
+        keys.append(entry.idempotency_key)
+    assert keys[0] == keys[1] == original.idempotency_key
+    assert keys[2] != keys[0]
+
+
+@pytest.mark.asyncio
+async def test_bundle_readonly_tail_cold_restore_only_adds_report_and_keeps_full_ledger() -> None:
+    class ReadTailJourney(ProjectJourney):
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+            completed = await super().complete_with_context(request)
+            if any(call.name == 'workspace_bundle' for call in completed.response.tool_calls):
+                return replace(completed, response=replace(completed.response, tool_calls=(
+                    *completed.response.tool_calls,
+                    ToolCall(id='post-bundle-list', name='workspace_list', arguments={}),
+                )))
+            return completed
+
+    journey = ReadTailJourney()
+    repo = ContinuationRepository(journey)
+    runtime = BoundaryFailure(journey)
+    service = RunService(repo, runtime_registry=RuntimeRegistry((runtime,)), router=None, task_queue=object())
+    assert (await service.execute(repo.run_id)).status is RunStatus.QUEUED
+    runtime.second_fault = 'after_write'
+    assert (await service.execute(repo.run_id)).status is RunStatus.QUEUED
+    consumed = repo.row.routing_decision['self_repair_episode_progress']['tool_count']
+    runtime.second_fault = 'after_bundle_list'
+    assert (await service.execute(repo.run_id)).status is RunStatus.QUEUED, repo.continuation_errors
+    stopped = repo.checkpoint
+    before = stopped.to_payload()
+    tools, models = stopped.state['tool_ledger'], stopped.state['model_ledger']
+    assert [row['name'] for row in tools[consumed:]] == ['project.verify', 'workspace.bundle', 'workspace.list']
+    assert stopped.state['engineering_tool_prefix'] == len(tools)
+    assert stopped.state['project_repair_phase']['model_floor'] == len(models)
+    assert all(row['status'] == 'succeeded' and 'report_binding' not in row for row in models)
+    assert tools[-1]['status'] == 'succeeded'
+    assert repo.accept_count == 1 and len(repo.outbox) == 3
+    calls, requests = len(journey.calls), len(journey.requests)
+    runtime.second_fault = None
+    completed = await service.execute(repo.run_id)
+    assert completed.status is RunStatus.COMPLETED, [(e.kind, e.reason) for e in repo.event_log[-6:]]
+    assert len(journey.calls) == calls and len(journey.requests) == requests + 1
+    request = journey.requests[-1]
+    assert request.tools == () and request.required_tool is None
+    assert any(m.role == 'system' and 'Main Agent final delivery' in str(m.content) for m in request.messages)
+    assert repo.checkpoint.state['tool_ledger'] == tools
+    assert repo.checkpoint.state['model_ledger'][:-1] == models
+    assert stopped.to_payload() == before
+    final = [event.artifact for event in repo.event_log if event.artifact is not None
+             and event.artifact.content.get('presentation') == 'final_answer']
+    assert len(final) == 1 and final[0].content['text'] == journey.report
+    metadata = final[0].content['engineering_report']
+    assert metadata['bundle_position'] == len(tools) - 2
+    assert metadata['bundle_artifact_id'] == tools[-2]['artifact_id']
+    assert metadata['tool_prefix_length'] == len(tools)
+    assert metadata['tool_prefix_sha256'] == journey.digest(before['state']['tool_ledger'])
+    assert journey.write_count == 2 and journey.verify_count == 2
+    assert sum(call.tool_name == 'workspace.bundle' for call in journey.calls) == 1
+    assert repo.row.routing_decision['runtime_token_absolute_tokens'] == 500
+    assert repo.row.routing_decision['runtime_timeout_absolute_seconds'] == 20.0
+    assert repo.checkpoint.state['usage']['tokens'] >= stopped.state['usage']['tokens']
+    assert Decimal(repo.checkpoint.state['usage']['cost_usd']) >= Decimal(stopped.state['usage']['cost_usd'])
+    assert repo.checkpoint.state['remaining_absolute_timeout_seconds'] <= stopped.state['remaining_absolute_timeout_seconds']
+    terminal = repo.checkpoint
+    cold = journey.runtime()
+    await cold.restore_checkpoint(terminal)
+    calls, requests = len(journey.calls), len(journey.requests)
+    events = [event async for event in cold.run(journey.context.model_copy(update={'checkpoint': terminal}))]
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED, events[-1].reason
+    assert len(journey.calls) == calls and len(journey.requests) == requests
+    assert (await cold.save_checkpoint()).state_sha256 == terminal.state_sha256
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize('defect', ['consumed', 'permission', 'hard_tokens', 'tokens_reset', 'time_reset',
                                    'lease', 'stale_version', 'stale_checkpoint', 'unconfirmed_effect'])
 async def test_episode_transaction_refuses_replay_or_changed_authority(defect: str) -> None:
@@ -575,8 +754,11 @@ async def test_real_strict_soft_progress_renewal_survives_service_cold_resume() 
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('late_bundle', [False, True])
 @pytest.mark.parametrize('owner_status', ['written', 'reserved', 'aborted'])
-async def test_sqlite_transaction_uses_real_private_write_ownership_and_sql_predicates(owner_status: str) -> None:
+async def test_sqlite_transaction_uses_real_private_write_ownership_and_sql_predicates(
+    owner_status: str, late_bundle: bool,
+) -> None:
     from sqlalchemy import JSON, Column, MetaData, String, Table, select
     from sqlalchemy.dialects.postgresql import JSONB
     from sqlalchemy.dialects.postgresql import UUID as PGUUID
@@ -598,11 +780,20 @@ async def test_sqlite_transaction_uses_real_private_write_ownership_and_sql_pred
     assert (await service.execute(fake.run_id)).status is RunStatus.QUEUED
     runtime.second_fault = 'after_write'
     await service.execute(fake.run_id)
+    route = dict(fake.row.routing_decision)
+    if late_bundle:
+        runtime.second_fault = 'after_bundle'
+        assert (await service.execute(fake.run_id)).status is RunStatus.QUEUED
+    else:
+        route.pop('self_repair_episode_progress')
     checkpoint = fake.checkpoint
     refs = tuple(ArtifactReference(id=UUID(k), sha256=v) for k, v in checkpoint.state['artifact_registry'].items())
     artifacts = await journey.artifacts.get_many(fake.row.tenant_id, fake.run_id, refs)
     writes = [a for a in artifacts if a.type == 'tool_result']
     assert sum(a.content.get('tool_name') == 'workspace.write_text' for a in writes) == 2
+    target_id = UUID(checkpoint.state['tool_ledger'][-1]['artifact_id'])
+    if late_bundle:
+        assert next(a for a in writes if a.id == target_id).content['tool_name'] == 'workspace.bundle'
     engine = create_async_engine('sqlite+aiosqlite:///:memory:')
     factory = async_sessionmaker(engine, expire_on_commit=False)
     # Dialect-only schema adaptation; mapped columns, actual WHERE/EXISTS and transaction logic stay real.
@@ -618,8 +809,7 @@ async def test_sqlite_transaction_uses_real_private_write_ownership_and_sql_pred
             await connection.run_sync(metadata.create_all)
         values = {c.name: getattr(fake.row, c.name) for c in RunRow.__table__.columns}
         values['status'] = RunStatus.FAILED.value
-        values['routing_decision'] = {k: v for k, v in fake.row.routing_decision.items()
-                                      if k != 'self_repair_episode_progress'}
+        values['routing_decision'] = route
         async with factory.begin() as session:
             session.add(RunRow(**values))
             session.add(RunCheckpointRow(id=checkpoint.id, tenant_id=fake.row.tenant_id, run_id=fake.run_id,
@@ -627,14 +817,14 @@ async def test_sqlite_transaction_uses_real_private_write_ownership_and_sql_pred
                 state=checkpoint.to_payload()['state'], state_sha256=checkpoint.state_sha256,
                 payload=checkpoint.to_payload()))
         store = PostgresArtifactRepository(factory)
-        write_ids = []
+        write_ids = {}
         for artifact in writes:
-            write_ids.append(uuid4())
-            await store.put(fake.row.tenant_id, fake.run_id, artifact, write_id=write_ids[-1])
+            write_ids[artifact.id] = uuid4()
+            await store.put(fake.row.tenant_id, fake.run_id, artifact, write_id=write_ids[artifact.id])
         async with factory.begin() as session:
             persisted = (await session.scalars(select(RuntimeArtifactRow))).all()
             assert len(persisted) == len(writes) and all(a.permanent is False for a in persisted)
-            owner = await session.get(RuntimeArtifactWriteRow, (fake.row.tenant_id, fake.run_id, write_ids[-1]))
+            owner = await session.get(RuntimeArtifactWriteRow, (fake.row.tenant_id, fake.run_id, write_ids[target_id]))
             assert owner.status == 'written'
             owner.status = owner_status
         real = RunRepository(factory)
@@ -650,7 +840,12 @@ async def test_sqlite_transaction_uses_real_private_write_ownership_and_sql_pred
             fake.row.routing_decision = dict(continued.routing_decision)
             fake.row.status, fake.row.version = continued.status.value, continued.version
             runtime.second_fault = None
+            calls, models = len(journey.calls), len(journey.requests)
             assert (await service.execute(fake.run_id)).status is RunStatus.COMPLETED
+            if late_bundle:
+                assert len(journey.calls) == calls and len(journey.requests) == models + 1
+                assert any(m.role == 'system' and 'Main Agent final delivery' in str(m.content)
+                           for m in journey.requests[-1].messages)
             assert journey.write_count == 2 and journey.verify_count == 2 and journey.bundle_bytes
             assert len(set(journey.plans)) == 1
             assert fake.checkpoint.state['usage']['tokens'] >= checkpoint.state['usage']['tokens']

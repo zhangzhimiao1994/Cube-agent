@@ -14,6 +14,7 @@ import re
 from collections.abc import Mapping, Sequence
 from uuid import UUID, uuid5
 
+from agent_hub.runtime.autogen.engineering_delivery import _READ_ONLY
 from agent_hub.runtime.autogen.project_repair_phase import selected as repair_selected
 from agent_hub.runtime.autogen.project_repair_phase import stopped_models
 from agent_hub.runtime.contracts import Artifact, JsonValue, TaskContext, _mutable_json
@@ -53,11 +54,13 @@ def _ledger_artifact(
 def _bundle_artifact(
     context: TaskContext, tool_entries: Sequence[Mapping[str, JsonValue]],
     by_id: Mapping[str, Artifact],
-) -> Artifact:
-    if (not tool_entries or tool_entries[-1].get("status") != "succeeded"
-        or tool_entries[-1].get("name") != "workspace.bundle"):
+) -> tuple[int, Artifact]:
+    bundle_position = next((position for position in reversed(range(len(tool_entries)))
+                            if tool_entries[position].get("name") == "workspace.bundle"), None)
+    if bundle_position is None or tool_entries[bundle_position].get("status") != "succeeded":
         raise ValueError("final report requires a final succeeded bundle row")
     used: set[str] = set()
+    bundle: Artifact | None = None
     for position, row in enumerate(tool_entries):
         actor, name, arguments = row.get("actor"), row.get("name"), row.get("arguments_hash")
         if (type(row.get("position")) is not int or row.get("position") != position
@@ -66,6 +69,8 @@ def _bundle_artifact(
             or row.get("idempotency_key") != hashlib.sha256(
                 f"{context.run_id}:{actor}:{position}:{name}:{arguments}".encode()).hexdigest()):
             raise ValueError("final report tool prefix is invalid")
+        if position > bundle_position and (name not in _READ_ONLY or row.get("status") != "succeeded"):
+            raise ValueError("final report tail must contain only succeeded readonly outcomes")
         artifact = _ledger_artifact(row, by_id)
         if (str(artifact.id) in used or artifact.type != "tool_result"
             or artifact.producer != actor or artifact.content.get("tool_name") != name
@@ -73,7 +78,10 @@ def _bundle_artifact(
             or not isinstance(artifact.content.get("result"), Mapping)):
             raise ValueError("final report tool outcome is invalid")
         used.add(str(artifact.id))
-    return artifact
+        if position == bundle_position:
+            bundle = artifact
+    assert bundle is not None
+    return bundle_position, bundle
 
 
 def engineering_report_binding(
@@ -83,7 +91,7 @@ def engineering_report_binding(
     by_id = {str(artifact.id): artifact for artifact in artifacts}
     if len(by_id) != len(artifacts):
         raise ValueError("final report artifact registry is ambiguous")
-    bundle = _bundle_artifact(context, tool_entries, by_id)
+    _, bundle = _bundle_artifact(context, tool_entries, by_id)
     prefix = json.dumps(_mutable_json(tuple(tool_entries)), ensure_ascii=False, allow_nan=False,
                         sort_keys=True, separators=(",", ":")).encode("utf-8")
     return {"version": 1, "run_id": str(context.run_id), "tenant_id": str(context.tenant_id),
@@ -120,7 +128,7 @@ def engineering_report_metadata(
     if (not stopped_models(model_entries, context) if repair_selected(context)
             else any(entry.get("status") != "succeeded" for entry in model_entries)):
         raise ValueError("final report cannot hide an uncertain model outcome")
-    bundle = _bundle_artifact(context, tool_entries, by_id)
+    bundle_position, bundle = _bundle_artifact(context, tool_entries, by_id)
     row = model_entries[-1]
     binding = engineering_report_binding(context=context, logical_model=logical_model,
                                         tool_entries=tool_entries, artifacts=artifacts)
@@ -161,7 +169,7 @@ def engineering_report_metadata(
         **({"requested_logical_model": logical_model} if fallback else {}),
         "model_request_hash": row["request_hash"],
         "model_artifact_id": str(model.id), "model_artifact_sha256": model.content_sha256,
-        "bundle_position": len(tool_entries) - 1,
+        "bundle_position": bundle_position,
         "bundle_artifact_id": str(bundle.id), "bundle_artifact_sha256": bundle.content_sha256,
         "tool_prefix_length": len(tool_entries),
         "tool_prefix_sha256": hashlib.sha256(prefix).hexdigest(),

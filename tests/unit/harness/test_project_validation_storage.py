@@ -10,7 +10,10 @@ import stat
 import subprocess
 import sys
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Protocol, cast
 
 import pytest
@@ -508,3 +511,320 @@ def test_invalid_source_creates_no_target(tmp_path: Path, source_kind: str) -> N
     assert not (tmp_path / "copy").exists()
     if source_kind == "file":
         assert source.read_bytes() == b"keep"
+
+
+def _metadata(**changes: int) -> os.stat_result:
+    values = {'st_dev': 7, 'st_ino': 11, 'st_mode': stat.S_IFREG | 0o644, 'st_nlink': 1,
+              'st_uid': 1000, 'st_gid': 1000, 'st_size': 8, 'st_mtime_ns': 100,
+              'st_ctime_ns': 200, 'st_file_attributes': 0x20, 'st_reparse_tag': 0}
+    values.update(changes)
+    return cast(os.stat_result, SimpleNamespace(**values))
+
+
+@pytest.mark.parametrize('platform', ['win32', 'linux'])
+@pytest.mark.parametrize('attributes', ['missing', 'zero'])
+def test_path_fd_comparison_accounts_for_windows_api_metadata(
+    monkeypatch: pytest.MonkeyPatch, platform: str, attributes: str,
+) -> None:
+    module = runpy.run_path(str(_MODULE))
+    monkeypatch.setitem(module['_unchanged'].__globals__, 'sys', SimpleNamespace(platform=platform))
+    path = _metadata()
+    descriptor = _metadata(st_ctime_ns=201, st_file_attributes=0)
+    if attributes == 'missing':
+        delattr(descriptor, 'st_file_attributes')
+    if platform == 'win32':
+        module['_unchanged'](descriptor, path, fd=True)
+    else:
+        with pytest.raises(RuntimeError):
+            module['_unchanged'](descriptor, path, fd=True)
+
+
+@pytest.mark.parametrize('platform', ['win32', 'linux'])
+@pytest.mark.parametrize('kind', [stat.S_IFDIR, stat.S_IFREG])
+@pytest.mark.parametrize('reverse', [False, True])
+def test_attribute_bit_changes_outside_enumeration_are_rejected(
+    monkeypatch: pytest.MonkeyPatch, platform: str, kind: int, reverse: bool,
+) -> None:
+    module = runpy.run_path(str(_MODULE))
+    monkeypatch.setitem(module['_unchanged'].__globals__, 'sys', SimpleNamespace(platform=platform))
+    before = _metadata(st_mode=kind | 0o755, st_file_attributes=0x10000010)
+    after = _metadata(st_mode=kind | 0o755, st_file_attributes=0x10)
+    if reverse:
+        before, after = after, before
+    with pytest.raises(RuntimeError):
+        module['_unchanged'](after, before)
+
+
+def _enumeration_case(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, before: os.stat_result, after: os.stat_result,
+) -> tuple[dict[str, Any], Any, list[os.stat_result], list[int]]:
+    module = runpy.run_path(str(_MODULE))
+    monkeypatch.setitem(module['_Tree'].names.__globals__, 'sys', SimpleNamespace(platform='win32'))
+    root = tmp_path / 'controlled scan'
+    root.mkdir()
+    tree = module['_Tree'](root, before, time.monotonic() + 10)
+    current, calls = [before], [0]
+    original_lstat, original_path_lstat, original_scandir = os.lstat, Path.lstat, os.scandir
+
+    def lstat(path: Any, *, dir_fd: int | None = None) -> os.stat_result:
+        if isinstance(path, (str, Path)) and Path(path) == root:
+            return current[0]
+        return original_lstat(path, dir_fd=dir_fd)
+
+    def path_lstat(path: Path) -> os.stat_result:
+        return current[0] if path == root else original_path_lstat(path)
+
+    @contextmanager
+    def scandir(path: Any) -> Iterator[Iterator[Any]]:
+        if path == root:
+            calls[0] += 1
+            current[0] = after
+            yield iter(())
+        else:
+            with original_scandir(path) as entries:
+                yield entries
+
+    monkeypatch.setattr(os, 'lstat', lstat)
+    monkeypatch.setattr(Path, 'lstat', path_lstat)
+    monkeypatch.setattr(os, 'scandir', scandir)
+    return module, tree, current, calls
+
+
+@pytest.mark.parametrize('before_attrs,after_attrs', [(0x10, 0x10), (0x10000010, 0x10000010),
+                                                    (0x10000010, 0x10)])
+def test_controlled_scandir_only_rebases_exact_forward_transition(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, before_attrs: int, after_attrs: int,
+) -> None:
+    before = _metadata(st_mode=stat.S_IFDIR | 0o755, st_file_attributes=before_attrs)
+    after = _metadata(st_mode=stat.S_IFDIR | 0o755, st_file_attributes=after_attrs)
+    module, tree, _, calls = _enumeration_case(tmp_path, monkeypatch, before, after)
+    snapshot = module['_snapshot'](tree, True)
+    assert calls == [1] and tree.directories[()] == after
+    assert snapshot[()].info == after
+    module['_verify_stats'](tree, snapshot)
+
+
+@pytest.mark.parametrize('changes', [
+    {'st_dev': 8}, {'st_ino': 12}, {'st_mode': stat.S_IFDIR | 0o555},
+    {'st_mode': stat.S_IFREG | 0o755}, {'st_nlink': 2}, {'st_uid': 1001}, {'st_gid': 1001},
+    {'st_size': 9}, {'st_mtime_ns': 101}, {'st_ctime_ns': 201},
+    {'st_reparse_tag': 0xA000000C}, {'st_file_attributes': 0x11},
+    {'st_file_attributes': 0x410}, {'st_file_attributes': 0x0},
+])
+def test_scandir_transition_with_any_other_change_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, changes: dict[str, int],
+) -> None:
+    before = _metadata(st_mode=stat.S_IFDIR | 0o755, st_file_attributes=0x10000010)
+    after = _metadata(**{'st_mode': stat.S_IFDIR | 0o755, 'st_file_attributes': 0x10, **changes})
+    _, tree, _, _ = _enumeration_case(tmp_path, monkeypatch, before, after)
+    with pytest.raises((RuntimeError, ValueError)):
+        tree.names(())
+    assert tree.directories[()] == before
+
+
+def test_controlled_scandir_reverse_transition_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    before = _metadata(st_mode=stat.S_IFDIR | 0o755, st_file_attributes=0x10)
+    after = _metadata(st_mode=stat.S_IFDIR | 0o755, st_file_attributes=0x10000010)
+    _, tree, _, _ = _enumeration_case(tmp_path, monkeypatch, before, after)
+    with pytest.raises(RuntimeError):
+        tree.names(())
+    assert tree.directories[()] == before
+
+
+@pytest.mark.parametrize('before_attrs,after_attrs', [(0x10, 0x10000010), (0x10000010, 0x10)])
+def test_scandir_does_not_absorb_a_change_before_enumeration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, before_attrs: int, after_attrs: int,
+) -> None:
+    before = _metadata(st_mode=stat.S_IFDIR | 0o755, st_file_attributes=before_attrs)
+    outside = _metadata(st_mode=stat.S_IFDIR | 0o755, st_file_attributes=after_attrs)
+    _, tree, current, calls = _enumeration_case(tmp_path, monkeypatch, before, outside)
+    current[0] = outside
+    with pytest.raises(RuntimeError):
+        tree.names(())
+    assert calls == [0] and tree.directories[()] == before
+
+
+@pytest.mark.parametrize('before_attrs,after_attrs', [(0x10, 0x10000010), (0x10000010, 0x10)])
+def test_first_snapshot_cannot_overwrite_root_baseline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, before_attrs: int, after_attrs: int,
+) -> None:
+    before = _metadata(st_mode=stat.S_IFDIR | 0o755, st_file_attributes=before_attrs)
+    outside = _metadata(st_mode=stat.S_IFDIR | 0o755, st_file_attributes=after_attrs)
+    module, tree, current, calls = _enumeration_case(tmp_path, monkeypatch, before, outside)
+    current[0] = outside
+    with pytest.raises(RuntimeError, match='identity/stat changed'):
+        module['_snapshot'](tree, True)
+    assert calls == [0] and tree.directories[()] == before
+
+
+@pytest.mark.parametrize('changes', [
+    {}, {'st_dev': 8}, {'st_ino': 13}, {'st_mode': stat.S_IFDIR | 0o555},
+    {'st_mode': stat.S_IFREG | 0o755}, {'st_nlink': 2}, {'st_uid': 1001}, {'st_gid': 1001},
+    {'st_ctime_ns': 201}, {'st_file_attributes': 0x10000010},
+    {'st_file_attributes': 0x11}, {'st_file_attributes': 0x410}, {'st_reparse_tag': 1},
+])
+def test_owned_target_refresh_validates_all_before_updating(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, changes: dict[str, int],
+) -> None:
+    module = runpy.run_path(str(_MODULE))
+    root = _metadata(st_mode=stat.S_IFDIR | 0o755, st_file_attributes=0x10)
+    child = _metadata(st_mode=stat.S_IFDIR | 0o755, st_file_attributes=0x10, st_ino=12)
+    tree = module['_Tree'](tmp_path, root, time.monotonic() + 10)
+    tree.directories[('child',)] = child
+    owned = {(): root, ('child',): child, ('payload',): _metadata()}
+    original = dict(tree.directories)
+    current = {
+        (): _metadata(st_mode=stat.S_IFDIR | 0o755, st_file_attributes=0x10,
+                      st_size=16, st_mtime_ns=101),
+        ('child',): _metadata(**{'st_mode': stat.S_IFDIR | 0o755, 'st_file_attributes': 0x10,
+                                'st_ino': 12, 'st_size': 16, 'st_mtime_ns': 102, **changes}),
+    }
+    monkeypatch.setattr(tree, 'lstat', lambda parts: current[parts])
+    if changes:
+        with pytest.raises((RuntimeError, ValueError)):
+            module['_refresh_owned_directories'](tree, owned)
+        assert tree.directories == original
+    else:
+        module['_refresh_owned_directories'](tree, owned)
+        assert tree.directories == current
+    assert owned == {**original, ('payload',): owned[('payload',)]}
+
+
+@pytest.mark.parametrize('case', ['unowned_directory', 'unregistered_owner', 'forged_baseline'])
+def test_target_refresh_requires_creation_ledger(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str,
+) -> None:
+    module = runpy.run_path(str(_MODULE))
+    root = _metadata(st_mode=stat.S_IFDIR | 0o755, st_file_attributes=0x10)
+    tree = module['_Tree'](tmp_path, root, time.monotonic() + 10)
+    owned: dict[tuple[str, ...], os.stat_result] = {(): root}
+    if case == 'unowned_directory':
+        tree.directories[('unknown',)] = root
+    elif case == 'unregistered_owner':
+        owned[('unknown',)] = root
+    else:
+        tree.directories[()] = _metadata(st_mode=stat.S_IFDIR | 0o555, st_file_attributes=0x10)
+    original = dict(tree.directories)
+    monkeypatch.setattr(tree, 'lstat', lambda parts: root)
+    with pytest.raises(RuntimeError):
+        module['_refresh_owned_directories'](tree, owned)
+    assert tree.directories == original
+
+
+def test_resnapshot_cannot_hide_an_outside_reverse_transition(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    before = _metadata(st_mode=stat.S_IFDIR | 0o755, st_file_attributes=0x10000010)
+    after = _metadata(st_mode=stat.S_IFDIR | 0o755, st_file_attributes=0x10)
+    module, tree, current, calls = _enumeration_case(tmp_path, monkeypatch, before, after)
+    module['_snapshot'](tree, True)
+    current[0] = before
+    with pytest.raises(RuntimeError):
+        module['_snapshot'](tree, True)
+    assert calls == [1]
+
+
+@pytest.mark.parametrize('platform', ['win32', 'linux'])
+@pytest.mark.parametrize('field,value', [
+    ('st_dev', 8), ('st_ino', 12), ('st_mode', stat.S_IFREG | 0o444),
+    ('st_mode', stat.S_IFDIR | 0o644), ('st_nlink', 2), ('st_uid', 1001), ('st_gid', 1001),
+    ('st_size', 9), ('st_mtime_ns', 101), ('st_ctime_ns', 201),
+    ('st_file_attributes', 0x21), ('st_file_attributes', 0x420), ('st_reparse_tag', 0xA000000C),
+])
+def test_path_and_same_api_fd_security_metadata_changes_remain_rejected(
+    monkeypatch: pytest.MonkeyPatch, platform: str, field: str, value: int,
+) -> None:
+    module = runpy.run_path(str(_MODULE))
+    monkeypatch.setitem(module['_unchanged'].__globals__, 'sys', SimpleNamespace(platform=platform))
+    with pytest.raises((RuntimeError, ValueError)):
+        module['_unchanged'](_metadata(**{field: value}), _metadata())
+    if field not in {'st_ctime_ns', 'st_file_attributes'}:
+        with pytest.raises((RuntimeError, ValueError)):
+            module['_unchanged'](_metadata(**{field: value}), _metadata(), fd=True)
+
+
+def test_windows_fd_reparse_attribute_is_not_ignored(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = runpy.run_path(str(_MODULE))
+    monkeypatch.setitem(module['_unchanged'].__globals__, 'sys', SimpleNamespace(platform='win32'))
+    with pytest.raises((RuntimeError, ValueError)):
+        module['_unchanged'](_metadata(st_file_attributes=0x420), _metadata(), fd=True)
+
+
+def test_fd_change_time_is_checked_between_reads(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    source = _source(tmp_path)
+    module = runpy.run_path(str(_MODULE))
+    tree = module['_Tree'](source, source.lstat(), time.monotonic() + 10)
+    info = (source / 'payload.txt').lstat()
+    original = os.fstat
+    calls = 0
+
+    def fstat(fd: int) -> os.stat_result:
+        nonlocal calls
+        actual = original(fd)
+        if stat.S_ISREG(actual.st_mode) and (actual.st_dev, actual.st_ino) == (info.st_dev, info.st_ino):
+            calls += 1
+            if calls == 2:
+                fields = ('st_dev', 'st_ino', 'st_mode', 'st_nlink', 'st_uid', 'st_gid',
+                          'st_size', 'st_mtime_ns', 'st_ctime_ns', 'st_file_attributes', 'st_reparse_tag')
+                return _metadata(**{name: int(getattr(actual, name, 0)) + (name == 'st_ctime_ns')
+                                    for name in fields})
+        return actual
+
+    monkeypatch.setattr(os, 'fstat', fstat)
+    with pytest.raises(RuntimeError, match='identity/stat changed'):
+        module['_read_file'](tree, ('payload.txt',), info)
+    assert calls == 2
+
+
+@pytest.mark.parametrize('kind', ['empty', 'ordinary', 'nested_empty'])
+def test_live_copy_retains_empty_directories_and_independent_files(tmp_path: Path, kind: str) -> None:
+    source, target = tmp_path / 'fresh source', tmp_path / 'copy'
+    source.mkdir()
+    if kind != 'empty':
+        (source / 'payload').write_bytes(b'live payload')
+    if kind == 'nested_empty':
+        (source / 'empty child').mkdir()
+    result = _copy(source, target)
+    assert result['files'] == (0 if kind == 'empty' else 1)
+    assert result['bytes'] == (0 if kind == 'empty' else 12)
+    assert _copy(target, tmp_path / 'again') == result
+    if kind != 'empty':
+        assert (target / 'payload').read_bytes() == b'live payload'
+        assert (target / 'payload').stat().st_ino != (source / 'payload').stat().st_ino
+    if kind == 'nested_empty':
+        assert (target / 'empty child').is_dir() and not list((target / 'empty child').iterdir())
+
+
+@pytest.mark.skipif(sys.platform != 'win32', reason='Windows target enumeration boundary')
+def test_owned_target_is_enumerated_before_populating_children(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = runpy.run_path(str(_MODULE))
+    source = _source(tmp_path)
+    (source / 'child').mkdir()
+    (source / 'child' / 'payload').write_bytes(b'child')
+    target = tmp_path / 'target'
+    names, populate = module['_Tree'].names, module['_populate']
+    calls: list[tuple[str, ...]] = []
+
+    def checked_names(tree: Any, parts: tuple[str, ...]) -> list[str]:
+        result = cast(list[str], names(tree, parts))
+        if tree.root == target:
+            calls.append(parts)
+            if len(calls) <= 2:
+                assert result == []
+        return result
+
+    def checked_populate(src: Any, dst: Any, entries: Any, owned: Any) -> None:
+        assert calls == [()]
+        populate(src, dst, entries, owned)
+        assert calls == [(), ('child',)]
+
+    monkeypatch.setattr(module['_Tree'], 'names', checked_names)
+    monkeypatch.setitem(module['copy_validation_tree'].__globals__, '_populate', checked_populate)
+    result = module['copy_validation_tree'](
+        source, target, deadline=time.monotonic() + 10, reject_hardlinks=True,
+    )
+    assert result['files'] == 2 and (target / 'child' / 'payload').read_bytes() == b'child'
