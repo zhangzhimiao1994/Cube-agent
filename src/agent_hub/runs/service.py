@@ -668,6 +668,7 @@ class RunService:
         operator_selection: dict[str, object] = {
             "requested_mode": requested_mode.value,
             "engineering_diagnostic_submission_version": 1,
+            "engineering_diagnostic_reads_submission_version": 1,
             "role_planning_intent_version": 2,
             "workspace_maintenance_contract_version": 1,
             "workspace_maintenance_intent_version": 2,
@@ -1976,6 +1977,14 @@ class RunService:
                     mode=mode,
                 )
                 if checkpoint is None:
+                    if (mode is TaskMode.DIRECT and not allow_running_recovery
+                            and "engineering_action_version" not in (row.routing_decision or {})
+                            and type(routing_decision.get("engineering_diagnostic_reads_submission_version")) is int
+                            and routing_decision["engineering_diagnostic_reads_submission_version"] == 1
+                            and routing_decision.get("project_delivery") == "workspace"
+                            and routing_decision.get("artifact_strategy") == "workspace_bundle"
+                            and routing_decision.get("sandbox_profile") == "workspace_write"):
+                        routing_decision["engineering_diagnostic_reads_version"] = 1
                     routing_decision["runtime_progress_policy"] = "semantic_workspace_v1"
                     routing_decision["engineering_delivery_contract_version"] = 1
                     routing_decision["engineering_action_version"] = 1

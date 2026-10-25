@@ -1655,6 +1655,12 @@ class RuntimeExecutionError(RuntimeError):
     """Stable dispatch failure that never includes model, tool, or plan input."""
 
 
+class _ProjectPrerequisiteBlocked(RuntimeExecutionError):
+    def __init__(self, report: Mapping[str, JsonValue]) -> None:
+        super().__init__("project prerequisite blocked: " + cast(str, report["reason"]))
+        self.project_prerequisite_payload = report
+
+
 class _ReviewFailed(RuntimeExecutionError):
     """A failed review must not restart the worker through outer recovery."""
 
@@ -3585,6 +3591,63 @@ class _Terminal:
 class _ToolLedger:
     states: dict[str, Mapping[str, JsonValue]] = field(default_factory=dict)
     artifacts: dict[str, Artifact] = field(default_factory=dict)
+
+
+def _current_project_prerequisite(
+    context: TaskContext, step: DispatchStep, ledger: _ToolLedger,
+) -> Mapping[str, JsonValue] | None:
+    """Retain only a private current failure, never infer one from missing delivery."""
+    if step.engineering_delivery_contract_version != 1 or "project.verify" not in step.tools:
+        return None
+    rows: list[tuple[tuple[int, int, int], str, Mapping[str, JsonValue]]] = []
+    for key, row in ledger.states.items():
+        if row.get("step_id") != step.id:
+            continue
+        if (row.get("status") not in {"succeeded", "failed", "rejected"}
+                or any(type(row.get(field)) is not int or cast(int, row[field]) < 0
+                       for field in ("attempt", "round", "tool_index"))):
+            return None
+        rows.append((_tool_observation_position(row), key, row))
+    if len({position for position, _, _ in rows}) != len(rows):
+        return None
+    readonly = {"read_context", "project.inspect", "workspace.read", "workspace_read",
+                "workspace.list", "workspace.search"}
+    for position, key, row in sorted(rows, reverse=True):
+        name, status = row.get("name"), row.get("status")
+        if name in readonly and name in step.tools and status == "succeeded":
+            continue
+        if name != "project.verify" or status != "failed":
+            return None
+        artifact = ledger.artifacts.get(key)
+        digest, trigger = row.get("arguments_sha256"), row.get("trigger_model_artifact_id")
+        if (artifact is None or digest != hashlib.sha256(b"{}").hexdigest()
+                or not isinstance(trigger, str)
+                or artifact.type != "tool_result" or artifact.producer != step.agent
+                or set(artifact.content) != {"agent_id", "tool_name", "arguments_sha256", "result"}
+                or artifact.content.get("agent_id") != step.agent
+                or artifact.content.get("tool_name") != name
+                or artifact.content.get("arguments_sha256") != digest
+                or artifact.source_ids != (trigger,)
+                or str(artifact.id) != row.get("artifact_id")
+                or artifact.content_sha256 != row.get("sha256")
+                or artifact.recompute_content_sha256() != artifact.content_sha256):
+            return None
+        try:
+            if str(UUID(trigger)) != trigger:
+                return None
+        except ValueError:
+            return None
+        if key not in {CrewDispatchRuntime._tool_call_key(
+            context.run_id, step.id, *position, "project.verify", digest,
+            trigger_model_artifact_id=source,
+        ) for source in (None, trigger)}:
+            return None
+        result = artifact.content.get("result")
+        feedback = project_prerequisite_feedback(result, tool_name=name)
+        if feedback is None or feedback != result:
+            return None
+        return cast(Mapping[str, JsonValue], feedback["verification_blocked"])
+    return None
 
 
 def _succeeded_semantic_tool_result(
@@ -8023,6 +8086,9 @@ class CrewDispatchRuntime:
                             ),
                         ))
                         continue
+                    prerequisite = _current_project_prerequisite(context, step, tool_ledger)
+                    if prerequisite is not None:
+                        raise _ProjectPrerequisiteBlocked(prerequisite)
                     _fail("project workspace bundle is missing")
                 if step.final_synthesizer:
                     completion = _reconcile_final_attachment_completion(completion, evidence)

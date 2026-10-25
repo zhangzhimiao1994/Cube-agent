@@ -18,6 +18,7 @@ from agent_hub.domain.runs import TaskMode
 from agent_hub.harness import HarnessToolGateway
 from agent_hub.models.gateway import GatewayCompletion
 from agent_hub.models.types import ModelRequest, ModelResponse, TokenUsage, ToolCall
+from agent_hub.runs.repository import _event_with_failure_diagnostic
 from agent_hub.runtime.artifacts import ArtifactReference, InMemoryArtifactRepository
 from agent_hub.runtime.autogen.adapter import (
     AutoGenDiscussionRuntime,
@@ -32,11 +33,14 @@ from agent_hub.runtime.contracts import (
     RuntimeCheckpoint,
     TaskContext,
 )
+from agent_hub.runtime.crew import adapter as crew_adapter
 from agent_hub.runtime.crew.adapter import CrewDispatchRuntime, RuntimeExecutionError
 from agent_hub.runtime.crew.plan import AgentSpec, DispatchPlan, DispatchStep
+from agent_hub.runtime.hybrid import HybridRuntime
 from tests.unit.capabilities.test_project_prerequisites import SOURCE, raw_report
 from tests.unit.runtime.crew.test_adapter_failure_reason import FastFactory
 from tests.unit.runtime.crew.test_execution_diagnostic_continuation import Policy, context
+from tests.unit.runtime.test_hybrid import UnusedRuntime
 
 TOOLS = ("project.verify", "workspace.read")
 ENGINEERING_TOOLS = (*TOOLS, "project.inspect", "workspace.write_text", "workspace.bundle")
@@ -300,7 +304,10 @@ async def test_engineering_blocked_then_complete_claim_cannot_publish_delivery(m
             async for event in runner.run(ctx):
                 events.append(event)
         except RuntimeExecutionError as error:
-            assert "delivery" in str(error) or "bundle is missing" in str(error)
+            if mode is TaskMode.DISPATCH:
+                assert error.project_prerequisite_payload == backend.observation.to_payload()
+            else:
+                assert "delivery" in str(error) or "bundle is missing" in str(error)
 
     await asyncio.wait_for(consume(), 10)
     assert backend.calls == ["project.verify"]
@@ -313,6 +320,221 @@ async def test_engineering_blocked_then_complete_claim_cannot_publish_delivery(m
                for request in model.requests for message in request.messages
                if message.role == "user" and isinstance(message.content, str))
     assert len([request for request in model.requests if request.logical_model != "selector"]) >= 2
+
+
+class BlockedReportModel(ObservationModel):
+    async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+        if self.stage < 2:
+            return await super().complete_with_context(request)
+        self.requests.append(request)
+        return GatewayCompletion(
+            response=ModelResponse(
+                text="[COMPLETE] Runtime prerequisites remain blocked; no verification succeeded.",
+                usage=TokenUsage(1, 1, 2),
+            ), deployment_id="fixture", logical_model=request.logical_model,
+            provider_id="fixture", provider_model="fixture/model", cost_usd=Decimal(0),
+        )
+
+
+def engineering_context(mode: TaskMode) -> TaskContext:
+    ctx = context(mode)
+    return ctx.model_copy(update={"routing_decision": {
+        **ctx.routing_decision, "project_delivery": "workspace", "artifact_strategy": "workspace_bundle",
+        "engineering_delivery_contract_version": 1,
+    }})
+
+
+async def collect_engineering_failure(runner: Any, ctx: TaskContext) -> tuple[list[RunEvent], Any]:
+    events = []
+    error = None
+
+    async def consume() -> None:
+        nonlocal error
+        try:
+            async for event in runner.run(ctx):
+                events.append(_event_with_failure_diagnostic(event))
+        except RuntimeExecutionError as caught:
+            error = caught
+
+    await asyncio.wait_for(consume(), 10)
+    assert events[-1].kind is EventKind.RUNTIME_FAILED
+    assert not any(event.kind in {EventKind.RUNTIME_COMPLETED, EventKind.STEP_COMPLETED,
+                                  EventKind.STEP_RETRYING} for event in events)
+    return events, error
+
+
+@pytest.mark.parametrize("mode", [TaskMode.DISPATCH, TaskMode.HYBRID])
+@pytest.mark.parametrize("reason", [
+    "node_runtime_missing", "systemd_authorization_required", "install_authorization_required",
+])
+async def test_engineering_closure_preserves_bound_prerequisite_classification(
+    mode: TaskMode, reason: str,
+) -> None:
+    ctx, repository = engineering_context(mode), InMemoryArtifactRepository()
+    backend, model = BlockedBackend(ENGINEERING_TOOLS), BlockedReportModel(TaskMode.DISPATCH)
+    backend.observation = validate_project_prerequisite_report(raw_report(reason=reason), SOURCE)
+    policy = Policy(ctx)
+    child = runtime(ctx.model_copy(update={"mode": TaskMode.DISPATCH}), model, backend, policy, repository)
+    runner = child if mode is TaskMode.DISPATCH else HybridRuntime(
+        child, UnusedRuntime(TaskMode.DISCUSS, "unused"), UnusedRuntime(TaskMode.DIRECT, "unused"),
+        artifact_repository=repository,
+    )
+    events, error = await collect_engineering_failure(runner, ctx)
+    assert backend.calls == ["project.verify", "workspace.read"]
+    assert model.feedback
+    assert len(model.requests) == 4
+    assert len(policy.calls) == 2
+    for failure in (event for event in events if event.kind in {
+        EventKind.STEP_FAILED, EventKind.RUNTIME_FAILED,
+    }):
+        assert failure.payload["error_code"] == "project.prerequisite." + reason
+        assert failure.payload["error_stage"] == "project_prerequisite"
+        assert failure.payload["retryable"] is False
+    if mode is TaskMode.DISPATCH:
+        assert error is not None and error.project_prerequisite_payload == backend.observation.to_payload()
+
+
+@pytest.mark.parametrize("mode", [TaskMode.DISPATCH, TaskMode.HYBRID])
+async def test_engineering_startup_gate_does_not_invent_prerequisite_receipt(mode: TaskMode) -> None:
+    ctx, repository = engineering_context(mode), InMemoryArtifactRepository()
+    backend = BlockedBackend(tuple(name for name in ENGINEERING_TOOLS if name != "project.verify"))
+    model = BlockedReportModel(TaskMode.DISPATCH)
+    child = runtime(ctx.model_copy(update={"mode": TaskMode.DISPATCH}), model, backend, Policy(ctx), repository)
+    runner = child if mode is TaskMode.DISPATCH else HybridRuntime(
+        child, UnusedRuntime(TaskMode.DISCUSS, "unused"), UnusedRuntime(TaskMode.DIRECT, "unused"),
+        artifact_repository=repository,
+    )
+    events, error = await collect_engineering_failure(runner, ctx)
+    assert backend.calls == [] and model.requests == []
+    assert not any(event.kind is EventKind.TOOL_FAILED for event in events)
+    assert events[-1].payload["error_stage"] != "project_prerequisite"
+    assert not hasattr(error, "project_prerequisite_payload")
+
+
+async def test_engineering_cold_closure_preserves_prerequisite_without_reexecuting_verify(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = engineering_context(TaskMode.DISPATCH)
+    backend, repository, policy = BlockedBackend(ENGINEERING_TOOLS), InMemoryArtifactRepository(), Policy(ctx)
+    saved = await blocked_checkpoint(ctx, backend, repository, policy, monkeypatch)
+    model = BlockedReportModel(TaskMode.DISPATCH, stage=1)
+    resumed = runtime(ctx, model, backend, policy, repository)
+    await resumed.restore_checkpoint(saved)
+    events, error = await collect_engineering_failure(resumed, ctx.model_copy(update={"checkpoint": saved}))
+    assert backend.calls == ["project.verify", "workspace.read"]
+    assert model.feedback
+    assert events[-1].payload["error_code"] == "project.prerequisite.node_runtime_missing"
+    assert error is not None and error.project_prerequisite_payload == backend.observation.to_payload()
+
+
+def private_prerequisite_ledger() -> tuple[TaskContext, DispatchStep, Any, str]:
+    ctx = engineering_context(TaskMode.DISPATCH)
+    step = DispatchStep(id="observe", agent="implementer", task="Observe prerequisites.",
+                        tools=ENGINEERING_TOOLS, engineering_delivery_contract_version=1)
+    digest, trigger = hashlib.sha256(b"{}").hexdigest(), str(uuid4())
+    key = hashlib.sha256(f"{ctx.run_id}:observe:0:0:0:project.verify:{digest}".encode()).hexdigest()
+    artifact = Artifact(id=uuid4(), type="tool_result", producer="implementer", source_ids=(trigger,),
+        content={"agent_id": "implementer", "tool_name": "project.verify", "arguments_sha256": digest,
+                 "result": {"status": "failed", "untrusted": True, "verification_blocked":
+                            validate_project_prerequisite_report(raw_report(), SOURCE).to_payload()}})
+    row = {"step_id": "observe", "status": "failed", "attempt": 0, "round": 0, "tool_index": 0,
+           "name": "project.verify", "arguments_sha256": digest, "trigger_model_artifact_id": trigger,
+           "artifact_id": str(artifact.id), "sha256": artifact.content_sha256}
+    return ctx, step, crew_adapter._ToolLedger(states={key: row}, artifacts={key: artifact}), key
+
+
+@pytest.mark.parametrize("trigger_key", [False, True])
+def test_private_prerequisite_carrier_accepts_existing_key_formats(trigger_key: bool) -> None:
+    ctx, step, ledger, key = private_prerequisite_ledger()
+    if trigger_key:
+        row = ledger.states.pop(key)
+        artifact = ledger.artifacts.pop(key)
+        digest, trigger = row["arguments_sha256"], row["trigger_model_artifact_id"]
+        key = hashlib.sha256(
+            f"{ctx.run_id}:observe:0:0:0:project.verify:{digest}:trigger:{trigger}".encode()).hexdigest()
+        ledger.states[key], ledger.artifacts[key] = row, artifact
+    report = crew_adapter._current_project_prerequisite(ctx, step, ledger)
+    assert report is not None and report["reason"] == "node_runtime_missing"
+
+
+@pytest.mark.parametrize("defect", [
+    "missing", "hash", "id", "producer", "agent", "tool", "arguments", "lineage", "key",
+    "foreign_run", "foreign_step", "malformed_report", "mixed_authority", "content_hash",
+    "duplicate_position", "invalid_position", "not_engineering",
+])
+def test_private_prerequisite_carrier_rejects_unbound_or_invalid_evidence(defect: str) -> None:
+    ctx, step, ledger, key = private_prerequisite_ledger()
+    row, artifact = dict(ledger.states[key]), ledger.artifacts[key]
+    content = artifact.to_payload()["content"]
+    producer, sources = artifact.producer, artifact.source_ids
+    if defect == "missing":
+        del ledger.artifacts[key]
+    elif defect == "hash":
+        row["sha256"] = "f" * 64
+    elif defect == "id":
+        row["artifact_id"] = str(uuid4())
+    elif defect == "producer":
+        producer = "reviewer"
+    elif defect == "agent":
+        content["agent_id"] = "reviewer"
+    elif defect == "tool":
+        content["tool_name"] = "workspace.read"
+    elif defect == "arguments":
+        content["arguments_sha256"] = row["arguments_sha256"] = "f" * 64
+    elif defect == "lineage":
+        sources = (str(uuid4()),)
+    elif defect == "key":
+        ledger.states["f" * 64] = ledger.states.pop(key)
+        ledger.artifacts["f" * 64] = ledger.artifacts.pop(key)
+        key = "f" * 64
+    elif defect == "foreign_run":
+        ctx = ctx.model_copy(update={"run_id": uuid4()})
+    elif defect == "foreign_step":
+        row["step_id"] = "other"
+    elif defect == "malformed_report":
+        content["result"]["verification_blocked"]["status"] = "passed"
+    elif defect == "mixed_authority":
+        content["result"]["execution_diagnostic"] = {}
+    elif defect == "content_hash":
+        ledger.artifacts[key] = artifact.model_copy(update={"content": {**artifact.content, "extra": True}})
+    elif defect == "duplicate_position":
+        ledger.states["f" * 64] = row
+    elif defect == "invalid_position":
+        row["round"] = True
+    elif defect == "not_engineering":
+        step = step.model_copy(update={"engineering_delivery_contract_version": 0})
+    if defect in {"producer", "agent", "tool", "arguments", "lineage", "malformed_report", "mixed_authority"}:
+        changed = Artifact(id=artifact.id, type=artifact.type, producer=producer,
+                           source_ids=sources, content=content)
+        ledger.artifacts[key], row["sha256"] = changed, changed.content_sha256
+    ledger.states[key] = row
+    assert crew_adapter._current_project_prerequisite(ctx, step, ledger) is None
+
+
+@pytest.mark.parametrize(("name", "status"), [
+    ("workspace.write_text", "succeeded"), ("project.verify", "succeeded"), ("project.verify", "failed"),
+    ("workspace.read", "running"), ("workspace.read", "uncertain"), ("workspace.read", "failed"),
+    ("project.verify", "waiting_approval"),
+])
+def test_old_prerequisite_cannot_mask_a_later_outcome(name: str, status: str) -> None:
+    ctx, step, ledger, key = private_prerequisite_ledger()
+    ledger.states["f" * 64] = {**ledger.states[key], "round": 1, "name": name,
+                                 "status": status, "artifact_id": None, "sha256": None}
+    assert crew_adapter._current_project_prerequisite(ctx, step, ledger) is None
+
+
+@pytest.mark.parametrize("status", ["prepared", "running", "uncertain", "UNKNOWN", "waiting_approval"])
+def test_prerequisite_carrier_cannot_mask_an_earlier_unresolved_effect(status: str) -> None:
+    ctx, step, ledger, key = private_prerequisite_ledger()
+    row = dict(ledger.states.pop(key))
+    artifact = ledger.artifacts.pop(key)
+    row["round"] = 1
+    digest = row["arguments_sha256"]
+    key = hashlib.sha256(f"{ctx.run_id}:observe:0:1:0:project.verify:{digest}".encode()).hexdigest()
+    ledger.states[key], ledger.artifacts[key] = row, artifact
+    ledger.states["f" * 64] = {**row, "round": 0, "name": "workspace.write_text", "status": status,
+                                 "artifact_id": None, "sha256": None}
+    assert crew_adapter._current_project_prerequisite(ctx, step, ledger) is None
 
 
 @pytest.mark.parametrize("mode", [TaskMode.DISPATCH, TaskMode.DISCUSS])

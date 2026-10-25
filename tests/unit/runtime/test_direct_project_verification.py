@@ -204,6 +204,326 @@ def runner(tmp_path: Path, ctx: TaskContext, model: Model, *, failure: str = "ex
     return runtime, backend, shared, policy
 
 
+def diagnostic_context() -> TaskContext:
+    ctx = context()
+    return ctx.model_copy(update={"routing_decision": {
+        **ctx.routing_decision, "engineering_diagnostic_reads_version": 1,
+        "runtime_timeout_source": "project_scale_soft_budget",
+        "runtime_timeout_soft_seconds": 60, "runtime_timeout_absolute_seconds": 120,
+        "runtime_token_soft_base_tokens": 50_000, "runtime_token_absolute_tokens": 100_000,
+        "critical_path_complexity_units": 20,
+        "requested_permissions": ["workspace.read", "workspace.write", "command.run"],
+    }})
+
+
+def diagnostic_read_batch(*, path: str = "main.py", summary: str = "Inspect the failed implementation.") -> str:
+    return json.dumps({"workspace_batch": {
+        "files": {}, "read_paths": [path], "complete": False,
+        "continuation": "Read the source before changing the failed implementation.",
+    }, "summary": summary})
+
+
+def capture_delivery_deadline(monkeypatch: pytest.MonkeyPatch) -> list[Any]:
+    from agent_hub.runtime import direct
+
+    deadlines: list[Any] = []
+    create = direct.deadline_from_routing
+
+    def capture(*args: Any, **kwargs: Any) -> Any:
+        budget = create(*args, **kwargs)
+        deadlines.append(budget)
+        return budget
+
+    monkeypatch.setattr(direct, "deadline_from_routing", capture)
+    return deadlines
+
+
+async def test_direct_diagnostic_read_repairs_known_failure_before_verified_bundle(tmp_path: Path) -> None:
+    ctx = diagnostic_context()
+    model = Model(batch({"main.py": BROKEN, "README.md": "Keep me.\n"}),
+                  diagnostic_read_batch(), batch({"main.py": FIXED}))
+    runtime, backend, shared, policy = runner(tmp_path, ctx, model)
+    events = [event async for event in runtime.run(ctx)]
+
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert backend.calls == [
+        "workspace.write_text", "workspace.write_text", "workspace.write_text",
+        "project.verify", "read_context", "workspace.write_text", "workspace.write_text",
+        "project.verify", "workspace.bundle",
+    ]
+    assert [request.tool_name for request in shared.requests] == ["project.verify", "read_context", "project.verify"]
+    assert [result.status for result in shared.results] == ["failed", "succeeded", "succeeded"]
+    read = shared.requests[1]
+    assert read.run_id == ctx.run_id and read.actor == "main_agent" and read.sandbox == "workspace_write"
+    assert read.arguments == {"path": "main.py"}
+    assert dict(shared.results[1].payload) == {"path": "main.py", "text": BROKEN, "truncated": False}
+    assert len(model.requests) == len(policy.calls) == 3
+    assert policy.calls[1].capability == "file" and policy.calls[1].operation == "read"
+    assert policy.calls[1].resource == "workspace/main.py"
+    feedback = "\n".join(cast(str, message.content) for message in model.requests[-1].messages
+                         if message.role == "user")
+    assert "UNTRUSTED_PROJECT_VERIFICATION_JSON" in feedback and "F01_EXPECTED_2_GOT_1" in feedback
+    assert "UNTRUSTED_WORKSPACE_READ_JSON" in feedback and BROKEN.strip() in feedback
+    assert [result.exit_code for result in backend.process_results] == [3, 0]
+    assert (backend.root / "README.md").read_text() == "Keep me.\n"
+    delivery = cast(Mapping[str, JsonValue], events[-1].payload["workspace_delivery"])
+    assert cast(Mapping[str, JsonValue], delivery["verification"])["status"] == "passed"
+    archives = list((tmp_path / "generated").rglob("*.zip"))
+    assert len(archives) == 1
+    with zipfile.ZipFile(archives[0]) as archive:
+        assert archive.read("main.py").decode() == FIXED
+        assert archive.read("README.md") == b"Keep me.\n"
+
+
+@pytest.mark.parametrize("first_batch_read", [False, True])
+async def test_direct_diagnostic_observations_preserve_budget_and_completed_batches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, first_batch_read: bool,
+) -> None:
+    from agent_hub.runtime import direct
+
+    ctx = diagnostic_context()
+    deadlines = capture_delivery_deadline(monkeypatch)
+    token_limit = direct._workspace_delivery_token_limit
+    token_observations = []
+    read_observations = []
+
+    def record_token_limit(*args: Any, **kwargs: Any) -> int:
+        limit = token_limit(*args, **kwargs)
+        token_observations.append((kwargs["completed_files"], kwargs["completed_batches"], limit))
+        return limit
+
+    def budget_state() -> tuple[Any, ...]:
+        budget = deadlines[0]
+        return (budget.deadline, budget.absolute_deadline, budget.progress_units, token_observations[-1])
+
+    class ObservationModel(Model):
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+            if read_observations:
+                assert budget_state() == read_observations[-1], "observations must not earn time, tokens or batches"
+            return await super().complete_with_context(request)
+
+    texts = [diagnostic_read_batch(), diagnostic_read_batch(path="README.md"), batch({"main.py": FIXED})]
+    if not first_batch_read:
+        texts.insert(0, batch({"main.py": BROKEN}))
+    model = ObservationModel(*texts)
+    runtime, backend, shared, policy = runner(tmp_path, ctx, model)
+    backend.root.mkdir(parents=True)
+    (backend.root / "main.py").write_text(BROKEN, encoding="utf-8", newline="\n")
+    assert (backend.root / "main.py").read_bytes() == BROKEN.encode("utf-8")
+    # Exercise the real scoped reader's truncation without inventing receipt fields.
+    (backend.root / "README.md").write_text("x" * 70_000 + "UNREAD_TAIL", encoding="utf-8")
+    invoke = shared.invoke
+
+    async def record_read(*args: Any, **kwargs: Any) -> HarnessToolCallResult:
+        request = args[1]
+        if request.tool_name == "read_context":
+            read_observations.append(budget_state())
+        return await invoke(*args, **kwargs)
+
+    monkeypatch.setattr(direct, "_workspace_delivery_token_limit", record_token_limit)
+    monkeypatch.setattr(shared, "invoke", record_read)
+    events = [event async for event in runtime.run(ctx)]
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert len(deadlines) == 1 and len(read_observations) == 2
+    assert read_observations[0] == read_observations[1]
+    assert read_observations[0][-1][1] == (0 if first_batch_read else 1)
+    assert read_observations[0][0] < read_observations[0][1]
+    assert [request.tool_name for request in shared.requests] == (
+        ([] if first_batch_read else ["project.verify"]) + ["read_context", "read_context", "project.verify"])
+    reads = [result for result in shared.results if result.tool_name == "read_context"]
+    assert reads[0].payload == {"path": "main.py", "text": BROKEN, "truncated": False}
+    assert reads[1].status == "succeeded" and reads[1].payload["truncated"] is True
+    assert "UNREAD_TAIL" not in cast(str, reads[1].payload["text"])
+    final_prompt = "\n".join(cast(str, message.content) for message in model.requests[-1].messages)
+    assert "UNTRUSTED_WORKSPACE_READ_JSON" in final_prompt
+    assert '"truncated":true' in final_prompt and '"reader_truncated":true' in final_prompt
+    assert backend.calls.count("workspace.bundle") == 1
+    assert [result.exit_code for result in backend.process_results] == ([0] if first_batch_read else [3, 0])
+    assert len(model.requests) == (3 if first_batch_read else 4)
+    assert all(call.tenant_id == ctx.tenant_id and call.run_id == ctx.run_id
+               and call.user_id == ctx.actor_id and call.agent_id == "main_agent" for call in policy.calls)
+
+
+@pytest.mark.parametrize("changed_summary", [False, True])
+async def test_direct_diagnostic_repeated_read_does_not_extend_soft_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, changed_summary: bool,
+) -> None:
+    ctx = diagnostic_context()
+    read = diagnostic_read_batch()
+    repeated = diagnostic_read_batch(summary="New summary is not new evidence.") if changed_summary else read
+    model = Model(batch({"main.py": BROKEN}), read, repeated, batch({"main.py": FIXED}))
+    runtime, backend, shared, _ = runner(tmp_path, ctx, model)
+    deadlines = capture_delivery_deadline(monkeypatch)
+    invoke = shared.invoke
+    read_budgets = []
+
+    async def record_read(*args: Any, **kwargs: Any) -> HarnessToolCallResult:
+        request = args[1]
+        if request.tool_name == "read_context":
+            budget = deadlines[0]
+            read_budgets.append((budget.deadline, budget.absolute_deadline, budget.progress_units))
+        return await invoke(*args, **kwargs)
+
+    monkeypatch.setattr(shared, "invoke", record_read)
+    with pytest.raises(RuntimeExecutionError, match="no progress"):
+        _ = [event async for event in runtime.run(ctx)]
+    assert len(deadlines) == 1 and len(read_budgets) == 2
+    budget = deadlines[0]
+    assert (budget.deadline, budget.absolute_deadline, budget.progress_units) == read_budgets[-1]
+    assert budget.deadline < budget.absolute_deadline
+    assert [request.tool_name for request in shared.requests] == ["project.verify", "read_context", "read_context"]
+    assert shared.results[1].payload == shared.results[2].payload
+    assert len(model.requests) == 3 and len(model.texts) == 1
+    assert backend.calls.count("project.verify") == 1 and "workspace.bundle" not in backend.calls
+    assert (backend.root / "main.py").read_text() == BROKEN
+
+
+async def test_direct_diagnostic_failed_read_does_not_extend_soft_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = diagnostic_context()
+    model = Model(batch({"main.py": BROKEN}), diagnostic_read_batch(), batch({"main.py": FIXED}))
+    runtime, backend, shared, _ = runner(tmp_path, ctx, model)
+    deadlines = capture_delivery_deadline(monkeypatch)
+    execute = backend.execute
+    read_budgets = []
+
+    async def deny_read(*, name: str, **kwargs: Any) -> Any:
+        if name == "read_context":
+            backend.calls.append(name)
+            budget = deadlines[0]
+            read_budgets.append((budget.deadline, budget.absolute_deadline, budget.progress_units))
+            raise RuntimeCapabilityError("workspace access is not authorized")
+        return await execute(name=name, **kwargs)
+
+    monkeypatch.setattr(backend, "execute", deny_read)
+    with pytest.raises(RuntimeExecutionError, match="workspace read failed"):
+        _ = [event async for event in runtime.run(ctx)]
+    assert len(deadlines) == len(read_budgets) == 1
+    budget = deadlines[0]
+    assert (budget.deadline, budget.absolute_deadline, budget.progress_units) == read_budgets[0]
+    assert budget.deadline < budget.absolute_deadline
+    assert [request.tool_name for request in shared.requests] == ["project.verify", "read_context"]
+    assert shared.results[-1].status == "failed"
+    assert len(model.requests) == 2 and len(model.texts) == 1
+    assert backend.calls.count("project.verify") == 1 and "workspace.bundle" not in backend.calls
+    assert (backend.root / "main.py").read_text() == BROKEN
+
+
+@pytest.mark.parametrize("marker", [None, True, 1.0, "1"])
+async def test_direct_diagnostic_read_without_typed_marker_keeps_legacy_rejection(
+    tmp_path: Path, marker: object,
+) -> None:
+    ctx = context()
+    assert "engineering_diagnostic_reads_version" not in ctx.routing_decision
+    if marker is not None:
+        ctx = ctx.model_copy(update={"routing_decision": {
+            **ctx.routing_decision, "engineering_diagnostic_reads_version": marker,
+        }})
+    model = Model(batch({"main.py": BROKEN}), diagnostic_read_batch(), batch({"main.py": FIXED}))
+    runtime, backend, shared, _ = runner(tmp_path, ctx, model)
+    with pytest.raises(RuntimeExecutionError, match="workspace batch is invalid"):
+        _ = [event async for event in runtime.run(ctx)]
+    assert len(model.requests) == 2 and len(shared.requests) == 1
+    assert shared.requests[0].tool_name == "project.verify" and shared.results[0].status == "failed"
+    assert "read_context" not in backend.calls and "workspace.bundle" not in backend.calls
+
+
+async def test_direct_diagnostic_read_approval_cold_resume_does_not_replay_old_effects(tmp_path: Path) -> None:
+    from agent_hub.runtime.action_direct import ActionApprovedDirectRuntime
+    from agent_hub.runtime.contracts import Artifact, RunEvent, RuntimeCheckpoint
+    from agent_hub.runtime.worker_execution import worker_runtime_events
+    from tests.unit.capabilities.test_verification_cold_recovery import Fixture
+    from tests.unit.runtime.test_action_direct_cold_verification import Policy as ApprovalPolicy
+
+    fixture = Fixture(tmp_path, failed=True)
+    fixture.db.row.routing_decision.update({"project_scale": "small", "project_delivery": "workspace",
+        "artifact_strategy": "workspace_bundle", "engineering_diagnostic_reads_version": 1})
+    policy = ApprovalPolicy()
+    policy.allowed.update({"write", "run", "create"})
+    broken, fixed = "Initial failing implementation.\n", "Repaired implementation.\n"
+    executions: list[tuple[str, str]] = []
+    read_results: list[HarnessToolCallResult] = []
+    published: dict[Any, Artifact] = {}
+
+    class RepairModel(Model):
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+            if len(self.requests) == 2:
+                fixture.executor.failed = False
+            return await super().complete_with_context(request)
+
+    class RecordingBackend(RuntimeCapabilityGateway):
+        async def execute(self, *, name: str, idempotency_key: str, **kwargs: Any) -> Any:
+            executions.append((name, idempotency_key))
+            return await super().execute(name=name, idempotency_key=idempotency_key, **kwargs)
+
+    class RecordingShared(HarnessToolGateway):
+        async def invoke(self, tenant_id: Any, request: HarnessToolCallRequest,
+                         **kwargs: Any) -> HarnessToolCallResult:
+            result = await super().invoke(tenant_id, request, **kwargs)
+            if request.tool_name == "read_context":
+                read_results.append(result)
+            return result
+
+    model = RepairModel(batch({"README.md": broken}), diagnostic_read_batch(path="README.md"),
+                        batch({"README.md": fixed}))
+    runtimes = []
+    gateways = []
+
+    async def step(checkpoint: RuntimeCheckpoint | None) -> list[RunEvent]:
+        backend = RecordingBackend(skill_store_dir=tmp_path / "skills", project_workspace_dir=fixture.root,
+            generated_artifact_dir=tmp_path / "generated", run_repository=fixture.runs,
+            project_executor=fixture.executor, receipt_repository=fixture.db.repository(),
+            artifact_repository=fixture.artifacts)
+        runtime = ActionApprovedDirectRuntime(model, logical_model="main", capability_gateway=backend,
+            artifact_repository=fixture.artifacts, harness_tool_gateway=RecordingShared(
+                backend, policy_gateway=policy, require_actor_identity=True))
+        runtimes.append(runtime)
+        gateways.append(backend)
+        ctx = fixture.context().model_copy(update={"checkpoint": checkpoint, "token_budget": 50_000,
+                                                  "artifacts": tuple(published.values())})
+        if checkpoint is not None:
+            await runtime.restore_checkpoint(checkpoint)
+        async with worker_runtime_events(runtime, ctx, worker_id=fixture.db.row.worker_id) as stream:
+            events = [event async for event in stream]
+        for event in events:
+            if event.artifact is not None:
+                published[event.artifact.id] = event.artifact
+        return events
+
+    waiting = await step(None)
+    checkpoint = waiting[-1].checkpoint
+    assert checkpoint is not None and checkpoint.runtime_type == "direct_action"
+    assert checkpoint.state["tool_name"] == "read_context" and checkpoint.state["approval_id"] == "approval_read"
+    assert not any(event.kind is EventKind.RUNTIME_COMPLETED for event in waiting)
+    assert len(model.requests) == 2 and len(fixture.executor.calls) == 1
+    assert [name for name, _ in executions] == ["workspace.write_text", "workspace.write_text", "project.verify"]
+    assert len(read_results) == 1 and read_results[0].status == "failed"
+    assert read_results[0].failure_reason == "capability requires approval"
+    prior_executions = list(executions)
+    prior_requests = list(model.requests)
+    policy.allowed.add("read")
+    fixture.db.new_lease()
+    completed = await step(checkpoint)
+    assert completed[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert runtimes[0] is not runtimes[1] and gateways[0] is not gateways[1]
+    assert model.requests[:2] == prior_requests and len(model.requests) == 3
+    assert len(fixture.executor.calls) == 2
+    assert executions[:len(prior_executions)] == prior_executions
+    assert [name for name, _ in executions[len(prior_executions):]] == [
+        "read_context", "workspace.write_text", "workspace.write_text", "project.verify", "workspace.bundle"]
+    assert len(executions) == len(set(executions)), "no already executed action may reach the backend twice"
+    assert len(read_results) == 2 and read_results[-1].status == "succeeded"
+    assert read_results[-1].payload == {"path": "README.md", "text": broken, "truncated": False}
+    feedback = "\n".join(cast(str, message.content) for message in model.requests[-1].messages)
+    assert "UNTRUSTED_WORKSPACE_READ_JSON" in feedback and "Initial failing implementation." in feedback
+    assert "UNTRUSTED_PROJECT_VERIFICATION_JSON" in feedback
+    archives = list((tmp_path / "generated").rglob("*.zip"))
+    assert len(archives) == 1
+    with zipfile.ZipFile(archives[0]) as archive:
+        assert archive.read("README.md").decode("utf-8") == fixed
+
+
 async def test_direct_repairs_same_workspace_from_shared_diagnostic_before_bundle(
     tmp_path: Path,
 ) -> None:

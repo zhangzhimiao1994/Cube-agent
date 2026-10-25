@@ -56,6 +56,7 @@ _FIXED_ROUTE_KEYS = (
     'project_delivery', 'artifact_strategy', 'project_scale', 'replace_workspace_files',
     'website_preview_required', 'runtime_timeout_source', 'critical_path_complexity_units',
     'direct_model', 'main_agent_model', 'allowed_models', 'harness_policy', 'permission_mode',
+    'engineering_diagnostic_reads_version',
 )
 _GUIDANCE_ROUTE_KEYS = (
     'project_preflight_approved', 'project_preflight_proposal',
