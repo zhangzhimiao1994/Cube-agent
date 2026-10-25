@@ -10,6 +10,8 @@ import pytest
 from agent_hub.runtime.artifacts import ArtifactReference
 from agent_hub.runtime.autogen.engineering_delivery import engineering_progress
 from agent_hub.runtime.autogen.project_repair_phase import (
+    ROUND_INTENT,
+    completed_round,
     prefix_digest,
     prepare,
     productive_boundary,
@@ -173,7 +175,7 @@ def test_final_report_retains_bound_correction_chain_without_hiding_unknown() ->
         evidence.metadata()
 
 
-async def late_case(fault='after_bundle'):
+async def late_case(fault='after_bundle', *, include_models=False):
     journey = ProjectJourney()
     repo = ContinuationRepository(journey)
     runtime = BoundaryFailure(journey)
@@ -188,7 +190,7 @@ async def late_case(fault='after_bundle'):
     context = journey.context.model_copy(update={'checkpoint': saved, 'routing_decision': route})
     refs = tuple(ArtifactReference(id=UUID(k), sha256=v) for k, v in saved.state['artifact_registry'].items())
     artifacts = await journey.artifacts.get_many(context.tenant_id, context.run_id, refs)
-    return context, saved, [a for a in artifacts if a.type == 'tool_result']
+    return context, saved, [a for a in artifacts if include_models or a.type == 'tool_result']
 
 
 def boundary_checkpoint(saved, state):
@@ -317,3 +319,108 @@ async def test_repeated_delivery_semantics_cannot_buy_another_continuation(fault
     assert fault == 'after_verify' or current.bundle_current
     with pytest.raises(ValueError):
         productive_boundary(context, stopped, artifacts)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('fault', ['ack_verify', 'ack_bundle'])
+async def test_complete_bound_round_is_pure_and_does_not_grant_repeat_credit(fault: str) -> None:
+    context, saved, artifacts = await late_case(fault, include_models=True)
+    original = saved.to_payload()
+    assert completed_round(context, saved.state, artifacts)
+    progress = productive_boundary(context, saved, artifacts)
+    state = _mutable_json(saved.state)
+    state['project_repair_phase']['model_floor'] = len(state['model_ledger'])
+    state['engineering_tool_prefix'] = len(state['tool_ledger'])
+    settled = boundary_checkpoint(saved, state)
+    assert not completed_round(context, settled.state, artifacts)
+    assert saved.to_payload() == original
+    context = context.model_copy(update={'routing_decision': {
+        **context.routing_decision, 'self_repair_episode_progress': progress}})
+    with pytest.raises(ValueError):
+        productive_boundary(context, settled, artifacts)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('defect', [
+    'legacy', 'actor', 'request', 'tenant', 'run', 'model_position', 'tool_start',
+    'logical_model', 'alias', 'missing_call', 'extra_call', 'arguments', 'call_name',
+    'missing_model', 'model_hash', 'tool_hash', 'tool_actor', 'tool_position',
+    'tool_idempotency', 'unknown_tool', 'failed_tool', 'unknown_model', 'approval',
+    'selector_actor', 'selector_request', 'selector_text', 'selector_calls',
+])
+async def test_known_round_requires_exact_private_intent_and_complete_effect_batch(defect: str) -> None:
+    context, saved, artifacts = await late_case('ack_verify', include_models=True)
+    state = _mutable_json(saved.state)
+    models, tools = state['model_ledger'], state['tool_ledger']
+    row, tool = models[-1], tools[-1]
+    artifact = next(a for a in artifacts if str(a.id) == row['artifact_id'])
+    content = _mutable_json(artifact.content)
+    binding = content[ROUND_INTENT]
+    if defect == 'legacy':
+        del content[ROUND_INTENT]
+    elif defect in {'actor', 'request', 'tenant', 'run', 'model_position', 'tool_start', 'logical_model'}:
+        key = {'request': 'request_hash', 'tenant': 'tenant_id', 'run': 'run_id'}.get(defect, defect)
+        binding[key] = {'actor': 'another_actor', 'request_hash': 'f' * 64,
+            'tenant_id': str(uuid4()), 'run_id': str(uuid4()), 'model_position': 0,
+            'tool_start': 0, 'logical_model': 'another_model'}[key]
+    elif defect == 'alias':
+        binding['tool_names']['project_verify'] = 'workspace.bundle'
+    elif defect == 'missing_call':
+        content['tool_calls'] = []
+    elif defect == 'extra_call':
+        extra = copy.deepcopy(content['tool_calls'][-1])
+        extra['id'] = 'unexecuted-tail'
+        content['tool_calls'].append(extra)
+    elif defect in {'arguments', 'call_name'}:
+        call = content['tool_calls'][-1]
+        if defect == 'arguments':
+            call['arguments']['unexpected'] = True
+        else:
+            call['name'] = 'workspace_bundle'
+    elif defect == 'missing_model':
+        artifacts.remove(artifact)
+    elif defect == 'model_hash':
+        row['artifact_sha256'] = 'f' * 64
+    elif defect == 'tool_hash':
+        tool['artifact_sha256'] = 'f' * 64
+    elif defect == 'tool_actor':
+        tool['actor'] = 'another_actor'
+    elif defect == 'tool_position':
+        tool['position'] -= 1
+    elif defect == 'tool_idempotency':
+        tool['idempotency_key'] = 'f' * 64
+    elif defect == 'unknown_tool':
+        tool['status'] = 'running'
+        tool['replay_safe'] = True
+    elif defect == 'failed_tool':
+        tool['status'] = 'failed'
+    elif defect == 'unknown_model':
+        row['status'] = 'running'
+    elif defect == 'approval':
+        state['approval_batch'] = {}
+    elif defect.startswith('selector_'):
+        selector = models[state['project_repair_phase']['model_floor']]
+        source = next(a for a in artifacts if str(a.id) == selector['artifact_id'])
+        changed = _mutable_json(source.content)
+        if defect == 'selector_actor':
+            changed[ROUND_INTENT]['actor'] = 'implementer'
+        elif defect == 'selector_request':
+            changed[ROUND_INTENT]['request_hash'] = 'f' * 64
+        elif defect == 'selector_text':
+            changed['text'] = 'another_actor'
+        else:
+            changed['tool_calls'] = content['tool_calls']
+        replacement = Artifact(id=source.id, type=source.type, producer=source.producer, content=changed)
+        artifacts[artifacts.index(source)] = replacement
+        selector['artifact_sha256'] = replacement.content_sha256
+        state['artifact_registry'][str(replacement.id)] = replacement.content_sha256
+    if defect in {'legacy', 'actor', 'request', 'tenant', 'run', 'model_position', 'tool_start',
+                  'logical_model', 'alias', 'missing_call', 'extra_call', 'arguments', 'call_name'}:
+        replacement = Artifact(id=artifact.id, type=artifact.type, producer=artifact.producer, content=content)
+        artifacts[artifacts.index(artifact)] = replacement
+        row['artifact_sha256'] = replacement.content_sha256
+        state['artifact_registry'][str(replacement.id)] = replacement.content_sha256
+    before = copy.deepcopy(state)
+    with pytest.raises(ValueError):
+        completed_round(context, boundary_checkpoint(saved, state).state, artifacts)
+    assert state == before

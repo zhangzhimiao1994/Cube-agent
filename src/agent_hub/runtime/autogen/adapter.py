@@ -124,6 +124,10 @@ from agent_hub.runtime.autogen.model_tool_correction import (
     validate_rejected_model_rows,
 )
 from agent_hub.runtime.autogen.project_repair_phase import PHASE_KEY as PROJECT_REPAIR_PHASE
+from agent_hub.runtime.autogen.project_repair_phase import ROUND_INTENT, pending_round_intents
+from agent_hub.runtime.autogen.project_repair_phase import (
+    completed_round as completed_project_repair_round,
+)
 from agent_hub.runtime.autogen.project_repair_phase import prepare as prepare_project_repair_phase
 from agent_hub.runtime.autogen.project_repair_phase import selected as project_repair_selected
 from agent_hub.runtime.autogen.project_repair_phase import validate as validate_project_repair_phase
@@ -475,6 +479,25 @@ def _pending_approval_call(
             for key in ('deployment_id', 'logical_model', 'provider_id', 'provider_model'))
             or type(content.get('fallback_used', False)) is not bool):
         raise RuntimeExecutionError('durable capability approval model binding is invalid')
+    if durability.repair_phase is not None:
+        if durability._context_tenant_id is None:
+            raise RuntimeExecutionError('durable capability approval model binding is invalid')
+        intents = pending_round_intents(run_id=durability._context_run_id,
+            tenant_id=durability._context_tenant_id, models=durability.model_entries,
+            floor=cast(int, durability.repair_phase['model_floor']), prefix=start,
+            artifacts=durability.artifacts)
+        if not intents:
+            raise RuntimeExecutionError('durable capability approval model binding is invalid')
+        for index, intent in enumerate(intents):
+            if intent is not None and (intent['actor'] != (batch['actor'] if index == len(intents) - 1
+                    else '__selector__') or index == len(intents) - 1 and intent['logical_model'] != expected_model):
+                raise RuntimeExecutionError('durable capability approval model binding is invalid')
+        if len(intents) > 1 and intents[-2] is not None:
+            selector_row = [row for row in durability.model_entries[
+                cast(int, durability.repair_phase['model_floor']):] if row.get('status') == 'succeeded'][-2]
+            selector = durability._artifacts[cast(str, selector_row['artifact_id'])]
+            if not isinstance(selector.content.get('text'), str) or cast(str, selector.content['text']).strip() != batch['actor']:
+                raise RuntimeExecutionError('durable capability approval model binding is invalid')
     try:
         completion = durability._completion_from_artifact(artifact)
         if (completion.response.usage is None or completion.cost_usd is None
@@ -497,6 +520,11 @@ def _pending_approval_call(
             raise RuntimeExecutionError('durable capability approval model binding is invalid')
         _safe_id(call['id'], 'tool call id')
         identifiers.add(call['id'])
+        call_intent = content.get(ROUND_INTENT)
+        if durability.repair_phase is not None and isinstance(call_intent, Mapping):
+            names = cast(Mapping[str, JsonValue], call_intent['tool_names'])
+            if call['name'] not in names:
+                raise RuntimeExecutionError('durable capability approval model binding is invalid')
         if index >= cursor and start + index >= len(durability.tool_entries):
             continue
         if index >= cursor + 1:
@@ -507,6 +535,8 @@ def _pending_approval_call(
         row_name = row.get('name')
         if (row.get('actor') != batch['actor'] or not isinstance(row_name, str)
                 or call['name'] not in {row_name, row_name.replace('.', '_')}
+                or durability.repair_phase is not None and isinstance(call_intent, Mapping)
+                    and cast(Mapping[str, JsonValue], call_intent['tool_names']).get(call['name']) != row_name
                 or hashlib.sha256(raw).hexdigest() != row.get('arguments_hash')
                 or type(row.get('position')) is not int or row['position'] != start + index):
             raise RuntimeExecutionError('durable capability approval model binding is invalid')
@@ -690,6 +720,7 @@ class _DiscussionDurability:
         completion: GatewayCompletion,
         *,
         tool_names: Mapping[str, str] | None = None,
+        actor: str | None = None,
     ) -> Artifact:
         entry = self.model_entries[self._model_cursor]
         if entry.get("status") != "running" or entry.get("request_hash") != self.request_hash(
@@ -698,6 +729,19 @@ class _DiscussionDurability:
             self.fail_model()
             raise RuntimeExecutionError("durable model ledger mismatch")
         artifact = self._completion_artifact(completion)
+        if self.repair_phase is not None and actor is not None:
+            if (self._context_tenant_id is None or self.approval_batch is not None
+                    or self._tool_cursor != len(self.tool_entries)):
+                self.fail_model()
+                raise RuntimeExecutionError('project repair round intent is unavailable')
+            artifact = Artifact(id=artifact.id, type=artifact.type, producer=artifact.producer,
+                content={**artifact.content, ROUND_INTENT: {
+                    'version': 1, 'run_id': str(self._context_run_id),
+                    'tenant_id': str(self._context_tenant_id), 'actor': actor,
+                    'request_hash': entry['request_hash'], 'model_position': self._model_cursor,
+                    'tool_start': self._tool_cursor, 'logical_model': request.logical_model,
+                    'tool_names': dict(tool_names or {}),
+                }})
         try:
             write_id = await self._store(artifact)
         except BaseException:
@@ -941,6 +985,61 @@ class _DiscussionDurability:
             self._model_cursor = 0
             if not preserve_engineering:
                 self._tool_cursor = 0
+
+    async def drain_completed_round(self, context: TaskContext, state: Mapping[str, JsonValue]) -> None:
+        if self.approval_batch is not None:
+            return
+        assert self.repair_phase is not None
+        intents = pending_round_intents(run_id=context.run_id, tenant_id=context.tenant_id,
+            models=self.model_entries, floor=cast(int, self.repair_phase['model_floor']),
+            prefix=self.engineering_tool_prefix, artifacts=self.artifacts)
+        if any(intent is None for intent in intents):
+            return
+        if not completed_project_repair_round(context, state, self.artifacts):
+            return
+        assert self.repair_phase is not None
+        previous = (self._model_cursor, self._tool_cursor, self.engineering_tool_prefix,
+                    self.repair_phase['model_floor'])
+        try:
+            self._model_cursor = len(self.model_entries)
+            self._tool_cursor = len(self.tool_entries)
+            await self.compact(preserve_engineering=True)
+            await self._checkpoint()
+        except BaseException:
+            (self._model_cursor, self._tool_cursor, self.engineering_tool_prefix,
+             self.repair_phase['model_floor']) = previous
+            raise
+
+    async def acknowledge_approved_round(self, participant_models: Mapping[str, str]) -> None:
+        pending = _pending_approval_call(self, participant_models)
+        if pending is None or self.repair_phase is None or self.approval_batch is None:
+            raise RuntimeExecutionError('durable capability approval boundary is invalid')
+        actor, calls, cursor = pending
+        start = cast(int, self.approval_batch['start_position'])
+        if cursor != len(calls) or self._tool_cursor != start + cursor:
+            raise RuntimeExecutionError('durable capability approval boundary is invalid')
+        for row in self.tool_entries[start:start + cursor]:
+            artifact = self._artifacts.get(cast(str, row.get('artifact_id')))
+            digest, name, position = row.get('arguments_hash'), row.get('name'), row.get('position')
+            if (artifact is None or artifact.type != 'tool_result' or artifact.producer != actor
+                    or artifact.content_sha256 != row.get('artifact_sha256')
+                    or artifact.recompute_content_sha256() != artifact.content_sha256
+                    or artifact.content.get('tool_name') != name
+                    or artifact.content.get('arguments_sha256') != digest
+                    or not isinstance(artifact.content.get('result'), Mapping)
+                    or row.get('idempotency_key') != hashlib.sha256(
+                        f'{self._context_run_id}:{actor}:{position}:{name}:{digest}'.encode()).hexdigest()):
+                raise RuntimeExecutionError('durable capability approval receipt is invalid')
+        previous = (self._model_cursor, self.engineering_tool_prefix,
+                    self.repair_phase['model_floor'], dict(self.approval_batch))
+        try:
+            self._model_cursor = len(self.model_entries)
+            await self.compact(preserve_engineering=True)
+            await self._checkpoint()
+        except BaseException:
+            (self._model_cursor, self.engineering_tool_prefix,
+             self.repair_phase['model_floor'], self.approval_batch) = previous
+            raise
 
     @staticmethod
     def _completion_artifact(completion: GatewayCompletion) -> Artifact:
@@ -2280,6 +2379,7 @@ class GatewayChatCompletionClient(ChatCompletionClient):
         tool_correction_enabled: bool = False,
         admitted_tool_correction: bool = False,
         engineering_context_compaction: bool = False,
+        actor: str | None = None,
     ) -> None:
         self._gateway = gateway
         self._logical_model = logical_model
@@ -2287,6 +2387,7 @@ class GatewayChatCompletionClient(ChatCompletionClient):
         self._max_output_tokens = max_output_tokens
         self._supports_tool_calls = supports_tool_calls
         self._durability = durability
+        self._actor = actor
         self._compaction_window = compaction_window
         self._engineering_action = engineering_action
         self._engineering_budget = engineering_budget
@@ -2651,7 +2752,7 @@ class GatewayChatCompletionClient(ChatCompletionClient):
                 self._durability.fail_model("discussion_failed")
             raise RuntimeExecutionError("model requested an unavailable capability")
         if not replayed and self._durability is not None:
-            await self._durability.succeed_model(request, completion, tool_names=tool_names)
+            await self._durability.succeed_model(request, completion, tool_names=tool_names, actor=self._actor)
         if request.required_tool is not None and (len(response.tool_calls) != 1
             or response.tool_calls[0].name != request.required_tool):
             raise RuntimeExecutionError("required engineering tool was not returned")
@@ -3288,8 +3389,9 @@ class AutoGenDiscussionRuntime:
                         raise ModelOutcomeUncertain("model outcome is uncertain")
                     if any("report_binding" in row for row in durability.model_entries):
                         raise RuntimeExecutionError("durable final report phase is invalid")
-                    durability._tool_cursor = len(durability.tool_entries)
-                    await durability.compact(preserve_engineering=True)
+                    if durability.repair_phase is None:
+                        durability._tool_cursor = len(durability.tool_entries)
+                        await durability.compact(preserve_engineering=True)
             cancelled = lambda: (
                 self._cancel_token is None
                 or (self._cancel_token.is_cancelled() and not wall_expired.is_set())
@@ -3324,6 +3426,7 @@ class AutoGenDiscussionRuntime:
                     max_output_tokens=participant.max_output_tokens,
                     supports_tool_calls=bool(participant.allowed_tools),
                     durability=durability,
+                    actor=participant.id,
                     compaction_window=compaction_window,
                     engineering_action=next_action if actions and participant.id == owner else None,
                     engineering_budget=action_budget if actions and participant.id == owner else None,
@@ -3407,6 +3510,7 @@ class AutoGenDiscussionRuntime:
                 usage,
                 max_output_tokens=self._plan.selector_max_output_tokens,
                 durability=durability,
+                actor='__selector__',
                 compaction_window=compaction_window,
                 request_timeout=request_timeout,
                 model_admission=admit_model if soft_admission else None,
@@ -3582,6 +3686,11 @@ class AutoGenDiscussionRuntime:
 
             async def stream_after_approval() -> AsyncIterator[Any]:
                 assert durability is not None
+                if (restored is not None and durability.repair_phase is not None
+                        and durability.engineering_tool_prefix < len(durability.tool_entries)):
+                    # Settle only the privately bound complete batch, then ACK
+                    # its boundary before constructing any new provider request.
+                    await durability.drain_completed_round(context, restored.state)
                 if restored is not None and project_repair_selected(context) and durability.repair_phase is None:
                     phase = prepare_project_repair_phase(context, restored,
                         durability.model_entries, durability.tool_entries)
@@ -3626,8 +3735,11 @@ class AutoGenDiscussionRuntime:
                         except _ExecutionObservationError:
                             # A diagnosed check failure ends the batch, not the repair loop.
                             break
-                    await durability.compact(preserve_engineering=True)
-                    await durability._checkpoint()
+                    if durability.repair_phase is not None:
+                        await durability.acknowledge_approved_round(participant_models)
+                    else:
+                        await durability.compact(preserve_engineering=True)
+                        await durability._checkpoint()
                 task = self._task_text(context, tuple(message_artifacts))
                 if durability.repair_phase is not None:
                     phase = durability.repair_phase

@@ -1505,6 +1505,12 @@ class RunRepository:
                     raise TypeError('tool ledger is unavailable')
                 ids = [UUID(cast(str, tool['artifact_id'])) for tool in tools
                     if isinstance(tool, Mapping) and tool.get('status') in {'succeeded', 'failed'}]
+                phase = checkpoint.state.get('project_repair_phase')
+                models = checkpoint.state.get('model_ledger')
+                floor = phase.get('model_floor') if isinstance(phase, Mapping) else None
+                if isinstance(models, tuple) and type(floor) is int and 0 <= floor < len(models):
+                    ids.extend(UUID(cast(str, model['artifact_id'])) for model in models[floor:]
+                               if isinstance(model, Mapping) and model.get('status') == 'succeeded')
                 written = select(RuntimeArtifactWriteRow.write_id).where(
                     RuntimeArtifactWriteRow.tenant_id == RuntimeArtifactRow.tenant_id,
                     RuntimeArtifactWriteRow.run_id == RuntimeArtifactRow.run_id,

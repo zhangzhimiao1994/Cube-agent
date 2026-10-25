@@ -28,6 +28,7 @@ from agent_hub.runtime.contracts import (
 )
 
 PHASE_KEY = 'project_repair_phase'
+ROUND_INTENT = 'project_repair_round'
 _FIELDS = frozenset({
     'version', 'phase', 'source_checkpoint_id', 'source_checkpoint_sha256', 'source_scope_sha256',
     'source_model_count', 'source_model_sha256', 'source_tool_count', 'source_tool_sha256',
@@ -258,6 +259,150 @@ def _budget_not_replenished(metadata: Mapping[str, JsonValue], state: Mapping[st
               and (current <= old or key == 'remaining_timeout_seconds' and soft_progress))
 
 
+def _round_model(run_id: UUID, tenant_id: UUID, row: Mapping[str, JsonValue], position: int,
+                 prefix: int, by_id: Mapping[str, Artifact]) -> tuple[Artifact, Mapping[str, JsonValue]]:
+    _need(row.get('status') == 'succeeded' and 'report_binding' not in row)
+    model = by_id.get(cast(str, row.get('artifact_id')))
+    _need(model is not None)
+    assert model is not None
+    _need(model.type == 'model_result' and model.producer == 'agent_hub'
+          and model.content_sha256 == row.get('artifact_sha256')
+          and model.recompute_content_sha256() == model.content_sha256)
+    content, binding = model.content, model.content.get(ROUND_INTENT)
+    _need(isinstance(binding, Mapping) and set(binding) == {
+        'version', 'run_id', 'tenant_id', 'actor', 'request_hash', 'model_position',
+        'tool_start', 'logical_model', 'tool_names'})
+    assert isinstance(binding, Mapping)
+    _need(type(binding['version']) is int and binding['version'] == 1
+          and binding['run_id'] == str(run_id) and binding['tenant_id'] == str(tenant_id)
+          and _digest(row.get('request_hash')) and binding['request_hash'] == row['request_hash']
+          and type(binding['model_position']) is int and binding['model_position'] == position
+          and type(binding['tool_start']) is int and binding['tool_start'] == prefix
+          and type(content.get('fallback_used', False)) is bool)
+    origin = content.get('fallback_from_logical_model') if content.get('fallback_used') is True else content.get('logical_model')
+    _need(binding['logical_model'] == origin and all(isinstance(content.get(key), str)
+          and cast(str, content[key]).strip() for key in ('deployment_id', 'logical_model', 'provider_id', 'provider_model')))
+    actor, names = binding['actor'], binding['tool_names']
+    _need(isinstance(actor, str) and (actor == '__selector__'
+          or re.fullmatch('[a-z0-9][a-z0-9_.-]{0,127}', actor)) and isinstance(names, Mapping))
+    assert isinstance(names, Mapping)
+    canonical: dict[str, str] = {}
+    for name in names.values():
+        _need(isinstance(name, str) and re.fullmatch('[A-Za-z0-9_.-]{1,128}', name))
+        assert isinstance(name, str)
+        alias = name.replace('.', '_')
+        if len(alias) > 64:
+            alias = alias[:47] + '_' + hashlib.sha256(name.encode()).hexdigest()[:16]
+        for key in {name, alias}:
+            _need(key not in canonical or canonical[key] == name)
+            canonical[key] = name
+    _need(dict(names) == canonical and (actor != '__selector__'
+          or not names and content.get('tool_calls') == ()))
+    usage, cost = content.get('usage'), Decimal(str(content.get('cost_usd')))
+    _need(isinstance(usage, Mapping) and set(usage) == {'prompt_tokens', 'completion_tokens', 'total_tokens'}
+          and all(type(value) is int and value >= 0 for value in usage.values())
+          and usage['total_tokens'] == cast(int, usage['prompt_tokens']) + cast(int, usage['completion_tokens'])
+          and cost.is_finite() and cost >= 0)
+    return model, binding
+
+
+def pending_round_intents(*, run_id: UUID, tenant_id: UUID,
+                          models: Sequence[Mapping[str, JsonValue]], floor: int, prefix: int,
+                          artifacts: Sequence[Artifact]) -> tuple[Mapping[str, JsonValue] | None, ...]:
+    """Legacy receipts lack intent; present intent must still validate in every row."""
+    _need(type(floor) is int and 0 <= floor <= len(models))
+    by_id = {str(item.id): item for item in artifacts}
+    _need(len(by_id) == len(artifacts))
+    intents: list[Mapping[str, JsonValue] | None] = []
+    for position, row in enumerate(models[floor:], floor):
+        if row.get('status') != 'succeeded':
+            continue
+        model = by_id.get(cast(str, row.get('artifact_id')))
+        _need(model is not None)
+        assert model is not None
+        _need(model.type == 'model_result' and model.producer == 'agent_hub'
+              and model.content_sha256 == row.get('artifact_sha256')
+              and model.recompute_content_sha256() == model.content_sha256)
+        intents.append(None if ROUND_INTENT not in model.content else
+            _round_model(run_id, tenant_id, row, position, prefix, by_id)[1])
+    return tuple(intents)
+
+
+def completed_round(context: TaskContext, state: Mapping[str, JsonValue],
+                    artifacts: Sequence[Artifact]) -> bool:
+    """Prove a whole acknowledged batch; never infer intent from legacy effects."""
+    models, tools, phase = state.get('model_ledger'), state.get('tool_ledger'), state.get(PHASE_KEY)
+    _need(isinstance(models, tuple) and isinstance(tools, tuple) and isinstance(phase, Mapping)
+          and 'approval_batch' not in state)
+    assert isinstance(models, tuple) and isinstance(tools, tuple) and isinstance(phase, Mapping)
+    floor, prefix = phase.get('model_floor'), state.get('engineering_tool_prefix')
+    _need(type(floor) is int and type(prefix) is int)
+    assert isinstance(floor, int) and isinstance(prefix, int)
+    if floor == len(models) and prefix == len(tools):
+        return False
+    validate(phase, context=context, models=cast(Sequence[Mapping[str, JsonValue]], models),
+             tools=cast(Sequence[Mapping[str, JsonValue]], tools), tool_prefix=prefix,
+             state=state, artifacts=artifacts)
+    _need(stopped_models(cast(Sequence[Mapping[str, JsonValue]], models), context)
+          and all(isinstance(row, Mapping) and row.get('status') in {'succeeded', 'failed'} for row in tools)
+          and 0 <= prefix < len(tools) and 0 <= floor < len(models))
+    pending = models[floor:]
+    statuses = [row.get('status') if isinstance(row, Mapping) else None for row in pending]
+    _need(bool(statuses) and statuses[-1] == 'succeeded' and (
+        all(status == 'succeeded' for status in statuses[:-1])
+        or len(statuses) >= 2 and statuses[-2] == 'rejected'
+            and all(status == 'succeeded' for status in statuses[:-2])))
+    by_id = {str(item.id): item for item in artifacts}
+    _need(len(by_id) == len(artifacts))
+    bound = [_round_model(context.run_id, context.tenant_id, row, floor + offset, prefix, by_id)
+             for offset, row in enumerate(pending) if isinstance(row, Mapping) and row.get('status') == 'succeeded']
+    model, binding = bound[-1]
+    content = model.content
+    actor, names = binding['actor'], binding['tool_names']
+    _need(isinstance(actor, str) and re.fullmatch('[a-z0-9][a-z0-9_.-]{0,127}', actor)
+          and isinstance(names, Mapping) and bool(names))
+    assert isinstance(names, Mapping)
+    for selection, selection_binding in bound[:-1]:
+        _need(selection_binding['actor'] == '__selector__' and selection_binding['tool_names'] == {}
+              and selection.content.get('tool_calls') == () and isinstance(selection.content.get('text'), str))
+    if len(bound) > 1:
+        _need(cast(str, bound[-2][0].content['text']).strip() == actor)
+    calls = content.get('tool_calls')
+    _need(isinstance(calls, tuple) and len(calls) == len(tools) - prefix)
+    assert isinstance(calls, tuple)
+    identifiers: set[str] = set()
+    used: set[str] = set()
+    for offset, call in enumerate(calls):
+        _need(isinstance(call, Mapping) and set(call) == {'id', 'name', 'arguments'})
+        assert isinstance(call, Mapping)
+        identifier, arguments = call['id'], call['arguments']
+        _need(isinstance(identifier, str) and re.fullmatch('[A-Za-z0-9_.:-]{1,128}', identifier)
+              and identifier not in identifiers and isinstance(arguments, Mapping))
+        identifiers.add(cast(str, identifier))
+        name = names.get(cast(str, call['name']))
+        current = tools[prefix + offset]
+        assert isinstance(current, Mapping)
+        digest = hashlib.sha256(json.dumps(_mutable_json(arguments), ensure_ascii=False,
+            allow_nan=False, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+        _need(current.get('status') == 'succeeded' and current.get('actor') == actor
+              and isinstance(name, str) and current.get('name') == name
+              and type(current.get('position')) is int and current['position'] == prefix + offset
+              and current.get('arguments_hash') == digest
+              and current.get('idempotency_key') == hashlib.sha256(
+                  f'{context.run_id}:{actor}:{prefix + offset}:{name}:{digest}'.encode()).hexdigest())
+        artifact = by_id.get(cast(str, current.get('artifact_id')))
+        _need(artifact is not None and str(artifact.id) not in used)
+        assert artifact is not None
+        used.add(str(artifact.id))
+        _need(artifact.type == 'tool_result' and artifact.producer == actor
+              and artifact.content_sha256 == current.get('artifact_sha256')
+              and artifact.recompute_content_sha256() == artifact.content_sha256
+              and artifact.content.get('tool_name') == name
+              and artifact.content.get('arguments_sha256') == digest
+              and isinstance(artifact.content.get('result'), Mapping))
+    return True
+
+
 def productive_boundary(context: TaskContext, checkpoint: RuntimeCheckpoint,
                         artifacts: Sequence[Artifact]) -> dict[str, JsonValue]:
     """New confirmed write or delivery progress may continue an episode, never UNKNOWN."""
@@ -323,8 +468,8 @@ def productive_boundary(context: TaskContext, checkpoint: RuntimeCheckpoint,
                 productive.append(file)
             observed.add(pair)
     if not productive:
-        _need(phase['model_floor'] == len(models)
-              and state.get('engineering_tool_prefix') == len(tools))
+        _need(phase['model_floor'] == len(models) and state.get('engineering_tool_prefix') == len(tools)
+              or completed_round(context, state, artifacts))
         allowed: dict[str, tuple[str, ...]] = {}
         for row in tools:
             actor, name = row.get('actor'), row.get('name')

@@ -17,6 +17,9 @@ from unittest.mock import patch
 from uuid import UUID, uuid4
 
 import pytest
+from autogen_core import CancellationToken
+from sqlalchemy.sql import operators, visitors
+from sqlalchemy.sql.elements import BinaryExpression, BindParameter
 
 from agent_hub.auth.models import Role
 from agent_hub.db.models import RunOutboxRow, RunRow, RuntimeArtifactRow
@@ -24,6 +27,7 @@ from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.harness.types import HarnessToolCallResult
 from agent_hub.models.gateway import GatewayCompletion
 from agent_hub.models.types import ModelRequest, ModelResponse, TokenUsage, ToolCall
+from agent_hub.runs.approval_checkpoint import checkpoint_waits_for_approval
 from agent_hub.runs.repository import RunConflict, RunRecord, RunRepository
 from agent_hub.runs.service import RunService
 from agent_hub.runs.workspace import workspace_selection
@@ -32,11 +36,20 @@ from agent_hub.runtime.autogen.adapter import (
     AutoGenDiscussionRuntime,
     DiscussionParticipant,
     DiscussionPlan,
+    RuntimeExecutionError,
     _DiscussionDurability,
+    _pending_approval_call,
 )
-from agent_hub.runtime.contracts import EventKind, RunEvent, RuntimeCheckpoint, TaskContext
+from agent_hub.runtime.contracts import (
+    Artifact,
+    EventKind,
+    RunEvent,
+    RuntimeCheckpoint,
+    TaskContext,
+)
 from agent_hub.runtime.registry import RuntimeRegistry
 from tests.unit.runs.test_terminal_hooks import ExecutableFakeRepository, FakeTransaction
+from tests.unit.runtime.autogen.test_capability_approval_resume import tool as approval_tool
 from tests.unit.runtime.autogen.test_soft_model_admission import Journey
 from tests.unit.runtime.test_generated_draft_autogen import EMPTY_HASH, rejection
 
@@ -265,14 +278,19 @@ class ContinuationRepository(ExecutableFakeRepository):
                 return repository.row
 
             async def scalars(self, statement):
+                id_filters = [clause for clause in visitors.iterate(statement.whereclause)
+                    if isinstance(clause, BinaryExpression) and clause.operator is operators.in_op
+                    and clause.left.shares_lineage(RuntimeArtifactRow.__table__.c.id)
+                    and isinstance(clause.right, BindParameter)]
+                assert len(id_filters) == 1, 'private artifact query must select explicit artifact ids'
+                requested_ids = set(id_filters[0].right.value)
                 refs = tuple(ArtifactReference(id=UUID(k), sha256=v)
-                    for k, v in repository.checkpoint.state['artifact_registry'].items())
+                    for k, v in repository.checkpoint.state['artifact_registry'].items()
+                    if UUID(k) in requested_ids)
                 artifacts = await repository.journey.artifacts.get_many(
                     repository.row.tenant_id, repository.run_id, refs)
                 rows = []
                 for a in artifacts:
-                    if a.type != 'tool_result':
-                        continue
                     payload = PostgresArtifactRepository._encode_payload(a.to_payload())
                     rows.append(RuntimeArtifactRow(id=a.id, run_id=repository.run_id,
                         tenant_id=repository.row.tenant_id, content_sha256=a.content_sha256,
@@ -337,6 +355,13 @@ class BoundaryFailure:
 
         async def succeed(durable, artifact):
             await original_success(durable, artifact)
+            ack_tool = {'ack_verify': 'project.verify', 'ack_bundle': 'workspace.bundle'}.get(
+                getattr(self, 'second_fault', None))
+            if not self.initial and ack_tool == artifact.content.get('tool_name'):
+                self.ack_checkpoint = await self.runner.save_checkpoint()
+                self.ack_artifact = artifact
+                self.ack_counts = (len(self.journey.calls), len(self.journey.requests))
+                await freeze()
             if (not self.initial and getattr(self, 'second_fault', None) == 'after_write'
                     and artifact.content.get('tool_name') == 'workspace.write_text'):
                 await freeze()
@@ -558,6 +583,647 @@ async def test_late_delivery_progress_continues_after_write_credit_is_consumed(
     assert repo.checkpoint.state['remaining_absolute_timeout_seconds'] <= stopped.state['remaining_absolute_timeout_seconds']
     with zipfile.ZipFile(io.BytesIO(journey.bundle_bytes)) as archive:
         assert archive.read('ACCEPTANCE.json') == b'repaired draft'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('fault,pending_tools,pending_models', [
+    ('ack_verify', ['workspace.bundle'], ['selector', 'writer', 'main_report']),
+    ('ack_bundle', [], ['main_report']),
+])
+async def test_acknowledged_delivery_before_compact_continues_without_old_replay(
+    fault: str, pending_tools: list[str], pending_models: list[str],
+) -> None:
+    journey = ProjectJourney()
+    repo = ContinuationRepository(journey)
+    runtime = BoundaryFailure(journey)
+    service = RunService(repo, runtime_registry=RuntimeRegistry((runtime,)), router=None, task_queue=object())
+    assert (await service.execute(repo.run_id)).status is RunStatus.QUEUED
+    runtime.second_fault = 'after_write'
+    assert (await service.execute(repo.run_id)).status is RunStatus.QUEUED
+    consumed = dict(repo.row.routing_decision['self_repair_episode_progress'])
+    source = repo.checkpoint
+    runtime.second_fault = fault
+    continued = await service.execute(repo.run_id)
+    stopped = repo.checkpoint
+    before = stopped.to_payload()
+    tools, models = stopped.state['tool_ledger'], stopped.state['model_ledger']
+    assert hasattr(runtime, 'ack_checkpoint'), (
+        continued.status, repo.continuation_errors,
+        [(event.kind, event.reason) for event in repo.event_log[-8:]],
+        [call.tool_name for call in journey.calls])
+    ack = runtime.ack_checkpoint
+    assert tools == ack.state['tool_ledger'] and models == ack.state['model_ledger']
+    assert tools[-1]['name'] == ('project.verify' if fault == 'ack_verify' else 'workspace.bundle')
+    assert tools[-1]['status'] == 'succeeded'
+    assert tools[-1]['artifact_id'] == str(runtime.ack_artifact.id)
+    assert tools[-1]['artifact_sha256'] == runtime.ack_artifact.content_sha256
+    assert ack.state['artifact_registry'][str(runtime.ack_artifact.id)] == runtime.ack_artifact.content_sha256
+    assert stopped.state['usage'] == ack.state['usage']
+    assert all(row['status'] == 'succeeded' for row in models)
+    assert all(row['status'] in {'succeeded', 'failed'} for row in tools)
+    assert stopped.state['engineering_tool_prefix'] < len(tools)
+    assert stopped.state['project_repair_phase']['model_floor'] < len(models)
+    assert tools[:len(source.state['tool_ledger'])] == source.state['tool_ledger']
+    assert models[:len(source.state['model_ledger'])] == source.state['model_ledger']
+    assert consumed['tool_count'] == len(source.state['tool_ledger'])
+    assert stopped.state['usage']['tokens'] >= source.state['usage']['tokens'] > 0
+    assert Decimal(stopped.state['usage']['cost_usd']) >= Decimal(source.state['usage']['cost_usd']) > 0
+    assert stopped.state['remaining_absolute_timeout_seconds'] <= source.state['remaining_absolute_timeout_seconds']
+    assert stopped.state['remaining_timeout_seconds'] <= source.state['remaining_timeout_seconds']
+    assert runtime.ack_counts == (len(journey.calls), len(journey.requests))
+    assert journey.write_count == 2 and journey.verify_count == 2
+    assert continued.status is RunStatus.QUEUED, (
+        repo.continuation_errors, [(event.kind, event.reason) for event in repo.event_log[-6:]])
+
+    assert repo.accept_count == 1 and len(repo.outbox) == 3
+    calls, requests = runtime.ack_counts
+    old_runner = runtime.runner
+    runtime.second_fault = None
+    completed = await service.execute(repo.run_id)
+    assert runtime.runner is not old_runner
+    assert completed.status is RunStatus.COMPLETED, [(event.kind, event.reason) for event in repo.event_log[-6:]]
+    assert [call.tool_name for call in journey.calls[calls:]] == pending_tools
+    assert [('main_report' if any(message.role == 'system'
+                                 and 'Main Agent final delivery' in str(message.content)
+                                 for message in request.messages) else request.logical_model)
+            for request in journey.requests[requests:]] == pending_models
+    assert repo.checkpoint.state['tool_ledger'][:len(tools)] == tools
+    assert repo.checkpoint.state['model_ledger'][:len(models)] == models
+    assert stopped.to_payload() == before
+    assert journey.write_count == 2 and journey.verify_count == 2
+    assert sum(call.tool_name == 'workspace.bundle' for call in journey.calls) == 1
+    final = [event.artifact for event in repo.event_log if event.artifact is not None
+             and event.artifact.content.get('presentation') == 'final_answer']
+    assert len(final) == 1 and final[0].content['text'] == journey.report
+    assert repo.checkpoint.state['usage']['tokens'] >= stopped.state['usage']['tokens']
+    assert Decimal(repo.checkpoint.state['usage']['cost_usd']) >= Decimal(stopped.state['usage']['cost_usd'])
+    assert repo.checkpoint.state['remaining_absolute_timeout_seconds'] <= stopped.state['remaining_absolute_timeout_seconds']
+    assert repo.checkpoint.state['remaining_timeout_seconds'] <= stopped.state['remaining_timeout_seconds']
+    assert repo.row.routing_decision['runtime_token_absolute_tokens'] == 500
+    assert repo.row.routing_decision['runtime_timeout_absolute_seconds'] == 20.0
+    assert repo.row.routing_decision['self_repair_attempt'] == 1
+    with zipfile.ZipFile(io.BytesIO(journey.bundle_bytes)) as archive:
+        assert archive.read('ACCEPTANCE.json') == b'repaired draft'
+    calls, requests = len(journey.calls), len(journey.requests)
+    cold = journey.runtime()
+    await cold.restore_checkpoint(repo.checkpoint)
+    events = [event async for event in cold.run(journey.context.model_copy(update={'checkpoint': repo.checkpoint}))]
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert (len(journey.calls), len(journey.requests)) == (calls, requests)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('fault', ['ack_verify', 'ack_bundle'])
+async def test_completed_round_checkpoint_ack_failure_rolls_back_without_provider_calls(fault: str) -> None:
+    journey = ProjectJourney()
+    repo = ContinuationRepository(journey)
+    runtime = BoundaryFailure(journey)
+    service = RunService(repo, runtime_registry=RuntimeRegistry((runtime,)), router=None, task_queue=object())
+    assert (await service.execute(repo.run_id)).status is RunStatus.QUEUED
+    runtime.second_fault = 'after_write'
+    assert (await service.execute(repo.run_id)).status is RunStatus.QUEUED
+    runtime.second_fault = fault
+    assert (await service.execute(repo.run_id)).status is RunStatus.QUEUED, repo.continuation_errors
+    stopped = runtime.ack_checkpoint
+    before = stopped.to_payload()
+    state = stopped.state
+    references = tuple(ArtifactReference(id=UUID(key), sha256=value)
+                       for key, value in state['artifact_registry'].items())
+    artifacts = await journey.artifacts.get_many(stopped.tenant_id, stopped.run_id, references)
+    calls, requests = len(journey.calls), len(journey.requests)
+    published = []
+    failure = OSError('drain checkpoint ACK failed')
+
+    async def publish(saved_artifacts, model_entries, tool_entries):
+        assert durability._model_cursor == len(model_entries)
+        assert durability._tool_cursor == len(tool_entries)
+        assert durability.engineering_tool_prefix == len(tool_entries)
+        assert durability.repair_phase['model_floor'] == len(model_entries)
+        assert tuple(model_entries) == state['model_ledger']
+        assert tuple(tool_entries) == state['tool_ledger']
+        assert saved_artifacts == artifacts
+        published.append((durability._model_cursor, durability._tool_cursor))
+        raise failure
+
+    async def unexpected_artifact_write(*args):
+        pytest.fail('draining a completed round must not write or abort artifacts')
+
+    def unexpected_finalize(*args):
+        pytest.fail('draining a completed round must not finalize artifacts')
+
+    durability = _DiscussionDurability(publish, unexpected_artifact_write,
+        unexpected_artifact_write, unexpected_finalize, run_id=stopped.run_id, tenant_id=stopped.tenant_id,
+        model_entries=state['model_ledger'], tool_entries=state['tool_ledger'], artifacts=artifacts,
+        engineering_tool_prefix=state['engineering_tool_prefix'], repair_phase=state['project_repair_phase'])
+    previous_cursors = (durability._model_cursor, durability._tool_cursor, durability.engineering_tool_prefix)
+    previous_phase = dict(state['project_repair_phase'])
+    previous_models = [dict(entry) for entry in state['model_ledger']]
+    previous_tools = [dict(entry) for entry in state['tool_ledger']]
+    assert previous_cursors[0] < len(previous_models) and previous_cursors[1] < len(previous_tools)
+    with pytest.raises(OSError, match='drain checkpoint ACK failed') as raised:
+        await durability.drain_completed_round(journey.context, state)
+    assert raised.value is failure
+    assert published == [(len(previous_models), len(previous_tools))]
+    assert (durability._model_cursor, durability._tool_cursor,
+            durability.engineering_tool_prefix) == previous_cursors
+    assert durability.repair_phase == previous_phase
+    assert durability.model_entries == previous_models and durability.tool_entries == previous_tools
+    assert durability.artifacts == artifacts
+    assert stopped.to_payload() == before
+    assert state['usage'] == before['state']['usage']
+    assert state['remaining_timeout_seconds'] == before['state']['remaining_timeout_seconds']
+    assert state['remaining_absolute_timeout_seconds'] == before['state']['remaining_absolute_timeout_seconds']
+    assert (len(journey.calls), len(journey.requests)) == (calls, requests)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('defect', ['missing_intent', 'broken_intent', 'missing_artifact',
+                                  'legacy_selector_broken_writer', 'legacy_selector_missing_writer'])
+async def test_pending_round_legacy_fallback_does_not_accept_corrupt_private_intent(defect: str) -> None:
+    journey = ProjectJourney()
+    repo = ContinuationRepository(journey)
+    runtime = BoundaryFailure(journey)
+    service = RunService(repo, runtime_registry=RuntimeRegistry((runtime,)), router=None, task_queue=object())
+    assert (await service.execute(repo.run_id)).status is RunStatus.QUEUED
+    runtime.second_fault = 'after_write'
+    assert (await service.execute(repo.run_id)).status is RunStatus.QUEUED
+    runtime.second_fault = 'ack_verify'
+    assert (await service.execute(repo.run_id)).status is RunStatus.QUEUED, repo.continuation_errors
+    stopped = runtime.ack_checkpoint
+    state = stopped.to_payload()['state']
+    refs = tuple(ArtifactReference(id=UUID(key), sha256=value)
+                 for key, value in state['artifact_registry'].items())
+    artifacts = list(await journey.artifacts.get_many(stopped.tenant_id, stopped.run_id, refs))
+    if defect.startswith('legacy_selector_'):
+        selection = state['model_ledger'][state['project_repair_phase']['model_floor']]
+        index = next(index for index, artifact in enumerate(artifacts) if str(artifact.id) == selection['artifact_id'])
+        original_selection = artifacts[index]
+        content = original_selection.model_dump(mode='json')['content']
+        assert content['project_repair_round']['actor'] == '__selector__' and content['tool_calls'] == []
+        del content['project_repair_round']
+        legacy = Artifact(id=original_selection.id, type=original_selection.type,
+            producer=original_selection.producer, content=content)
+        artifacts[index] = legacy
+        selection['artifact_sha256'] = legacy.content_sha256
+        state['artifact_registry'][str(legacy.id)] = legacy.content_sha256
+    row = state['model_ledger'][-1]
+    position = next(index for index, artifact in enumerate(artifacts) if str(artifact.id) == row['artifact_id'])
+    original = artifacts[position]
+    assert original.type == 'model_result' and row['status'] == 'succeeded'
+    assert 'project_repair_round' in original.content
+    if defect in {'missing_artifact', 'legacy_selector_missing_writer'}:
+        artifacts.pop(position)
+    else:
+        content = original.model_dump(mode='json')['content']
+        if defect == 'missing_intent':
+            del content['project_repair_round']
+        else:
+            content['project_repair_round'] = {'version': 1}
+        changed = Artifact(id=original.id, type=original.type, producer=original.producer, content=content)
+        artifacts[position] = changed
+        row['artifact_sha256'] = changed.content_sha256
+        state['artifact_registry'][str(changed.id)] = changed.content_sha256
+    checkpoint = RuntimeCheckpoint(id=uuid4(), runtime_type=stopped.runtime_type,
+        runtime_version=stopped.runtime_version, run_id=stopped.run_id, tenant_id=stopped.tenant_id,
+        mode=stopped.mode, state=state)
+
+    async def unexpected(*args):
+        pytest.fail('a fallback or rejected round must not publish or write artifacts')
+
+    durable = _DiscussionDurability(unexpected, unexpected, unexpected, lambda _: pytest.fail('no finalize'),
+        run_id=stopped.run_id, tenant_id=stopped.tenant_id, model_entries=checkpoint.state['model_ledger'],
+        tool_entries=checkpoint.state['tool_ledger'], artifacts=tuple(artifacts),
+        engineering_tool_prefix=checkpoint.state['engineering_tool_prefix'],
+        repair_phase=checkpoint.state['project_repair_phase'])
+    before = (durable._model_cursor, durable._tool_cursor, durable.engineering_tool_prefix,
+              dict(durable.repair_phase), list(durable.model_entries), list(durable.tool_entries))
+    calls, requests = len(journey.calls), len(journey.requests)
+    if defect == 'missing_intent':
+        await durable.drain_completed_round(journey.context, checkpoint.state)
+    else:
+        with pytest.raises(ValueError, match='project repair phase is invalid'):
+            await durable.drain_completed_round(journey.context, checkpoint.state)
+    assert (durable._model_cursor, durable._tool_cursor, durable.engineering_tool_prefix,
+            durable.repair_phase, durable.model_entries, durable.tool_entries) == before
+    assert (len(journey.calls), len(journey.requests)) == (calls, requests)
+
+
+class ApprovalProjectJourney(ProjectJourney):
+    approval_id = 'approval_active_repair_verify'
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.approved = False
+
+    async def invoke(self, tenant_id, request, *, user_id=None, role=None):
+        if request.tool_name == 'project.verify' and self.write_count == 2 and not self.approved:
+            self.calls.append(request)
+            return HarnessToolCallResult(call_id=request.call_id, tool_name=request.tool_name,
+                status='failed', failure_reason='capability requires approval',
+                payload={'approval_id': self.approval_id})
+        return await super().invoke(tenant_id, request, user_id=user_id, role=role)
+
+
+async def _active_approval_fixture(journey=None, *, validate_pending: bool = True):
+    journey = ApprovalProjectJourney() if journey is None else journey
+    repo = ContinuationRepository(journey)
+    runtime = BoundaryFailure(journey)
+    service = RunService(repo, runtime_registry=RuntimeRegistry((runtime,)), router=None, task_queue=object())
+    assert (await service.execute(repo.run_id)).status is RunStatus.QUEUED
+    runtime.second_fault = 'after_write'
+    assert (await service.execute(repo.run_id)).status is RunStatus.QUEUED
+    source = repo.checkpoint
+    journey.context = journey.context.model_copy(update={
+        'checkpoint': source, 'routing_decision': dict(repo.row.routing_decision)})
+    runner = journey.runtime()
+    await runner.restore_checkpoint(source)
+    events = [event async for event in runner.run(journey.context)]
+    saved = await runner.save_checkpoint()
+    assert checkpoint_waits_for_approval(saved, journey.approval_id), [
+        (event.kind, event.reason) for event in events[-5:]]
+    assert saved.state['project_repair_phase']['model_floor'] < len(saved.state['model_ledger'])
+    refs = tuple(ArtifactReference(id=UUID(key), sha256=value)
+                 for key, value in saved.state['artifact_registry'].items())
+    artifacts = await journey.artifacts.get_many(saved.tenant_id, saved.run_id, refs)
+    snapshots = []
+    writes = {}
+
+    async def publish(saved_artifacts, models, tools):
+        state = saved.to_payload()['state']
+        state.update(model_ledger=models, tool_ledger=tools,
+            engineering_tool_prefix=durable.engineering_tool_prefix,
+            project_repair_phase=dict(durable.repair_phase),
+            artifact_registry={str(artifact.id): artifact.content_sha256 for artifact in saved_artifacts})
+        if durable.approval_batch is None:
+            state.pop('approval_batch', None)
+        else:
+            state['approval_batch'] = dict(durable.approval_batch)
+        snapshots.append(RuntimeCheckpoint(id=uuid4(), runtime_type=saved.runtime_type,
+            runtime_version=saved.runtime_version, run_id=saved.run_id, tenant_id=saved.tenant_id,
+            mode=saved.mode, state=state))
+
+    async def store(artifact):
+        write_id = uuid4()
+        reference = ArtifactReference(id=artifact.id, sha256=artifact.content_sha256)
+        writes[write_id] = reference
+        await journey.artifacts.reserve_write(saved.tenant_id, saved.run_id, reference, write_id=write_id)
+        await journey.artifacts.put(saved.tenant_id, saved.run_id, artifact, write_id=write_id)
+        return write_id
+
+    async def abort(write_id):
+        return await journey.artifacts.abort_write(saved.tenant_id, saved.run_id,
+            writes[write_id], write_id=write_id)
+
+    durable = _DiscussionDurability(publish, store, abort, lambda _: None,
+        run_id=saved.run_id, tenant_id=saved.tenant_id, model_entries=saved.state['model_ledger'],
+        tool_entries=saved.state['tool_ledger'], artifacts=artifacts,
+        engineering_tool_prefix=saved.state['engineering_tool_prefix'],
+        repair_phase=saved.state['project_repair_phase'], approval_batch=saved.state['approval_batch'])
+    if validate_pending:
+        pending = _pending_approval_call(durable, {'implementer': 'writer', 'reviewer': 'reviewer'})
+        assert pending is not None and pending[0] == 'implementer' and pending[2] == 0
+    return journey, durable, saved, snapshots
+
+
+@pytest.mark.asyncio
+async def test_pending_approval_drain_is_noop_and_retains_original_resume_path() -> None:
+    journey, durable, saved, snapshots = await _active_approval_fixture()
+    before = (durable._model_cursor, durable._tool_cursor, durable.engineering_tool_prefix,
+              dict(durable.repair_phase), dict(durable.approval_batch))
+    calls, requests = len(journey.calls), len(journey.requests)
+    pending = _pending_approval_call(durable, {'implementer': 'writer', 'reviewer': 'reviewer'})
+    await durable.drain_completed_round(journey.context, saved.state)
+    assert (durable._model_cursor, durable._tool_cursor, durable.engineering_tool_prefix,
+            durable.repair_phase, durable.approval_batch) == before
+    assert _pending_approval_call(durable, {'implementer': 'writer', 'reviewer': 'reviewer'}) == pending
+    assert snapshots == []
+    assert (len(journey.calls), len(journey.requests)) == (calls, requests)
+
+
+async def _complete_approved_fixture():
+    journey, durable, saved, snapshots = await _active_approval_fixture()
+    actor, calls, cursor = _pending_approval_call(durable, {'implementer': 'writer', 'reviewer': 'reviewer'})
+    assert actor == 'implementer' and cursor == 0 and len(calls) == 1
+    journey.approved = True
+    await approval_tool(durable, journey, [], name='project.verify').run_json(
+        {}, CancellationToken(), call_id=calls[0]['id'])
+    assert durable.tool_entries[-1]['status'] == 'succeeded'
+    assert durable.approval_batch['next_index'] == len(calls)
+    assert journey.verify_count == 2 and journey.write_count == 2
+    assert durable._model_cursor == saved.state['project_repair_phase']['model_floor']
+    return journey, durable, saved, snapshots
+
+
+def _replace_approval_model_content(durable, row, content):
+    original = durable._artifacts[row['artifact_id']]
+    assert original.type == 'model_result' and row['status'] == 'succeeded'
+    changed = Artifact(id=original.id, type=original.type, producer=original.producer, content=content)
+    durable._artifacts[str(changed.id)] = changed
+    row['artifact_sha256'] = changed.content_sha256
+    if durable.approval_batch['model_artifact_id'] == str(changed.id):
+        durable.approval_batch['model_artifact_sha256'] = changed.content_sha256
+
+
+class RetriedSelectorApprovalJourney(ApprovalProjectJourney):
+    retried_selector = False
+
+    async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+        if (request.logical_model == 'selector' and self.write_count == 2 and self.verify_count == 1
+                and not self.retried_selector):
+            self.retried_selector = True
+            self.requests.append(request)
+            return GatewayCompletion(response=ModelResponse(text='no_candidate', usage=TokenUsage(1, 1, 2)),
+                deployment_id='fixture', logical_model=request.logical_model,
+                provider_id='fixture', provider_model='fixture/model', cost_usd=Decimal('0.001'))
+        return await super().complete_with_context(request)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('variant', ['legacy', 'intent', 'foreign_prior_actor'])
+async def test_real_selector_retry_approval_preserves_legacy_and_strict_intent(variant: str) -> None:
+    journey, durable, saved, snapshots = await _active_approval_fixture(
+        RetriedSelectorApprovalJourney(), validate_pending=False)
+    floor = durable.repair_phase['model_floor']
+    rows = durable.model_entries[floor:]
+    assert len(rows) == 3 and all(row['status'] == 'succeeded' for row in rows)
+    models = [durable._artifacts[row['artifact_id']] for row in rows]
+    assert [model.content.get('text') for model in models[:2]] == ['no_candidate', 'implementer']
+    assert [model.content['project_repair_round']['actor'] for model in models] == [
+        '__selector__', '__selector__', 'implementer']
+    assert models[0].content['tool_calls'] == models[1].content['tool_calls'] == ()
+    assert models[-1].content['tool_calls'][0]['name'] == 'project_verify'
+    participants = {'implementer': 'writer', 'reviewer': 'reviewer'}
+    if variant == 'legacy':
+        for row, model in zip(rows, models, strict=True):
+            content = model.model_dump(mode='json')['content']
+            del content['project_repair_round']
+            legacy = Artifact(id=uuid4(), type=model.type, producer=model.producer, content=content)
+            write_id = await durable._store(legacy)
+            durable._finalize(write_id)
+            del durable._artifacts[str(model.id)]
+            durable._artifacts[str(legacy.id)] = legacy
+            row.update(artifact_id=str(legacy.id), artifact_sha256=legacy.content_sha256)
+            if durable.approval_batch['model_artifact_id'] == str(model.id):
+                durable.approval_batch.update(model_artifact_id=str(legacy.id),
+                    model_artifact_sha256=legacy.content_sha256)
+        native = _DiscussionDurability(durable._publish, durable._store, durable._abort, durable._finalize,
+            run_id=saved.run_id, tenant_id=saved.tenant_id, model_entries=tuple(durable.model_entries),
+            tool_entries=tuple(durable.tool_entries), artifacts=durable.artifacts,
+            engineering_tool_prefix=durable.engineering_tool_prefix, approval_batch=durable.approval_batch)
+        assert _pending_approval_call(native, participants) is not None
+    elif variant == 'foreign_prior_actor':
+        content = models[0].model_dump(mode='json')['content']
+        content['project_repair_round']['actor'] = 'reviewer'
+        _replace_approval_model_content(durable, rows[0], content)
+    before = (durable._model_cursor, durable._tool_cursor, durable.engineering_tool_prefix,
+              dict(durable.repair_phase), dict(durable.approval_batch))
+    calls, requests = len(journey.calls), len(journey.requests)
+    if variant == 'foreign_prior_actor':
+        with pytest.raises((RuntimeExecutionError, ValueError)):
+            _pending_approval_call(durable, participants)
+        assert (durable._model_cursor, durable._tool_cursor, durable.engineering_tool_prefix,
+                durable.repair_phase, durable.approval_batch) == before
+        assert snapshots == [] and (len(journey.calls), len(journey.requests)) == (calls, requests)
+        return
+    pending = _pending_approval_call(durable, participants)
+    assert pending is not None and pending[0] == 'implementer' and pending[2] == 0
+    journey.approved = True
+    await approval_tool(durable, journey, [], name='project.verify').run_json(
+        {}, CancellationToken(), call_id=pending[1][0]['id'])
+    await durable.acknowledge_approved_round(participants)
+    assert durable.approval_batch is None and durable.repair_phase['model_floor'] == len(durable.model_entries)
+    acknowledged = snapshots[-1]
+    calls = len(journey.calls)
+    cold = journey.runtime()
+    await cold.restore_checkpoint(acknowledged)
+    events = [event async for event in cold.run(journey.context.model_copy(update={'checkpoint': acknowledged}))]
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED, [(event.kind, event.reason) for event in events[-5:]]
+    assert [call.tool_name for call in journey.calls[calls:]] == ['workspace.bundle']
+    assert len(journey.requests) == requests + 3
+    assert journey.write_count == 2 and journey.verify_count == 2
+    assert tuple(rows) == acknowledged.state['model_ledger'][floor:]
+
+
+@pytest.mark.asyncio
+async def test_real_selector_retry_verify_ack_cold_resume_does_not_replay_old_round() -> None:
+    journey = RetriedSelectorApprovalJourney()
+    journey.approved = True
+    repo = ContinuationRepository(journey)
+    runtime = BoundaryFailure(journey)
+    service = RunService(repo, runtime_registry=RuntimeRegistry((runtime,)), router=None, task_queue=object())
+    assert (await service.execute(repo.run_id)).status is RunStatus.QUEUED
+    runtime.second_fault = 'after_write'
+    assert (await service.execute(repo.run_id)).status is RunStatus.QUEUED
+    runtime.second_fault = 'ack_verify'
+    continued = await service.execute(repo.run_id)
+    stopped = runtime.ack_checkpoint
+    floor = stopped.state['project_repair_phase']['model_floor']
+    pending = stopped.state['model_ledger'][floor:]
+    assert len(pending) == 3 and all(row['status'] == 'succeeded' for row in pending)
+    refs = tuple(ArtifactReference(id=UUID(row['artifact_id']), sha256=row['artifact_sha256']) for row in pending)
+    artifacts = await journey.artifacts.get_many(stopped.tenant_id, stopped.run_id, refs)
+    assert [artifact.content.get('text') for artifact in artifacts[:2]] == ['no_candidate', 'implementer']
+    assert stopped.state['tool_ledger'][-1]['name'] == 'project.verify'
+    assert stopped.state['tool_ledger'][-1]['status'] == 'succeeded'
+    assert continued.status is RunStatus.QUEUED, repo.continuation_errors
+    calls, requests = len(journey.calls), len(journey.requests)
+    before = stopped.to_payload()
+    runtime.second_fault = None
+    assert (await service.execute(repo.run_id)).status is RunStatus.COMPLETED
+    assert [call.tool_name for call in journey.calls[calls:]] == ['workspace.bundle']
+    assert len(journey.requests) == requests + 3
+    assert journey.write_count == 2 and journey.verify_count == 2
+    assert stopped.to_payload() == before
+    assert repo.checkpoint.state['model_ledger'][:len(stopped.state['model_ledger'])] == stopped.state['model_ledger']
+    assert repo.checkpoint.state['tool_ledger'][:len(stopped.state['tool_ledger'])] == stopped.state['tool_ledger']
+    assert repo.checkpoint.state['usage']['tokens'] >= stopped.state['usage']['tokens']
+    assert Decimal(repo.checkpoint.state['usage']['cost_usd']) >= Decimal(stopped.state['usage']['cost_usd'])
+    assert repo.checkpoint.state['remaining_absolute_timeout_seconds'] <= stopped.state['remaining_absolute_timeout_seconds']
+    assert repo.row.routing_decision['runtime_token_absolute_tokens'] == 500
+    assert repo.row.routing_decision['runtime_timeout_absolute_seconds'] == 20.0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('field', ['actor', 'request_hash', 'tool_start', 'model_position',
+                                 'tool_names', 'selector_text', 'selector_actor', 'selector_tool_names'])
+async def test_completed_approved_round_rejects_present_intent_binding_corruption(field: str) -> None:
+    journey, durable, _saved, snapshots = await _complete_approved_fixture()
+    pending = _pending_approval_call(durable, {'implementer': 'writer', 'reviewer': 'reviewer'})
+    assert pending is not None and pending[2] == len(pending[1])
+    index = durable.repair_phase['model_floor'] if field.startswith('selector_') else -1
+    row = durable.model_entries[index]
+    content = durable._artifacts[row['artifact_id']].model_dump(mode='json')['content']
+    binding = content['project_repair_round']
+    if field == 'selector_text':
+        assert binding['actor'] == '__selector__' and content['text'].strip() == 'implementer'
+        content['text'] = 'reviewer'
+    elif field == 'selector_actor':
+        assert binding['actor'] == '__selector__'
+        binding['actor'] = 'implementer'
+    elif field == 'selector_tool_names':
+        assert binding['tool_names'] == {} and content['tool_calls'] == []
+        binding['tool_names'] = {'project_verify': 'project.verify'}
+    elif field == 'tool_names':
+        binding[field] = {'project_verify': 'workspace.list'}
+    elif field == 'actor':
+        binding[field] = 'reviewer'
+    elif field == 'request_hash':
+        binding[field] = '0' * 64 if row['request_hash'] != '0' * 64 else '1' * 64
+    else:
+        binding[field] += 1
+    _replace_approval_model_content(durable, row, content)
+    # Rebind hashes so rejection must check intent, not merely a stale artifact digest.
+    previous = (durable._model_cursor, durable._tool_cursor, durable.engineering_tool_prefix,
+                dict(durable.repair_phase), dict(durable.approval_batch))
+    tools, models, artifacts = list(durable.tool_entries), list(durable.model_entries), durable.artifacts
+    calls, requests, publication_count = len(journey.calls), len(journey.requests), len(snapshots)
+    with pytest.raises((RuntimeExecutionError, ValueError)):
+        await durable.acknowledge_approved_round({'implementer': 'writer', 'reviewer': 'reviewer'})
+    assert (durable._model_cursor, durable._tool_cursor, durable.engineering_tool_prefix,
+            durable.repair_phase, durable.approval_batch) == previous
+    assert durable.model_entries == models and durable.tool_entries == tools and durable.artifacts == artifacts
+    assert len(snapshots) == publication_count
+    assert (len(journey.calls), len(journey.requests)) == (calls, requests)
+
+
+@pytest.mark.asyncio
+async def test_completed_legacy_approved_round_without_intent_remains_compatible() -> None:
+    journey, durable, saved, snapshots = await _complete_approved_fixture()
+    floor = durable.repair_phase['model_floor']
+    for row in durable.model_entries[floor:]:
+        assert row['status'] == 'succeeded'
+        content = durable._artifacts[row['artifact_id']].model_dump(mode='json')['content']
+        del content['project_repair_round']
+        _replace_approval_model_content(durable, row, content)
+    pending = _pending_approval_call(durable, {'implementer': 'writer', 'reviewer': 'reviewer'})
+    assert pending is not None and pending[2] == len(pending[1])
+    tools, models = list(durable.tool_entries), list(durable.model_entries)
+    calls, requests, publication_count = len(journey.calls), len(journey.requests), len(snapshots)
+    await durable.acknowledge_approved_round({'implementer': 'writer', 'reviewer': 'reviewer'})
+    assert durable._model_cursor == len(models) and durable._tool_cursor == len(tools)
+    assert durable.repair_phase['model_floor'] == len(models) and durable.engineering_tool_prefix == len(tools)
+    assert durable.approval_batch is None
+    assert durable.model_entries == models and durable.tool_entries == tools
+    assert len(snapshots) == publication_count + 1
+    assert snapshots[-1].state['usage'] == saved.state['usage']
+    assert 'approval_batch' not in snapshots[-1].state
+    assert (len(journey.calls), len(journey.requests)) == (calls, requests)
+
+
+@pytest.mark.asyncio
+async def test_completed_approved_round_acknowledges_then_cold_restores_without_old_replay() -> None:
+    journey, durable, saved, snapshots = await _complete_approved_fixture()
+    calls, requests = len(journey.calls), len(journey.requests)
+    tools, models = list(durable.tool_entries), list(durable.model_entries)
+    await durable.acknowledge_approved_round({'implementer': 'writer', 'reviewer': 'reviewer'})
+    assert durable._model_cursor == len(models) and durable._tool_cursor == len(tools)
+    assert durable.engineering_tool_prefix == len(tools)
+    assert durable.repair_phase['model_floor'] == len(models) and durable.approval_batch is None
+    assert durable.tool_entries == tools and durable.model_entries == models
+    assert (len(journey.calls), len(journey.requests)) == (calls, requests)
+    acknowledged = snapshots[-1]
+    assert 'approval_batch' not in acknowledged.state
+    cold = journey.runtime()
+    await cold.restore_checkpoint(acknowledged)
+    events = [event async for event in cold.run(journey.context.model_copy(update={'checkpoint': acknowledged}))]
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED, [(event.kind, event.reason) for event in events[-5:]]
+    assert [call.tool_name for call in journey.calls[calls:]] == ['workspace.bundle']
+    assert len(journey.requests) == requests + 3
+    assert journey.verify_count == 2 and journey.write_count == 2
+    final = [event.artifact for event in events if event.artifact is not None
+             and event.artifact.content.get('presentation') == 'final_answer']
+    assert len(final) == 1 and final[0].content['text'] == journey.report
+    assert acknowledged.state['usage'] == saved.state['usage']
+    assert cold._last_checkpoint.state['tool_ledger'][:len(tools)] == tuple(tools)
+
+
+@pytest.mark.asyncio
+async def test_approved_round_ack_failure_restores_batch_markers_but_keeps_acked_tool() -> None:
+    journey, durable, saved, snapshots = await _complete_approved_fixture()
+    previous = (durable._model_cursor, durable._tool_cursor, durable.engineering_tool_prefix,
+                dict(durable.repair_phase), dict(durable.approval_batch))
+    tools, models, artifacts = list(durable.tool_entries), list(durable.model_entries), durable.artifacts
+    calls, requests, publication_count = len(journey.calls), len(journey.requests), len(snapshots)
+    failure = OSError('approved round checkpoint ACK failed')
+    attempted = []
+
+    async def reject(*args):
+        assert durable._model_cursor == len(models) and durable.engineering_tool_prefix == len(tools)
+        assert durable.repair_phase['model_floor'] == len(models) and durable.approval_batch is None
+        attempted.append(True)
+        raise failure
+
+    durable._publish = reject
+    with pytest.raises(OSError, match='approved round checkpoint ACK failed') as raised:
+        await durable.acknowledge_approved_round({'implementer': 'writer', 'reviewer': 'reviewer'})
+    assert raised.value is failure and attempted == [True]
+    assert (durable._model_cursor, durable._tool_cursor, durable.engineering_tool_prefix,
+            durable.repair_phase, durable.approval_batch) == previous
+    assert durable._tool_cursor == len(tools) and tools[-1]['status'] == 'succeeded'
+    assert durable.model_entries == models and durable.tool_entries == tools and durable.artifacts == artifacts
+    assert len(snapshots) == publication_count and snapshots[-1].state['usage'] == saved.state['usage']
+    assert (len(journey.calls), len(journey.requests)) == (calls, requests)
+
+
+@pytest.mark.asyncio
+async def test_approved_round_with_unexecuted_tail_cannot_advance() -> None:
+    journey, durable, _saved, snapshots = await _active_approval_fixture()
+    before = (durable._model_cursor, durable._tool_cursor, durable.engineering_tool_prefix,
+              dict(durable.repair_phase), dict(durable.approval_batch))
+    calls, requests = len(journey.calls), len(journey.requests)
+    with pytest.raises(RuntimeExecutionError):
+        await durable.acknowledge_approved_round({'implementer': 'writer', 'reviewer': 'reviewer'})
+    assert (durable._model_cursor, durable._tool_cursor, durable.engineering_tool_prefix,
+            durable.repair_phase, durable.approval_batch) == before
+    assert durable.tool_entries[-1]['status'] == 'waiting_approval' and snapshots == []
+    assert (len(journey.calls), len(journey.requests)) == (calls, requests)
+
+
+@pytest.mark.asyncio
+async def test_active_repair_waiting_approval_native_resume_rechecks_policy_then_finishes() -> None:
+    journey, _durable, saved, snapshots = await _active_approval_fixture()
+    calls, requests = len(journey.calls), len(journey.requests)
+    unapproved = journey.runtime()
+    await unapproved.restore_checkpoint(saved)
+    events = [event async for event in unapproved.run(journey.context.model_copy(update={'checkpoint': saved}))]
+    waiting = await unapproved.save_checkpoint()
+    assert checkpoint_waits_for_approval(waiting, journey.approval_id), [
+        (event.kind, event.reason) for event in events[-5:]]
+    assert len(journey.requests) == requests and len(journey.calls) == calls + 1
+    assert journey.verify_count == 1 and journey.write_count == 2
+    journey.approved = True
+    approved = journey.runtime()
+    await approved.restore_checkpoint(waiting)
+    events = [event async for event in approved.run(journey.context.model_copy(update={'checkpoint': waiting}))]
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED, [(event.kind, event.reason) for event in events[-5:]]
+    assert journey.verify_count == 2 and journey.write_count == 2
+    assert [call.tool_name for call in journey.calls[calls:]] == ['project.verify', 'project.verify', 'workspace.bundle']
+    assert len(journey.requests) == requests + 3
+    assert snapshots == []
+
+
+@pytest.mark.asyncio
+async def test_active_approved_native_resume_consumes_models_before_compact() -> None:
+    journey, _durable, saved, _snapshots = await _active_approval_fixture()
+    journey.approved = True
+    requests, calls = len(journey.requests), len(journey.calls)
+    original = _DiscussionDurability.drain_completed_round
+
+    async def skip_only_approval_gate(durable, context, state):
+        if durable.approval_batch is not None:
+            assert _pending_approval_call(durable, {'implementer': 'writer', 'reviewer': 'reviewer'}) is not None
+            return
+        await original(durable, context, state)
+
+    cold = journey.runtime()
+    await cold.restore_checkpoint(saved)
+    # Isolate the downstream compact bug from the separately covered entry gate.
+    with patch.object(_DiscussionDurability, 'drain_completed_round', skip_only_approval_gate):
+        events = [event async for event in cold.run(journey.context.model_copy(update={'checkpoint': saved}))]
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED, [(event.kind, event.reason) for event in events[-5:]]
+    assert journey.write_count == 2 and journey.verify_count == 2
+    assert [call.tool_name for call in journey.calls[calls:]] == ['project.verify', 'workspace.bundle']
+    assert len(journey.requests) == requests + 3
 
 
 @pytest.mark.asyncio
