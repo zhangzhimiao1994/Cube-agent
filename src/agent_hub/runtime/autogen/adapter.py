@@ -57,7 +57,6 @@ from opentelemetry.trace import NoOpTracerProvider
 from pydantic import BaseModel, ConfigDict
 
 from agent_hub.auth.models import Role
-from agent_hub.capabilities.project_verification import validated_project_failure_payload
 from agent_hub.domain.runs import TaskMode
 from agent_hub.harness import HarnessToolGateway
 from agent_hub.harness.events import safe_tool_event_payload
@@ -123,8 +122,14 @@ from agent_hub.runtime.autogen.model_tool_correction import (
     tool_correction_request,
     validate_rejected_model_rows,
 )
+from agent_hub.runtime.autogen.project_repair_phase import (
+    DIAGNOSTIC_POLICY,
+    DIAGNOSTIC_WATERMARK,
+    ROUND_INTENT,
+    diagnostic_progress,
+    pending_round_intents,
+)
 from agent_hub.runtime.autogen.project_repair_phase import PHASE_KEY as PROJECT_REPAIR_PHASE
-from agent_hub.runtime.autogen.project_repair_phase import ROUND_INTENT, pending_round_intents
 from agent_hub.runtime.autogen.project_repair_phase import (
     completed_round as completed_project_repair_round,
 )
@@ -143,6 +148,9 @@ from agent_hub.runtime.contracts import (
     TaskContext,
 )
 from agent_hub.runtime.engineering_actions import required_engineering_action
+from agent_hub.runtime.execution_failure import (
+    execution_failure_result as _execution_failure_result,
+)
 from agent_hub.runtime.failure_reason import (
     gateway_scope_failure_payload,
     runtime_failure_diagnostic_from_reason,
@@ -159,7 +167,6 @@ from agent_hub.runtime.generated_draft_feedback import (
 from agent_hub.runtime.generated_file_recovery import reusable_generated_file_result
 from agent_hub.runtime.generated_project_guidance import generated_project_guidance
 from agent_hub.runtime.hermes_context import runtime_memory_context_text
-from agent_hub.runtime.project_prerequisite_feedback import project_prerequisite_feedback
 from agent_hub.runtime.self_repair_context import (
     project_repair_failure_text,
     self_repair_context_text,
@@ -1780,62 +1787,6 @@ class _ExecutionObservationError(RuntimeError):
         ))
 
 
-def _execution_failure_result(
-    payload: object, *, tool_name: object = None,
-) -> Mapping[str, JsonValue] | None:
-    """Accept only the bounded F01 receipt supplied by the trusted tool gateway."""
-    if not isinstance(payload, Mapping) or {"approval_id", "generated_draft_rejection"} & payload.keys():
-        return None
-    if "python_verification_failure" in payload:
-        from agent_hub.runtime.python_project_history import python_failure_feedback
-
-        return python_failure_feedback(payload, tool_name=tool_name)
-    if "verification_blocked" in payload:
-        return project_prerequisite_feedback(payload, tool_name=tool_name)
-    diagnostic = payload.get("execution_diagnostic")
-    if not isinstance(diagnostic, Mapping) or set(diagnostic) != {
-        "schema_version", "backend", "exit_code", "timed_out", "stdout", "stderr",
-        "stdout_metadata", "stderr_metadata",
-    }:
-        return None
-    exit_code, timed_out = diagnostic["exit_code"], diagnostic["timed_out"]
-    if (
-        type(diagnostic["schema_version"]) is not int or diagnostic["schema_version"] != 1
-        or type(timed_out) is not bool
-        or (exit_code is not None and type(exit_code) is not int)
-        or (not timed_out and (exit_code is None or exit_code == 0))
-        or type(diagnostic["backend"]) is not str
-        or re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", diagnostic["backend"]) is None
-    ):
-        return None
-    for stream in ("stdout", "stderr"):
-        text, metadata = diagnostic[stream], diagnostic[f"{stream}_metadata"]
-        if (
-            type(text) is not str or len(text.encode("utf-8")) > 4096
-            or not isinstance(metadata, Mapping)
-            or set(metadata) != {
-                "sanitized_bytes", "returned_bytes", "sha256", "truncated", "redacted", "redacted_lines",
-            }
-            or any(type(metadata[key]) is not int or metadata[key] < 0
-                   for key in ("sanitized_bytes", "returned_bytes", "redacted_lines"))
-            or metadata["returned_bytes"] != len(text.encode("utf-8"))
-            or metadata["sanitized_bytes"] < metadata["returned_bytes"]
-            or any(type(metadata[key]) is not bool for key in ("truncated", "redacted"))
-            or type(metadata["sha256"]) is not str
-            or re.fullmatch(r"[0-9a-f]{64}", metadata["sha256"]) is None
-        ):
-            return None
-    result: dict[str, JsonValue] = {
-        "status": "failed", "untrusted": True, "execution_diagnostic": diagnostic,
-    }
-    if "verification_failure" in payload:
-        report = validated_project_failure_payload(payload["verification_failure"], diagnostic=diagnostic)
-        if report is None:
-            return None
-        result["verification_failure"] = report
-    return result
-
-
 def _draft_observation_repeated(
     artifact: Artifact, artifacts: Sequence[Artifact], *, context: TaskContext,
 ) -> bool:
@@ -3274,6 +3225,11 @@ class AutoGenDiscussionRuntime:
                     artifacts=ledger_artifacts, allowed_tools=allowed_tools,
                     include_draft_diagnoses=soft_admission,
                     include_bootstrap_observations=soft_admission and continuation))
+                    + len(diagnostic_progress(context,
+                        phase=cast(Mapping[str, JsonValue] | None, restored.state.get(PROJECT_REPAIR_PHASE))
+                            if restored is not None else None,
+                        models=self._restored_ledger(restored, 'model_ledger'),
+                        tools=self._restored_ledger(restored, 'tool_ledger'), artifacts=ledger_artifacts))
                     if engineering and type(context.routing_decision.get("engineering_progress_budget_version")) is int
                     and context.routing_decision.get("engineering_progress_budget_version") == 1
                     else discussion_control.progress_units),
@@ -3778,13 +3734,25 @@ class AutoGenDiscussionRuntime:
                             publication_task = asyncio.create_task(publications.next())
                             if publication.cancelled:
                                 continue
-                            checkpoint = publication.build(sequence + 1)
-                            self._last_checkpoint = checkpoint
-                            yield RunEvent(kind=EventKind.CHECKPOINT_SAVED, sequence=sequence,
-                                           run_id=context.run_id, checkpoint=checkpoint)
-                            sequence += 1
-                            # Resumption follows the driver's committed event transaction.
-                            publication.acknowledge()
+                            budget = self._wall_budget
+                            snapshot = (budget.deadline, budget.progress_units, self._wall_deadline,
+                                discussion_control.progress_since_extension, self._last_checkpoint) if budget is not None else None
+                            try:
+                                checkpoint = publication.build(sequence + 1)
+                                self._last_checkpoint = checkpoint
+                                yield RunEvent(kind=EventKind.CHECKPOINT_SAVED, sequence=sequence,
+                                               run_id=context.run_id, checkpoint=checkpoint)
+                                # Resumption follows the driver's committed event transaction.
+                                acknowledged = publication.acknowledge()
+                                if not acknowledged and snapshot is not None and budget is not None:
+                                    (budget.deadline, budget.progress_units, self._wall_deadline,
+                                     discussion_control.progress_since_extension, self._last_checkpoint) = snapshot
+                                sequence += 1
+                            except BaseException:
+                                if snapshot is not None and budget is not None:
+                                    (budget.deadline, budget.progress_units, self._wall_deadline,
+                                     discussion_control.progress_since_extension, self._last_checkpoint) = snapshot
+                                raise
                             continue
                         deadline = execution_deadline()
                         if deadline is None:
@@ -4386,6 +4354,8 @@ class AutoGenDiscussionRuntime:
         work_budget = (engineering
             and type(context.routing_decision.get("engineering_progress_budget_version")) is int
             and context.routing_decision.get("engineering_progress_budget_version") == 1)
+        diagnostic = diagnostic_progress(context, phase=self._repair_phase,
+            models=model_ledger, tools=tool_ledger, artifacts=artifacts) if work_budget else {}
         if wall_budget is not None:
             if work_budget:
                 soft = context.routing_decision.get("runtime_timeout_soft_seconds")
@@ -4396,7 +4366,7 @@ class AutoGenDiscussionRuntime:
                     include_draft_diagnoses=_soft_admission_selected(context),
                     include_bootstrap_observations=(_soft_admission_selected(context)
                         and engineering_continuation_selected(context)
-                        and sum("workspace.write_text" in tools for tools in allowed_tools.values()) == 1)))
+                        and sum("workspace.write_text" in tools for tools in allowed_tools.values()) == 1))) + len(diagnostic)
                 if _checkpoint_ack_selected(context) and work_units > wall_budget.progress_units:
                     discussion_control.progress_since_extension = True
                 wall_budget.renew_for_progress(progress_units=work_units,
@@ -4454,6 +4424,9 @@ class AutoGenDiscussionRuntime:
                and engineering_continuation_selected(context) else {}),
             **({"engineering_progress_budget_version": 1} if work_budget else {}),
             **({_SOFT_ADMISSION_POLICY: 1} if engineering and _soft_admission_selected(context) else {}),
+            **({DIAGNOSTIC_POLICY: 1, DIAGNOSTIC_WATERMARK: max(diagnostic.values(), default=0)}
+               if engineering and type(context.routing_decision.get(DIAGNOSTIC_POLICY)) is int
+               and context.routing_decision.get(DIAGNOSTIC_POLICY) == 1 else {}),
             **({_CHECKPOINT_ACK_POLICY: 1} if engineering and _checkpoint_ack_selected(context) else {}),
             **({FINAL_REPORT_POLICY: 1} if engineering
                and type(context.routing_decision.get(FINAL_REPORT_POLICY)) is int
@@ -4527,7 +4500,8 @@ class AutoGenDiscussionRuntime:
         optional_state = (
             {"remaining_absolute_timeout_seconds", "engineering_tool_prefix", "engineering_action_version",
              ENGINEERING_CONTINUATION_POLICY, _CHECKPOINT_ACK_POLICY, FINAL_REPORT_POLICY, TOOL_CORRECTION_POLICY,
-             "engineering_progress_budget_version", _SOFT_ADMISSION_POLICY, 'approval_batch', PROJECT_REPAIR_PHASE}
+             "engineering_progress_budget_version", _SOFT_ADMISSION_POLICY, DIAGNOSTIC_POLICY,
+             DIAGNOSTIC_WATERMARK, 'approval_batch', PROJECT_REPAIR_PHASE}
             if checkpoint.runtime_version == _RUNTIME_VERSION
             else set()
         )
@@ -4559,6 +4533,14 @@ class AutoGenDiscussionRuntime:
             raise RuntimeExecutionError("runtime checkpoint is incompatible")
         checkpoint_ack = engineering and _checkpoint_ack_selected(context)
         soft_admission = engineering and _soft_admission_selected(context)
+        diagnostic_selected = (engineering and type(context.routing_decision.get(DIAGNOSTIC_POLICY)) is int
+                               and context.routing_decision.get(DIAGNOSTIC_POLICY) == 1)
+        if ((DIAGNOSTIC_POLICY in state) != diagnostic_selected
+                or (DIAGNOSTIC_WATERMARK in state) != diagnostic_selected
+                or diagnostic_selected and (not soft_admission
+                    or type(state[DIAGNOSTIC_POLICY]) is not int or state[DIAGNOSTIC_POLICY] != 1
+                    or type(state[DIAGNOSTIC_WATERMARK]) is not int or cast(int, state[DIAGNOSTIC_WATERMARK]) < 0)):
+            raise RuntimeExecutionError("runtime checkpoint is incompatible")
         if ((_SOFT_ADMISSION_POLICY in state) != soft_admission
             or (_SOFT_ADMISSION_POLICY in state and (
                 type(state[_SOFT_ADMISSION_POLICY]) is not int or state[_SOFT_ADMISSION_POLICY] != 1))
@@ -4773,6 +4755,15 @@ class AutoGenDiscussionRuntime:
                     state=checkpoint.state, artifacts=artifacts)
             except (ArithmeticError, KeyError, TypeError, ValueError):
                 raise RuntimeExecutionError('project repair progress evidence is invalid') from None
+        if DIAGNOSTIC_POLICY in checkpoint.state:
+            try:
+                diagnostic = diagnostic_progress(context,
+                    phase=cast(Mapping[str, JsonValue] | None, checkpoint.state.get(PROJECT_REPAIR_PHASE)),
+                    models=models, tools=self._restored_ledger(checkpoint, 'tool_ledger'), artifacts=artifacts)
+                if checkpoint.state[DIAGNOSTIC_WATERMARK] != max(diagnostic.values(), default=0):
+                    raise ValueError('diagnostic watermark mismatch')
+            except (ArithmeticError, KeyError, TypeError, ValueError):
+                raise RuntimeExecutionError('project diagnostic evidence is invalid') from None
         return artifacts
 
     @staticmethod

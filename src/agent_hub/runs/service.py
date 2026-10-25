@@ -667,6 +667,7 @@ class RunService:
                 raise ValueError('original project input requires an explicit writable project and execution scope')
         operator_selection: dict[str, object] = {
             "requested_mode": requested_mode.value,
+            "engineering_diagnostic_submission_version": 1,
             "role_planning_intent_version": 2,
             "workspace_maintenance_contract_version": 1,
             "workspace_maintenance_intent_version": 2,
@@ -1990,6 +1991,9 @@ class RunService:
                                 == "project_scale_soft_budget"):
                             routing_decision.setdefault("engineering_soft_admission_version", 1)
                             routing_decision["engineering_auto_repair_version"] = 1
+                            if (type(routing_decision.get("engineering_diagnostic_submission_version")) is int
+                                    and routing_decision["engineering_diagnostic_submission_version"] == 1):
+                                routing_decision["engineering_diagnostic_allowance_version"] = 1
                     if (mode is TaskMode.DISCUSS
                             and type(routing_decision.get("generated_project_contract_version")) is int
                             and routing_decision["generated_project_contract_version"] == 1):
@@ -2398,6 +2402,8 @@ class RunService:
                                     event = _event_at_sequence(candidate, run_id=run_id, sequence=sequence)
                                     await self._repository.persist_event(
                                         session, tenant_id=tenant_id, run_id=run_id, event=event,
+                                        **({'routing_decision': cast(Mapping[str, JsonValue], routing_decision)}
+                                           if 'engineering_diagnostic_allowance_version' in routing_decision else {}),
                                     )
                                     committed_events.append(event)
                                 if event.kind is EventKind.RUNTIME_COMPLETED:

@@ -1484,6 +1484,7 @@ class RunRepository:
     ) -> RunRecord:
         """Continue a live stopped episode only after new privately proven productive work."""
         from agent_hub.runs.artifacts import PostgresArtifactRepository
+        from agent_hub.runtime.artifacts import ArtifactRepositoryError
         from agent_hub.runtime.autogen.project_repair_phase import productive_boundary
 
         async with self._session_factory() as session, session.begin():
@@ -1508,6 +1509,10 @@ class RunRepository:
                 phase = checkpoint.state.get('project_repair_phase')
                 models = checkpoint.state.get('model_ledger')
                 floor = phase.get('model_floor') if isinstance(phase, Mapping) else None
+                diagnostic_policy = route.get('engineering_diagnostic_allowance_version')
+                if type(diagnostic_policy) is int and diagnostic_policy == 1:
+                    # Consumed diagnostic keys still need their historical whole-batch proof.
+                    floor = 0
                 if isinstance(models, tuple) and type(floor) is int and 0 <= floor < len(models):
                     ids.extend(UUID(cast(str, model['artifact_id'])) for model in models[floor:]
                                if isinstance(model, Mapping) and model.get('status') == 'succeeded')
@@ -1524,7 +1529,7 @@ class RunRepository:
                 ))).all()
                 artifacts = tuple(PostgresArtifactRepository._hydrate(a) for a in stored)
                 progress = productive_boundary(context, checkpoint, artifacts)
-            except (ArithmeticError, KeyError, TypeError, ValueError):
+            except (ArithmeticError, KeyError, TypeError, ValueError, ArtifactRepositoryError):
                 raise RunConflict('project repair episode has no safe productive boundary') from None
             baseline = await self.next_event_sequence(session, run_id) - 1
             if await self._recovery_blocked_after_checkpoint(
@@ -3006,10 +3011,21 @@ class RunRepository:
         tenant_id: UUID,
         run_id: UUID,
         event: RunEvent,
+        routing_decision: Mapping[str, JsonValue] | None = None,
     ) -> None:
         event = _event_with_failure_diagnostic(event)
         if event.kind in {EventKind.RUNTIME_FAILED, EventKind.STEP_FAILED, EventKind.TOOL_FAILED}:
             event = RunEvent.model_validate(event)
+        policy = 'engineering_diagnostic_allowance_version'
+        if event.checkpoint is not None and (
+            policy in event.checkpoint.state
+            or 'engineering_diagnostic_consumed_through' in event.checkpoint.state
+            or routing_decision is not None and policy in routing_decision
+        ) and await self._guard_diagnostic_checkpoint(
+            session, tenant_id=tenant_id, run_id=run_id, event=event,
+            routing_decision=routing_decision,
+        ):
+            return
         payload = event.to_payload()
         inserted_event_id = await session.scalar(
             insert(RunEventRow)
@@ -3036,6 +3052,107 @@ class RunRepository:
             await self._persist_approval(session, tenant_id, run_id, event)
         if event.kind is EventKind.COST_RECORDED:
             await self._persist_usage(session, tenant_id, run_id, event)
+
+    async def _guard_diagnostic_checkpoint(
+        self, session: AsyncSession, *, tenant_id: UUID, run_id: UUID, event: RunEvent,
+        routing_decision: Mapping[str, JsonValue] | None,
+    ) -> bool:
+        """Validate against the locked DB predecessor; True is an identical replay."""
+        from agent_hub.runs.artifacts import PostgresArtifactRepository
+        from agent_hub.runtime.artifacts import ArtifactRepositoryError
+        from agent_hub.runtime.autogen.project_repair_phase import validate_diagnostic_transition
+
+        checkpoint = event.checkpoint
+        assert checkpoint is not None
+        policy = 'engineering_diagnostic_allowance_version'
+        failure = 'diagnostic checkpoint transition is invalid'
+        row = await session.scalar(self._run_select(tenant_id, run_id).with_for_update())
+        if (row is None or event.run_id != run_id or checkpoint.run_id != run_id
+                or checkpoint.tenant_id != tenant_id or row.mode != TaskMode.DISCUSS.value
+                or checkpoint.mode is not TaskMode.DISCUSS or row.actor_id is None):
+            raise RunConflict(failure)
+        actual_route = row.routing_decision or {}
+        if (type(actual_route.get(policy)) is not int or actual_route[policy] != 1
+                or type(checkpoint.state.get(policy)) is not int or checkpoint.state[policy] != 1
+                or routing_decision is not None and policy in routing_decision and (
+                    type(routing_decision[policy]) is not int or routing_decision[policy] != 1)):
+            raise RunConflict(failure)
+        duplicate = await session.scalar(select(RunEventRow).where(
+            RunEventRow.tenant_id == tenant_id, RunEventRow.run_id == run_id,
+            RunEventRow.sequence == event.sequence,
+        ))
+        if duplicate is not None:
+            saved = await session.scalar(select(RunCheckpointRow).where(
+                RunCheckpointRow.tenant_id == tenant_id, RunCheckpointRow.run_id == run_id,
+                RunCheckpointRow.sequence == event.sequence,
+            ))
+            if (json.dumps(duplicate.payload, sort_keys=True, allow_nan=False)
+                    != json.dumps(event.to_payload(), sort_keys=True, allow_nan=False)
+                    or saved is None or saved.id != checkpoint.id
+                    or saved.state_sha256 != checkpoint.state_sha256
+                    or json.dumps(saved.payload, sort_keys=True, allow_nan=False)
+                    != json.dumps(checkpoint.to_payload(), sort_keys=True, allow_nan=False)):
+                raise RunConflict('diagnostic checkpoint sequence conflicts with persisted event')
+            return True
+        if event.sequence < await self.next_event_sequence(session, run_id):
+            raise RunConflict('diagnostic checkpoint sequence is stale')
+        previous = await self.latest_checkpoint(session, tenant_id=tenant_id, run_id=run_id)
+        try:
+            references: dict[UUID, str] = {}
+            for item in (previous, checkpoint):
+                if item is None:
+                    continue
+                if item.state_sha256 != item.recompute_state_sha256():
+                    raise ValueError
+                registry = item.state.get('artifact_registry', {})
+                if not isinstance(registry, Mapping):
+                    raise TypeError
+                for ledger in ('model_ledger', 'tool_ledger'):
+                    entries = item.state.get(ledger, ())
+                    if not isinstance(entries, tuple):
+                        raise TypeError
+                    for entry in entries:
+                        if not isinstance(entry, Mapping):
+                            raise TypeError
+                        identifier = entry.get('artifact_id')
+                        if identifier is None:
+                            continue
+                        digest = entry.get('artifact_sha256')
+                        if (not isinstance(identifier, str) or not isinstance(digest, str)
+                                or re.fullmatch('[a-f0-9]{64}', digest) is None
+                                or registry.get(identifier) != digest):
+                            raise ValueError
+                        artifact_id = UUID(identifier)
+                        if artifact_id in references and references[artifact_id] != digest:
+                            raise ValueError
+                        references[artifact_id] = digest
+            artifacts: tuple[Artifact, ...] = ()
+            if references:
+                written = select(RuntimeArtifactWriteRow.write_id).where(
+                    RuntimeArtifactWriteRow.tenant_id == RuntimeArtifactRow.tenant_id,
+                    RuntimeArtifactWriteRow.run_id == RuntimeArtifactRow.run_id,
+                    RuntimeArtifactWriteRow.artifact_id == RuntimeArtifactRow.id,
+                    RuntimeArtifactWriteRow.content_sha256 == RuntimeArtifactRow.content_sha256,
+                    RuntimeArtifactWriteRow.status == 'written',
+                ).exists()
+                stored = (await session.scalars(select(RuntimeArtifactRow).where(
+                    RuntimeArtifactRow.tenant_id == tenant_id, RuntimeArtifactRow.run_id == run_id,
+                    RuntimeArtifactRow.id.in_(references),
+                    or_(RuntimeArtifactRow.permanent.is_(True), written),
+                ))).all()
+                artifacts = tuple(PostgresArtifactRepository._hydrate(artifact) for artifact in stored)
+                if ({artifact.id: artifact.content_sha256 for artifact in artifacts} != references):
+                    raise ValueError
+            context = TaskContext(
+                run_id=run_id, tenant_id=tenant_id, actor_id=_database_uuid(row.actor_id),
+                actor_role=None if row.actor_role is None else Role(row.actor_role),
+                mode=TaskMode.DISCUSS, request=row.request,
+                routing_decision=cast(Mapping[str, JsonValue], actual_route),
+            )
+            validate_diagnostic_transition(context, previous, checkpoint, artifacts)
+        except (ArithmeticError, KeyError, TypeError, ValueError, ArtifactRepositoryError):
+            raise RunConflict(failure) from None
+        return False
 
     async def record_self_repair_decision(
         self,
