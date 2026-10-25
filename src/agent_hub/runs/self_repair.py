@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Literal
+from decimal import Decimal, InvalidOperation
+from typing import Literal, cast
 from uuid import UUID
 
 from agent_hub.domain.runs import RunStatus, TaskMode
@@ -21,7 +23,7 @@ from agent_hub.recovery_metadata import (
     SAFE_SELF_REPAIR_ORCHESTRATION_RECOVERY_HINTS,
     SAFE_SELF_REPAIR_RECOVERY_STRATEGIES,
 )
-from agent_hub.runtime.contracts import EventKind, JsonValue, RunEvent
+from agent_hub.runtime.contracts import EventKind, JsonValue, RunEvent, RuntimeCheckpoint
 from agent_hub.runtime.failure_reason import (
     RECOVERY_BLOCKED_FAILURE_REASON,
     runtime_failure_diagnostic_from_reason,
@@ -270,9 +272,10 @@ class SelfRepairPolicy:
     enabled: bool = True
     requires_approval: bool = True
     max_attempts: int = 1
+    automatic_project_repairs: bool = True
 
     def __post_init__(self) -> None:
-        for name in ("enabled", "requires_approval"):
+        for name in ("enabled", "requires_approval", "automatic_project_repairs"):
             if type(getattr(self, name)) is not bool:
                 raise TypeError(f"{name} must be a boolean")
         if type(self.max_attempts) is not int or not 1 <= self.max_attempts <= 3:
@@ -302,6 +305,8 @@ class SelfRepairDecision:
     suggested_action: str | None = None
     blocked_contract_ids: tuple[str, ...] = ()
     role_capability_requirements: tuple[Mapping[str, JsonValue], ...] = ()
+    automatic_checkpoint_sha256: str | None = None
+    automatic_scope_sha256: str | None = None
 
     @property
     def pauses_run(self) -> bool:
@@ -334,6 +339,8 @@ class SelfRepairDecision:
             suggested_action=self.suggested_action,
             blocked_contract_ids=self.blocked_contract_ids,
             role_capability_requirements=self.role_capability_requirements,
+            automatic_checkpoint_sha256=self.automatic_checkpoint_sha256,
+            automatic_scope_sha256=self.automatic_scope_sha256,
         )
 
     def to_event(self, *, run_id: UUID, sequence: int) -> RunEvent:
@@ -414,7 +421,108 @@ class SelfRepairDecision:
             proposal["blocked_contract_ids"] = self.blocked_contract_ids
         if self.role_capability_requirements:
             proposal["role_capability_requirements"] = self.role_capability_requirements
+        if self.automatic_checkpoint_sha256 is not None:
+            proposal["automatic_checkpoint_sha256"] = self.automatic_checkpoint_sha256
+            proposal["automatic_scope_sha256"] = self.automatic_scope_sha256
         return proposal
+
+
+def project_repair_scope_sha256(routing_decision: Mapping[str, object]) -> str:
+    from agent_hub.runtime.autogen.project_repair_phase import authority_digest
+
+    return authority_digest(routing_decision)
+
+
+def project_repair_checkpoint_is_safe(
+    checkpoint: RuntimeCheckpoint | None,
+    *,
+    routing_decision: Mapping[str, object] | None,
+    run_id: UUID,
+    tenant_id: UUID,
+    mode: TaskMode | None,
+) -> bool:
+    """Authorize only a new, bounded project continuation, never an outcome replay."""
+    route = routing_decision or {}
+    if (checkpoint is None or checkpoint.run_id != run_id or checkpoint.tenant_id != tenant_id
+            or checkpoint.mode is not mode or mode is not TaskMode.DISCUSS
+            or checkpoint.runtime_type != 'autogen' or checkpoint.runtime_version != '2'
+            or checkpoint.state_sha256 != checkpoint.recompute_state_sha256()
+            or route.get('source') == 'self_repair' or route.get('self_repair_accepted') is True
+            or route.get('sandbox_profile') != 'workspace_write'
+            or any(not isinstance(route.get(key), str) or not route[key]
+                   for key in ('project_id', 'workspace_session_id'))
+            or any(type(route.get(key)) is not int or route[key] != 1 for key in (
+                'engineering_auto_repair_version', 'engineering_delivery_contract_version',
+                'engineering_checkpoint_ack_version',
+            ))):
+        return False
+    state = checkpoint.state
+    if (state.get('terminal') is not False or 'approval_batch' in state
+            or type(state.get('engineering_checkpoint_ack_version')) is not int
+            or state.get('engineering_checkpoint_ack_version') != 1):
+        return False
+    soft = _positive_repair_seconds(state.get('remaining_timeout_seconds'))
+    absolute = _positive_repair_seconds(state.get('remaining_absolute_timeout_seconds'))
+    ceiling = _positive_repair_seconds(route.get('runtime_timeout_absolute_seconds'))
+    if (soft is None or absolute is None or ceiling is None
+            or not 0 < soft <= absolute <= ceiling):
+        return False
+    tokens, hard_tokens = route.get('runtime_plan_token_budget'), route.get('runtime_token_absolute_tokens')
+    usage = state.get('usage')
+    if (type(tokens) is not int or type(hard_tokens) is not int
+            or not 0 < tokens <= hard_tokens or not isinstance(usage, Mapping)):
+        return False
+    used_tokens, cost_text = usage.get('tokens'), usage.get('cost_usd')
+    if type(used_tokens) is not int or not 0 <= used_tokens < tokens or not isinstance(cost_text, str):
+        return False
+    try:
+        cost = Decimal(cost_text)
+    except InvalidOperation:
+        return False
+    if not cost.is_finite() or cost < 0:
+        return False
+    registry = state.get('artifact_registry')
+    if not isinstance(registry, Mapping):
+        return False
+    for key, statuses in (('model_ledger', {'succeeded', 'rejected'}), ('tool_ledger', {'succeeded', 'failed'})):
+        raw_entries = state.get(key)
+        if (not isinstance(raw_entries, Sequence) or isinstance(raw_entries, str | bytes)
+                or key == 'tool_ledger' and not raw_entries
+                or any(not isinstance(e, Mapping) for e in raw_entries)):
+            return False
+        entries = cast(Sequence[Mapping[str, JsonValue]], raw_entries)
+        if key == 'model_ledger' and any(isinstance(e, Mapping) and e.get('status') == 'rejected' for e in entries):
+            from agent_hub.runtime.autogen.model_tool_correction import validate_rejected_model_rows
+
+            try:
+                enabled = (type(route.get('engineering_tool_correction_version')) is int
+                           and route.get('engineering_tool_correction_version') == 1)
+                records = validate_rejected_model_rows(entries, run_id=run_id, tenant_id=tenant_id,
+                                                       repair_enabled=enabled)
+                if (not enabled or sum(r.usage.total_tokens for r in records if r.usage) > used_tokens
+                        or any(e.get('status') == 'rejected' and (i + 1 >= len(entries)
+                            or entries[i + 1].get('status') != 'succeeded'
+                            or entries[i + 1].get('correction_for') != i) for i, e in enumerate(entries))):
+                    return False
+            except (ArithmeticError, AttributeError, KeyError, TypeError, ValueError):
+                return False
+        for entry in entries:
+            if not isinstance(entry, Mapping) or entry.get('status') not in statuses:
+                return False
+            if key == 'model_ledger' and entry.get('status') == 'rejected':
+                continue
+            artifact_id, digest = entry.get('artifact_id'), entry.get('artifact_sha256')
+            if (not isinstance(artifact_id, str) or not isinstance(digest, str)
+                    or re.fullmatch(r'[a-f0-9]{64}', digest) is None
+                    or registry.get(artifact_id) != digest):
+                return False
+    return True
+
+
+def _positive_repair_seconds(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    return float(value) if math.isfinite(value) and value > 0 else None
 
 
 def _repair_resolution(failure_category: str) -> tuple[str, str]:

@@ -9,7 +9,7 @@ import math
 import re
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import aclosing
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Literal, Protocol, cast
@@ -59,6 +59,8 @@ from agent_hub.runs.self_repair import (
     SelfRepairDecision,
     SelfRepairPolicy,
     classify_terminal_run,
+    project_repair_checkpoint_is_safe,
+    project_repair_scope_sha256,
 )
 from agent_hub.runs.workspace import (
     DEFAULT_PROJECT_ID,
@@ -1987,6 +1989,7 @@ class RunService:
                                 and routing_decision.get("runtime_timeout_source")
                                 == "project_scale_soft_budget"):
                             routing_decision.setdefault("engineering_soft_admission_version", 1)
+                            routing_decision["engineering_auto_repair_version"] = 1
                     if (mode is TaskMode.DISCUSS
                             and type(routing_decision.get("generated_project_contract_version")) is int
                             and routing_decision["generated_project_contract_version"] == 1):
@@ -2528,6 +2531,10 @@ class RunService:
             }:
                 return _submitted(failed)
             if _routing_source(failed.routing_decision) == "self_repair":
+                if not runtime_cancel_failed:
+                    continued = await self._safe_continue_project_repair(failed.tenant_id, run_id)
+                    if continued is not None:
+                        return continued
                 await self._safe_record_self_repair_execution_event(
                     tenant_id=failed.tenant_id,
                     run_id=run_id,
@@ -2548,6 +2555,10 @@ class RunService:
                 events=(*observed_events, failure_event),
                 policy=self._self_repair_policy,
             )
+            if not runtime_cancel_failed:
+                repair_decision = await self._safe_project_repair_decision(
+                    tenant_id=failed.tenant_id, run_id=run_id, decision=repair_decision,
+                )
             if repair_decision is not None:
                 await self._safe_record_self_repair_decision(
                     tenant_id=failed.tenant_id,
@@ -2607,6 +2618,10 @@ class RunService:
             terminal in {RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED}
             and _routing_source(routing_decision) == "self_repair"
         ):
+            if terminal is RunStatus.FAILED:
+                continued = await self._safe_continue_project_repair(tenant_id, run_id)
+                if continued is not None:
+                    return continued
             await self._safe_record_self_repair_execution_event(
                 tenant_id=tenant_id,
                 run_id=run_id,
@@ -2620,6 +2635,9 @@ class RunService:
             routing_decision=routing_decision,
             events=tuple(observed_events),
             policy=self._self_repair_policy,
+        )
+        repair_decision = await self._safe_project_repair_decision(
+            tenant_id=tenant_id, run_id=run_id, decision=repair_decision,
         )
         if repair_decision is not None:
             await self._safe_record_self_repair_decision(
@@ -2665,6 +2683,31 @@ class RunService:
             if not _record_has_worker_execution(released):
                 await self._release_conversation_successor(tenant_id, run_id)
         return await self._submitted_by_run_id(tenant_id, run_id)
+
+    async def _safe_continue_project_repair(self, tenant_id: UUID, run_id: UUID) -> SubmittedRun | None:
+        if not self._self_repair_policy.enabled or not self._self_repair_policy.automatic_project_repairs:
+            return None
+        try:
+            record = await self._repository.get(tenant_id, run_id)
+            route = record.routing_decision or {}
+            if (route.get('source') != 'self_repair'
+                    or type(route.get('engineering_auto_repair_version')) is not int
+                    or route.get('engineering_auto_repair_version') != 1):
+                return None
+            async with await self._repository.run_transaction() as session:
+                checkpoint = await self._repository.latest_checkpoint(session, tenant_id=tenant_id, run_id=run_id)
+            if checkpoint is None or 'project_repair_phase' not in checkpoint.state:
+                return None
+            continued = await self._repository.continue_project_repair_and_enqueue(
+                tenant_id=tenant_id, run_id=run_id, version=record.version,
+                checkpoint_sha256=checkpoint.state_sha256)
+            return _submitted(continued)
+        except RunConflict:
+            return None
+        except Exception as error:
+            _LOGGER.exception('project_repair_continuation_failed run_id=%s error_type=%s',
+                              run_id, type(error).__name__)
+            return None
 
     async def _safe_record_self_repair_execution_event(
         self,
@@ -2794,6 +2837,52 @@ class RunService:
                 type(error).__name__,
             )
 
+    async def _safe_project_repair_decision(
+        self, *, tenant_id: UUID, run_id: UUID, decision: SelfRepairDecision | None,
+    ) -> SelfRepairDecision | None:
+        # Called only by this execution's terminal path, not historical recovery.
+        if decision is None or decision.kind != 'repair.classified':
+            return decision
+        new_project = False
+
+        def blocked(reason: str) -> SelfRepairDecision:
+            return replace(decision, kind='repair.skipped', action='manual_review',
+                           skip_reason=reason, requires_approval=False, automatic_execution=False)
+
+        try:
+            record = await self._repository.get(tenant_id, run_id)
+            route = record.routing_decision or {}
+            new_project = (type(route.get('engineering_auto_repair_version')) is int
+                           and route.get('engineering_auto_repair_version') == 1)
+            if not new_project:
+                return decision
+            if not self._self_repair_policy.automatic_project_repairs:
+                return blocked('project_auto_repair_disabled')
+            if decision.failure_category not in {'runtime_failure', 'step_failure', 'tool_failure'}:
+                return blocked('external_resolution_required:' + decision.failure_category)
+            if (record.status is not RunStatus.FAILED or record.actor_id is None
+                    or record.blocked_by_run_id is not None or _record_has_worker_execution(record)):
+                return blocked('project_repair_execution_not_quiescent')
+            async with await self._repository.run_transaction() as session, session.begin():
+                checkpoint = await self._repository.latest_checkpoint(
+                    session, tenant_id=tenant_id, run_id=run_id,
+                )
+            if not project_repair_checkpoint_is_safe(
+                checkpoint, routing_decision=record.routing_decision,
+                run_id=run_id, tenant_id=tenant_id, mode=record.mode,
+            ):
+                return blocked('project_repair_checkpoint_not_resumable')
+            assert checkpoint is not None
+            return replace(decision, requires_approval=False, automatic_execution=True,
+                           automatic_checkpoint_sha256=checkpoint.state_sha256,
+                           automatic_scope_sha256=project_repair_scope_sha256(
+                               record.routing_decision or {},
+                           ))
+        except Exception as error:
+            _LOGGER.exception('run_project_repair_evidence_failed run_id=%s error_type=%s',
+                              run_id, type(error).__name__)
+            return blocked('project_repair_evidence_unavailable') if new_project else decision
+
     async def _safe_auto_accept_self_repair_if_allowed(
         self,
         *,
@@ -2814,11 +2903,14 @@ class RunService:
                 submitted.repair_proposal
             ):
                 return None
+            options = ({'automatic_checkpoint_sha256': decision.automatic_checkpoint_sha256}
+                       if decision.automatic_checkpoint_sha256 is not None else {})
             record = await self._repository.accept_self_repair_and_enqueue(
                 tenant_id=tenant_id,
                 run_id=run_id,
                 decision_token=submitted.decision_token,
                 version=submitted.version,
+                **options,
             )
             return _submitted(record)
         except Exception as error:
@@ -3691,6 +3783,8 @@ def _should_drop_incompatible_self_repair_checkpoint(
     routing_decision: Mapping[str, object] | None,
 ) -> bool:
     if (
+        (routing_decision or {}).get('engineering_auto_repair_version') == 1
+        or
         _routing_source(routing_decision) != "self_repair"
         or routing_decision is None
         or routing_decision.get("self_repair_accepted") is not True

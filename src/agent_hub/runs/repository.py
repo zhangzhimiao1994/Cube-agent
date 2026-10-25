@@ -30,14 +30,27 @@ from agent_hub.db.models import (
     RunOutboxRow,
     RunRow,
     RunStepRow,
+    RuntimeArtifactRow,
+    RuntimeArtifactWriteRow,
     RunUsageRow,
     UserRow,
 )
 from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.runs.approval_checkpoint import checkpoint_waits_for_approval
 from agent_hub.runs.context_evidence import CONTEXT_EVENT_KINDS, context_event_projection
-from agent_hub.runs.self_repair import repair_context_from_proposal
-from agent_hub.runtime.contracts import Artifact, EventKind, JsonValue, RunEvent, RuntimeCheckpoint
+from agent_hub.runs.self_repair import (
+    project_repair_checkpoint_is_safe,
+    project_repair_scope_sha256,
+    repair_context_from_proposal,
+)
+from agent_hub.runtime.contracts import (
+    Artifact,
+    EventKind,
+    JsonValue,
+    RunEvent,
+    RuntimeCheckpoint,
+    TaskContext,
+)
 from agent_hub.runtime.failure_reason import (
     RECOVERY_BLOCKED_FAILURE_REASON,
     is_public_project_prerequisite_text,
@@ -1361,6 +1374,7 @@ class RunRepository:
         run_id: UUID,
         decision_token: str,
         version: int,
+        automatic_checkpoint_sha256: str | None = None,
     ) -> RunRecord:
         async with self._session_factory() as session, session.begin():
             row = await session.scalar(self._run_select(tenant_id, run_id).with_for_update())
@@ -1383,6 +1397,37 @@ class RunRepository:
             proposal = routing_decision.get("repair_proposal")
             if not isinstance(proposal, dict) or proposal.get("kind") != "self_repair":
                 raise RunConflict("self repair proposal is invalid")
+            bound_checkpoint = proposal.get('automatic_checkpoint_sha256')
+            if bound_checkpoint is not None or automatic_checkpoint_sha256 is not None:
+                if (RunStatus(row.status) is not RunStatus.FAILED
+                        or self.has_worker_execution(row) or row.blocked_by_run_id is not None
+                        or row.actor_id is None
+                        or row.mode is None
+                        or not isinstance(bound_checkpoint, str)
+                        or re.fullmatch(r'[a-f0-9]{64}', bound_checkpoint) is None
+                        or automatic_checkpoint_sha256 is not None
+                        and automatic_checkpoint_sha256 != bound_checkpoint
+                        or proposal.get('requires_approval') is not False
+                        or proposal.get('automatic_execution') is not True
+                        or proposal.get('automatic_scope_sha256')
+                        != project_repair_scope_sha256(routing_decision)
+                        or proposal.get('failure_kind') not in {
+                            'runtime_failure', 'step_failure', 'tool_failure',
+                        }):
+                    raise RunConflict('automatic project repair authority is invalid')
+                checkpoint = await self.latest_checkpoint(
+                    session, tenant_id=tenant_id, run_id=run_id,
+                )
+                if (not project_repair_checkpoint_is_safe(
+                    checkpoint, routing_decision=routing_decision,
+                    run_id=run_id, tenant_id=tenant_id,
+                    mode=None if row.mode is None else TaskMode(row.mode),
+                ) or checkpoint is None or checkpoint.state_sha256 != bound_checkpoint
+                        or await self._recovery_blocked_after_checkpoint(
+                            session, run_id=run_id,
+                            minimum_event_sequence=await self.next_event_sequence(session, run_id) - 1,
+                        )):
+                    raise RunConflict('automatic project repair checkpoint is unavailable')
             attempt = proposal.get("attempt", 1)
             max_attempts = proposal.get("max_attempts", 1)
             if type(attempt) is not int or type(max_attempts) is not int or attempt > max_attempts:
@@ -1431,6 +1476,63 @@ class RunRepository:
                     payload={"run_id": str(run_id)},
                 )
             )
+            await session.flush()
+            return self._record(row)
+
+    async def continue_project_repair_and_enqueue(
+        self, *, tenant_id: UUID, run_id: UUID, version: int, checkpoint_sha256: str,
+    ) -> RunRecord:
+        """Continue a live stopped episode only after new privately proven productive work."""
+        from agent_hub.runs.artifacts import PostgresArtifactRepository
+        from agent_hub.runtime.autogen.project_repair_phase import productive_boundary
+
+        async with self._session_factory() as session, session.begin():
+            row = await session.scalar(self._run_select(tenant_id, run_id).with_for_update())
+            if (row is None or row.version != version or RunStatus(row.status) is not RunStatus.FAILED
+                    or self.has_worker_execution(row) or row.blocked_by_run_id is not None
+                    or row.actor_id is None or row.mode != TaskMode.DISCUSS.value):
+                raise RunConflict('project repair episode is not quiescent')
+            checkpoint = await self.latest_checkpoint(session, tenant_id=tenant_id, run_id=run_id)
+            if checkpoint is None or checkpoint.state_sha256 != checkpoint_sha256:
+                raise RunConflict('project repair episode checkpoint changed')
+            route = dict(row.routing_decision or {})
+            try:
+                context = TaskContext(run_id=run_id, tenant_id=tenant_id, actor_id=row.actor_id,
+                    actor_role=None if row.actor_role is None else Role(row.actor_role),
+                    mode=TaskMode.DISCUSS, request=row.request, routing_decision=cast(Mapping[str, JsonValue], route))
+                tools = checkpoint.state.get('tool_ledger')
+                if not isinstance(tools, tuple):
+                    raise TypeError('tool ledger is unavailable')
+                ids = [UUID(cast(str, tool['artifact_id'])) for tool in tools
+                    if isinstance(tool, Mapping) and tool.get('status') in {'succeeded', 'failed'}]
+                written = select(RuntimeArtifactWriteRow.write_id).where(
+                    RuntimeArtifactWriteRow.tenant_id == RuntimeArtifactRow.tenant_id,
+                    RuntimeArtifactWriteRow.run_id == RuntimeArtifactRow.run_id,
+                    RuntimeArtifactWriteRow.artifact_id == RuntimeArtifactRow.id,
+                    RuntimeArtifactWriteRow.content_sha256 == RuntimeArtifactRow.content_sha256,
+                    RuntimeArtifactWriteRow.status == 'written',
+                ).exists()
+                stored = (await session.scalars(select(RuntimeArtifactRow).where(
+                    RuntimeArtifactRow.tenant_id == tenant_id, RuntimeArtifactRow.run_id == run_id,
+                    RuntimeArtifactRow.id.in_(ids), or_(RuntimeArtifactRow.permanent.is_(True), written),
+                ))).all()
+                artifacts = tuple(PostgresArtifactRepository._hydrate(a) for a in stored)
+                progress = productive_boundary(context, checkpoint, artifacts)
+            except (ArithmeticError, KeyError, TypeError, ValueError):
+                raise RunConflict('project repair episode has no safe productive boundary') from None
+            baseline = await self.next_event_sequence(session, run_id) - 1
+            if await self._recovery_blocked_after_checkpoint(
+                    session, run_id=run_id, minimum_event_sequence=baseline):
+                raise RunConflict('project repair episode has unconfirmed effects')
+            # Preserve proposal/attempt, hard ceilings, usage and every ledger row.
+            row.routing_decision = {**route, 'self_repair_episode_progress': progress,
+                                   'self_repair_recovery_baseline_sequence': baseline}
+            row.status = RunStatus.QUEUED.value
+            row.version += 1
+            session.add(RunOutboxRow(id=uuid4(), tenant_id=tenant_id, run_id=run_id,
+                task_name='agent_hub.runs.execute',
+                idempotency_key=f'{tenant_id}:{run_id}:repair-progress:{checkpoint_sha256}',
+                payload={'run_id': str(run_id)}))
             await session.flush()
             return self._record(row)
 

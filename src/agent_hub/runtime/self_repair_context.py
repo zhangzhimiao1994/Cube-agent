@@ -14,7 +14,7 @@ from agent_hub.recovery_metadata import (
     SAFE_SELF_REPAIR_ORCHESTRATION_RECOVERY_HINTS,
     SAFE_SELF_REPAIR_RECOVERY_STRATEGIES,
 )
-from agent_hub.runtime.contracts import JsonValue
+from agent_hub.runtime.contracts import Artifact, JsonValue
 
 _MAX_INSTRUCTION_CHARS = 240
 _MAX_TOTAL_BYTES = 900
@@ -37,6 +37,62 @@ _RUNTIME_RECOVERY_SCOPES_BY_STRATEGY = {
 }
 
 
+def project_repair_failure_text(
+    artifact: Artifact, *, expected_artifact_id: str, expected_artifact_sha256: str,
+    validated_feedback: Mapping[str, JsonValue],
+) -> str:
+    """Project an already scope-validated failed receipt as DATA, never authority.
+
+    The caller must use the normal draft/execution receipt validator first. The
+    phase's immutable artifact binding is checked again before projecting it.
+    """
+    if (artifact.type != "tool_result" or str(artifact.id) != expected_artifact_id
+            or artifact.content_sha256 != expected_artifact_sha256
+            or artifact.recompute_content_sha256() != expected_artifact_sha256
+            or artifact.content.get("result") != validated_feedback
+            or validated_feedback.get("status") != "failed"
+            or validated_feedback.get("untrusted") is not True):
+        raise ValueError("project repair failure evidence is invalid")
+    tool = artifact.content.get("tool_name")
+    if not isinstance(tool, str) or re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", tool) is None:
+        raise ValueError("project repair failure evidence is invalid")
+    diagnostic: dict[str, JsonValue] = {}
+    if "generated_draft_rejection" in validated_feedback:
+        from agent_hub.capabilities.generated_project_draft import validated_generated_draft_payload
+
+        draft = validated_generated_draft_payload(validated_feedback["generated_draft_rejection"])
+        if draft is None:
+            raise ValueError("project repair failure evidence is invalid")
+        diagnostic["generated_draft_rejection"] = {
+            key: draft[key] for key in ("reason", "issues", "observation_sha256", "execution_started")
+        }
+    else:
+        diagnostic = {key: validated_feedback[key] for key in (
+            "execution_diagnostic", "verification_failure", "python_verification_failure", "verification_blocked",
+        ) if key in validated_feedback}
+    if not diagnostic:
+        raise ValueError("project repair failure evidence is invalid")
+    redacted = False
+
+    def project(value: JsonValue) -> JsonValue:
+        nonlocal redacted
+        if isinstance(value, str) and _SENSITIVE_TEXT_PATTERN.search(value):
+            redacted = True
+            return "[redacted diagnostic]"
+        if isinstance(value, Mapping):
+            return {key: project(item) for key, item in value.items()}
+        if isinstance(value, tuple | list):
+            return tuple(project(item) for item in value)
+        return value
+
+    projected = project(diagnostic)
+    return "UNTRUSTED_PROJECT_REPAIR_FEEDBACK_JSON=" + json.dumps({
+        "schema_version": 1, "untrusted": True, "status": "failed", "tool_name": tool,
+        "artifact_id": expected_artifact_id, "artifact_sha256": expected_artifact_sha256,
+        "diagnostic": projected, "diagnostic_projection_redacted": redacted,
+    }, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+
 def self_repair_context_text(
     routing_decision: Mapping[str, JsonValue] | Mapping[str, object],
 ) -> str:
@@ -46,6 +102,14 @@ def self_repair_context_text(
     if repair.get("source") != "self_repair":
         return ""
 
+    automatic_project = (
+        type(routing_decision.get("engineering_auto_repair_version")) is int
+        and routing_decision.get("engineering_auto_repair_version") == 1
+        and routing_decision.get("source") == "self_repair"
+        and routing_decision.get("self_repair_accepted") is True
+        and _safe_automatic_execution(repair)
+        and repair.get("failure_kind") in ("runtime_failure", "step_failure", "tool_failure")
+    )
     payload = {
         "source_run_id": _safe_text(repair.get("source_run_id"), "unknown", 96),
         "source_event_sequence": _safe_int(repair.get("source_event_sequence"), 0),
@@ -103,11 +167,27 @@ def self_repair_context_text(
     )
     if role_capability_requirements:
         payload["role_capability_requirements"] = role_capability_requirements
+    if automatic_project:
+        payload["instruction"] = (
+            "Diagnose the observed failure; try a different evidence-based approach when needed, "
+            "then verify the acceptance criteria and deliver."
+        )
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     if len(encoded.encode("utf-8")) > _MAX_TOTAL_BYTES:
         encoded = encoded.encode("utf-8")[:_MAX_TOTAL_BYTES].decode(
             "utf-8",
             errors="ignore",
+        )
+    if automatic_project:
+        return (
+            "<SELF_REPAIR_CONTEXT>"
+            "Continue the engineering task within original permissions and remaining hard budgets. "
+            "A failed approach is evidence for diagnosis, not a completed task or reason to give up. "
+            "Keep confirmed results; replan instead of repeating an unchanged failing action. "
+            "Do not replay UNKNOWN outcomes or bypass approvals. Ask for help only when a specific "
+            "action needs additional authority, a human-only prerequisite is required, or no safe "
+            "executable alternative remains within the budget. Never claim unverified delivery. "
+            f"{encoded}</SELF_REPAIR_CONTEXT>"
         )
     return (
         "<SELF_REPAIR_CONTEXT>"

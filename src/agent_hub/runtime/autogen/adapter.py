@@ -123,6 +123,10 @@ from agent_hub.runtime.autogen.model_tool_correction import (
     tool_correction_request,
     validate_rejected_model_rows,
 )
+from agent_hub.runtime.autogen.project_repair_phase import PHASE_KEY as PROJECT_REPAIR_PHASE
+from agent_hub.runtime.autogen.project_repair_phase import prepare as prepare_project_repair_phase
+from agent_hub.runtime.autogen.project_repair_phase import selected as project_repair_selected
+from agent_hub.runtime.autogen.project_repair_phase import validate as validate_project_repair_phase
 from agent_hub.runtime.autogen.termination import CompositeDiscussionTermination, DiscussionUsage
 from agent_hub.runtime.contracts import (
     _CAPACITY_DIAGNOSTIC_ENUMS,
@@ -152,7 +156,10 @@ from agent_hub.runtime.generated_file_recovery import reusable_generated_file_re
 from agent_hub.runtime.generated_project_guidance import generated_project_guidance
 from agent_hub.runtime.hermes_context import runtime_memory_context_text
 from agent_hub.runtime.project_prerequisite_feedback import project_prerequisite_feedback
-from agent_hub.runtime.self_repair_context import self_repair_context_text
+from agent_hub.runtime.self_repair_context import (
+    project_repair_failure_text,
+    self_repair_context_text,
+)
 from agent_hub.subprocess_cleanup import ProcessCleanupIncomplete
 
 _ID = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,127}$")
@@ -533,6 +540,7 @@ class _DiscussionDurability:
         artifacts: tuple[Artifact, ...] = (),
         engineering_tool_prefix: int = 0,
         approval_batch: Mapping[str, JsonValue] | None = None,
+        repair_phase: Mapping[str, JsonValue] | None = None,
     ) -> None:
         self._publish = publish
         self._store = store
@@ -553,6 +561,9 @@ class _DiscussionDurability:
         self.failure_payload: Mapping[str, JsonValue] = {}
         self.approval_pending = False
         self.approval_batch = dict(approval_batch) if approval_batch is not None else None
+        self.repair_phase = dict(repair_phase) if repair_phase is not None else None
+        if self.repair_phase is not None:
+            self._model_cursor = cast(int, self.repair_phase['model_floor'])
 
     @property
     def artifacts(self) -> tuple[Artifact, ...]:
@@ -908,6 +919,14 @@ class _DiscussionDurability:
 
     async def compact(self, *, preserve_engineering: bool = False) -> None:
         async with self._model_lock:
+            if self.repair_phase is not None:
+                if not preserve_engineering or self._model_cursor != len(self.model_entries):
+                    raise RuntimeExecutionError('project repair phase has unconsumed model outcomes')
+                # Keep every source/new outcome. Only advance an acknowledged round boundary.
+                self.repair_phase['model_floor'] = len(self.model_entries)
+                self.engineering_tool_prefix = self._tool_cursor
+                self.approval_batch = None
+                return
             self.model_entries.clear()
             self.approval_batch = None
             if preserve_engineering:
@@ -2765,6 +2784,7 @@ class AutoGenDiscussionRuntime:
             raise RuntimeExecutionError("AutoGen runtime version is incompatible")
         self._gateway = gateway
         self._plan = plan
+        self._repair_phase: dict[str, JsonValue] | None = None
         if (
             any(participant.allowed_tools for participant in plan.participants)
             and capability_gateway is None
@@ -3209,7 +3229,15 @@ class AutoGenDiscussionRuntime:
                 if engineering and restored is not None else 0,
                 approval_batch=cast(Mapping[str, JsonValue] | None, restored.state.get('approval_batch'))
                 if restored is not None else None,
+                repair_phase=cast(Mapping[str, JsonValue] | None, restored.state.get(PROJECT_REPAIR_PHASE))
+                if restored is not None else None,
             )
+            self._repair_phase = durability.repair_phase
+            if durability.repair_phase is not None:
+                if any(row.get('status') == 'running' for row in durability.model_entries):
+                    raise ModelOutcomeUncertain('model outcome is uncertain')
+                if any(row.get('status') == 'running' for row in durability.tool_entries):
+                    raise ToolOutcomeUncertain('capability outcome is uncertain')
             if restored is not None and reports and tools_ready():
                 # A verified tool prefix is a phase boundary, not permission to
                 # replay model calls or effects from the discarded team transcript.
@@ -3554,6 +3582,24 @@ class AutoGenDiscussionRuntime:
 
             async def stream_after_approval() -> AsyncIterator[Any]:
                 assert durability is not None
+                if restored is not None and project_repair_selected(context) and durability.repair_phase is None:
+                    phase = prepare_project_repair_phase(context, restored,
+                        durability.model_entries, durability.tool_entries)
+                    previous = (durability._model_cursor, durability._tool_cursor,
+                                durability.engineering_tool_prefix)
+                    durability.repair_phase = phase
+                    self._repair_phase = phase
+                    durability._model_cursor = len(durability.model_entries)
+                    durability._tool_cursor = len(durability.tool_entries)
+                    durability.engineering_tool_prefix = len(durability.tool_entries)
+                    try:
+                        # The pump commits and ACKs this phase before any new model request.
+                        await durability._checkpoint()
+                    except BaseException:
+                        durability.repair_phase = self._repair_phase = None
+                        (durability._model_cursor, durability._tool_cursor,
+                         durability.engineering_tool_prefix) = previous
+                        raise
                 pending = _pending_approval_call(durability, participant_models) if restored is not None else None
                 if pending is not None:
                     actor, calls, cursor = pending
@@ -3582,8 +3628,25 @@ class AutoGenDiscussionRuntime:
                             break
                     await durability.compact(preserve_engineering=True)
                     await durability._checkpoint()
+                task = self._task_text(context, tuple(message_artifacts))
+                if durability.repair_phase is not None:
+                    phase = durability.repair_phase
+                    failed = next((a for a in ledger_artifacts if str(a.id) == phase['failure_artifact_id']), None)
+                    if failed is not None:
+                        result = failed.content.get('result')
+                        feedback = (_generated_draft_artifact_feedback(failed, context=context, actor=failed.producer)
+                            if isinstance(result, Mapping) and 'generated_draft_rejection' in result
+                            else _execution_failure_result(result, tool_name=failed.content.get('tool_name')))
+                        if feedback is None:
+                            raise RuntimeExecutionError('project repair failure evidence is invalid')
+                        task += '\n\n' + project_repair_failure_text(failed,
+                            expected_artifact_id=cast(str, phase['failure_artifact_id']),
+                            expected_artifact_sha256=cast(str, phase['failure_artifact_sha256']),
+                            validated_feedback=feedback)
+                    elif phase['failure_artifact_id'] is not None:
+                        raise RuntimeExecutionError('project repair failure evidence is unavailable')
                 child_stream = team.run_stream(
-                    task=self._task_text(context, tuple(message_artifacts)),
+                    task=task,
                     cancellation_token=self._cancel_token,
                 )
                 try:
@@ -4015,6 +4078,7 @@ class AutoGenDiscussionRuntime:
             self._discussion_control = None
             self._wall_deadline = None
             self._wall_budget = None
+            self._repair_phase = None
 
     @staticmethod
     def _task_text(context: TaskContext, transcript: tuple[Artifact, ...] = ()) -> str:
@@ -4269,6 +4333,7 @@ class AutoGenDiscussionRuntime:
             "model_ledger": model_ledger,
             "tool_ledger": tool_ledger,
             **({'approval_batch': approval_batch} if approval_batch is not None else {}),
+            **({PROJECT_REPAIR_PHASE: self._repair_phase} if self._repair_phase is not None else {}),
             **({"engineering_tool_prefix": engineering_tool_prefix} if engineering else {}),
             **({"engineering_action_version": 1} if engineering
                and type(context.routing_decision.get("engineering_action_version")) is int
@@ -4350,7 +4415,7 @@ class AutoGenDiscussionRuntime:
         optional_state = (
             {"remaining_absolute_timeout_seconds", "engineering_tool_prefix", "engineering_action_version",
              ENGINEERING_CONTINUATION_POLICY, _CHECKPOINT_ACK_POLICY, FINAL_REPORT_POLICY, TOOL_CORRECTION_POLICY,
-             "engineering_progress_budget_version", _SOFT_ADMISSION_POLICY, 'approval_batch'}
+             "engineering_progress_budget_version", _SOFT_ADMISSION_POLICY, 'approval_batch', PROJECT_REPAIR_PHASE}
             if checkpoint.runtime_version == _RUNTIME_VERSION
             else set()
         )
@@ -4468,6 +4533,14 @@ class AutoGenDiscussionRuntime:
         if 'approval_batch' in state and (
                 not engineering or state['terminal'] is not False or not isinstance(state['approval_batch'], Mapping)):
             raise RuntimeExecutionError('durable capability approval batch is invalid')
+        if PROJECT_REPAIR_PHASE in state:
+            try:
+                validate_project_repair_phase(state[PROJECT_REPAIR_PHASE], context=context,
+                    models=cast(tuple[Mapping[str, JsonValue], ...], model_ledger),
+                    tools=cast(tuple[Mapping[str, JsonValue], ...], tool_ledger),
+                    tool_prefix=cast(int, state.get('engineering_tool_prefix', 0)), state=state)
+            except (ArithmeticError, KeyError, TypeError, ValueError):
+                raise RuntimeExecutionError('project repair phase is invalid') from None
         try:
             cost = Decimal(cast(str, usage["cost_usd"]))
             for artifact_id, sha256 in registry.items():
@@ -4580,6 +4653,14 @@ class AutoGenDiscussionRuntime:
                 if observation in draft_observations:
                     raise RuntimeExecutionError("generated draft correction made no progress")
                 draft_observations.add(observation)
+        if PROJECT_REPAIR_PHASE in checkpoint.state:
+            try:
+                validate_project_repair_phase(checkpoint.state[PROJECT_REPAIR_PHASE], context=context,
+                    models=models, tools=self._restored_ledger(checkpoint, 'tool_ledger'),
+                    tool_prefix=cast(int, checkpoint.state.get('engineering_tool_prefix', 0)),
+                    state=checkpoint.state, artifacts=artifacts)
+            except (ArithmeticError, KeyError, TypeError, ValueError):
+                raise RuntimeExecutionError('project repair progress evidence is invalid') from None
         return artifacts
 
     @staticmethod

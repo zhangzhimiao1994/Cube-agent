@@ -14,6 +14,8 @@ import re
 from collections.abc import Mapping, Sequence
 from uuid import UUID, uuid5
 
+from agent_hub.runtime.autogen.project_repair_phase import selected as repair_selected
+from agent_hub.runtime.autogen.project_repair_phase import stopped_models
 from agent_hub.runtime.contracts import Artifact, JsonValue, TaskContext, _mutable_json
 
 FINAL_REPORT_POLICY = "engineering_final_report_version"
@@ -115,7 +117,8 @@ def engineering_report_metadata(
     by_id = {str(artifact.id): artifact for artifact in artifacts}
     if len(by_id) != len(artifacts):
         raise ValueError("final report artifact registry is ambiguous")
-    if any(entry.get("status") != "succeeded" for entry in model_entries):
+    if (not stopped_models(model_entries, context) if repair_selected(context)
+            else any(entry.get("status") != "succeeded" for entry in model_entries)):
         raise ValueError("final report cannot hide an uncertain model outcome")
     bundle = _bundle_artifact(context, tool_entries, by_id)
     row = model_entries[-1]
