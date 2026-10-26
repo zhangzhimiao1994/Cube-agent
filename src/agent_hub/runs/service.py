@@ -670,6 +670,7 @@ class RunService:
             "engineering_diagnostic_submission_version": 1,
             "engineering_diagnostic_reads_submission_version": 1,
             "engineering_prerequisite_repair_submission_version": 1,
+            "engineering_action_admission_submission_version": 1,
             "role_planning_intent_version": 2,
             "workspace_maintenance_contract_version": 1,
             "workspace_maintenance_intent_version": 2,
@@ -1978,6 +1979,18 @@ class RunService:
                     mode=mode,
                 )
                 if checkpoint is None:
+                    admission_permissions = routing_decision.get("requested_permissions")
+                    if (not allow_running_recovery and "engineering_action_version" not in (row.routing_decision or {})
+                            and mode in {TaskMode.DISPATCH, TaskMode.DISCUSS, TaskMode.HYBRID}
+                            and type(routing_decision.get("engineering_action_admission_submission_version")) is int
+                            and routing_decision["engineering_action_admission_submission_version"] == 1
+                            and routing_decision.get("sandbox_profile") == "workspace_write"
+                            and routing_decision.get("permission_mode") in {"default", "auto_review"}
+                            and isinstance(admission_permissions, (list, tuple))
+                            and all(isinstance(permission, str) for permission in admission_permissions)
+                            and {"workspace.read", "workspace.write", "command.run"}.issubset(
+                                admission_permissions)):
+                        routing_decision["engineering_action_admission_version"] = 1
                     if (mode is TaskMode.DIRECT and not allow_running_recovery
                             and "engineering_action_version" not in (row.routing_decision or {})
                             and type(routing_decision.get("engineering_diagnostic_reads_submission_version")) is int

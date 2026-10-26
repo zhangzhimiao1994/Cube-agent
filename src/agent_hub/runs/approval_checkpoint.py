@@ -78,6 +78,15 @@ def checkpoint_waits_for_approval(
             child = RuntimeCheckpoint.from_payload(payload)
             if child.run_id != checkpoint.run_id or child.tenant_id != checkpoint.tenant_id:
                 return False
+            if child.runtime_type == 'autogen':
+                from agent_hub.runtime.hybrid import HybridPlan
+
+                return (
+                    checkpoint.runtime_version == '3'
+                    and checkpoint.state['next_stage'] == 1
+                    and checkpoint.state.get('plan_digest') == HybridPlan().digest
+                    and _autogen_waits_for_approval(child, approval_id)
+                )
             checkpoint = child
         # Hybrid Direct actions remain unsupported until the actual plan's Direct
         # stage is validated. Preserve the existing one-level Crew v11 rule only;

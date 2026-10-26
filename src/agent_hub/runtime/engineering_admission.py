@@ -73,7 +73,14 @@ def _fingerprint(context: TaskContext) -> str:
 
 
 def with_engineering_admission(child: ExecutionRuntime, authorizer: object | None,
-                               context: TaskContext) -> ExecutionRuntime:
+                               context: TaskContext, *, concrete_actions: bool = False) -> ExecutionRuntime:
+    version = context.routing_decision.get('engineering_action_admission_version')
+    legacy_pending = context.checkpoint is not None and context.checkpoint.runtime_type == _TYPE
+    if (concrete_actions is True and type(version) is int and version == 1
+            and context.mode in {TaskMode.DISPATCH, TaskMode.DISCUSS, TaskMode.HYBRID}
+            and context.routing_decision.get('permission_mode') in {'default', 'auto_review'}
+            and _required(context) and not legacy_pending):
+        return child
     if _required(context) or (context.checkpoint is not None and context.checkpoint.runtime_type == _TYPE):
         return EngineeringAdmissionRuntime(child, authorizer)
     return child

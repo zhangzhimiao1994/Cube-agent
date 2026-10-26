@@ -967,6 +967,39 @@ class ConfigBackedDirectRuntime:
         )
 
 
+def _configured_concrete_actions(
+    runtime: ExecutionRuntime, context: TaskContext, *,
+    capability_gateway: RuntimeCapabilityGatewayProtocol | None,
+    harness_tool_gateway: HarnessToolInvoker | None, artifact_repository: ArtifactRepository | None,
+    pending: RuntimeCheckpoint | None,
+) -> bool:
+    if (not isinstance(runtime, _PlannedRuntime) or capability_gateway is None
+            or artifact_repository is None or not callable(getattr(harness_tool_gateway, 'invoke', None))
+            or pending is not None and pending.runtime_type == 'engineering_admission'):
+        return False
+    policies = ('engineering_action_admission_version', 'engineering_delivery_contract_version',
+                'engineering_action_version')
+    if not all(type(context.routing_decision.get(key)) is int
+               and context.routing_decision.get(key) == 1 for key in policies):
+        return False
+    from agent_hub.runtime.autogen.adapter import AutoGenDiscussionRuntime, _checkpoint_ack_selected
+    from agent_hub.runtime.autogen.engineering_delivery import engineering_delivery_required
+
+    # Preseed/unknown wrappers do not attest a durable concrete-action boundary.
+    child = runtime._child
+    if (isinstance(child, HybridRuntime)
+            and isinstance(child._dispatch, ProjectScaleArtifactPreseedRuntime)):
+        return False
+    discussion = child._discussion if isinstance(child, HybridRuntime) else child
+    if isinstance(discussion, AutoGenDiscussionRuntime):
+        discussion_context = context.model_copy(update={'mode': TaskMode.DISCUSS})
+        tools = {participant.id: participant.allowed_tools for participant in discussion._plan.participants}
+        if (engineering_delivery_required(discussion_context, tools)
+                and not _checkpoint_ack_selected(discussion_context)):
+            return False
+    return isinstance(child, (CrewDispatchRuntime, AutoGenDiscussionRuntime, HybridRuntime))
+
+
 class ConfigBackedDispatchRuntime:
     """Build a fresh Crew-style dispatch runtime from published model config."""
 
@@ -1002,9 +1035,13 @@ class ConfigBackedDispatchRuntime:
             runtime = await self._runtime_for(context)
         except HarnessModelSelectionError:
             runtime = UnavailableRuntime(TaskMode.DISPATCH, reason="harness_model_unavailable")
-        if not isinstance(runtime, UnavailableRuntime):
-            runtime = with_engineering_admission(runtime, self._harness_tool_gateway, context)
         checkpoint = self._pending_checkpoints.pop(context.run_id, None)
+        if not isinstance(runtime, UnavailableRuntime):
+            runtime = with_engineering_admission(runtime, self._harness_tool_gateway, context,
+                concrete_actions=_configured_concrete_actions(runtime, context,
+                    capability_gateway=self._capability_gateway,
+                    harness_tool_gateway=self._harness_tool_gateway,
+                    artifact_repository=self._artifact_repository, pending=checkpoint))
         if checkpoint is not None:
             await runtime.restore_checkpoint(checkpoint)
         execution_token = context.execution_token or uuid4()
@@ -1204,9 +1241,13 @@ class ConfigBackedDiscussionRuntime:
             runtime = await self._runtime_for(context)
         except HarnessModelSelectionError:
             runtime = UnavailableRuntime(TaskMode.DISCUSS, reason="harness_model_unavailable")
-        if not isinstance(runtime, UnavailableRuntime):
-            runtime = with_engineering_admission(runtime, self._harness_tool_gateway, context)
         checkpoint = self._pending_checkpoints.pop(context.run_id, None)
+        if not isinstance(runtime, UnavailableRuntime):
+            runtime = with_engineering_admission(runtime, self._harness_tool_gateway, context,
+                concrete_actions=_configured_concrete_actions(runtime, context,
+                    capability_gateway=self._capability_gateway,
+                    harness_tool_gateway=self._harness_tool_gateway,
+                    artifact_repository=self._artifact_repository, pending=checkpoint))
         if checkpoint is not None:
             await runtime.restore_checkpoint(checkpoint)
         execution_token = context.execution_token or uuid4()
@@ -1383,9 +1424,13 @@ class ConfigBackedHybridRuntime:
             runtime = await self._runtime_for(context)
         except HarnessModelSelectionError:
             runtime = UnavailableRuntime(TaskMode.HYBRID, reason="harness_model_unavailable")
-        if not isinstance(runtime, UnavailableRuntime):
-            runtime = with_engineering_admission(runtime, self._harness_tool_gateway, context)
         checkpoint = self._pending_checkpoints.pop(context.run_id, None)
+        if not isinstance(runtime, UnavailableRuntime):
+            runtime = with_engineering_admission(runtime, self._harness_tool_gateway, context,
+                concrete_actions=_configured_concrete_actions(runtime, context,
+                    capability_gateway=self._capability_gateway,
+                    harness_tool_gateway=self._harness_tool_gateway,
+                    artifact_repository=self._artifact_repository, pending=checkpoint))
         if checkpoint is not None:
             await runtime.restore_checkpoint(checkpoint)
         execution_token = context.execution_token or uuid4()
