@@ -41,6 +41,8 @@ from agent_hub.runtime.contracts import JsonValue, _freeze_object
 from agent_hub.skills.sandbox.project import ProjectInvocation, project_source_manifest
 
 if TYPE_CHECKING:
+    from agent_hub.capabilities.python_metadata_preparation_flow import MetadataPreparationClient
+    from agent_hub.capabilities.types import CapabilityRequest
     from agent_hub.skills.sandbox.python_dependency_protocol import (
         PythonDependencyClosureObservation,
     )
@@ -59,6 +61,14 @@ _CAPTURED = {'reference', 'acceptance_sha256'}
 
 class GeneratedProjectError(RuntimeError):
     """Finite generated preparation failure; never raw project or host text."""
+
+
+class PythonMetadataPreparationApprovalRequired(GeneratedProjectError):
+    """An exact metadata plan needs admission, not a project installation grant."""
+
+    def __init__(self, request: CapabilityRequest) -> None:
+        super().__init__('metadata_prepare_approval_required')
+        self.approval_request = request
 
 
 class GeneratedProjectDraftRejected(GeneratedProjectError):
@@ -352,9 +362,11 @@ def generated_verification_binding(
 class GeneratedProjectService:
     def __init__(self, *, root: Path, repository: object,
                  dependency_inspector: Callable[[ProjectInvocation, str],
-                    Awaitable[PythonDependencyClosureObservation]] | None = None) -> None:
+                    Awaitable[PythonDependencyClosureObservation]] | None = None,
+                 metadata_client: MetadataPreparationClient | None = None) -> None:
         self.root, self.repository = root, repository
         self._dependency_inspector = _inspect_dependencies if dependency_inspector is None else dependency_inspector
+        self._metadata_client = metadata_client
 
     async def _record(self, tenant: UUID, run: UUID) -> Any:
         getter = getattr(self.repository, 'get', None)
@@ -445,23 +457,126 @@ class GeneratedProjectService:
             observation_sha256=observation_sha, reason=reason, issues=issues,
             schema_version=2 if dependency is not None else 1, dependency_closure=dependency))
 
+    async def _prepare_dependency_metadata(
+        self, authority: GeneratedAuthority, actor: str,
+        observation: tuple[bytes | None, dict[str, str]], controls: tuple[bytes, bytes],
+        *, deadline: float,
+    ) -> None:
+        from agent_hub.capabilities.approvals import capability_approval_scope
+        from agent_hub.capabilities.python_metadata_preparation import (
+            METADATA_KEY,
+            metadata_preparation_request,
+            metadata_scope,
+        )
+        from agent_hub.capabilities.python_metadata_preparation_flow import prepare_python_metadata
+        from agent_hub.skills.sandbox.python_metadata_plan_protocol import (
+            PythonMetadataDraft,
+            PythonMetadataPlan,
+        )
+
+        invocation = authority.invocation
+        _need(observation[0] is not None)
+        latest = await self._record(authority.tenant_id, authority.run_id)
+        scope = metadata_scope(latest, actor=actor, live=True)
+        draft = PythonMetadataDraft(source_sha256=_fingerprint(observation[1]),
+            acceptance_sha256=hashlib.sha256(cast(bytes, observation[0])).hexdigest(),
+            manifest_sha256=hashlib.sha256(controls[0]).hexdigest(),
+            lock_sha256=hashlib.sha256(controls[1]).hexdigest())
+
+        async def guard() -> None:
+            await asyncio.to_thread(self._controls_absent, invocation)
+            _need(await self._draft_observation(invocation) == observation)
+
+        async def state_io(*, expected: Mapping[str, JsonValue] | None = None,
+                           replace: Mapping[str, JsonValue] | None = None) -> Mapping[str, JsonValue] | None:
+            await guard()
+            current = await self._record(authority.tenant_id, authority.run_id)
+            _need(generated_authority(current, authority.tenant_id, authority.run_id) == authority
+                  and metadata_scope(current, actor=actor, live=True) == scope)
+            route = getattr(current, 'routing_decision', {})
+            _draft_route(current)
+            state = cast(Mapping[str, JsonValue] | None, route.get(METADATA_KEY))
+            if replace is not None:
+                _need(state == expected and authority.lease_token is not None)
+                setter = getattr(self.repository, 'compare_and_set_python_metadata_preparation', None)
+                _need(callable(setter), 'metadata_prepare_persistence_unavailable')
+                assert callable(setter)
+                current = await setter(authority.tenant_id, authority.run_id, actor_id=authority.user_id,
+                    actor_role=authority.role, lease_token=authority.lease_token,
+                    request_sha256=authority.request_sha256, project_id=authority.project_id,
+                    session_id=authority.session_id, expected=expected, replacement=replace,
+                    before_reservation=guard)
+                return cast(Mapping[str, JsonValue], current.routing_decision[METADATA_KEY])
+            return state
+
+        async def authorize(plan: PythonMetadataPlan) -> None:
+            request = metadata_preparation_request(plan, idempotency_key='metadata-prepare-' + plan.sha256)
+            checker = getattr(self.repository, 'is_capability_approval_scope_approved', None)
+            _need(callable(checker), 'metadata_prepare_persistence_unavailable')
+            assert callable(checker)
+            approved = await checker(authority.tenant_id, authority.run_id, capability_approval_scope(request))
+            if approved is not True:
+                raise PythonMetadataPreparationApprovalRequired(request)
+
+        client = self._metadata_client
+        if client is None:
+            from agent_hub.skills.sandbox.python_metadata_preparation_client import (
+                PythonMetadataPreparationSandbox,
+            )
+
+            client = PythonMetadataPreparationSandbox()
+        await prepare_python_metadata(client=client, invocation=invocation, scope=scope, draft=draft,
+            state_io=state_io, authorize=authorize, deadline=deadline)
+
     async def _dependency_draft_preflight(
         self, authority: GeneratedAuthority, actor: str,
         observation: tuple[bytes | None, dict[str, str]], controls: tuple[bytes, bytes],
     ) -> Mapping[str, JsonValue]:
         from agent_hub.skills.sandbox.python_dependency_protocol import (
+            PythonDependencyClosureFailure,
             PythonDependencyClosureObservation,
         )
 
         invocation = authority.invocation
+        deadline = asyncio.get_running_loop().time() + invocation.timeout_seconds
         latest = await self._record(authority.tenant_id, authority.run_id)
         _draft_route(latest)
         await asyncio.to_thread(self._controls_absent, invocation)
         source = _fingerprint(observation[1])
-        readonly = ProjectInvocation.model_validate({**invocation.model_dump(),
-            'execution_id': 'dependency_preflight_' + uuid4().hex,
-            'sandbox_profile': 'restricted', 'install_allowed': False}, strict=True)
-        observed = await self._dependency_inspector(readonly, source)
+        async def inspect() -> PythonDependencyClosureObservation:
+            remaining = deadline - asyncio.get_running_loop().time()
+            _need(remaining >= 1, 'python_dependency_unavailable')
+            readonly = ProjectInvocation.model_validate({**invocation.model_dump(),
+                'execution_id': 'dependency_preflight_' + uuid4().hex, 'timeout_seconds': int(remaining),
+                'sandbox_profile': 'restricted', 'install_allowed': False}, strict=True)
+            async with asyncio.timeout_at(deadline):
+                return await self._dependency_inspector(readonly, source)
+
+        route = latest.routing_decision
+        metadata_enabled = (type(route.get('python_dependency_preflight_submission_version')) is int
+                            and route['python_dependency_preflight_submission_version'] == 1)
+        prepared = 'python_metadata_preparation' in route
+        if prepared:
+            from agent_hub.capabilities.python_metadata_preparation import (
+                metadata_scope,
+                metadata_state_plan,
+            )
+
+            metadata = route['python_metadata_preparation']
+            prior_plan = metadata_state_plan(metadata)
+            _need(prior_plan.scope == metadata_scope(latest, actor=actor, live=True))
+            # A known receipt is history, not authority over a later corrected draft.
+            # Only unresolved executions must inspect their original bound draft.
+            if metadata['phase'] != 'prepared':
+                await self._prepare_dependency_metadata(authority, actor, observation, controls, deadline=deadline)
+        try:
+            observed = await inspect()
+        except PythonDependencyClosureFailure as error:
+            if metadata_enabled and not prepared and error.code == 'python_dependency_metadata_unavailable':
+                await self._prepare_dependency_metadata(authority, actor, observation, controls, deadline=deadline)
+                observed = await inspect()
+            else:
+                raise GeneratedProjectError(error.code) from None
         _need(type(observed) is PythonDependencyClosureObservation, 'python_dependency_unavailable')
         observed = PythonDependencyClosureObservation.model_validate_json(
             observed.model_dump_json(warnings='error'), strict=True)

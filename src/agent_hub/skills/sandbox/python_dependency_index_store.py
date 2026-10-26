@@ -73,6 +73,17 @@ def _check(deadline: float) -> None:
           and time.monotonic() < deadline, "timeout")
 
 
+def _bounded_deadline(deadline: float | None, seconds: float) -> float:
+    limit = time.monotonic() + seconds
+    if deadline is None:
+        return limit
+    try:
+        _check(deadline)
+    except OverflowError:
+        raise PythonDependencyIndexError("timeout") from None
+    return min(limit, deadline)
+
+
 def _supply(value: RootSupplyConfig) -> RootSupplyConfig:
     _need(type(value) is RootSupplyConfig)
     return replace(value)
@@ -200,11 +211,13 @@ def _read_index(parent: int, name: str, supply: RootSupplyConfig, stack: ExitSta
     return value, pin
 
 
-def read_dependency_metadata_index(supply: RootSupplyConfig) -> PythonDependencyMetadataIndex:
+def read_dependency_metadata_index(
+    supply: RootSupplyConfig, *, deadline: float | None = None,
+) -> PythonDependencyMetadataIndex:
     """Read only the fixed catalog-bound index under a shared directory lock."""
     try:
+        deadline = _bounded_deadline(deadline, _READ_SECONDS)
         _native()
-        deadline = time.monotonic() + _READ_SECONDS
         configured = _supply(supply)
         digest = configured.digest
         name = "dependency-metadata-" + digest + ".json"
@@ -311,11 +324,13 @@ def _publish(parent: int, name: str, value: PythonDependencyMetadataIndex,
             raise
 
 
-def publish_dependency_metadata_index(root: RootConfig, supply: RootSupplyConfig) -> PythonDependencyMetadataIndex:
+def publish_dependency_metadata_index(
+    root: RootConfig, supply: RootSupplyConfig, *, deadline: float | None = None,
+) -> PythonDependencyMetadataIndex:
     """Explicit Root publisher: verify every configured local wheel, never fetch."""
     try:
+        deadline = _bounded_deadline(deadline, _PUBLISH_SECONDS)
         _native()
-        deadline = time.monotonic() + _PUBLISH_SECONDS
         # Lazy import avoids extending the backend's initialization dependency graph.
         from agent_hub.skills.sandbox.python_project_backend import RootConfig
 

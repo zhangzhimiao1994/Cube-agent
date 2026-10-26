@@ -40,6 +40,10 @@ if TYPE_CHECKING:
         PythonInputSupplyRequest,
         PythonInputSupplyResponse,
     )
+    from agent_hub.skills.sandbox.python_metadata_preparation_protocol import (
+        PythonMetadataPreparationRequest,
+        PythonMetadataPreparationResponse,
+    )
     from agent_hub.skills.sandbox.python_project_profile import (
         PythonProjectProfileResponse,
     )
@@ -362,6 +366,15 @@ class SkillBroker:
 
         return await handle_input_supply(self._project_broker, request, peer_uid=peer_uid)
 
+    async def handle_metadata_preparation(
+        self, request: PythonMetadataPreparationRequest, *, peer_uid: int,
+    ) -> PythonMetadataPreparationResponse:
+        from agent_hub.skills.sandbox.python_metadata_preparation_broker import (
+            handle_metadata_preparation,
+        )
+
+        return await handle_metadata_preparation(self._project_broker, request, peer_uid=peer_uid)
+
     async def handle_toolchain(self, request: ToolchainRequest, *, peer_uid: int) -> ToolchainResponse:
         from agent_hub.skills.sandbox.toolchain_broker import handle_toolchain_request
 
@@ -582,6 +595,17 @@ async def _serve_client(
         PythonInputSupplyRequest,
         PythonInputSupplyResponse,
     )
+    from agent_hub.skills.sandbox.python_metadata_plan_client import parse_metadata_planning_request
+    from agent_hub.skills.sandbox.python_metadata_plan_protocol import (
+        PythonMetadataPlanningResponse,
+    )
+    from agent_hub.skills.sandbox.python_metadata_planning import plan_python_dependency_metadata
+    from agent_hub.skills.sandbox.python_metadata_preparation_client import (
+        parse_metadata_preparation_request,
+    )
+    from agent_hub.skills.sandbox.python_metadata_preparation_protocol import (
+        PythonMetadataPreparationResponse,
+    )
     from agent_hub.skills.sandbox.python_project_profile import (
         PythonProjectProfileResponse,
         dispatch_profile_request,
@@ -600,18 +624,51 @@ async def _serve_client(
 
     is_project = False
     is_dependency = False
+    is_metadata_plan = False
+    is_metadata_preparation = False
     is_supply = False
     is_profile = False
     is_toolchain = False
     toolchain_request: ToolchainRequest | None = None
     supply_request: PythonInputSupplyRequest | None = None
     python_request: PythonProjectBrokerRequest | PythonProjectProbeRequest | PythonProjectInspectEnvironmentRequest | PythonProjectReleaseEnvironmentRequest | None = None
-    response: BrokerResponse | PythonProjectBrokerResponse | PythonInputSupplyResponse | PythonProjectProfileResponse | ToolchainResponse | PythonDependencyClosureResponse
+    response: BrokerResponse | PythonProjectBrokerResponse | PythonInputSupplyResponse | PythonProjectProfileResponse | ToolchainResponse | PythonDependencyClosureResponse | PythonMetadataPlanningResponse | PythonMetadataPreparationResponse
     try:
         peer_uid = _peer_uid(writer)
         payload = await _read_frame(reader, _MAX_REQUEST_BYTES)
         envelope = json.loads(payload)
         if isinstance(envelope, dict) and (
+            type(envelope.get('version')) is int and envelope['version'] == 10
+            or isinstance(envelope.get('action'), str) and envelope['action'] in {
+                'prepare_python_dependency_metadata', 'inspect_python_dependency_metadata_preparation',
+            }
+        ):
+            is_metadata_preparation = True
+            if peer_uid != broker._policy.allowed_uid:
+                raise BrokerRequestError('caller uid is not authorized')
+            preparation_request = parse_metadata_preparation_request(payload)
+            try:
+                preparation_response = await broker.handle_metadata_preparation(
+                    preparation_request, peer_uid=peer_uid,
+                )
+                if type(preparation_response) is not PythonMetadataPreparationResponse:
+                    raise ValueError('metadata_prepare_response_invalid')
+                response = PythonMetadataPreparationResponse.model_validate(
+                    preparation_response, strict=True,
+                )
+                response.require_for(preparation_request)
+            except (OSError, ValueError, TypeError, AttributeError, RuntimeError, RecursionError):
+                raise ValueError('metadata_prepare_request_invalid') from None
+        elif isinstance(envelope, dict) and (
+            type(envelope.get('version')) is int and envelope['version'] == 9
+            or envelope.get('action') == 'plan_python_dependency_metadata'
+        ):
+            is_metadata_plan = True
+            if peer_uid != broker._policy.allowed_uid:
+                raise BrokerRequestError('caller uid is not authorized')
+            metadata_request = parse_metadata_planning_request(payload)
+            response = await plan_python_dependency_metadata(metadata_request, policy=broker._policy)
+        elif isinstance(envelope, dict) and (
             type(envelope.get('version')) is int and envelope['version'] == 8
             or envelope.get('action') == 'inspect_python_dependency_closure'
         ):
@@ -708,7 +765,9 @@ async def _serve_client(
                 error="input_supply_unavailable")
         else:
             response = BrokerResponse(ok=False,
-                error='python_dependency_request_invalid' if is_dependency else
+                error='metadata_prepare_request_invalid' if is_metadata_preparation else
+                    'metadata_plan_request_invalid' if is_metadata_plan else
+                    'python_dependency_request_invalid' if is_dependency else
                     'toolchain_request_invalid' if is_toolchain else
                     'python_project_profile_request_invalid' if is_profile else
                     "input_supply_request_invalid" if is_supply else str(error))

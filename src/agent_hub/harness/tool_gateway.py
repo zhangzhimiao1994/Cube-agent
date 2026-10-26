@@ -338,7 +338,10 @@ class HarnessToolGateway:
         )
         if authorization_failure is not None:
             return authorization_failure
-        from agent_hub.capabilities.generated_project_service import GeneratedProjectDraftRejected
+        from agent_hub.capabilities.generated_project_service import (
+            GeneratedProjectDraftRejected,
+            PythonMetadataPreparationApprovalRequired,
+        )
         from agent_hub.capabilities.python_generated_service import (
             PythonGeneratedRecipeApprovalRequired,
         )
@@ -383,14 +386,14 @@ class HarnessToolGateway:
                      if type(user_id) is UUID and isinstance(role, Role) else None)
             return self._failure(request, 'generated project draft requires correction' if draft is not None
                                  else 'capability authorization unavailable', payload=draft)
-        except PythonGeneratedRecipeApprovalRequired as error:
+        except (PythonGeneratedRecipeApprovalRequired, PythonMetadataPreparationApprovalRequired) as error:
             if (request.tool_name != 'project.verify' or self._policy_gateway is None
                     or type(user_id) is not UUID or not isinstance(role, Role)):
                 return self._failure(request, 'capability authorization unavailable')
             try:
                 expected = _capability_request(tenant_id, user_id, request)
                 selected = error.approval_request.model_copy(update={'idempotency_key': expected.idempotency_key})
-                selected = _python_recipe_authorization(selected, expected=expected)
+                selected = _project_verification_authorization(selected, expected=expected)
                 decision = await self._policy_gateway.invoke(selected, role=role)
             except Exception:  # noqa: BLE001 - only a scope-bound independent approval can follow supply.
                 return self._failure(request, 'capability authorization unavailable')
@@ -579,12 +582,14 @@ def _project_authorization_failure_reason(error: Exception) -> str:
 
     from agent_hub.capabilities.generated_project_service import GeneratedProjectError
     from agent_hub.capabilities.project_verification import ProjectVerificationError
+    from agent_hub.skills.sandbox.python_dependency_protocol import PythonDependencyClosureError
     from agent_hub.skills.sandbox.python_input_supply_protocol import SupplyError
     from agent_hub.skills.sandbox.python_project_protocol import PythonProjectBrokerError
 
     # A syntactically safe prefix is not a finite code: it can still carry a
     # project-controlled token. Keep diagnostics independent of exception text.
     allowed = {*get_args(PythonProjectBrokerError), *get_args(SupplyError),
+        *get_args(PythonDependencyClosureError.__value__),
         'python_project_systemd_linux_unsupported', 'python_project_recipe_invalid',
         'python_project_recipe_unsupported', 'python_project_lock_invalid',
         'python_project_declaration_limit', 'python_project_response_invalid',
@@ -602,6 +607,8 @@ def _project_authorization_failure_reason(error: Exception) -> str:
 
 
 def _project_verification_authorization(selected: object, *, expected: CapabilityRequest) -> CapabilityRequest:
+    if type(selected) is CapabilityRequest and selected.resource.startswith('workspace/current/project-metadata/'):
+        return _metadata_preparation_authorization(selected, expected=expected)
     if type(selected) is not CapabilityRequest or not selected.resource.startswith('workspace/current/project-inputs/'):
         return _python_recipe_authorization(selected, expected=expected)
     from agent_hub.capabilities.project_baselines import ProjectBaselineReference
@@ -623,6 +630,31 @@ def _project_verification_authorization(selected: object, *, expected: Capabilit
                    for name in ('project_id', 'workspace_session_id'))):
         raise ValueError('project verification authorization unavailable')
     ProjectBaselineReference.from_payload(args['original_reference'])
+    return selected
+
+
+def _metadata_preparation_authorization(selected: CapabilityRequest, *, expected: CapabilityRequest) -> CapabilityRequest:
+    selected = CapabilityRequest.model_validate(dict(vars(selected)) | (selected.model_extra or {}), strict=True)
+    args = selected.arguments
+    match = re.fullmatch(r'workspace/current/project-metadata/python/([a-f0-9]{64})', selected.resource)
+    if (match is None or selected.tool_origin != 'builtin'
+            or any(getattr(selected, name) != getattr(expected, name)
+                for name in ('tenant_id', 'user_id', 'run_id', 'agent_id', 'idempotency_key'))
+            or (selected.capability, selected.operation) != ('command', 'run')
+            or set(args) != {'schema_version', 'purpose', 'plan_sha256', 'project_id', 'workspace_session_id',
+                'catalog_sha256', 'root_config_sha256', 'source_sha256', 'catalog_count', 'catalog_bytes',
+                'download_count', 'download_bytes'}
+            or type(args.get('schema_version')) is not int or args['schema_version'] != 1
+            or args['purpose'] != 'python_dependency_metadata' or args['plan_sha256'] != match.group(1)
+            or any(type(args[name]) is not str or re.fullmatch(r'[a-f0-9]{64}', cast(str, args[name])) is None
+                for name in ('catalog_sha256', 'root_config_sha256', 'source_sha256'))
+            or any(type(args[name]) is not str or re.fullmatch(r'[a-z0-9][a-z0-9_-]{0,63}', cast(str, args[name])) is None
+                for name in ('project_id', 'workspace_session_id'))
+            or any(type(args[name]) is not int or not 0 <= cast(int, args[name]) < 2**63
+                for name in ('catalog_count', 'catalog_bytes', 'download_count', 'download_bytes'))
+            or not 0 <= cast(int, args['download_count']) <= cast(int, args['catalog_count']) <= 1000
+            or not 0 <= cast(int, args['download_bytes']) <= cast(int, args['catalog_bytes'])):
+        raise ValueError('project metadata preparation authorization unavailable')
     return selected
 
 

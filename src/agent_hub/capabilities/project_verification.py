@@ -383,8 +383,15 @@ class ProjectVerificationService:
     async def authorization_request(self, request: CapabilityRequest) -> CapabilityRequest | None:
         await self._require_legacy_candidate_scope(request.tenant_id, request.run_id)
         await self._require_supported_source(request.tenant_id, request.run_id)
-        generated = await self.generated.prepare(request.tenant_id, request.run_id, request.agent_id,
-                                                 user_id=request.user_id)
+        from agent_hub.capabilities.generated_project_service import (
+            PythonMetadataPreparationApprovalRequired,
+        )
+
+        try:
+            generated = await self.generated.prepare(request.tenant_id, request.run_id, request.agent_id,
+                                                     user_id=request.user_id)
+        except PythonMetadataPreparationApprovalRequired as error:
+            return error.approval_request.model_copy(update={'idempotency_key': request.idempotency_key})
         if generated is not None:
             if generated.envelope.manifest.stack == 'python':
                 return await self._python_generated.authorization_request(request, generated)

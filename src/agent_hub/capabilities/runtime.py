@@ -464,6 +464,7 @@ class RuntimeCapabilityGateway:
             from agent_hub.capabilities.generated_project_service import (
                 GeneratedProjectDraftRejected,
                 GeneratedProjectError,
+                PythonMetadataPreparationApprovalRequired,
             )
             from agent_hub.capabilities.python_generated_service import (
                 PythonGeneratedRecipeApprovalRequired,
@@ -480,7 +481,7 @@ class RuntimeCapabilityGateway:
                 )
                 self._cache_project_verification(tenant_id, run_id, result)
                 return result
-            except PythonGeneratedRecipeApprovalRequired:
+            except (PythonGeneratedRecipeApprovalRequired, PythonMetadataPreparationApprovalRequired):
                 raise
             except GeneratedProjectDraftRejected:
                 raise

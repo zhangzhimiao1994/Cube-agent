@@ -8,7 +8,7 @@ import hashlib
 import json
 import math
 from pathlib import Path
-from typing import Literal, Self
+from typing import Literal, Self, get_args
 
 from pydantic import (
     BaseModel,
@@ -40,6 +40,20 @@ _MARKER_KEYS = frozenset({
     "platform_release", "platform_system", "platform_version",
     "platform_python_implementation", "python_full_version", "python_version", "sys_platform",
 })
+
+
+class PythonDependencyClosureFailure(ValueError):
+    """Finite Root rejection, raised only after response and scope validation."""
+
+    def __init__(self, code: PythonDependencyClosureError) -> None:
+        if type(code) is not str or code not in get_args(PythonDependencyClosureError.__value__):
+            raise ValueError(_RESPONSE_INVALID)
+        self._code: PythonDependencyClosureError = code
+        super().__init__(code)
+
+    @property
+    def code(self) -> PythonDependencyClosureError:
+        return self._code
 
 
 class _Strict(BaseModel):
@@ -273,6 +287,7 @@ class PythonDependencyClosureSandbox:
         except (ValueError, TypeError, RecursionError):
             raise ValueError(_RESPONSE_INVALID) from None
         if not response.ok:
-            raise ValueError(response.error or _UNAVAILABLE)
+            assert response.error is not None
+            raise PythonDependencyClosureFailure(response.error)
         assert response.observation is not None
         return response.observation

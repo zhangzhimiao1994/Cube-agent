@@ -115,6 +115,7 @@ class PythonProjectProfile(_Strict):
     catalog: tuple[PythonProjectProfileWheel, ...] = Field(min_length=1, max_length=1000)
     # RootSupplyConfig.digest binds the entire private policy, not just this public projection.
     catalog_sha256: Digest
+    root_config_sha256: Digest | None = None
 
     @model_validator(mode="after")
     def complete_sorted_catalog(self) -> Self:
@@ -201,12 +202,15 @@ def _read_profile() -> tuple[PythonProjectProfile | None, ProfileError | None]:
         supply = read_supply_configuration()
     except (PythonProjectBackendError, InputSupplyError) as error:
         return None, codes.get(error.code, _UNAVAILABLE)
+    from agent_hub.skills.sandbox.python_metadata_plan import _digest
+
     return PythonProjectProfile(
         interpreter=PythonProjectProfileInterpreter.model_validate(root.interpreter.to_payload(), strict=True),
         catalog=tuple(sorted((PythonProjectProfileWheel(name=e.name, filename=e.filename,
             version=e.version, sha256=e.sha256, size_bytes=e.size_bytes) for e in supply.catalog),
             key=lambda e: (e.name, e.version))),
         catalog_sha256=supply.digest,
+        root_config_sha256=_digest(root.to_payload()),
     ), None
 
 

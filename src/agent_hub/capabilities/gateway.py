@@ -256,11 +256,14 @@ class CapabilityGateway:
     ) -> bool:
         recorder = getattr(self._run_repository, "record_capability_approval_review", None)
         if not callable(recorder):
-            return self._toolchain_authority is None and self._go_recipe_authority is None
+            return (self._toolchain_authority is None and self._go_recipe_authority is None
+                    and not _is_metadata_preparation_request(request))
         fingerprint = fingerprint_capability_request(request)
         approval_id = f"auto_review_{hashlib.sha256(fingerprint.encode()).hexdigest()[:24]}"
         try:
             toolchain_options: dict[str, object] = {}
+            if _is_metadata_preparation_request(request):
+                toolchain_options['approval_scope'] = capability_approval_scope(request)
             if self._toolchain_authority is not None:
                 toolchain_options = {'toolchain_authority': self._toolchain_authority,
                                      'approval_scope': capability_approval_scope(request)}
@@ -281,6 +284,12 @@ class CapabilityGateway:
         except Exception:  # noqa: BLE001 - failed audit must not auto-approve execution.
             return False
         return True
+
+
+def _is_metadata_preparation_request(request: CapabilityRequest) -> bool:
+    resource = normalize_resource(request.resource)
+    prefix = 'workspace/current/project-metadata'
+    return resource is not None and (resource == prefix or resource.startswith(prefix + '/'))
 
 
 def _is_toolchain_supply_request(request: CapabilityRequest) -> bool:

@@ -16,6 +16,7 @@ import os
 import socket
 import subprocess
 import threading
+import time
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -101,9 +102,10 @@ def configured(api: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any
         reads.append(("supply", threading.get_ident()))
         return state.supply
 
-    def read_index(supply: Any) -> Any:
+    def read_index(supply: Any, *, deadline: float) -> Any:
         reads.append(("index", threading.get_ident()))
         assert supply is state.supply
+        assert deadline > time.monotonic()
         return state.index
 
     monkeypatch.setattr(api, "_require_root", lambda: None)
@@ -232,7 +234,7 @@ async def test_full_source_drift_never_reports_complete(
     write_lock(configured, complete=True)
     request = await request_for(configured)
 
-    def drift(*args: Any) -> Any:
+    def drift(*args: Any, **kwargs: Any) -> Any:
         (configured.project / "src" / "billing.py").write_bytes(b"# changed non-control source\n")
         return configured.index
 
@@ -254,7 +256,7 @@ async def test_catalog_and_root_configuration_are_bound_before_and_after(
     if change == "expected":
         request = request.model_copy(update={"expected_catalog_sha256": "f" * 64})
     elif change in {"supply_end", "root_end"}:
-        def drift(*args: Any) -> Any:
+        def drift(*args: Any, **kwargs: Any) -> Any:
             if change == "supply_end":
                 configured.supply = replace(configured.supply, min_free_bytes=1)
             else:
@@ -280,7 +282,7 @@ async def test_catalog_and_root_configuration_are_bound_before_and_after(
 async def test_index_errors_map_to_finite_path_free_codes(
     configured: Any, monkeypatch: pytest.MonkeyPatch, code: str, expected: str,
 ) -> None:
-    def fail(*args: Any) -> Any:
+    def fail(*args: Any, **kwargs: Any) -> Any:
         raise PythonDependencyIndexError(code)
     monkeypatch.setattr(configured.api, "read_dependency_metadata_index", fail)
     value = await inspect(configured)

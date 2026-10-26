@@ -147,8 +147,17 @@ class DefaultRuntimeCapabilityPolicyGateway:
         approval_required = (permission_mode is not None
                              or await self._tool_approval_required(request.tenant_id))
         extra_rules = self._extra_policy_rules(request)
-        project_effect = await _project_toolchain_supply_effect(self._run_repository, request,
-            role=role, authority=toolchain_authority)
+        metadata_effect = await _project_metadata_preparation_effect(
+            self._run_repository, request, role=role,
+        )
+        if metadata_effect is PolicyEffect.DENY:
+            return CapabilityResult(CapabilityStatus.DENIED, request.run_id, reason="capability denied")
+        if metadata_effect is not None:
+            concrete_approval = True
+        project_effect: PolicyEffect | None = metadata_effect
+        if project_effect is None:
+            project_effect = await _project_toolchain_supply_effect(self._run_repository, request,
+                role=role, authority=toolchain_authority)
         if project_effect is None:
             project_effect = await _project_input_supply_effect(self._run_repository, request, role=role)
         if project_effect is None:
@@ -188,7 +197,7 @@ class DefaultRuntimeCapabilityPolicyGateway:
         if toolchain_authority is None and await _has_approved_capability_request(self._run_repository, request):
             return CapabilityResult(CapabilityStatus.ALLOWED, request.run_id)
         conversation_grant = getattr(self._run_repository, "is_conversation_capability_approved", None)
-        if (toolchain_authority is None and callable(conversation_grant)
+        if (metadata_effect is None and toolchain_authority is None and callable(conversation_grant)
             and await conversation_grant(request, role=role) is True):
             return CapabilityResult(CapabilityStatus.ALLOWED, request.run_id)
         if not concrete_approval and await _has_approved_capability_scope(self._run_repository, request):
@@ -474,6 +483,48 @@ async def _project_verification_effect(
             return PolicyEffect.DENY
         return PolicyEffect.ALLOW if "network.read" in permissions else PolicyEffect.REQUIRE_APPROVAL
     except Exception:  # noqa: BLE001 - missing authority cannot enable project execution.
+        return PolicyEffect.DENY
+
+
+async def _project_metadata_preparation_effect(
+    repository: object, request: CapabilityRequest, *, role: Role,
+) -> PolicyEffect | None:
+    prefix = "workspace/current/project-metadata"
+    resource = normalize_resource(request.resource)
+    # Keep the lexical namespace too: traversal out of metadata must not reach
+    # an older project effect or a broad plugin grant after normalization.
+    lexical_resource = "/".join(part for part in request.resource.replace("\\", "/").split("/")
+                                if part not in {"", "."})
+    if not any(value is not None and (value == prefix or value.startswith(prefix + "/"))
+               for value in (resource, lexical_resource)):
+        return None
+    try:
+        from agent_hub.capabilities.python_metadata_preparation import (
+            METADATA_PREFIX,
+            metadata_preparation_binding,
+        )
+
+        if (type(request) is not CapabilityRequest or type(role) is not Role
+                or resource is None or request.resource != resource
+                or not resource.startswith(METADATA_PREFIX)
+                or request.tool_origin != "builtin"
+                or request.capability != "command" or request.operation != "run"):
+            return PolicyEffect.DENY
+        checked = CapabilityRequest.model_validate(vars(request), strict=True)
+        getter = getattr(repository, "get", None)
+        if not callable(getter):
+            return PolicyEffect.DENY
+        record = getter(checked.tenant_id, checked.run_id)
+        if isinstance(record, Awaitable):
+            record = await record
+        expected = metadata_preparation_binding(record, planned=True, live=True)
+        actual_role = getattr(record, "actor_role", None)
+        selected = checked.model_copy(update={"idempotency_key": expected.idempotency_key})
+        if (not isinstance(actual_role, str) or Role(actual_role) is not role
+                or fingerprint_capability_request(selected) != fingerprint_capability_request(expected)):
+            return PolicyEffect.DENY
+        return PolicyEffect.REQUIRE_APPROVAL
+    except Exception:  # noqa: BLE001 - uncertain live state never grants metadata preparation.
         return PolicyEffect.DENY
 
 

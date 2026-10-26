@@ -47,6 +47,8 @@ def configured(api: Any, monkeypatch: pytest.MonkeyPatch) -> Any:
     supply = catalog.RootSupplyConfig(Path("/var/lib/private-secret-config"), wheels,
                                      1024 * 1024, 1024, 120)
     root = SimpleNamespace(interpreter=interpreter, runtime_root=Path("/private/runtime-secret"))
+    root.to_payload = lambda: {'interpreter': root.interpreter.to_payload(),
+        'runtime_root': str(root.runtime_root)}
     reads: list[str] = []
     def read_root() -> Any:
         reads.append("root")
@@ -85,6 +87,17 @@ def test_empty_workspace_profile_is_configuration_only_and_returns_actual_catalo
     assert all(secret not in public for secret in (
         "/var/lib", "/private", "https:", "files.pythonhosted", "available", "credentials"))
     assert set(profile.catalog[0].model_dump()) == {"filename", "name", "version", "sha256", "size_bytes"}
+
+
+def test_profile_exposes_only_digest_of_root_config_for_metadata_plan(api: Any, configured: Any) -> None:
+    from agent_hub.skills.sandbox.python_metadata_plan import _digest
+
+    profile = response(api).profile
+    assert getattr(profile, 'root_config_sha256', None) == _digest(configured.root.to_payload())
+    old = profile.root_config_sha256
+    configured.root.runtime_root = Path('/different/private/runtime')
+    assert response(api).profile.root_config_sha256 != old
+    assert '/different' not in response(api).model_dump_json()
 
 
 def test_scope_echoes_all_five_independent_request_identifiers(api: Any, configured: Any) -> None:

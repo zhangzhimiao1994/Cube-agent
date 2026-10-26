@@ -165,7 +165,7 @@ async def _observe(
         raise _InspectionError("python_dependency_declaration_invalid") from None
     _check(deadline)
     # This reader alone owns the fixed state_root/dependency-metadata-<digest>.json path.
-    index = read_dependency_metadata_index(supply)
+    index = read_dependency_metadata_index(supply, deadline=deadline)
     _check(deadline)
     try:
         if type(index) is not PythonDependencyMetadataIndex:

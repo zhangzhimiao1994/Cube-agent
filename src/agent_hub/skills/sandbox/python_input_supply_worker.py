@@ -17,7 +17,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from agent_hub.skills.sandbox.base import run_subprocess_with_limits
-from agent_hub.skills.sandbox.project import ProjectExecutionBroker, _Execution, _Limits
+from agent_hub.skills.sandbox.project import (
+    ProjectExecutionBroker,
+    ProjectInvocation,
+    _Execution,
+    _Limits,
+)
 from agent_hub.skills.sandbox.project_contract_broker import (
     _encoded,
     _object,
@@ -43,11 +48,10 @@ if TYPE_CHECKING:
     from agent_hub.skills.sandbox.python_input_fetch import WheelDownload
     from agent_hub.skills.sandbox.python_input_supply_catalog import RootSupplyConfig
     from agent_hub.skills.sandbox.python_project_backend import RootConfig
-    from agent_hub.skills.sandbox.python_project_protocol import PythonProjectProbeInvocation
 
 
 def build_fetch_command(
-    invocation: PythonProjectProbeInvocation, policy: BrokerPolicy, *,
+    invocation: ProjectInvocation, policy: BrokerPolicy, *,
     configuration: RootConfig, supply: RootSupplyConfig,
 ) -> tuple[str, ...]:
     hidden_roots = (Path("/var"), Path("/run"), Path("/tmp"))
@@ -123,9 +127,23 @@ async def _fetch_inputs(
     entries: tuple[WheelDownload, ...], request: PythonInputSupplyRequest, policy: BrokerPolicy,
     configuration: RootConfig, supply: RootSupplyConfig, deadline: float,
 ) -> dict[str, bytes]:
+    return await fetch_catalog_wheels(entries, base_python_invocation(request.invocation),
+        policy, configuration, supply, deadline)
+
+
+async def fetch_catalog_wheels(
+    entries: tuple[WheelDownload, ...], invocation: ProjectInvocation, policy: BrokerPolicy,
+    configuration: RootConfig, supply: RootSupplyConfig, deadline: float,
+) -> dict[str, bytes]:
     from dataclasses import asdict
 
     from agent_hub.skills.sandbox.python_input_supply_catalog import InputSupplyError
+
+    if type(invocation) is not ProjectInvocation:
+        raise InputSupplyError("input_supply_request_invalid")
+    baseinvocation = ProjectInvocation.model_validate(vars(invocation), strict=True)
+    if baseinvocation.install_allowed is not False:
+        raise InputSupplyError("input_supply_request_invalid")
 
     remaining = min(deadline - time.monotonic(), supply.fetch_timeout_seconds)
     if remaining <= 0:
@@ -136,8 +154,8 @@ async def _fetch_inputs(
     total = sum(entry.size_bytes for entry in entries)
     if total > supply.max_total_bytes or len(payload_raw) > 512 * 1024:
         raise InputSupplyError("input_supply_quota")
-    job = _Execution(base_python_invocation(request.invocation), None)
-    command = build_fetch_command(request.invocation, policy, configuration=configuration, supply=supply)
+    job = _Execution(baseinvocation, None)
+    command = build_fetch_command(baseinvocation, policy, configuration=configuration, supply=supply)
 
     async def stop() -> None:
         try:

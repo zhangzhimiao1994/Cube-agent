@@ -81,12 +81,51 @@ class _PythonApprovalOptions(TypedDict, total=False):
     python_input_binding: dict[str, object]
     toolchain_input_binding: dict[str, object]
     go_recipe_binding: dict[str, object]
+    python_metadata_binding: dict[str, object]
 
 
 class _ToolchainReviewOptions(TypedDict, total=False):
     approval_scope: str
     toolchain_input_binding: dict[str, object]
     go_recipe_binding: dict[str, object]
+    python_metadata_binding: dict[str, object]
+
+
+def _is_metadata_preparation_scope(scope: object) -> bool:
+    return isinstance(scope, str) and ':resource=workspace/current/project-metadata/' in scope
+
+
+def _metadata_approval_binding(
+    row: RunRow, scope: object, *, planned: bool = False, live: bool = False,
+) -> dict[str, object] | None:
+    from agent_hub.capabilities.approvals import capability_approval_scope
+    from agent_hub.capabilities.python_metadata_preparation import metadata_preparation_binding
+
+    try:
+        request = metadata_preparation_binding(row, planned=planned, live=live)
+        if capability_approval_scope(request) == scope:
+            return dict(request.arguments)
+    except (ValueError, TypeError, RuntimeError, LookupError):
+        pass
+    return None
+
+
+def _metadata_approval_matches(row: RunRow, approval: RunApprovalRow) -> bool:
+    payload = approval.payload
+    expected = _metadata_approval_binding(row, payload.get('approval_scope'))
+    if (approval.tenant_id != row.tenant_id or approval.run_id != row.id
+            or approval.status != 'approved'
+            or approval.action not in {'capability_tool', 'capability_tool.auto_review'}
+            or expected is None or type(payload.get('python_metadata_binding')) is not dict
+            or {'public_binding', 'python_binding', 'python_input_binding', 'toolchain_input_binding',
+                'go_recipe_binding', 'conversation_binding'} & payload.keys()
+            or payload.get('decision_scope', 'once') != 'once'):
+        return False
+    try:
+        return json.dumps(payload['python_metadata_binding'], sort_keys=True, allow_nan=False) == json.dumps(
+            expected, sort_keys=True, allow_nan=False)
+    except (TypeError, ValueError, RecursionError):
+        return False
 
 
 def _is_go_recipe_scope(scope: object) -> bool:
@@ -107,6 +146,33 @@ def _go_approval_binding(row: RunRow, scope: object) -> dict[str, object]:
         return cast(dict[str, object], (row.routing_decision or {})[RECIPE_KEY])
     except (ValueError, TypeError, RuntimeError, LookupError):
         raise RunConflict('go_project_recipe_changed') from None
+
+
+def _metadata_history_projection(row: RunRow, approval: RunApprovalRow) -> dict[str, object]:
+    """Display a persisted action after capture; this is never an admission check."""
+    from agent_hub.capabilities.approvals import capability_approval_scope
+    from agent_hub.capabilities.python_metadata_preparation import (
+        METADATA_KEY,
+        metadata_preparation_request,
+        metadata_state_plan,
+    )
+
+    try:
+        plan = metadata_state_plan((row.routing_decision or {}).get(METADATA_KEY))
+        request = metadata_preparation_request(plan, idempotency_key='metadata-history')
+        if ((plan.scope.tenant_id, plan.scope.run_id, plan.scope.user_id)
+                != (row.tenant_id, row.id, row.actor_id)
+                or approval.payload.get('approval_scope') != capability_approval_scope(request)
+                or {'public_binding', 'python_binding', 'python_input_binding', 'toolchain_input_binding',
+                    'go_recipe_binding', 'conversation_binding'} & approval.payload.keys()
+                or json.dumps(approval.payload.get('python_metadata_binding'), sort_keys=True, allow_nan=False)
+                    != json.dumps(request.arguments, sort_keys=True, allow_nan=False)):
+            return {}
+        return {'capability': 'command', 'operation': 'run', 'resource': request.resource,
+            'approval_scope': capability_approval_scope(request),
+            'download_count': plan.missing_count, 'download_bytes': plan.missing_bytes}
+    except (ValueError, TypeError, KeyError, RuntimeError, RecursionError):
+        return {}
 
 
 def _has_generated_preparation(route: Mapping[str, object]) -> bool:
@@ -257,7 +323,7 @@ def _toolchain_approval_matches(run: RunRow, approval: RunApprovalRow) -> bool:
     expected = _toolchain_supply_approval_binding(run, payload.get('approval_scope'))
     stored = payload.get('toolchain_input_binding')
     if expected is None or type(stored) is not dict or {
-        'python_binding', 'python_input_binding', 'public_binding',
+        'python_binding', 'python_input_binding', 'public_binding', 'python_metadata_binding',
     } & payload.keys():
         return False
     try:
@@ -1085,6 +1151,112 @@ class RunRepository:
             await session.flush()
             result = self._record(row)
         return result
+
+    @staticmethod
+    async def _require_metadata_user(session: AsyncSession, row: RunRow) -> UserRow:
+        user = await session.scalar(select(UserRow).where(
+            UserRow.tenant_id == row.tenant_id, UserRow.id == row.actor_id).with_for_update())
+        if (user is None or user.tenant_id != row.tenant_id or user.id != row.actor_id
+                or user.disabled is not False or user.role != row.actor_role):
+            raise RunConflict('metadata preparation user scope changed')
+        return user
+
+    @staticmethod
+    async def _revalidate_metadata_manual_approval(
+        session: AsyncSession, row: RunRow, *, approval_id: str, fingerprint: str, grant: bool,
+    ) -> dict[str, object] | None:
+        from agent_hub.capabilities.python_metadata_preparation import METADATA_KEY
+
+        route = row.routing_decision or {}
+        if not _is_metadata_preparation_scope(route.get('approval_scope')) and METADATA_KEY not in route:
+            return None
+        if grant and _is_metadata_preparation_scope(route.get('approval_scope')):
+            await RunRepository._require_metadata_user(session, row)
+        rows = (await session.scalars(select(RunApprovalRow).where(
+            RunApprovalRow.tenant_id == row.tenant_id, RunApprovalRow.run_id == row.id,
+            RunApprovalRow.approval_id == approval_id).with_for_update())).all()
+        for approval in rows:
+            payload = approval.payload
+            if (approval.tenant_id != row.tenant_id or approval.run_id != row.id
+                    or approval.approval_id != approval_id or approval.status != 'pending'
+                    or approval.action != 'capability_tool'
+                    or payload.get('approval_fingerprint') != fingerprint):
+                continue
+            if not _is_metadata_preparation_scope(payload.get('approval_scope')):
+                continue
+            stored = payload.get('python_metadata_binding')
+            if type(stored) is not dict:
+                raise RunConflict('metadata preparation pending binding is missing')
+            if grant:
+                expected = _metadata_approval_binding(row, route.get('approval_scope'), planned=True)
+                if (expected is None or payload.get('approval_scope') != route.get('approval_scope')
+                        or {'public_binding', 'python_binding', 'python_input_binding',
+                            'toolchain_input_binding', 'go_recipe_binding', 'conversation_binding'} & payload.keys()
+                        or json.dumps(stored, sort_keys=True, allow_nan=False)
+                            != json.dumps(expected, sort_keys=True, allow_nan=False)):
+                    raise RunConflict('metadata preparation pending plan changed')
+            return stored
+        if _is_metadata_preparation_scope(route.get('approval_scope')):
+            raise RunConflict('metadata preparation pending approval is unavailable')
+        if any('python_metadata_binding' in item.payload for item in rows):
+            raise RunConflict('metadata preparation pending scope changed')
+        return None
+
+    async def compare_and_set_python_metadata_preparation(
+        self, tenant_id: UUID, run_id: UUID, *, actor_id: UUID, actor_role: Role,
+        lease_token: UUID, request_sha256: str, project_id: str, session_id: str,
+        expected: Mapping[str, JsonValue] | None, replacement: Mapping[str, JsonValue],
+        before_reservation: Callable[[], Awaitable[None]] | None = None,
+    ) -> RunRecord:
+        from agent_hub.capabilities.generated_project_service import generated_authority
+        from agent_hub.capabilities.python_metadata_preparation import (
+            METADATA_KEY,
+            metadata_scope,
+            metadata_state_plan,
+            validate_metadata_transition,
+        )
+
+        async with self._session_factory() as session, session.begin():
+            row = await session.scalar(self._run_select(tenant_id, run_id).with_for_update())
+            if row is None:
+                raise RunNotFound('run was not found')
+            authority = generated_authority(self._record(row), tenant_id, run_id)
+            if (authority.user_id != actor_id or authority.role is not actor_role
+                    or authority.lease_token != lease_token or authority.request_sha256 != request_sha256
+                    or (authority.project_id, authority.session_id) != (project_id, session_id)):
+                raise RunConflict('metadata_prepare_scope_changed')
+            route = dict(row.routing_decision or {})
+            previous = route.get(METADATA_KEY)
+            def encoded(value: object) -> str:
+                return json.dumps(value, default=dict, sort_keys=True, allow_nan=False)
+
+            route_encoded = encoded(route)
+            if encoded(previous) != encoded(expected):
+                raise RunConflict('metadata_prepare_state_changed')
+            after = validate_metadata_transition(previous, replacement)
+            plan = metadata_state_plan(after)
+            scope = metadata_scope(row, actor=plan.scope.actor, live=True)
+            if plan.scope != scope or not callable(before_reservation):
+                raise RunConflict('metadata_prepare_scope_changed')
+            # The grant lookup and the intent write share the same locked run row.
+            if after['phase'] == 'executing':
+                await self._require_metadata_user(session, row)
+                approvals = (await session.scalars(select(RunApprovalRow).where(
+                    RunApprovalRow.tenant_id == tenant_id, RunApprovalRow.run_id == run_id,
+                    RunApprovalRow.status == 'approved').with_for_update())).all()
+                if not any(_metadata_approval_matches(row, item) for item in approvals):
+                    raise RunConflict('metadata_prepare_approval_required')
+            await before_reservation()
+            if (generated_authority(self._record(row), tenant_id, run_id) != authority
+                    or metadata_scope(row, actor=plan.scope.actor, live=True) != scope
+                    or encoded(row.routing_decision) != route_encoded):
+                raise RunConflict('metadata_prepare_scope_changed')
+            if after['phase'] == 'executing':
+                await self._require_metadata_user(session, row)
+            row.routing_decision = {**route, METADATA_KEY: json.loads(encoded(after))}
+            row.version += 1
+            await session.flush()
+            return self._record(row)
 
     async def compare_and_set_generated_preparation(
         self, tenant_id: UUID, run_id: UUID, *, actor_id: UUID, actor_role: Role,
@@ -2040,6 +2212,21 @@ class RunRepository:
                     raise RunConflict("capability approval request binding is invalid")
                 conversation_binding = conversation_approval_binding(row, approval_request)
             toolchain_binding = None
+            metadata_binding = None
+            if _is_metadata_preparation_scope(approval_scope):
+                from agent_hub.capabilities.approvals import fingerprint_capability_request
+                from agent_hub.capabilities.python_metadata_preparation import (
+                    metadata_preparation_binding,
+                )
+
+                metadata_binding = _metadata_approval_binding(row, approval_scope, planned=True, live=True)
+                if (metadata_binding is None or plugin_identity is not None or approval_request is None
+                        or approval_request.tool_origin != 'builtin' or actor_id != row.actor_id):
+                    raise RunConflict('metadata preparation approval binding is invalid or stale')
+                bound_request = metadata_preparation_binding(row, planned=True, live=True).model_copy(
+                    update={'idempotency_key': approval_request.idempotency_key})
+                if fingerprint_capability_request(bound_request) != approval_fingerprint:
+                    raise RunConflict('metadata preparation approval request changed')
             if _is_toolchain_supply_scope(approval_scope):
                 toolchain_binding = _toolchain_supply_approval_binding(row, approval_scope, planned=True)
                 if (plugin_identity is not None or toolchain_binding is None
@@ -2060,6 +2247,8 @@ class RunRepository:
             checkpoint_required = _has_generated_preparation(routing_decision) or (
                 approval_worker_token is not None and not original_capture)
             python_options: _PythonApprovalOptions = {}
+            if metadata_binding is not None:
+                python_options['python_metadata_binding'] = metadata_binding
             if go_scope:
                 python_options['go_recipe_binding'] = _go_approval_binding(row, approval_scope)
                 from agent_hub.runs.go_project_admission import require_recipe_marker
@@ -2079,14 +2268,18 @@ class RunRepository:
                 python_options['toolchain_input_binding'] = toolchain_binding
             if toolchain_authority is not None:
                 toolchain_authority.require_current(self._record(row), tenant_id, run_id)
-            if go_recipe_authority is not None:
+            if go_recipe_authority is not None or metadata_binding is not None:
                 # The approval INSERT may wait on its row/unique constraint. Keep
                 # the run lease intact until that await and its second fence pass.
                 await self._upsert_capability_approval(
                     session, tenant_id, run_id, approval_id=approval_id,
                     approval_fingerprint=approval_fingerprint, approval_scope=approval_scope,
                     status='pending', request_version=row.version + 1, **python_options)
-                go_recipe_authority.require_current(self._record(row), tenant_id, run_id)
+                if go_recipe_authority is not None:
+                    go_recipe_authority.require_current(self._record(row), tenant_id, run_id)
+                if (metadata_binding is not None and metadata_binding
+                        != _metadata_approval_binding(row, approval_scope, planned=True, live=True)):
+                    raise RunConflict('metadata preparation approval scope changed')
             row.status = RunStatus.WAITING_APPROVAL.value
             self.clear_worker_lease(row)
             row.routing_decision = {
@@ -2101,7 +2294,7 @@ class RunRepository:
                 **({"approval_scope": approval_scope} if approval_scope else {}),
             }
             row.version += 1
-            if go_recipe_authority is None:
+            if go_recipe_authority is None and metadata_binding is None:
                 await self._upsert_capability_approval(
                     session,
                     tenant_id,
@@ -2157,6 +2350,11 @@ class RunRepository:
             ):
                 raise RunConflict("run is waiting for a different approval")
             go_options: _PythonApprovalOptions = {}
+            metadata_binding = await self._revalidate_metadata_manual_approval(
+                session, row, approval_id=approval_id, fingerprint=approval_fingerprint,
+                grant=status is RunStatus.RUNNING)
+            if metadata_binding is not None:
+                go_options['python_metadata_binding'] = metadata_binding
             if _is_go_recipe_scope(routing_decision.get('approval_scope')):
                 go_options['go_recipe_binding'] = await self._revalidate_go_manual_approval(
                     session, row, approval_id=approval_id, fingerprint=approval_fingerprint,
@@ -2171,6 +2369,9 @@ class RunRepository:
                 await self._require_capability_approval_checkpoint(
                     session, row, routing_decision, approval_id=approval_id,
                 )
+            if metadata_binding is not None and status is RunStatus.RUNNING:
+                await self._revalidate_metadata_manual_approval(session, row,
+                    approval_id=approval_id, fingerprint=approval_fingerprint, grant=True)
             row.status = status.value
             self.clear_worker_lease(row)
             row.routing_decision = {
@@ -2241,6 +2442,15 @@ class RunRepository:
             if row is None:
                 raise RunNotFound("run was not found")
             toolchain_options: _ToolchainReviewOptions = {}
+            metadata_binding = None
+            if _is_metadata_preparation_scope(approval_scope):
+                metadata_binding = _metadata_approval_binding(row, approval_scope, planned=True, live=True)
+                if metadata_binding is None:
+                    raise RunConflict('metadata preparation approval binding is invalid or stale')
+                await self._require_metadata_user(session, row)
+                assert isinstance(approval_scope, str)
+                toolchain_options['approval_scope'] = approval_scope
+                toolchain_options['python_metadata_binding'] = metadata_binding
             if go_binding is not None:
                 assert isinstance(approval_scope, str)
                 toolchain_options['approval_scope'] = approval_scope
@@ -2264,6 +2474,9 @@ class RunRepository:
                 toolchain_authority.require_current(self._record(row), tenant_id, run_id)
             if go_recipe_authority is not None:
                 go_recipe_authority.require_current(self._record(row), tenant_id, run_id)
+            if (metadata_binding is not None and metadata_binding
+                    != _metadata_approval_binding(row, approval_scope, planned=True, live=True)):
+                raise RunConflict('metadata preparation approval scope changed')
             await session.flush()
             return self._record(row)
 
@@ -2295,6 +2508,12 @@ class RunRepository:
                     continue
                 if _is_go_recipe_scope(row.payload.get('approval_scope')) or 'go_recipe_binding' in row.payload:
                     continue
+                if (_is_metadata_preparation_scope(row.payload.get('approval_scope'))
+                        or 'python_metadata_binding' in row.payload):
+                    run = await session.scalar(self._run_select(tenant_id, run_id))
+                    if run is not None and _metadata_approval_matches(run, row):
+                        return True
+                    continue
                 if (_is_toolchain_supply_scope(row.payload.get('approval_scope'))
                         or 'toolchain_input_binding' in row.payload):
                     run = await session.scalar(self._run_select(tenant_id, run_id))
@@ -2325,9 +2544,15 @@ class RunRepository:
                     continue
                 if ("decision_scope" in row.payload and not any(key in row.payload for key in (
                     "python_binding", "python_input_binding", "toolchain_input_binding", "go_recipe_binding",
+                    "python_metadata_binding",
                 ))):
                     continue
                 if _is_go_recipe_scope(approval_scope) or 'go_recipe_binding' in row.payload:
+                    continue
+                if _is_metadata_preparation_scope(approval_scope) or 'python_metadata_binding' in row.payload:
+                    run = await session.scalar(self._run_select(tenant_id, run_id))
+                    if run is not None and _metadata_approval_matches(run, row):
+                        return True
                     continue
                 if _is_toolchain_supply_scope(approval_scope) or 'toolchain_input_binding' in row.payload:
                     run = await session.scalar(self._run_select(tenant_id, run_id))
@@ -2484,12 +2709,19 @@ class RunRepository:
             if row.version != version:
                 raise RunConflict("run version is stale")
             go_options: _PythonApprovalOptions = {}
+            metadata_binding = await self._revalidate_metadata_manual_approval(
+                session, row, approval_id=approval_id, fingerprint=approval_fingerprint, grant=True)
+            if metadata_binding is not None:
+                go_options['python_metadata_binding'] = metadata_binding
             if _is_go_recipe_scope(approval_scope):
                 go_options['go_recipe_binding'] = await self._revalidate_go_manual_approval(
                     session, row, approval_id=approval_id, fingerprint=approval_fingerprint, grant=True)
             await self._require_capability_approval_checkpoint(
                 session, row, routing_decision, approval_id=approval_id,
             )
+            if metadata_binding is not None:
+                await self._revalidate_metadata_manual_approval(session, row,
+                    approval_id=approval_id, fingerprint=approval_fingerprint, grant=True)
             row.routing_decision = {
                 key: value
                 for key, value in routing_decision.items()
@@ -2567,6 +2799,10 @@ class RunRepository:
             if _is_go_recipe_scope(approval_scope):
                 go_options['go_recipe_binding'] = await self._revalidate_go_manual_approval(
                     session, row, approval_id=approval_id, fingerprint=approval_fingerprint, grant=False)
+            metadata_binding = await self._revalidate_metadata_manual_approval(
+                session, row, approval_id=approval_id, fingerprint=approval_fingerprint, grant=False)
+            if metadata_binding is not None:
+                go_options['python_metadata_binding'] = metadata_binding
             row.routing_decision = {
                 key: value
                 for key, value in routing_decision.items()
@@ -3370,6 +3606,7 @@ class RunRepository:
         python_input_binding: dict[str, object] | None = None,
         toolchain_input_binding: dict[str, object] | None = None,
         go_recipe_binding: dict[str, object] | None = None,
+        python_metadata_binding: dict[str, object] | None = None,
         conversation_binding: dict[str, object] | None = None,
         approval_origin: str | None = None,
         request_version: int | None = None,
@@ -3387,6 +3624,7 @@ class RunRepository:
             **({'python_input_binding': python_input_binding} if python_input_binding is not None else {}),
             **({'toolchain_input_binding': toolchain_input_binding} if toolchain_input_binding is not None else {}),
             **({'go_recipe_binding': go_recipe_binding} if go_recipe_binding is not None else {}),
+            **({'python_metadata_binding': python_metadata_binding} if python_metadata_binding is not None else {}),
             **({"conversation_binding": conversation_binding} if conversation_binding is not None else {}),
             **({"approval_origin": approval_origin} if approval_origin is not None else {}),
             **({"decision_scope": decision_scope} if decision_scope is not None else {}),
@@ -3428,6 +3666,9 @@ class RunRepository:
                     (RunApprovalRow.payload['go_recipe_binding'] == go_recipe_binding
                      if go_recipe_binding is not None
                      else ~RunApprovalRow.payload.has_key('go_recipe_binding')),
+                    (RunApprovalRow.payload['python_metadata_binding'] == python_metadata_binding
+                     if python_metadata_binding is not None
+                     else ~RunApprovalRow.payload.has_key('python_metadata_binding')),
                 ).values(action="capability_tool", status=status,
                          payload=RunApprovalRow.payload.op("||")(resolution))
                 .returning(RunApprovalRow.id)
@@ -3449,6 +3690,7 @@ class RunRepository:
         approval_scope: str | None = None,
         toolchain_input_binding: dict[str, object] | None = None,
         go_recipe_binding: dict[str, object] | None = None,
+        python_metadata_binding: dict[str, object] | None = None,
     ) -> None:
         payload: dict[str, object] = {
             "approval_id": approval_id,
@@ -3461,6 +3703,8 @@ class RunRepository:
                if toolchain_input_binding is not None else {}),
             **({'approval_scope': approval_scope, 'go_recipe_binding': go_recipe_binding}
                if go_recipe_binding is not None else {}),
+            **({'approval_scope': approval_scope, 'python_metadata_binding': python_metadata_binding}
+               if python_metadata_binding is not None else {}),
         }
         result = await session.execute(
             insert(RunApprovalRow)
@@ -3679,7 +3923,9 @@ def _public_plugin_approval_events(
             raise RunConflict("pending capability approval evidence is stale")
         public_binding = dict(binding)
         python_binding = None
-        if 'public_binding' not in approval.payload and 'go_recipe_binding' in approval.payload:
+        if 'public_binding' not in approval.payload and 'python_metadata_binding' in approval.payload:
+            public_binding.update(_metadata_history_projection(run, approval))
+        elif 'public_binding' not in approval.payload and 'go_recipe_binding' in approval.payload:
             from agent_hub.capabilities.approvals import capability_approval_scope
             from agent_hub.runs.go_project_admission import RECIPE_KEY, encoded, go_recipe_binding
 
