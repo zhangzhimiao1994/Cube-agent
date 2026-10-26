@@ -57,6 +57,7 @@ _FIXED_ROUTE_KEYS = (
     'website_preview_required', 'runtime_timeout_source', 'critical_path_complexity_units',
     'direct_model', 'main_agent_model', 'allowed_models', 'harness_policy', 'permission_mode',
     'engineering_diagnostic_reads_version',
+    'engineering_catalog_reads_version',
     'engineering_prerequisite_repair_version',
 )
 _GUIDANCE_ROUTE_KEYS = (

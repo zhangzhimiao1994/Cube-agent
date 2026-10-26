@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Protocol, cast
 from uuid import UUID, uuid4
 
 if TYPE_CHECKING:
+    from agent_hub.capabilities.project_inspection import PythonCatalogQuery
     from agent_hub.capabilities.python_project_reports import PythonProjectFailure
     from agent_hub.harness.tool_gateway import HarnessToolGateway
     from agent_hub.runs.project_inputs import OriginalProjectPreparer
@@ -441,16 +442,21 @@ class RuntimeCapabilityGateway:
         if normalized_name == _WORKSPACE_BUNDLE_TOOL:
             return await self._execute_workspace_bundle(tenant_id, run_id, arguments)
         if normalized_name == PROJECT_INSPECT_TOOL:
-            if arguments:
-                raise RuntimeCapabilityError("project.inspect takes no arguments")
+            if arguments and 'python_catalog' not in arguments:
+                raise RuntimeCapabilityError("project.inspect takes no arguments other than python_catalog")
             if self._project_workspace_dir is None:
                 raise RuntimeCapabilityError("project inspection scope unavailable")
             try:
+                from agent_hub.capabilities.project_inspection import parse_python_catalog_query
+
+                catalog_query = parse_python_catalog_query(arguments)
                 observation = dict(await inspect_project(
                     repository=self._run_repository, tenant_id=tenant_id, run_id=run_id,
                     project_root=self._project_workspace_dir,
                 ))
-                observation['python_build_profile'] = await self._python_build_profile(tenant_id, run_id)
+                observation['python_build_profile'] = (
+                    await self._python_build_profile(tenant_id, run_id) if catalog_query is None
+                    else await self._python_build_profile(tenant_id, run_id, catalog_query=catalog_query))
                 return observation
             except ProjectInspectionError as error:
                 raise RuntimeCapabilityError(str(error)) from None
@@ -536,12 +542,17 @@ class RuntimeCapabilityGateway:
             raise RuntimeCapabilityError('project preparation scope is unavailable')
         return await capture_action_preparation(self._project_verification, context)
 
-    async def _python_build_profile(self, tenant_id: UUID, run_id: UUID) -> Mapping[str, JsonValue]:
+    async def _python_build_profile(
+        self, tenant_id: UUID, run_id: UUID, *, catalog_query: PythonCatalogQuery | None = None,
+    ) -> Mapping[str, JsonValue]:
+        from agent_hub.capabilities.project_inspection import python_catalog_projection
         from agent_hub.skills.sandbox.project import ProjectInvocation
         from agent_hub.skills.sandbox.python_project_profile import PythonProjectProfileSandbox
 
         getter = getattr(self._run_repository, 'get', None)
         if not callable(getter):
+            if catalog_query is not None:
+                raise ProjectInspectionError('python catalog unavailable')
             return {'status': 'unavailable'}
         record = await getter(tenant_id, run_id)
         project, session = authorized_workspace_scope(record, tenant_id=tenant_id, run_id=run_id)
@@ -551,11 +562,15 @@ class RuntimeCapabilityGateway:
         try:
             result = await PythonProjectProfileSandbox().inspect(invocation)
         except (ValueError, OSError, TimeoutError):
+            if catalog_query is not None:
+                raise ProjectInspectionError('python catalog unavailable') from None
             return {'status': 'unavailable', 'readiness': 'not_probed'}
         if not result.ok or result.profile is None:
+            if catalog_query is not None:
+                raise ProjectInspectionError('python catalog unavailable')
             return {'status': 'unavailable', 'readiness': 'not_probed', 'reason': result.error}
         return {
-            **cast(Mapping[str, JsonValue], result.profile.model_dump(mode='json')),
+            **python_catalog_projection(result.profile, query=catalog_query),
             'recipe': 'python_offline_wheel_v1', 'build_backend': 'setuptools.build_meta',
             'requires_python': '>=3.12,<3.13', 'build_requirement_names': ('setuptools', 'wheel'),
             'source_directory': 'src', 'test_directory': 'tests', 'test_runner': 'unittest',

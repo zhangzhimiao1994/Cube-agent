@@ -6,9 +6,10 @@ import json
 import re
 import tomllib
 from collections.abc import Mapping
+from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
-from typing import Protocol, cast
+from typing import TYPE_CHECKING, Protocol, cast
 from uuid import UUID
 
 from agent_hub.capabilities.project_stack_admission import additional_stack_discovery
@@ -18,6 +19,9 @@ from agent_hub.capabilities.scoped_read import (
 )
 from agent_hub.files.workspace import ProjectWorkspaceStore
 from agent_hub.runtime.contracts import JsonValue
+
+if TYPE_CHECKING:
+    from agent_hub.skills.sandbox.python_project_profile import PythonProjectProfile
 
 PROJECT_INSPECT_TOOL = "project.inspect"
 _MANIFESTS = ("package.json", "pyproject.toml", "requirements.txt")
@@ -30,10 +34,107 @@ _PYTHON_NAME = re.compile(r"([A-Za-z0-9][A-Za-z0-9._-]{0,127})(.*)")
 _CONSTRAINT = re.compile(r"[A-Za-z0-9*^~<>=!|., +_-]{1,160}")
 _PYTHON_CONSTRAINT = re.compile(r"(?:\[[A-Za-z0-9_,. -]+\])?[A-Za-z0-9*~<>=!., +()_-]*")
 _MARKER = re.compile(r"[A-Za-z0-9_ .<>=!'\"() -]{1,256}")
+_CATALOG_BYTES = 6144  # Reserve space for the runtime's recipe guidance fields.
+_CATALOG_ROWS = 24
+_CATALOG_SHA = re.compile(r"[a-f0-9]{64}")
+_CATALOG_NAME = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 
 
 class ProjectInspectionError(RuntimeError):
     """Project observations could not be authorized."""
+
+
+@dataclass(frozen=True, slots=True)
+class PythonCatalogQuery:
+    catalog_sha256: str
+    offset: int = 0
+    names: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if (type(self.catalog_sha256) is not str or _CATALOG_SHA.fullmatch(self.catalog_sha256) is None
+                or type(self.offset) is not int or not 0 <= self.offset <= 1000
+                or type(self.names) is not tuple or len(self.names) > 16
+                or any(type(name) is not str or not 1 <= len(name) <= 128
+                       or _CATALOG_NAME.fullmatch(name) is None for name in self.names)
+                or self.names != tuple(sorted(set(self.names)))):
+            raise ProjectInspectionError('python_catalog_query_invalid')
+
+    def to_payload(self) -> Mapping[str, JsonValue]:
+        query: dict[str, JsonValue] = {'catalog_sha256': self.catalog_sha256, 'offset': self.offset}
+        if self.names:
+            query['names'] = self.names
+        return {'python_catalog': query}
+
+
+def parse_python_catalog_query(arguments: Mapping[str, JsonValue]) -> PythonCatalogQuery | None:
+    if not isinstance(arguments, Mapping):
+        raise ProjectInspectionError('python_catalog_query_invalid')
+    if not arguments:
+        return None
+    if set(arguments) != {'python_catalog'}:
+        raise ProjectInspectionError('python_catalog_query_invalid')
+    query = arguments['python_catalog']
+    if (not isinstance(query, Mapping) or 'catalog_sha256' not in query
+            or set(query) - {'catalog_sha256', 'offset', 'names'}):
+        raise ProjectInspectionError('python_catalog_query_invalid')
+    digest, offset = query['catalog_sha256'], query.get('offset', 0)
+    if type(digest) is not str or type(offset) is not int:
+        raise ProjectInspectionError('python_catalog_query_invalid')
+    names: list[str] = []
+    if 'names' in query:
+        raw_names = query['names']
+        if not isinstance(raw_names, (list, tuple)) or not 1 <= len(raw_names) <= 16:
+            raise ProjectInspectionError('python_catalog_query_invalid')
+        for name in raw_names:
+            if type(name) is not str:
+                raise ProjectInspectionError('python_catalog_query_invalid')
+            names.append(name)
+    return PythonCatalogQuery(digest, offset, tuple(names))
+
+
+def _python_catalog_size(value: Mapping[str, JsonValue]) -> int:
+    return len(json.dumps(value, ensure_ascii=False, allow_nan=False,
+                          sort_keys=True, separators=(',', ':')).encode('utf-8'))
+
+
+def python_catalog_projection(
+    profile: PythonProjectProfile, query: PythonCatalogQuery | None = None,
+) -> Mapping[str, JsonValue]:
+    """Page public declarations only; the Root digest remains opaque authority."""
+    raw = cast(dict[str, JsonValue], profile.model_dump(mode='json'))
+    if query is None and _python_catalog_size(raw) <= _CATALOG_BYTES:
+        return raw
+    if query is not None and query.catalog_sha256 != profile.catalog_sha256:
+        raise ProjectInspectionError('python_catalog_changed')
+    names, offset = ((), 0) if query is None else (query.names, query.offset)
+    matches = tuple(wheel for wheel in profile.catalog if not names or wheel.name in names)
+    if offset > len(matches):
+        raise ProjectInspectionError('python_catalog_offset_invalid')
+
+    def page(rows: list[JsonValue]) -> dict[str, JsonValue]:
+        end = offset + len(rows)
+        return {**raw, 'catalog': cast(JsonValue, rows),
+                'catalog_complete': not names and offset == 0 and end == len(profile.catalog),
+                'catalog_page': {
+                    'schema_version': 1, 'total_count': len(profile.catalog),
+                    'matched_count': len(matches), 'offset': offset, 'returned_count': len(rows),
+                    'next_offset': end if end < len(matches) else None, 'names': names,
+                }}
+
+    rows: list[JsonValue] = []
+    result = page(rows)
+    if _python_catalog_size(result) > _CATALOG_BYTES:
+        raise ProjectInspectionError('python_catalog_projection_limit')
+    # Rebuild metadata with each whole row so next_offset and all echoed names count.
+    for wheel in matches[offset:offset + _CATALOG_ROWS]:
+        candidate_rows = [*rows, cast(JsonValue, wheel.model_dump(mode='json'))]
+        candidate = page(candidate_rows)
+        if _python_catalog_size(candidate) > _CATALOG_BYTES:
+            break
+        rows, result = candidate_rows, candidate
+    if not rows and offset < len(matches):
+        raise ProjectInspectionError('python_catalog_projection_limit')
+    return result
 
 
 class _RunRepository(Protocol):

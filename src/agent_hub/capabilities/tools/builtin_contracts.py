@@ -15,7 +15,18 @@ def builtin_tool_input_schema(name: str) -> Mapping[str, JsonValue] | None:
     read_schema = read_tool_input_schema(name)
     if read_schema is not None:
         return read_schema
-    if name in {"project.inspect", "project.verify"}:
+    if name == "project.inspect":
+        return {"type": "object", "additionalProperties": False, "properties": {
+            "python_catalog": {"type": "object", "additionalProperties": False,
+                "required": ("catalog_sha256",), "properties": {
+                    "catalog_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+                    "offset": {"type": "integer", "minimum": 0, "maximum": 1000},
+                    "names": {"type": "array", "minItems": 1, "maxItems": 16, "uniqueItems": True,
+                        "items": {"type": "string", "maxLength": 128,
+                                  "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"}},
+                }},
+        }}
+    if name == "project.verify":
         return {"type": "object", "additionalProperties": False, "properties": {}}
     if name == PROJECT_ZIP_TOOL_NAME:
         return project_zip_input_schema()
@@ -65,14 +76,15 @@ def builtin_tool_description(name: str) -> str | None:
         )
     if name == "project.inspect":
         return (
-            "Inspect current run's project manifests, declared dependencies, runtime constraints "
-            "and build/test script presence without executing code. Takes no arguments. "
-            "Does not install dependencies or prove execution environment readiness. "
-            "python_build_profile reports the Root-configured interpreter and pinned artifact candidates, without "
-            "granting installation. For python_offline_wheel_v1 use setuptools.build_meta, src package-dir, "
-            "[tool.setuptools.packages.find] where=[src], and [tool.agent-hub.python-project] "
-            "recipe=python_offline_wheel_v1, import-module=<actual package>, test-directory=tests. "
-            "Select needed direct/transitive dependency pins from the actual catalog and write their SHA lock entries."
+            "Inspect this run's manifests, dependencies and build/test declarations without executing code. "
+            "Empty arguments inspect the project. python_build_profile contains Root-configured interpreter "
+            "and wheel candidates, not installation or readiness evidence. For python_offline_wheel_v1 use "
+            "setuptools.build_meta, src package-dir, [tool.setuptools.packages.find] where=[src], and "
+            "[tool.agent-hub.python-project] recipe=python_offline_wheel_v1, import-module=<package>, "
+            "test-directory=tests. If catalog_complete=false, query python_catalog={catalog_sha256:observed "
+            "digest,offset:0,names:[sorted canonical names]}. Follow catalog_page.next_offset with the same "
+            "digest and names; changed digest requires fresh inspection. Select needed direct/transitive pins "
+            "and write their exact hashes to requirements.lock. Catalog reads grant no engineering progress."
         )
     if name in {"calculator.evaluate", "calculator", "calculator_evaluate"}:
         return "Evaluate a calculator expression supplied as the required nonblank expression string."
