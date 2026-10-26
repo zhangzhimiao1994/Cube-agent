@@ -97,6 +97,11 @@ def _feedback(
     rejection = validated_generated_draft_payload(payload['generated_draft_rejection'])
     if rejection is None:
         return None
+    if rejection['schema_version'] == 2 and (
+        type(route.get('python_dependency_preflight_version')) is not int
+        or route['python_dependency_preflight_version'] != 1
+    ):
+        return None
     expected = {'tenant_id': str(context.tenant_id), 'run_id': str(context.run_id),
         'user_id': str(context.actor_id), 'proposer_actor': request.actor,
         'project_id': route.get('project_id'), 'session_id': route.get('workspace_session_id'),

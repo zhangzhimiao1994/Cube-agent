@@ -1090,6 +1090,7 @@ class RunRepository:
         self, tenant_id: UUID, run_id: UUID, *, actor_id: UUID, actor_role: Role,
         lease_token: UUID, request_sha256: str, project_id: str, session_id: str,
         expected: Mapping[str, JsonValue] | None, replacement: Mapping[str, JsonValue],
+        before_reservation: Callable[[], Awaitable[None]] | None = None,
     ) -> RunRecord:
         from agent_hub.capabilities.generated_project_service import (
             STATE,
@@ -1114,6 +1115,16 @@ class RunRepository:
             if normalized != expected:
                 raise RunConflict('generated_acceptance_state_changed')
             after = validate_generated_transition(previous, replacement)
+            if previous is None and 'python_dependency_preflight' in after:
+                if (type(route.get('python_dependency_preflight_version')) is not int
+                        or route['python_dependency_preflight_version'] != 1
+                        or not callable(before_reservation)):
+                    raise RunConflict('generated_acceptance_scope_changed')
+                await before_reservation()
+                if generated_authority(self._record(row), tenant_id, run_id) != authority:
+                    raise RunConflict('generated_acceptance_scope_changed')
+            elif before_reservation is not None:
+                raise RunConflict('generated_acceptance_scope_changed')
             row.routing_decision = {**route, STATE: json.loads(json.dumps(after, default=dict))}
             row.version += 1
             await session.flush()

@@ -569,6 +569,15 @@ async def _serve_client(
     writer: asyncio.StreamWriter,
     broker: SystemdBroker,
 ) -> None:
+    from agent_hub.skills.sandbox.python_dependency_inspection import (
+        inspect_python_dependency_closure,
+    )
+    from agent_hub.skills.sandbox.python_dependency_protocol import (
+        PythonDependencyClosureResponse,
+    )
+    from agent_hub.skills.sandbox.python_dependency_protocol import (
+        _parse_request as parse_dependency_request,
+    )
     from agent_hub.skills.sandbox.python_input_supply_protocol import (
         PythonInputSupplyRequest,
         PythonInputSupplyResponse,
@@ -590,18 +599,28 @@ async def _serve_client(
     )
 
     is_project = False
+    is_dependency = False
     is_supply = False
     is_profile = False
     is_toolchain = False
     toolchain_request: ToolchainRequest | None = None
     supply_request: PythonInputSupplyRequest | None = None
     python_request: PythonProjectBrokerRequest | PythonProjectProbeRequest | PythonProjectInspectEnvironmentRequest | PythonProjectReleaseEnvironmentRequest | None = None
-    response: BrokerResponse | PythonProjectBrokerResponse | PythonInputSupplyResponse | PythonProjectProfileResponse | ToolchainResponse
+    response: BrokerResponse | PythonProjectBrokerResponse | PythonInputSupplyResponse | PythonProjectProfileResponse | ToolchainResponse | PythonDependencyClosureResponse
     try:
         peer_uid = _peer_uid(writer)
         payload = await _read_frame(reader, _MAX_REQUEST_BYTES)
         envelope = json.loads(payload)
         if isinstance(envelope, dict) and (
+            type(envelope.get('version')) is int and envelope['version'] == 8
+            or envelope.get('action') == 'inspect_python_dependency_closure'
+        ):
+            is_dependency = True
+            if peer_uid != broker._policy.allowed_uid:
+                raise BrokerRequestError('caller uid is not authorized')
+            dependency_request = parse_dependency_request(payload)
+            response = await inspect_python_dependency_closure(dependency_request, policy=broker._policy)
+        elif isinstance(envelope, dict) and (
             type(envelope.get('version')) is int and envelope['version'] == 7
             or isinstance(envelope.get('action'), str) and envelope['action'] in {
                 'plan_project_toolchain', 'supply_project_toolchain',
@@ -689,7 +708,8 @@ async def _serve_client(
                 error="input_supply_unavailable")
         else:
             response = BrokerResponse(ok=False,
-                error='toolchain_request_invalid' if is_toolchain else
+                error='python_dependency_request_invalid' if is_dependency else
+                    'toolchain_request_invalid' if is_toolchain else
                     'python_project_profile_request_invalid' if is_profile else
                     "input_supply_request_invalid" if is_supply else str(error))
     try:

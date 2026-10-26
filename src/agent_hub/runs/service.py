@@ -670,6 +670,7 @@ class RunService:
             "engineering_diagnostic_submission_version": 1,
             "engineering_diagnostic_reads_submission_version": 1,
             "engineering_catalog_reads_submission_version": 1,
+            "python_dependency_preflight_submission_version": 1,
             "engineering_prerequisite_repair_submission_version": 1,
             "engineering_action_admission_submission_version": 1,
             "role_planning_intent_version": 2,
@@ -1981,6 +1982,23 @@ class RunService:
                 )
                 if checkpoint is None:
                     admission_permissions = routing_decision.get("requested_permissions")
+                    if (not allow_running_recovery
+                            and not {'engineering_action_version', 'python_dependency_preflight_version',
+                                     'project_input', 'project_input_contract_version', 'project_input_preparation',
+                                     'generated_project_preparation'} & (row.routing_decision or {}).keys()
+                            and type(routing_decision.get('python_dependency_preflight_submission_version')) is int
+                            and routing_decision['python_dependency_preflight_submission_version'] == 1
+                            and type(routing_decision.get('generated_project_contract_version')) is int
+                            and routing_decision['generated_project_contract_version'] == 1
+                            and routing_decision.get('project_delivery') == 'workspace'
+                            and routing_decision.get('artifact_strategy') == 'workspace_bundle'
+                            and routing_decision.get('sandbox_profile') == 'workspace_write'
+                            and routing_decision.get('permission_mode') in ('default', 'auto_review')
+                            and routing_decision.get('execution_backend', 'systemd') == 'systemd'
+                            and isinstance(admission_permissions, (list, tuple))
+                            and all(isinstance(permission, str) for permission in admission_permissions)
+                            and {'workspace.read', 'workspace.write', 'command.run'}.issubset(admission_permissions)):
+                        routing_decision['python_dependency_preflight_version'] = 1
                     if (not allow_running_recovery and "engineering_action_version" not in (row.routing_decision or {})
                             and mode in {TaskMode.DISPATCH, TaskMode.DISCUSS, TaskMode.HYBRID}
                             and type(routing_decision.get("engineering_action_admission_submission_version")) is int

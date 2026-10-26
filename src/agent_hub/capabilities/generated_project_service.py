@@ -7,16 +7,19 @@ import hashlib
 import json
 import math
 import re
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from contextlib import ExitStack
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, NoReturn, cast
+from typing import TYPE_CHECKING, Any, NoReturn, cast
 from uuid import UUID, uuid4
 
 from agent_hub.auth.models import Role
-from agent_hub.capabilities.generated_project_draft import GeneratedDraftRejection
+from agent_hub.capabilities.generated_project_draft import (
+    GeneratedDraftRejection,
+    dependency_observation_payload,
+)
 from agent_hub.capabilities.project_acceptance import (
     GeneratedAcceptanceEnvelope,
     _nonfinite,
@@ -28,6 +31,7 @@ from agent_hub.capabilities.project_baselines import (
     ProjectBaselineReference,
     ProjectBaselineStore,
     StoredProjectBaseline,
+    _fingerprint,
 )
 from agent_hub.capabilities.project_contracts import _path
 from agent_hub.capabilities.scoped_read import _read_no_links, authorized_workspace_scope
@@ -36,8 +40,15 @@ from agent_hub.plugins.handover_snapshots import _Directory
 from agent_hub.runtime.contracts import JsonValue, _freeze_object
 from agent_hub.skills.sandbox.project import ProjectInvocation, project_source_manifest
 
+if TYPE_CHECKING:
+    from agent_hub.skills.sandbox.python_dependency_protocol import (
+        PythonDependencyClosureObservation,
+    )
+
 VERSION = 'generated_project_contract_version'
 STATE = 'generated_project_preparation'
+_DEPENDENCY = 'python_dependency_preflight'
+_DEPENDENCY_POLICY = 'python_dependency_preflight_version'
 _MANIFEST = 'ACCEPTANCE.json'
 _ENVELOPE = 'generated-acceptance.json'
 _SHA = re.compile(r'[a-f0-9]{64}')
@@ -74,6 +85,40 @@ def _encoded(value: object) -> bytes:
 def _uuid(value: object) -> UUID:
     _need(isinstance(value, UUID))
     return UUID(str(value))
+
+
+def _dependency_selected(route: Mapping[str, object]) -> bool:
+    if _DEPENDENCY_POLICY not in route:
+        return False
+    _need(type(route[_DEPENDENCY_POLICY]) is int and route[_DEPENDENCY_POLICY] == 1)
+    return True
+
+
+async def _inspect_dependencies(
+    invocation: ProjectInvocation, source: str,
+) -> PythonDependencyClosureObservation:
+    from agent_hub.skills.sandbox.python_dependency_protocol import PythonDependencyClosureSandbox
+    from agent_hub.skills.sandbox.python_project_profile import (
+        PythonProjectProfileRequest,
+        PythonProjectProfileSandbox,
+    )
+
+    started = asyncio.get_running_loop().time()
+    async with asyncio.timeout(invocation.timeout_seconds):
+        profile_invocation = ProjectInvocation.model_validate({**invocation.model_dump(),
+            'execution_id': 'dependency_profile_' + uuid4().hex,
+            'timeout_seconds': min(10, invocation.timeout_seconds)}, strict=True)
+        profile = await PythonProjectProfileSandbox().inspect(profile_invocation)
+        profile.require_for(PythonProjectProfileRequest(invocation=profile_invocation))
+        _need(profile.ok and profile.profile is not None, 'python_dependency_metadata_unavailable')
+        assert profile.profile is not None
+        remaining = invocation.timeout_seconds - (asyncio.get_running_loop().time() - started)
+        if remaining <= 0:
+            raise TimeoutError
+        actual = ProjectInvocation.model_validate({**invocation.model_dump(),
+            'timeout_seconds': max(1, math.ceil(remaining))}, strict=True)
+        return await PythonDependencyClosureSandbox().inspect(actual,
+            expected_source_sha256=source, expected_catalog_sha256=profile.profile.catalog_sha256)
 
 
 def _manifest_issues(raw: bytes) -> tuple[str, ...]:
@@ -207,6 +252,13 @@ def validate_generated_preparation(value: object) -> Mapping[str, JsonValue]:
             _need(isinstance(supply, Mapping)
                   and (phase != 'python_ready' or supply['phase'] == 'supplied'))
             keys.add('python_input_supply')
+        if _DEPENDENCY in state:
+            _need(state['stack'] == 'python')
+            proof = dependency_observation_payload(state[_DEPENDENCY], complete=True)
+            if phase != 'capturing':
+                reference = ProjectBaselineReference.from_payload(state['reference'])
+                _need(proof['source_sha256'] == reference.input_source_sha256)
+            keys.add(_DEPENDENCY)
         _need(set(state) == keys, 'generated_acceptance_state_invalid')
         user = state['user_id']
         _need(type(user) is str and str(UUID(user)) == user)
@@ -232,6 +284,8 @@ def validate_generated_transition(previous: object, replacement: object) -> Mapp
     _need(all(before[key] == after[key] for key in common))
     allowed = {'capturing': {'captured'}, 'captured': {'captured', 'python_ready'}, 'python_ready': {'python_ready'}}
     _need(after['phase'] in allowed[cast(str, before['phase'])])
+    _need((_DEPENDENCY in before) == (_DEPENDENCY in after)
+          and before.get(_DEPENDENCY) == after.get(_DEPENDENCY))
     if before['phase'] != 'capturing':
         _need(all(before[key] == after[key] for key in _CAPTURED))
     if 'python_recipe' in before:
@@ -296,8 +350,11 @@ def generated_verification_binding(
 
 
 class GeneratedProjectService:
-    def __init__(self, *, root: Path, repository: object) -> None:
+    def __init__(self, *, root: Path, repository: object,
+                 dependency_inspector: Callable[[ProjectInvocation, str],
+                    Awaitable[PythonDependencyClosureObservation]] | None = None) -> None:
         self.root, self.repository = root, repository
+        self._dependency_inspector = _inspect_dependencies if dependency_inspector is None else dependency_inspector
 
     async def _record(self, tenant: UUID, run: UUID) -> Any:
         getter = getattr(self.repository, 'get', None)
@@ -306,16 +363,18 @@ class GeneratedProjectService:
         return await getter(tenant, run)
 
     async def _cas(self, authority: GeneratedAuthority, expected: Mapping[str, JsonValue] | None,
-                   replacement: Mapping[str, JsonValue]) -> object:
+                   replacement: Mapping[str, JsonValue], *,
+                   before_reservation: Callable[[], Awaitable[None]] | None = None) -> object:
         value = validate_generated_transition(expected, replacement)
         _need(authority.lease_token is not None)
         setter = getattr(self.repository, 'compare_and_set_generated_preparation', None)
         _need(callable(setter), 'generated_acceptance_persistence_unavailable')
         assert callable(setter)
+        extra = {} if before_reservation is None else {'before_reservation': before_reservation}
         return await setter(authority.tenant_id, authority.run_id, actor_id=authority.user_id,
             actor_role=authority.role, lease_token=authority.lease_token,
             request_sha256=authority.request_sha256, project_id=authority.project_id,
-            session_id=authority.session_id, expected=expected, replacement=json.loads(_encoded(value)))
+            session_id=authority.session_id, expected=expected, replacement=json.loads(_encoded(value)), **extra)
 
     def _manifest(self, invocation: ProjectInvocation, *, stored: StoredProjectBaseline | None = None) -> bytes:
         if stored is not None:
@@ -366,7 +425,7 @@ class GeneratedProjectService:
 
     async def _reject_draft(
         self, authority: GeneratedAuthority, actor: str, observation: tuple[bytes | None, dict[str, str]],
-        reason: str, issues: tuple[str, ...],
+        reason: str, issues: tuple[str, ...], *, dependency: Mapping[str, JsonValue] | None = None,
     ) -> NoReturn:
         invocation = authority.invocation
         await asyncio.to_thread(self._controls_absent, invocation)
@@ -383,7 +442,44 @@ class GeneratedProjectService:
             tenant_id=str(authority.tenant_id), user_id=str(authority.user_id), run_id=str(authority.run_id),
             project_id=authority.project_id, session_id=authority.session_id,
             request_sha256=authority.request_sha256, proposer_actor=actor,
-            observation_sha256=observation_sha, reason=reason, issues=issues))
+            observation_sha256=observation_sha, reason=reason, issues=issues,
+            schema_version=2 if dependency is not None else 1, dependency_closure=dependency))
+
+    async def _dependency_draft_preflight(
+        self, authority: GeneratedAuthority, actor: str,
+        observation: tuple[bytes | None, dict[str, str]], controls: tuple[bytes, bytes],
+    ) -> Mapping[str, JsonValue]:
+        from agent_hub.skills.sandbox.python_dependency_protocol import (
+            PythonDependencyClosureObservation,
+        )
+
+        invocation = authority.invocation
+        latest = await self._record(authority.tenant_id, authority.run_id)
+        _draft_route(latest)
+        await asyncio.to_thread(self._controls_absent, invocation)
+        source = _fingerprint(observation[1])
+        readonly = ProjectInvocation.model_validate({**invocation.model_dump(),
+            'execution_id': 'dependency_preflight_' + uuid4().hex,
+            'sandbox_profile': 'restricted', 'install_allowed': False}, strict=True)
+        observed = await self._dependency_inspector(readonly, source)
+        _need(type(observed) is PythonDependencyClosureObservation, 'python_dependency_unavailable')
+        observed = PythonDependencyClosureObservation.model_validate_json(
+            observed.model_dump_json(warnings='error'), strict=True)
+        _need(observed.source_sha256 == source
+              and observed.manifest_sha256 == hashlib.sha256(controls[0]).hexdigest()
+              and observed.lock_sha256 == hashlib.sha256(controls[1]).hexdigest())
+        _need(await self._draft_observation(invocation) == observation)
+        latest = await self._record(authority.tenant_id, authority.run_id)
+        _need(generated_authority(latest, authority.tenant_id, authority.run_id) == authority
+              and _dependency_selected(latest.routing_decision))
+        _draft_route(latest)
+        payload = cast(Mapping[str, JsonValue], observed.model_dump(mode='json'))
+        if observed.closure['status'] != 'complete':
+            await self._reject_draft(authority, actor, observation,
+                'generated_acceptance_python_dependency_incomplete', ('python_dependency_incomplete',),
+                dependency=payload)
+        await asyncio.to_thread(self._controls_absent, invocation)
+        return _freeze_object(payload, name='dependency preflight')
 
     async def load(self, tenant: UUID, run: UUID, actor: str, *, readonly: bool = False) -> GeneratedProjectContext | None:
         try:
@@ -397,6 +493,8 @@ class GeneratedProjectService:
             if raw_state is None:
                 return None
             state = validate_generated_preparation(raw_state)
+            if state['stack'] == 'python':
+                _need((_DEPENDENCY in state) == _dependency_selected(route))
             _need(state['phase'] != 'capturing', 'generated_acceptance_unknown_no_recapture')
             invocation = authority.invocation
             reference = ProjectBaselineReference.from_payload(state['reference'])
@@ -456,6 +554,7 @@ class GeneratedProjectService:
                 await self._reject_draft(authority, actor, observation,
                     'generated_acceptance_scaffold_incomplete', ('scaffold_incomplete',))
             parts = (str(tenant), 'projects', authority.project_id, 'sessions', authority.session_id)
+            dependency: Mapping[str, JsonValue] | None = None
             if manifest.stack == 'node':
                 from agent_hub.capabilities.project_inspection import _parse_node
                 data = await asyncio.to_thread(_read_no_links, self.root, (*parts, 'package.json'), max_bytes=1024**2)
@@ -484,16 +583,31 @@ class GeneratedProjectService:
                 except (ValueError, TypeError):
                     await self._reject_draft(authority, actor, observation,
                         'generated_acceptance_python_declaration_invalid', ('python_declaration_invalid',))
-            state = validate_generated_preparation({'schema_version': 1, 'phase': 'capturing',
+                if _dependency_selected(route):
+                    dependency = await self._dependency_draft_preflight(authority, actor, observation,
+                        (controls[0], controls[1]))
+            state_body: dict[str, JsonValue] = {'schema_version': 1, 'phase': 'capturing',
                 'user_id': str(authority.user_id), 'request_sha256': authority.request_sha256,
                 'proposer_actor': actor, 'stack': manifest.stack, 'manifest_sha256': manifest.sha256,
-                'manifest_raw_sha256': hashlib.sha256(raw).hexdigest()})
-            await self._cas(authority, None, state)
+                'manifest_raw_sha256': hashlib.sha256(raw).hexdigest()}
+            if dependency is not None:
+                state_body[_DEPENDENCY] = dependency
+            state = validate_generated_preparation(state_body)
+
+            async def before_reservation() -> None:
+                # The repository holds the run row lock; do not reserve a known-stale draft.
+                await asyncio.to_thread(self._controls_absent, invocation)
+                _need(await self._draft_observation(invocation) == observation)
+
+            await self._cas(authority, None, state,
+                before_reservation=before_reservation if dependency is not None else None)
             metadata: dict[str, JsonValue] = {'schema_version': 1, 'purpose': 'generated_acceptance',
                 'capture_phase': 'post_model', 'user_id': str(authority.user_id),
                 'request_sha256': authority.request_sha256, 'manifest_sha256': hashlib.sha256(raw).hexdigest()}
             store = ProjectBaselineStore(self.root)
             reference = await store.capture_generated_once(invocation, editable_paths=manifest.editable_paths, metadata=metadata)
+            if dependency is not None:
+                _need(reference.input_source_sha256 == dependency['source_sha256'])
             stored = await asyncio.to_thread(store.load, invocation, reference)
             captured_raw = await asyncio.to_thread(self._manifest, invocation, stored=stored)
             _need(raw == captured_raw)

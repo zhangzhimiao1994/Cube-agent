@@ -414,10 +414,12 @@ def engineering_work_progress(
                 rejection = feedback["generated_draft_rejection"]
                 assert isinstance(rejection, Mapping)
                 observation = cast(str, rejection["observation_sha256"])
-                # One diagnosis window per productive draft, not a verification pass.
-                if productive_since_diagnosis and observation not in seen_diagnoses:
-                    credits.add(f"draft.diagnosis:{observation}")
-                seen_diagnoses.add(observation)
+                # Only v1 draft diagnoses earn runway. Dependency observations
+                # consume the causal write without creating another budget window.
+                if rejection["schema_version"] == 1:
+                    if productive_since_diagnosis and observation not in seen_diagnoses:
+                        credits.add(f"draft.diagnosis:{observation}")
+                    seen_diagnoses.add(observation)
                 productive_since_diagnosis = False
             continue
         semantic: object

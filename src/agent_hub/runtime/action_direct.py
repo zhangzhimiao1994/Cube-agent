@@ -58,6 +58,7 @@ _FIXED_ROUTE_KEYS = (
     'direct_model', 'main_agent_model', 'allowed_models', 'harness_policy', 'permission_mode',
     'engineering_diagnostic_reads_version',
     'engineering_catalog_reads_version',
+    'python_dependency_preflight_version',
     'engineering_prerequisite_repair_version',
 )
 _GUIDANCE_ROUTE_KEYS = (

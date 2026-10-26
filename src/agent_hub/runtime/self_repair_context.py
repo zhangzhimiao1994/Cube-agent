@@ -45,6 +45,8 @@ def project_repair_failure_text(
 
     The caller must use the normal draft/execution receipt validator first. The
     phase's immutable artifact binding is checked again before projecting it.
+    V2 drafts retain only the bounded closure as dependency_closure schema v1;
+    Root environment, digests and scope are not part of this prompt projection.
     """
     if (artifact.type != "tool_result" or str(artifact.id) != expected_artifact_id
             or artifact.content_sha256 != expected_artifact_sha256
@@ -63,9 +65,17 @@ def project_repair_failure_text(
         draft = validated_generated_draft_payload(validated_feedback["generated_draft_rejection"])
         if draft is None:
             raise ValueError("project repair failure evidence is invalid")
-        diagnostic["generated_draft_rejection"] = {
+        projected_draft: dict[str, JsonValue] = {
             key: draft[key] for key in ("reason", "issues", "observation_sha256", "execution_started")
         }
+        if draft["schema_version"] == 2:
+            observation = draft["dependency_closure"]
+            assert isinstance(observation, Mapping)
+            closure = observation["closure"]
+            assert isinstance(closure, Mapping)
+            projected_draft["schema_version"] = 2
+            projected_draft["dependency_closure"] = {"schema_version": 1, **closure}
+        diagnostic["generated_draft_rejection"] = projected_draft
     else:
         diagnostic = {key: validated_feedback[key] for key in (
             "execution_diagnostic", "verification_failure", "python_verification_failure", "verification_blocked",

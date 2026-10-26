@@ -13,7 +13,7 @@ def generated_project_guidance(context: TaskContext) -> str:
     if (type(route.get('generated_project_contract_version')) is not int
             or route['generated_project_contract_version'] != 1 or route.get('project_delivery') != 'workspace'):
         return ''
-    return (
+    guidance = (
         'Use only tools assigned to your current role; planning-only roles pass this contract to the writer. '
         'For this new project, define executable acceptance covering the actual user requirements, '
         'including error cases, before claiming completion. Inspect the workspace with project.inspect. '
@@ -43,3 +43,15 @@ def generated_project_guidance(context: TaskContext) -> str:
         'supply and recipe installation have separate approvals. Unsupported inputs are a precise blocker, '
         'not permission to run host commands or manufacture successful evidence.'
     )
+    if (type(route.get('python_dependency_preflight_version')) is int
+            and route['python_dependency_preflight_version'] == 1):
+        guidance += (
+            ' Before capture, project.verify checks dependency_closure against trusted wheel metadata. '
+            'Correct missing or incompatible lock entries using the actual catalog pins and the returned '
+            'dependency constraints, then verify again. If the requested dependency is unsupported, '
+            'choose a supported alternative that still meets the user requirements, including standard '
+            'library implementation when appropriate; do not repeat an unchanged failed draft. '
+            'A dependency observation is not installation, build or test evidence, an approval, '
+            'or an extension of the original task deadline.'
+        )
+    return guidance

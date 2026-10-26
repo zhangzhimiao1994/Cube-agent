@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -18,6 +19,7 @@ _ISSUES = {
     'generated_acceptance_scaffold_incomplete': frozenset({'scaffold_incomplete'}),
     'generated_acceptance_node_declaration_invalid': frozenset({'node_declaration_invalid'}),
     'generated_acceptance_python_declaration_invalid': frozenset({'python_declaration_invalid'}),
+    'generated_acceptance_python_dependency_incomplete': frozenset({'python_dependency_incomplete'}),
 }
 _KEYS = frozenset({'schema_version', 'kind', 'phase', 'execution_started', 'tenant_id', 'user_id',
     'run_id', 'project_id', 'session_id', 'request_sha256', 'proposer_actor', 'observation_sha256',
@@ -25,12 +27,37 @@ _KEYS = frozenset({'schema_version', 'kind', 'phase', 'execution_started', 'tena
 _ERROR = 'invalid generated draft rejection'
 
 
+def dependency_observation_payload(value: object, *, complete: bool = False) -> dict[str, object]:
+    from agent_hub.skills.sandbox.python_dependency_protocol import (
+        PythonDependencyClosureObservation,
+    )
+
+    if not isinstance(value, Mapping) or type(complete) is not bool:
+        raise ValueError(_ERROR)
+    raw = bytearray()
+    encoder = json.JSONEncoder(default=dict, ensure_ascii=True, allow_nan=False,
+                               sort_keys=True, separators=(',', ':'))
+    for chunk in encoder.iterencode(value):
+        if len(raw) + len(chunk) > 32 * 1024:
+            raise ValueError(_ERROR)
+        raw.extend(chunk.encode('ascii'))
+    observed = PythonDependencyClosureObservation.model_validate_json(bytes(raw), strict=True)
+    if (observed.closure['status'] == 'complete') is not complete:
+        raise ValueError(_ERROR)
+    return observed.model_dump(mode='json')
+
+
 def _checked(value: object) -> Mapping[str, JsonValue]:
-    if not isinstance(value, Mapping) or len(value) != len(_KEYS) or set(value) != _KEYS:
+    if not isinstance(value, Mapping) or 'schema_version' not in value:
+        raise ValueError(_ERROR)
+    version = value.get('schema_version')
+    if type(version) is not int or version not in (1, 2):
+        raise ValueError(_ERROR)
+    keys = _KEYS | {'dependency_closure'} if version == 2 else _KEYS
+    if len(value) != len(keys) or set(value) != keys:
         raise ValueError(_ERROR)
     item = dict(value)
-    if (type(item['schema_version']) is not int or item['schema_version'] != 1
-            or type(item['execution_started']) is not bool or item['execution_started'] is not False
+    if (type(item['execution_started']) is not bool or item['execution_started'] is not False
             or type(item['kind']) is not str or item['kind'] != 'generated_project_draft_rejection'
             or type(item['phase']) is not str or item['phase'] != 'before_capture'):
         raise ValueError(_ERROR)
@@ -47,6 +74,13 @@ def _checked(value: object) -> Mapping[str, JsonValue]:
             or type(issues) not in (list, tuple) or not 1 <= len(issues) <= 3
             or any(type(issue) is not str or issue not in _ISSUES[reason] for issue in issues)
             or len(set(issues)) != len(issues)):
+        raise ValueError(_ERROR)
+    dependency_reason = 'generated_acceptance_python_dependency_incomplete'
+    if version == 2:
+        if reason != dependency_reason:
+            raise ValueError(_ERROR)
+        item['dependency_closure'] = dependency_observation_payload(item['dependency_closure'])
+    elif reason == dependency_reason:
         raise ValueError(_ERROR)
     return _freeze_object(cast(Mapping[str, JsonValue], item), name='generated draft rejection')
 
@@ -75,9 +109,13 @@ class GeneratedDraftRejection:
     kind: str = 'generated_project_draft_rejection'
     phase: str = 'before_capture'
     execution_started: bool = False
+    dependency_closure: Mapping[str, JsonValue] | None = None
 
     def __post_init__(self) -> None:
-        self.to_payload()
+        payload = self.to_payload()
+        if self.dependency_closure is not None:
+            object.__setattr__(self, 'dependency_closure', _freeze_object(
+                cast(Mapping[str, JsonValue], payload['dependency_closure']), name='dependency observation'))
 
     def to_payload(self) -> dict[str, object]:
         # Revalidate even frozen instances: object.__setattr__ must not forge evidence.
@@ -92,6 +130,8 @@ class GeneratedDraftRejection:
                 'proposer_actor': self.proposer_actor, 'observation_sha256': self.observation_sha256,
                 'reason': self.reason, 'issues': list(self.issues),
             }
+            if self.dependency_closure is not None:
+                item['dependency_closure'] = dependency_observation_payload(self.dependency_closure)
             _checked(item)
             return item
         except (ValueError, TypeError, KeyError, AttributeError, RecursionError, OverflowError):
