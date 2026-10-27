@@ -16,6 +16,7 @@ from uuid import UUID, uuid4
 
 from agent_hub.domain.runs import TaskMode
 from agent_hub.models.gateway import preserve_gateway_scope_diagnostic
+from agent_hub.runtime import direct_delivery_report, hybrid_delivery_report
 from agent_hub.runtime.adaptive_budget import AdaptiveDeadline, deadline_from_routing
 from agent_hub.runtime.artifacts import (
     ArtifactReference,
@@ -270,6 +271,8 @@ class HybridRuntime:
                         known.add(artifact.id)
                 sequence = cast(int, restored.state["next_sequence"])
                 if restored.state["terminal"] is True:
+                    if not _final_report_ready(context, artifacts, output_ids):
+                        raise _OriginalProjectReplayError("hybrid final report checkpoint proof is invalid")
                     if not _delivery_artifacts(artifacts, output_ids):
                         raise RuntimeExecutionError("hybrid completed without displayable output")
                     yield RunEvent(
@@ -373,6 +376,12 @@ class HybridRuntime:
                     if is_discussion
                     else tuple(artifacts)
                 )
+                if (mode is TaskMode.DIRECT and hybrid_delivery_report.selected(context)
+                        and _is_workspace_project_delivery(context)):
+                    _, required = hybrid_delivery_report.delivery(context, artifacts, output_ids=output_ids)
+                    required_ids = {item.id for item in required}
+                    handoff_artifacts = _bounded_handoff_artifacts(
+                        (*required, *(item for item in artifacts if item.id not in required_ids)))
                 stage_budget = _StageBudget(
                     token_limit=remaining_tokens,
                     timeout_limit=stage_timeout,
@@ -551,6 +560,8 @@ class HybridRuntime:
                     checkpoint=stage_checkpoint,
                 )
                 sequence += 1
+            if not _final_report_ready(context, artifacts, output_ids):
+                raise RuntimeExecutionError("hybrid final delivery report is missing")
             if not _delivery_artifacts(artifacts, output_ids):
                 raise RuntimeExecutionError("hybrid completed without displayable output")
             checkpoint = self._checkpoint(
@@ -608,6 +619,7 @@ class HybridRuntime:
             partial_reason = (
                 None if (
                     original_terminal_replay
+                    or (hybrid_delivery_report.selected(context) and _is_workspace_project_delivery(context))
                     # Preserve engineering outputs for diagnosis/recovery; a
                     # failed stage cannot substitute for final main delivery.
                     or (type(context.routing_decision.get("engineering_delivery_contract_version")) is int
@@ -788,6 +800,13 @@ class HybridRuntime:
         stage_budget: _StageBudget,
         checkpoint: RuntimeCheckpoint | None,
     ) -> AsyncIterator[RunEvent]:
+        routing = parent.routing_decision
+        if (mode is TaskMode.DIRECT and hybrid_delivery_report.selected(parent)
+                and _is_workspace_project_delivery(parent)):
+            _, required = hybrid_delivery_report.delivery(parent, artifacts,
+                output_ids={item.id for item in artifacts if item.id not in stage_budget.input_artifact_ids})
+            routing = {**routing, hybrid_delivery_report.INPUT: {
+                str(item.id): item.content_sha256 for item in required}}
         child_context = TaskContext(
             run_id=parent.run_id,
             tenant_id=parent.tenant_id,
@@ -796,7 +815,7 @@ class HybridRuntime:
             mode=mode,
             request=parent.request,
             artifacts=artifacts,
-            routing_decision=parent.routing_decision,
+            routing_decision=routing,
             timeout_seconds=stage_budget.timeout_limit,
             token_budget=min(
                 10_000_000,
@@ -859,7 +878,7 @@ class HybridRuntime:
                         )
                         sequence += 1
                         continue
-                    if mode is TaskMode.DIRECT:
+                    if mode is TaskMode.DIRECT and not hybrid_delivery_report.selected(parent):
                         item = _reconcile_synthesis_event(item, artifacts)
                     if (
                         item.kind is EventKind.ARTIFACT_CREATED
@@ -906,10 +925,22 @@ class HybridRuntime:
         child_checkpoint: RuntimeCheckpoint | None,
         terminal_diagnostic: Mapping[str, JsonValue] | None = None,
     ) -> RuntimeCheckpoint:
-        checkpoint_artifacts = _bounded_handoff_artifacts(artifacts)
         # Private checkpoint builders may explicitly supply an owned output registry.
         if output_ids is None:
             output_ids = {item.id for item in artifacts if not _is_context_artifact(item)}
+        checkpoint_artifacts = _bounded_handoff_artifacts(artifacts)
+        if hybrid_delivery_report.selected(context) and _is_workspace_project_delivery(context):
+            try:
+                _, required = hybrid_delivery_report.delivery(context, artifacts, output_ids=output_ids)
+            except (ValueError, TypeError, RecursionError):
+                required = ()  # The native producer may not have reached its report yet.
+            if required:
+                main = next((item for item in reversed(artifacts)
+                    if item.id in output_ids and direct_delivery_report.valid(context, item)), None)
+                anchors = (*((main,) if main is not None else ()), *required)
+                anchor_ids = {item.id for item in anchors}
+                checkpoint_artifacts = _bounded_handoff_artifacts(
+                    (*anchors, *(item for item in artifacts if item.id not in anchor_ids)))
         return RuntimeCheckpoint(
             id=uuid4(),
             runtime_type=_RUNTIME_TYPE,
@@ -945,6 +976,7 @@ class HybridRuntime:
                 ),
                 **({"terminal_diagnostic": dict(terminal_diagnostic)}
                    if terminal_diagnostic is not None else {}),
+                **({hybrid_delivery_report.POLICY: 1} if hybrid_delivery_report.selected(context) else {}),
             },
         )
 
@@ -961,6 +993,11 @@ class HybridRuntime:
         ):
             raise RuntimeExecutionError("runtime checkpoint is incompatible")
         state = checkpoint.state
+        if hybrid_delivery_report.POLICY in state and (
+                type(state[hybrid_delivery_report.POLICY]) is not int
+                or state[hybrid_delivery_report.POLICY] != 1
+                or not hybrid_delivery_report.selected(context)):
+            raise RuntimeExecutionError("hybrid final report checkpoint policy changed")
         registry = state.get("artifact_registry")
         required_state = {
             "plan_digest",
@@ -1011,6 +1048,7 @@ class HybridRuntime:
                 keys | {"terminal_diagnostic"} for keys in allowed_state
                 if "output_artifact_registry" in keys
             }
+            allowed_state |= {keys | {hybrid_delivery_report.POLICY} for keys in allowed_state}
         if (
             frozenset(state) not in allowed_state
             or not isinstance(registry, Mapping)
@@ -1471,6 +1509,21 @@ def _has_final_attachment(artifact: Artifact) -> bool:
         return False
     view = artifact.model_copy(update={"content": {"result": delivery}})
     return final_attachment_result((view,)) is not None
+
+
+def _final_report_ready(context: TaskContext, artifacts: list[Artifact], output_ids: set[UUID]) -> bool:
+    if not hybrid_delivery_report.selected(context) or not _is_workspace_project_delivery(context):
+        return True
+    try:
+        expected, required = hybrid_delivery_report.delivery(context, artifacts, output_ids=output_ids)
+        expected_digest = direct_delivery_report.digest(expected)
+        required_ids = {str(item.id) for item in required}
+        return any(item.id in output_ids and direct_delivery_report.valid(context, item)
+                   and isinstance(item.content.get("workspace_delivery"), Mapping)
+                   and direct_delivery_report.digest(item.content["workspace_delivery"]) == expected_digest
+                   and required_ids.issubset(item.source_ids) for item in artifacts)
+    except (ValueError, TypeError, RecursionError):
+        return False
 
 
 def _partial_hybrid_completion_reason(

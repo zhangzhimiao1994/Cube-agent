@@ -60,6 +60,7 @@ _FIXED_ROUTE_KEYS = (
     'engineering_catalog_reads_version',
     'python_dependency_preflight_version',
     'engineering_prerequisite_repair_version',
+    'engineering_direct_report_version',
 )
 _GUIDANCE_ROUTE_KEYS = (
     'project_preflight_approved', 'project_preflight_proposal',

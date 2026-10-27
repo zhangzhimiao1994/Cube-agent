@@ -42,6 +42,7 @@ from agent_hub.models.types import (
     TokenUsage,
 )
 from agent_hub.plugins.contracts import plugin_package_generation_guidance
+from agent_hub.runtime import direct_delivery_report, hybrid_delivery_report
 from agent_hub.runtime.adaptive_budget import deadline_from_routing
 from agent_hub.runtime.contracts import (
     Artifact,
@@ -258,6 +259,7 @@ class _BatchedWorkspaceOutcome:
     request: ModelRequest
     written_paths: tuple[str, ...]
     agent_standard_evidence: bool
+    report_binding: Mapping[str, JsonValue] | None = None
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -2355,9 +2357,74 @@ class DirectRuntime:
                     error.__context__ = None
                     error.__cause__ = None
                 else:
+                    report_binding: Mapping[str, JsonValue] | None = None
+                    summary = "\n".join(summaries) or "Project workspace completed."
+                    if direct_delivery_report.selected(context):
+                        try:
+                            observed = direct_delivery_report.evidence(context, delivery)
+                        except (ValueError, TypeError, RecursionError):
+                            _raise_execution_error("direct final delivery evidence is unavailable")
+                        encoded = json.dumps(observed, default=dict, ensure_ascii=False,
+                                             allow_nan=False, sort_keys=True, separators=(",", ":"))
+                        encoded = encoded.replace("<", "\\u003c").replace(">", "\\u003e")
+                        report_messages = (ModelMessage(role="system", content=direct_delivery_report.PROMPT),
+                            ModelMessage(role="user", content=context.request), ModelMessage(role="user", content=(
+                                "<UNTRUSTED_VERIFIED_DELIVERY_JSON>" + encoded
+                                + "</UNTRUSTED_VERIFIED_DELIVERY_JSON>")))
+                        report_estimate = _estimate_text_tokens(json.dumps([
+                            {"role": message.role, "content": message.content} for message in report_messages],
+                            ensure_ascii=False, separators=(",", ":")))
+                        report_seconds = deadline - asyncio.get_running_loop().time()
+                        report_tokens = min(_max_direct_output_tokens_for_context(context),
+                            _effective_context_token_budget(context) - report_estimate,
+                            active_token_limit - consumed_tokens - report_estimate)
+                        if report_seconds <= 0 or report_tokens <= 0:
+                            _raise_execution_error("workspace delivery budget is exhausted")
+                        request = ModelRequest(logical_model=self._logical_model, messages=report_messages,
+                            required_capabilities=frozenset({ModelCapability.TEXT}),
+                            allow_fallback=initial_request.allow_fallback,
+                            timeout_seconds=min(initial_request.timeout_seconds, report_seconds),
+                            max_output_tokens=report_tokens)
+                        report_task = asyncio.create_task(self._complete_with_scope(request))
+                        self._active_task = report_task
+                        try:
+                            async with asyncio.timeout(report_seconds):
+                                raw_report = await report_task
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as error:  # noqa: BLE001 - preserve only finite gateway diagnostics.
+                            failure = RuntimeExecutionError(_gateway_failure_reason(error))
+                            preserve_gateway_scope_diagnostic(failure, error)
+                            _raise_execution_error(str(failure), source=failure)
+                        finally:
+                            if not report_task.done():
+                                report_task.cancel()
+                            await asyncio.gather(report_task, return_exceptions=True)
+                            if self._active_task is report_task:
+                                self._active_task = None
+                        final_completion = self._strict_completion(raw_report)
+                        if (final_completion is None or final_completion.response.tool_calls
+                                or not final_completion.response.text or not final_completion.response.text.strip()
+                                or _json_mapping_from_model_text(final_completion.response.text) is not None):
+                            _raise_execution_error("direct final report is invalid")
+                        report_usage = self._verified_budget_usage(final_completion.response.usage,
+                            prompt_estimate=report_estimate, response_text=final_completion.response.text,
+                            request_max_output_tokens=request.max_output_tokens,
+                            context_token_budget=_effective_context_token_budget(context))
+                        if report_usage.usage is None:
+                            _raise_execution_error(report_usage.error_code or "model response budget is unverifiable")
+                        total_prompt_tokens += report_usage.usage.prompt_tokens
+                        total_completion_tokens += report_usage.usage.completion_tokens
+                        total_reported_tokens += report_usage.usage.total_tokens
+                        if total_reported_tokens > active_token_limit:
+                            _raise_execution_error("model response budget exceeds runtime limit")
+                        usage_estimated = usage_estimated or report_usage.estimated
+                        completion = final_completion
+                        summary = cast(str, completion.response.text)
+                        report_binding = direct_delivery_report.binding(context, delivery, request, completion)
                     return _BatchedWorkspaceOutcome(
                         delivery=delivery,
-                        summary="\n".join(summaries) or "Project workspace completed.",
+                        summary=summary,
                         usage=TokenUsage(
                             prompt_tokens=total_prompt_tokens,
                             completion_tokens=total_completion_tokens,
@@ -2370,6 +2437,7 @@ class DirectRuntime:
                         agent_standard_evidence=(
                             _workspace_files_have_agent_standard_evidence(evidence_files)
                         ),
+                        report_binding=report_binding,
                     )
 
             remaining_run_tokens = active_token_limit - consumed_tokens
@@ -2596,6 +2664,10 @@ class DirectRuntime:
                     raise RuntimeExecutionError("runtime checkpoint boundary is unsupported")
                 artifacts = tuple(artifact for artifact in context.artifacts
                                   if str(artifact.id) == restored.state["artifact_id"])
+                if (direct_delivery_report.selected(context) and _is_workspace_project_delivery(context)
+                        and (len(artifacts) != 1 or artifacts[0].content_sha256 != restored.state["artifact_sha256"]
+                             or not direct_delivery_report.valid(context, artifacts[0]))):
+                    raise RuntimeExecutionError("direct final report checkpoint proof is invalid")
                 generated_delivery = generated_history_selected(context) and (
                     _is_workspace_project_delivery(context)
                     or 'generated_event_layout' in restored.state
@@ -2728,6 +2800,25 @@ class DirectRuntime:
             included_source_ids = request_outcome.included_source_ids
             prompt_estimate = request_outcome.prompt_estimate
             del request_outcome
+            hybrid_delivery: Mapping[str, JsonValue] | None = None
+            if (hybrid_delivery_report.selected(context) and _is_workspace_project_delivery(context)
+                    and self._capability_gateway is None):
+                try:
+                    hybrid_delivery, required = hybrid_delivery_report.framed(context)
+                    report_messages = direct_delivery_report.messages(context, hybrid_delivery)
+                except (ValueError, TypeError, RecursionError):
+                    _raise_execution_error("hybrid final delivery evidence is unavailable")
+                prompt_estimate = _estimate_text_tokens(json.dumps([
+                    {"role": message.role, "content": message.content} for message in report_messages],
+                    ensure_ascii=False, separators=(",", ":")))
+                report_tokens = min(_max_direct_output_tokens_for_context(context),
+                    _effective_context_token_budget(context) - prompt_estimate,
+                    context.token_budget - prompt_estimate)
+                if report_tokens <= 0:
+                    _raise_execution_error("runtime token budget is insufficient")
+                request = replace(request, messages=report_messages, max_output_tokens=report_tokens,
+                                  tools=(), required_tool=None, response_schema=None)
+                included_source_ids = tuple(str(item.id) for item in required)
             if inspection_artifact is not None:
                 inspection_json = json.dumps(inspection_artifact.content['result'], default=dict,
                     sort_keys=True, separators=(',', ':'), ensure_ascii=True, allow_nan=False)
@@ -2833,7 +2924,7 @@ class DirectRuntime:
                     fingerprint = _failure_fingerprint(error)
                     fingerprint_count = failure_fingerprints.get(fingerprint, 0) + 1
                     failure_fingerprints[fingerprint] = fingerprint_count
-                    retryable = not generated_entry and _retryable_gateway_failure(error)
+                    retryable = not generated_entry and hybrid_delivery is None and _retryable_gateway_failure(error)
                     failure_source = RuntimeExecutionError(failure_reason)
                     preserve_gateway_scope_diagnostic(failure_source, error)
                     error.__traceback__ = None
@@ -2950,7 +3041,8 @@ class DirectRuntime:
                     deadline=retry_deadline,
                 )
                 if (
-                    fingerprint_count >= 2
+                    hybrid_delivery is not None
+                    or fingerprint_count >= 2
                     or attempt_count >= self._available_model_attempts
                     or retry_request is None
                 ):
@@ -2961,8 +3053,15 @@ class DirectRuntime:
                 gateway_task.add_done_callback(lambda _task: submission_ready.set())
                 self._active_task = gateway_task
             workspace_delivery: Mapping[str, JsonValue] | None = None
+            delivery_report_binding: Mapping[str, JsonValue] | None = None
             artifact_origin: str | None = None
             batched_agent_standard_evidence = False
+            if hybrid_delivery is not None:
+                if _json_mapping_from_model_text(text) is not None:
+                    _raise_execution_error("direct final report is invalid")
+                workspace_delivery = hybrid_delivery
+                artifact_origin = "verified_hybrid_final_report"
+                delivery_report_binding = direct_delivery_report.binding(context, hybrid_delivery, request, completion)
             batch = (
                 _workspace_batch_from_model_text(text,
                     allow_reads=_original_project_policy(context) or generated_entry
@@ -3021,6 +3120,7 @@ class DirectRuntime:
                 completion = batched.completion
                 request = batched.request
                 batched_agent_standard_evidence = batched.agent_standard_evidence
+                delivery_report_binding = batched.report_binding
                 if (
                     not _original_project_policy(context)
                     and context.routing_decision.get("website_preview_required") is True
@@ -3168,6 +3268,8 @@ class DirectRuntime:
                     artifact_content = {"text": text}
                 if generated_event_layout is not None:
                     artifact_content['generated_event_layout'] = generated_event_layout
+                if delivery_report_binding is not None:
+                    artifact_content.update(text=text, delivery_report_binding=delivery_report_binding)
                 artifact = Artifact(
                     id=uuid4(),
                     type=artifact_type,
@@ -3314,6 +3416,8 @@ class DirectRuntime:
                     "next_sequence": 4 + injection_offset,
                     **({"model_scope_event_count": len(scope_events)} if scope_events else {}),
                     **({'generated_event_layout': generated_event_layout} if generated_event_layout is not None else {}),
+                    **({direct_delivery_report.CHECKPOINT_POLICY: direct_delivery_report.policy_identity(context)}
+                       if delivery_report_binding is not None else {}),
                 },
             )
             self._last_checkpoint = checkpoint
@@ -3770,6 +3874,10 @@ class DirectRuntime:
         ):
             raise RuntimeExecutionError("runtime checkpoint is incompatible")
         layout = checkpoint.state.get('generated_event_layout')
+        if (direct_delivery_report.CHECKPOINT_POLICY in checkpoint.state
+                and checkpoint.state[direct_delivery_report.CHECKPOINT_POLICY]
+                != direct_delivery_report.policy_identity(context)):
+            raise RuntimeExecutionError("direct final report checkpoint policy changed")
         if (layout is None and generated_history_selected(context) and _is_workspace_project_delivery(context)):
             raise RuntimeExecutionError('generated project checkpoint evidence is invalid')
         if layout is not None:
@@ -3800,6 +3908,13 @@ class DirectRuntime:
         base_keys = {"completed", "artifact_id", "artifact_sha256", "next_sequence"}
         generated = 'generated_event_layout' in state
         allowed = base_keys | ({'generated_event_layout'} if generated else set())
+        if direct_delivery_report.CHECKPOINT_POLICY in state:
+            policy = state[direct_delivery_report.CHECKPOINT_POLICY]
+            if (not isinstance(policy, Mapping) or not policy
+                    or set(policy) - {direct_delivery_report.POLICY, hybrid_delivery_report.POLICY}
+                    or any(type(value) is not int or value != 1 for value in policy.values())):
+                return False
+            allowed |= {direct_delivery_report.CHECKPOINT_POLICY}
         if set(state) not in (allowed, allowed | {"model_scope_event_count"}):
             return False
         artifact_id = state["artifact_id"]

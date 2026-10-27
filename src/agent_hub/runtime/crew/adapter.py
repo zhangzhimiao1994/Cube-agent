@@ -100,6 +100,7 @@ from agent_hub.runtime.contracts import (
 from agent_hub.runtime.contracts import (
     _freeze_json as _freeze_bounded_json,
 )
+from agent_hub.runtime.crew import delivery_report as _delivery_report
 from agent_hub.runtime.crew.engineering_delivery import (
     engineering_action_progress,
     engineering_delivery_ready,
@@ -4015,6 +4016,7 @@ class _RunState:
     initial_incomplete_chain_growth: bool = True
     post_tool_finalization_growth_version: int = 0
     workspace_maintenance_feedback_version: int = 0
+    engineering_dispatch_report_version: int = 0
     deadline: float | None = None
     adaptive_deadline: AdaptiveDeadline | None = None
     crew_generation: CrewStepGeneration | None = None
@@ -4284,6 +4286,13 @@ class CrewDispatchRuntime:
 
         try:
             plan = DispatchPlan.revalidate(self._plan)
+            report_version = context.routing_decision.get(_delivery_report.POLICY, 0)
+            if type(report_version) is not int or report_version not in {0, 1}:
+                _fail("engineering delivery report version is invalid")
+            state.engineering_dispatch_report_version = (
+                cast(int, restored.state.get(_delivery_report.POLICY, 0))
+                if restored is not None else report_version
+            )
             state.native_tool_continuation = self._provider_continuation_repository is not None
             maintenance_version = context.routing_decision.get("workspace_maintenance_contract_version", 0)
             if (type(maintenance_version) is not int or maintenance_version not in {0, 1}
@@ -4441,6 +4450,18 @@ class CrewDispatchRuntime:
                     review_ledger,
                     restored_artifacts,
                 ) = await self._hydrate_checkpoint(restored, context, plan, state)
+                if state.engineering_dispatch_report_version == 1:
+                    for report_step in plan.steps:
+                        if (report_step.id in completed
+                                and _delivery_report.selected(context, plan, report_step)):
+                            try:
+                                _delivery_report.validate_report(
+                                    completed[report_step.id], context=context, plan=plan, step=report_step,
+                                    states=tool_ledger.states, artifacts=tool_ledger.artifacts,
+                                    models=model_ledger.states, model_artifacts=model_ledger.artifacts,
+                                )
+                            except ValueError as error:
+                                _fail(str(error))
                 for restored_step in plan.steps:
                     if (restored_step.id in completed
                             and restored_step.engineering_delivery_contract_version == 1
@@ -5230,6 +5251,8 @@ class CrewDispatchRuntime:
             await emit(**values)
 
         agent = agents[step.agent]
+        delivery_report = (run_state.engineering_dispatch_report_version == 1
+                           and _delivery_report.selected(context, plan, step))
         retries = prior_retries
         feedback_artifact = review_ledger.artifacts.get(step.id)
         feedback_value = (
@@ -5310,6 +5333,22 @@ class CrewDispatchRuntime:
                     artifact_sources,
                     version=retries + 1,
                 )
+                if delivery_report:
+                    try:
+                        binding = _delivery_report.report_binding(
+                            context=context, plan=plan, step=step,
+                            text=cast(str, completion.response.text),
+                            states=tool_ledger.states, artifacts=tool_ledger.artifacts,
+                            models=model_ledger.states, model_artifacts=model_ledger.artifacts,
+                        )
+                    except ValueError as error:
+                        _fail(str(error))
+                    artifact = Artifact(
+                        id=artifact.id, version=artifact.version, type=artifact.type,
+                        producer=artifact.producer, source_ids=artifact.source_ids,
+                        provenance=artifact.provenance,
+                        content={"text": completion.response.text, _delivery_report.BINDING: binding},
+                    )
                 await event(
                     kind=EventKind.ARTIFACT_CREATED,
                     artifact=artifact,
@@ -5557,7 +5596,8 @@ class CrewDispatchRuntime:
                     ):
                         _fail("model incomplete recovery budget exhausted")
                 if (
-                    incomplete_recovery_model is None
+                    not delivery_report
+                    and incomplete_recovery_model is None
                     and not isinstance(error, (_ReviewFailed, _ModelContractFailed))
                     and (
                         (
@@ -5632,7 +5672,8 @@ class CrewDispatchRuntime:
                         ),
                     }
                 if (
-                    recovery_status == "failed_after_compact_retry"
+                    not delivery_report
+                    and recovery_status == "failed_after_compact_retry"
                     and diagnostic.get("error_code") == "model.empty_response"
                 ):
                     fallback_artifact = _final_synthesis_fallback_artifact(
@@ -5785,6 +5826,18 @@ class CrewDispatchRuntime:
             "task": step.task,
             "untrusted_source_artifacts": source_payload,
         }
+        delivery_report = (run_state.engineering_dispatch_report_version == 1
+                           and _delivery_report.selected(context, self._plan, step))
+        if delivery_report:
+            if _agent_response_schema(agent) is not None:
+                _fail("delivery report requires a natural language final step")
+            try:
+                _delivery_report.delivery_evidence(
+                    context, self._plan, step, tool_ledger.states, tool_ledger.artifacts,
+                )
+            except ValueError as error:
+                _fail(str(error))
+            user["delivery_report_instruction"] = _delivery_report.PROMPT
         hermes_context = runtime_memory_context_text(context.routing_decision)
         if hermes_context:
             user["hermes_memory_context"] = hermes_context
@@ -6024,6 +6077,8 @@ class CrewDispatchRuntime:
         completion = last_completion
         if completion is None:
             _fail("CrewAI bypassed the ModelGateway bridge")
+        if delivery_report and raw != completion.response.text:
+            _fail("delivery report framework text differs from native model output")
         schema = _agent_response_schema(agent)
         if schema is not None:
             if _should_check_framework_raw(step, completion):
@@ -6727,6 +6782,21 @@ class CrewDispatchRuntime:
         key = self._model_call_key(context.run_id, step.id, attempt, purpose, actor, index)
         request_sha = self._model_request_sha256(request)
         existing = ledger.states.get(key)
+        report_phase: Mapping[str, JsonValue] | None = None
+        if (run_state.engineering_dispatch_report_version == 1 and purpose == "step"
+                and _delivery_report.selected(context, self._plan, step)):
+            if index != 0 or attempt != 0:
+                _fail("delivery report allows only its existing single native model call")
+            if tool_ledger is None or request.tools or request.response_schema is not None:
+                _fail("delivery report requires a no-tool native model request")
+            try:
+                report_phase, _ = _delivery_report.delivery_evidence(
+                    context, self._plan, step, tool_ledger.states, tool_ledger.artifacts,
+                )
+            except ValueError as error:
+                _fail(str(error))
+            if existing is not None and existing.get(_delivery_report.BINDING) != report_phase:
+                _fail("delivery report evidence changed after checkpoint")
         rejected: GatewayRejectedOutput | None = None
         policy_failure: str | None = None
         qualified_incomplete = False
@@ -6806,6 +6876,7 @@ class CrewDispatchRuntime:
                 "purpose": purpose, "actor": actor, "call_index": index,
                 "request_sha256": request_sha, "artifact_id": None, "sha256": None,
                 "provenance": None, "failure_reason": None,
+                **({_delivery_report.BINDING: report_phase} if report_phase is not None else {}),
                 **({"reserved_max_output_tokens": reserved_max_output_tokens}
                    if reserved_max_output_tokens is not None else {}),
                 **({"initial_incomplete_chain": initial_incomplete_chain}
@@ -7588,6 +7659,22 @@ class CrewDispatchRuntime:
         messages = list(
             self._guidance_messages(context, crew_messages, limits=content_limits)
         )
+        if (run_state.engineering_dispatch_report_version == 1
+                and _delivery_report.selected(context, self._plan, step)):
+            try:
+                _, outcomes = _delivery_report.delivery_evidence(
+                    context, self._plan, step, tool_ledger.states, tool_ledger.artifacts,
+                )
+            except ValueError as error:
+                _fail(str(error))
+            # Insert at the native boundary: framework prompt transformations cannot
+            # replace this current-run evidence with upstream summary claims.
+            messages.extend((
+                ModelMessage(role="system", content=_delivery_report.PROMPT),
+                ModelMessage(role="user", content="CURRENT_VERIFIED_DELIVERY_EVIDENCE_JSON="
+                             + json.dumps(_mutable_json(outcomes), ensure_ascii=False,
+                                          sort_keys=True, separators=(",", ":"))),
+            ))
         initial_message_count = len(messages)
         initial_content_limits = content_limits
         replay_prefixes: tuple[tuple[ModelMessage, ...], ...] | None = None
@@ -8090,7 +8177,9 @@ class CrewDispatchRuntime:
                     if prerequisite is not None:
                         raise _ProjectPrerequisiteBlocked(prerequisite)
                     _fail("project workspace bundle is missing")
-                if step.final_synthesizer:
+                if (step.final_synthesizer
+                        and not (run_state.engineering_dispatch_report_version == 1
+                                 and _delivery_report.selected(context, self._plan, step))):
                     completion = _reconcile_final_attachment_completion(completion, evidence)
                 return completion
             completion_proposed = False
@@ -10498,6 +10587,8 @@ class CrewDispatchRuntime:
             mode=self.mode,
             state={
                 "plan_digest": plan.digest,
+                **({_delivery_report.POLICY: 1}
+                   if run_state.engineering_dispatch_report_version == 1 else {}),
                 "workspace_delivery_continuation": run_state.workspace_delivery_continuation,
                 **({"native_tool_continuation": True} if run_state.native_tool_continuation else {}),
                 **({"workspace_productive_boundary": True}
@@ -10623,6 +10714,7 @@ class CrewDispatchRuntime:
             "audit_overflow",
         }
         optional_state_keys = {
+            _delivery_report.POLICY,
             "workspace_productive_boundary",
             "native_tool_continuation",
             "repair_reopened_contract_ids", "workspace_delivery_continuation",
@@ -10645,6 +10737,15 @@ class CrewDispatchRuntime:
             )
         if not required_state_keys <= set(state) <= required_state_keys | optional_state_keys:
             _fail("runtime checkpoint is incompatible")
+        if _delivery_report.POLICY in state and (
+            type(state[_delivery_report.POLICY]) is not int
+            or state[_delivery_report.POLICY] != 1
+            or (context_budget_known and (
+                type(context.routing_decision.get(_delivery_report.POLICY)) is not int
+                or context.routing_decision.get(_delivery_report.POLICY) != 1
+            ))
+        ):
+            _fail("delivery report checkpoint policy is invalid")
         completed = state["completed"]
         retries = state["retries"]
         refs = state["artifact_refs"]
@@ -11095,6 +11196,7 @@ class CrewDispatchRuntime:
                     or set(value) - model_state_keys - {
                         "failure_reason", "reserved_max_output_tokens", "initial_incomplete_chain", "post_tool_growth",
                         "provider_continuation",
+                        _delivery_report.BINDING,
                     }
                 )
             ):
@@ -11128,6 +11230,11 @@ class CrewDispatchRuntime:
             ):
                 _fail("runtime checkpoint is incompatible")
             model_step = steps[model_step_id]
+            report_row = (state.get(_delivery_report.POLICY) == 1 and purpose == "step"
+                          and model_step.final_synthesizer and not model_step.tools
+                          and any(item.engineering_delivery_contract_version == 1 for item in plan.steps))
+            if report_row != (_delivery_report.BINDING in value):
+                _fail("delivery report checkpoint binding is missing or misplaced")
             model_agent_id = (
                 model_step.agent
                 if purpose == "step"

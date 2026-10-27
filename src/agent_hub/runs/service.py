@@ -2034,6 +2034,12 @@ class RunService:
                     routing_decision["engineering_delivery_contract_version"] = 1
                     routing_decision["engineering_action_version"] = 1
                     routing_decision["delivery_followup_version"] = 2
+                    if mode is TaskMode.DIRECT:
+                        routing_decision["engineering_direct_report_version"] = 1
+                    if mode in (TaskMode.DISPATCH, TaskMode.HYBRID):
+                        routing_decision["engineering_dispatch_report_version"] = 1
+                    if mode is TaskMode.HYBRID:
+                        routing_decision["engineering_hybrid_report_version"] = 1
                     if mode is TaskMode.DISCUSS:
                         routing_decision["engineering_final_report_version"] = 1
                         routing_decision["engineering_tool_correction_version"] = 1

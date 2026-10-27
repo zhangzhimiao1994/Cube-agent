@@ -455,6 +455,7 @@ _SENSITIVE_PUBLIC_KEYS = frozenset(
         "reasoning_content",
         "provider_continuation",
         "native_assistant",
+        "delivery_report_binding",
     }
 )
 _SENSITIVE_PUBLIC_TEXT = re.compile(
