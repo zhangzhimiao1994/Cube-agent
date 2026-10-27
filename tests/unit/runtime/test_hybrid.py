@@ -1183,6 +1183,55 @@ async def test_hybrid_runtime_completes_partial_when_synthesis_gateway_fails() -
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("failed_mode", [TaskMode.DISCUSS, TaskMode.DIRECT])
+@pytest.mark.parametrize("attachment", [False, True])
+async def test_engineering_hybrid_stage_failure_never_completes_from_prior_outputs(
+    failed_mode: TaskMode, attachment: bool,
+) -> None:
+    dispatch_output = final_zip_artifact() if attachment else artifact("implementer", "work retained")
+    review = artifact("reviewer", "review retained")
+    failure = "model gateway failed: model transport failed"
+    runtime = HybridRuntime(
+        MultiArtifactRuntime(TaskMode.DISPATCH, (dispatch_output,)),
+        FailingRuntime(TaskMode.DISCUSS, failure) if failed_mode is TaskMode.DISCUSS
+        else MultiArtifactRuntime(TaskMode.DISCUSS, (review,)),
+        FailingRuntime(TaskMode.DIRECT, failure),
+    )
+    context = TaskContext(
+        run_id=uuid4(), tenant_id=uuid4(), mode=TaskMode.HYBRID,
+        request="Build and deliver the project with its validation results.",
+        routing_decision={"engineering_delivery_contract_version": 1,
+                          "project_delivery": "workspace", "artifact_strategy": "workspace_bundle",
+                          "project_scale": "small"},
+    )
+    events = [event async for event in runtime.run(context)]
+    assert any(event.artifact == dispatch_output for event in events)
+    assert events[-1].kind is EventKind.RUNTIME_FAILED
+    assert events[-1].reason == f"hybrid {failed_mode.value} failed: {failure}"
+    assert not any(event.kind is EventKind.RUNTIME_COMPLETED for event in events)
+    assert (await runtime.save_checkpoint()).state["terminal"] is False
+
+
+@pytest.mark.asyncio
+async def test_engineering_hybrid_completes_after_successful_final_synthesis() -> None:
+    report = artifact("main", "Project attached. Validation passed; deployment was not tested.")
+    runtime = HybridRuntime(
+        MultiArtifactRuntime(TaskMode.DISPATCH, (final_zip_artifact(),)),
+        MultiArtifactRuntime(TaskMode.DISCUSS, (artifact("reviewer", "review passed"),)),
+        MultiArtifactRuntime(TaskMode.DIRECT, (report,)),
+    )
+    events = [event async for event in runtime.run(TaskContext(
+        run_id=uuid4(), tenant_id=uuid4(), mode=TaskMode.HYBRID, request="Build and deliver the project.",
+        routing_decision={"engineering_delivery_contract_version": 1,
+                          "project_delivery": "workspace", "artifact_strategy": "workspace_bundle",
+                          "project_scale": "small"},
+    ))]
+    assert any(event.artifact == report for event in events)
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert events[-1].reason == "explicit_completion"
+
+
+@pytest.mark.asyncio
 async def test_hybrid_runtime_emits_closure_artifact_for_initial_empty_model_response() -> None:
     run_id = uuid4()
     runtime = HybridRuntime(

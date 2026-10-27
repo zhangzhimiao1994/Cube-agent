@@ -31,7 +31,10 @@ from agent_hub.runtime.contracts import (
     RuntimeCheckpoint,
     TaskContext,
 )
-from agent_hub.runtime.direct import _original_project_terminal_artifact_matches
+from agent_hub.runtime.direct import (
+    _is_workspace_project_delivery,
+    _original_project_terminal_artifact_matches,
+)
 from agent_hub.runtime.failure_reason import (
     MAX_FAILURE_REASON_LENGTH,
     gateway_scope_failure_payload,
@@ -605,6 +608,11 @@ class HybridRuntime:
             partial_reason = (
                 None if (
                     original_terminal_replay
+                    # Preserve engineering outputs for diagnosis/recovery; a
+                    # failed stage cannot substitute for final main delivery.
+                    or (type(context.routing_decision.get("engineering_delivery_contract_version")) is int
+                        and context.routing_decision["engineering_delivery_contract_version"] == 1
+                        and _is_workspace_project_delivery(context))
                     or isinstance(error, _ChildModelScopeError | _OriginalProjectReplayError)
                     or runtime_failure_diagnostic_from_reason(failure_reason).get("error_code")
                     == "model.request_negotiation_exhausted"
