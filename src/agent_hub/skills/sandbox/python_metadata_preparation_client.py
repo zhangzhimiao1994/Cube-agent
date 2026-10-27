@@ -32,6 +32,7 @@ from agent_hub.skills.sandbox.python_metadata_preparation_protocol import (
     _plan_fields,
 )
 from agent_hub.skills.sandbox.python_project_profile import (
+    ProfileError,
     PythonProjectProfile,
     PythonProjectProfileInterpreter,
     PythonProjectProfileRequest,
@@ -50,7 +51,7 @@ _TIMEOUT = "metadata_prepare_timeout"
 _Phase = Literal["profile", "plan", "prepare", "inspect"]
 _LOCAL_CODES = frozenset({_INVALID_REQUEST, _INVALID_RESPONSE, _UNAVAILABLE, _TIMEOUT})
 _PHASE_CODES = {
-    "profile": _LOCAL_CODES,
+    "profile": _LOCAL_CODES | frozenset(get_args(ProfileError.__value__)),
     "plan": _LOCAL_CODES | frozenset(get_args(MetadataPlanningError.__value__)),
     "prepare": _LOCAL_CODES | frozenset(get_args(MetadataPreparationError.__value__)),
     "inspect": _LOCAL_CODES | frozenset(get_args(MetadataPreparationError.__value__)),
@@ -274,7 +275,7 @@ class PythonMetadataPreparationSandbox:
                         # qualifies. Transport exception text is never consulted.
                         if attempt == 0 and profile.error == "python_project_profile_unavailable":
                             continue
-                        raise PythonMetadataPreparationFailure(phase=phase, code=_UNAVAILABLE)
+                        raise PythonMetadataPreparationFailure(phase=phase, code=profile.error or _UNAVAILABLE)
                     if profile.profile is None or profile.profile.root_config_sha256 is None:
                         raise PythonMetadataPreparationFailure(phase=phase, code=_UNAVAILABLE)
                     phase = "plan"

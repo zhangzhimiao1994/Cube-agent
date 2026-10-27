@@ -513,7 +513,9 @@ async def test_sandbox_profile_must_be_strict_bound_and_have_root_digest(
     monkeypatch.setattr(profile_api.PythonProjectProfileSandbox, "inspect", inspect)
     monkeypatch.setattr(api, "request_python_metadata_plan_broker", forbidden, raising=False)
     with pytest.raises(api.PythonMetadataPreparationFailure,
-                       match=r"^python_metadata\.profile\.metadata_prepare_(unavailable|response_invalid)$"):
+                       match=(r"^python_metadata\.profile\.python_project_profile_unavailable$"
+                              if defect == "negative" else
+                              r"^python_metadata\.profile\.metadata_prepare_(unavailable|response_invalid)$")):
         await api.PythonMetadataPreparationSandbox().plan(value.invocation, value.scope, value.draft)
 
 
@@ -684,6 +686,68 @@ def failure_type() -> Any:
     return failure
 
 
+@pytest.mark.parametrize("code,attempts", [
+    ("python_project_profile_unavailable", 2),
+    ("python_project_profile_unsupported", 1),
+    ("python_project_runtime_missing", 1),
+    ("python_project_runtime_untrusted", 1),
+    ("input_supply_configuration_missing", 1),
+    ("input_supply_configuration_untrusted", 1),
+])
+async def test_bound_v6_profile_negative_preserves_cause_without_extra_authority(
+    monkeypatch: pytest.MonkeyPatch, code: str, attempts: int,
+) -> None:
+    from agent_hub.capabilities.project_verification import ProjectVerificationError
+    from agent_hub.harness.tool_gateway import _project_authorization_failure_reason
+
+    api = client()
+    failure = failure_type()
+    value = request().planning
+    negative = profile_api.PythonProjectProfileResponse.model_validate_json(json.dumps({
+        "version": 6, "action": "inspect_python_project_profile", "ok": False,
+        "scope": profile_api.PythonProjectProfileScope.for_invocation(
+            value.invocation).model_dump(mode="json"),
+        "profile": None, "error": code,
+    }), strict=True)
+    raw = negative.model_dump_json().encode()
+    writers: list[Writer] = []
+
+    async def connect(path: str) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+        assert path == Path("metadata.sock").as_posix()
+        reader, writer = asyncio.StreamReader(), Writer(Peer())
+        reader.feed_data(struct.pack("!I", len(raw)) + raw)
+        reader.feed_eof()
+        writers.append(writer)
+        return reader, cast(asyncio.StreamWriter, writer)
+
+    async def forbidden(*args: Any, **kwargs: Any) -> Any:
+        pytest.fail("profile negative reached planning or preparation")
+
+    monkeypatch.setattr(profile_api, "_systemd_supported", lambda: True)
+    monkeypatch.setattr(socket, "SO_PEERCRED", 17, raising=False)
+    monkeypatch.setattr(asyncio, "open_unix_connection", connect, raising=False)
+    monkeypatch.setattr(api, "request_python_metadata_plan_broker", forbidden)
+    monkeypatch.setattr(api, "request_python_metadata_preparation_broker", forbidden)
+    with pytest.raises(failure) as caught:
+        await api.PythonMetadataPreparationSandbox(socket_path=Path("metadata.sock")).plan(
+            value.invocation, value.scope, value.draft)
+    assert type(caught.value) is failure
+    assert (caught.value.phase, caught.value.code) == ("profile", code)
+    assert caught.value.public_code == f"python_metadata.profile.{code}"
+    assert caught.value.public_code in api.PUBLIC_FAILURE_CODES
+    assert _project_authorization_failure_reason(
+        ProjectVerificationError(caught.value.public_code)) == caught.value.public_code
+    assert _project_authorization_failure_reason(
+        ProjectVerificationError(caught.value.public_code + ".forged")) == "capability authorization unavailable"
+    assert len(writers) == attempts and all(writer.closed for writer in writers)
+    for writer in writers:
+        sent = profile_api.PythonProjectProfileRequest.model_validate_json(
+            bytes(writer.writes[4:]), strict=True)
+        assert sent.action == "inspect_python_project_profile"
+        assert sent.invocation.install_allowed is False
+        assert sent.invocation.sandbox_profile == "restricted"
+
+
 def test_failure_constructor_is_finite_and_has_keyword_interface() -> None:
     failure = failure_type()
     value = failure(phase="profile", code="metadata_prepare_unavailable")
@@ -696,7 +760,10 @@ def test_failure_constructor_is_finite_and_has_keyword_interface() -> None:
     assert "python_metadata.prepare.metadata_prepare_unknown" in codes
     assert "python_metadata.inspect.metadata_prepare_unknown" in codes
     for phase, code in [(True, "metadata_prepare_unavailable"), ("root", "metadata_prepare_unavailable"),
-                        ("plan", PRIVATE), ("plan", True), ("plan", "metadata_plan_timeout\n")]:
+                        ("plan", PRIVATE), ("plan", True), ("plan", "metadata_plan_timeout\n"),
+                        ("profile", "python_project_runtime_" + PRIVATE),
+                        ("profile", "python_project_runtime_missing\n"),
+                        ("prepare", "python_project_runtime_missing")]:
         with pytest.raises((ValueError, TypeError)) as caught:
             failure(phase=phase, code=code)
         assert PRIVATE not in str(caught.value)
@@ -745,6 +812,9 @@ async def test_trusted_negative_reconnects_once_then_returns_plan(
 @pytest.mark.parametrize("phase", ["profile", "plan"])
 @pytest.mark.parametrize("error,code", [
     (OSError("metadata_plan_unavailable"), "metadata_prepare_unavailable"),
+    (OSError("python_project_profile_unavailable"), "metadata_prepare_unavailable"),
+    (OSError("python_project_runtime_missing"), "metadata_prepare_unavailable"),
+    (RuntimeError("input_supply_configuration_untrusted"), "metadata_prepare_unavailable"),
     (TimeoutError("metadata_plan_timeout"), "metadata_prepare_timeout"),
     (ValueError("metadata_plan_unavailable"), "metadata_prepare_response_invalid"),
 ])
@@ -892,10 +962,15 @@ async def test_sdk_cancels_or_sanitizes_unexpected_exception_without_retry(
         assert PRIVATE not in str(caught.value)
 
 
-@pytest.mark.parametrize("phase", ["profile", "plan"])
-@pytest.mark.parametrize("defect", ["extra", "scope"])
+@pytest.mark.parametrize("phase,code", [
+    ("profile", "python_project_profile_unavailable"),
+    ("profile", "python_project_runtime_missing"),
+    ("profile", "input_supply_configuration_untrusted"),
+    ("plan", "metadata_plan_unavailable"),
+])
+@pytest.mark.parametrize("defect", ["extra", "scope", "code"])
 async def test_negative_response_must_validate_before_retry(
-    monkeypatch: pytest.MonkeyPatch, phase: str, defect: str,
+    monkeypatch: pytest.MonkeyPatch, phase: str, code: str, defect: str,
 ) -> None:
     api = client()
     failure = failure_type()
@@ -903,6 +978,8 @@ async def test_negative_response_must_validate_before_retry(
     calls = 0
 
     def corrupt(result: Any) -> Any:
+        if defect == "code":
+            return replace(result, "", {"error": "python_project_runtime_" + PRIVATE})
         return replace(result, "" if defect == "extra" else "scope",
                        {"extra": True} if defect == "extra" else {"project_id": "foreign"})
 
@@ -911,7 +988,7 @@ async def test_negative_response_must_validate_before_retry(
         if phase == "profile":
             calls += 1
             negative = discovery(invocation).model_copy(update={"ok": False, "profile": None,
-                "error": "python_project_profile_unavailable"})
+                "error": code})
             return corrupt(negative)
         return discovery(invocation)
 
