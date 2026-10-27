@@ -1386,6 +1386,12 @@ def _serialized_prior_artifacts(
         text = source_texts[index]
         if text is None:
             continue
+        # A partial JSON/hash is not a factual delivery reference. Keep the
+        # entire bounded observation or omit it; never cut it into prose.
+        if (entries[index]["producer"] == "historical_delivery_evidence"
+                and (len(text.encode("utf-8")) > per_artifact_bytes
+                     or _estimate_text_tokens(text) > per_artifact_tokens)):
+            continue
         entries[index]["text"] = _truncate_prompt_text_to_budget(
             text,
             max_tokens=per_artifact_tokens,

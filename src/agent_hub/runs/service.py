@@ -3511,15 +3511,28 @@ class RunService:
                 conversation_id,
             )
             return ()
+        delivery_artifacts: tuple[Artifact, ...] = ()
+        loader = getattr(self._instruction_context_loader, "load_delivery_evidence", None)
+        if callable(loader) and context_items:
+            try:
+                delivery_artifacts = await loader(
+                    tenant_id=tenant_id, run_id=run_id,
+                    source_run_ids=tuple(item.run_id for item in context_items),
+                    token_budget=max(1, history_token_budget // 2),
+                )
+            except Exception:
+                _LOGGER.exception("conversation_delivery_evidence_unavailable run_id=%s", run_id)
+        delivery_tokens = sum(estimate_tokens(str(item.content.get("text", ""))) + 64
+                              for item in delivery_artifacts)
         artifact = _conversation_history_artifact(
             conversation_id=conversation_id,
             current_request=current_request,
             context_items=context_items,
-            history_token_budget=history_token_budget,
+            history_token_budget=max(1, history_token_budget - delivery_tokens),
         )
         if artifact is None:
-            return ()
-        return (artifact,)
+            return delivery_artifacts
+        return (artifact, *delivery_artifacts)
 
     async def _main_agent_context_window_tokens(
         self, routing_decision: Mapping[str, object]

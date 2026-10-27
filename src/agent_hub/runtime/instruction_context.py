@@ -8,7 +8,7 @@ import json
 from collections.abc import Mapping
 from dataclasses import fields, is_dataclass
 from pathlib import Path
-from typing import Literal, Self
+from typing import TYPE_CHECKING, Literal, Self
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -20,6 +20,9 @@ from agent_hub.capabilities.scoped_read import (
     read_scoped_file,
 )
 from agent_hub.models.types import ModelMessage, ModelRequest, model_message_payload
+
+if TYPE_CHECKING:
+    from agent_hub.runtime.contracts import Artifact
 
 MAX_SOURCE_BYTES = 8192
 _PATHS: tuple[Literal["AGENTS.md", "SKILL.md"], ...] = ("AGENTS.md", "SKILL.md")
@@ -152,6 +155,19 @@ class InstructionContextLoader:
     def __init__(self, *, repository: object, project_root: Path) -> None:
         self._repository = repository
         self._project_root = project_root
+
+    async def load_delivery_evidence(
+        self, *, tenant_id: UUID, run_id: UUID, source_run_ids: tuple[UUID, ...],
+        token_budget: int,
+    ) -> tuple[Artifact, ...]:
+        """Independent read references; never project instructions or new authority."""
+        from agent_hub.runs.delivery_context import delivery_context_artifacts
+
+        return await delivery_context_artifacts(
+            repository=self._repository, project_root=self._project_root,
+            tenant_id=tenant_id, run_id=run_id, source_run_ids=source_run_ids,
+            token_budget=token_budget,
+        )
 
     async def load(self, *, tenant_id: UUID, run_id: UUID) -> InstructionContext:
         sources: list[InstructionSource] = []
