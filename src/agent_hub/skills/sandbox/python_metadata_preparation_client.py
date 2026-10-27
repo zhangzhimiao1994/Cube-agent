@@ -8,11 +8,13 @@ import math
 import socket
 import struct
 from pathlib import Path
+from typing import Literal, get_args
 
 from agent_hub.skills.sandbox.project import ProjectInvocation, _systemd_supported, _uninterrupted
 from agent_hub.skills.sandbox.python_dependency_protocol import _check_json
 from agent_hub.skills.sandbox.python_metadata_plan_client import request_python_metadata_plan_broker
 from agent_hub.skills.sandbox.python_metadata_plan_protocol import (
+    MetadataPlanningError,
     PythonMetadataDraft,
     PythonMetadataPlan,
     PythonMetadataPlanningRequest,
@@ -21,6 +23,7 @@ from agent_hub.skills.sandbox.python_metadata_plan_protocol import (
 )
 from agent_hub.skills.sandbox.python_metadata_preparation_protocol import (
     MetadataPreparationAction,
+    MetadataPreparationError,
     PythonMetadataPreparationReceipt,
     PythonMetadataPreparationRequest,
     PythonMetadataPreparationResponse,
@@ -43,6 +46,36 @@ _RESPONSE_BYTES = 16 * 1024
 _UNAVAILABLE = "metadata_prepare_unavailable"
 _INVALID_REQUEST = "metadata_prepare_request_invalid"
 _INVALID_RESPONSE = "metadata_prepare_response_invalid"
+_TIMEOUT = "metadata_prepare_timeout"
+_Phase = Literal["profile", "plan", "prepare", "inspect"]
+_LOCAL_CODES = frozenset({_INVALID_REQUEST, _INVALID_RESPONSE, _UNAVAILABLE, _TIMEOUT})
+_PHASE_CODES = {
+    "profile": _LOCAL_CODES,
+    "plan": _LOCAL_CODES | frozenset(get_args(MetadataPlanningError.__value__)),
+    "prepare": _LOCAL_CODES | frozenset(get_args(MetadataPreparationError.__value__)),
+    "inspect": _LOCAL_CODES | frozenset(get_args(MetadataPreparationError.__value__)),
+}
+PUBLIC_FAILURE_CODES = frozenset(
+    f"python_metadata.{phase}.{code}"
+    for phase, codes in _PHASE_CODES.items() for code in codes
+)
+
+
+class PythonMetadataPreparationFailure(RuntimeError):
+    """Finite SDK failure data, never evidence of Root provenance or retry authority."""
+
+    def __init__(self, *, phase: str, code: str) -> None:
+        if (type(self) is not PythonMetadataPreparationFailure
+                or type(phase) is not str or type(code) is not str
+                or f"python_metadata.{phase}.{code}" not in PUBLIC_FAILURE_CODES):
+            raise ValueError("metadata_prepare_failure_invalid")
+        self.phase = phase
+        self.code = code
+        super().__init__(self.public_code)
+
+    @property
+    def public_code(self) -> str:
+        return f"python_metadata.{self.phase}.{self.code}"
 
 
 def parse_metadata_preparation_request(payload: bytes) -> PythonMetadataPreparationRequest:
@@ -211,67 +244,97 @@ class PythonMetadataPreparationSandbox:
     async def plan(
         self, invocation: ProjectInvocation, scope: PythonMetadataScope, draft: PythonMetadataDraft,
     ) -> PythonMetadataPlan:
-        invocation, scope, draft = _planning_inputs(invocation, scope, draft)
+        try:
+            invocation, scope, draft = _planning_inputs(invocation, scope, draft)
+        except (ValueError, TypeError, AttributeError, RecursionError):
+            raise PythonMetadataPreparationFailure(phase="plan", code=_INVALID_REQUEST) from None
         loop = asyncio.get_running_loop()
         deadline = loop.time() + invocation.timeout_seconds
+        phase: _Phase = "profile"
 
         def remaining() -> ProjectInvocation:
             seconds = deadline - loop.time()
             if seconds <= 0:
-                raise TimeoutError("metadata_prepare_timeout")
+                raise TimeoutError
             return invocation.model_copy(update={
                 "timeout_seconds": min(invocation.timeout_seconds, math.ceil(seconds)),
             })
 
         try:
             async with asyncio.timeout_at(deadline):
-                profile_invocation = remaining()
-                discovered = await PythonProjectProfileSandbox(socket_path=self.socket_path).inspect(
-                    profile_invocation,
-                )
-                profile = _profile_response(discovered, profile_invocation)
-                if (not profile.ok or profile.profile is None
-                        or profile.profile.root_config_sha256 is None):
-                    raise ValueError(_UNAVAILABLE)
-                request = PythonMetadataPlanningRequest(invocation=remaining(), scope=scope, draft=draft,
-                    expected_root_config_sha256=profile.profile.root_config_sha256,
-                    expected_catalog_sha256=profile.profile.catalog_sha256)
-                result = _planning_response(await request_python_metadata_plan_broker(
-                    request, socket_path=self.socket_path,
-                ), request)
+                for attempt in range(2):
+                    phase = "profile"
+                    profile_invocation = remaining()
+                    discovered = await PythonProjectProfileSandbox(socket_path=self.socket_path).inspect(
+                        profile_invocation,
+                    )
+                    profile = _profile_response(discovered, profile_invocation)
+                    if not profile.ok:
+                        # Only a fully revalidated, scope-bound negative response
+                        # qualifies. Transport exception text is never consulted.
+                        if attempt == 0 and profile.error == "python_project_profile_unavailable":
+                            continue
+                        raise PythonMetadataPreparationFailure(phase=phase, code=_UNAVAILABLE)
+                    if profile.profile is None or profile.profile.root_config_sha256 is None:
+                        raise PythonMetadataPreparationFailure(phase=phase, code=_UNAVAILABLE)
+                    phase = "plan"
+                    request = PythonMetadataPlanningRequest(invocation=remaining(), scope=scope, draft=draft,
+                        expected_root_config_sha256=profile.profile.root_config_sha256,
+                        expected_catalog_sha256=profile.profile.catalog_sha256)
+                    result = _planning_response(await request_python_metadata_plan_broker(
+                        request, socket_path=self.socket_path,
+                    ), request)
+                    if not result.ok:
+                        if attempt == 0 and result.error in {"metadata_plan_unavailable", "metadata_plan_timeout"}:
+                            continue
+                        raise PythonMetadataPreparationFailure(phase=phase, code=result.error or _UNAVAILABLE)
+                    if result.plan is None:
+                        raise PythonMetadataPreparationFailure(phase=phase, code=_INVALID_RESPONSE)
+                    return result.plan
+        except PythonMetadataPreparationFailure:
+            raise
         except TimeoutError:
-            raise TimeoutError("metadata_prepare_timeout") from None
+            raise PythonMetadataPreparationFailure(phase=phase, code=_TIMEOUT) from None
         except (OSError, NotImplementedError):
-            raise OSError(_UNAVAILABLE) from None
-        if not result.ok:
-            raise ValueError(result.error or _UNAVAILABLE)
-        if result.plan is None:
-            raise ValueError(_INVALID_RESPONSE)
-        return result.plan
+            raise PythonMetadataPreparationFailure(phase=phase, code=_UNAVAILABLE) from None
+        except (ValueError, TypeError, AttributeError, RecursionError):
+            raise PythonMetadataPreparationFailure(phase=phase, code=_INVALID_RESPONSE) from None
+        except Exception:  # noqa: BLE001 - unexpected transport text is never public SDK data.
+            raise PythonMetadataPreparationFailure(phase=phase, code=_UNAVAILABLE) from None
+        raise PythonMetadataPreparationFailure(phase=phase, code=_UNAVAILABLE)
 
     async def prepare(
         self, invocation: ProjectInvocation, plan: PythonMetadataPlan,
     ) -> PythonMetadataPreparationReceipt:
-        request = _preparation_request("prepare_python_dependency_metadata", invocation, plan)
-        response = await self._exchange(request)
+        try:
+            request = _preparation_request("prepare_python_dependency_metadata", invocation, plan)
+        except (ValueError, TypeError, AttributeError, RecursionError):
+            raise PythonMetadataPreparationFailure(phase="prepare", code=_INVALID_REQUEST) from None
+        response = await self._exchange(request, phase="prepare")
         if response.receipt is None:
-            raise ValueError(_INVALID_RESPONSE)
+            raise PythonMetadataPreparationFailure(phase="prepare", code=_INVALID_RESPONSE)
         return response.receipt
 
     async def inspect(
         self, invocation: ProjectInvocation, plan: PythonMetadataPlan, execution_id: str,
     ) -> PythonMetadataPreparationStatus:
-        request = _preparation_request("inspect_python_dependency_metadata_preparation",
-            invocation, plan, execution_id)
-        response = await self._exchange(request)
+        try:
+            request = _preparation_request("inspect_python_dependency_metadata_preparation",
+                invocation, plan, execution_id)
+        except (ValueError, TypeError, AttributeError, RecursionError):
+            raise PythonMetadataPreparationFailure(phase="inspect", code=_INVALID_REQUEST) from None
+        response = await self._exchange(request, phase="inspect")
         if response.status is None:
-            raise ValueError(_INVALID_RESPONSE)
+            raise PythonMetadataPreparationFailure(phase="inspect", code=_INVALID_RESPONSE)
         return response.status
 
     async def _exchange(
-        self, request: PythonMetadataPreparationRequest,
+        self, request: PythonMetadataPreparationRequest, *, phase: _Phase,
     ) -> PythonMetadataPreparationResponse:
-        request = _validated_request(request)
+        try:
+            request = _validated_request(request)
+        except (ValueError, TypeError, AttributeError, RecursionError):
+            raise PythonMetadataPreparationFailure(phase=phase, code=_INVALID_REQUEST) from None
         try:
             async with asyncio.timeout(request.invocation.timeout_seconds):
                 response = await request_python_metadata_preparation_broker(
@@ -282,11 +345,13 @@ class PythonMetadataPreparationSandbox:
                 response = PythonMetadataPreparationResponse.model_validate(response, strict=True)
                 response.require_for(request)
         except TimeoutError:
-            raise TimeoutError("metadata_prepare_timeout") from None
+            raise PythonMetadataPreparationFailure(phase=phase, code=_TIMEOUT) from None
         except (OSError, NotImplementedError):
-            raise OSError(_UNAVAILABLE) from None
+            raise PythonMetadataPreparationFailure(phase=phase, code=_UNAVAILABLE) from None
         except (ValueError, TypeError, AttributeError, RecursionError):
-            raise ValueError(_INVALID_RESPONSE) from None
+            raise PythonMetadataPreparationFailure(phase=phase, code=_INVALID_RESPONSE) from None
+        except Exception:  # noqa: BLE001 - preserve cancellation, sanitize other transport failures.
+            raise PythonMetadataPreparationFailure(phase=phase, code=_UNAVAILABLE) from None
         if not response.ok:
-            raise ValueError(response.error or _UNAVAILABLE)
+            raise PythonMetadataPreparationFailure(phase=phase, code=response.error or _UNAVAILABLE)
         return response

@@ -512,7 +512,8 @@ async def test_sandbox_profile_must_be_strict_bound_and_have_root_digest(
 
     monkeypatch.setattr(profile_api.PythonProjectProfileSandbox, "inspect", inspect)
     monkeypatch.setattr(api, "request_python_metadata_plan_broker", forbidden, raising=False)
-    with pytest.raises(ValueError, match="^metadata_prepare_(unavailable|response_invalid)$"):
+    with pytest.raises(api.PythonMetadataPreparationFailure,
+                       match=r"^python_metadata\.profile\.metadata_prepare_(unavailable|response_invalid)$"):
         await api.PythonMetadataPreparationSandbox().plan(value.invocation, value.scope, value.draft)
 
 
@@ -538,7 +539,8 @@ async def test_sandbox_revalidates_v9_planner_response_tree(
 
     monkeypatch.setattr(profile_api.PythonProjectProfileSandbox, "inspect", inspect)
     monkeypatch.setattr(api, "request_python_metadata_plan_broker", planning, raising=False)
-    with pytest.raises(ValueError, match="^metadata_prepare_response_invalid$"):
+    with pytest.raises(api.PythonMetadataPreparationFailure,
+                       match=r"^python_metadata\.plan\.metadata_prepare_response_invalid$"):
         await api.PythonMetadataPreparationSandbox().plan(value.invocation, value.scope, value.draft)
 
 
@@ -561,7 +563,8 @@ async def test_profile_and_planner_share_one_absolute_deadline(monkeypatch: pyte
 
     monkeypatch.setattr(profile_api.PythonProjectProfileSandbox, "inspect", inspect)
     monkeypatch.setattr(api, "request_python_metadata_plan_broker", planning, raising=False)
-    with pytest.raises(TimeoutError, match="^metadata_prepare_timeout$"):
+    with pytest.raises(api.PythonMetadataPreparationFailure,
+                       match=r"^python_metadata\.plan\.metadata_prepare_timeout$"):
         await asyncio.wait_for(api.PythonMetadataPreparationSandbox().plan(
             invocation, value.scope, value.draft), timeout=2)
     assert entered.is_set() and cancelled.is_set()
@@ -628,7 +631,9 @@ async def test_sandbox_revalidates_even_substituted_v10_transport(
         return replace(response(inspect), path, {"extra": True})
 
     monkeypatch.setattr(api, "request_python_metadata_preparation_broker", exchange)
-    with pytest.raises(ValueError, match="^metadata_prepare_response_invalid$"):
+    phase = "inspect" if inspect else "prepare"
+    with pytest.raises(api.PythonMetadataPreparationFailure,
+                       match=rf"^python_metadata\.{phase}\.metadata_prepare_response_invalid$"):
         sandbox = api.PythonMetadataPreparationSandbox()
         if inspect:
             await sandbox.inspect(expected.invocation, approved_plan(), expected.preparation_execution_id)
@@ -647,7 +652,9 @@ async def test_sandbox_preserves_typed_root_failure_as_finite_error(
         return response(inspect, ok=False, receipt=None, status=None, error="metadata_prepare_plan_changed")
 
     monkeypatch.setattr(api, "request_python_metadata_preparation_broker", exchange)
-    with pytest.raises(ValueError, match="^metadata_prepare_plan_changed$"):
+    phase = "inspect" if inspect else "prepare"
+    with pytest.raises(api.PythonMetadataPreparationFailure,
+                       match=rf"^python_metadata\.{phase}\.metadata_prepare_plan_changed$"):
         sandbox = api.PythonMetadataPreparationSandbox()
         if inspect:
             await sandbox.inspect(expected.invocation, approved_plan(), expected.preparation_execution_id)
@@ -666,5 +673,284 @@ async def test_sandbox_rejects_forged_planning_inputs_before_discovery(
         pytest.fail("forged planning inputs reached profile discovery")
 
     monkeypatch.setattr(profile_api.PythonProjectProfileSandbox, "inspect", forbidden)
-    with pytest.raises(ValueError, match="^metadata_prepare_request_invalid$"):
+    with pytest.raises(api.PythonMetadataPreparationFailure,
+                       match=r"^python_metadata\.plan\.metadata_prepare_request_invalid$"):
         await api.PythonMetadataPreparationSandbox().plan(value.invocation, value.scope, value.draft)
+
+
+def failure_type() -> Any:
+    failure = getattr(client(), "PythonMetadataPreparationFailure", None)
+    assert failure is not None, "high-level metadata SDK must preserve typed phase/code"
+    return failure
+
+
+def test_failure_constructor_is_finite_and_has_keyword_interface() -> None:
+    failure = failure_type()
+    value = failure(phase="profile", code="metadata_prepare_unavailable")
+    assert type(value) is failure and isinstance(value, RuntimeError)
+    assert (value.phase, value.code) == ("profile", "metadata_prepare_unavailable")
+    assert value.public_code == str(value) == "python_metadata.profile.metadata_prepare_unavailable"
+    codes = client().PUBLIC_FAILURE_CODES
+    assert type(codes) is frozenset and value.public_code in codes
+    assert "python_metadata.plan.metadata_plan_timeout" in codes
+    assert "python_metadata.prepare.metadata_prepare_unknown" in codes
+    assert "python_metadata.inspect.metadata_prepare_unknown" in codes
+    for phase, code in [(True, "metadata_prepare_unavailable"), ("root", "metadata_prepare_unavailable"),
+                        ("plan", PRIVATE), ("plan", True), ("plan", "metadata_plan_timeout\n")]:
+        with pytest.raises((ValueError, TypeError)) as caught:
+            failure(phase=phase, code=code)
+        assert PRIVATE not in str(caught.value)
+    class Text(str):
+        pass
+    for phase, code in [(Text("plan"), "metadata_plan_timeout"), ("plan", Text("metadata_plan_timeout"))]:
+        with pytest.raises((ValueError, TypeError)):
+            failure(phase=phase, code=code)
+
+
+@pytest.mark.parametrize("phase,code", [
+    ("profile", "metadata_prepare_unavailable"),
+    ("plan", "metadata_plan_unavailable"), ("plan", "metadata_plan_timeout"),
+])
+async def test_trusted_negative_reconnects_once_then_returns_plan(
+    monkeypatch: pytest.MonkeyPatch, phase: str, code: str,
+) -> None:
+    api = client()
+    value = request().planning
+    seen: list[str] = []
+
+    async def inspect(self: Any, invocation: Any) -> Any:
+        seen.append("profile")
+        result = discovery(invocation)
+        if phase == "profile" and seen == ["profile"]:
+            return result.model_copy(update={"ok": False, "profile": None,
+                                             "error": "python_project_profile_unavailable"})
+        return result
+
+    async def planning(item: PythonMetadataPlanningRequest, **kwargs: Any) -> Any:
+        seen.append("plan")
+        negative = phase == "plan" and seen == ["profile", "plan"]
+        return PythonMetadataPlanningResponse(
+            scope=profile_api.PythonProjectProfileScope.for_invocation(item.invocation),
+            ok=not negative, error=code if negative else None,
+            plan=None if negative else approved_plan())
+
+    monkeypatch.setattr(profile_api.PythonProjectProfileSandbox, "inspect", inspect)
+    monkeypatch.setattr(api, "request_python_metadata_plan_broker", planning)
+    assert await api.PythonMetadataPreparationSandbox().plan(
+        value.invocation, value.scope, value.draft) == approved_plan()
+    assert seen == (["profile", "profile", "plan"] if phase == "profile"
+                    else ["profile", "plan", "profile", "plan"])
+
+
+@pytest.mark.parametrize("phase", ["profile", "plan"])
+@pytest.mark.parametrize("error,code", [
+    (OSError("metadata_plan_unavailable"), "metadata_prepare_unavailable"),
+    (TimeoutError("metadata_plan_timeout"), "metadata_prepare_timeout"),
+    (ValueError("metadata_plan_unavailable"), "metadata_prepare_response_invalid"),
+])
+async def test_plain_errors_never_authorize_readonly_retry(
+    monkeypatch: pytest.MonkeyPatch, phase: str, error: Exception, code: str,
+) -> None:
+    api = client()
+    failure = failure_type()
+    value = request().planning
+    seen: list[str] = []
+
+    async def inspect(self: Any, invocation: Any) -> Any:
+        seen.append("profile")
+        if phase == "profile":
+            raise error
+        return discovery(invocation)
+
+    async def planning(*args: Any, **kwargs: Any) -> Any:
+        seen.append("plan")
+        raise error
+
+    monkeypatch.setattr(profile_api.PythonProjectProfileSandbox, "inspect", inspect)
+    monkeypatch.setattr(api, "request_python_metadata_plan_broker", planning)
+    with pytest.raises(failure) as caught:
+        await api.PythonMetadataPreparationSandbox().plan(value.invocation, value.scope, value.draft)
+    assert type(caught.value) is failure
+    assert (caught.value.phase, caught.value.code) == (phase, code)
+    assert seen == (["profile"] if phase == "profile" else ["profile", "plan"])
+
+
+@pytest.mark.parametrize("code", ["metadata_plan_unavailable", "metadata_plan_timeout",
+                                  "metadata_plan_cache_untrusted"])
+async def test_repeated_or_nonretryable_root_plan_failure_is_typed(
+    monkeypatch: pytest.MonkeyPatch, code: str,
+) -> None:
+    api = client()
+    failure = failure_type()
+    value = request().planning
+    seen: list[str] = []
+
+    async def inspect(self: Any, invocation: Any) -> Any:
+        seen.append("profile")
+        return discovery(invocation)
+
+    async def planning(item: PythonMetadataPlanningRequest, **kwargs: Any) -> Any:
+        seen.append("plan")
+        return PythonMetadataPlanningResponse(
+            scope=profile_api.PythonProjectProfileScope.for_invocation(item.invocation),
+            ok=False, error=code)
+
+    monkeypatch.setattr(profile_api.PythonProjectProfileSandbox, "inspect", inspect)
+    monkeypatch.setattr(api, "request_python_metadata_plan_broker", planning)
+    with pytest.raises(failure) as caught:
+        await api.PythonMetadataPreparationSandbox().plan(value.invocation, value.scope, value.draft)
+    assert (caught.value.phase, caught.value.code) == ("plan", code)
+    assert seen == ["profile", "plan"] * (1 if code == "metadata_plan_cache_untrusted" else 2)
+
+
+@pytest.mark.parametrize("inspect", [False, True])
+@pytest.mark.parametrize("code", ERRORS)
+async def test_high_level_negative_preserves_phase_and_code_without_reexecution(
+    monkeypatch: pytest.MonkeyPatch, inspect: bool, code: str,
+) -> None:
+    api = client()
+    failure = failure_type()
+    expected = request(inspect)
+    calls = 0
+
+    async def exchange(*args: Any, **kwargs: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        return response(inspect, ok=False, receipt=None, status=None, error=code)
+
+    monkeypatch.setattr(api, "request_python_metadata_preparation_broker", exchange)
+    with pytest.raises(failure) as caught:
+        sandbox = api.PythonMetadataPreparationSandbox()
+        if inspect:
+            await sandbox.inspect(expected.invocation, approved_plan(), expected.preparation_execution_id)
+        else:
+            await sandbox.prepare(expected.invocation, approved_plan())
+    assert type(caught.value) is failure
+    assert (caught.value.phase, caught.value.code) == ("inspect" if inspect else "prepare", code)
+    assert calls == 1
+
+
+async def test_readonly_retry_does_not_reset_absolute_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
+    api = client()
+    failure = failure_type()
+    value = request().planning
+    invocation = value.invocation.model_copy(update={"timeout_seconds": 1})
+    calls = 0
+
+    async def inspect(self: Any, invocation: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        await asyncio.sleep(0.6)
+        return discovery(invocation).model_copy(update={"ok": False, "profile": None,
+            "error": "python_project_profile_unavailable"})
+
+    monkeypatch.setattr(profile_api.PythonProjectProfileSandbox, "inspect", inspect)
+    started = asyncio.get_running_loop().time()
+    with pytest.raises(failure) as caught:
+        await api.PythonMetadataPreparationSandbox().plan(invocation, value.scope, value.draft)
+    assert caught.value.code == "metadata_prepare_timeout"
+    assert calls == 2 and asyncio.get_running_loop().time() - started < 1.2
+
+
+@pytest.mark.parametrize("phase", ["profile", "plan", "prepare", "inspect"])
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_sdk_cancels_or_sanitizes_unexpected_exception_without_retry(
+    monkeypatch: pytest.MonkeyPatch, phase: str, cancel: bool,
+) -> None:
+    api = client()
+    failure = failure_type()
+    value = request().planning
+    calls = 0
+
+    async def fail(*args: Any, **kwargs: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        if cancel:
+            raise asyncio.CancelledError
+        raise RuntimeError(PRIVATE)
+
+    async def inspect(self: Any, invocation: Any) -> Any:
+        return discovery(invocation)
+
+    monkeypatch.setattr(profile_api.PythonProjectProfileSandbox, "inspect",
+                        fail if phase == "profile" else inspect)
+    monkeypatch.setattr(api, "request_python_metadata_plan_broker", fail)
+    monkeypatch.setattr(api, "request_python_metadata_preparation_broker", fail)
+    expected = asyncio.CancelledError if cancel else failure
+    with pytest.raises(expected) as caught:
+        sandbox = api.PythonMetadataPreparationSandbox()
+        if phase in {"profile", "plan"}:
+            await sandbox.plan(value.invocation, value.scope, value.draft)
+        elif phase == "prepare":
+            await sandbox.prepare(request().invocation, approved_plan())
+        else:
+            await sandbox.inspect(request(True).invocation, approved_plan(),
+                                  request(True).preparation_execution_id)
+    assert calls == 1
+    if not cancel:
+        assert (caught.value.phase, caught.value.code) == (phase, "metadata_prepare_unavailable")
+        assert PRIVATE not in str(caught.value)
+
+
+@pytest.mark.parametrize("phase", ["profile", "plan"])
+@pytest.mark.parametrize("defect", ["extra", "scope"])
+async def test_negative_response_must_validate_before_retry(
+    monkeypatch: pytest.MonkeyPatch, phase: str, defect: str,
+) -> None:
+    api = client()
+    failure = failure_type()
+    value = request().planning
+    calls = 0
+
+    def corrupt(result: Any) -> Any:
+        return replace(result, "" if defect == "extra" else "scope",
+                       {"extra": True} if defect == "extra" else {"project_id": "foreign"})
+
+    async def inspect(self: Any, invocation: Any) -> Any:
+        nonlocal calls
+        if phase == "profile":
+            calls += 1
+            negative = discovery(invocation).model_copy(update={"ok": False, "profile": None,
+                "error": "python_project_profile_unavailable"})
+            return corrupt(negative)
+        return discovery(invocation)
+
+    async def planning(item: PythonMetadataPlanningRequest, **kwargs: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        return corrupt(PythonMetadataPlanningResponse(
+            scope=profile_api.PythonProjectProfileScope.for_invocation(item.invocation),
+            ok=False, error="metadata_plan_unavailable"))
+
+    monkeypatch.setattr(profile_api.PythonProjectProfileSandbox, "inspect", inspect)
+    monkeypatch.setattr(api, "request_python_metadata_plan_broker", planning)
+    with pytest.raises(failure) as caught:
+        await api.PythonMetadataPreparationSandbox().plan(value.invocation, value.scope, value.draft)
+    assert (caught.value.phase, caught.value.code) == (phase, "metadata_prepare_response_invalid")
+    assert calls == 1
+
+
+@pytest.mark.parametrize("state", ["unknown", "absent"])
+async def test_readonly_inspect_returns_unknown_or_absent_without_preparing(
+    monkeypatch: pytest.MonkeyPatch, state: str,
+) -> None:
+    from agent_hub.skills.sandbox.python_metadata_preparation_protocol import (
+        PythonMetadataPreparationStatus,
+    )
+
+    api = client()
+    expected = request(True)
+    status = PythonMetadataPreparationStatus(plan_sha256=expected.expected_plan_sha256,
+        preparation_execution_id=expected.preparation_execution_id, state=state)
+    calls = 0
+
+    async def exchange(item: PythonMetadataPreparationRequest, **kwargs: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        assert item.action == "inspect_python_dependency_metadata_preparation"
+        return response(True, status=status, receipt=None)
+
+    monkeypatch.setattr(api, "request_python_metadata_preparation_broker", exchange)
+    assert await api.PythonMetadataPreparationSandbox().inspect(
+        expected.invocation, approved_plan(), expected.preparation_execution_id) == status
+    assert calls == 1

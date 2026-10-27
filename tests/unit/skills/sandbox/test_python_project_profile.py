@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import json
+import struct
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -251,6 +252,12 @@ class Writer:
     def close(self) -> None:
         self.closed = True
 
+    def get_extra_info(self, name: str) -> object:
+        class RootPeer:
+            def getsockopt(self, *args: object) -> bytes:
+                return struct.pack('3i', 321, 0, 0)
+        return RootPeer() if name == 'socket' else None
+
     async def wait_closed(self) -> None:
         self.close_started.set()
         if self.close_gate is not None:
@@ -270,6 +277,7 @@ async def transport(api: Any, configured: Any, monkeypatch: pytest.MonkeyPatch) 
         return reader, writer
     monkeypatch.setattr(api.asyncio, "open_unix_connection", connect, raising=False)
     monkeypatch.setattr(api, "_systemd_supported", lambda: True)
+    monkeypatch.setattr(api.socket, 'SO_PEERCRED', 17, raising=False)
     return SimpleNamespace(reader=reader, writer=writer, calls=calls, entered=entered, raw=raw)
 
 

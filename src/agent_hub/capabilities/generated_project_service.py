@@ -39,6 +39,9 @@ from agent_hub.domain.runs import RunStatus
 from agent_hub.plugins.handover_snapshots import _Directory
 from agent_hub.runtime.contracts import JsonValue, _freeze_object
 from agent_hub.skills.sandbox.project import ProjectInvocation, project_source_manifest
+from agent_hub.skills.sandbox.python_metadata_preparation_client import (
+    PythonMetadataPreparationFailure,
+)
 
 if TYPE_CHECKING:
     from agent_hub.capabilities.python_metadata_preparation_flow import MetadataPreparationClient
@@ -736,7 +739,14 @@ class GeneratedProjectService:
             return await self.load(tenant, run, actor)
         except GeneratedProjectError:
             raise
-        except Exception:  # noqa: BLE001 - uncertain captures remain consumed; never expose source/path data.
+        except Exception as error:  # noqa: BLE001 - uncertain captures remain consumed; never expose source/path data.
+            if type(error) is PythonMetadataPreparationFailure:
+                try:
+                    public_code = PythonMetadataPreparationFailure(phase=error.phase, code=error.code).public_code
+                except (ValueError, TypeError, AttributeError):
+                    pass
+                else:
+                    raise GeneratedProjectError(public_code) from None
             raise GeneratedProjectError('generated_acceptance_unavailable_or_changed') from None
 
     async def update(self, context: GeneratedProjectContext, replacement: Mapping[str, JsonValue]) -> GeneratedProjectContext:

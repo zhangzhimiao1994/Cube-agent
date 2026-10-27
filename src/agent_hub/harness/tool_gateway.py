@@ -584,12 +584,14 @@ def _project_authorization_failure_reason(error: Exception) -> str:
     from agent_hub.capabilities.project_verification import ProjectVerificationError
     from agent_hub.skills.sandbox.python_dependency_protocol import PythonDependencyClosureError
     from agent_hub.skills.sandbox.python_input_supply_protocol import SupplyError
+    from agent_hub.skills.sandbox.python_metadata_preparation_client import PUBLIC_FAILURE_CODES
     from agent_hub.skills.sandbox.python_project_protocol import PythonProjectBrokerError
 
     # A syntactically safe prefix is not a finite code: it can still carry a
     # project-controlled token. Keep diagnostics independent of exception text.
     allowed = {*get_args(PythonProjectBrokerError), *get_args(SupplyError),
         *get_args(PythonDependencyClosureError.__value__),
+        *PUBLIC_FAILURE_CODES,
         'python_project_systemd_linux_unsupported', 'python_project_recipe_invalid',
         'python_project_recipe_unsupported', 'python_project_lock_invalid',
         'python_project_declaration_limit', 'python_project_response_invalid',

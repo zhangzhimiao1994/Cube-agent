@@ -10,6 +10,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import socket
+import struct
 from pathlib import Path
 from typing import Annotated, Literal, Self
 from uuid import UUID
@@ -252,6 +254,19 @@ async def _close_socket(writer: asyncio.StreamWriter) -> None:
             await writer.wait_closed()
 
 
+def _root_peer(writer: asyncio.StreamWriter) -> None:
+    peer = writer.get_extra_info('socket')
+    option = getattr(socket, 'SO_PEERCRED', None)
+    if peer is None or type(option) is not int:
+        raise OSError(_UNAVAILABLE)
+    try:
+        pid, uid, gid = struct.unpack('3i', peer.getsockopt(socket.SOL_SOCKET, option, 12))
+    except (OSError, ValueError, TypeError, struct.error):
+        raise OSError(_UNAVAILABLE) from None
+    if pid <= 0 or uid != 0 or gid != 0:
+        raise OSError(_UNAVAILABLE)
+
+
 async def request_python_project_profile_broker(
     request: PythonProjectProfileRequest, *, socket_path: Path | None = None,
 ) -> PythonProjectProfileResponse:
@@ -272,6 +287,7 @@ async def request_python_project_profile_broker(
     except OSError:
         raise OSError(_UNAVAILABLE) from None
     try:
+        _root_peer(writer)
         await _write_frame(writer, request.model_dump_json().encode("utf-8"))
         return _parse_response(await _read_frame(reader, _MAX_RESPONSE_BYTES), request)
     except (BrokerRequestError, asyncio.IncompleteReadError, ValueError, TypeError):
