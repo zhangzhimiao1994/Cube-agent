@@ -36,9 +36,13 @@ from agent_hub.skills.sandbox.project import (
 )
 
 if TYPE_CHECKING:
+    from agent_hub.skills.sandbox.python_dependency_protocol import PythonDependencyClosureResponse
     from agent_hub.skills.sandbox.python_input_supply_protocol import (
         PythonInputSupplyRequest,
         PythonInputSupplyResponse,
+    )
+    from agent_hub.skills.sandbox.python_metadata_plan_protocol import (
+        PythonMetadataPlanningResponse,
     )
     from agent_hub.skills.sandbox.python_metadata_preparation_protocol import (
         PythonMetadataPreparationRequest,
@@ -584,46 +588,8 @@ async def _serve_client(
     writer: asyncio.StreamWriter,
     broker: SystemdBroker,
 ) -> None:
-    from agent_hub.skills.sandbox.python_dependency_inspection import (
-        inspect_python_dependency_closure,
-    )
-    from agent_hub.skills.sandbox.python_dependency_protocol import (
-        PythonDependencyClosureResponse,
-    )
-    from agent_hub.skills.sandbox.python_dependency_protocol import (
-        _parse_request as parse_dependency_request,
-    )
-    from agent_hub.skills.sandbox.python_input_supply_protocol import (
-        PythonInputSupplyRequest,
-        PythonInputSupplyResponse,
-    )
-    from agent_hub.skills.sandbox.python_metadata_plan_client import parse_metadata_planning_request
-    from agent_hub.skills.sandbox.python_metadata_plan_protocol import (
-        PythonMetadataPlanningResponse,
-    )
-    from agent_hub.skills.sandbox.python_metadata_planning import plan_python_dependency_metadata
-    from agent_hub.skills.sandbox.python_metadata_preparation_client import (
-        parse_metadata_preparation_request,
-    )
-    from agent_hub.skills.sandbox.python_metadata_preparation_protocol import (
-        PythonMetadataPreparationResponse,
-    )
-    from agent_hub.skills.sandbox.python_project_profile import (
-        PythonProjectProfileResponse,
-        dispatch_profile_request,
-    )
-    from agent_hub.skills.sandbox.python_project_protocol import (
-        PythonProjectBrokerRequest,
-        PythonProjectBrokerResponse,
-        PythonProjectInspectEnvironmentRequest,
-        PythonProjectProbeRequest,
-        PythonProjectReleaseEnvironmentRequest,
-    )
-    from agent_hub.skills.sandbox.toolchain_protocol import (
-        ToolchainResponse,
-        parse_toolchain_request,
-    )
-
+    # Select the envelope before loading unrelated protocol/metadata graphs.
+    # A v1 health probe must remain independent of optional project protocols.
     is_project = False
     is_dependency = False
     is_metadata_plan = False
@@ -648,6 +614,13 @@ async def _serve_client(
             is_metadata_preparation = True
             if peer_uid != broker._policy.allowed_uid:
                 raise BrokerRequestError('caller uid is not authorized')
+            from agent_hub.skills.sandbox.python_metadata_preparation_client import (
+                parse_metadata_preparation_request,
+            )
+            from agent_hub.skills.sandbox.python_metadata_preparation_protocol import (
+                PythonMetadataPreparationResponse,
+            )
+
             preparation_request = parse_metadata_preparation_request(payload)
             try:
                 preparation_response = await broker.handle_metadata_preparation(
@@ -668,6 +641,13 @@ async def _serve_client(
             is_metadata_plan = True
             if peer_uid != broker._policy.allowed_uid:
                 raise BrokerRequestError('caller uid is not authorized')
+            from agent_hub.skills.sandbox.python_metadata_plan_client import (
+                parse_metadata_planning_request,
+            )
+            from agent_hub.skills.sandbox.python_metadata_planning import (
+                plan_python_dependency_metadata,
+            )
+
             metadata_request = parse_metadata_planning_request(payload)
             response = await plan_python_dependency_metadata(metadata_request, policy=broker._policy)
         elif isinstance(envelope, dict) and (
@@ -677,6 +657,13 @@ async def _serve_client(
             is_dependency = True
             if peer_uid != broker._policy.allowed_uid:
                 raise BrokerRequestError('caller uid is not authorized')
+            from agent_hub.skills.sandbox.python_dependency_inspection import (
+                inspect_python_dependency_closure,
+            )
+            from agent_hub.skills.sandbox.python_dependency_protocol import (
+                _parse_request as parse_dependency_request,
+            )
+
             dependency_request = parse_dependency_request(payload)
             response = await inspect_python_dependency_closure(dependency_request, policy=broker._policy)
         elif isinstance(envelope, dict) and (
@@ -687,6 +674,11 @@ async def _serve_client(
             }
         ):
             is_project = is_toolchain = True
+            from agent_hub.skills.sandbox.toolchain_protocol import (
+                ToolchainResponse,
+                parse_toolchain_request,
+            )
+
             toolchain_request = parse_toolchain_request(payload)
             response = await broker.handle_toolchain(toolchain_request, peer_uid=peer_uid)
         elif isinstance(envelope, dict) and (
@@ -696,6 +688,11 @@ async def _serve_client(
             is_profile = True
             if peer_uid != broker._policy.allowed_uid:
                 raise BrokerRequestError('caller uid is not authorized')
+            from agent_hub.skills.sandbox.python_project_profile import (
+                PythonProjectProfileResponse,
+                dispatch_profile_request,
+            )
+
             response = PythonProjectProfileResponse.model_validate_json(dispatch_profile_request(payload), strict=True)
         elif isinstance(envelope, dict) and (
             type(envelope.get("version")) is int and envelope["version"] == 5
@@ -705,10 +702,23 @@ async def _serve_client(
             }
         ):
             is_project = is_supply = True
+            from agent_hub.skills.sandbox.python_input_supply_protocol import (
+                PythonInputSupplyRequest,
+                PythonInputSupplyResponse,
+            )
+
             supply_request = PythonInputSupplyRequest.model_validate_json(payload, strict=True)
             response = await broker.handle_input_supply(supply_request, peer_uid=peer_uid)
         elif isinstance(envelope, dict) and type(envelope.get("version")) is int and envelope["version"] == 4:
             is_project = True
+            from agent_hub.skills.sandbox.python_project_protocol import (
+                PythonProjectBrokerRequest,
+                PythonProjectBrokerResponse,
+                PythonProjectInspectEnvironmentRequest,
+                PythonProjectProbeRequest,
+                PythonProjectReleaseEnvironmentRequest,
+            )
+
             action = envelope.get("action")
             if action == "run_python_project":
                 python_request = PythonProjectBrokerRequest.model_validate_json(payload, strict=True)
