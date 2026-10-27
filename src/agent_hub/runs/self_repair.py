@@ -598,6 +598,16 @@ def classify_terminal_run(
             skip_reason="delivery_report_no_safe_recovery", error_code=error_code,
             suggested_action=suggested_action,
         )
+    if failure_category == "project_verification":
+        # This terminal observation has no executable proposal to approve.
+        # Live capability approvals remain on their existing waiting path.
+        return _skipped_decision(
+            status=status, mode=mode, source_kind=source_kind, source_sequence=source_sequence,
+            fingerprint=fingerprint, failure_category=failure_category,
+            requires_approval=False, attempt=1, max_attempts=policy.max_attempts,
+            skip_reason="project_verification_no_safe_recovery", error_code=error_code,
+            suggested_action=suggested_action,
+        )
     if _routing_source(routing_decision) == "self_repair":
         return _skipped_decision(
             status=status,
@@ -954,7 +964,7 @@ def _failure_diagnostic_metadata(failure: RunEvent | None) -> tuple[str | None, 
     if failure is None:
         return None, None
     report = runtime_failure_diagnostic_from_reason(failure.reason)
-    if report.get("error_stage") == "delivery_report":
+    if report.get("error_stage") in {"delivery_report", "project_verification"}:
         return (_safe_diagnostic_code(report.get("error_code")),
                 _safe_text(report.get("suggested_action"), default="", max_chars=240) or None)
     payload_error_code = _safe_diagnostic_code(failure.payload.get("error_code"))
@@ -1223,6 +1233,8 @@ def _failure_category(event: RunEvent) -> str:
         return "outcome_uncertain"
     if runtime_failure_diagnostic_from_reason(event.reason).get("error_stage") == "delivery_report":
         return "delivery_report"
+    if runtime_failure_diagnostic_from_reason(event.reason).get("error_stage") == "project_verification":
+        return "project_verification"
     if _contains_marker(text, _EMPTY_RESPONSE_MARKERS):
         return "empty_model_response"
     if _contains_marker(text, _STRUCTURED_OUTPUT_INVALID_MARKERS):

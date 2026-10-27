@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import re
+from functools import cache
+from typing import get_args
 
 from agent_hub.capabilities.project_prerequisites import (
     project_prerequisite_reason_category,
@@ -65,6 +67,41 @@ _PREREQUISITE_FAILURE = re.compile(
     r"(?:hybrid (?P<mode>direct|dispatch|discuss) failed: )?"
     r"project prerequisite blocked: (?P<reason>[a-z0-9_]{1,64})"
 )
+_VERIFICATION_BASE = "project verification failed"
+_VERIFICATION_PREFIX_CHAIN = re.compile(
+    r"(?:(?i:hybrid (?:direct|dispatch|discuss) failed: ))*" + re.escape(_VERIFICATION_BASE)
+)
+_VERIFICATION_CODES = frozenset({
+    "tool_unavailable", "capability_denied", "approval_required", "identity_unavailable",
+    "permission_mapping_unavailable", "sandbox_denied", "scope_denied", "backend_unavailable",
+    "backend_unsupported", "source_changed", "blocked_prerequisites", "malformed_report",
+    "outcome_unconfirmed", "tool_failed", "failed", "invalid_response", "truncated_response",
+    "not_passed", "timeout", "execution_failed",
+})
+_VERIFICATION_LITERALS = {code.replace("_", " "): code for code in _VERIFICATION_CODES}
+_VERIFICATION_BACKENDS = ((_VERIFICATION_CODES - {
+        "tool_failed", "failed", "invalid_response", "truncated_response", "not_passed", "timeout", "execution_failed",
+    }) | {
+    "python_project_product_unavailable", "python_project_report_invalid",
+    "python_project_response_invalid", "python_project_service_unavailable", "python_project_checks_failed",
+    "python_project_systemd_linux_unsupported", "python_project_recipe_invalid",
+    "python_project_recipe_unsupported", "python_project_lock_invalid",
+    "python_project_declaration_limit", "python_project_install_approval_required",
+    "generated_python_project_unavailable", "generated_acceptance_scope_changed",
+    "generated_acceptance_state_invalid", "generated_acceptance_persistence_unavailable",
+    "generated_acceptance_unknown_no_recapture", "generated_acceptance_unavailable_or_changed",
+    "generated_acceptance_manifest_required", "generated_acceptance_scaffold_incomplete",
+    "generated_acceptance_python_declaration_invalid", "generated_acceptance_node_declaration_invalid",
+    "generated_acceptance_test_execution_invalid", "generated_acceptance_test_evidence_missing",
+    "input_supply_approval_required",
+})
+_VERIFICATION_FAILURE = re.compile(re.escape(_VERIFICATION_BASE)
+    + r"(?:: (?P<failure>[a-z ]{1,80}))?(?: \(backend=(?P<backend>[a-z0-9_.]{1,160})\))?")
+_VERIFICATION_PERMISSION_CODES = frozenset({
+    "capability_denied", "approval_required", "identity_unavailable", "permission_mapping_unavailable",
+    "sandbox_denied", "scope_denied", "python_project_recipe_approval_required",
+    "python_project_install_approval_required", "input_supply_approval_required",
+})
 GENERIC_MODEL_GATEWAY_FAILURE = "model gateway failed"
 LEGACY_GENERIC_FAILURES = frozenset(
     {
@@ -180,6 +217,45 @@ def _delivery_report_failure_parts(reason: str) -> tuple[str, str, str | None] |
     return category, summary, None if child is None else child["mode"].lower()
 
 
+@cache
+def _verification_backend_literals() -> frozenset[str]:
+    # Protocol modules depend on run repositories. Resolve their finite enums
+    # only after import initialization; ordinary model diagnostics need none.
+    from agent_hub.skills.sandbox.python_dependency_protocol import PythonDependencyClosureError
+    from agent_hub.skills.sandbox.python_input_supply_protocol import SupplyError
+    from agent_hub.skills.sandbox.python_metadata_preparation_client import PUBLIC_FAILURE_CODES
+    from agent_hub.skills.sandbox.python_project_protocol import PythonProjectBrokerError
+
+    return (_VERIFICATION_BACKENDS | frozenset(get_args(PythonProjectBrokerError))
+        | frozenset(get_args(SupplyError)) | frozenset(get_args(PythonDependencyClosureError.__value__))
+        | PUBLIC_FAILURE_CODES)
+
+
+def _project_verification_parts(reason: str) -> tuple[str, str | None, str, str | None] | None:
+    child = _HYBRID_CHILD_FAILURE.fullmatch(reason)
+    candidate = reason if child is None else child["reason"]
+    match = _VERIFICATION_FAILURE.fullmatch(candidate)
+    if match is None:
+        return None
+    code = "failed" if match["failure"] is None else _VERIFICATION_LITERALS.get(match["failure"])
+    backend = match["backend"]
+    if code is None or backend is not None and backend not in _verification_backend_literals():
+        return None
+    summary = _VERIFICATION_BASE
+    if code != "failed":
+        summary += ": " + code.replace("_", " ")
+    if backend is not None:
+        summary += " (backend=" + backend + ")"
+    return code, backend, summary, None if child is None else child["mode"].lower()
+
+
+def _project_verification_candidate(reason: str) -> bool:
+    # Detect the strict wrapper prefix chain for rejection without a depth
+    # budget or recursive classification. Only _parts may accept a diagnostic;
+    # nested wrappers remain invalid even around a finite backend literal.
+    return _VERIFICATION_PREFIX_CHAIN.match(reason) is not None
+
+
 def is_public_project_prerequisite_text(value: object) -> bool:
     """Recognize finite diagnostic literals, never free text or secret field names."""
     if type(value) is not str:
@@ -202,6 +278,12 @@ def safe_runtime_failure_reason(error: Exception, *, fallback: str = "runtime_fa
     if prerequisite is not None:
         return "project prerequisite blocked: " + str(prerequisite["reason"])
     reason = normalize_failure_reason(str(error))
+    verification = _project_verification_parts(reason)
+    if verification is not None:
+        _, _, summary, child_mode = verification
+        return summary if child_mode is None else f"hybrid {child_mode} failed: {summary}"
+    if _project_verification_candidate(reason):
+        return fallback
     report = _delivery_report_failure_parts(reason)
     if report is not None:
         _, summary, child_mode = report
@@ -259,6 +341,26 @@ def runtime_failure_diagnostic_from_reason(
     """Classify an already-redacted failure reason into UI/operator hints."""
 
     normalized = normalize_failure_reason(reason or "") or "runtime_failed"
+    verification = _project_verification_parts(normalized)
+    if verification is not None:
+        code, backend, summary, child_mode = verification
+        permission = code in _VERIFICATION_PERMISSION_CODES or backend in _VERIFICATION_PERMISSION_CODES
+        category = "permission" if permission else "backend" if backend is not None else (
+            "unknown" if code == "failed" else code)
+        action = (
+            "核查当前身份与项目权限；当前具体动作仍走原 capability 审批路径，"
+            "不得全局放宽权限、自动重试或重放旧 FAILED。"
+            if permission else
+            "检查并对账既有 execution（inspect/reconcile existing execution）及清理、移交和 receipt 状态；"
+            "UNKNOWN 或 cleanup uncertain 不能推定成功或失败，不自动重试、修补平台或重跑原 FAILED。"
+        )
+        diagnostic = _base_diagnostic(summary, error_stage="project_verification", error_category=category,
+            error_code="project_verification." + (backend or code), retryable=False, suggested_action=action)
+        if child_mode is not None:
+            diagnostic["hybrid_child_mode"] = child_mode
+        return diagnostic
+    if _project_verification_candidate(normalized):
+        normalized = "runtime_failed"
     report = _delivery_report_failure_parts(normalized)
     if report is not None:
         category, summary, child_mode = report

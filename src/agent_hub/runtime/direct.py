@@ -11,7 +11,7 @@ import re
 from collections.abc import AsyncGenerator, AsyncIterator, Mapping
 from contextlib import aclosing
 from dataclasses import dataclass, field, replace
-from typing import Never, Protocol, cast
+from typing import Never, Protocol, cast, get_args
 from uuid import UUID, uuid4
 
 from agent_hub.capabilities.project_contracts import ManagedProjectInput
@@ -77,6 +77,10 @@ from agent_hub.runtime.project_scale_artifact import (
     project_scale_artifact_zip_files,
 )
 from agent_hub.runtime.self_repair_context import self_repair_context_text
+from agent_hub.skills.sandbox.python_dependency_protocol import PythonDependencyClosureError
+from agent_hub.skills.sandbox.python_input_supply_protocol import SupplyError
+from agent_hub.skills.sandbox.python_metadata_preparation_client import PUBLIC_FAILURE_CODES
+from agent_hub.skills.sandbox.python_project_protocol import PythonProjectBrokerError
 from agent_hub.subprocess_cleanup import ProcessCleanupIncomplete
 from agent_hub.website_preview_contract import WEBSITE_PREVIEW_API_GUIDANCE
 
@@ -312,6 +316,31 @@ _VERIFICATION_PROCESS_FAILURE_REASONS = frozenset({
 _VERIFICATION_FAILURE_CODES = frozenset(_VERIFICATION_GATE_FAILURE_CODES.values()) | {
     "failed", "invalid_response", "truncated_response", "not_passed", "timeout", "execution_failed",
 }
+_VERIFICATION_BACKEND_REASONS = (frozenset(get_args(PythonProjectBrokerError))
+    | frozenset(get_args(SupplyError)) | frozenset(get_args(PythonDependencyClosureError.__value__))
+    | PUBLIC_FAILURE_CODES | {
+    "python_project_product_unavailable", "python_project_report_invalid",
+    "python_project_response_invalid", "python_project_service_unavailable", "python_project_checks_failed",
+    "python_project_systemd_linux_unsupported", "python_project_recipe_invalid",
+    "python_project_recipe_unsupported", "python_project_lock_invalid",
+    "python_project_declaration_limit", "python_project_install_approval_required",
+    "generated_python_project_unavailable", "generated_acceptance_scope_changed",
+    "generated_acceptance_state_invalid", "generated_acceptance_persistence_unavailable",
+    "generated_acceptance_unknown_no_recapture", "generated_acceptance_unavailable_or_changed",
+    "generated_acceptance_manifest_required", "generated_acceptance_scaffold_incomplete",
+    "generated_acceptance_python_declaration_invalid", "generated_acceptance_node_declaration_invalid",
+    "generated_acceptance_test_execution_invalid", "generated_acceptance_test_evidence_missing",
+    "input_supply_approval_required",
+})
+
+
+def _verification_backend_error_code(reason: object) -> str | None:
+    if type(reason) is not str:
+        return None
+    if reason in _VERIFICATION_BACKEND_REASONS:
+        return reason
+    code = _VERIFICATION_GATE_FAILURE_CODES.get(reason)
+    return None if code == "tool_failed" else code
 
 
 def _verification_gate_failure_code(reason: object) -> str:
@@ -322,11 +351,18 @@ def _verification_gate_failure_code(reason: object) -> str:
 
 
 class _WorkspaceVerificationError(RuntimeExecutionError):
-    def __init__(self, failure_code: str) -> None:
+    def __init__(self, failure_code: str, *, backend_error_code: str | None = None) -> None:
         self.failure_code = failure_code if failure_code in _VERIFICATION_FAILURE_CODES else "failed"
+        allowed = _VERIFICATION_BACKEND_REASONS | frozenset(_VERIFICATION_GATE_FAILURE_CODES.values())
+        self.backend_error_code = (backend_error_code if type(backend_error_code) is str
+            and backend_error_code in allowed and backend_error_code != "tool_failed" else None)
+        self.tool_failure_artifact: Artifact | None = None
+        self.tool_failure_published = False
         reason = "project verification failed"
         if self.failure_code != "failed":
             reason += ": " + self.failure_code.replace("_", " ")
+        if self.backend_error_code is not None and self.backend_error_code != self.failure_code:
+            reason += " (backend=" + self.backend_error_code + ")"
         super().__init__(reason)
 
 
@@ -404,6 +440,21 @@ class _WorkspaceVerificationTrace:
     _previous_files: dict[str, str] = field(default_factory=dict)
     _failed_digest: str | None = None
     _failed_attempt: int | None = None
+
+    def record_unconfirmed(
+        self, result: HarnessToolCallResult, *, known_files: Mapping[str, str], attempt: int,
+        diagnostic: Mapping[str, JsonValue],
+    ) -> None:
+        # An owned failed tool result is not a measured failed process. Do not
+        # create checks, a failure receipt or a repair target from this entry.
+        self.attempts.append({"attempt": attempt, "model_round": self.model_round,
+            "call_id": result.call_id, "status": "unconfirmed",
+            "runtime_written_files_sha256": _workspace_source_digest(known_files, self.context),
+            **diagnostic})
+        self.attempt_count += 1
+        if len(self.attempts) > _MAX_VERIFICATION_HISTORY_ATTEMPTS:
+            del self.attempts[1]
+        self.truncated = self.truncated or self.attempt_count > _MAX_VERIFICATION_HISTORY_ATTEMPTS
 
     def record(
         self, result: HarnessToolCallResult, *, known_files: Mapping[str, str], attempt: int,
@@ -1533,6 +1584,7 @@ class DirectRuntime:
 
     def _model_scope_events(
         self, *, run_id: UUID, sequence: int, include_received_only: bool = False,
+        model_failure: bool = True,
     ) -> tuple[RunEvent, ...]:
         tracker = self._model_scope_tracker
         if tracker is None or self._model_scope_published or self._cancel_requested:
@@ -1562,12 +1614,11 @@ class DirectRuntime:
                 "deployment": provenance.deployment_id, "provider": provenance.provider_id,
                 "upstream_model": provenance.provider_model,
             }
-            events.extend((
-                RunEvent(kind=EventKind.ARTIFACT_CREATED, sequence=sequence + len(events),
-                         run_id=run_id, actor="main_agent", artifact=artifact, payload=payload),
-                RunEvent(kind="model.failure_receipt", sequence=sequence + len(events) + 1,
-                         run_id=run_id, payload={**payload, "actor": "main_agent"}),
-            ))
+            events.append(RunEvent(kind=EventKind.ARTIFACT_CREATED, sequence=sequence + len(events),
+                run_id=run_id, actor="main_agent", artifact=artifact, payload=payload))
+            if model_failure or any(call.get("outcome") == "failed" for call in calls):
+                events.append(RunEvent(kind="model.failure_receipt", sequence=sequence + len(events),
+                    run_id=run_id, payload={**payload, "actor": "main_agent"}))
         return tuple(events)
 
     async def _deliver_workspace_incrementally(
@@ -1959,6 +2010,37 @@ class DirectRuntime:
             _raise_execution_error('generated project inspection is invalid')
         return payload
 
+    async def _verification_result_error(
+        self, context: TaskContext, result: HarnessToolCallResult, *, failure_code: str,
+        known_files: Mapping[str, str], attempt: int,
+        verification_trace: _WorkspaceVerificationTrace | None,
+    ) -> _WorkspaceVerificationError:
+        # Call/tool ownership and non-truncation are checked by _verify_workspace
+        # before reaching here. Never project arbitrary backend payload/text.
+        backend_code = _verification_backend_error_code(result.failure_reason)
+        diagnostic: dict[str, JsonValue] = {"schema_version": 1, "failure_code": failure_code,
+            "backend_error_code": backend_code, "failure_reason": (
+                result.failure_reason if backend_code is not None else "unknown"),
+            "process_failure_confirmed": False, "retryable": False}
+        error = _WorkspaceVerificationError(failure_code, backend_error_code=backend_code)
+        if verification_trace is not None:
+            verification_trace.record_unconfirmed(result, known_files=known_files, attempt=attempt,
+                diagnostic=diagnostic)
+        artifact = Artifact(id=uuid4(), type="tool_result", producer="main_agent", content={
+            "agent_id": "main_agent", "tool_name": "project.verify", "call_id": result.call_id,
+            "arguments_sha256": hashlib.sha256(b"{}").hexdigest(), "status": "failed",
+            "result": {"verification_backend_failure": diagnostic,
+                **({"verification_history": verification_trace.to_payload()}
+                   if verification_trace is not None else {})}})
+        error.tool_failure_artifact = artifact
+        if self._generated_model_events is not None:
+            await self._generated_model_boundary(RunEvent(kind=EventKind.ARTIFACT_CREATED, sequence=1,
+                run_id=context.run_id, actor="main_agent", artifact=artifact,
+                payload={"artifact_id": str(artifact.id), "tool_name": "project.verify", "status": "failed",
+                    **diagnostic}))
+            error.tool_failure_published = True
+        return error
+
     async def _verify_workspace(
         self, context: TaskContext, *, known_files: Mapping[str, str], attempt: int,
         deadline: float,
@@ -2082,7 +2164,10 @@ class DirectRuntime:
             raise _WorkspaceVerificationError("invalid_response") from None
         if generated_history_selected(context):
             if result.status != "failed" or not generated_failure_current(context, result.payload):
-                raise _WorkspaceVerificationError("outcome_unconfirmed") from None
+                gate_code = failure_code if result.status == "failed" and failure_code not in {
+                    "failed", "tool_failed"} else "outcome_unconfirmed"
+                raise await self._verification_result_error(context, result, failure_code=gate_code,
+                    known_files=known_files, attempt=attempt, verification_trace=verification_trace) from None
             if self._generated_model_events is not None:
                 failure_artifact = Artifact(id=uuid4(), type='tool_result', producer='main_agent', content={
                     'agent_id': 'main_agent', 'tool_name': 'project.verify', 'call_id': request.call_id,
@@ -2097,12 +2182,16 @@ class DirectRuntime:
             raise _WorkspaceVerificationFailure(result)
         if python:
             if result.status != "failed" or not python_failure_current(context, result.payload):
-                raise _WorkspaceVerificationError("outcome_unconfirmed") from None
+                gate_code = failure_code if result.status == "failed" and failure_code not in {
+                    "failed", "tool_failed"} else "outcome_unconfirmed"
+                raise await self._verification_result_error(context, result, failure_code=gate_code,
+                    known_files=known_files, attempt=attempt, verification_trace=verification_trace) from None
             if verification_trace is not None:
                 verification_trace.record(result, known_files=known_files, attempt=attempt)
             raise _WorkspaceVerificationFailure(result)
         if result.failure_reason not in _VERIFICATION_PROCESS_FAILURE_REASONS:
-            raise _WorkspaceVerificationError(failure_code) from None
+            raise await self._verification_result_error(context, result, failure_code=failure_code,
+                known_files=known_files, attempt=attempt, verification_trace=verification_trace) from None
         diagnostic = result.payload.get("execution_diagnostic")
         if diagnostic is None:
             raise _WorkspaceVerificationError("outcome_unconfirmed") from None
@@ -3442,9 +3531,18 @@ class DirectRuntime:
                 payload=completed_payload,
                 inputs=(artifact,),
             )
-        except RuntimeExecutionError:
+        except RuntimeExecutionError as error:
+            if (isinstance(error, _WorkspaceVerificationError) and error.tool_failure_artifact is not None
+                    and not error.tool_failure_published):
+                failure_artifact = error.tool_failure_artifact
+                yield RunEvent(kind=EventKind.ARTIFACT_CREATED, sequence=2 + injection_offset,
+                    run_id=scope_run_id, actor="main_agent", artifact=failure_artifact,
+                    payload={"artifact_id": str(failure_artifact.id), "tool_name": "project.verify",
+                        "status": "failed"})
+                injection_offset += 1
             for scope_event in self._model_scope_events(
                 run_id=scope_run_id, sequence=2 + injection_offset, include_received_only=True,
+                model_failure=not isinstance(error, _WorkspaceVerificationError),
             ):
                 yield scope_event
             raise

@@ -585,9 +585,25 @@ class ProjectExecutionBroker:
             "session_id": job.invocation.session_id,
             "source_sha256": job.source_sha256,
         }
-        temporary = job.stage / "execution.json.tmp"
-        temporary.write_text(json.dumps(data, sort_keys=True), encoding="ascii")
-        temporary.replace(job.stage / "execution.json")
+        # Never inherit the daemon's umask or follow/reuse an existing tmp entry.
+        descriptor, name = tempfile.mkstemp(prefix="execution-", suffix=".tmp", dir=job.stage)
+        temporary = Path(name)
+        try:
+            with os.fdopen(descriptor, "w", encoding="ascii") as stream:
+                if sys.platform != "win32":
+                    os.fchmod(stream.fileno(), 0o600)
+                json.dump(data, stream, sort_keys=True)
+                stream.flush()
+                os.fsync(stream.fileno())
+            temporary.replace(job.stage / "execution.json")
+            if sys.platform != "win32":
+                directory = os.open(job.stage, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                try:
+                    os.fsync(directory)
+                finally:
+                    os.close(directory)
+        finally:
+            temporary.unlink(missing_ok=True)
 
     @staticmethod
     def _validate_result(
