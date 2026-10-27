@@ -35,6 +35,7 @@ Kind = Literal['node_plain', 'node_original', 'node_generated', 'python_original
 _TYPE = 'project_verification_receipt'
 _PRODUCER = 'trusted_project_verifier'
 _ERROR = 'project verification receipt is unavailable or changed'
+PublicationDisposition = Literal['private', 'writing', 'aborted', 'completing', 'committed', 'unknown']
 
 
 @dataclass(slots=True)
@@ -45,6 +46,18 @@ class _Attempt:
     action: str
     issued: VerificationRecord | None = None
     active: bool = True
+    product: Mapping[str, JsonValue] | None = None
+    publication_disposition: PublicationDisposition = 'private'
+    artifact_reference: ArtifactReference | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _RetainedProductPublication:
+    """Non-authorizing reconciliation data, separate from current receipt caches."""
+
+    product: Mapping[str, JsonValue]
+    artifact_reference: ArtifactReference | None
+    disposition: Literal['unknown'] = 'unknown'
 
 
 @dataclass(slots=True)
@@ -74,9 +87,31 @@ class DurableVerification:
         self._attempt: ContextVar[_Attempt | None] = ContextVar('project_verification_attempt', default=None)
         self._restoring: ContextVar[_Recovery | None] = ContextVar('verification_restoring', default=None)
         self._issued: dict[tuple[UUID, UUID], VerificationRecord] = {}
+        self._retained_product_publications: dict[
+            tuple[UUID, UUID, str], _RetainedProductPublication,
+        ] = {}
 
     def clear(self, tenant: UUID, run: UUID) -> None:
         self._issued.pop((tenant, run), None)
+
+    def _finish_product_publication(self, attempt: _Attempt) -> None:
+        from agent_hub.capabilities.python_product_delivery import discard_product
+
+        product = attempt.product
+        if product is None:
+            return
+        key = (attempt.tenant, attempt.run)
+        if self.owner._pending_python_products.get(key) is product:
+            self.owner._pending_python_products.pop(key, None)
+        if attempt.publication_disposition in {'private', 'aborted'}:
+            discard_product(self.owner.generated_file_store, product)
+        elif attempt.publication_disposition != 'committed':
+            # No new publication or execution is attempted here. The existing
+            # possibly written body must remain intact; retain its small file
+            # locator even when put/abort acknowledgements were unavailable.
+            artifact_id = cast(str, product['artifact_id'])
+            self._retained_product_publications[(*key, artifact_id)] = _RetainedProductPublication(
+                product, attempt.artifact_reference)
 
     async def require_current(self, tenant: UUID, run: UUID) -> None:
         attempt = self._attempt.get()
@@ -137,37 +172,54 @@ class DurableVerification:
 
     async def _publish(self, issued: VerificationRecord, result: Mapping[str, JsonValue]) -> None:
         tenant, run = issued.authority.tenant_id, issued.authority.run_id
+        attempt = self._attempt.get()
+        if attempt is None or attempt.issued != issued or not attempt.active:
+            raise ValueError(_ERROR)
         if await self.owner.require_current_receipt(tenant, run) != issued.source_sha256:
             raise ValueError(_ERROR)
         artifact = Artifact(id=uuid4(), type=_TYPE, producer=_PRODUCER,
             content=self._body(issued, self._kind(tenant, run), result))
         reference = ArtifactReference(id=artifact.id, sha256=artifact.content_sha256)
+        attempt.artifact_reference = reference
         write_id = uuid4()
         completing = False
         try:
+            attempt.publication_disposition = 'writing'
             await self.artifacts.reserve_write(tenant, run, reference, write_id=write_id)
             await self.artifacts.put(tenant, run, artifact, write_id=write_id)
             if await self.owner.require_current_receipt(tenant, run) != issued.source_sha256:
                 raise ValueError(_ERROR)
             completing = True
+            attempt.publication_disposition = 'completing'
             complete = await self.receipts.complete(issued.authority, expected=issued, status='passed',
                                                    artifact_references=(reference,))
+            attempt.publication_disposition = 'committed'
             self._issued[(tenant, run)] = complete
         except BaseException:
             # After CAS starts the outcome may be unknown: retain a possibly committed body.
+            attempt.publication_disposition = 'unknown'
             if not completing:
                 cleanup = asyncio.create_task(self.artifacts.abort_write(tenant, run, reference, write_id=write_id))
+                aborted = False
                 while True:
                     try:
-                        await asyncio.shield(cleanup)
+                        aborted = await asyncio.shield(cleanup)
                         break
                     except asyncio.CancelledError:
                         if cleanup.done():
-                            logging.getLogger(__name__).warning('private verification write cleanup cancelled')
+                            if not cleanup.cancelled():
+                                try:
+                                    aborted = cleanup.result()
+                                except Exception:  # noqa: BLE001 - a missing acknowledgement is UNKNOWN.
+                                    logging.getLogger(__name__).warning('private verification write cleanup unavailable')
+                            else:
+                                logging.getLogger(__name__).warning('private verification write cleanup cancelled')
                             break
                     except Exception:  # noqa: BLE001 - never expose storage content while draining.
                         logging.getLogger(__name__).warning('private verification write cleanup unavailable')
                         break
+                if aborted is True:
+                    attempt.publication_disposition = 'aborted'
             raise
 
     async def verify(self, *, tenant_id: UUID, run_id: UUID, actor: str,
@@ -192,6 +244,9 @@ class DurableVerification:
             ):
                 raise ValueError(_ERROR)
             result = await self.owner._verify(tenant_id=tenant_id, run_id=run_id, actor=actor)
+            attempt.product = self.owner._pending_python_products.get((tenant_id, run_id))
+            if attempt.product != result.get('python_product'):
+                raise ValueError(_ERROR)
             if attempt.issued is None:
                 raise ValueError(_ERROR)
             await self._publish(attempt.issued, result)
@@ -211,8 +266,11 @@ class DurableVerification:
                 raise
             raise ProjectVerificationError(_ERROR) from None
         finally:
-            attempt.active = False
-            self._attempt.reset(token)
+            try:
+                self._finish_product_publication(attempt)
+            finally:
+                attempt.active = False
+                self._attempt.reset(token)
 
     async def restore(self, *, tenant_id: UUID, run_id: UUID, actor: str,
                       action_key: str) -> Mapping[str, JsonValue]:

@@ -56,6 +56,11 @@ _HYBRID_CHILD_FAILURE = re.compile(
     r"^hybrid (?P<mode>direct|dispatch|discuss) failed: (?P<reason>.+)$",
     re.IGNORECASE,
 )
+_DELIVERY_REPORT_BASE = "direct final report is invalid"
+_DELIVERY_REPORT_FAILURE = re.compile(
+    re.escape(_DELIVERY_REPORT_BASE)
+    + r"(?: ?\(reason=(?P<reason>completion_missing|tool_calls|empty_text|json_only|binding_invalid)\))?"
+)
 _PREREQUISITE_FAILURE = re.compile(
     r"(?:hybrid (?P<mode>direct|dispatch|discuss) failed: )?"
     r"project prerequisite blocked: (?P<reason>[a-z0-9_]{1,64})"
@@ -158,6 +163,23 @@ def _prerequisite_failure_parts(reason: str) -> tuple[str, str, str | None] | No
     return None if category is None else (match["reason"], category, match["mode"])
 
 
+def _delivery_report_failure_parts(reason: str) -> tuple[str, str, str | None] | None:
+    child = _HYBRID_CHILD_FAILURE.fullmatch(reason)
+    candidate = reason if child is None else child["reason"]
+    if candidate != _DELIVERY_REPORT_BASE and not candidate.startswith(
+        (_DELIVERY_REPORT_BASE + " (", _DELIVERY_REPORT_BASE + "("),
+    ):
+        return None
+    match = _DELIVERY_REPORT_FAILURE.fullmatch(candidate)
+    category = "unknown" if match is None or match["reason"] is None else match["reason"]
+    # Never project an unrecognized suffix or attached provider text. A legacy
+    # aggregate guard cannot establish which branch rejected the old report.
+    summary = _DELIVERY_REPORT_BASE
+    if category != "unknown":
+        summary += f" (reason={category})"
+    return category, summary, None if child is None else child["mode"].lower()
+
+
 def is_public_project_prerequisite_text(value: object) -> bool:
     """Recognize finite diagnostic literals, never free text or secret field names."""
     if type(value) is not str:
@@ -180,6 +202,10 @@ def safe_runtime_failure_reason(error: Exception, *, fallback: str = "runtime_fa
     if prerequisite is not None:
         return "project prerequisite blocked: " + str(prerequisite["reason"])
     reason = normalize_failure_reason(str(error))
+    report = _delivery_report_failure_parts(reason)
+    if report is not None:
+        _, summary, child_mode = report
+        return summary if child_mode is None else f"hybrid {child_mode} failed: {summary}"
     if _prerequisite_failure_parts(reason) is not None:
         # Only finite diagnostic codes may cross Hybrid's string boundary.
         # No arbitrary authorization text or execution authority is preserved.
@@ -233,6 +259,20 @@ def runtime_failure_diagnostic_from_reason(
     """Classify an already-redacted failure reason into UI/operator hints."""
 
     normalized = normalize_failure_reason(reason or "") or "runtime_failed"
+    report = _delivery_report_failure_parts(normalized)
+    if report is not None:
+        category, summary, child_mode = report
+        diagnostic = _base_diagnostic(
+            summary, error_stage="delivery_report", error_category=category,
+            error_code="delivery_report." + category, retryable=False,
+            suggested_action=(
+                "最终报告未通过交付校验；仅记录有限诊断并保留当前验证证据。"
+                "当前没有安全可执行的报告恢复动作，不自动重试、修补平台或恢复旧失败运行。"
+            ),
+        )
+        if child_mode is not None:
+            diagnostic["hybrid_child_mode"] = child_mode
+        return diagnostic
     prerequisite = _prerequisite_failure_parts(normalized)
     if prerequisite is not None:
         prerequisite_reason, prerequisite_category, child_mode = prerequisite

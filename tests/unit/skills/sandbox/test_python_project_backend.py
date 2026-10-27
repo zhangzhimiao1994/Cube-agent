@@ -509,6 +509,8 @@ def stubbed_context(api: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -
         events.append("wheels")
         return recipe.wheels
 
+    # Native product IO is separately covered; this fixture models privileged boundaries.
+    monkeypatch.setattr(api, "retain_python_product", lambda *args, **kwargs: None)
     monkeypatch.setattr(api, "_native", lambda: None)
     monkeypatch.setattr(api, "_roots", roots)
     monkeypatch.setattr(api, "_admission", admission, raising=False)
@@ -627,10 +629,12 @@ def test_disk_lock_spans_preflight_through_handler_and_uses_source_copy_budget(
         finally:
             events.append("disk_unlock")
 
-    def budget(config: Any, roots: Any, size: int, copying: bool, *, source_bytes: int = 0) -> None:
+    def budget(config: Any, roots: Any, size: int, copying: bool, *, source_bytes: int = 0,
+               product_bytes: int = 0) -> None:
         assert events == ["disk_lock"] and config == configured
         assert source_bytes == invocation.source_limit_bytes * (2 if action == "candidate" else 1)
         assert copying is (action in {"original", "candidate"})
+        assert product_bytes == (invocation.workspace_limit_bytes if copying else 0)
         assert size == (
             min(configured.max_environment_bytes, invocation.workspace_limit_bytes)
             if copying

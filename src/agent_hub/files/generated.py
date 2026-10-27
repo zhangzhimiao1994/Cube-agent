@@ -4,16 +4,19 @@ from __future__ import annotations
 
 import os
 import shutil
+import tempfile
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path, PurePosixPath, PureWindowsPath
+from typing import BinaryIO
 from uuid import UUID
 
 DOCX_MIME_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 PPTX_MIME_TYPE = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
 PDF_MIME_TYPE = "application/pdf"
 ZIP_MIME_TYPE = "application/zip"
+WHEEL_MIME_TYPE = "application/vnd.python.wheel"
 GZIP_MIME_TYPE = "application/gzip"
 TAR_MIME_TYPE = "application/x-tar"
 PNG_MIME_TYPE = "image/png"
@@ -31,6 +34,7 @@ ALLOWED_GENERATED_FILE_MIME_TYPES = frozenset(
         PPTX_MIME_TYPE,
         PDF_MIME_TYPE,
         ZIP_MIME_TYPE,
+        WHEEL_MIME_TYPE,
         GZIP_MIME_TYPE,
         TAR_MIME_TYPE,
         PNG_MIME_TYPE,
@@ -49,6 +53,7 @@ GENERATED_FILE_EXTENSIONS_BY_MIME_TYPE = {
     PPTX_MIME_TYPE: (".pptx",),
     PDF_MIME_TYPE: (".pdf",),
     ZIP_MIME_TYPE: (".zip",),
+    WHEEL_MIME_TYPE: (".whl",),
     GZIP_MIME_TYPE: (".gz", ".tgz"),
     TAR_MIME_TYPE: (".tar",),
     PNG_MIME_TYPE: (".png",),
@@ -134,6 +139,46 @@ class GeneratedFileStore:
             storage_key=storage_key,
             download_url=f"/api/v1/runs/{run_id}/artifacts/{artifact_id}/download",
         )
+
+    def store_stream(
+        self, tenant_id: UUID, run_id: UUID, artifact_id: UUID,
+        filename: str, mime_type: str, stream: BinaryIO, *,
+        expected_sha256: str, expected_size: int,
+    ) -> GeneratedFileMetadata:
+        """Publish only fully received, measured bytes; never overwrite a product."""
+        safe_filename = validate_generated_filename(filename, mime_type)
+        if (type(expected_size) is not int or expected_size <= 0
+                or type(expected_sha256) is not str or len(expected_sha256) != 64
+                or any(c not in "0123456789abcdef" for c in expected_sha256)):
+            raise ValueError("invalid generated product measurement")
+        storage_key = f"{tenant_id}/{run_id}/{artifact_id}/{safe_filename}"
+        output = self._path_for_storage_key(storage_key)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        fd, temporary = tempfile.mkstemp(prefix=".product-", dir=output.parent)
+        stage = Path(temporary)
+        try:
+            with os.fdopen(fd, "wb") as destination:
+                digest = sha256()
+                remaining = expected_size
+                while remaining:
+                    chunk = stream.read(min(65536, remaining))
+                    if not chunk:
+                        raise ValueError("generated product is truncated")
+                    destination.write(chunk)
+                    digest.update(chunk)
+                    remaining -= len(chunk)
+                if stream.read(1) or digest.hexdigest() != expected_sha256:
+                    raise ValueError("generated product measurement mismatch")
+                destination.flush()
+                os.fsync(destination.fileno())
+            # Hard-link publication is atomic and fails if another writer won.
+            # Only the temporary link remains for finally to remove.
+            os.link(stage, output, follow_symlinks=False)
+        finally:
+            stage.unlink(missing_ok=True)
+        return GeneratedFileMetadata(filename=safe_filename, mime_type=mime_type,
+            size_bytes=expected_size, sha256=expected_sha256, storage_key=storage_key,
+            download_url=f"/api/v1/runs/{run_id}/artifacts/{artifact_id}/download")
 
     def store_path(
         self,

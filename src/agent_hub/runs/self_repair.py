@@ -590,6 +590,14 @@ def classify_terminal_run(
         failure_category=failure_category,
         failure=failure,
     )
+    if failure_category == "delivery_report":
+        return _skipped_decision(
+            status=status, mode=mode, source_kind=source_kind, source_sequence=source_sequence,
+            fingerprint=fingerprint, failure_category=failure_category,
+            requires_approval=False, attempt=1, max_attempts=policy.max_attempts,
+            skip_reason="delivery_report_no_safe_recovery", error_code=error_code,
+            suggested_action=suggested_action,
+        )
     if _routing_source(routing_decision) == "self_repair":
         return _skipped_decision(
             status=status,
@@ -945,6 +953,10 @@ def _requires_manual_repair_approval(failure_category: str) -> bool:
 def _failure_diagnostic_metadata(failure: RunEvent | None) -> tuple[str | None, str | None]:
     if failure is None:
         return None, None
+    report = runtime_failure_diagnostic_from_reason(failure.reason)
+    if report.get("error_stage") == "delivery_report":
+        return (_safe_diagnostic_code(report.get("error_code")),
+                _safe_text(report.get("suggested_action"), default="", max_chars=240) or None)
     payload_error_code = _safe_diagnostic_code(failure.payload.get("error_code"))
     payload_suggested_action = _safe_text(
         failure.payload.get("suggested_action"),
@@ -1209,6 +1221,8 @@ def _failure_category(event: RunEvent) -> str:
     text = _failure_text(event)
     if _contains_marker(text, _UNCERTAIN_MARKERS):
         return "outcome_uncertain"
+    if runtime_failure_diagnostic_from_reason(event.reason).get("error_stage") == "delivery_report":
+        return "delivery_report"
     if _contains_marker(text, _EMPTY_RESPONSE_MARKERS):
         return "empty_model_response"
     if _contains_marker(text, _STRUCTURED_OUTPUT_INVALID_MARKERS):

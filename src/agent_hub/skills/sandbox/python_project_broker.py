@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import os
 import tempfile
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -28,10 +29,12 @@ from agent_hub.skills.sandbox.python_project_command import _escaped
 from agent_hub.skills.sandbox.python_project_process import python_root_response_limit
 from agent_hub.skills.sandbox.python_project_protocol import (
     PYTHON_PROJECT_NATIVE_UNCERTAIN_EXIT_CODE,
+    PythonProductDescriptor,
     PythonProjectBrokerError,
     PythonProjectBrokerRequest,
     PythonProjectBrokerResponse,
     PythonProjectInspectEnvironmentRequest,
+    PythonProjectInvocation,
     PythonProjectProbeRequest,
     PythonProjectReleaseEnvironmentRequest,
     base_python_invocation,
@@ -46,6 +49,8 @@ type _Request = (
     PythonProjectBrokerRequest | PythonProjectProbeRequest | PythonProjectInspectEnvironmentRequest
     | PythonProjectReleaseEnvironmentRequest
 )
+type ProductSink = Callable[[Path, PythonProjectBrokerResponse, PythonProjectInvocation],
+                           Awaitable[PythonProductDescriptor | None]]
 
 
 @dataclass
@@ -166,6 +171,7 @@ async def handle_python_project(
     request: _Request,
     *,
     peer_uid: int,
+    product_sink: ProductSink | None = None,
 ) -> PythonProjectBrokerResponse:
     def failure(code: PythonProjectBrokerError) -> PythonProjectBrokerResponse:
         return PythonProjectBrokerResponse(
@@ -290,6 +296,15 @@ async def handle_python_project(
                     result.stdout, strict=True
                 )
                 response.require_for(request)
+                if isinstance(request, PythonProjectBrokerRequest) and request.product_transfer_version == 1:
+                    if product_sink is None:
+                        return failure("python_project_execution_unavailable")
+                    # Drain both cgroups before reading an output; keep stage and
+                    # slot until the transfer and normal cleanup have completed.
+                    await stop_units()
+                    product = await product_sink(job.stage, response, request.invocation)
+                    response = response.model_copy(update={"product": product})
+                    response.require_for(request)
                 return response
         finally:
             await _uninterrupted(finish())

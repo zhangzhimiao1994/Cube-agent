@@ -16,6 +16,7 @@ from uuid import UUID
 from agent_hub.capabilities.generated_project_service import generated_verification_binding
 from agent_hub.capabilities.project_verification import ProjectVerificationError, _OriginalScope
 from agent_hub.capabilities.python_generated_service import _Receipt as _GeneratedReceipt
+from agent_hub.capabilities.python_product_delivery import restore_product
 from agent_hub.capabilities.python_project_inputs import PythonProjectInputs
 from agent_hub.capabilities.python_project_receipts import validate_python_passed_receipt
 from agent_hub.capabilities.python_project_reports import PythonProjectReport
@@ -100,8 +101,8 @@ async def restore_python_verification(
         payload = _freeze_object(payload, name="private Python verification recovery")
         binding_field = ("original_check_contract" if kind == "python_original"
                          else "generated_project_acceptance")
-        _need(set(payload) == {"verification", binding_field, "python_recipe",
-                               "python_environment_reference", "summary"})
+        expected = {"verification", binding_field, "python_recipe", "python_environment_reference", "summary"}
+        _need(set(payload) == expected | ({"python_product"} if "python_product" in payload else set()))
         reference = PythonEnvironmentReference.model_validate_json(
             _encoded(payload["python_environment_reference"]), strict=True)
         if kind == "python_original":
@@ -123,11 +124,13 @@ async def restore_python_verification(
                 historical = observation["environment_reference"]
                 _need(historical is not None and reference == (
                     PythonEnvironmentReference.model_validate_json(_encoded(historical), strict=True)))
-            _passed(payload, inputs=context.inputs, invocation=invocation,
-                    reference=reference, source=source_sha256)
+            report = _passed(payload, inputs=context.inputs, invocation=invocation,
+                             reference=reference, source=source_sha256)
+            product = restore_product(owner.generated_file_store, payload.get("python_product"),
+                                      invocation, source_sha256, report.to_payload())
             binding = _OriginalScope(context.stored, context.observation_sha256).binding(source_sha256)
             _need(payload[binding_field] == binding)
-            service.receipts[key] = _OriginalReceipt(context, invocation, source_sha256, reference, actor)
+            service.receipts[key] = _OriginalReceipt(context, invocation, source_sha256, reference, actor, product)
             service.environments[key] = reference
             owner._original_receipts[key] = binding
             _need(await service.require_current(tenant_id, run_id) == source_sha256)
@@ -157,8 +160,10 @@ async def restore_python_verification(
             assert isinstance(evidence, Mapping)
             binding = generated_verification_binding(current, source_sha256, evidence)
             _need(saved_binding == binding and report.report["test_count"] == evidence["count"])
+            product = restore_product(owner.generated_file_store, payload.get("python_product"),
+                                      invocation, source_sha256, report.to_payload())
             generated.receipts[key] = _GeneratedReceipt(
-                current, invocation, inputs, source_sha256, reference, actor, binding)
+                current, invocation, inputs, source_sha256, reference, actor, binding, product)
             _need(await generated.require_current(tenant_id, run_id) == source_sha256)
     except (asyncio.CancelledError, ProcessCleanupIncomplete):
         _clear(owner, key)

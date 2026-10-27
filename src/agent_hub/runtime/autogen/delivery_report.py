@@ -18,6 +18,7 @@ from agent_hub.runtime.autogen.engineering_delivery import _READ_ONLY
 from agent_hub.runtime.autogen.project_repair_phase import selected as repair_selected
 from agent_hub.runtime.autogen.project_repair_phase import stopped_models
 from agent_hub.runtime.contracts import Artifact, JsonValue, TaskContext, _mutable_json
+from agent_hub.runtime.direct_delivery_report import is_whole_body_json
 
 FINAL_REPORT_POLICY = "engineering_final_report_version"
 FINAL_REPORT_ACTOR = "delivery_main_agent"
@@ -120,7 +121,8 @@ def engineering_report_metadata(
     """
     version = context.routing_decision.get(FINAL_REPORT_POLICY)
     if (type(version) is not int or version != 1 or owner != FINAL_REPORT_ACTOR
-        or not text.strip() or not logical_model.strip() or not model_entries):
+        or not text.strip() or is_whole_body_json(text)
+        or not logical_model.strip() or not model_entries):
         raise ValueError("final report policy or text is invalid")
     by_id = {str(artifact.id): artifact for artifact in artifacts}
     if len(by_id) != len(artifacts):

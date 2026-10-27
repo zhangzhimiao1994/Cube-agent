@@ -44,6 +44,7 @@ if TYPE_CHECKING:
         PythonMetadataPreparationRequest,
         PythonMetadataPreparationResponse,
     )
+    from agent_hub.skills.sandbox.python_project_broker import ProductSink
     from agent_hub.skills.sandbox.python_project_profile import (
         PythonProjectProfileResponse,
     )
@@ -353,11 +354,12 @@ class SkillBroker:
 
     async def handle_python_project(
         self, request: PythonProjectBrokerRequest | PythonProjectProbeRequest | PythonProjectInspectEnvironmentRequest | PythonProjectReleaseEnvironmentRequest,
-        *, peer_uid: int,
+        *, peer_uid: int, product_sink: ProductSink | None = None,
     ) -> PythonProjectBrokerResponse:
         from agent_hub.skills.sandbox.python_project_broker import handle_python_project
 
-        return await handle_python_project(self._project_broker, request, peer_uid=peer_uid)
+        return await handle_python_project(self._project_broker, request, peer_uid=peer_uid,
+                                          product_sink=product_sink)
 
     async def handle_input_supply(
         self, request: PythonInputSupplyRequest, *, peer_uid: int,
@@ -718,7 +720,26 @@ async def _serve_client(
                 python_request = PythonProjectReleaseEnvironmentRequest.model_validate_json(payload, strict=True)
             else:
                 raise BrokerRequestError("invalid Python broker action")
-            response = await broker.handle_python_project(python_request, peer_uid=peer_uid)
+            if (isinstance(python_request, PythonProjectBrokerRequest)
+                    and python_request.product_transfer_version == 1):
+                from agent_hub.skills.sandbox.python_product_transport import send_product
+                from agent_hub.skills.sandbox.python_project_product_export import (
+                    open_python_product,
+                )
+
+                async def product_sink(stage: Path, reply: PythonProjectBrokerResponse,
+                                       invocation: Any) -> Any:
+                    with open_python_product(stage, reply, invocation) as product:
+                        if product is None:
+                            return None
+                        descriptor_fd, descriptor = product
+                        await send_product(writer, descriptor, descriptor_fd)
+                        return descriptor
+
+                response = await broker.handle_python_project(
+                    python_request, peer_uid=peer_uid, product_sink=product_sink)
+            else:
+                response = await broker.handle_python_project(python_request, peer_uid=peer_uid)
         elif isinstance(envelope, dict) and type(envelope.get("version")) is int and envelope["version"] in {2, 3}:
             is_project = True
             if envelope.get("action") == "terminate_project":

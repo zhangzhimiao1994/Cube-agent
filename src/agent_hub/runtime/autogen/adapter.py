@@ -2945,6 +2945,8 @@ class AutoGenDiscussionRuntime:
                 tool_entries=durability.tool_entries, artifacts=durability.artifacts)
 
         def report_evidence() -> str:
+            from agent_hub.runtime.direct_delivery_report import public_product_evidence
+
             binding = report_binding()
             assert durability is not None
             by_id = {str(item.id): item for item in durability.artifacts}
@@ -2959,11 +2961,13 @@ class AutoGenDiscussionRuntime:
                         or key == "size_bytes" and type(value) is int and value >= 0):
                         file_metadata[key] = value
             verification_checks: list[JsonValue] = []
+            verification_receipt: Mapping[str, JsonValue] | None = None
             for row in reversed(durability.tool_entries):
                 if row.get("name") != "project.verify" or row.get("status") != "succeeded":
                     continue
                 verified = by_id[cast(str, row["artifact_id"])].content.get("result")
                 receipt = verified.get("verification") if isinstance(verified, Mapping) else None
+                verification_receipt = receipt if isinstance(receipt, Mapping) else None
                 checks = receipt.get("checks") if isinstance(receipt, Mapping) else None
                 if isinstance(checks, tuple | list):
                     for check in checks:
@@ -2972,6 +2976,7 @@ class AutoGenDiscussionRuntime:
                             verification_checks.append({"phase": check["phase"], "status": "passed"})
                 break
             evidence: dict[str, JsonValue] = {
+                **public_product_evidence(result, verification_receipt),
                 "run_id": str(context.run_id), "bundle_artifact_id": str(bundle.id),
                 "bundle_artifact_sha256": bundle.content_sha256, "file": file_metadata,
                 "verification_checks": tuple(verification_checks),

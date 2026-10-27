@@ -51,8 +51,6 @@ from agent_hub.skills.sandbox.python_input_supply_protocol import (
 )
 from agent_hub.skills.sandbox.python_project_protocol import (
     PythonEnvironmentReference,
-    PythonProjectBrokerRequest,
-    PythonProjectBrokerResponse,
     PythonProjectInvocation,
     PythonProjectProbeInvocation,
     _reference_matches,
@@ -152,6 +150,7 @@ class _Receipt:
     reference: PythonEnvironmentReference
     actor: str
     binding: Mapping[str, JsonValue]
+    product: Mapping[str, JsonValue] | None = None
 
 
 @dataclass(frozen=True)
@@ -310,6 +309,14 @@ class PythonGeneratedProjectService:
     async def verify(self, context: GeneratedProjectContext, actor: str) -> Mapping[str, JsonValue]:
         key = (context.invocation.tenant_id, context.invocation.run_id)
         self.receipts.pop(key, None)
+        self.owner._pending_python_products.pop(key, None)
+        from agent_hub.capabilities.python_product_delivery import (
+            consume_response,
+            discard_product,
+            persist_product,
+        )
+        product = None
+        committed = False
         try:
             context = await self._current(context, actor)
             if _SUPPLY in context.state and cast(Mapping[str, JsonValue], context.state[_SUPPLY])['phase'] != 'supplied':
@@ -331,39 +338,50 @@ class PythonGeneratedProjectService:
             await self.owner._begin_verification(tenant_id=invocation.tenant_id, run_id=invocation.run_id,
                 actor=actor, execution_id=invocation.execution_id, source_sha256=source)
             response = await self.executor.run(invocation)
-            _need(type(response) is PythonProjectBrokerResponse)
-            response = PythonProjectBrokerResponse.model_validate(response.model_dump(), strict=True)
-            response.require_for(PythonProjectBrokerRequest(invocation=invocation))
-            _need(response.ok and response.result is not None, response.error or _ERROR)
-            assert response.result is not None
-            report = decode_python_project_report(invocation=invocation, inputs=inputs,
-                expected_source_sha256=source, environment_reference=response.environment_reference,
-                result=response.result)
-            await self._after(context, actor, approval, source)
-            if report.environment_reference is not None:
-                await asyncio.to_thread(self._persist_reference, context, inputs, report.environment_reference)
-            if isinstance(report, PythonProjectFailure):
-                raise ProjectVerificationError('python_project_checks_failed', report.diagnostic,
-                    python_project_failure=report)
-            proof = self._named_proof(context, response.result.stdout, report.report['test_count'])
-            from agent_hub.capabilities.generated_project_service import (
-                generated_verification_binding,
-            )
+            with consume_response(response, invocation, source) as (response, stream):
+                _need(response.ok and response.result is not None, response.error or _ERROR)
+                assert response.result is not None
+                report = decode_python_project_report(invocation=invocation, inputs=inputs,
+                    expected_source_sha256=source, environment_reference=response.environment_reference,
+                    result=response.result)
+                await self._after(context, actor, approval, source)
+                if report.environment_reference is not None:
+                    await asyncio.to_thread(self._persist_reference, context, inputs, report.environment_reference)
+                if isinstance(report, PythonProjectFailure):
+                    raise ProjectVerificationError('python_project_checks_failed', report.diagnostic,
+                        python_project_failure=report)
+                proof = self._named_proof(context, response.result.stdout, report.report['test_count'])
+                from agent_hub.capabilities.generated_project_service import (
+                    generated_verification_binding,
+                )
 
-            binding = generated_verification_binding(context, source, proof)
-            await self._after(context, actor, approval, source)
-            self.receipts[key] = _Receipt(context, invocation, inputs, source,
-                report.environment_reference, actor, binding)
-            return {'verification': {**report.to_payload(),
-                    'generated_acceptance_sha256': context.envelope.sha256},
-                'generated_project_acceptance': binding,
-                'python_recipe': python_recipe_marker(inputs),
-                'python_environment_reference': report.environment_reference.model_dump(mode='json'),
-                'summary': 'Generated acceptance preserved; Python build and named tests verified in isolation.'}
+                binding = generated_verification_binding(context, source, proof)
+                await self._after(context, actor, approval, source)
+                product = await persist_product(self.owner.generated_file_store, response, stream,
+                    invocation, source, report.to_payload())
+                if product is not None:
+                    self.owner._pending_python_products[key] = product
+                await self._after(context, actor, approval, source)
+                self.receipts[key] = _Receipt(context, invocation, inputs, source,
+                    report.environment_reference, actor, binding, product)
+                result: dict[str, JsonValue] = {**({'python_product': product} if product is not None else {}), 'verification': {**report.to_payload(),
+                        'generated_acceptance_sha256': context.envelope.sha256},
+                    'generated_project_acceptance': binding,
+                    'python_recipe': python_recipe_marker(inputs),
+                    'python_environment_reference': report.environment_reference.model_dump(mode='json'),
+                    'summary': 'Generated acceptance preserved; Python build and named tests verified in isolation.'}
+            committed = True
+            return result
         except (ProjectVerificationError, ProcessCleanupIncomplete):
             raise
         except Exception as error:  # noqa: BLE001 - no arbitrary native text becomes public evidence.
             self._raise(error)
+
+        finally:
+            if not committed:
+                self.receipts.pop(key, None)
+                self.owner._pending_python_products.pop(key, None)
+                discard_product(self.owner.generated_file_store, product)
 
     async def _after(self, context: GeneratedProjectContext, actor: str,
                      approval: CapabilityRequest, source: str) -> None:

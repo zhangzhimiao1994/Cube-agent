@@ -6,10 +6,10 @@ authorize that recipe and the broker must independently observe its inputs.
 
 from __future__ import annotations
 
-from typing import Literal, Self, cast
+from typing import BinaryIO, Literal, Self, cast
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator, model_validator
 
 from agent_hub.capabilities.python_project_inputs import PythonInterpreterIdentity
 from agent_hub.capabilities.python_project_recipe import PythonProjectDeclaration
@@ -60,6 +60,14 @@ class _PythonRequest(BaseModel):
 class PythonProjectBrokerRequest(_PythonRequest):
     action: Literal["run_python_project"] = "run_python_project"
     invocation: PythonProjectInvocation
+    product_transfer_version: Literal[1] | None = None
+
+    @field_validator("product_transfer_version", mode="before")
+    @classmethod
+    def strict_transfer(cls, value: object) -> object:
+        if value is not None and (type(value) is not int or value != 1):
+            raise ValueError("invalid product transfer version")
+        return value
 
 
 class PythonProjectProbeRequest(_PythonRequest):
@@ -194,6 +202,37 @@ PythonProjectBrokerError = Literal[
 ]
 
 
+class PythonProductDescriptor(BaseModel):
+    """Root-measured bytes, never a path or authorization grant."""
+
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+    schema_version: Literal[1]
+    execution_id: str = Field(pattern=r"^[a-z0-9][a-z0-9_-]{0,127}$")
+    tenant_id: str = Field(pattern=r"^[a-f0-9-]{36}$")
+    run_id: str = Field(pattern=r"^[a-f0-9-]{36}$")
+    project_id: str = Field(pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$")
+    session_id: str = Field(pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$")
+    source_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    recipe_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    filename: str = Field(min_length=5, max_length=255, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.+-]*\.whl$")
+    sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    size: int = Field(gt=0)
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def strict_product_version(cls, value: object) -> object:
+        if type(value) is not int:
+            raise ValueError("invalid Python product version")
+        return value
+
+    def require_for(self, invocation: PythonProjectInvocation) -> None:
+        if (self.execution_id, self.tenant_id, self.run_id, self.project_id, self.session_id,
+            self.recipe_sha256) != (invocation.execution_id, str(invocation.tenant_id),
+            str(invocation.run_id), invocation.project_id, invocation.session_id,
+            invocation.recipe_sha256) or self.size > invocation.workspace_limit_bytes:
+            raise ValueError("python_project_product_scope_invalid")
+
+
 class PythonProjectBrokerResponse(_PythonRequest):
     action: Literal[
         "probe_python_project", "run_python_project", "inspect_python_project_environment",
@@ -207,9 +246,13 @@ class PythonProjectBrokerResponse(_PythonRequest):
     released_environment: PythonEnvironmentReference | None = None
     release_outcome: Literal["released", "absent"] | None = None
     error: PythonProjectBrokerError | None = None
+    product: PythonProductDescriptor | None = None
+    _product_stream: BinaryIO | None = PrivateAttr(default=None)
 
     @model_validator(mode="after")
     def exclusive_outcome(self) -> Self:
+        if self.product is not None and (not self.ok or self.action != "run_python_project"):
+            raise ValueError("unexpected Python product")
         if not self.ok:
             if self.error is None or any(
                 value is not None
@@ -264,6 +307,10 @@ class PythonProjectBrokerResponse(_PythonRequest):
         }:
             raise ValueError("invalid Python broker request type")
         invocation = request.invocation
+        if self.product is not None:
+            if not isinstance(request, PythonProjectBrokerRequest) or request.product_transfer_version != 1:
+                raise ValueError("unsolicited Python product")
+            self.product.require_for(request.invocation)
         if (self.action, self.execution_id) != (request.action, invocation.execution_id):
             raise ValueError("Python broker response context mismatch")
         if (

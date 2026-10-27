@@ -254,7 +254,8 @@ def _seal_environment(root: Path, *, deadline: float) -> None:
         os.close(fd)
 
 
-def _wheel_actual(output: Path, expected: dict[str, Any], *, deadline: float) -> dict[str, Any]:
+def _wheel_actual(output: Path, expected: dict[str, Any], *, deadline: float,
+                  export_root: Path | None = None, maximum: int | None = None) -> dict[str, Any]:
     if sys.platform != "linux":
         raise ValueError("python_project_runner_rejected")
     directory = output / "wheels"
@@ -285,6 +286,13 @@ def _wheel_actual(output: Path, expected: dict[str, Any], *, deadline: float) ->
         )
     finally:
         os.close(fd)
+    if export_root is not None:
+        from agent_hub.skills.sandbox.python_project_product_export import export_python_product
+
+        _need(maximum is not None)
+        assert maximum is not None
+        export_python_product(output, export_root, expected=expected,
+                              maximum=maximum, deadline=deadline)
     return dict(expected)
 
 
@@ -409,6 +417,11 @@ def run_python_project(plan: PythonProjectRunnerPlan) -> dict[str, Any]:
                 deadline=deadline,
             )
             exported = True
+    if len(checks) == 3 and all(check["status"] == "passed" for check in checks):
+        _need(wheel is not None)
+        assert wheel is not None
+        _wheel_actual(output, wheel, deadline=deadline, export_root=_EXPORT,
+                      maximum=invocation.workspace_limit_bytes)
     return {
         "schema_version": 2,
         "kind": "python_project",

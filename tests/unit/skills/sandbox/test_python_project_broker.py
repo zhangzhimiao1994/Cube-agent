@@ -253,6 +253,43 @@ async def test_duplicate_and_cancel_tombstone_never_launch_helper(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("transfer_error", [False, True])
+async def test_product_transfer_is_after_quiescence_before_cleanup(
+    api: Any, configured: Any, monkeypatch: pytest.MonkeyPatch, transfer_error: bool,
+) -> None:
+    from agent_hub.skills.sandbox.python_project_protocol import PythonProjectBrokerRequest
+    from tests.unit.skills.sandbox.test_python_product_transport import descriptor
+    from tests.unit.skills.sandbox.test_python_project_client import (
+        invocation as product_invocation,
+    )
+
+    item = configured
+    inv = product_invocation()
+    req = PythonProjectBrokerRequest(invocation=inv, product_transfer_version=1)
+    async def process(*args: Any, **kwargs: Any) -> SkillResult:
+        kwargs["process_started"](SimpleNamespace(returncode=0))
+        reply = PythonProjectBrokerResponse(action=req.action, execution_id=inv.execution_id,
+            ok=True, result=SkillResult(exit_code=0, stdout="{}", stderr="", timed_out=False))
+        return SkillResult(exit_code=0, stdout=reply.model_dump_json(), stderr="", timed_out=False)
+    monkeypatch.setattr(api, "run_subprocess_with_limits", process)
+    async def transfer(stage: Path, reply: Any, invocation: Any) -> Any:
+        assert stage.is_dir()
+        assert "stop:agent-hub-python-broker-python_check.service" in item.events
+        assert "stop:agent-hub-project-python_check.service" in item.events
+        assert item.broker.slots._value == 7
+        item.events.append("transfer")
+        if transfer_error:
+            raise OSError("connection lost")
+        return descriptor()
+    reply = await api.handle_python_project(item.broker, req,
+        peer_uid=item.broker.policy.allowed_uid, product_sink=transfer)
+    assert list(item.root.iterdir()) == [] and item.broker.slots._value == 8
+    assert "transfer" in item.events
+    assert reply.ok is not transfer_error
+    assert reply.product == (None if transfer_error else descriptor())
+
+
+@pytest.mark.asyncio
 async def test_cancellation_drains_both_unit_groups_before_releasing_slot(
     api: Any, configured: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:

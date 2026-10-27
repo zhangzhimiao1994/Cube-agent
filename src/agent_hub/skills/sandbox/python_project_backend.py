@@ -74,6 +74,12 @@ from agent_hub.skills.sandbox.python_project_process import (
     python_phase_capture_limit,
     run_python_phase,
 )
+from agent_hub.skills.sandbox.python_project_product_export import (
+    open_python_product as open_python_product,  # noqa: PLC0414 - public broker entry point.
+)
+from agent_hub.skills.sandbox.python_project_product_export import (
+    retain_python_product,
+)
 from agent_hub.skills.sandbox.python_project_protocol import (
     PYTHON_PROJECT_NATIVE_UNCERTAIN_EXIT_CODE,
     PythonEnvironmentReference,
@@ -832,7 +838,8 @@ def _host_disk(fd: int) -> None:
 
 
 def _disk_budget(
-    config: RootConfig, roots: _Roots, budget: int, copying: bool, *, source_bytes: int = 0
+    config: RootConfig, roots: _Roots, budget: int, copying: bool, *, source_bytes: int = 0,
+    product_bytes: int = 0,
 ) -> None:
     # Native FD authority is established by _roots; this is only bounded admission
     # arithmetic on the actual filesystems. External writers remain outside it.
@@ -841,7 +848,9 @@ def _disk_budget(
     assert callable(statvfs)
     _need(not copying or roots.cache_fd is not None, "python_project_environment_unavailable")
     reserve = config.cache_policy.disk_reserve_bytes
-    stage_required = source_bytes + _STAGE_CONTROL_ALLOWANCE + (budget if copying else 0)
+    _need(type(product_bytes) is int and product_bytes >= 0, "python_project_environment_quota")
+    stage_required = (source_bytes + product_bytes + _STAGE_CONTROL_ALLOWANCE
+                      + (budget if copying else 0))
     requirements = [(roots.stage_fd, stage_required)]
     if roots.cache_fd is not None:
         if os.fstat(roots.stage_fd).st_dev == os.fstat(roots.cache_fd).st_dev and copying:
@@ -890,13 +899,14 @@ def _make_export(parent: int, stage: Path) -> Path:
     return stage / "export"
 
 
-def _export_empty(parent: int, deadline: float) -> None:
+def _export_empty(parent: int, deadline: float, product: bool = False) -> None:
     with ExitStack() as stack:
         pins: list[_Observed] = []
         fd = _open_directory(parent, "export", 0, stack, pins, mode=0o1777)
         _check(deadline)
         with os.scandir(fd) as entries:
-            _need(next(entries, None) is None, "python_project_environment_changed")
+            names = [entry.name for _, entry in zip(range(2), entries, strict=False)]
+            _need(names == (["product"] if product else []), "python_project_environment_changed")
         for pin in pins:
             pin.check()
 
@@ -910,6 +920,7 @@ def _publish_export(
     budget: int,
     reported_sha: str,
     deadline: float,
+    product: bool = False,
 ) -> PythonEnvironmentReference:
     """Only called AFTER manager/cgroup quiescence, never from runner evidence alone."""
     with ExitStack() as stack:
@@ -917,7 +928,8 @@ def _publish_export(
         exported = _open_directory(parent, "export", 0, stack, pins, mode=0o1777)
         with os.scandir(exported) as members:
             _need(
-                [entry.name for _, entry in zip(range(2), members, strict=False)] == ["ready"],
+                sorted(entry.name for _, entry in zip(range(3), members, strict=False))
+                == (["product", "ready"] if product else ["ready"]),
                 "python_project_environment_changed",
             )
         ready_info = os.stat("ready", dir_fd=exported, follow_symlinks=False)
@@ -1123,11 +1135,12 @@ def _run(
         deadline=deadline,
         disk_reserve_bytes=config.cache_policy.disk_reserve_bytes,
     )
-    _disk_budget(config, roots, budget, True)
+    _disk_budget(config, roots, budget, True, product_bytes=invocation.workspace_limit_bytes)
     cache = PythonProjectEnvironmentCache(config.environment_root, config.cache_policy)
     with cache.reserve(invocation, next_bytes=budget, deadline=deadline) as lease:
         reused = lease.current(deadline=deadline)
-        _disk_budget(config, roots, budget, reused is None)
+        _disk_budget(config, roots, budget, reused is None,
+                     product_bytes=invocation.workspace_limit_bytes)
         plan = PythonProjectRunnerPlan(
             invocation=invocation,
             inputs=prepared.inputs.to_payload(),
@@ -1195,9 +1208,10 @@ def _run(
                 budget,
                 payload["environment_sha256"],
                 deadline,
+                payload["status"] == "passed",
             )
         else:
-            _export_empty(roots.stage_fd, deadline)
+            _export_empty(roots.stage_fd, deadline, payload["status"] == "passed")
             if reused is not None and installed:
                 reference = lease.current(deadline=deadline, expected=reused)
                 _need(reference == reused, "python_project_environment_changed")
@@ -1229,6 +1243,9 @@ def _run(
                     execution=job,
                     deadline=deadline,
                 )
+        if payload["status"] == "passed":
+            retain_python_product(stage, invocation, payload, service_uid=policy.allowed_uid,
+                                  deadline=deadline)
         return PythonProjectBrokerResponse(
             action=request.action,
             execution_id=invocation.execution_id,
@@ -1297,6 +1314,7 @@ def execute_python_project_request(
                 budget if copying else 0,
                 copying,
                 source_bytes=request.invocation.source_limit_bytes * source_copies,
+                product_bytes=request.invocation.workspace_limit_bytes if copying else 0,
             )
             if isinstance(request, PythonProjectProbeRequest):
                 response = _probe(request, policy, configuration, stage, deadline)

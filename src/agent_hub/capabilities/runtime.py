@@ -274,6 +274,7 @@ class RuntimeCapabilityGateway:
             ProjectVerificationService(root=project_workspace_dir, repository=run_repository,
                                        executor=project_executor,
                                        receipt_repository=receipt_repository,
+                                       generated_file_store=self._generated_file_store,
                                        artifact_repository=(artifact_repository
                                            if receipt_repository is not None else None))
             if project_workspace_dir is not None else None
@@ -943,12 +944,14 @@ class RuntimeCapabilityGateway:
         verified_source: str | None = None
         delivery_receipt = self._project_delivery_receipts.get((tenant_id, run_id))
         generated_binding = self._generated_delivery_bindings.get((tenant_id, run_id))
+        python_product: Mapping[str, JsonValue] | None = None
         if (self._project_executor_configured and self._project_verification is not None
             and (original_contract is not None or delivery_receipt is not None or any(
                 item.path in {"package.json", "pyproject.toml"} for item in files
             ))):
             try:
                 verified_source = await self._project_verification.require_current_receipt(tenant_id, run_id)
+                python_product = await self._project_verification.require_current_python_product(tenant_id, run_id)
             except ProjectVerificationError as error:
                 if generated_binding is not None:
                     self._project_delivery_receipts.pop((tenant_id, run_id), None)
@@ -957,7 +960,7 @@ class RuntimeCapabilityGateway:
         filename = _filename(arguments, title=title, extension=".zip")
         try:
             artifact_id = uuid4()
-            metadata, files = await asyncio.to_thread(
+            packaging = asyncio.create_task(asyncio.to_thread(
                 self._bundle_workspace,
                 store=store,
                 generated_store=generated_store,
@@ -968,22 +971,46 @@ class RuntimeCapabilityGateway:
                 artifact_id=artifact_id,
                 filename=filename,
                 verified_source_sha256=verified_source,
-            )
-        except (OSError, ValueError) as error:
+                python_product=python_product,
+            ))
+            try:
+                metadata, files = await asyncio.shield(packaging)
+            except asyncio.CancelledError:
+                # A cancelled waiter cannot stop a disk writer. Drain it before
+                # removing this unpublished artifact; never leak a late product.
+                while not packaging.done():
+                    try:
+                        await asyncio.shield(packaging)
+                    except asyncio.CancelledError:
+                        continue
+                    except Exception:  # noqa: BLE001 - preserve cancellation after draining the writer.
+                        break
+                if not packaging.cancelled() and packaging.exception() is None:
+                    abandoned, _ = packaging.result()
+                    generated_store.resolve_for(tenant_id, run_id, artifact_id,
+                                                abandoned.storage_key).unlink(missing_ok=True)
+                raise
+        except (OSError, ValueError, ProjectVerificationError) as error:
             raise RuntimeCapabilityError(str(error)) from None
-        if generated_binding is not None:
+        if generated_binding is not None or python_product is not None:
             try:
                 assert self._project_verification is not None
                 current_source = await self._project_verification.require_current_receipt(tenant_id, run_id)
+                current_product = await self._project_verification.require_current_python_product(tenant_id, run_id)
                 if (current_source != verified_source
+                        or current_product != python_product
                         or self._project_delivery_receipts.get((tenant_id, run_id)) != delivery_receipt
                         or self._generated_delivery_bindings.get((tenant_id, run_id)) != generated_binding):
                     raise ProjectVerificationError('project verification required before delivery')
             except (asyncio.CancelledError, ProcessCleanupIncomplete):
+                generated_store.resolve_for(tenant_id, run_id, artifact_id,
+                                            metadata.storage_key).unlink(missing_ok=True)
                 self._project_delivery_receipts.pop((tenant_id, run_id), None)
                 self._generated_delivery_bindings.pop((tenant_id, run_id), None)
                 raise
             except Exception:  # noqa: BLE001 - never return stale generated artifact evidence.
+                generated_store.resolve_for(tenant_id, run_id, artifact_id,
+                                            metadata.storage_key).unlink(missing_ok=True)
                 self._project_delivery_receipts.pop((tenant_id, run_id), None)
                 self._generated_delivery_bindings.pop((tenant_id, run_id), None)
                 raise RuntimeCapabilityError('project verification required before delivery') from None
@@ -1002,6 +1029,13 @@ class RuntimeCapabilityGateway:
             cast(Mapping[str, JsonValue], item.to_public_dict()) for item in files
         )
         result["bundle_download_url"] = store.bundle_download_url(project_id, session_id)
+        if python_product is not None:
+            descriptor = python_product["descriptor"]
+            if not isinstance(descriptor, Mapping):
+                raise RuntimeCapabilityError("Python product reference is invalid")
+            result["python_product"] = {key: descriptor[key] for key in
+                ("filename", "sha256", "size", "source_sha256", "execution_id")}
+            result["python_product_path"] = "dist/" + cast(str, descriptor["filename"])
         if delivery_receipt is not None and delivery_receipt[0] == verified_source:
             # The receipt was issued by verify(), and _bundle_workspace checked the actual ZIP bytes.
             result["verification_source_sha256"] = verified_source
@@ -1026,6 +1060,7 @@ class RuntimeCapabilityGateway:
         artifact_id: UUID,
         filename: str,
         verified_source_sha256: str | None = None,
+        python_product: Mapping[str, JsonValue] | None = None,
     ) -> tuple[GeneratedFileMetadata, tuple[ProjectWorkspaceFile, ...]]:
         bundle = store.create_session_zip(tenant_id, project_id, session_id)
         try:
@@ -1045,6 +1080,18 @@ class RuntimeCapabilityGateway:
                 ).encode("ascii")).hexdigest()
                 if bundled != verified_source_sha256:
                     raise ValueError("bundle does not match verified source")
+            if python_product is not None:
+                if verified_source_sha256 is None:
+                    raise ValueError("Python product requires current verification")
+                from agent_hub.capabilities.python_product_bundle import append_python_product
+                from agent_hub.capabilities.python_product_delivery import open_product
+
+                with open_product(generated_store, python_product, tenant_id, run_id,
+                                  verified_source_sha256) as (fd, descriptor):
+                    append_python_product(bundle.path, fd, descriptor,
+                        max_file_bytes=store._max_file_bytes,
+                        max_bundle_bytes=store._max_bundle_bytes,
+                        max_bundle_files=store._max_bundle_files)
             metadata = generated_store.store_path(
                 tenant_id=tenant_id,
                 run_id=run_id,

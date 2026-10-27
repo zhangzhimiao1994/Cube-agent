@@ -42,6 +42,7 @@ if TYPE_CHECKING:
         PythonOriginalContext,
         PythonProjectExecutor,
     )
+    from agent_hub.files.generated import GeneratedFileStore
     from agent_hub.runs.project_verification_receipts import ProjectVerificationReceiptRepository
     from agent_hub.runtime.artifacts import ArtifactRepository
     from agent_hub.skills.sandbox.project import ProjectInvocation
@@ -298,7 +299,8 @@ class ProjectVerificationService:
     def __init__(self, *, root: Path, repository: object, executor: ProjectExecutor | None,
                  python_executor: PythonProjectExecutor | None = None,
                  receipt_repository: ProjectVerificationReceiptRepository | None = None,
-                 artifact_repository: ArtifactRepository | None = None) -> None:
+                 artifact_repository: ArtifactRepository | None = None,
+                 generated_file_store: GeneratedFileStore | None = None) -> None:
         from agent_hub.capabilities.durable_verification import DurableVerification
         from agent_hub.capabilities.generated_project_service import GeneratedProjectService
         from agent_hub.capabilities.python_generated_service import PythonGeneratedProjectService
@@ -306,6 +308,8 @@ class ProjectVerificationService:
         self.root = root
         self.repository = repository
         self.executor = executor
+        self.generated_file_store = generated_file_store
+        self._pending_python_products: dict[tuple[UUID, UUID], Mapping[str, JsonValue]] = {}
         self._receipts: dict[tuple[UUID, UUID], tuple[ProjectInvocation, str]] = {}
         self._original_receipts: dict[tuple[UUID, UUID], Mapping[str, JsonValue]] = {}
         self._python = PythonProjectService(self, python_executor)
@@ -602,11 +606,24 @@ class ProjectVerificationService:
 
     async def verify(self, *, tenant_id: UUID, run_id: UUID, actor: str,
                      action_key: str = '') -> Mapping[str, JsonValue]:
+        from agent_hub.capabilities.python_product_delivery import discard_product
+
+        key = (tenant_id, run_id)
+        self._pending_python_products.pop(key, None)
         await self._require_legacy_candidate_scope(tenant_id, run_id)
         if self._durable is not None:
+            # Durable owns publication disposition: a missing CAS/abort reply
+            # cannot prove that its private body and product are unpublished.
             return await self._durable.verify(tenant_id=tenant_id, run_id=run_id,
                                               actor=actor, action_key=action_key)
-        return await self._verify(tenant_id=tenant_id, run_id=run_id, actor=actor)
+        try:
+            result = await self._verify(tenant_id=tenant_id, run_id=run_id, actor=actor)
+            self._pending_python_products.pop(key, None)
+            return result
+        except BaseException:
+            self._clear_receipts(tenant_id, run_id)
+            discard_product(self.generated_file_store, self._pending_python_products.pop(key, None))
+            raise
 
     async def _verify(self, *, tenant_id: UUID, run_id: UUID, actor: str) -> Mapping[str, JsonValue]:
         from agent_hub.skills.sandbox.project import (
@@ -746,6 +763,29 @@ class ProjectVerificationService:
             except Exception:  # noqa: BLE001 - a stale/unreadable source cannot be delivered as verified.
                 self._receipts.pop((tenant_id, run_id), None)
         raise ProjectVerificationError("project verification required before delivery")
+
+    async def require_current_python_product(
+        self, tenant_id: UUID, run_id: UUID,
+    ) -> Mapping[str, JsonValue] | None:
+        from agent_hub.capabilities.python_product_delivery import open_product
+
+        source = await self.require_current_receipt(tenant_id, run_id)
+        key = (tenant_id, run_id)
+        generated = self._python_generated.receipts.get(key)
+        original = self._python.receipts.get(key)
+        receipt = generated if generated is not None else original
+        if receipt is None:
+            return None  # Node keeps its existing source-only delivery contract.
+        ref = receipt.product
+        if self.generated_file_store is None:
+            if ref is not None:
+                raise ProjectVerificationError('python_project_product_unavailable')
+            return None
+        if ref is None:
+            raise ProjectVerificationError('python_project_product_unavailable')
+        with open_product(self.generated_file_store, ref, tenant_id, run_id, source) as (_, descriptor):
+            descriptor.require_for(receipt.invocation)
+        return ref
 
     def original_receipt_binding(self, tenant_id: UUID, run_id: UUID) -> Mapping[str, JsonValue] | None:
         return self._original_receipts.get((tenant_id, run_id))

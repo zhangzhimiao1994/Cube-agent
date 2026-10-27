@@ -61,7 +61,6 @@ from agent_hub.skills.sandbox.python_project_client import PythonProjectSystemdS
 from agent_hub.skills.sandbox.python_project_protocol import (
     PythonEnvironmentReference,
     PythonProjectBrokerError,
-    PythonProjectBrokerRequest,
     PythonProjectBrokerResponse,
     PythonProjectInputsObservation,
     PythonProjectInvocation,
@@ -312,6 +311,7 @@ class _Receipt:
     source: str
     reference: PythonEnvironmentReference
     actor: str
+    product: Mapping[str, JsonValue] | None = None
 
 
 class PythonProjectService:
@@ -592,7 +592,8 @@ class PythonProjectService:
         original: bool,
         execution_id: str | None = None,
         timeout_seconds: float | None = None,
-    ) -> tuple[PythonProjectReport | PythonProjectFailure, PythonProjectInvocation, str]:
+    ) -> tuple[PythonProjectReport | PythonProjectFailure, PythonProjectInvocation, str,
+               Mapping[str, JsonValue] | None]:
         base = context.invocation
         if execution_id is not None:
             base = base.model_copy(update={"execution_id": execution_id})
@@ -620,63 +621,87 @@ class PythonProjectService:
         if not original:
             await self.owner._begin_verification(tenant_id=invocation.tenant_id, run_id=invocation.run_id,
                 actor=actor, execution_id=invocation.execution_id, source_sha256=before)
+        from agent_hub.capabilities.python_product_delivery import (
+            consume_response,
+            discard_product,
+            persist_product,
+        )
         response = await self.executor.run(invocation)
-        _need(type(response) is PythonProjectBrokerResponse)
-        response = PythonProjectBrokerResponse.model_validate(response.model_dump(), strict=True)
-        response.require_for(PythonProjectBrokerRequest(invocation=invocation))
-        _need(response.ok and response.result is not None)
-        _need(
-            await project_source_fingerprint(self.owner.root, base) == before,
-            "python_project_source_changed",
-        )
-        context.stored.contract.require_current(
-            await project_source_manifest(self.owner.root, base)
-        )
-        current = await self.select(
-            base.tenant_id,
-            base.run_id,
-            actor,
-            phases=("executing",) if original else ("observed",),
-            approve=True,
-        )
-        _need(
-            current is not None
-            and current.inputs == context.inputs
-            and current.state == context.state
-            and current.authority == context.authority,
-            "python_project_scope_changed",
-        )
-        assert response.result is not None
-        report = decode_python_project_report(
-            invocation=invocation,
-            inputs=context.inputs,
-            expected_source_sha256=before,
-            environment_reference=response.environment_reference,
-            result=response.result,
-        )
-        key = (base.tenant_id, base.run_id)
-        if report.environment_reference is not None:
-            await asyncio.to_thread(self._persist_reference, context, report.environment_reference)
-            _need(
-                await project_source_fingerprint(self.owner.root, base) == before,
-                "python_project_source_changed",
-            )
-            self.environments[key] = report.environment_reference
-        final = await self.select(
-            base.tenant_id,
-            base.run_id,
-            actor,
-            phases=("executing",) if original else ("observed",),
-            approve=True,
-        )
-        _need(
-            final is not None
-            and final.state == context.state
-            and final.inputs == context.inputs
-            and final.authority == context.authority,
-            "python_project_scope_changed",
-        )
-        return report, invocation, before
+        product = None
+        try:
+            with consume_response(response, invocation, before) as (response, stream):
+                _need(response.ok and response.result is not None)
+                _need(
+                    await project_source_fingerprint(self.owner.root, base) == before,
+                    "python_project_source_changed",
+                )
+                context.stored.contract.require_current(
+                    await project_source_manifest(self.owner.root, base)
+                )
+                current = await self.select(
+                    base.tenant_id,
+                    base.run_id,
+                    actor,
+                    phases=("executing",) if original else ("observed",),
+                    approve=True,
+                )
+                _need(
+                    current is not None
+                    and current.inputs == context.inputs
+                    and current.state == context.state
+                    and current.authority == context.authority,
+                    "python_project_scope_changed",
+                )
+                assert response.result is not None
+                report = decode_python_project_report(
+                    invocation=invocation,
+                    inputs=context.inputs,
+                    expected_source_sha256=before,
+                    environment_reference=response.environment_reference,
+                    result=response.result,
+                )
+                key = (base.tenant_id, base.run_id)
+                if report.environment_reference is not None:
+                    await asyncio.to_thread(self._persist_reference, context, report.environment_reference)
+                    _need(
+                        await project_source_fingerprint(self.owner.root, base) == before,
+                        "python_project_source_changed",
+                    )
+                    self.environments[key] = report.environment_reference
+                final = await self.select(
+                    base.tenant_id,
+                    base.run_id,
+                    actor,
+                    phases=("executing",) if original else ("observed",),
+                    approve=True,
+                )
+                _need(
+                    final is not None
+                    and final.state == context.state
+                    and final.inputs == context.inputs
+                    and final.authority == context.authority,
+                    "python_project_scope_changed",
+                )
+                product = None
+                if not original and isinstance(report, PythonProjectReport):
+                    product = await persist_product(self.owner.generated_file_store, response, stream,
+                        invocation, before, report.to_payload())
+                    try:
+                        current = await self.select(base.tenant_id, base.run_id, actor, approve=True)
+                        _need(current is not None and current.state == context.state
+                              and current.inputs == context.inputs and current.authority == context.authority,
+                              "python_project_scope_changed")
+                        _need(await project_source_fingerprint(self.owner.root, base) == before,
+                              "python_project_source_changed")
+                        context.stored.contract.require_current(await project_source_manifest(self.owner.root, base))
+                    except BaseException:
+                        discard_product(self.owner.generated_file_store, product)
+                        raise
+                outcome = (report, invocation, before, product)
+            return outcome
+        except BaseException:
+            discard_product(self.owner.generated_file_store, product)
+            raise
 
     def _persist_reference(self, context: _Context, reference: PythonEnvironmentReference) -> None:
         """Service-UID once records outside the original v1 envelope; never overwrite."""
@@ -766,7 +791,7 @@ class PythonProjectService:
                 reference == context.stored.reference
                 and context.state["execution_id"] == execution_id
             )
-            report, invocation, _ = await self._run(
+            report, invocation, _, _ = await self._run(
                 context,
                 actor,
                 original=True,
@@ -808,19 +833,27 @@ class PythonProjectService:
     async def verify(self, context: _Context, actor: str) -> Mapping[str, JsonValue]:
         key = (context.invocation.tenant_id, context.invocation.run_id)
         self.receipts.pop(key, None)
+        self.owner._pending_python_products.pop(key, None)
+        from agent_hub.capabilities.python_product_delivery import discard_product
+
+        product = None
+        committed = False
         try:
             await self._approval(context, actor)
-            report, invocation, source = await self._run(context, actor, original=False)
+            report, invocation, source, product = await self._run(context, actor, original=False)
+            if product is not None:
+                self.owner._pending_python_products[key] = product
             if isinstance(report, PythonProjectFailure):
                 raise ProjectVerificationError(
                     "python_project_checks_failed", report.diagnostic, python_project_failure=report
                 )
             binding = _OriginalScope(context.stored, context.observation_sha256).binding(source)
             self.receipts[key] = _Receipt(
-                context, invocation, source, report.environment_reference, actor
+                context, invocation, source, report.environment_reference, actor, product
             )
             self.owner._original_receipts[key] = binding
-            return {
+            result: dict[str, JsonValue] = {
+                **({"python_product": product} if product is not None else {}),
                 "verification": report.to_payload(),
                 "original_check_contract": binding,
                 "python_recipe": python_recipe_marker(context.inputs),
@@ -830,10 +863,17 @@ class PythonProjectService:
                 ),
                 "summary": "Original checks preserved; Python build and tests verified in isolation.",
             }
+            committed = True
+            return result
         except (ProjectVerificationError, ProcessCleanupIncomplete):
             raise
         except Exception as error:  # noqa: BLE001 - no arbitrary backend text becomes public evidence.
             self._raise_backend(error)
+        finally:
+            if not committed:
+                self.receipts.pop(key, None)
+                self.owner._pending_python_products.pop(key, None)
+                discard_product(self.owner.generated_file_store, product)
 
     async def require_current(self, tenant_id: UUID, run_id: UUID) -> str:
         key = (tenant_id, run_id)

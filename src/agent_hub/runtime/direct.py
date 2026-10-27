@@ -2403,10 +2403,14 @@ class DirectRuntime:
                             if self._active_task is report_task:
                                 self._active_task = None
                         final_completion = self._strict_completion(raw_report)
-                        if (final_completion is None or final_completion.response.tool_calls
-                                or not final_completion.response.text or not final_completion.response.text.strip()
-                                or _json_mapping_from_model_text(final_completion.response.text) is not None):
-                            _raise_execution_error("direct final report is invalid")
+                        if final_completion is None:
+                            _raise_execution_error("direct final report is invalid (reason=completion_missing)")
+                        if final_completion.response.tool_calls:
+                            _raise_execution_error("direct final report is invalid (reason=tool_calls)")
+                        if not final_completion.response.text or not final_completion.response.text.strip():
+                            _raise_execution_error("direct final report is invalid (reason=empty_text)")
+                        if direct_delivery_report.is_whole_body_json(final_completion.response.text):
+                            _raise_execution_error("direct final report is invalid (reason=json_only)")
                         report_usage = self._verified_budget_usage(final_completion.response.usage,
                             prompt_estimate=report_estimate, response_text=final_completion.response.text,
                             request_max_output_tokens=request.max_output_tokens,
@@ -3057,8 +3061,8 @@ class DirectRuntime:
             artifact_origin: str | None = None
             batched_agent_standard_evidence = False
             if hybrid_delivery is not None:
-                if _json_mapping_from_model_text(text) is not None:
-                    _raise_execution_error("direct final report is invalid")
+                if direct_delivery_report.is_whole_body_json(text):
+                    _raise_execution_error("direct final report is invalid (reason=json_only)")
                 workspace_delivery = hybrid_delivery
                 artifact_origin = "verified_hybrid_final_report"
                 delivery_report_binding = direct_delivery_report.binding(context, hybrid_delivery, request, completion)
@@ -3066,11 +3070,11 @@ class DirectRuntime:
                 _workspace_batch_from_model_text(text,
                     allow_reads=_original_project_policy(context) or generated_entry
                     or _diagnostic_workspace_reads(context), allow_catalog=_catalog_workspace_reads(context))
-                if self._capability_gateway is not None
+                if delivery_report_binding is None and self._capability_gateway is not None
                 and _is_workspace_project_delivery(context)
                 else None
             )
-            parsed_batch = _json_mapping_from_model_text(text)
+            parsed_batch = None if delivery_report_binding is not None else _json_mapping_from_model_text(text)
             raw_batch = None if parsed_batch is None else parsed_batch.get("workspace_batch")
             if not isinstance(raw_batch, Mapping) and parsed_batch is not None:
                 raw_batch = parsed_batch.get('workspace_bundle')
@@ -3079,7 +3083,8 @@ class DirectRuntime:
             if (batch is None and isinstance(raw_batch, Mapping)
                     and {'read_paths', 'python_catalog'} & raw_batch.keys()):
                 _raise_execution_error("workspace batch is invalid")
-            if batch is None and self._project_verification_enabled(context):
+            if (delivery_report_binding is None and batch is None
+                    and self._project_verification_enabled(context)):
                 fallback_bundle = _website_preview_workspace_bundle_from_model_text(text, context)
                 if fallback_bundle is not None:
                     batch = _WorkspaceBatch(
@@ -3133,8 +3138,9 @@ class DirectRuntime:
                 extracted_workspace_bundle = None
                 incremental_workspace_delivery = False
             else:
-                extracted_workspace_bundle = _project_scale_workspace_bundle_from_model_text(text)
-                if extracted_workspace_bundle is None:
+                extracted_workspace_bundle = (None if delivery_report_binding is not None
+                    else _project_scale_workspace_bundle_from_model_text(text))
+                if delivery_report_binding is None and extracted_workspace_bundle is None:
                     extracted_workspace_bundle = _website_preview_workspace_bundle_from_model_text(
                         text,
                         context,

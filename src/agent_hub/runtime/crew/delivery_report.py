@@ -13,6 +13,7 @@ from agent_hub.runtime.crew.engineering_delivery import (
     engineering_delivery_ready,
 )
 from agent_hub.runtime.crew.plan import DispatchPlan, DispatchStep
+from agent_hub.runtime.direct_delivery_report import is_whole_body_json
 
 POLICY = "engineering_dispatch_report_version"
 BINDING = "delivery_report_binding"
@@ -131,7 +132,7 @@ def report_binding(
         or model.content_sha256 != model.recompute_content_sha256()
         or model.content.get("text") != text or model.content.get("tool_calls")
         or model.provenance is None or model.provenance.to_payload() != row.get("provenance")
-        or not text.strip() or text.lstrip().startswith(("{", "[", "```json"))):
+        or not text.strip() or is_whole_body_json(text)):
         raise ValueError("delivery report does not match current native evidence")
     return {**phase, "model_artifact_id": str(model.id),
             "model_artifact_sha256": model.content_sha256,
@@ -193,7 +194,7 @@ def final_evidence(
         or str(model.id) not in report.source_ids or model.content.get("text") != text
         or model.content.get("tool_calls") or report.provenance != model.provenance
         or model.provenance is None or not text.strip()
-        or text.lstrip().startswith(("{", "[", "```json"))):
+        or is_whole_body_json(text)):
         raise ValueError("delivery report native text is invalid")
     for item, name in ((bundle, "workspace.bundle"), (verify, "project.verify")):
         if (item.type != "tool_result" or item.content.get("tool_name") != name

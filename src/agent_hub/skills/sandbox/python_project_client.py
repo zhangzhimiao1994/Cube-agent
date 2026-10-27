@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
+import sys
 from pathlib import Path
-from typing import cast
+from typing import BinaryIO, cast
 
 from agent_hub.skills.sandbox.broker import (
     _MAX_REQUEST_BYTES,
@@ -28,6 +30,7 @@ from agent_hub.skills.sandbox.project import (
 )
 from agent_hub.skills.sandbox.python_project_protocol import (
     PythonEnvironmentReference,
+    PythonProductDescriptor,
     PythonProjectBrokerRequest,
     PythonProjectBrokerResponse,
     PythonProjectInputsObservation,
@@ -79,20 +82,64 @@ async def request_python_project_broker(
     if connector is None:
         raise OSError("python_project_systemd_linux_unsupported")
     reader, writer = await connector(socket_path.as_posix())
+    spool: BinaryIO | None = None
+    delivered: PythonProjectBrokerResponse | None = None
     try:
         await _write_frame(writer, body)
         try:
-            response = PythonProjectBrokerResponse.model_validate_json(
-                await _read_frame(reader, _MAX_RESPONSE_BYTES),
-                strict=True,
-            )
+            first = await _read_frame(reader, _MAX_RESPONSE_BYTES)
+            envelope = json.loads(first)
+            product: PythonProductDescriptor | None = None
+            if isinstance(envelope, dict) and "python_product_stream" in envelope:
+                if (not isinstance(validated, PythonProjectBrokerRequest)
+                        or validated.product_transfer_version != 1
+                        or set(envelope) != {"python_product_stream", "product"}
+                        or type(envelope["python_product_stream"]) is not int
+                        or envelope["python_product_stream"] != 1):
+                    raise ValueError("unsolicited Python product")
+                product = PythonProductDescriptor.model_validate(envelope["product"], strict=True)
+                from agent_hub.skills.sandbox.python_product_transport import receive_product
+
+                spool = await receive_product(reader, product, validated.invocation)
+                first = await _read_frame(reader, _MAX_RESPONSE_BYTES)
+            response = PythonProjectBrokerResponse.model_validate_json(first, strict=True)
             response.require_for(validated)
+            if not response.ok and response.error == "python_project_cleanup_incomplete":
+                raise ProcessCleanupIncomplete(response.error)
+            if (isinstance(validated, PythonProjectBrokerRequest)
+                    and validated.product_transfer_version == 1 and response.ok
+                    and response.result is not None and product is None):
+                report = json.loads(response.result.stdout)
+                if isinstance(report, dict) and report.get("status") == "passed":
+                    raise ValueError("Python product transfer missing")
+            if response.product != product:
+                raise ValueError("Python product transfer missing")
+            if product is not None:
+                from agent_hub.skills.sandbox.python_product_transport import require_product_report
+
+                require_product_report(response, product)
+                response._product_stream = spool
+                spool = None
+            delivered = response
             return response
         except (ValueError, TypeError, BrokerRequestError, asyncio.IncompleteReadError):
             raise ValueError("python_project_response_invalid") from None
     finally:
-        writer.close()
-        await writer.wait_closed()
+        primary_error = sys.exception()
+        if spool is not None:
+            spool.close()
+        try:
+            writer.close()
+            await writer.wait_closed()
+        except BaseException:
+            # A failed close overrides the return, so ownership never reaches
+            # the service. Close a validated but undelivered spool here.
+            if delivered is not None and delivered._product_stream is not None:
+                delivered._product_stream.close()
+                delivered._product_stream = None
+            if primary_error is not None:
+                raise primary_error
+            raise
 
 
 class PythonProjectSystemdSandbox:
@@ -104,7 +151,8 @@ class PythonProjectSystemdSandbox:
 
     async def run(self, invocation: PythonProjectInvocation) -> PythonProjectBrokerResponse:
         """Return execution and reference separately; stdout is opaque project data."""
-        return await self._exchange(PythonProjectBrokerRequest(invocation=invocation))
+        return await self._exchange(PythonProjectBrokerRequest(
+            invocation=invocation, product_transfer_version=1))
 
     async def probe(
         self, invocation: PythonProjectProbeInvocation
@@ -175,7 +223,9 @@ class PythonProjectSystemdSandbox:
             # Retrieve even a late successful reply, but never turn interruption
             # into success. Wait for the transport's finally/close to finish.
             with contextlib.suppress(asyncio.CancelledError, OSError, ValueError):
-                await pending
+                late = await pending
+                if late._product_stream is not None:
+                    late._product_stream.close()
 
     async def terminate(self, execution_id: str) -> None:
         if not _systemd_supported():
