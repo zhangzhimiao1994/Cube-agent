@@ -2,7 +2,14 @@ import re
 from decimal import Decimal
 from typing import Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_serializer,
+    field_validator,
+    model_validator,
+)
 
 from agent_hub.models.types import Deployment, ModelCapability, StructuredOutputAPI
 
@@ -63,6 +70,10 @@ class DeploymentDefinition(StrictConfigModel):
     capabilities: set[Capability] = Field(
         default_factory=_default_capabilities, min_length=1, max_length=8
     )
+
+    @field_serializer("capabilities", when_used="json")
+    def serialize_capabilities(self, capabilities: set[Capability]) -> list[Capability]:
+        return sorted(capabilities)
 
     @field_validator("provider", "model", "api_base", "secret_ref", "quota_scope_id")
     @classmethod

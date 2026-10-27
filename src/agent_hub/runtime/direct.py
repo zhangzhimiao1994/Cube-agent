@@ -540,8 +540,29 @@ class _WorkspaceVerificationTrace:
                 "project install failed": "install", "project build failed": "build",
                 "project test failed": "test",
             }.get(result.failure_reason or "", "execution")
+            failure_diagnosis: Mapping[str, JsonValue] | None = None
+            if python or generated_python_failure:
+                from agent_hub.capabilities.python_project_reports import _failure_shape
+                from agent_hub.capabilities.verification_failure_diagnostics import (
+                    verification_failure_diagnosis,
+                )
+
+                try:
+                    native_failure = _failure_shape(failure_report)
+                    native_checks = cast(tuple[Mapping[str, JsonValue], ...], native_failure["checks"])
+                    last_check = native_checks[-1]
+                    native_diagnostic = cast(Mapping[str, JsonValue], last_check["execution_diagnostic"])
+                    observed_diagnostic = result.payload.get("execution_diagnostic")
+                    if (isinstance(observed_diagnostic, Mapping)
+                            and _verification_trace_diagnostic(native_diagnostic)
+                            == _verification_trace_diagnostic(observed_diagnostic)):
+                        phase = cast(str, last_check["phase"])
+                        failure_diagnosis = dict(verification_failure_diagnosis(native_failure, observed_diagnostic))
+                except (ValueError, TypeError, KeyError, AttributeError):
+                    pass  # Invalid or conflicting metadata cannot claim a native phase.
             entry["checks"] = ({
                 "phase": phase, "status": "failed",
+                **({"diagnosis": failure_diagnosis} if failure_diagnosis is not None else {}),
                 "execution_diagnostic": _verification_trace_diagnostic(
                     cast(Mapping[str, JsonValue], result.payload["execution_diagnostic"]),
                 ),

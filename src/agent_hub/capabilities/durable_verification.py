@@ -7,6 +7,7 @@ import logging
 from collections.abc import Mapping
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Literal, cast
 from uuid import UUID, uuid4
 
@@ -21,7 +22,11 @@ from agent_hub.runs.project_verification_receipts import (
     VerificationAuthority,
     VerificationRecord,
 )
-from agent_hub.runtime.artifacts import ArtifactReference, ArtifactRepository
+from agent_hub.runtime.artifacts import (
+    ArtifactReference,
+    ArtifactRepository,
+    ArtifactRepositoryError,
+)
 from agent_hub.runtime.contracts import Artifact, JsonValue, _freeze_object
 from agent_hub.subprocess_cleanup import ProcessCleanupIncomplete
 
@@ -30,12 +35,17 @@ if TYPE_CHECKING:
         ProjectVerificationError,
         ProjectVerificationService,
     )
+    from agent_hub.runs.repository import RunRecord
 
 Kind = Literal['node_plain', 'node_original', 'node_generated', 'python_original', 'python_generated']
 _TYPE = 'project_verification_receipt'
 _PRODUCER = 'trusted_project_verifier'
 _ERROR = 'project verification receipt is unavailable or changed'
 PublicationDisposition = Literal['private', 'writing', 'aborted', 'completing', 'committed', 'unknown']
+
+
+class _FailureEvidenceStorageError(Exception):
+    """Only ordinary reserve/put failures; never validation or CAS failures."""
 
 
 @dataclass(slots=True)
@@ -78,6 +88,30 @@ def _known_manifest_rejection(error: ProjectVerificationError, issued: Verificat
             and observation.category == report['category'] == 'integrity'
             and report['checks'] == tuple({'phase': phase, 'status': 'not_run'}
                                          for phase in ('install', 'build', 'test')))
+
+
+
+def _failure_result(issued: VerificationRecord, error: ProjectVerificationError) -> Mapping[str, JsonValue]:
+    from agent_hub.capabilities.execution_diagnostics import ExecutionDiagnostic
+    from agent_hub.capabilities.project_verification import _validate_original_diagnostic
+    from agent_hub.capabilities.python_project_reports import PythonProjectFailure
+    from agent_hub.capabilities.verification_failure_diagnostics import (
+        verification_failure_diagnosis,
+    )
+
+    failure = error.python_project_failure
+    if (type(failure) is not PythonProjectFailure or error.project_failure is not None
+            or error.diagnostic is not failure.diagnostic
+            or error.diagnostic is not None and type(error.diagnostic) is not ExecutionDiagnostic):
+        raise ValueError(_ERROR)
+    report = PythonProjectFailure(failure.report, failure.environment_reference, failure.diagnostic).to_payload()
+    if report['source_sha256'] != issued.source_sha256 or report['execution_id'] != issued.execution_id:
+        raise ValueError(_ERROR)
+    preview = None if failure.diagnostic is None else failure.diagnostic.to_payload()
+    if preview is not None:
+        _validate_original_diagnostic(preview, retain_tail=True)
+    return _freeze_object({'report': report, 'diagnosis': verification_failure_diagnosis(report, preview)},
+                          name='private failed verification')
 
 
 class DurableVerification:
@@ -170,31 +204,92 @@ class DurableVerification:
             'execution_id': issued.execution_id, 'source_sha256': issued.source_sha256,
             'kind': kind, 'result': result}, name='private verification receipt')
 
-    async def _publish(self, issued: VerificationRecord, result: Mapping[str, JsonValue]) -> None:
+    async def _failure_current(self, issued: VerificationRecord) -> Literal['python_original', 'python_generated']:
+        from agent_hub.capabilities.scoped_read import authorized_workspace_scope
+        from agent_hub.skills.sandbox.project import ProjectInvocation, project_source_fingerprint
+
+        tenant, run, actor = issued.authority.tenant_id, issued.authority.run_id, issued.authority.actor
+        getter = getattr(self.owner.repository, 'get', None)
+        if not callable(getter):
+            raise TypeError(_ERROR)
+
+        async def current() -> RunRecord:
+            record: RunRecord = await getter(tenant, run)
+            if record.actor_id is None or record.actor_role is None:
+                raise ValueError(_ERROR)
+            authority = replace(get_verification_authority(tenant_id=tenant, run_id=run,
+                user_id=record.actor_id, role=record.actor_role, current_record=record), actor=actor)
+            expiry = record.worker_lease_expires_at
+            if (authority != issued.authority
+                    or (record.worker_id, record.worker_lease_token) != (
+                        issued.authority.worker_id, issued.authority.execution_token)
+                    or expiry is None or expiry.tzinfo is None or expiry <= datetime.now(UTC)):
+                raise ValueError(_ERROR)
+            return record
+
+        record = await current()
+        project, session = authorized_workspace_scope(record, tenant_id=tenant, run_id=run)
+        route = record.routing_decision
+        if not isinstance(route, Mapping):
+            raise TypeError(_ERROR)
+        generated = type(route.get('generated_project_contract_version')) is int and route['generated_project_contract_version'] == 1
+        original = type(route.get('project_input_contract_version')) is int and route['project_input_contract_version'] == 1
+        if generated == original:
+            raise ValueError(_ERROR)
+        profile = route.get('sandbox_profile')
+        if type(profile) is not str or profile not in {'restricted', 'workspace_write'}:
+            raise ValueError(_ERROR)
+        invocation = ProjectInvocation(execution_id=issued.execution_id, tenant_id=tenant, run_id=run,
+            project_id=project, session_id=session,
+            sandbox_profile=cast(Literal['restricted', 'workspace_write'], profile),
+            install_allowed=False, timeout_seconds=1)
+        if await project_source_fingerprint(self.owner.root, invocation) != issued.source_sha256:
+            raise ValueError(_ERROR)
+        await current()
+        return 'python_generated' if generated else 'python_original'
+
+    async def _publish(self, issued: VerificationRecord, result: Mapping[str, JsonValue],
+                       *, failure_kind: Literal['python_original', 'python_generated'] | None = None) -> None:
         tenant, run = issued.authority.tenant_id, issued.authority.run_id
         attempt = self._attempt.get()
         if attempt is None or attempt.issued != issued or not attempt.active:
             raise ValueError(_ERROR)
-        if await self.owner.require_current_receipt(tenant, run) != issued.source_sha256:
-            raise ValueError(_ERROR)
-        artifact = Artifact(id=uuid4(), type=_TYPE, producer=_PRODUCER,
-            content=self._body(issued, self._kind(tenant, run), result))
+        async def current() -> None:
+            if failure_kind is None:
+                if await self.owner.require_current_receipt(tenant, run) != issued.source_sha256:
+                    raise ValueError(_ERROR)
+            elif await self._failure_current(issued) != failure_kind:
+                raise ValueError(_ERROR)
+
+        await current()
+        body = self._body(issued, self._kind(tenant, run) if failure_kind is None else failure_kind, result)
+        artifact = Artifact(id=uuid4(), type=_TYPE if failure_kind is None else 'project_verification_failure',
+            producer=_PRODUCER if failure_kind is None else 'trusted_project_failure_verifier',
+            content=body if failure_kind is None else {**body, 'status': 'failed', 'purpose': 'failure_diagnostics_only'})
         reference = ArtifactReference(id=artifact.id, sha256=artifact.content_sha256)
         attempt.artifact_reference = reference
         write_id = uuid4()
         completing = False
         try:
             attempt.publication_disposition = 'writing'
-            await self.artifacts.reserve_write(tenant, run, reference, write_id=write_id)
-            await self.artifacts.put(tenant, run, artifact, write_id=write_id)
-            if await self.owner.require_current_receipt(tenant, run) != issued.source_sha256:
-                raise ValueError(_ERROR)
+            try:
+                await self.artifacts.reserve_write(tenant, run, reference, write_id=write_id)
+                await self.artifacts.put(tenant, run, artifact, write_id=write_id)
+            except (OSError, ArtifactRepositoryError) as storage_error:
+                if (failure_kind is None or isinstance(storage_error, ArtifactRepositoryError)
+                        and storage_error.args not in (('artifact repository capacity exceeded',),
+                                                       ('artifact repository unavailable',))):
+                    raise
+                raise _FailureEvidenceStorageError(_ERROR) from None
+            await current()
             completing = True
             attempt.publication_disposition = 'completing'
-            complete = await self.receipts.complete(issued.authority, expected=issued, status='passed',
+            complete = await self.receipts.complete(issued.authority, expected=issued,
+                                                   status='passed' if failure_kind is None else 'failed',
                                                    artifact_references=(reference,))
             attempt.publication_disposition = 'committed'
-            self._issued[(tenant, run)] = complete
+            if failure_kind is None:
+                self._issued[(tenant, run)] = complete
         except BaseException:
             # After CAS starts the outcome may be unknown: retain a possibly committed body.
             attempt.publication_disposition = 'unknown'
@@ -258,7 +353,26 @@ class DurableVerification:
                           and (error.project_failure is not None or error.python_project_failure is not None))
                          or _known_manifest_rejection(error, attempt.issued))):
                 try:
-                    await self.receipts.complete(attempt.issued.authority, expected=attempt.issued, status='failed')
+                    if error.python_project_failure is not None:
+                        failed = _failure_result(attempt.issued, error)
+                        kind = await self._failure_current(attempt.issued)
+                        try:
+                            await self._publish(attempt.issued, failed, failure_kind=kind)
+                        except _FailureEvidenceStorageError:
+                            if attempt.publication_disposition != 'aborted':
+                                raise
+                            if await self._failure_current(attempt.issued) != kind:
+                                raise ValueError(_ERROR)
+                            attempt.publication_disposition = 'completing'
+                            try:
+                                await self.receipts.complete(attempt.issued.authority,
+                                    expected=attempt.issued, status='failed')
+                            except BaseException:
+                                attempt.publication_disposition = 'unknown'
+                                raise
+                            attempt.publication_disposition = 'committed'
+                    else:
+                        await self.receipts.complete(attempt.issued.authority, expected=attempt.issued, status='failed')
                 except Exception:  # noqa: BLE001 - failed CAS is UNKNOWN, not an alternate failure result.
                     raise ProjectVerificationError(_ERROR) from None
             if isinstance(error, (asyncio.CancelledError, ProcessCleanupIncomplete,
