@@ -31,6 +31,7 @@ from agent_hub.plugins.runtime import (
     build_plugin_package_subprocess_adapters,
 )
 from agent_hub.runs.artifacts import PostgresArtifactRepository
+from agent_hub.runs.project_inputs import OriginalProjectPreparer
 from agent_hub.runs.project_verification_receipts import ProjectVerificationReceiptRepository
 from agent_hub.runs.provider_continuation import PostgresProviderContinuationRepository
 from agent_hub.runs.repository import RunRepository
@@ -361,12 +362,15 @@ def build_worker_service(
         receipt_repository=ProjectVerificationReceiptRepository(database.session_factory),
     )
     runtime_capability_stack = capability_stack_builder()
+    if isinstance(runtime_capability_stack.project_input_preparer, OriginalProjectPreparer):
+        runtime_capability_stack.project_input_preparer.bind_artifact_repository(artifact_repository)
     cache_cleanup_hooks = tuple(hook for hook in (
         getattr(runtime_capability_stack, "project_cache_cleanup_hook", None),
         getattr(action_capability_stack, "project_cache_cleanup_hook", None),
     ) if hook is not None)
     service = RunService(
         run_repository,
+        conversation_artifact_repository=artifact_repository,
         project_input_preparer=runtime_capability_stack.project_input_preparer,
         instruction_context_loader=InstructionContextLoader(
             repository=run_repository, project_root=settings.project_workspace_dir,

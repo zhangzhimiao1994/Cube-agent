@@ -26,8 +26,9 @@ from agent_hub.runtime.action_approval_capture import capture_action_approval
 from agent_hub.runtime.action_checkpoint import (
     action_checkpoint_valid as action_checkpoint_valid,  # noqa: PLC0414
 )
+from agent_hub.runtime.action_continuation import read_action_continuation
 from agent_hub.runtime.artifacts import ArtifactRepository
-from agent_hub.runtime.continuation_artifacts import _encode, load_continuation, save_continuation
+from agent_hub.runtime.continuation_artifacts import _encode, save_continuation
 from agent_hub.runtime.contracts import (
     Artifact,
     EventKind,
@@ -406,9 +407,9 @@ class ActionApprovedDirectRuntime(DirectRuntime):
             raise RuntimeExecutionError('project inspection changed during recovery')
         return self._inspection
 
-    async def _data_io(
-        self, operation: Coroutine[Any, Any, dict[str, JsonValue]], *, deadline: float,
-    ) -> dict[str, JsonValue]:
+    async def _data_io[T: Mapping[str, JsonValue]](
+        self, operation: Coroutine[Any, Any, T], *, deadline: float,
+    ) -> T:
         task = asyncio.create_task(operation)
         previous = self._active_capability_task
         self._active_capability_task = task
@@ -471,22 +472,11 @@ class ActionApprovedDirectRuntime(DirectRuntime):
             if deadline <= started:
                 raise RuntimeExecutionError('action continuation execution budget is exhausted')
 
-            async def load() -> dict[str, JsonValue]:
-                value = await load_continuation(self._repository, tenant_id=context.tenant_id, run_id=context.run_id,
-                    reference=cast(Mapping[str, JsonValue], checkpoint.state['reference']))
-                if not isinstance(value, Mapping):
-                    raise RuntimeExecutionError('action continuation is unavailable')
-                return dict(value)
-
-            value = await self._data_io(load(), deadline=deadline)
-            if set(value) != {'context', 'models', 'actions', 'pending', 'emitted', 'elapsed', 'inspection', 'preparation'}:
-                raise RuntimeExecutionError('action continuation is unavailable')
-            snapshot = TaskContext.from_payload(json.loads(_json(value['context'])))
-            snapshot = snapshot.model_copy(update={'instruction_context': context.instruction_context})
+            loaded = await self._data_io(
+                read_action_continuation(self._repository, context), deadline=deadline,
+            )
+            value, snapshot = loaded.value, loaded.snapshot
             sources = {item.id: item for item in context.artifacts}
-            if any(item.id not in sources or _json(sources[item.id].to_payload()) != _json(item.to_payload())
-                   for item in snapshot.artifacts):
-                raise RuntimeExecutionError('action continuation sources changed')
             current = context.model_copy(update={'artifacts': snapshot.artifacts})
             _check_guidance(snapshot)
             preparation = await self._preparation_snapshot(current, deadline=deadline)

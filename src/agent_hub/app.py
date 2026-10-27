@@ -137,6 +137,7 @@ from agent_hub.routing.types import (
 from agent_hub.runs.artifacts import PostgresArtifactRepository
 from agent_hub.runs.conversation_queue import ConversationQueueRepository
 from agent_hub.runs.conversations import ConversationRepository
+from agent_hub.runs.project_inputs import OriginalProjectPreparer
 from agent_hub.runs.project_verification_receipts import ProjectVerificationReceiptRepository
 from agent_hub.runs.provider_continuation import PostgresProviderContinuationRepository
 from agent_hub.runs.repository import RunRepository
@@ -1401,6 +1402,7 @@ def create_app(
                 application.state.user_admin_service = PersistentUserAdminService(active_sessions)
             if run_service is None:
                 assert active_sessions is not None
+                artifact_repository = PostgresArtifactRepository(active_sessions)
                 if active_runtime_registry is None:
                     assert active_redis is not None
                     assert active_secret_service is not None
@@ -1610,12 +1612,13 @@ def create_app(
                         mcp_backend=runtime_mcp_service,
                         plugin_backend=runtime_plugin_service,
                     )
-                    artifact_repository = PostgresArtifactRepository(active_sessions)
                     action_capability_stack = capability_stack_builder(
                         artifact_repository=artifact_repository,
                         receipt_repository=ProjectVerificationReceiptRepository(active_sessions),
                     )
                     runtime_capability_stack = capability_stack_builder()
+                    if isinstance(runtime_capability_stack.project_input_preparer, OriginalProjectPreparer):
+                        runtime_capability_stack.project_input_preparer.bind_artifact_repository(artifact_repository)
                     application.state.runtime_capability_gateway = (
                         runtime_capability_stack.runtime_gateway
                     )
@@ -1683,6 +1686,7 @@ def create_app(
 
                 application.state.run_service = RunService(
                     RunRepository(active_sessions),
+                    conversation_artifact_repository=artifact_repository,
                     project_input_preparer=getattr(application.state, 'project_input_preparer', None),
                     terminal_run_hooks=tuple(hook for hook in (
                         getattr(application.state, "project_cache_cleanup_hook", None),

@@ -294,6 +294,7 @@ class RuntimeCapabilityGateway:
         return OriginalProjectPreparer(
             root=self._project_workspace_dir, repository=cast(RunRepository, self._run_repository),
             authorizer=authorizer, verifier=self._project_verification,
+            artifact_repository=self._artifact_repository,
         )
 
     def is_replay_safe(self, name: str) -> bool:

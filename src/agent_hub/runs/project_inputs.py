@@ -41,6 +41,7 @@ from agent_hub.runs.repository import (
     RunRepository,
     _pre_model_original_capture,
 )
+from agent_hub.runtime.artifacts import ArtifactRepository
 from agent_hub.runtime.contracts import Artifact, JsonValue, TaskContext, _freeze_object
 from agent_hub.skills.sandbox.project import ProjectInvocation
 
@@ -177,10 +178,46 @@ def python_original_context_metadata(context: PythonOriginalContext) -> Mapping[
 class OriginalProjectPreparer:
     def __init__(self, *, root: Path, repository: RunRepository,
                  authorizer: HarnessToolGateway, verifier: ProjectVerificationService,
-                 input_supply: InputSupplyClient | None = None) -> None:
+                 input_supply: InputSupplyClient | None = None,
+                 artifact_repository: ArtifactRepository | None = None) -> None:
         self.root, self.repository = root, repository
         self.authorizer, self.verifier = authorizer, verifier
         self.input_supply = input_supply
+        self.artifact_repository = artifact_repository
+
+    def bind_artifact_repository(self, repository: ArtifactRepository) -> None:
+        """Bootstrap-only private continuation reads; verifier/gateway remain unchanged."""
+        if not callable(getattr(repository, 'get_many', None)):
+            raise TypeError('private artifact repository is unavailable')
+        if self.artifact_repository is not None and self.artifact_repository is not repository:
+            raise RuntimeError('private artifact repository is already bound')
+        self.artifact_repository = repository
+
+    async def select_existing(self, context: TaskContext) -> TaskContext:
+        from agent_hub.runs.automatic_project_inputs import select_existing
+
+        async def generated_owned() -> bool:
+            if 'generated_project_preparation' in context.routing_decision:
+                current = await self.verifier.generated.load(
+                    context.tenant_id, context.run_id, 'main_agent', readonly=True,
+                )
+                return current is not None
+            if self.artifact_repository is None or context.checkpoint is None:
+                return False
+            from agent_hub.capabilities.action_preparation import capture_action_preparation
+            from agent_hub.files.workspace import ProjectWorkspaceStore
+            from agent_hub.runtime.action_continuation import writes_own_inventory
+
+            project, session = authorized_workspace_scope(
+                await self.repository.get(context.tenant_id, context.run_id),
+                tenant_id=context.tenant_id, run_id=context.run_id,
+            )
+            files = await asyncio.to_thread(ProjectWorkspaceStore(self.root).list_files,
+                context.tenant_id, project, session)
+            preparation = await capture_action_preparation(self.verifier, context)
+            return await writes_own_inventory(self.artifact_repository, context, files, preparation)
+
+        return await select_existing(self.repository, self.root, context, generated_owned=generated_owned)
 
     async def _state(
         self, context: TaskContext, *, expected: Mapping[str, JsonValue] | None = None,
@@ -257,9 +294,19 @@ class OriginalProjectPreparer:
         )
         state = await self._state(context)
         store = ProjectBaselineStore(self.root)
+        from agent_hub.runs.automatic_project_inputs import original_source
+
+        selected_source = original_source(context)
         if state is None:
+            if selected_source is not None:
+                from agent_hub.skills.sandbox.project import project_source_fingerprint
+
+                if await project_source_fingerprint(self.root, invocation) != selected_source:
+                    raise RunConflict(_FAILURE)
             state = await self._state(context, replace={'schema_version': 1, 'phase': 'reserved'})
             reference = await store.capture_once(invocation, selection)
+            if selected_source is not None and reference.input_source_sha256 != selected_source:
+                raise RunConflict(_FAILURE)
             state = await self._state(context, expected=state, replace={
                 'schema_version': 1, 'phase': 'captured',
                 'reference': cast(Mapping[str, JsonValue], reference.to_payload()),
@@ -268,6 +315,8 @@ class OriginalProjectPreparer:
                 or state.get('schema_version') not in {1, 2} or state.get('phase') not in {'captured', 'observed'}):
             raise RuntimeError(_FAILURE)
         reference = ProjectBaselineReference.from_payload(state.get('reference'))
+        if selected_source is not None and reference.input_source_sha256 != selected_source:
+            raise RunConflict(_FAILURE)
         stored = await asyncio.to_thread(store.load, invocation, reference)
         if stored.contract.editable_paths != selection.editable_paths:
             raise RuntimeError(_FAILURE)

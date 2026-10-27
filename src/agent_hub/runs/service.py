@@ -12,7 +12,7 @@ from contextlib import aclosing
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from typing import Literal, Protocol, cast
+from typing import TYPE_CHECKING, Literal, Protocol, cast
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from agent_hub.auth.models import Role
@@ -69,6 +69,7 @@ from agent_hub.runs.workspace import (
     PermissionMode,
     workspace_selection,
 )
+from agent_hub.runtime.artifacts import ArtifactRepository
 from agent_hub.runtime.contracts import (
     Artifact,
     EventKind,
@@ -88,6 +89,9 @@ from agent_hub.runtime.progress import artifact_progress_key
 from agent_hub.runtime.registry import RuntimeRegistry
 from agent_hub.runtime.worker_execution import worker_runtime_events
 from agent_hub.subprocess_cleanup import ProcessCleanupIncomplete
+
+if TYPE_CHECKING:
+    from agent_hub.runs.conversation_inputs import ConversationInputs
 
 _LOGGER = logging.getLogger(__name__)
 _AUTO_RESOLVE_MAX_SINGLE_COST_USD = Decimal("0.50")
@@ -545,6 +549,7 @@ class RunService:
         run_worker_lease_seconds: float = 60.0,
         instruction_context_loader: InstructionContextLoader | None = None,
         conversation_repository: ConversationRepositoryProtocol | None = None,
+        conversation_artifact_repository: ArtifactRepository | None = None,
         conversation_queue_repository: ConversationQueueRepository | None = None,
         conversation_preview_stopper: Callable[[UUID, str], Awaitable[None]] | None = None,
         project_input_preparer: Callable[[TaskContext], Awaitable[TaskContext]] | None = None,
@@ -552,6 +557,7 @@ class RunService:
         self._repository = repository
         self._instruction_context_loader = instruction_context_loader
         self._conversation_repository = conversation_repository
+        self._conversation_artifact_repository = conversation_artifact_repository
         self._conversation_queue_repository = conversation_queue_repository
         self._conversation_preview_stopper = conversation_preview_stopper
         self._project_input_preparer = project_input_preparer
@@ -693,7 +699,26 @@ class RunService:
             **workspace.routing_payload(),
             "execution_backend": resolved_execution_backend,
         }
+        if (self._conversation_artifact_repository is not None
+                and type(actor_id) is UUID and isinstance(actor_role, Role)
+                and 'workspace.read' in workspace.requested_permissions):
+            operator_selection['conversation_input_snapshot_version'] = 1
+        from agent_hub.runs.automatic_project_inputs import VERSION as automatic_version
+        from agent_hub.runs.automatic_project_inputs import eligible, maintenance_intent
+
+        automatic_candidate = (conversation is not None and conversation.tenant_id == tenant_id
+                and conversation.conversation_id == effective_conversation_id
+                and conversation.project_id == workspace.project_id
+                and conversation.workspace_path == workspace.session_id
+                and type(actor_id) is UUID and isinstance(actor_role, Role)
+                and project_input is None and eligible(operator_selection)
+                and callable(getattr(self._project_input_preparer, 'select_existing', None)))
+        automatic_action = automatic_candidate and maintenance_intent(message)
+        if automatic_action:
+            operator_selection[automatic_version] = 1
         project_delivery = _project_delivery_assessment(message)
+        if automatic_candidate and not automatic_action:
+            project_delivery = None
         if (project_input is None and resolved_execution_backend == 'systemd'
                 and workspace.sandbox_profile == 'workspace_write'
                 and {'workspace.read', 'workspace.write', 'command.run'}.issubset(
@@ -1862,6 +1887,53 @@ class RunService:
     async def _enqueue_outbox_run(self, run_id: UUID, idempotency_key: str) -> None:
         await self._queue.enqueue_run(run_id, idempotency_key=idempotency_key)
 
+    async def _select_automatic_project_context(self, context: TaskContext) -> TaskContext:
+        from agent_hub.runs.automatic_project_inputs import DERIVED, STATE, selected_route
+
+        failure = 'automatic project selection unavailable or changed'
+        selector = getattr(self._project_input_preparer, 'select_existing', None)
+        if not callable(selector):
+            raise TypeError(failure)
+        started = asyncio.get_running_loop().time()
+        from agent_hub.capabilities.execution_authority import bind_execution_authority
+
+        async with asyncio.timeout(context.timeout_seconds):
+            with bind_execution_authority(context, worker_id=self._worker_id):
+                selected = await selector(context)
+        if type(selected) is not TaskContext:
+            raise RuntimeError(failure)
+        selected = selected.validated_internal_clone()
+        if any(getattr(selected, field) != getattr(context, field)
+               for field in TaskContext.model_fields if field != 'routing_decision'):
+            raise RuntimeError(failure)
+        current = await self._repository.get(context.tenant_id, context.run_id)
+        if (current.id != context.run_id or current.tenant_id != context.tenant_id
+                or current.actor_id != context.actor_id or current.actor_role is not context.actor_role
+                or current.status is not RunStatus.RUNNING or current.worker_id != self._worker_id
+                or current.worker_lease_token != context.execution_token
+                or current.worker_lease_expires_at is None or current.worker_lease_expires_at <= datetime.now(UTC)
+                or current.request != context.request or current.mode is not context.mode):
+            raise RunConflict(failure)
+        persisted = current.routing_decision or {}
+        state = persisted.get(STATE)
+        if not isinstance(state, Mapping):
+            raise TypeError(failure)
+        expected = selected_route(context, cast(Mapping[str, JsonValue], state))
+        if (selected.routing_decision != _freeze_object(expected, name='automatic selected route')
+                or _freeze_object({k: persisted[k] for k in DERIVED if k in persisted}, name='persisted selection')
+                != _freeze_object({k: expected[k] for k in DERIVED if k in expected}, name='selected scope')
+                or any(persisted.get(k) != context.routing_decision.get(k) for k in (
+                    'project_id', 'workspace_session_id', 'conversation_id', 'sandbox_profile',
+                    'execution_backend', 'permission_mode', 'requested_permissions', 'replace_workspace_files')
+                    if k != 'requested_permissions')
+                or _freeze_object({'permissions': persisted.get('requested_permissions')}, name='persisted permission')
+                != _freeze_object({'permissions': context.routing_decision.get('requested_permissions')}, name='permission')):
+            raise RunConflict(failure)
+        remaining = context.timeout_seconds - (asyncio.get_running_loop().time() - started)
+        if remaining <= 0:
+            raise TimeoutError(failure)
+        return selected.model_copy(update={'timeout_seconds': remaining}).validated_internal_clone()
+
     async def _prepare_original_project_context(self, context: TaskContext) -> TaskContext:
         failure = "original project preparation is unavailable or changed"
         route = context.routing_decision
@@ -2226,6 +2298,45 @@ class RunService:
                         except RunConflict:
                             pre_runtime_exit = await self._repository.get(tenant_id, run_id)
                     return _submitted(pre_runtime_exit)
+            context_timeout_seconds = _runtime_timeout_seconds(
+                mode,
+                configured_seconds=self._runtime_timeout_seconds,
+                explicit_seconds=_routing_runtime_timeout_seconds(
+                    runtime_routing_decision,
+                    progress_units=checkpoint_progress_units,
+                ),
+            )
+            if "conversation_input_snapshot_version" in runtime_routing_decision and checkpoint is not None:
+                from agent_hub.runtime.action_checkpoint import action_checkpoint_valid
+
+                if action_checkpoint_valid(checkpoint):
+                    # Clamp the saved TOTAL before charging this input read. The
+                    # action runtime separately charges its saved elapsed time.
+                    context_timeout_seconds = min(
+                        context_timeout_seconds, cast(float, checkpoint.state["timeout_seconds"]),
+                    )
+            input_started = asyncio.get_running_loop().time()
+            async with asyncio.timeout(context_timeout_seconds):
+                context_inputs = await self._runtime_context_inputs(
+                    tenant_id=tenant_id,
+                    run_id=run_id,
+                    actor_id=actor_id,
+                    actor_role=actor_role,
+                    mode=mode,
+                    execution_token=worker_lease_token,
+                    current_request=request,
+                    routing_decision=runtime_routing_decision,
+                    runtime_token_budget=token_budget,
+                    checkpoint=checkpoint,
+                )
+            if context_inputs.snapshot is not None:
+                runtime_routing_decision = {
+                    **runtime_routing_decision,
+                    "conversation_input_snapshot": context_inputs.snapshot,
+                }
+                context_timeout_seconds -= asyncio.get_running_loop().time() - input_started
+                if context_timeout_seconds <= 0:
+                    raise TimeoutError("conversation input preparation budget exhausted")
             context = TaskContext(
                 run_id=run_id,
                 tenant_id=tenant_id,
@@ -2235,26 +2346,12 @@ class RunService:
                 mode=mode,
                 request=request,
                 instruction_context=instructions,
-                artifacts=await self._runtime_context_artifacts(
-                    tenant_id=tenant_id,
-                    run_id=run_id,
-                    current_request=request,
-                    routing_decision=runtime_routing_decision,
-                    runtime_token_budget=token_budget,
-                    checkpoint=checkpoint,
-                ),
+                artifacts=context_inputs.artifacts,
                 checkpoint=checkpoint,
                 routing_decision=cast(
                     Mapping[str, JsonValue], runtime_routing_decision
                 ),
-                timeout_seconds=_runtime_timeout_seconds(
-                    mode,
-                    configured_seconds=self._runtime_timeout_seconds,
-                    explicit_seconds=_routing_runtime_timeout_seconds(
-                        runtime_routing_decision,
-                        progress_units=checkpoint_progress_units,
-                    ),
-                ),
+                timeout_seconds=context_timeout_seconds,
                 token_budget=token_budget,
             )
             if _routing_source(routing_decision) == "self_repair":
@@ -2308,6 +2405,12 @@ class RunService:
                 )
             )
             try:
+                if "automatic_project_input_version" in context.routing_decision:
+                    project_preparation_task = asyncio.create_task(
+                        self._select_automatic_project_context(context)
+                    )
+                    context = await project_preparation_task
+                    project_preparation_task = None
                 if (
                     "project_input" in context.routing_decision
                     or "project_input_contract_version" in context.routing_decision
@@ -3455,19 +3558,51 @@ class RunService:
         routing_decision: Mapping[str, object], runtime_token_budget: int,
         checkpoint: RuntimeCheckpoint | None,
     ) -> tuple[Artifact, ...]:
-        from agent_hub.runs.action_context_artifacts import action_context_artifacts
+        prepared = await self._runtime_context_inputs(
+            tenant_id=tenant_id, run_id=run_id, actor_id=None, actor_role=None,
+            mode=checkpoint.mode if checkpoint is not None else TaskMode.DIRECT,
+            execution_token=None, current_request=current_request,
+            routing_decision=routing_decision, runtime_token_budget=runtime_token_budget,
+            checkpoint=checkpoint,
+        )
+        return prepared.artifacts
 
-        history = await self._conversation_artifacts(tenant_id=tenant_id, run_id=run_id,
-            current_request=current_request, routing_decision=routing_decision,
-            runtime_token_budget=runtime_token_budget)
+    async def _runtime_context_inputs(
+        self, *, tenant_id: UUID, run_id: UUID, actor_id: UUID | None,
+        actor_role: Role | None, mode: TaskMode, execution_token: UUID | None,
+        current_request: str, routing_decision: Mapping[str, object],
+        runtime_token_budget: int, checkpoint: RuntimeCheckpoint | None,
+    ) -> ConversationInputs:
+        from agent_hub.runs.action_context_artifacts import action_context_artifacts
+        from agent_hub.runs.conversation_inputs import (
+            VERSION,
+            ConversationInputs,
+            conversation_inputs,
+        )
+
+        async def history() -> tuple[Artifact, ...]:
+            return await self._conversation_artifacts(tenant_id=tenant_id, run_id=run_id,
+                current_request=current_request, routing_decision=routing_decision,
+                runtime_token_budget=runtime_token_budget)
+
+        if VERSION not in routing_decision:
+            prepared = ConversationInputs(await history(), None)
+        else:
+            if self._conversation_artifact_repository is None:
+                raise RunConflict("conversation inputs are unavailable or changed")
+            prepared = await conversation_inputs(self._repository, self._conversation_artifact_repository,
+                tenant_id=tenant_id, run_id=run_id, actor_id=actor_id, actor_role=actor_role,
+                mode=mode, worker_id=self._worker_id, execution_token=execution_token,
+                current_request=current_request, routing_decision=routing_decision,
+                checkpoint=checkpoint, builder=history)
         observations = await action_context_artifacts(self._repository, tenant_id=tenant_id,
             run_id=run_id, checkpoint=checkpoint, routing_decision=routing_decision)
-        combined = {item.id:item for item in history}
+        combined = {item.id:item for item in prepared.artifacts}
         for item in observations:
             if item.id in combined and combined[item.id].to_payload() != item.to_payload():
                 raise ValueError('action observation conflicts with conversation input')
             combined[item.id] = item
-        return tuple(combined.values())
+        return replace(prepared, artifacts=tuple(combined.values()))
 
     async def _conversation_artifacts(
         self,
