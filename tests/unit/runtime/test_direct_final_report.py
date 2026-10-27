@@ -142,7 +142,8 @@ def test_large_project_final_explanation_does_not_resend_full_file_manifest() ->
     view = evidence(report_context(), delivery)
     assert len(json.dumps(view)) < len(json.dumps(files)) // 10
     assert view["workspace_file_count"] == 2000
-    assert len(view["delivery_sha256"]) == 64
+    assert view["archive"] == {"filename": "project.zip"}
+    assert "delivery_sha256" not in view
 
 
 async def test_final_report_usage_cannot_renew_the_consumed_project_budget(tmp_path: Path) -> None:

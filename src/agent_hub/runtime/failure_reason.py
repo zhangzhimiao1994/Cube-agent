@@ -63,6 +63,77 @@ _DELIVERY_REPORT_FAILURE = re.compile(
     re.escape(_DELIVERY_REPORT_BASE)
     + r"(?: ?\(reason=(?P<reason>completion_missing|tool_calls|empty_text|json_only|binding_invalid)\))?"
 )
+# Exact native rejection literals only. Aggregate guards remain unknown; their
+# text cannot establish which condition rejected a model response or tool row.
+_DELIVERY_REPORT_LITERALS = {
+    "delivery report policy is invalid": "policy_invalid",
+    "delivery report workspace writers are unordered": "binding_invalid",
+    "delivery report requires current trusted verification and bundle": "evidence_unavailable",
+    "delivery report tool prefix is unresolved or unproven": "unknown",
+    "delivery report tool outcome changed or is unavailable": "unknown",
+    "delivery report tool outcome is unavailable": "evidence_unavailable",
+    "delivery report outcomes are missing": "evidence_unavailable",
+    "delivery report outcome is invalid": "binding_invalid",
+    "delivery report requires its single succeeded native model outcome": "unknown",
+    "delivery report does not match current native evidence": "unknown",
+    "delivery report text is unavailable": "unknown",
+    "delivery report persisted binding is invalid": "binding_invalid",
+    "delivery report scope or binding is invalid": "binding_invalid",
+    "delivery report artifact registry is ambiguous": "binding_invalid",
+    "delivery report current native artifact is unavailable": "evidence_unavailable",
+    "delivery report native text is invalid": "unknown",
+    "delivery report tool lineage is invalid": "binding_invalid",
+    "delivery report tool evidence is invalid": "binding_invalid",
+    "delivery report bundle verification is invalid": "binding_invalid",
+    "engineering delivery report version is invalid": "policy_invalid",
+    "delivery report requires a natural language final step": "policy_invalid",
+    "delivery report framework text differs from native model output": "binding_invalid",
+    "delivery report allows only its existing single native model call": "binding_invalid",
+    "delivery report requires a no-tool native model request": "unknown",
+    "delivery report evidence changed after checkpoint": "binding_invalid",
+    "delivery report checkpoint policy is invalid": "policy_invalid",
+    "delivery report checkpoint binding is missing or misplaced": "binding_invalid",
+    "final report outcome reference is invalid": "binding_invalid",
+    "final report requires a final succeeded bundle row": "evidence_unavailable",
+    "final report tool prefix is invalid": "binding_invalid",
+    "final report tail must contain only succeeded readonly outcomes": "unknown",
+    "final report tool outcome is invalid": "binding_invalid",
+    "final report artifact registry is ambiguous": "binding_invalid",
+    "final report policy or text is invalid": "unknown",
+    "final report phase binding is invalid": "binding_invalid",
+    "final report requires a succeeded text-only model row": "unknown",
+    "final report fallback provenance is inconsistent": "binding_invalid",
+    "final report fallback provenance is invalid": "binding_invalid",
+    "final report model outcome is invalid": "unknown",
+    "final report cannot invoke tools": "tool_calls",
+    "final report budget is unavailable": "budget_unavailable",
+    "final report budget is exhausted": "budget_exhausted",
+    "final report phase is unavailable": "evidence_unavailable",
+    "final report evidence is unavailable": "evidence_unavailable",
+    "final report evidence is invalid": "unknown",
+    "final report configuration is invalid": "policy_invalid",
+    "final_report_missing": "report_missing",
+    "durable final report binding mismatch": "binding_invalid",
+    "durable final report request mismatch": "binding_invalid",
+    "durable final report outcome is invalid": "unknown",
+    "durable final report phase is invalid": "binding_invalid",
+    "hybrid final report checkpoint proof is invalid": "binding_invalid",
+    "hybrid final report checkpoint policy changed": "policy_invalid",
+    "hybrid final delivery report is missing": "report_missing",
+    "hybrid final delivery inputs are ambiguous": "binding_invalid",
+    "hybrid final delivery verification is unavailable": "evidence_unavailable",
+    "hybrid final delivery reference is unavailable": "evidence_unavailable",
+    "hybrid final delivery model lineage is unavailable": "evidence_unavailable",
+    "hybrid final delivery frame is missing": "evidence_unavailable",
+    "hybrid final delivery frame changed": "binding_invalid",
+    "hybrid final delivery evidence is unavailable": "evidence_unavailable",
+}
+_DELIVERY_REPORT_PREFIX_CHAIN = re.compile(
+    r"(?:(?i:hybrid (?:direct|dispatch|discuss) failed: ))*"
+    r"(?i:direct final report is invalid|(?:engineering )?delivery report|"
+    r"(?:durable )?final report|final_report|hybrid final (?:delivery|report))(?=$|[ :_(])"
+)
+_REPORT_UNCERTAIN_MODEL = "final report cannot hide an uncertain model outcome"
 _PREREQUISITE_FAILURE = re.compile(
     r"(?:hybrid (?P<mode>direct|dispatch|discuss) failed: )?"
     r"project prerequisite blocked: (?P<reason>[a-z0-9_]{1,64})"
@@ -203,6 +274,12 @@ def _prerequisite_failure_parts(reason: str) -> tuple[str, str, str | None] | No
 def _delivery_report_failure_parts(reason: str) -> tuple[str, str, str | None] | None:
     child = _HYBRID_CHILD_FAILURE.fullmatch(reason)
     candidate = reason if child is None else child["reason"]
+    child_mode = None if child is None else child["mode"].lower()
+    if candidate == _REPORT_UNCERTAIN_MODEL:
+        return "model_outcome_uncertain", "model_outcome_uncertain", child_mode
+    category = _DELIVERY_REPORT_LITERALS.get(candidate)
+    if category is not None:
+        return category, candidate, child_mode
     if candidate != _DELIVERY_REPORT_BASE and not candidate.startswith(
         (_DELIVERY_REPORT_BASE + " (", _DELIVERY_REPORT_BASE + "("),
     ):
@@ -214,7 +291,7 @@ def _delivery_report_failure_parts(reason: str) -> tuple[str, str, str | None] |
     summary = _DELIVERY_REPORT_BASE
     if category != "unknown":
         summary += f" (reason={category})"
-    return category, summary, None if child is None else child["mode"].lower()
+    return category, summary, child_mode
 
 
 @cache
@@ -288,6 +365,10 @@ def safe_runtime_failure_reason(error: Exception, *, fallback: str = "runtime_fa
     if report is not None:
         _, summary, child_mode = report
         return summary if child_mode is None else f"hybrid {child_mode} failed: {summary}"
+    if _DELIVERY_REPORT_PREFIX_CHAIN.match(reason) is not None:
+        # Recognition accepts one wrapper only. Reject nested wrappers and
+        # arbitrary suffixes without recursive classification or provider text.
+        return fallback
     if _prerequisite_failure_parts(reason) is not None:
         # Only finite diagnostic codes may cross Hybrid's string boundary.
         # No arbitrary authorization text or execution authority is preserved.
@@ -364,17 +445,22 @@ def runtime_failure_diagnostic_from_reason(
     report = _delivery_report_failure_parts(normalized)
     if report is not None:
         category, summary, child_mode = report
-        diagnostic = _base_diagnostic(
-            summary, error_stage="delivery_report", error_category=category,
-            error_code="delivery_report." + category, retryable=False,
-            suggested_action=(
-                "最终报告未通过交付校验；仅记录有限诊断并保留当前验证证据。"
-                "当前没有安全可执行的报告恢复动作，不自动重试、修补平台或恢复旧失败运行。"
-            ),
-        )
+        if category == "model_outcome_uncertain":
+            diagnostic = runtime_failure_diagnostic_from_reason(summary)
+        else:
+            diagnostic = _base_diagnostic(
+                summary, error_stage="delivery_report", error_category=category,
+                error_code="delivery_report." + category, retryable=False,
+                suggested_action=(
+                    "最终报告未通过交付校验；仅记录有限诊断并保留当前验证证据。"
+                    "当前没有安全可执行的报告恢复动作，不自动重试、修补平台或恢复旧失败运行。"
+                ),
+            )
         if child_mode is not None:
             diagnostic["hybrid_child_mode"] = child_mode
         return diagnostic
+    if _DELIVERY_REPORT_PREFIX_CHAIN.match(normalized) is not None:
+        normalized = "runtime_failed"
     prerequisite = _prerequisite_failure_parts(normalized)
     if prerequisite is not None:
         prerequisite_reason, prerequisite_category, child_mode = prerequisite
