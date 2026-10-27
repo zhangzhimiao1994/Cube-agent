@@ -3208,7 +3208,7 @@ class RunRepository:
                 )
             return tuple(
                 ConversationContextItem(
-                    run_id=row.id,
+                    run_id=_database_uuid(row.id),
                     request=row.request,
                     artifacts=tuple(artifacts_by_run.get(row.id, ())),
                 )
