@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
+import math
+import re
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Protocol, cast
 from uuid import UUID, uuid4
 
 from sqlalchemy import and_, or_, select
@@ -90,6 +93,77 @@ def _uncertain(value: object) -> bool:
         elif isinstance(current, (list, tuple)):
             pending.extend((item, depth + 1) for item in current)
     return False
+
+
+def _cancelled_model_history_only(value: object, run_id: UUID) -> bool:
+    """Recognize only the cancelled historical model paths, never rewrite them.
+
+    Caller already holds the terminal run lock and checks cancellation policy,
+    leases, route and approvals. Root independently fences native consumers.
+    """
+    if (type(value) is not dict or value.get('phase') != 'running'
+            or type(value.get('models')) is not dict or not value['models']
+            or type(value.get('tools')) is not dict
+            or len(value['models']) + len(value['tools']) > 100_000):
+        return False
+    required = {'status', 'step_id', 'attempt', 'purpose', 'actor', 'call_index',
+                'request_sha256', 'artifact_id', 'sha256', 'provenance'}
+    optional = {'failure_reason', 'reserved_max_output_tokens', 'initial_incomplete_chain',
+                'post_tool_growth', 'provider_continuation'}
+    allowed_paths: set[tuple[str, ...]] = {('phase',)}
+    for key, row in value['models'].items():
+        if (type(key) is not str or re.fullmatch('[a-f0-9]{64}', key) is None
+                or type(row) is not dict or len(row) > len(required) + len(optional)
+                or not required <= row.keys()
+                or row.keys() - required - optional
+                or type(row['status']) is not str
+                or row['status'] not in {'running', 'succeeded', 'rejected'}):
+            return False
+        if (any(type(row[name]) is not str or re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}', row[name]) is None
+                for name in ('actor', 'step_id'))
+                or type(row['purpose']) is not str or row['purpose'] not in {'step', 'review'}
+                or any(type(row[name]) is not int or not 0 <= row[name] <= 2**31 - 1
+                       for name in ('attempt', 'call_index'))
+                or type(row['request_sha256']) is not str
+                or re.fullmatch('[a-f0-9]{64}', row['request_sha256']) is None):
+            return False
+        material = f"{run_id}:{row['step_id']}:{row['attempt']}:{row['purpose']}:{row['actor']}:{row['call_index']}"
+        if hashlib.sha256(material.encode()).hexdigest() != key:
+            return False
+        if row['status'] == 'running':
+            if any(row[name] is not None for name in ('artifact_id', 'sha256', 'provenance')):
+                return False
+            allowed_paths.add(('models', key, 'status'))
+    if len(allowed_paths) == 1:
+        return False
+    for key, row in value['tools'].items():
+        if (type(key) is not str or re.fullmatch('[a-f0-9]{64}', key) is None
+                or type(row) is not dict or type(row.get('status')) is not str
+                or row['status'] not in {'succeeded', 'rejected'}
+                or not {'step_id', 'attempt', 'round', 'tool_index', 'name', 'arguments_sha256',
+                        'trigger_model_artifact_id', 'replay_safe', 'artifact_id', 'sha256'} <= row.keys()):
+            return False
+    pending: list[tuple[object, tuple[str, ...], int]] = [(value, (), 0)]
+    remaining = 100_000
+    while pending:
+        current, path, depth = pending.pop()
+        remaining -= 1
+        if remaining < 0 or depth > 64:
+            return False
+        if type(current) is str:
+            if not (current == 'running' and path in allowed_paths) and _uncertain(current):
+                return False
+        elif type(current) is dict:
+            if any(type(key) is not str for key in current):
+                return False
+            pending.extend((item, (*path, key), depth + 1) for key, item in current.items())
+        elif type(current) in (list, tuple):
+            items = cast(list[object] | tuple[object, ...], current)
+            pending.extend((item, (*path, str(index)), depth + 1) for index, item in enumerate(items))
+        elif ((current is not None and type(current) not in (bool, int, float))
+              or type(current) is float and not math.isfinite(current)):
+            return False
+    return True
 
 
 def _generated_preparation(route: Mapping[str, object]) -> Mapping[str, object] | None:
@@ -213,7 +287,9 @@ class PythonProjectTerminalHook:
                 )
             ).all()
             if not states or any(
-                not isinstance(state, dict) or _uncertain(state) for state in states
+                not isinstance(state, dict) or (_uncertain(state) and not (
+                    status is RunStatus.CANCELLED and _cancelled_model_history_only(state, run_id)
+                )) for state in states
             ):
                 return
             project, workspace_session = authorized_workspace_scope(

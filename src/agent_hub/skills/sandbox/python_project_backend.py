@@ -37,6 +37,7 @@ from agent_hub.skills.sandbox.base import SkillResult
 from agent_hub.skills.sandbox.broker import BrokerPolicy, load_broker_policy
 from agent_hub.skills.sandbox.project import (
     ProjectExecutionBroker,
+    ProjectInvocation,
     _Execution,
     snapshot_project_source,
 )
@@ -1072,11 +1073,96 @@ async def _admit_release_unit(broker: ProjectExecutionBroker, job: _Execution) -
     await _admit_unit(broker, job)
 
 
+def _release_stage_invocation(value: object, name: str) -> ProjectInvocation:
+    """Decode the existing broker marker; never infer scope from a directory name."""
+    _need(type(value) is dict)
+    assert isinstance(value, dict)
+    _need(set(value) == {"execution_id", "project_id", "run_id", "session_id",
+                         "source_sha256", "state", "tenant_id", "unit"})
+    _need(type(value["state"]) is str and value["state"] in {"STAGED", "RUNNING", "UNKNOWN"})
+    source = value["source_sha256"]
+    _need(source is None or type(source) is str and re.fullmatch(r"[0-9a-f]{64}", source))
+    # Validate marker identifiers with the existing schema, not execution authority.
+    invocation = ProjectInvocation.model_validate_json(_encoded({
+        field: value[field]
+        for field in ("execution_id", "tenant_id", "run_id", "project_id", "session_id")
+    } | {"sandbox_profile": "restricted", "timeout_seconds": 1}), strict=True)
+    _need(name.rsplit("-", 1)[0] == invocation.execution_id
+          and name != invocation.execution_id + "-"
+          and value["unit"] == f"agent-hub-project-{invocation.execution_id}.service")
+    return invocation
+
+
+def _release_scope_guard(
+    request: PythonProjectReleaseEnvironmentRequest, stage_root: Path, stage: Path, deadline: float,
+) -> None:
+    """Under admission: another execution's stage fences its entire tenant/run.
+
+    Normal native consumers share admission, but an orphaned project unit does
+    not inherit that FD. Its durable stage must independently veto release.
+    This only inventories markers; it never cleans a stage or kills a unit.
+    """
+    if sys.platform != "linux":
+        raise ProcessCleanupIncomplete("python_project_cleanup_incomplete")
+    _need(stage.parent == stage_root)
+    with ExitStack() as stack:
+        pins: list[_Observed] = []
+        parent = _root(stage_root, 0, stack, pins, stage=True)
+        names: list[str] = []
+        with os.scandir(parent) as members:
+            for member in members:
+                _check(deadline)
+                _need(len(names) < 4096)
+                if member.name != "active.lock":
+                    names.append(member.name)
+        own = False
+        for name in sorted(names):
+            _check(deadline)
+            with ExitStack() as entry_stack:
+                observed: list[_Observed] = []
+                directory = _open_directory(parent, name, 0, entry_stack, observed, mode=0o700)
+                fd = os.open("execution.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+                             | os.O_CLOEXEC, dir_fd=directory)
+                entry_stack.callback(os.close, fd)
+                info = os.fstat(fd)
+                # Legacy root-owned 0644 markers only supply a liveness fence;
+                # this is not a product reader or a grant/receipt authority.
+                _need(stat.S_ISREG(info.st_mode) and info.st_uid == 0 and info.st_nlink == 1
+                      and stat.S_IMODE(info.st_mode) in {0o600, 0o644}
+                      and 0 < info.st_size <= _MAX_CONTROL)
+                marker = _Observed(directory, "execution.json", _stamp(info, full=True), True, fd)
+                marker.check()
+                raw = os.read(fd, _MAX_CONTROL + 1)
+                _check(deadline)
+                _need(len(raw) == info.st_size and not os.read(fd, 1))
+                payload = json.loads(raw, object_pairs_hook=_object)
+                item = _release_stage_invocation(payload, name)
+                marker.check()
+                for pin in observed:
+                    pin.check()
+                expected = request.invocation
+                if name == stage.name:
+                    _need(not own and item.execution_id == expected.execution_id
+                          and (item.tenant_id, item.run_id, item.project_id, item.session_id)
+                          == (expected.tenant_id, expected.run_id,
+                              expected.project_id, expected.session_id))
+                    _need(payload["state"] == "RUNNING")
+                    own = True
+                else:
+                    _need(item.execution_id != expected.execution_id
+                          and (item.tenant_id, item.run_id) != (expected.tenant_id, expected.run_id))
+        _need(own)
+        for pin in pins:
+            pin.check()
+
+
 def _release(
     request: PythonProjectReleaseEnvironmentRequest,
     policy: BrokerPolicy,
     config: RootConfig,
     deadline: float,
+    *,
+    stage: Path | None = None,
 ) -> PythonProjectBrokerResponse:
     """Called under shared admission, without staging or running project code."""
     from agent_hub.skills.sandbox.python_project_broker import PythonRootExecution
@@ -1094,7 +1180,10 @@ def _release(
 
     try:
         asyncio.run(quiescent())
-    except (OSError, ValueError, RuntimeError, TimeoutError):
+        _need(stage is not None)
+        assert stage is not None
+        _release_scope_guard(request, config.stage_root, stage, deadline)
+    except (OSError, ValueError, RuntimeError, TimeoutError, TypeError, KeyError, AttributeError):
         raise ProcessCleanupIncomplete("python_project_cleanup_incomplete") from None
     _check(deadline)
     cache = PythonProjectEnvironmentCache(config.environment_root, config.cache_policy)
@@ -1295,7 +1384,7 @@ def execute_python_project_request(
             _admission(roots.stage_root_fd, deadline),
         ):
             if isinstance(request, PythonProjectReleaseEnvironmentRequest):
-                response = _release(request, policy, configuration, deadline)
+                response = _release(request, policy, configuration, deadline, stage=stage)
                 response.require_for(request)
                 return response
             copying = isinstance(request, PythonProjectBrokerRequest)

@@ -10,7 +10,11 @@ import pytest
 
 from agent_hub.capabilities.python_project_lifecycle import PythonProjectTerminalHook
 from agent_hub.domain.runs import RunStatus
-from tests.unit.capabilities.test_python_project_lifecycle import Rows, Session
+from tests.unit.capabilities.test_python_project_lifecycle import (
+    Rows,
+    Session,
+    cancelled_model_checkpoint,
+)
 from tests.unit.skills.sandbox.test_python_project_client import invocation, reference
 
 
@@ -206,3 +210,43 @@ async def test_cancelled_root_cleanup_uncertain_does_not_mark_released() -> None
         await invoke(hook, status=RunStatus.CANCELLED)
     assert 'python_project_cache_release' not in session.row.routing_decision
     assert session.row.version == 1 and calls == ['generated-context']
+
+
+async def test_cancelled_dispatch_model_history_keeps_proposer_and_checkpoint_immutable() -> None:
+    import copy
+
+    from agent_hub.domain.runs import TaskMode
+
+    session = generated_session()
+    session.row.status = 'cancelled'
+    session.row.routing_decision['python_project_cancel_cleanup_version'] = 1
+    session.row.routing_decision['generated_project_preparation']['proposer_actor'] = 'implementer'
+    session.checkpoints = [cancelled_model_checkpoint()]
+    before = copy.deepcopy(session.checkpoints)
+    hook, calls = hook_for(session)
+    await hook(tenant_id=UUID(int=1), run_id=UUID(int=2), actor_id=None,
+        status=RunStatus.CANCELLED, mode=TaskMode.DISPATCH, routing_decision={})
+    assert len(calls) == 2 and calls[0] == 'generated-context'
+    assert session.checkpoints == before
+    assert session.row.routing_decision['generated_project_preparation']['proposer_actor'] == 'implementer'
+    assert session.row.routing_decision['python_project_cache_release']['environment_reference'] == reference().model_dump(mode='json')
+
+
+async def test_cancelled_model_history_does_not_override_root_unknown_guard() -> None:
+    from agent_hub.subprocess_cleanup import ProcessCleanupIncomplete
+
+    session = generated_session()
+    session.row.status = 'cancelled'
+    session.row.routing_decision['python_project_cancel_cleanup_version'] = 1
+    session.checkpoints = [cancelled_model_checkpoint()]
+    hook, calls = hook_for(session)
+
+    async def incomplete(*args: Any, **kwargs: Any) -> Any:
+        raise ProcessCleanupIncomplete('python_project_cleanup_incomplete')
+
+    hook.executor.release_completed = incomplete
+    with pytest.raises(ProcessCleanupIncomplete):
+        await invoke(hook, status=RunStatus.CANCELLED)
+    assert session.row.version == 1
+    assert 'python_project_cache_release' not in session.row.routing_decision
+    assert calls == ['generated-context']

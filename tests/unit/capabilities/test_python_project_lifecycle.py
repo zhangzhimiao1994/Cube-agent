@@ -13,6 +13,17 @@ from agent_hub.domain.runs import RunStatus
 from tests.unit.skills.sandbox.test_python_project_client import invocation, reference
 
 
+def cancelled_model_checkpoint() -> dict[str, Any]:
+    import hashlib
+
+    model = {"status": "running", "step_id": "implement", "attempt": 0,
+        "purpose": "step", "actor": "implementer", "call_index": 1,
+        "request_sha256": "a" * 64, "artifact_id": None, "sha256": None, "provenance": None}
+    material = f"{UUID(int=2)}:implement:0:step:implementer:1"
+    key = hashlib.sha256(material.encode()).hexdigest()
+    return {"phase": "running", "models": {key: model}, "tools": {}, "terminal": False}
+
+
 class Rows:
     def __init__(self, values: list[Any]) -> None:
         self.values = values
@@ -184,6 +195,86 @@ async def test_new_cancelled_run_releases_only_its_exact_durable_environment() -
     assert session.row.version == 2
     assert session.row.routing_decision['python_project_cache_release']['schema_version'] == 1
     assert session.queries[0]._for_update_arg is not None
+
+
+async def test_cancelled_history_only_model_snapshot_releases_under_lock_without_rewriting_checkpoint() -> None:
+    import copy
+
+    session = Session()
+    session.row.status = 'cancelled'
+    session.row.routing_decision['python_project_cancel_cleanup_version'] = 1
+    session.checkpoints = [cancelled_model_checkpoint()]
+    before = copy.deepcopy(session.checkpoints)
+    assert await invoke(session, callback_status=RunStatus.CANCELLED) == ['context', 'release']
+    assert session.checkpoints == before
+    assert session.queries[0]._for_update_arg is not None
+
+
+@pytest.mark.parametrize('defect', [
+    'completed', 'failed', 'no-version', 'bad-version', 'selfrepair', 'route-unknown',
+    'worker_id', 'worker_lease_token', 'worker_lease_expires_at', 'worker_heartbeat_at', 'approval',
+    'tools-running', 'tools-unknown', 'tools-partial', 'tools-prepared', 'tools-malformed',
+    'model-unknown', 'model-partial', 'model-prepared', 'model-id', 'foreign-model-id',
+    'model-malformed', 'model-status-type', 'model-request-hash', 'model-attempt-bool',
+    'phase-unknown', 'phase-case', 'nested-running', 'other-model-running', 'no-models',
+    'model-extra-field', 'depth',
+])
+async def test_cancelled_history_exception_never_ignores_other_uncertainty_or_bad_shapes(defect: str) -> None:
+    session = Session()
+    session.row.status = 'cancelled'
+    route = session.row.routing_decision
+    route['python_project_cancel_cleanup_version'] = 1
+    state = cancelled_model_checkpoint()
+    models = state['models']
+    key = next(iter(models))
+    model = models[key]
+    if defect in {'completed', 'failed'}:
+        session.row.status = defect
+    elif defect == 'no-version':
+        route.pop('python_project_cancel_cleanup_version')
+    elif defect == 'bad-version':
+        route['python_project_cancel_cleanup_version'] = True
+    elif defect == 'selfrepair':
+        route['source'] = 'self_repair'
+    elif defect == 'route-unknown':
+        route['phase'] = 'UNKNOWN'
+    elif defect.startswith('worker_'):
+        setattr(session.row, defect, 'present')
+    elif defect == 'approval':
+        session.approval = UUID(int=99)
+    elif defect.startswith('tools-'):
+        state['tools'] = [] if defect == 'tools-malformed' else {'b' * 64: {'status': defect[6:]}}
+    elif defect in {'model-unknown', 'model-partial', 'model-prepared'}:
+        model['status'] = defect[6:]
+    elif defect in {'model-id', 'foreign-model-id'}:
+        models['bad' if defect == 'model-id' else 'f' * 64] = models.pop(key)
+    elif defect == 'model-malformed':
+        models[key] = 'running'
+    elif defect == 'model-status-type':
+        model['status'] = True
+    elif defect == 'model-request-hash':
+        model['request_sha256'] = 'bad'
+    elif defect == 'model-attempt-bool':
+        model['attempt'] = True
+    elif defect in {'phase-unknown', 'phase-case'}:
+        state['phase'] = 'unknown' if defect == 'phase-unknown' else 'RUNNING'
+    elif defect == 'nested-running':
+        state['nested'] = {'phase': 'running'}
+    elif defect == 'other-model-running':
+        model['provenance'] = {'phase': 'running'}
+    elif defect == 'model-extra-field':
+        model['extra'] = 'benign-but-not-ledger-schema'
+    elif defect == 'no-models':
+        state['models'] = {}
+    else:
+        nested: dict[str, Any] = {}
+        state['deep'] = nested
+        for _ in range(66):
+            nested['next'] = {}
+            nested = nested['next']
+    session.checkpoints = [state]
+    assert await invoke(session, callback_status=RunStatus.CANCELLED) == []
+    assert 'python_project_cache_release' not in route
 
 
 @pytest.mark.parametrize('version', [None, True, False, '1', 1.0, 0, 2])

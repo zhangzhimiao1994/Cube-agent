@@ -124,15 +124,18 @@ def test_root_release_checks_both_origin_units_before_cache_without_project_exec
 
     monkeypatch.setattr(backend, "PythonProjectEnvironmentCache", Cache)
     monkeypatch.setattr(backend, "_admit_release_unit", admit)
+    monkeypatch.setattr(backend, "_release_scope_guard", lambda *args: None)
     config: Any = SimpleNamespace(
         environment_root="unused", cache_policy="unused", stage_root=Path("unused")
     )
     if not quiet:
         with pytest.raises(ProcessCleanupIncomplete):
-            backend._release(release(), BrokerPolicy(), config, time.monotonic() + 5)
+            backend._release(release(), BrokerPolicy(), config, time.monotonic() + 5,
+                             stage=Path("unused/current"))
         assert "release" not in calls
     else:
-        result = backend._release(release(), BrokerPolicy(), config, time.monotonic() + 5)
+        result = backend._release(release(), BrokerPolicy(), config, time.monotonic() + 5,
+                                  stage=Path("unused/current"))
         assert result.released_environment == reference()
         assert calls == [
             "agent-hub-python-broker-previous_run.service",
@@ -211,8 +214,9 @@ def test_release_dispatch_holds_shared_admission_without_preparing_or_running_pr
         finally:
             locked.pop()
 
-    def release_only(request: Any, *args: Any) -> Any:
+    def release_only(request: Any, *args: Any, **kwargs: Any) -> Any:
         assert locked == [True]
+        assert kwargs["stage"] == tmp_path
         return protocol.PythonProjectBrokerResponse(
             action=request.action,
             execution_id=request.invocation.execution_id,
@@ -269,6 +273,7 @@ def test_root_absent_cache_is_typed_retry_success_after_lost_reply(monkeypatch: 
 
     monkeypatch.setattr(backend, "_admit_release_unit", quiet)
     monkeypatch.setattr(ProjectExecutionBroker, "_retained", lambda self, key: False)
+    monkeypatch.setattr(backend, "_release_scope_guard", lambda *args: None)
     monkeypatch.setattr(
         backend,
         "PythonProjectEnvironmentCache",
@@ -279,6 +284,7 @@ def test_root_absent_cache_is_typed_retry_success_after_lost_reply(monkeypatch: 
     config: Any = SimpleNamespace(
         stage_root=Path("unused"), environment_root=Path("unused"), cache_policy=None
     )
-    response = backend._release(release(), BrokerPolicy(), config, time.monotonic() + 5)
+    response = backend._release(release(), BrokerPolicy(), config, time.monotonic() + 5,
+                                stage=Path("unused/current"))
     assert response.ok and response.released_environment == reference()
     assert response.release_outcome == "absent"
