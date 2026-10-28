@@ -58,3 +58,33 @@ $env:PYTHONPATH = "$PWD/src;$PWD"
 ```
 
 Implementation follow-up must keep native reviewer/model/tool intent and receipt checkpoints durable, withhold every body carrier, publish only at the native completed final-step CP, and validate bound candidates without accepting arbitrary extra content. Transaction rollback, PostgreSQL concurrency and post-fix cold-replay idempotence are not proven by this RED-only slice.
+
+## Independently authorized GREEN stage
+
+The subsequent parent instruction explicitly authorizes implementation in the integration worktree `structured-recovery-oct28`, now based on `43149a96` (Direct/Hybrid through `1f321ca4`). The earlier RED-only scope above remains the historical evidence boundary, not an implementation acceptance claim. Preserve its result and original test SHA.
+
+**Goal:** Make the native Crew publication and legitimate prepared-review recovery regressions pass without changing model calls, tools, authority or budgets.
+
+**Minimal boundaries:** Crew adapter and report binding validators; RunService publication batching; the dedicated Crew regression file. Extend existing configured-wrapper forwarding only if the actual integration requires it. Preserve all Direct/Hybrid and Discuss behavior.
+
+- [x] Keep candidate/model bodies in the existing private artifact repository; pass reviewer/model intent, receipt, usage and nonterminal checkpoints independently.
+- [x] Withhold every selected report body carrier, including event inputs/output previews, until native reviewer approval and the completed final-step checkpoint have been validated against current private ledgers and exact scope.
+- [x] Publish final report events and terminal CP through one existing RunRepository transaction. Reject/failure/uncertain and incomplete prefixes release no report.
+- [x] Strictly validate legitimate bound review candidates using current native report/model/tool evidence; reject arbitrary extra content, wrong scope/hash and forged binding. Preserve prepared/running recovery and no-replay rules.
+- [x] Add real repository insertion-failure rollback and committed-boundary cold-recovery/no-duplicate coverage, plus malformed binding/reviewer evidence regressions.
+- [x] Run dedicated RED-to-GREEN verification, then one relevant regression group, Ruff and strict mypy. Record actual results and limitations separately from historical RED; commit locally only.
+
+No upload, deployment, server, credentials, real model, CI or frozen-567-package changes are authorized.
+
+### GREEN verification and scope
+
+- Dedicated file: **28 PASS**. One subsequent related regression group: **301 PASS in 40.46s** (dedicated Crew, shared Direct/Hybrid publication, Crew delivery/verification/reviewer cancellation and recovery, configured runtime tests). No full-suite claim.
+- Ruff on all five changed production files and the dedicated test: PASS. `mypy --strict --follow-imports=silent --no-incremental` on the five changed production files: PASS, no issues.
+- The original twelve RED cases pass. New regression evidence first reproduced native-valid plan IDs rejected by the added matcher regex, a swallowed runtime.completed, silent incomplete EOF and a missing private model artifact in prepared-to-public recovery. Native plan identifier validation is now reused.
+- Fixes stay within DISPATCH publication; Direct/Hybrid and Discuss paths remain separate. ConfigBackedDispatch now forwards native validation through owned tenant/run/token binding, admission/planned/preseed wrappers, without rebuilding or restoring work.
+- Prepared CP persisted with no public report, lost in-memory pending, new runtime/repository sessions, then reviewer continuation: the original report/model artifacts are publicly published with the same ID/SHA exactly once. Rollback after final CP insertion failure preserves earlier receipt/usage CPs and private evidence; recovery from that latest running CP completes without another model/tool call. Recovery after a committed terminal CP emits only runtime.completed.
+- Real RunService execution through the configured/admission/planned/preseed/native chain ends COMPLETED with one completion event and one report artifact. Missing validated terminal CP cannot authorize runtime.completed; incomplete EOF raises a stable error.
+- DB event sequences are reassigned contiguously on publication. Native CP next_sequence and state hash remain unchanged; the former is a runtime cursor, not the public DB event number.
+- Native final-report attempt/index remain exactly zero. Reviewer revision cannot add a report model call; mismatched candidates fail closed. No additional retries, fallback, authority or budget were introduced.
+- Two fixture corrections are explicit: SQLite schema needed RunStepRow because the whole native stream now persists step.completed; post-final recovery batching must receive the restored terminal-CP context, as real RunService does. Neither correction weakens the product gates.
+- Limits: SQLite exercises actual RunRepository SQL/transactions, not PostgreSQL concurrent isolation. New runtime instances and exact private hash-bound registries model restart, but no real OS-process/private-PostgreSQL restart or live cancellation timing was executed. No server/model/CI or frozen release package was touched.

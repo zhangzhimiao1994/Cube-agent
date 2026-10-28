@@ -6044,6 +6044,115 @@ def _hybrid_publication_lineage(
     return {str(item.id): item.content_sha256 for item in (report, *required)}
 
 
+async def _crew_delivery_publication_batches(
+    events: AsyncIterator[RunEvent], context: TaskContext, *, runtime: ExecutionRuntime | None,
+) -> AsyncGenerator[tuple[RunEvent, ...], None]:
+    """Defer only report body carriers; native intents/receipts remain durable.
+
+    The DB assigns publication sequences after this projection. Checkpoint state
+    and its native next_sequence cursor are never edited or renumbered here.
+    """
+    from agent_hub.runtime.contracts import validate_publication_checkpoint
+    from agent_hub.runtime.crew import delivery_report
+
+    pending: list[RunEvent] = []
+    report_steps: set[str] = set()
+    actors: set[str] = set()
+    publication_checkpoint: RuntimeCheckpoint | None = None
+    published_reports: dict[str, Artifact] = {}
+
+    def observe(checkpoint: RuntimeCheckpoint) -> None:
+        if checkpoint.run_id != context.run_id or checkpoint.tenant_id != context.tenant_id:
+            raise RuntimeError("crew report publication checkpoint scope is invalid")
+        models = checkpoint.state.get("models")
+        if not isinstance(models, Mapping):
+            return
+        rows = tuple(row for row in models.values() if isinstance(row, Mapping))
+        for row in rows:
+            phase = row.get(delivery_report.BINDING)
+            if isinstance(phase, Mapping) and phase.get("runtime") == "crew":
+                step_id = row.get("step_id")
+                if isinstance(step_id, str):
+                    report_steps.add(step_id)
+        for row in rows:
+            if row.get("step_id") in report_steps and isinstance(row.get("actor"), str):
+                actors.add(cast(str, row["actor"]))
+
+    def bound_report(artifact: Artifact) -> bool:
+        binding = artifact.content.get(delivery_report.BINDING)
+        return isinstance(binding, Mapping) and binding.get("runtime") == "crew"
+
+    if context.checkpoint is not None:
+        observe(context.checkpoint)
+    async for event in events:
+        if event.run_id != context.run_id:
+            raise RuntimeError("crew report publication event scope is invalid")
+        checkpoint = event.checkpoint
+        if checkpoint is not None:
+            observe(checkpoint)
+        if event.kind is EventKind.RUNTIME_COMPLETED and (report_steps or pending
+                or any(bound_report(item) for item in event.inputs)):
+            saved = publication_checkpoint or context.checkpoint
+            if (pending or saved is None or saved.state.get("terminal") is not True
+                    or saved.state.get("phase") != "completed" or len(event.inputs) != 1):
+                raise RuntimeError("crew report completion has no validated publication checkpoint")
+            try:
+                validate_publication_checkpoint(runtime, saved, context)
+            except (TypeError, ValueError, RuntimeError, KeyError):
+                raise RuntimeError("crew report completion native checkpoint is invalid") from None
+            report = event.inputs[0]
+            binding = report.content.get(delivery_report.BINDING)
+            refs = saved.state.get("artifact_refs")
+            if (not isinstance(binding, Mapping) or not bound_report(report)
+                    or not isinstance(refs, Mapping)
+                    or refs.get(cast(str, binding.get("final_step_id"))) != {
+                        "id": str(report.id), "sha256": report.content_sha256,
+                    } or report.content_sha256 != report.recompute_content_sha256()
+                    or (published_reports and published_reports.get(str(report.id)) != report)):
+                raise RuntimeError("crew report completion final artifact is invalid")
+            yield (event,)
+            continue
+        body = (
+            event.artifact is not None and (bound_report(event.artifact) or (
+                event.artifact.type == "model_response" and event.artifact.producer in actors
+            ))
+        ) or any(bound_report(item) for item in event.inputs)
+        if body:
+            pending.append(event)
+            continue
+        if (checkpoint is not None and checkpoint.state.get("terminal") is True
+                and checkpoint.state.get("phase") == "completed" and pending):
+            try:
+                validate_publication_checkpoint(runtime, checkpoint, context)
+            except (TypeError, ValueError, RuntimeError, KeyError):
+                raise RuntimeError("crew report publication native checkpoint is invalid") from None
+            refs = checkpoint.state.get("artifact_refs")
+            reports = [item.artifact for item in pending
+                       if item.artifact is not None and bound_report(item.artifact)]
+            if not isinstance(refs, Mapping) or not reports or any(
+                not isinstance(binding := report.content.get(delivery_report.BINDING), Mapping)
+                or refs.get(cast(str, binding.get("final_step_id"))) != {
+                    "id": str(report.id), "sha256": report.content_sha256,
+                } for report in reports
+            ):
+                raise RuntimeError("crew report publication final artifact is invalid")
+            yield (*pending, event)
+            publication_checkpoint = checkpoint
+            published_reports = {str(report.id): report for report in reports}
+            pending = []
+            continue
+        if (checkpoint is not None and checkpoint.state.get("terminal") is True
+                and checkpoint.state.get("phase") != "completed"):
+            pending = []
+        if event.kind in {EventKind.RUNTIME_FAILED, EventKind.RUNTIME_CANCELLED}:
+            pending = []
+        if event.kind is EventKind.RUNTIME_COMPLETED and pending:
+            raise RuntimeError("crew report publication ended before completed checkpoint")
+        yield (event,)
+    if pending:
+        raise RuntimeError("crew report publication incomplete stream")
+
+
 async def _delivery_publication_batches(
     events: AsyncIterator[RunEvent], context: TaskContext, *, runtime: ExecutionRuntime | None = None,
     recovery_events: tuple[RunEvent, ...] = (),
@@ -6051,6 +6160,14 @@ async def _delivery_publication_batches(
     """Commit the selected no-effect report envelope and its checkpoint atomically."""
     from agent_hub.runtime import direct_delivery_report
     from agent_hub.runtime.autogen.delivery_report import FINAL_REPORT_ACTOR, FINAL_REPORT_POLICY
+    from agent_hub.runtime.crew import delivery_report
+
+    if (context.mode is TaskMode.DISPATCH
+            and type(context.routing_decision.get(delivery_report.POLICY)) is int
+            and context.routing_decision.get(delivery_report.POLICY) == 1):
+        async for group in _crew_delivery_publication_batches(events, context, runtime=runtime):
+            yield group
+        return
 
     if context.mode in (TaskMode.DIRECT, TaskMode.HYBRID) and direct_delivery_report.selected(context):
         async for group in _main_delivery_publication_batches(

@@ -18,6 +18,7 @@ from agent_hub.runtime.contracts import (
     RunEvent,
     RuntimeCheckpoint,
     TaskContext,
+    validate_publication_checkpoint,
 )
 from agent_hub.runtime.streams import closing_runtime_events
 
@@ -179,6 +180,11 @@ class ProjectScaleArtifactPreseedRuntime:
             async for event in events:
                 yield event.model_copy(update={"sequence": sequence})
                 sequence += 1
+
+    def validate_publication_checkpoint(
+        self, checkpoint: RuntimeCheckpoint, context: TaskContext,
+    ) -> None:
+        validate_publication_checkpoint(self._child, checkpoint, context)
 
     async def save_checkpoint(self) -> RuntimeCheckpoint:
         return await self._child.save_checkpoint()

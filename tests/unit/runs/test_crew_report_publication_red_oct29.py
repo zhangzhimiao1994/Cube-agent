@@ -1,8 +1,8 @@
-"""RED-only native Crew publication evidence; no provider or server is called.
+"""Native Crew publication/recovery regressions; no provider or server is called.
 
-These assertions describe the required second-slice behavior, not the baseline's
-early publication. Do not xfail them: the intentionally failing assertions are
-the handoff to the implementation agent.
+The original twelve RED cases are preserved as expected-behavior assertions.
+Additional guards cover native binding, owned runtime scope, SQL rollback,
+publication ordering and recovery from independently persisted review receipts.
 """
 from __future__ import annotations
 
@@ -10,15 +10,23 @@ import asyncio
 import json
 import types
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, cast
 from uuid import UUID
 
 import pytest
+from sqlalchemy import JSON, Column, MetaData, String, Table, UniqueConstraint, func, select
+from sqlalchemy import event as sql_event
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import UUID as PGUUID
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from agent_hub.db.models import RunArtifactRow, RunCheckpointRow, RunEventRow, RunRow, RunStepRow
 from agent_hub.models.gateway import GatewayCompletion
 from agent_hub.models.types import ModelRequest, ModelResponse, TokenUsage
-from agent_hub.runs.repository import _public_event_payload
+from agent_hub.runs.repository import RunRepository, _public_event_payload
 from agent_hub.runs.service import _delivery_publication_batches
 from agent_hub.runtime.artifacts import ArtifactReference, InMemoryArtifactRepository
 from agent_hub.runtime.contracts import (
@@ -66,7 +74,7 @@ class ReviewGateway(WorkspaceDeliverySequenceGateway):
 
 def reviewed_runtime(
     gateway: WorkspaceDeliverySequenceGateway, harness: ActualCapabilityHarness,
-    repository: InMemoryArtifactRepository, parser: types.ModuleType,
+    repository: InMemoryArtifactRepository, parser: types.ModuleType, *, final_id: str = "report",
 ) -> adapter.CrewDispatchRuntime:
     runtime = subject(gateway, harness, repository, parser)
     worker, report = runtime._plan.steps
@@ -74,7 +82,7 @@ def reviewed_runtime(
     reviewer = reporter.model_copy(update={"id": "reviewer", "logical_model": "review"})
     runtime._plan = runtime._plan.model_copy(update={
         "agents": (*runtime._plan.agents, reviewer),
-        "steps": (worker, report.model_copy(update={"reviewer": "reviewer"})),
+        "steps": (worker, report.model_copy(update={"id": final_id, "reviewer": "reviewer"})),
     })
     return runtime
 
@@ -98,18 +106,20 @@ class NativeCase:
         for index, event in enumerate(self.events):
             checkpoint = event.checkpoint
             if checkpoint is not None and any(
-                row["step_id"] == "report" and row["purpose"] == "review"
+                row["step_id"] == self.runtime._plan.final_step.id and row["purpose"] == "review"
                 and row["status"] == status for row in checkpoint.state["models"].values()
             ):
                 return index, checkpoint
         raise AssertionError(f"native fixture did not produce reviewer {status}")
 
 
-async def make_case(tmp_path: Path, parser: types.ModuleType, outcome: str = "approve") -> NativeCase:
+async def make_case(
+    tmp_path: Path, parser: types.ModuleType, outcome: str = "approve", *, final_id: str = "report",
+) -> NativeCase:
     repository = InMemoryArtifactRepository()
     harness = ActualCapabilityHarness(tmp_path, Executor())
     gateway = ReviewGateway(outcome)
-    runtime = reviewed_runtime(gateway, harness, repository, parser)
+    runtime = reviewed_runtime(gateway, harness, repository, parser, final_id=final_id)
     task = context()
     events: list[RunEvent] = []
     error = None
@@ -151,7 +161,16 @@ async def stream(events: tuple[RunEvent, ...]) -> AsyncIterator[RunEvent]:
 
 
 async def published(case: NativeCase, events: tuple[RunEvent, ...]) -> list[tuple[RunEvent, ...]]:
-    return [group async for group in _delivery_publication_batches(stream(events), case.context)]
+    groups = []
+    try:
+        async for group in _delivery_publication_batches(stream(events), case.context, runtime=case.runtime):
+            groups.append(group)
+    except RuntimeError as error:
+        # Prefix observations inspect already committable groups. The separate
+        # EOF regression requires the actual publisher to raise for truncation.
+        if str(error) != "crew report publication incomplete stream":
+            raise
+    return groups
 
 
 def public_json(event: RunEvent) -> str:
@@ -284,3 +303,324 @@ async def test_prepared_bound_report_cold_recovers_without_replaying_writer_or_t
     assert saved.state["artifact_refs"]["report"] == {
         "id": str(case.candidate.id), "sha256": case.candidate.content_sha256,
     }
+
+
+@pytest.mark.parametrize("defect", ["extra_content", "run", "tenant", "model", "stripped_binding"])
+async def test_forged_prepared_report_is_rejected_before_any_model_or_tool_replay(
+    native_case: NativeCase, installed_parser: types.ModuleType, defect: str,  # noqa: F811
+) -> None:
+    from uuid import uuid4
+
+    case = native_case
+    _, checkpoint = case.reviewer_checkpoint("prepared")
+    content = case.candidate.to_payload()["content"]
+    if defect == "extra_content":
+        content["arbitrary_private_payload"] = "not a native report field"
+    elif defect == "stripped_binding":
+        content.pop("delivery_report_binding")
+    else:
+        key = {"run": "run_id", "tenant": "tenant_id", "model": "model_artifact_id"}[defect]
+        content["delivery_report_binding"][key] = str(uuid4())
+    candidate = Artifact(id=case.candidate.id, type=case.candidate.type,
+        producer=case.candidate.producer, version=case.candidate.version,
+        source_ids=case.candidate.source_ids, provenance=case.candidate.provenance, content=content)
+    payload = checkpoint.to_payload()
+    payload["state"]["artifact_registry"][str(candidate.id)] = candidate.content_sha256
+    payload.pop("state_sha256")
+    for key in ("id", "run_id", "tenant_id"):
+        payload[key] = UUID(payload[key])
+    payload["mode"] = type(checkpoint.mode)(payload["mode"])
+    changed = RuntimeCheckpoint(**payload)
+    references = tuple(ArtifactReference(UUID(key), digest)
+                       for key, digest in checkpoint.state["artifact_registry"].items())
+    artifacts = await case.repository.get_many(case.context.tenant_id, case.context.run_id, references)
+    repository = InMemoryArtifactRepository()
+    for artifact in artifacts:
+        await repository.put(case.context.tenant_id, case.context.run_id,
+                             candidate if artifact.id == candidate.id else artifact)
+    gateway = WorkspaceDeliverySequenceGateway(())
+    cold = reviewed_runtime(gateway, case.harness, repository, installed_parser)
+    with pytest.raises(adapter.RuntimeExecutionError):
+        await cold.restore_checkpoint(changed)
+        _ = [event async for event in cold.run(case.context.model_copy(update={"checkpoint": changed}))]
+    assert not gateway.requests, "forged candidate reached the reviewer/model boundary"
+    assert len(case.harness.calls) == 3
+
+
+@asynccontextmanager
+async def sql_repository(task: TaskContext):
+    """Actual repository SQL, with only PostgreSQL column types adapted to SQLite."""
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    metadata = MetaData()
+    for model in (RunRow, RunEventRow, RunArtifactRow, RunCheckpointRow, RunStepRow):
+        columns = [Column(c.name, JSON() if isinstance(c.type, JSONB)
+                          else String(32) if isinstance(c.type, PGUUID) else c.type,
+                          primary_key=c.primary_key, nullable=c.nullable,
+                          server_default=c.server_default) for c in model.__table__.columns]
+        constraints = [UniqueConstraint(*(c.name for c in item.columns))
+                       for item in model.__table__.constraints if isinstance(item, UniqueConstraint)]
+        Table(model.__tablename__, metadata, *columns, *constraints)
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(metadata.create_all)
+        factory = async_sessionmaker(engine, expire_on_commit=False)
+        async with factory.begin() as session:
+            session.add(RunRow(id=task.run_id, tenant_id=task.tenant_id, actor_id=task.actor_id,
+                actor_role="operator", request=task.request, mode=task.mode.value,
+                status="running", version=1, routing_decision=dict(task.routing_decision)))
+        yield RunRepository(factory), factory, engine
+    finally:
+        await engine.dispose()
+
+
+async def persist_group(repository: RunRepository, task: TaskContext, group: tuple[RunEvent, ...]) -> None:
+    async with await repository.run_transaction() as session, session.begin():
+        await repository.get_for_update(session, task.run_id)
+        for item in group:
+            sequence = await repository.next_event_sequence(session, task.run_id)
+            await repository.persist_event(session, tenant_id=task.tenant_id, run_id=task.run_id,
+                event=item.model_copy(update={"sequence": sequence}))
+
+
+async def test_real_repository_rolls_back_only_final_publication_and_keeps_private_evidence(
+    native_case: NativeCase, installed_parser: types.ModuleType,  # noqa: F811
+) -> None:
+    case = native_case
+    async with sql_repository(case.context) as (repository, factory, engine):
+        groups = await published(case, case.events[:terminal_index(case) + 1])
+
+        class SaveFailed(RuntimeError):
+            pass
+
+        def fail_final(connection, cursor, statement, parameters, execution_context, many):
+            if statement.startswith("INSERT INTO " + RunCheckpointRow.__tablename__):
+                raise SaveFailed("owned final checkpoint insertion failure")
+
+        for group in groups:
+            if any(item.artifact == case.candidate for item in group):
+                sql_event.listen(engine.sync_engine, "before_cursor_execute", fail_final)
+                try:
+                    with pytest.raises(SaveFailed):
+                        await persist_group(repository, case.context, group)
+                finally:
+                    sql_event.remove(engine.sync_engine, "before_cursor_execute", fail_final)
+            else:
+                await persist_group(repository, case.context, group)
+        raw = await repository.raw_events(case.context.tenant_id, case.context.run_id)
+        assert raw and not any(REPORT in public_json(item) for item in raw)
+        assert not any(item.checkpoint is not None and item.checkpoint.state["phase"] == "completed"
+                       for item in raw)
+        async with factory() as session:
+            assert await session.scalar(select(func.count()).select_from(RunCheckpointRow)) > 0
+            assert await session.scalar(select(func.count()).select_from(RunArtifactRow).where(
+                RunArtifactRow.id == case.candidate.id,
+            )) == 0
+        reference = ArtifactReference(case.candidate.id, case.candidate.content_sha256)
+        assert await case.repository.get_many(case.context.tenant_id, case.context.run_id,
+                                             (reference,)) == (case.candidate,)
+        async with factory() as session:
+            checkpoint = await repository.latest_checkpoint(session, tenant_id=case.context.tenant_id,
+                                                             run_id=case.context.run_id)
+        assert checkpoint is not None and checkpoint.state["phase"] == "running"
+        gateway = WorkspaceDeliverySequenceGateway(())
+        cold = reviewed_runtime(gateway, case.harness, case.repository, installed_parser)
+        await cold.restore_checkpoint(checkpoint)
+        task = case.context.model_copy(update={"checkpoint": checkpoint})
+        async for group in _delivery_publication_batches(cold.run(task), task, runtime=cold):
+            await persist_group(repository, task, group)
+        recovered = await repository.raw_events(task.tenant_id, task.run_id)
+        assert sum(item.artifact == case.candidate for item in recovered) == 1
+        assert sum(item.kind is EventKind.RUNTIME_COMPLETED for item in recovered) == 1
+        assert not gateway.requests and len(case.harness.calls) == 3
+
+
+async def test_real_repository_publication_sequences_and_cold_recovery_do_not_duplicate_report(
+    native_case: NativeCase, installed_parser: types.ModuleType,  # noqa: F811
+) -> None:
+    case = native_case
+    boundary = terminal_index(case)
+    expected = case.events[boundary].checkpoint
+    assert expected is not None
+    async with sql_repository(case.context) as (repository, factory, _):
+        for group in await published(case, case.events[:boundary + 1]):
+            await persist_group(repository, case.context, group)
+        cold_repository = RunRepository(factory)
+        raw = await cold_repository.raw_events(case.context.tenant_id, case.context.run_id)
+        assert [item.sequence for item in raw] == list(range(1, len(raw) + 1))
+        assert sum(item.artifact == case.candidate for item in raw) == 1
+        # CP native cursor/hash are unchanged even though its public predecessors
+        # were delayed and the repository has reassigned every DB sequence.
+        async with factory() as session:
+            checkpoint = await cold_repository.latest_checkpoint(session, tenant_id=case.context.tenant_id,
+                                                                  run_id=case.context.run_id)
+        assert checkpoint == expected
+        assert checkpoint.state["next_sequence"] == expected.state["next_sequence"]
+        gateway = WorkspaceDeliverySequenceGateway(())
+        cold = reviewed_runtime(gateway, case.harness, case.repository, installed_parser)
+        await cold.restore_checkpoint(checkpoint)
+        recovered = tuple([item async for item in cold.run(case.context.model_copy(update={"checkpoint": checkpoint}))])
+        assert [item.kind for item in recovered] == [EventKind.RUNTIME_COMPLETED]
+        for group in [group async for group in _delivery_publication_batches(
+            stream(recovered), case.context.model_copy(update={"checkpoint": checkpoint}), runtime=cold,
+        )]:
+            await persist_group(cold_repository, case.context, group)
+        final = await cold_repository.raw_events(case.context.tenant_id, case.context.run_id)
+        assert [item.sequence for item in final] == list(range(1, len(raw) + 2))
+        assert sum(item.artifact == case.candidate for item in final) == 1
+        assert not gateway.requests and len(case.harness.calls) == 3
+
+
+@pytest.mark.parametrize("final_id", ["report.v1", "1report"])
+async def test_native_plan_identifiers_survive_bound_prepared_review_recovery(
+    tmp_path: Path, installed_parser: types.ModuleType, final_id: str,  # noqa: F811
+) -> None:
+    case = await make_case(tmp_path, installed_parser, final_id=final_id)
+    _, checkpoint = case.reviewer_checkpoint("prepared")
+    gateway = WorkspaceDeliverySequenceGateway((ModelResponse(
+        text='{"verdict":"approve"}', usage=TokenUsage(1, 1, 2),
+    ),))
+    cold = reviewed_runtime(gateway, case.harness, case.repository, installed_parser, final_id=final_id)
+    await cold.restore_checkpoint(checkpoint)
+    events = [event async for event in cold.run(case.context.model_copy(update={"checkpoint": checkpoint}))]
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert len(gateway.requests) == 1 and len(case.harness.calls) == 3
+
+
+async def test_native_report_revision_keeps_the_single_model_attempt_boundary(
+    tmp_path: Path, installed_parser: types.ModuleType,  # noqa: F811
+) -> None:
+    old = "OWNED_REJECTED_REPORT_BODY_DO_NOT_PUBLISH"
+    repository = InMemoryArtifactRepository()
+    harness = ActualCapabilityHarness(tmp_path, Executor())
+    gateway = ReviewGateway("approve")
+    gateway.responses = (*responses(old),
+        ModelResponse(text='{"verdict":"revise","feedback":"Please revise"}', usage=TokenUsage(1, 1, 2)),
+        ModelResponse(text=REPORT, usage=TokenUsage(1, 1, 2)),
+        ModelResponse(text='{"verdict":"approve"}', usage=TokenUsage(1, 1, 2)))
+    runtime = reviewed_runtime(gateway, harness, repository, installed_parser)
+    runtime._plan = runtime._plan.model_copy(update={"steps": (
+        runtime._plan.steps[0], runtime._plan.final_step.model_copy(update={"reviewer_retries": 1}),
+    )})
+    task = context()
+    events = []
+    with pytest.raises(adapter.RuntimeExecutionError, match="single native model call"):
+        async for event in runtime.run(task):
+            events.append(event)
+    groups = [group async for group in _delivery_publication_batches(stream(events), task, runtime=runtime)]
+    public = [item for group in groups for item in group]
+    assert not any(old in public_json(item) for item in public)
+    assert not any(item.kind is EventKind.RUNTIME_COMPLETED for item in public)
+    assert len(gateway.requests) == 6 and len(harness.calls) == 3
+    saved = await runtime.save_checkpoint()
+    assert len(saved.state["models"]) == 6
+
+
+async def test_pending_without_terminal_checkpoint_fails_closed(native_case: NativeCase) -> None:
+    case = native_case
+    prefix = case.events[:case.reviewer_checkpoint("prepared")[0] + 1]
+    with pytest.raises(RuntimeError, match="incomplete stream"):
+        _ = [group async for group in _delivery_publication_batches(
+            stream(prefix), case.context, runtime=case.runtime,
+        )]
+
+
+async def test_full_native_stream_delivers_exactly_one_validated_completed_event(native_case: NativeCase) -> None:
+    case = native_case
+    groups = await published(case, case.events)
+    completed = [item for group in groups for item in group if item.kind is EventKind.RUNTIME_COMPLETED]
+    assert len(completed) == 1 and completed[0].inputs == (case.candidate,)
+    assert sum(item.artifact == case.candidate for group in groups for item in group) == 1
+
+
+async def test_prepared_db_checkpoint_restarts_with_full_public_report_and_no_replay(
+    native_case: NativeCase, installed_parser: types.ModuleType,  # noqa: F811
+) -> None:
+    case = native_case
+    index, prepared = case.reviewer_checkpoint("prepared")
+    async with sql_repository(case.context) as (repository, factory, _):
+        iterator = _delivery_publication_batches(stream(case.events[:index + 1]), case.context, runtime=case.runtime)
+        try:
+            async for group in iterator:
+                await persist_group(repository, case.context, group)
+                if any(item.checkpoint == prepared for item in group):
+                    break  # Simulated worker death: do not pretend this prefix is a normal EOF.
+        finally:
+            await iterator.aclose()
+        cold_repository = RunRepository(factory)
+        async with factory() as session:
+            checkpoint = await cold_repository.latest_checkpoint(session, tenant_id=case.context.tenant_id,
+                                                                  run_id=case.context.run_id)
+        assert checkpoint == prepared
+        before = await cold_repository.raw_events(case.context.tenant_id, case.context.run_id)
+        assert not any(REPORT in public_json(item) for item in before)
+        gateway = WorkspaceDeliverySequenceGateway((ModelResponse(
+            text='{"verdict":"approve"}', usage=TokenUsage(1, 1, 2),
+        ),))
+        cold = reviewed_runtime(gateway, case.harness, case.repository, installed_parser)
+        await cold.restore_checkpoint(checkpoint)
+        task = case.context.model_copy(update={"checkpoint": checkpoint})
+        async for group in _delivery_publication_batches(cold.run(task), task, runtime=cold):
+            await persist_group(cold_repository, task, group)
+        raw = await cold_repository.raw_events(task.tenant_id, task.run_id)
+        assert sum(item.artifact == case.candidate for item in raw) == 1
+        model_id = case.candidate.content["delivery_report_binding"]["model_artifact_id"]
+        assert sum(item.artifact is not None and str(item.artifact.id) == model_id for item in raw) == 1
+        assert sum(item.kind is EventKind.RUNTIME_COMPLETED for item in raw) == 1
+        assert len(gateway.requests) == 1 and len(case.harness.calls) == 3
+
+
+async def test_actual_run_service_completes_through_owned_configured_admission_chain(
+    tmp_path: Path, installed_parser: types.ModuleType, monkeypatch: pytest.MonkeyPatch,  # noqa: F811
+) -> None:
+    from agent_hub.domain.runs import RunStatus, TaskMode
+    from agent_hub.runs.service import RunService
+    from agent_hub.runtime.defaults import ConfigBackedDispatchRuntime, _PlannedRuntime
+    from agent_hub.runtime.engineering_admission import EngineeringAdmissionRuntime
+    from agent_hub.runtime.project_scale_artifact import ProjectScaleArtifactPreseedRuntime
+    from agent_hub.runtime.registry import RuntimeRegistry
+    from tests.unit.runs import test_terminal_hooks as service_fixture
+
+    task = context()
+    monkeypatch.setattr(service_fixture, "TENANT_ID", task.tenant_id)
+    monkeypatch.setattr(service_fixture, "ACTOR_ID", task.actor_id)
+    repository = service_fixture.ExecutableFakeRepository(routing_decision=dict(task.routing_decision))
+    repository.run_id = repository.row.id = task.run_id
+    repository.row.request = task.request
+    repository.row.actor_role = task.actor_role.value
+    gateway = ReviewGateway("approve")
+    harness = ActualCapabilityHarness(tmp_path, Executor())
+    private = InMemoryArtifactRepository()
+    native = reviewed_runtime(gateway, harness, private, installed_parser)
+    wrapped = EngineeringAdmissionRuntime(_PlannedRuntime(
+        ProjectScaleArtifactPreseedRuntime(native, harness_tool_gateway=None),
+        mode=TaskMode.DISPATCH, main_agent_model="general", roles=(), steps=(),
+    ), None)
+
+    class Configured(ConfigBackedDispatchRuntime):
+        builds = 0
+
+        async def _runtime_for(self, observed):
+            self.builds += 1
+            assert observed.tenant_id == task.tenant_id and observed.run_id == task.run_id
+            assert observed.execution_token is not None
+            return wrapped
+
+    configured = Configured(config_service=cast(Any, object()), secret_service=cast(Any, object()),
+                            capacity_factory=cast(Any, object()), transport=cast(Any, object()))
+    service = RunService(cast(RunRepository, repository), runtime_registry=RuntimeRegistry((configured,)),
+        router=None, task_queue=cast(Any, object()), runtime_token_budget=10_000)
+    result = await service.execute(task.run_id)
+    assert result.status is RunStatus.COMPLETED
+    assert sum(item.kind is EventKind.RUNTIME_COMPLETED for item in repository.event_log) == 1
+    reports = [item.artifact for item in repository.event_log if item.artifact is not None
+               and "delivery_report_binding" in item.artifact.content]
+    assert len(reports) == 1 and reports[0].content["text"] == REPORT
+    assert configured.builds == 1 and len(gateway.requests) == 6 and len(harness.calls) == 3
+
+
+async def test_completed_event_without_native_completed_checkpoint_is_rejected(native_case: NativeCase) -> None:
+    case = native_case
+    with pytest.raises(RuntimeError, match="no validated publication checkpoint"):
+        _ = [group async for group in _delivery_publication_batches(
+            stream((case.events[-1],)), case.context, runtime=case.runtime,
+        )]

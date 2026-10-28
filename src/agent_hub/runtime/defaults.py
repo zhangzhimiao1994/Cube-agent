@@ -1052,6 +1052,7 @@ class ConfigBackedDispatchRuntime:
         self._provider_continuation_repository = provider_continuation_repository
         self._pending_checkpoints: dict[UUID, RuntimeCheckpoint] = {}
         self._active: dict[tuple[UUID, UUID], ExecutionRuntime] = {}
+        self._publication_tenants: dict[tuple[UUID, UUID], UUID] = {}
 
     async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
         try:
@@ -1069,13 +1070,27 @@ class ConfigBackedDispatchRuntime:
             await runtime.restore_checkpoint(checkpoint)
         execution_token = context.execution_token or uuid4()
         execution_key = (context.run_id, execution_token)
+        if execution_key in self._active:
+            raise RuntimeError("runtime execution already active")
         self._active[execution_key] = runtime
+        self._publication_tenants[execution_key] = context.tenant_id
         try:
             async with closing_runtime_events(runtime.run(context)) as events:
                 async for event in events:
                     yield event
         finally:
             self._active.pop(execution_key, None)
+            self._publication_tenants.pop(execution_key, None)
+
+    def validate_publication_checkpoint(
+        self, checkpoint: RuntimeCheckpoint, context: TaskContext,
+    ) -> None:
+        if type(context.execution_token) is not UUID:
+            raise RuntimeError("publication checkpoint execution identity unavailable")
+        key = (context.run_id, context.execution_token)
+        if self._publication_tenants.get(key) != context.tenant_id:
+            raise RuntimeError("publication checkpoint original tenant unavailable")
+        validate_publication_checkpoint(self._active.get(key), checkpoint, context)
 
     async def save_checkpoint(self) -> RuntimeCheckpoint:
         raise RuntimeError("runtime checkpoint unavailable outside an active run")

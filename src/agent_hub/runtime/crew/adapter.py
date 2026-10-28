@@ -4043,6 +4043,7 @@ class _RunState:
     artifact_writes_open: bool = True
     commit_tasks: set[asyncio.Task[None]] = field(default_factory=set)
     pending_artifact_writes: dict[UUID, ArtifactReference] = field(default_factory=dict)
+    queued_model_artifacts: set[UUID] = field(default_factory=set)
     cleanup_error: RuntimeExecutionError | None = None
     gateway_scope_failures: dict[str, RuntimeExecutionError] = field(default_factory=dict)
 
@@ -4302,6 +4303,9 @@ class CrewDispatchRuntime:
                 state.pending_artifact_writes.pop(write_id, None)
             if run_open and self._is_current_run(state):
                 await queue.put(await sequence.event(run_id=context.run_id, **values))
+                if isinstance(artifact, Artifact) and artifact.type == "model_response":
+                    # Queue-local de-duplication only, never a DB commit claim.
+                    state.queued_model_artifacts.add(artifact.id)
 
         try:
             plan = DispatchPlan.revalidate(self._plan)
@@ -5346,6 +5350,7 @@ class CrewDispatchRuntime:
                 artifact = self._persisted_review_candidate(
                     step, completion, artifact_sources, retries + 1, model_ledger,
                     agents.get(step.reviewer) if step.reviewer is not None else None,
+                    context=context, tool_ledger=tool_ledger,
                 ) or self._artifact(
                     step,
                     completion,
@@ -5368,6 +5373,10 @@ class CrewDispatchRuntime:
                         provenance=artifact.provenance,
                         content={"text": completion.response.text, _delivery_report.BINDING: binding},
                     )
+                    report_model = self._current_artifact_registry[cast(str, binding["model_artifact_id"])]
+                    if report_model.id not in run_state.queued_model_artifacts:
+                        await event(kind=EventKind.ARTIFACT_CREATED, artifact=report_model,
+                                    actor=step.agent, payload={"agent_id": step.agent})
                 await event(
                     kind=EventKind.ARTIFACT_CREATED,
                     artifact=artifact,
@@ -5501,6 +5510,12 @@ class CrewDispatchRuntime:
                             )
                             raise _gateway_scope_review_failure(review_failure, error) from None
                         else:
+                            if delivery_report:
+                                for review_model in review_evidence:
+                                    if (review_model.type == "model_response"
+                                            and review_model.id not in run_state.queued_model_artifacts):
+                                        await event(kind=EventKind.ARTIFACT_CREATED, artifact=review_model,
+                                                    actor=step.reviewer, payload={"agent_id": step.reviewer})
                             await event(
                                 kind=EventKind.REVIEW_COMPLETED,
                                 actor=step.reviewer,
@@ -10464,7 +10479,7 @@ class CrewDispatchRuntime:
             artifact.type == "text" and artifact.producer == step.agent
             and artifact.version == version and artifact.source_ids == source_ids
             and completion.response.text is not None and not completion.response.tool_calls
-            and artifact.content == {"text": completion.response.text}
+            and _delivery_report.candidate_content_matches(artifact, completion.response.text)
             and artifact.content_sha256 == artifact.recompute_content_sha256()
             and artifact.provenance == GatewayProvenance(
                 logical_model=completion.logical_model, deployment_id=completion.deployment_id,
@@ -10475,6 +10490,7 @@ class CrewDispatchRuntime:
     def _persisted_review_candidate(
         self, step: DispatchStep, completion: GatewayCompletion, sources: tuple[Artifact, ...],
         version: int, ledger: _ModelLedger, reviewer: AgentSpec | None,
+        *, context: TaskContext, tool_ledger: _ToolLedger,
     ) -> Artifact | None:
         if reviewer is None:
             return None
@@ -10516,6 +10532,16 @@ class CrewDispatchRuntime:
         ]
         if len(candidates) != 1 or (linked_ids and linked_ids != {str(candidates[0].id)}):
             _fail("runtime checkpoint review candidate linkage is invalid")
+        if (_delivery_report.BINDING in candidates[0].content
+                or _delivery_report.selected(context, self._plan, step)):
+            try:
+                _delivery_report.validate_report(
+                    candidates[0], context=context, plan=self._plan, step=step,
+                    states=tool_ledger.states, artifacts=tool_ledger.artifacts,
+                    models=ledger.states, model_artifacts=ledger.artifacts,
+                )
+            except ValueError as error:
+                _fail(str(error))
         return candidates[0]
 
     @staticmethod
@@ -12318,6 +12344,16 @@ class CrewDispatchRuntime:
                     ):
                         _fail("runtime checkpoint review artifact lineage is invalid")
                     consumed_candidates.add(str(candidate.id))
+                    if (_delivery_report.BINDING in candidate.content
+                            or _delivery_report.selected(context, plan, step)):
+                        try:
+                            _delivery_report.validate_report(
+                                candidate, context=context, plan=plan, step=step,
+                                states=tool_ledger.states, artifacts=tool_ledger.artifacts,
+                                models=model_ledger.states, model_artifacts=model_ledger.artifacts,
+                            )
+                        except ValueError as error:
+                            _fail(str(error))
                     review_evidence: list[str] = []
                     for call_index in range(len(review_calls)):
                         state, review_model = review_calls[call_index]
@@ -12706,6 +12742,66 @@ class CrewDispatchRuntime:
             review_ledger,
             registry,
         )
+
+    def validate_publication_checkpoint(
+        self, checkpoint: RuntimeCheckpoint, context: TaskContext,
+    ) -> None:
+        """Validate a final report against this execution's private native graph.
+
+        No restore/provider continuation call is allowed at publication. These
+        artifacts were hash-verified in the private repository before emit; the
+        checkpoint's exact subset is checked again with native graph validators.
+        """
+        plan = DispatchPlan.revalidate(self._plan)
+        self._validate_checkpoint(checkpoint, context, plan)
+        if checkpoint.state["terminal"] is not True or checkpoint.state["phase"] != "completed":
+            _fail("delivery report publication checkpoint is not completed")
+        raw = cast(Mapping[str, str], checkpoint.state["artifact_registry"])
+        registry: dict[str, Artifact] = {}
+        for key, digest in raw.items():
+            artifact = self._current_artifact_registry.get(key)
+            if (artifact is None or str(artifact.id) != key or artifact.content_sha256 != digest
+                    or artifact.recompute_content_sha256() != digest):
+                _fail("delivery report publication private artifact is unavailable")
+            registry[key] = artifact
+        refs = cast(Mapping[str, Mapping[str, str]], checkpoint.state["artifact_refs"])
+        completed = {key: registry[value["id"]] for key, value in refs.items()}
+        retries = dict(cast(Mapping[str, int], checkpoint.state["retries"]))
+        models = _ModelLedger(
+            states=dict(cast(Mapping[str, Mapping[str, JsonValue]], checkpoint.state["models"])),
+            rejected_outputs=dict(cast(Mapping[str, Mapping[str, JsonValue]], checkpoint.state["rejected_outputs"])),
+            structured_repairs=dict(cast(Mapping[str, Mapping[str, JsonValue]], checkpoint.state["structured_repairs"])),
+        )
+        tools = _ToolLedger(states=dict(cast(Mapping[str, Mapping[str, JsonValue]], checkpoint.state["tools"])))
+        for key, row in models.states.items():
+            if row["status"] == "succeeded":
+                models.artifacts[key] = registry[cast(str, row["artifact_id"])]
+        for key, row in tools.states.items():
+            if row["artifact_id"] is not None:
+                tools.artifacts[key] = registry[cast(str, row["artifact_id"])]
+        reviews = _ReviewLedger(artifacts={key: registry[value["id"]] for key, value in cast(
+            Mapping[str, Mapping[str, str]], checkpoint.state["review_refs"],
+        ).items()})
+        self._validate_artifact_graph(
+            plan, context, tuple(registry.values()), completed, retries, tools, models, reviews,
+            tuple(row["id"] for row in cast(tuple[Mapping[str, str], ...], checkpoint.state["input_refs"])),
+            checkpoint.runtime_version,
+            workspace_delivery_continuation=checkpoint.state.get("workspace_delivery_continuation") is True,
+            workspace_meaningful_progress=checkpoint.state.get("workspace_meaningful_progress") is True,
+            workspace_context_refresh=checkpoint.state.get("workspace_context_refresh") is True,
+            post_tool_finalization_growth_version=cast(int, checkpoint.state.get("post_tool_finalization_growth_version", 0)),
+        )
+        reports = [step for step in plan.steps if _delivery_report.selected(context, plan, step)]
+        if len(reports) != 1 or reports[0].id not in completed:
+            _fail("delivery report publication final step is unavailable")
+        try:
+            _delivery_report.validate_report(
+                completed[reports[0].id], context=context, plan=plan, step=reports[0],
+                states=tools.states, artifacts=tools.artifacts,
+                models=models.states, model_artifacts=models.artifacts,
+            )
+        except ValueError as error:
+            _fail(str(error))
 
     async def save_checkpoint(self) -> RuntimeCheckpoint:
         checkpoint = self._last_checkpoint

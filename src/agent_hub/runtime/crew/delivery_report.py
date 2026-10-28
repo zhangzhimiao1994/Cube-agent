@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import Mapping, Sequence
 from typing import cast
+from uuid import UUID
 
 from agent_hub.runtime.contracts import Artifact, JsonValue, TaskContext, _mutable_json
 from agent_hub.runtime.crew.engineering_delivery import (
@@ -12,7 +14,7 @@ from agent_hub.runtime.crew.engineering_delivery import (
     _trusted_result,
     engineering_delivery_ready,
 )
-from agent_hub.runtime.crew.plan import DispatchPlan, DispatchStep
+from agent_hub.runtime.crew.plan import DispatchPlan, DispatchStep, _identifier
 from agent_hub.runtime.direct_delivery_report import is_whole_body_json
 
 POLICY = "engineering_dispatch_report_version"
@@ -32,6 +34,40 @@ def selected(context: TaskContext, plan: DispatchPlan, step: DispatchStep) -> bo
     return (type(version) is int and version == 1 and step.final_synthesizer
             and not step.tools
             and any(item.engineering_delivery_contract_version == 1 for item in plan.steps))
+
+
+def candidate_content_matches(report: Artifact, text: str) -> bool:
+    """Match only the two native candidate shapes; callers verify full ledgers.
+
+    A bound candidate is not a general permission to attach extra content. Its
+    contextual binding is independently recomputed by validate_report before
+    accepting it into a recovered graph or reusing its review request.
+    """
+    if set(report.content) == {"text"}:
+        return report.content["text"] == text
+    binding = report.content.get(BINDING)
+    hashes = {"plan_digest", "tool_prefix_sha256", "bundle_artifact_sha256",
+              "verification_artifact_sha256", "model_artifact_sha256", "model_request_sha256"}
+    ids = {"run_id", "tenant_id", "bundle_artifact_id", "verification_artifact_id", "model_artifact_id"}
+    keys = hashes | ids | {"schema_version", "runtime", "final_step_id", "actor",
+                           "trusted_write_verify_bundle", "require_write"}
+    if (set(report.content) != {"text", BINDING} or report.content.get("text") != text
+            or not isinstance(binding, Mapping) or set(binding) != keys
+            or type(binding.get("schema_version")) is not int or binding["schema_version"] != 1
+            or binding.get("runtime") != "crew" or binding.get("actor") != report.producer
+            or binding.get("trusted_write_verify_bundle") is not True
+            or type(binding.get("require_write")) is not bool
+            or not isinstance(binding.get("final_step_id"), str)
+            or binding.get("model_artifact_id") not in report.source_ids
+            or any(type(binding.get(key)) is not str
+                   or re.fullmatch(r"[a-f0-9]{64}", cast(str, binding[key])) is None for key in hashes)):
+        return False
+    try:
+        _identifier(cast(str, binding["final_step_id"]), "final_step_id")
+        return all(type(binding[key]) is str and str(UUID(cast(str, binding[key]))) == binding[key]
+                   for key in ids)
+    except ValueError:
+        return False
 
 
 def _digest(value: JsonValue) -> str:
@@ -147,6 +183,9 @@ def validate_report(
     text = report.content.get("text")
     if type(text) is not str:
         raise ValueError("delivery report text is unavailable")
+    binding = report.content.get(BINDING)
+    if not isinstance(binding, Mapping) or not isinstance(binding.get("model_artifact_id"), str):
+        raise ValueError("delivery report persisted binding is invalid")  # noqa: TRY004 - Invalid native evidence.
     expected = report_binding(context=context, plan=plan, step=step, text=text, states=states,
                               artifacts=artifacts, models=models, model_artifacts=model_artifacts)
     model = next(item for item in model_artifacts.values() if str(item.id) == expected["model_artifact_id"])
