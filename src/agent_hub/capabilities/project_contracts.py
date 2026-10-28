@@ -100,8 +100,12 @@ def _editables(value: object, *, allow_list: bool = False) -> tuple[str, ...]:
     _need(type(value) is tuple or (allow_list and type(value) is list))
     paths = cast(tuple[object, ...] | list[object], value)
     _need(1 <= len(paths) <= EDITABLE_PATHS_MAX_COUNT)
+    raw_bytes = 1
+    for path in paths:
+        _need(type(path) is str)
+        raw_bytes += len(cast(str, path)) + 3
+        _need(raw_bytes <= EDITABLE_PATHS_MAX_BYTES)
     result = tuple(_path(path) for path in paths)
-    _need(1 + sum(len(path) + 3 for path in result) <= EDITABLE_PATHS_MAX_BYTES)
     _need(not any(_control(path) for path in result))
     _tree(result)
     return tuple(sorted(result))

@@ -95,6 +95,22 @@ def test_managed_input_round_trips_explicit_json_paths_without_authority() -> No
     assert request.editable_paths == ("docs", "src")
 
 
+def test_oversized_editable_metadata_is_rejected_before_path_parsing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    long_path = "/".join(("a",) * 512)
+    paths = (long_path,) * 2048
+    assert len(paths) < contracts.EDITABLE_PATHS_MAX_COUNT
+    assert sum(len(path) + 3 for path in paths) > contracts.EDITABLE_PATHS_MAX_BYTES
+
+    def fail_if_parsed(_path: object) -> str:
+        raise AssertionError("over-budget input reached path parsing")
+
+    monkeypatch.setattr(contracts, "_path", fail_if_parsed)
+    with pytest.raises(ValueError, match="invalid project check contract"):
+        contracts.ManagedProjectInput(paths)
+
+
 @pytest.mark.parametrize("value", [
     {}, {"editable_paths": []}, {"editable_paths": ["src"] * 129},
     {"editable_paths": ["src"], "schema_version": True},
