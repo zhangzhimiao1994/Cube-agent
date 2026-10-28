@@ -12,6 +12,8 @@ from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, cast
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
+from pydantic import ValidationError
+
 from agent_hub.auth.models import Role
 from agent_hub.capabilities.project_baselines import (
     ProjectBaselineReference,
@@ -51,6 +53,12 @@ if TYPE_CHECKING:
 _FAILURE = 'original project preparation is unavailable or changed'
 _SCOPE_KEYS = ('project_id', 'workspace_session_id', 'sandbox_profile', 'requested_permissions',
                'execution_backend', 'project_input_contract_version', 'project_input')
+_PREVIEW_BUDGET_ERRORS = frozenset({
+    'JSON value exceeds structural limits', 'JSON string exceeds size limit',
+    'JSON value exceeds serialized size limit', 'payload exceeds structural limits',
+    'payload string exceeds size limit', 'payload container exceeds width limit',
+    'payload exceeds estimated size limit', 'payload exceeds serialized size limit',
+})
 
 
 class OriginalProjectApprovalPending(RuntimeError):
@@ -541,9 +549,22 @@ class OriginalProjectPreparer:
             }).validated_internal_clone()
 
         def fits(preview: OriginalSourceContext) -> bool:
+            # The empty proposal validates all fixed evidence before source reads.
+            # Its errors cannot be repaired by dropping preview rows.
+            if preview['included_count'] == 0:
+                prepared_with_preview(preview)
+                return True
             try:
                 prepared_with_preview(preview)
-            except (ValueError, TypeError):
+            except ValidationError as error:
+                details = error.errors(include_input=False, include_url=False)
+                if not details or any(
+                    detail['type'] != 'value_error'
+                    or type(cause := detail.get('ctx', {}).get('error')) is not ValueError
+                    or str(cause) not in _PREVIEW_BUDGET_ERRORS
+                    for detail in details
+                ):
+                    raise
                 return False
             return True
 
