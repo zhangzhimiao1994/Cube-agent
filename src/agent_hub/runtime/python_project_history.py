@@ -14,6 +14,7 @@ import re
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, cast
 
+from agent_hub.capabilities.project_baselines import ProjectBaselineReference
 from agent_hub.capabilities.project_contracts import (
     ManagedProjectInput,
     _editable,
@@ -70,7 +71,11 @@ def _encoded(value: object) -> bytes:
     ).encode("ascii")
 
 
-def _files(artifact: Artifact) -> tuple[Mapping[str, JsonValue], ...]:
+def _files(
+    artifact: Artifact, *, file_limit: int = 100_000, source_limit_bytes: int = 500 * 1024**2,
+) -> tuple[Mapping[str, JsonValue], ...]:
+    _need(type(file_limit) is int and 1 <= file_limit <= 100_000
+          and type(source_limit_bytes) is int and 1 <= source_limit_bytes <= 500 * 1024**2)
     source = _object(
         artifact.content.get("python_source_index"),
         {"schema_version", "source_sha256", "editable_files", "files"},
@@ -93,10 +98,12 @@ def _files(artifact: Artifact) -> tuple[Mapping[str, JsonValue], ...]:
             for scope in scopes
         )
     )
-    _need(isinstance(rows, tuple | list) and len(rows) <= 256)
+    _need(isinstance(rows, tuple | list) and len(rows) <= file_limit)
+    _freeze_object(source, name="Python baseline source index")
     assert isinstance(rows, tuple | list)
     result: list[Mapping[str, JsonValue]] = []
     seen: set[str] = set()
+    total_bytes = 0
     for row in rows:
         entry = _object(row, {"path", "sha256", "size_bytes", "source_file_sha256"})
         path = _path(entry["path"])
@@ -108,6 +115,8 @@ def _files(artifact: Artifact) -> tuple[Mapping[str, JsonValue], ...]:
         )
         _hash(entry["sha256"])
         _hash(entry["source_file_sha256"])
+        total_bytes += cast(int, entry["size_bytes"])
+        _need(total_bytes <= source_limit_bytes)
         seen.add(path)
         result.append({key: entry[key] for key in ("path", "sha256", "size_bytes")})
     return tuple(result)
@@ -131,7 +140,9 @@ def build_python_history(
     if len(original.environment_references) > 128:
         raise ValueError("python_project_history_budget_exceeded")
     source_index = cast(Mapping[str, JsonValue], artifact.content.get("python_source_index"))
-    initial = _files(artifact)
+    _need(original.stored.reference.file_count <= invocation.file_limit)
+    initial = _files(artifact, file_limit=invocation.file_limit,
+                     source_limit_bytes=invocation.source_limit_bytes)
     indexed = cast(tuple[Mapping[str, JsonValue], ...], source_index["files"])
     _need(
         {row["path"] for row in initial}
@@ -253,7 +264,8 @@ def _history(context: TaskContext) -> Mapping[str, JsonValue]:
         and artifact.content.get("editable_paths") == metadata["editable_paths"]
         and artifact.content.get("original_source_sha256")
         == cast(Mapping[str, JsonValue], metadata["reference"])["input_source_sha256"]
-        and metadata["initial_files"] == _files(artifact)
+        and metadata["initial_files"] == _files(artifact,
+            file_limit=ProjectBaselineReference.from_payload(metadata["reference"]).file_count)
         and metadata["editable_files"]
         == cast(Mapping[str, JsonValue], artifact.content["python_source_index"])["editable_files"]
     )

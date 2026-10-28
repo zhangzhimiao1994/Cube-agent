@@ -111,18 +111,32 @@ def _encoded(value: object) -> bytes:
 
 
 def python_original_source_index(
-    stored: StoredProjectBaseline, *, source_limit_bytes: int,
+    stored: StoredProjectBaseline, *, source_limit_bytes: int, file_limit: int = 10_000,
 ) -> Mapping[str, JsonValue]:
     """Hash the captured baseline, independently of the bounded prompt projection."""
     paths = sorted(path for path in stored.source_files if path.endswith('.py'))
-    if len(paths) > 256:
+    if (type(source_limit_bytes) is not int or not 1 <= source_limit_bytes <= 500 * 1024**2
+            or type(file_limit) is not int or not 1 <= file_limit <= 100_000
+            or stored.reference.file_count > file_limit):
         raise ValueError('python_project_history_budget_exceeded')
-    if type(source_limit_bytes) is not int or not 1 <= source_limit_bytes <= 500 * 1024**2:
-        raise ValueError('python_project_history_budget_exceeded')
-    rows: list[JsonValue] = []
+    rows: list[Mapping[str, JsonValue]] = [
+        {'path': path, 'sha256': '0' * 64, 'size_bytes': 0,
+         'source_file_sha256': stored.source_files[path]} for path in paths
+    ]
+    index: dict[str, JsonValue] = {
+        'schema_version': 1, 'source_sha256': stored.reference.input_source_sha256,
+        'editable_files': tuple(scope for scope in stored.contract.editable_paths if scope in stored.source_files),
+        'files': tuple(rows),
+    }
+    try:
+        # Preflight the FULL metadata shape before opening source files. The same
+        # unchanged JSON limits apply again after actual hashes/sizes are measured.
+        _freeze_object(index, name='Python baseline source index')
+    except (TypeError, ValueError):
+        raise ValueError('python_project_history_budget_exceeded') from None
     remaining = source_limit_bytes
     try:
-        for path in paths:
+        for number, path in enumerate(paths):
             raw = _read_no_links(stored.snapshot, PurePosixPath(path).parts, max_bytes=remaining)
             if len(raw) > remaining:
                 raise ValueError
@@ -130,13 +144,12 @@ def python_original_source_index(
             captured = stored.source_files[path]
             if captured not in {hashlib.sha256(tag + raw).hexdigest() for tag in (b'f\0', b'x\0')}:
                 raise ValueError
-            rows.append({'path': path, 'sha256': hashlib.sha256(raw).hexdigest(),
-                         'size_bytes': len(raw), 'source_file_sha256': captured})
+            rows[number] = {'path': path, 'sha256': hashlib.sha256(raw).hexdigest(),
+                            'size_bytes': len(raw), 'source_file_sha256': captured}
     except (OSError, ValueError, RuntimeError):
         raise RuntimeError(_FAILURE) from None
-    return _freeze_object({'schema_version': 1, 'source_sha256': stored.reference.input_source_sha256,
-        'editable_files': tuple(scope for scope in stored.contract.editable_paths if scope in stored.source_files),
-        'files': tuple(rows)}, name='Python baseline source index')
+    index['files'] = tuple(rows)
+    return _freeze_object(index, name='Python baseline source index')
 
 
 def python_original_context_metadata(context: PythonOriginalContext) -> Mapping[str, JsonValue]:
@@ -467,7 +480,8 @@ class OriginalProjectPreparer:
         source_index: Mapping[str, JsonValue] = {}
         if python_inputs is not None:
             source_index = {'python_source_index': await asyncio.to_thread(
-                python_original_source_index, stored, source_limit_bytes=invocation.source_limit_bytes)}
+                python_original_source_index, stored, source_limit_bytes=invocation.source_limit_bytes,
+                file_limit=invocation.file_limit)}
         artifact = Artifact(
             id=uuid5(NAMESPACE_URL, f'original-project:{context.tenant_id}:{context.run_id}:'
                      f'{state["observation_sha256"]}'),
