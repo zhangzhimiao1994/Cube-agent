@@ -6,6 +6,7 @@ proof. A reservation holds the global lock through execution/publication; a
 crashed reservation is never reused. READY entries require fresh tree measurement.
 Only an explicit root-owned failed/quiescent marker permits a fresh granted
 execution to archive the consumed attempt; at most 16 such recoveries are kept.
+Unpublished capacity aborts are consumed, never install failures or retry grants.
 No automatic eviction can erase UNKNOWN state. Expiry/release are explicit trusted
 lifecycle operations; callers must exclude active/retained runs when pruning.
 The bounded observer forks; use a single-threaded root helper, not asyncio.to_thread.
@@ -22,7 +23,7 @@ import re
 import stat
 import sys
 import time
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -303,7 +304,7 @@ def _usage(parent: int, *, maximum: int, deadline: float) -> int:
                     )
                 elif len(parts) == 1:
                     _need(
-                        member.name in _READY | {"failed.json"}
+                        member.name in _READY | {"failed.json", "unpublished.json"}
                         or _ARCHIVE.fullmatch(member.name) is not None
                     )
                     _need(
@@ -428,6 +429,21 @@ def _validate_failed_outcome(value: object, reservation: dict[str, Any]) -> None
     )
 
 
+def _validate_unpublished_outcome(value: object, reservation: dict[str, Any]) -> None:
+    """Known capacity abort, never a failed install or a fresh execution grant."""
+    _need(type(value) is dict, "cache_incomplete")
+    assert isinstance(value, dict)
+    _need(set(value) == {"schema_version", "state", "phase", "execution_id",
+        "reservation_sha256", "unit_quiet", "cache_unpublished", "export_disposition", "reason"}
+        and type(value["schema_version"]) is int and value["schema_version"] == 1
+        and value["state"] == "unpublished_capacity" and value["phase"] == "publish"
+        and value["execution_id"] == reservation["origin_execution_id"]
+        and value["reservation_sha256"] == hashlib.sha256(_encoded(reservation)).hexdigest()
+        and value["unit_quiet"] is True and value["cache_unpublished"] is True
+        and value["export_disposition"] == "broker_cleanup"
+        and value["reason"] == "native_export_limit", "cache_incomplete")
+
+
 def _entry_members(
     parent: int, reservation: dict[str, Any], pins: list[_Observed], deadline: float
 ) -> set[str]:
@@ -453,6 +469,9 @@ def _entry_members(
             )
             _need(previous["origin_execution_id"] == origin, "cache_changed")
             _validate_failed_outcome(_read(parent, f"failed-{origin}.outcome.json", pins), previous)
+    if "unpublished.json" in names:
+        _need(names - archives == {"reservation.json", "unpublished.json"}, "cache_incomplete")
+        _validate_unpublished_outcome(_read(parent, "unpublished.json", pins), reservation)
     return names - archives
 
 
@@ -687,6 +706,39 @@ class PythonProjectCacheLease:
         self._fresh = False
 
     @_io_errors()
+    def record_unpublished_capacity(self, *, execution: _Execution, deadline: float) -> None:
+        """After a pre-copy native limit refusal; broker alone owns export cleanup.
+
+        No environment/reference may have been created in the cache. A recorded
+        abort remains consumed, with no failed-install recovery or automatic GC.
+        """
+        self._check(deadline)
+        _need(self._fresh and self.invocation.install_allowed
+            and type(execution) is _Execution and execution.quiet is True
+            and execution.launched is True and execution.stage is not None
+            and execution.invocation == base_python_invocation(self.invocation), "cache_incomplete")
+        _need(self.current(deadline=deadline) is None, "cache_incomplete")
+        assert execution.stage is not None
+        with ExitStack() as stack:
+            pins: list[_Observed] = []
+            stage = _root(execution.stage, 0, stack, pins, stage=True)
+            _open_directory(stage, "export", 0, stack, pins, mode=0o1777)
+            value = {"schema_version": 1, "state": "unpublished_capacity", "phase": "publish",
+                "execution_id": self.invocation.execution_id,
+                "reservation_sha256": hashlib.sha256(_encoded(self.reservation)).hexdigest(),
+                "unit_quiet": True, "cache_unpublished": True,
+                "export_disposition": "broker_cleanup", "reason": "native_export_limit"}
+            _validate_unpublished_outcome(value, self.reservation)
+            for pin in pins:
+                pin.check()
+            self._check(deadline)
+            self._cache._capacity(self._root_parent, deadline, additional=len(_encoded(value)))
+            _write(self._parent, "unpublished.json", value)
+            for pin in pins:
+                pin.check()
+        self._fresh = False
+
+    @_io_errors()
     def publish(
         self,
         source: Path,
@@ -841,9 +893,13 @@ class PythonProjectEnvironmentCache:
 
     @contextmanager
     def reserve(
-        self, invocation: PythonProjectInvocation, *, next_bytes: int, deadline: float
+        self, invocation: PythonProjectInvocation, *, next_bytes: int, deadline: float,
+        adaptive: bool = False, minimum_bytes: int = 1,
+        fresh_check: Callable[[], None] | None = None,
     ) -> Iterator[PythonProjectCacheLease]:
         key = python_project_cache_key(invocation)
+        _need(type(adaptive) is bool and type(minimum_bytes) is int and minimum_bytes > 0
+            and (fresh_check is None or callable(fresh_check)), "cache_invalid")
         _need(type(next_bytes) is int and 0 < next_bytes <= self.policy.max_bytes, "cache_quota")
         with self._locked(deadline) as locked:
             with _io_errors():
@@ -851,9 +907,19 @@ class PythonProjectEnvironmentCache:
                 parent, stack, pins = locked
                 names = self._catalog(parent, deadline)
                 used, free = self._capacity(parent, deadline)
+                def new_budget() -> int:
+                    # Called only under the global cache lock, before any mutation.
+                    selected = min(next_bytes, self.policy.max_bytes - used - _CONTROL_ALLOWANCE,
+                        free - self.policy.disk_reserve_bytes - _CONTROL_ALLOWANCE) if adaptive else next_bytes
+                    _need(selected >= minimum_bytes, "cache_quota")
+                    if fresh_check is not None:
+                        fresh_check()
+                    return selected
+
                 fresh = key not in names
                 if fresh:
                     _need(invocation.install_allowed, "cache_incomplete")
+                    next_bytes = new_budget()
                     self.policy.require_capacity(
                         used_bytes=used, entries=len(names), next_bytes=next_bytes, free_bytes=free
                     )
@@ -880,6 +946,7 @@ class PythonProjectEnvironmentCache:
                             "cache_incomplete",
                         )
                         _need(len(history) < 2 + 2 * _MAX_FAILURES, "cache_quota")
+                        next_bytes = new_budget()
                         self.policy.require_capacity(
                             used_bytes=used,
                             entries=len(names) - 1,
@@ -999,7 +1066,7 @@ class PythonProjectEnvironmentCache:
                         continue
                     members = _entry_members(entry, reservation, pins, deadline)
                     if members != _READY:
-                        _need(members <= _READY | {"failed.json"})
+                        _need(members <= _READY | {"failed.json", "unpublished.json"})
                         continue
                     reference = _reference(_read(entry, "reference.json", pins))
                     _bind_reference(reference, reservation)

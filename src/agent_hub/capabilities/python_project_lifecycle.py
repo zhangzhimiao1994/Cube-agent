@@ -34,6 +34,7 @@ if TYPE_CHECKING:
 _LOGGER = logging.getLogger(__name__)
 _RELEASE_MARKER = "python_project_cache_release"
 _CANCEL_VERSION = 'python_project_cancel_cleanup_version'
+_FAILED_VERSION = 'terminal_failed_python_environment_cleanup_version'
 
 
 class _Repository(Protocol):
@@ -95,10 +96,10 @@ def _uncertain(value: object) -> bool:
     return False
 
 
-def _cancelled_model_history_only(value: object, run_id: UUID) -> bool:
-    """Recognize only the cancelled historical model paths, never rewrite them.
+def _terminal_model_history_only(value: object, run_id: UUID) -> bool:
+    """Recognize only the opted-in terminal model snapshot paths; never rewrite them.
 
-    Caller already holds the terminal run lock and checks cancellation policy,
+    Caller already holds the terminal run lock and checks the persisted policy,
     leases, route and approvals. Root independently fences native consumers.
     """
     if (type(value) is not dict or value.get('phase') != 'running'
@@ -210,7 +211,8 @@ class PythonProjectTerminalHook:
         mode: TaskMode | None,
         routing_decision: dict[str, object],
     ) -> None:
-        if status is not RunStatus.COMPLETED and status is not RunStatus.CANCELLED:
+        if (status is not RunStatus.COMPLETED and status is not RunStatus.CANCELLED
+                and status is not RunStatus.FAILED):
             return
         async with await self.repository.run_transaction() as session, session.begin():
             # Retain the run lock through the RPC, fencing worker/approval writers
@@ -241,12 +243,14 @@ class PythonProjectTerminalHook:
             route = row.routing_decision
             if not isinstance(route, dict) or _RELEASE_MARKER in route or _uncertain(route):
                 return
-            if status is RunStatus.CANCELLED and (
-                type(route.get(_CANCEL_VERSION)) is not int or route[_CANCEL_VERSION] != 1
-                or route.get('source') == 'self_repair'
-                or any(not isinstance(key, str) or key.startswith('self_repair_') for key in route)
-            ):
-                return
+            if status in {RunStatus.CANCELLED, RunStatus.FAILED}:
+                policy = _FAILED_VERSION if status is RunStatus.FAILED else _CANCEL_VERSION
+                # Only the locked, service-persisted opt-in is authority. Never
+                # backfill legacy FAILED rows from callback arguments or history.
+                if (type(route.get(policy)) is not int or route[policy] != 1
+                        or route.get('source') == 'self_repair'
+                        or any(not isinstance(key, str) or key.startswith('self_repair_') for key in route)):
+                    return
             generated = ('generated_project_contract_version' in route
                          or 'generated_project_preparation' in route)
             if generated:
@@ -288,7 +292,8 @@ class PythonProjectTerminalHook:
             ).all()
             if not states or any(
                 not isinstance(state, dict) or (_uncertain(state) and not (
-                    status is RunStatus.CANCELLED and _cancelled_model_history_only(state, run_id)
+                    status in {RunStatus.CANCELLED, RunStatus.FAILED}
+                    and _terminal_model_history_only(state, run_id)
                 )) for state in states
             ):
                 return
@@ -369,6 +374,8 @@ class PythonProjectTerminalHook:
                     RunRow.status == RunStatus.COMPLETED.value,
                     and_(RunRow.status == RunStatus.CANCELLED.value,
                          RunRow.routing_decision.contains({_CANCEL_VERSION: 1})),
+                    and_(RunRow.status == RunStatus.FAILED.value,
+                         RunRow.routing_decision.contains({_FAILED_VERSION: 1})),
                 ),
                 or_(
                     RunRow.routing_decision.contains(

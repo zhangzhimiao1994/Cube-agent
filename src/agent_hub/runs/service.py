@@ -677,6 +677,7 @@ class RunService:
             "engineering_diagnostic_reads_submission_version": 1,
             "engineering_catalog_reads_submission_version": 1,
             "python_dependency_preflight_submission_version": 1,
+            "terminal_failed_python_environment_cleanup_version": 1,
             "engineering_prerequisite_repair_submission_version": 1,
             "engineering_action_admission_submission_version": 1,
             "role_planning_intent_version": 3,

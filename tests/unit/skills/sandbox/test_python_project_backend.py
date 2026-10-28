@@ -510,6 +510,7 @@ def stubbed_context(api: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -
         return recipe.wheels
 
     # Native product IO is separately covered; this fixture models privileged boundaries.
+    monkeypatch.setattr(api, "_minimum_environment_bytes", lambda *args: 3)
     monkeypatch.setattr(api, "retain_python_product", lambda *args, **kwargs: None)
     monkeypatch.setattr(api, "_native", lambda: None)
     monkeypatch.setattr(api, "_roots", roots)
@@ -633,12 +634,9 @@ def test_disk_lock_spans_preflight_through_handler_and_uses_source_copy_budget(
                product_bytes: int = 0) -> None:
         assert events == ["disk_lock"] and config == configured
         assert source_bytes == invocation.source_limit_bytes * (2 if action == "candidate" else 1)
-        assert copying is (action in {"original", "candidate"})
-        assert product_bytes == (invocation.workspace_limit_bytes if copying else 0)
-        assert size == (
-            min(configured.max_environment_bytes, invocation.workspace_limit_bytes)
-            if copying
-            else 0
+        assert copying is False and size == 0
+        assert product_bytes == (
+            invocation.workspace_limit_bytes if action in {"original", "candidate"} else 0
         )
         events.append("preflight")
 
@@ -829,6 +827,8 @@ def test_run_quiesces_before_publication_and_keeps_failure_environment_branch_di
 
     class Lease:
         path = Path("/var/lib/python-project-cache/key")
+        limits = api.ScanLimits(min(api.RootConfig.from_payload(configuration_payload()).max_environment_bytes,
+            invocation.workspace_limit_bytes))
 
         def record_install_failure(self, phase: Any, *, execution: Any, deadline: float) -> None:
             assert type(phase) is PythonPhaseProcessResult and phase.exit_code == 1
@@ -897,7 +897,7 @@ def test_run_quiesces_before_publication_and_keeps_failure_environment_branch_di
     monkeypatch.setattr(api, "_make_export", lambda *args: stage / "export")
     monkeypatch.setattr(api, "_quiesce", quiesce)
     monkeypatch.setattr(
-        api, "_publish_export", lambda lease, *args: lease.publish(stage / "export")
+        api, "_publish_export", lambda lease, *args, **kwargs: lease.publish(stage / "export")
     )
     monkeypatch.setattr(api, "_export_empty", lambda *args: events.append("empty_export"))
     monkeypatch.setattr(api, "run_python_phase", launch)

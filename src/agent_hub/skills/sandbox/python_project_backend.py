@@ -62,6 +62,7 @@ from agent_hub.skills.sandbox.python_project_cache import (
 )
 from agent_hub.skills.sandbox.python_project_command import build_python_project_systemd_command
 from agent_hub.skills.sandbox.python_project_copy import (
+    PythonProjectCopyError,
     _directory_flags,
     _observe,
     _recipe_entries,
@@ -912,6 +913,15 @@ def _export_empty(parent: int, deadline: float, product: bool = False) -> None:
             pin.check()
 
 
+def _minimum_environment_bytes(config: RootConfig, deadline: float) -> int:
+    """Trusted lower bound: the environment requires three physical interpreter files."""
+    raw = _read_no_links(config.runtime_root, ("bin", "python3.12"), max_bytes=config.runtime_max_bytes)
+    _need(bool(raw) and hashlib.sha256(raw).hexdigest() == config.interpreter.binary_sha256,
+        "python_project_runtime_untrusted")
+    _check(deadline)
+    return 3 * len(raw)
+
+
 def _publish_export(
     lease: PythonProjectCacheLease,
     parent: int,
@@ -922,6 +932,7 @@ def _publish_export(
     reported_sha: str,
     deadline: float,
     product: bool = False,
+    *, execution: _Execution | None = None,
 ) -> PythonEnvironmentReference:
     """Only called AFTER manager/cgroup quiescence, never from runner evidence alone."""
     with ExitStack() as stack:
@@ -945,13 +956,22 @@ def _publish_export(
                 "python_project_environment_changed",
             )
         environment = _open_directory(ready, "environment", owner, stack, pins, mode=0o555)
-        _snapshot(environment, owner, ScanLimits(budget), deadline)
-        actual = _observe(
-            export / "ready/environment",
-            inputs.environment_input_sha256,
-            ScanLimits(budget),
-            deadline,
-        )
+        _need(lease.limits.max_bytes <= budget, "python_project_environment_quota")
+        try:
+            _snapshot(environment, owner, lease.limits, deadline)
+            actual = _observe(export / "ready/environment", inputs.environment_input_sha256,
+                lease.limits, deadline)
+        except PythonProjectCopyError as error:
+            if error.reason != "copy_limit":
+                raise
+            # No cache copy has started. Preserve a finite consumed outcome only
+            # after actual unit quiescence; never reinterpret it as install failure.
+            for pin in pins:
+                pin.check()
+            _need(execution is not None and execution.quiet is True)
+            assert execution is not None
+            lease.record_unpublished_capacity(execution=execution, deadline=deadline)
+            raise PythonProjectBackendError("python_project_environment_quota") from None
         _recipe_entries(actual.security_manifest, inputs.interpreter.binary_sha256)
         _need(actual.environment_sha256 == reported_sha, "python_project_environment_changed")
         for pin in pins:
@@ -1224,9 +1244,20 @@ def _run(
         deadline=deadline,
         disk_reserve_bytes=config.cache_policy.disk_reserve_bytes,
     )
-    _disk_budget(config, roots, budget, True, product_bytes=invocation.workspace_limit_bytes)
     cache = PythonProjectEnvironmentCache(config.environment_root, config.cache_policy)
-    with cache.reserve(invocation, next_bytes=budget, deadline=deadline) as lease:
+    minimum = _minimum_environment_bytes(config, deadline)
+    def fresh_check() -> None:
+        # Runner export still has the original producer ceiling. Lowering the
+        # cache copy budget must not lower the temporary-disk safety reserve.
+        try:
+            _disk_budget(config, roots, budget, True, product_bytes=invocation.workspace_limit_bytes)
+        except PythonProjectBackendError as error:
+            if error.code == "python_project_environment_quota":
+                raise PythonProjectCacheError("cache_quota") from None
+            raise
+
+    with cache.reserve(invocation, next_bytes=budget, deadline=deadline,
+            adaptive=True, minimum_bytes=minimum, fresh_check=fresh_check) as lease:
         reused = lease.current(deadline=deadline)
         _disk_budget(config, roots, budget, reused is None,
                      product_bytes=invocation.workspace_limit_bytes)
@@ -1294,10 +1325,11 @@ def _run(
                 export,
                 prepared.inputs,
                 config,
-                budget,
+                lease.limits.max_bytes,
                 payload["environment_sha256"],
                 deadline,
                 payload["status"] == "passed",
+                execution=job,
             )
         else:
             _export_empty(roots.stage_fd, deadline, payload["status"] == "passed")
@@ -1394,14 +1426,13 @@ def execute_python_project_request(
                 and request.invocation.source_kind == "candidate"
                 else 1
             )
-            budget = min(
-                configuration.max_environment_bytes, request.invocation.workspace_limit_bytes
-            )
+            # Initial admission covers staging/product. Environment allocation is
+            # checked after the locked cache lease determines fresh versus reuse.
             _disk_budget(
                 configuration,
                 roots,
-                budget if copying else 0,
-                copying,
+                0,
+                False,
                 source_bytes=request.invocation.source_limit_bytes * source_copies,
                 product_bytes=request.invocation.workspace_limit_bytes if copying else 0,
             )
