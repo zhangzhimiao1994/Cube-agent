@@ -4,7 +4,7 @@ import hashlib
 import json
 import re
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import PureWindowsPath
 from types import MappingProxyType
 from typing import Literal, Self, cast
@@ -25,6 +25,11 @@ _CONTRACT_FIELDS = frozenset({
     "editable_paths", "protected_files", "protected_sha256",
 })
 _ERROR = "invalid project check contract"
+# Preserve the old worst-case JSON path envelope (128 paths of 1024 ASCII bytes).
+# Count is a soft convenience threshold; actual normalized metadata remains bounded.
+EDITABLE_PATHS_SOFT_LIMIT = 128
+EDITABLE_PATHS_MAX_BYTES = EDITABLE_PATHS_SOFT_LIMIT * (1024 + 3) + 1
+EDITABLE_PATHS_MAX_COUNT = min(100_000, (EDITABLE_PATHS_MAX_BYTES - 1) // 4)
 
 
 def _need(condition: object) -> None:
@@ -94,8 +99,9 @@ def _control(path: str) -> bool:
 def _editables(value: object, *, allow_list: bool = False) -> tuple[str, ...]:
     _need(type(value) is tuple or (allow_list and type(value) is list))
     paths = cast(tuple[object, ...] | list[object], value)
-    _need(1 <= len(paths) <= 128)
+    _need(1 <= len(paths) <= EDITABLE_PATHS_MAX_COUNT)
     result = tuple(_path(path) for path in paths)
+    _need(1 + sum(len(path) + 3 for path in result) <= EDITABLE_PATHS_MAX_BYTES)
     _need(not any(_control(path) for path in result))
     _tree(result)
     return tuple(sorted(result))
@@ -107,8 +113,13 @@ def _files(value: object) -> dict[str, str]:
     return dict(sorted(files.items()))
 
 
-def _editable(path: str, scopes: tuple[str, ...]) -> bool:
-    return not _control(path) and any(path == scope or path.startswith(scope + "/") for scope in scopes)
+def _editable(path: str, scopes: tuple[str, ...] | frozenset[str]) -> bool:
+    if _control(path):
+        return False
+    if isinstance(scopes, frozenset):
+        parts = path.split('/')
+        return any('/'.join(parts[:end]) in scopes for end in range(1, len(parts) + 1))
+    return any(path == scope or path.startswith(scope + "/") for scope in scopes)
 
 
 def _layout(scopes: tuple[str, ...], files: Mapping[str, str]) -> None:
@@ -186,6 +197,7 @@ class ProjectCheckContract:
     protected_files: Mapping[str, str]
     protected_sha256: str
     schema_version: Literal[1] = 1
+    _editable_scope_index: frozenset[str] = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         _need(type(self.schema_version) is int and self.schema_version == 1)
@@ -196,16 +208,18 @@ class ProjectCheckContract:
         scopes = _editables(self.editable_paths)
         protected = _files(self.protected_files)
         _layout(scopes, protected)
-        _need(all(path != _DELIVERY_MANIFEST and not _editable(path, scopes) for path in protected))
+        index = frozenset(scopes)
+        _need(all(path != _DELIVERY_MANIFEST and not _editable(path, index) for path in protected))
         binding = _binding(self.tenant_id, self.run_id, self.project_id, self.session_id,
                            self.input_source_sha256, scopes, protected)
         _need(_sha(self.protected_sha256) == _digest(binding))
         object.__setattr__(self, "editable_paths", scopes)
+        object.__setattr__(self, "_editable_scope_index", index)
         object.__setattr__(self, "protected_files", MappingProxyType(protected))
 
     def is_editable(self, relative_path: object) -> bool:
         try:
-            return _editable(_path(relative_path), self.editable_paths)
+            return _editable(_path(relative_path), self._editable_scope_index)
         except ValueError:
             return False
 
@@ -215,7 +229,7 @@ class ProjectCheckContract:
         _spellings((*current, *self.protected_files))
         _need(all(current.get(path) == digest for path, digest in self.protected_files.items()))
         _need(all(path in self.protected_files or path == _DELIVERY_MANIFEST
-                  or _editable(path, self.editable_paths) for path in current))
+                  or _editable(path, self._editable_scope_index) for path in current))
 
     def to_payload(self) -> dict[str, object]:
         return {
@@ -247,8 +261,9 @@ def build_project_check_contract(
     scopes, files = _editables(editable_paths), _files(source_files)
     _layout(scopes, files)
     _need(_sha(input_source_sha256) == _digest(files))
+    index = frozenset(scopes)
     protected = {path: digest for path, digest in files.items()
-                 if path != _DELIVERY_MANIFEST and not _editable(path, scopes)}
+                 if path != _DELIVERY_MANIFEST and not _editable(path, index)}
     binding = _binding(tenant_id, run_id, project_id, session_id, input_source_sha256, scopes, protected)
     return ProjectCheckContract(
         tenant_id=tenant_id, run_id=run_id, project_id=project_id, session_id=session_id,

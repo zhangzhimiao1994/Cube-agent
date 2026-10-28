@@ -134,7 +134,11 @@ def _absent_path(path: str, paths: Sequence[str]) -> bool:
                    or p.casefold().startswith(candidate + '/') for p in paths)
 
 
-def _editables(paths: Sequence[str], request: str, run_id: UUID, python: bool) -> tuple[str, ...]:
+def _editables(
+    paths: Sequence[str], request: str, run_id: UUID, python: bool, *, file_limit: int = 10_000,
+) -> tuple[str, ...]:
+    if type(file_limit) is not int or not 1 <= file_limit <= 100_000:
+        raise ValueError('scope_limit')
     result = [p for p in paths if _implementation(p, python) or p == 'README.md']
     if _absent_path('README.md', paths):
         result.append('README.md')
@@ -148,9 +152,15 @@ def _editables(paths: Sequence[str], request: str, run_id: UUID, python: bool) -
         _need(new_test.casefold() not in {v.casefold() for v in paths})
         _need(not any(new_test.startswith(p + '/') or p.startswith(new_test + '/') for p in paths))
         result.append(new_test)
-    if len(result) > 128:
+    # Existing files plus precisely the absent README/test must fit the SAME native
+    # file budget; do not coalesce exact files into directory write permissions.
+    existing = set(paths)
+    if len(paths) + sum(path not in existing for path in result) > file_limit:
         raise ValueError('scope_limit')
-    return ManagedProjectInput(tuple(result)).editable_paths
+    try:
+        return ManagedProjectInput(tuple(result)).editable_paths
+    except ValueError:
+        raise ValueError('scope_limit') from None
 
 
 async def select_existing(
@@ -242,7 +252,8 @@ async def select_existing(
             require_supported_project_paths(paths)
             if ('pyproject.toml' in paths) == ('package.json' in paths):
                 raise ValueError('unsupported')
-            editable = _editables(paths, context.request, context.run_id, 'pyproject.toml' in paths)
+            editable = _editables(paths, context.request, context.run_id, 'pyproject.toml' in paths,
+                                  file_limit=invocation.file_limit)
             kind = 'original'
         except ValueError as error:
             kind = 'blocked'
@@ -252,6 +263,13 @@ async def select_existing(
         'binding_sha256': _binding(context), 'source_sha256': hashlib.sha256(_encoded(manifest)).hexdigest()}
     if kind == 'original':
         decision['editable_paths'] = editable
+        try:
+            # Keep the existing JSON node/byte budgets, including the duplicate
+            # persisted selection, user route and existing context artifacts.
+            context.model_copy(update={'routing_decision': selected_route(context, decision)}).validated_internal_clone()
+        except (ValueError, TypeError):
+            decision.pop('editable_paths')
+            decision.update(kind='blocked', reason='scope_limit')
     if kind == 'blocked':
         decision['reason'] = reason
     await state_io(expected=reserved, replacement=decision)

@@ -26,7 +26,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from agent_hub.api.dependencies import require_permission
 from agent_hub.api.errors import PublicAPIError, error_responses
 from agent_hub.auth.models import AuthenticatedPrincipal, Role
-from agent_hub.capabilities.project_contracts import ManagedProjectInput
+from agent_hub.capabilities.project_contracts import EDITABLE_PATHS_MAX_COUNT, ManagedProjectInput
 from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.execution_backends import execution_backend_unavailable_reason
 from agent_hub.runs.conversation_queue import (
@@ -284,7 +284,7 @@ class ManagedProjectInputRequest(BaseModel):
 
     schema_version: Literal[1] = 1
     kind: Literal['managed_workspace'] = 'managed_workspace'
-    editable_paths: tuple[str, ...] = Field(min_length=1, max_length=128)
+    editable_paths: tuple[str, ...] = Field(min_length=1, max_length=EDITABLE_PATHS_MAX_COUNT)
 
     @model_validator(mode='before')
     @classmethod

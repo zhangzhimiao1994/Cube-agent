@@ -14,7 +14,12 @@ import re
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, cast
 
-from agent_hub.capabilities.project_contracts import ManagedProjectInput, _editable, _path
+from agent_hub.capabilities.project_contracts import (
+    ManagedProjectInput,
+    _editable,
+    _editables,
+    _path,
+)
 from agent_hub.capabilities.project_verification import _validate_original_diagnostic
 from agent_hub.capabilities.python_project_inputs import PythonInterpreterIdentity
 from agent_hub.capabilities.python_project_receipts import validate_python_passed_receipt
@@ -77,8 +82,10 @@ def _files(artifact: Artifact) -> tuple[Mapping[str, JsonValue], ...]:
     )
     rows = source["files"]
     scopes = source["editable_files"]
-    _need(isinstance(scopes, tuple | list) and len(scopes) <= 128)
+    _need(isinstance(scopes, tuple | list))
     assert isinstance(scopes, tuple | list)
+    if scopes:
+        _editables(tuple(scopes))
     _need(
         len(scopes) == len(set(scopes))
         and all(

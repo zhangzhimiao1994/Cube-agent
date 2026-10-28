@@ -327,11 +327,11 @@ def test_membership_never_expands_invalid_or_control_paths(path: object) -> None
     assert build().is_editable(path) is False
 
 
-def test_explicit_path_count_bound_and_disjoint_scopes() -> None:
+def test_explicit_path_soft_count_and_disjoint_scopes() -> None:
     paths = [f"source_{index}" for index in range(128)]
     assert len(contracts.ManagedProjectInput.from_payload({"editable_paths": paths}).editable_paths) == 128
-    with pytest.raises(ValueError):
-        contracts.ManagedProjectInput.from_payload({"editable_paths": [*paths, "source_128"]})
+    expanded = contracts.ManagedProjectInput.from_payload({"editable_paths": [*paths, "source_128"]})
+    assert len(expanded.editable_paths) == 129
     assert contracts.ManagedProjectInput(("src", "src2")).editable_paths == ("src", "src2")
 
 

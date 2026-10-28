@@ -200,14 +200,15 @@ def test_old_unmarked_context_is_not_selected(tmp_path: Path, monkeypatch: pytes
     assert run(preparer.select_existing(context)) is context
 
 
-def test_scope_limit_is_explicitly_blocked_never_truncated_or_generated(tmp_path: Path) -> None:
+def test_larger_scope_is_selected_exactly_never_truncated_or_generated(tmp_path: Path) -> None:
     preparer, repository, context, path = selector(tmp_path)
     for index in range(130):
         (path / 'src' / f'module_{index}.py').write_text('value = 1')
-    with pytest.raises(RuntimeError, match='automatic project'):
-        run(preparer.select_existing(context))
-    assert repository.row.routing_decision[STATE]['kind'] == 'blocked'
-    assert 'project_input' not in repository.row.routing_decision
+    selected = run(preparer.select_existing(context))
+    assert repository.row.routing_decision[STATE]['kind'] == 'original'
+    editable = ManagedProjectInput.from_payload(selected.routing_decision['project_input']).editable_paths
+    assert len(editable) == 134 and 'src' not in editable
+    assert all(f'src/module_{index}.py' in editable for index in range(130))
 
 
 @pytest.mark.parametrize('message', ['Please add NDJSON if possible', '请增加NDJSON，但先只做计划',
@@ -536,10 +537,10 @@ def test_snapshot_marker_requires_repository_owned_actor_and_read_permission(opt
 
 def test_app_external_registry_still_injects_snapshot_repository(tmp_path: Path) -> None:
     from fastapi.testclient import TestClient
+    from tests.unit.test_action_capability_stack_wiring import _settings
 
     from agent_hub.app import create_app
     from agent_hub.runs.artifacts import PostgresArtifactRepository
-    from tests.unit.test_action_capability_stack_wiring import _settings
     from tests.unit.test_app_wiring import (
         FakeDatabase,
         FakeRedis,
@@ -564,15 +565,15 @@ def test_app_internal_registry_binds_metadata_only_to_real_preparer(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from fastapi.testclient import TestClient
-
-    from agent_hub import app as app_module
-    from agent_hub.capabilities.runtime import RuntimeCapabilityGateway
     from tests.unit.test_action_capability_stack_wiring import (
         RuntimeAdapter,
         _assert_isolated_stacks,
         _capture_builds,
         _settings,
     )
+
+    from agent_hub import app as app_module
+    from agent_hub.capabilities.runtime import RuntimeCapabilityGateway
     from tests.unit.test_app_wiring import (
         FakeDatabase,
         FakeRedis,
@@ -610,11 +611,12 @@ def test_app_internal_registry_binds_metadata_only_to_real_preparer(
 def test_production_worker_bootstrap_shares_private_repository_without_durable_upgrade(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, preparer_available: bool,
 ) -> None:
-    from agent_hub.capabilities.runtime import RuntimeCapabilityGateway
     from tests.unit.test_action_capability_stack_wiring import (
         _assert_isolated_stacks,
         _build_worker,
     )
+
+    from agent_hub.capabilities.runtime import RuntimeCapabilityGateway
 
     original = RuntimeCapabilityGateway.original_project_preparer
     def available_preparer(gateway: RuntimeCapabilityGateway, authorizer: Any) -> Any:
