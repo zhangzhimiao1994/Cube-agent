@@ -29,6 +29,24 @@ _PROHIBITION_V2 = re.compile(
     r"deploy\b(?=[^.;!?]{0,120}\b(?:remote|production)\b)))",
     re.IGNORECASE | re.ASCII | re.DOTALL,
 )
+
+
+_PROHIBITION_V3 = re.compile(
+    r"(?:(?<![a-z0-9_])(?:no|never|without|cannot|can['\u2019]t|do\s+not|will\s+not|"
+    r"don['\u2019]t|must\s+not|should\s+not)\b"
+    r"(?!\s+(?:forget|fail|not|only)\b)|(?:不要|无需|不需要|不用|不必|禁止|不得|不允许|切勿|"
+    r"不能|不可|(?<!不能)(?<!不得)(?<!不要)(?<!不可)(?<!不需要)(?<!不用)(?<!不必)(?<!无需)"
+    r"不(?:修改|改动|更改|启动|运行|执行|部署|安装|增加|新增|扩大|调整))"
+    r"(?!不|忘记|忘了|只|仅))"
+    r".*?(?=$|[;!?。；！？]|\.(?=\s|$)|\n\s*\n|"
+    r"(?<!,)(?<!，)\n\s*(?=(?:deploy|install|build|implement|fix|review|research)\b)|"
+    r",\s*and\s+(?=deploy\b[^.;!?\n]{0,120}\b(?:remote|production)\b)|"
+    r",\s*just\b|\b(?:but|however|instead)\b|但是|但|然而|而是|"
+    r"[,，]\s*(?:(?:must|please|then)\b|只|仅|必须|需要|请|"
+    r"deploy\b(?=[^.;!?]{0,120}\b(?:remote|production)\b)))",
+    re.IGNORECASE | re.ASCII | re.DOTALL,
+)
+
 _DEPLOY_ACTION = re.compile(
     r"(?<![a-z0-9_])deploy(?:s|ed|ing)?\b|\bdeployment\s+(?:to|on|of)\b|\u90e8\u7f72",
     re.IGNORECASE | re.ASCII,
@@ -49,7 +67,7 @@ _HOST_INSTALL = re.compile(
 
 
 def _version(value: object) -> int:
-    if type(value) is not int or value not in (0, 1, 2):
+    if type(value) is not int or value not in (0, 1, 2, 3):
         raise ValueError("unsupported role planning intent version")
     return value
 
@@ -86,7 +104,8 @@ def role_planning_intent_view(task: object, *, version: int = 0) -> str:
         position = end
     else:
         parts.append(text[position:])
-    prohibition = _PROHIBITION_V2 if version == 2 else _PROHIBITION
+    prohibition = (_PROHIBITION_V3 if version == 3 else
+        _PROHIBITION_V2 if version == 2 else _PROHIBITION)
     return prohibition.sub(" ", "".join(parts))
 
 

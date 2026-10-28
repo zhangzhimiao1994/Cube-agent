@@ -474,6 +474,10 @@ class OriginalProjectPreparer:
             type='original_project_observation', producer='original_project_preparer',
             content={'schema_version': 1, 'original_source_sha256': reference.input_source_sha256,
                      'protected_sha256': stored.contract.protected_sha256,
+                     **({'baseline_reference': cast(Mapping[str, JsonValue], reference.to_payload())}
+                        if (python_inputs is None
+                            and type(context.routing_decision.get('role_planning_intent_version')) is int
+                            and context.routing_decision['role_planning_intent_version'] == 3) else {}),
                      'editable_paths': selection.editable_paths, 'observation': saved_observation,
                      'source_context': cast(Mapping[str, JsonValue], source_context),
                      **source_index,

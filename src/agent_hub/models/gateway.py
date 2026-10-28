@@ -7,7 +7,7 @@ import json
 import logging
 import math
 import time
-from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -55,6 +55,7 @@ from agent_hub.models.litellm_client import (
 from agent_hub.models.litellm_client import (
     is_model_negotiation_exhausted as _is_transport_negotiation_exhausted,
 )
+from agent_hub.models.provider_diagnostics import ProviderDiagnostic, get_provider_diagnostic
 from agent_hub.models.registry import ModelRegistry, NoCapableDeployment
 from agent_hub.models.types import (
     Deployment,
@@ -422,6 +423,7 @@ class _GatewayFailureTracking:
     def record(
         self, outcome: Literal["empty_response", "transport_error"],
         status_code: int | None, usage: TokenUsage | None = None,
+        provider_diagnostic: ProviderDiagnostic | None = None,
     ) -> None:
         if self.ordinal == 0 or self.recorded or self.ordinal > MAX_GATEWAY_FAILURE_ATTEMPTS:
             self.history.mark_incomplete(ScopeIncompletePhase.RECORDER,
@@ -452,6 +454,7 @@ class _GatewayFailureTracking:
                     cast(TokenUsage, usage).completion_tokens,
                     cast(TokenUsage, usage).total_tokens,
                 ),
+                provider_diagnostic=provider_diagnostic,
             ))
         except Exception:  # noqa: BLE001 - invalid supplier metadata must fail closed.
             self.history.mark_incomplete(ScopeIncompletePhase.RECORDER,
@@ -968,6 +971,21 @@ class ModelGateway:
     async def stream_openai_compatible_events(
         self, request: ModelRequest
     ) -> AsyncIterator[NormalizedProviderEvent]:
+        history = _GatewayFailureHistory()
+        events = self._stream_with_failure_history(request, history)
+        try:
+            async for event in events:
+                yield event
+        except BaseException as error:
+            if isinstance(error, (ModelTransportError, ModelGatewayError)):
+                history.attach(error, request)
+            raise
+        finally:
+            await events.aclose()
+
+    async def _stream_with_failure_history(
+        self, request: ModelRequest, history: _GatewayFailureHistory,
+    ) -> AsyncGenerator[NormalizedProviderEvent, None]:
         request_deadline = asyncio.get_running_loop().time() + request.timeout_seconds
         streaming_transport = self._streaming_transport()
         last_retryable_error: BaseException | None = None
@@ -980,6 +998,7 @@ class ModelGateway:
             fallback_from_logical_model,
             fallback_reason,
         ) = self._capable_candidate_groups(request)
+        history.attempted_logical_models = attempted_logical_models
         relevant_deployments = tuple(
             deployment
             for _logical_model, candidates in candidate_groups
@@ -1083,6 +1102,7 @@ class ModelGateway:
                 selected_request,
                 streaming_transport,
                 deadline=request_deadline,
+                failure_tracking=_GatewayFailureTracking(history, selected),
             )
             try:
                 while True:
@@ -1458,6 +1478,7 @@ class ModelGateway:
         transport: OpenAICompatibleChunkTransport,
         *,
         deadline: float,
+        failure_tracking: _GatewayFailureTracking | None = None,
     ) -> AsyncIterator[NormalizedProviderEvent]:
         primary_error: BaseException | None = None
         transport_started: float | None = None
@@ -1484,6 +1505,8 @@ class ModelGateway:
             else:
                 transport_started = self._monotonic()
                 should_record = True
+                if failure_tracking is not None:
+                    failure_tracking.enter()
                 stream_primary_error: BaseException | None = None
                 events = self._iterate_stream_with_heartbeat(
                     capacity,
@@ -1541,6 +1564,7 @@ class ModelGateway:
                     primary_error = ModelTransportError(
                         "model transport failed",
                         status_code=error.status_code,
+                        diagnostic=get_provider_diagnostic(error),
                     )
                     error.__traceback__ = None
                     error.__context__ = None
@@ -1556,6 +1580,7 @@ class ModelGateway:
                     ):
                         safe_error = ModelTransportError(
                             "model transport failed", status_code=safe_error.status_code,
+                            diagnostic=get_provider_diagnostic(safe_error),
                         )
                     stream_primary_error = safe_error
                     _LOGGER.error(
@@ -1572,6 +1597,7 @@ class ModelGateway:
                         status_code = safe_error.status_code
                         primary_error = ModelTransportError(
                             "model transport failed", status_code=status_code,
+                            diagnostic=get_provider_diagnostic(safe_error),
                         )
                     else:
                         primary_error = ModelGatewayError("model client internal failure")
@@ -1584,6 +1610,9 @@ class ModelGateway:
                     del api_key
         finally:
             if should_record:
+                if failure_tracking is not None and isinstance(primary_error, ModelTransportError) and not isinstance(primary_error, ModelResponseError):
+                    failure_tracking.record("transport_error", primary_error.status_code,
+                                            provider_diagnostic=get_provider_diagnostic(primary_error))
                 if transport_started is None:  # pragma: no cover - invariant
                     raise ModelGatewayError("model transport timing unavailable")
                 latency = max(0.0, self._monotonic() - transport_started)
@@ -2032,7 +2061,8 @@ class ModelGateway:
             del error
         except ModelTransportError as error:
             if failure_tracking is not None:
-                failure_tracking.record("transport_error", error.status_code)
+                failure_tracking.record("transport_error", error.status_code,
+                                        provider_diagnostic=get_provider_diagnostic(error))
             _LOGGER.warning(
                 "model_transport_failed deployment_id=%s status_code=%s error_type=%s",
                 deployment.id,
@@ -2042,7 +2072,8 @@ class ModelGateway:
             error_type = (ModelNegotiationExhausted if type(error) is ModelNegotiationExhausted
                           else ModelTransportError)
             outcome = _SafeTransportFailure(
-                error_type("model transport failed", status_code=error.status_code)
+                error_type("model transport failed", status_code=error.status_code,
+                           diagnostic=get_provider_diagnostic(error))
             )
             error.__traceback__ = None
             del error
@@ -2053,6 +2084,7 @@ class ModelGateway:
             ):
                 safe_error = ModelTransportError(
                     "model transport failed", status_code=safe_error.status_code,
+                    diagnostic=get_provider_diagnostic(safe_error),
                 )
             _LOGGER.error(
                 "model_transport_unexpected_failure deployment_id=%s error_type=%s",
@@ -2068,9 +2100,11 @@ class ModelGateway:
                 outcome = _SafeTransportFailure(safe_error)
             elif isinstance(safe_error, ModelTransportError):
                 if failure_tracking is not None:
-                    failure_tracking.record("transport_error", safe_error.status_code)
+                    failure_tracking.record("transport_error", safe_error.status_code,
+                                            provider_diagnostic=get_provider_diagnostic(safe_error))
                 outcome = _SafeTransportFailure(
-                    ModelTransportError("model transport failed", status_code=safe_error.status_code)
+                    ModelTransportError("model transport failed", status_code=safe_error.status_code,
+                                        diagnostic=get_provider_diagnostic(safe_error))
                 )
             else:
                 if failure_tracking is not None:

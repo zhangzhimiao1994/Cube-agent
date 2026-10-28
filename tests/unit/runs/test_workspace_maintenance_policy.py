@@ -35,7 +35,7 @@ def test_fresh_submit_persists_independent_policies_without_trusting_channel(mod
     for key in FLAGS:
         assert type(route[key]) is int and route[key] == 1
     assert type(route['role_planning_intent_version']) is int
-    assert route['role_planning_intent_version'] == 2
+    assert route['role_planning_intent_version'] == 3
     assert type(route.get(INTENT_VERSION)) is int and route[INTENT_VERSION] == 2
     assert record['request'] == message and record['actor_id'] == ACTOR_ID and record['actor_role'] is Role.OPERATOR
     assert route['requested_mode'] == mode.value

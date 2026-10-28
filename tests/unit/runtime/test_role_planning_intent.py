@@ -129,7 +129,7 @@ def test_malformed_or_noncontainer_data_tail_is_conservatively_not_role_intent(d
     assert TaskProfile.DEPLOYMENT not in d._task_profiles(message, intent_version=1)
 
 
-@pytest.mark.parametrize('version', [3, -1, True, '1', None, 1.0])
+@pytest.mark.parametrize('version', [4, -1, True, '1', None, 1.0])
 def test_unknown_or_untyped_version_is_rejected_not_silently_upgraded(version: object) -> None:
     for helper in (d._role_planning_task, d._task_profile, d._task_profiles):
         with pytest.raises(ValueError):
@@ -263,7 +263,7 @@ def test_explicit_configured_agent_selection_is_not_replaced(configured: Any, mo
         assert {'chosen_one', 'chosen_two'} <= {agent.id for agent in configured.plans[-1].agents}
 
 
-@pytest.mark.parametrize('version', [None, True, '1', 3])
+@pytest.mark.parametrize('version', [None, True, '1', 4])
 def test_invalid_persisted_marker_rejects_before_gateway_construction(configured: Any, version: object) -> None:
     context = TaskContext(run_id=uuid4(), tenant_id=uuid4(), mode=TaskMode.DISPATCH, request=MESSAGE,
         routing_decision={'role_planning_intent_version': cast(Any, version)})

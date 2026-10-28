@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from typing import Literal, cast
 from uuid import UUID
 
+from agent_hub.models.provider_diagnostics import ProviderDiagnostic
 from agent_hub.models.types import JsonValue, TokenUsage, _require_safe_identifier
 
 MAX_GATEWAY_FAILURE_ATTEMPTS = 64
@@ -61,6 +62,7 @@ class GatewayFailureAttempt:
     status_code: int | None = None
     usage_status: Literal["known", "missing", "invalid"] = "missing"
     usage: TokenUsage | None = None
+    provider_diagnostic: ProviderDiagnostic | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         self._validate()
@@ -96,10 +98,16 @@ class GatewayFailureAttempt:
             raise ValueError("gateway failure unknown usage must be absent")
         if self.outcome == "transport_error" and (self.usage_status != "missing" or self.usage is not None):
             raise ValueError("gateway transport failure cannot contain response usage")
+        if self.provider_diagnostic is not None:
+            if type(self.provider_diagnostic) is not ProviderDiagnostic:
+                raise ValueError("gateway provider diagnostic is invalid")
+            self.provider_diagnostic._validate()
+            if self.outcome != "transport_error" or self.provider_diagnostic.status_code != self.status_code:
+                raise ValueError("gateway provider diagnostic status is invalid")
 
-    def to_payload(self) -> dict[str, JsonValue]:
+    def to_payload(self, *, include_diagnostic: bool = False) -> dict[str, JsonValue]:
         self._validate()
-        return {
+        result: dict[str, JsonValue] = {
             "ordinal": self.ordinal,
             "provenance": {
                 "logical_model": self.logical_model,
@@ -117,6 +125,10 @@ class GatewayFailureAttempt:
                 "total_tokens": self.usage.total_tokens,
             },
         }
+        if include_diagnostic or self.provider_diagnostic is not None:
+            result["provider_diagnostic"] = (None if self.provider_diagnostic is None else
+                                             cast(JsonValue, self.provider_diagnostic.to_payload()))
+        return result
 
 
 @dataclass(frozen=True, slots=True)
@@ -177,8 +189,9 @@ class GatewayFailureReceipt:
 
     def to_payload(self) -> dict[str, JsonValue]:
         self._validate()
+        diagnostic_version = any(attempt.provider_diagnostic is not None for attempt in self.attempts)
         return {
-            "schema_version": 1,
+            "schema_version": 2 if diagnostic_version else 1,
             "source": "model_gateway",
             "call_id": self.call_id,
             "requested_logical_model": self.requested_logical_model,
@@ -186,7 +199,7 @@ class GatewayFailureReceipt:
             "disposition": "failed",
             "history_complete": self.history_complete,
             "attempted_logical_models": cast(JsonValue, list(self.attempted_logical_models)),
-            "attempts": cast(JsonValue, [attempt.to_payload() for attempt in self.attempts]),
+            "attempts": cast(JsonValue, [attempt.to_payload(include_diagnostic=diagnostic_version) for attempt in self.attempts]),
         }
 
     @classmethod
@@ -195,7 +208,7 @@ class GatewayFailureReceipt:
         try:
             raw = _exact_object(value, _RECEIPT_KEYS)
             if (
-                type(raw["schema_version"]) is not int or raw["schema_version"] != 1
+                type(raw["schema_version"]) is not int or raw["schema_version"] not in (1, 2)
                 or type(raw["source"]) is not str or raw["source"] != "model_gateway"
                 or type(raw["disposition"]) is not str or raw["disposition"] != "failed"
             ):
@@ -208,7 +221,7 @@ class GatewayFailureReceipt:
                 raise ValueError
             attempts = []
             for item in items:
-                attempt = _exact_object(item, _ATTEMPT_KEYS)
+                attempt = _exact_object(item, _ATTEMPT_KEYS | ({"provider_diagnostic"} if raw["schema_version"] == 2 else set()))
                 provenance = _exact_object(attempt["provenance"], _PROVENANCE_KEYS)
                 if type(attempt["transport_state"]) is not str or attempt["transport_state"] != "entered":
                     raise ValueError
@@ -231,7 +244,11 @@ class GatewayFailureReceipt:
                     status_code=cast(int | None, attempt["status_code"]),
                     usage_status=cast(Literal["known", "missing", "invalid"], attempt["usage_status"]),
                     usage=usage,
+                    provider_diagnostic=(None if attempt.get("provider_diagnostic") is None else
+                                         ProviderDiagnostic.from_payload(attempt["provider_diagnostic"])),
                 ))
+            if raw["schema_version"] == 2 and not any(item.provider_diagnostic is not None for item in attempts):
+                raise ValueError
             return cls(
                 call_id=cast(str, raw["call_id"]),
                 requested_logical_model=cast(str, raw["requested_logical_model"]),

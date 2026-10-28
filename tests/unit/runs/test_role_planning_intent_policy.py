@@ -58,7 +58,7 @@ async def test_fresh_submission_persists_intent_version_without_changing_executi
     route = created["routing_decision"]
     assert isinstance(route, dict)
     assert type(route["role_planning_intent_version"]) is int
-    assert route["role_planning_intent_version"] == 2
+    assert route["role_planning_intent_version"] == 3
     assert created["request"] == message
     assert created["actor_id"] == ACTOR_ID
     assert created["actor_role"] is Role.OPERATOR
@@ -92,7 +92,7 @@ async def test_fresh_auto_route_persists_intent_version() -> None:
     assert isinstance(route, dict)
     assert route["requested_mode"] == "auto"
     assert type(route["role_planning_intent_version"]) is int
-    assert route["role_planning_intent_version"] == 2
+    assert route["role_planning_intent_version"] == 3
 
 
 @pytest.mark.parametrize("version", (None, 0, 1, 2))

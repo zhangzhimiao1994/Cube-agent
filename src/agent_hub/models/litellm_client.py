@@ -17,8 +17,14 @@ from openai import (
     BadRequestError,
 )
 
+from agent_hub.models import provider_diagnostics
 from agent_hub.models.failure_receipt import _valid_usage
 from agent_hub.models.native_messages import NativeAssistantMessage, NativeToolCall
+from agent_hub.models.provider_diagnostics import (
+    ProviderDiagnostic,
+    RequestShape,
+    get_provider_diagnostic,
+)
 from agent_hub.models.responses import (
     ResponsesContractError,
     parse_response,
@@ -114,13 +120,22 @@ class HTTPClientFactory(Protocol):
 class ModelTransportError(RuntimeError):
     """Stable, redacted model transport failure."""
 
-    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+    def __init__(self, message: str, *, status_code: int | None = None,
+                 diagnostic: ProviderDiagnostic | None = None) -> None:
         if status_code is not None and (
             type(status_code) is not int or not 100 <= status_code <= 599
         ):
             raise ValueError("status_code must be None or between 100 and 599")
         super().__init__(message)
         self.status_code = status_code
+        self.provider_diagnostic: ProviderDiagnostic | None = None
+        try:
+            if type(diagnostic) is ProviderDiagnostic and diagnostic.status_code == status_code:
+                diagnostic._validate()
+                self.provider_diagnostic = diagnostic
+                provider_diagnostics._attach_provider_diagnostic(self, diagnostic)
+        except Exception:  # noqa: BLE001 - optional evidence must never replace the primary error.
+            self.provider_diagnostic = None
 
 
 class ModelClientError(RuntimeError):
@@ -137,12 +152,14 @@ class ModelResponseError(ModelTransportError):
     def __init__(
         self, message: str, *, status_code: int | None = None,
         evidence: RejectedOutputEvidence | None = None,
+        diagnostic: ProviderDiagnostic | None = None,
     ) -> None:
         if evidence is not None and not isinstance(evidence, RejectedOutputEvidence):
             raise TypeError("evidence must be RejectedOutputEvidence or None")
         super().__init__(
             "model response rejected" if evidence is not None else message,
             status_code=status_code,
+            diagnostic=diagnostic,
         )
         self.evidence = evidence
 
@@ -190,6 +207,7 @@ def _safe_response_error(error: ModelResponseError) -> ModelResponseError:
     error_type = ModelNegotiatedResponseError if type(error) is ModelNegotiatedResponseError else ModelResponseError
     return error_type(
         "model response rejected", status_code=error.status_code, evidence=error.evidence,
+        diagnostic=get_provider_diagnostic(error),
     )
 
 
@@ -202,9 +220,10 @@ class _NegotiatedOutcome:
     def __init__(self, outcome: ModelResponse | Exception | _CancelledOutcome) -> None:
         if isinstance(outcome, ModelResponseError):
             outcome = ModelNegotiatedResponseError("model response rejected",
-                status_code=outcome.status_code, evidence=outcome.evidence)
+                status_code=outcome.status_code, evidence=outcome.evidence, diagnostic=get_provider_diagnostic(outcome))
         elif isinstance(outcome, ModelTransportError):
-            outcome = ModelNegotiationExhausted("model parameter negotiation failed", status_code=outcome.status_code)
+            outcome = ModelNegotiationExhausted("model parameter negotiation failed", status_code=outcome.status_code,
+                                               diagnostic=get_provider_diagnostic(outcome))
         elif isinstance(outcome, ModelClientError):
             outcome = ModelNegotiatedClientError("model client internal failure")
         self.outcome = outcome
@@ -578,12 +597,34 @@ def _parse_response(
         raise rejected(reason, choice=choice, content=content) from None
 
 
+def _capture_provider_diagnostic(error: object, shape: RequestShape | None,
+                                prior: ProviderDiagnostic | None = None) -> ProviderDiagnostic | None:
+    try:
+        value = provider_diagnostics.capture_error(error, shape, prior)
+        if type(value) is ProviderDiagnostic:
+            value._validate()
+            return value
+        return None
+    except Exception:  # noqa: BLE001 - optional capture failure is not a new model outcome.
+        return None
+
+
+def _request_shape(payload: object, protocol: str, ordinal: int, request: ModelRequest) -> RequestShape | None:
+    try:
+        return provider_diagnostics.make_request_shape(payload, protocol, send_ordinal=ordinal,
+                                                       native_continuation=request.native_tool_continuation)
+    except Exception:  # noqa: BLE001 - shape capture is optional and cannot reject a request.
+        return None
+
+
 def safe_model_client_error(
     deployment_id: str,
     error: Exception,
     sensitive_values: Sequence[str],
+    *, request_shape: RequestShape | None = None, prior_diagnostic: ProviderDiagnostic | None = None,
 ) -> ModelTransportError | ModelClientError:
     """Classify provider failures without retaining raw exception text or context."""
+    diagnostic = _capture_provider_diagnostic(error, request_shape, prior_diagnostic)
     if type(error) is ModelNegotiatedClientError:
         return ModelNegotiatedClientError("model client internal failure")
     if isinstance(error, ModelResponseError):
@@ -618,6 +659,7 @@ def safe_model_client_error(
     return error_type(
         f"model transport failed for deployment {deployment_id!r}{suffix}",
         status_code=safe_status,
+        diagnostic=diagnostic,
     )
 
 
@@ -674,11 +716,13 @@ class _OpenAICompatibleChunkStream:
         deployment_id: str,
         sensitive_values: Sequence[str],
         timeout: float,
+        request_shape: list[RequestShape | None] | None = None,
     ) -> None:
         self._start: Callable[[], Awaitable[tuple[_OpenAIClient, object]]] | None = start
         self._deployment_id = deployment_id
         self._sensitive_values = tuple(sensitive_values)
         self._timeout = timeout
+        self._request_shape = request_shape
         self._deadline: float | None = None
         self._client: _OpenAIClient | None = None
         self._iterator: AsyncIterator[object] | None = None
@@ -723,6 +767,7 @@ class _OpenAICompatibleChunkStream:
                 self._deployment_id,
                 error,
                 self._sensitive_values,
+                request_shape=None if self._request_shape is None else self._request_shape[0],
             )
         finally:
             if self._response_body is not None:
@@ -877,11 +922,13 @@ class LiteLLMClient:
         if request.response_schema is not None and deployment.structured_output_api == "responses":
             raise ValueError("structured Responses streaming is not supported")
         sensitive_values = _sensitive_values(request, api_key)
+        shape: list[RequestShape | None] = [None]
         return _OpenAICompatibleChunkStream(
-            lambda: self._start_stream(deployment, request, api_key, sensitive_values),
+            lambda: self._start_stream(deployment, request, api_key, sensitive_values, shape),
             deployment_id=deployment.id,
             sensitive_values=sensitive_values,
             timeout=request.timeout_seconds,
+            request_shape=shape,
         )
 
     async def _complete_outcome(
@@ -906,6 +953,7 @@ class LiteLLMClient:
         response: object | None = None
         safe_failure: ModelTransportError | ModelClientError | None = None
         negotiated = False
+        shape: RequestShape | None = None
         try:
             client = self._client_factory(
                 api_key=api_key,
@@ -917,6 +965,7 @@ class LiteLLMClient:
                 request,
                 stream=False,
             )
+            shape = _request_shape(create_kwargs, "chat_completions", 1, request)
             response = await client.chat.completions.create(**create_kwargs)
             parsed = _parse_response(response, deployment.id, sensitive_values,
                                      native_tool_continuation=request.native_tool_continuation)
@@ -926,6 +975,7 @@ class LiteLLMClient:
         except ModelResponseError as error:
             safe_failure = _safe_response_error(error)
         except Exception as error:  # noqa: BLE001 - redact every SDK/network failure
+            prior = _capture_provider_diagnostic(error, shape)
             if (
                 client is not None
                 and create_kwargs is not None
@@ -934,6 +984,7 @@ class LiteLLMClient:
             ):
                 negotiated = True
                 negotiated_kwargs = {**create_kwargs, "tool_choice": "auto", "timeout": negotiation_remaining}
+                shape = _request_shape(negotiated_kwargs, "chat_completions", 2, request)
                 try:
                     response = await client.chat.completions.create(**negotiated_kwargs)
                     parsed = _parse_response(response, deployment.id, sensitive_values,
@@ -944,7 +995,8 @@ class LiteLLMClient:
                 except ModelResponseError as retry_error:
                     safe_failure = _safe_response_error(retry_error)
                 except Exception as retry_error:  # noqa: BLE001 - consume once; never chain negotiations.
-                    safe_failure = safe_model_client_error(deployment.id, retry_error, sensitive_values)
+                    safe_failure = safe_model_client_error(deployment.id, retry_error, sensitive_values,
+                                                           request_shape=shape, prior_diagnostic=prior)
             elif (
                 client is not None
                 and create_kwargs is not None
@@ -952,6 +1004,7 @@ class LiteLLMClient:
             ):
                 legacy_kwargs = dict(create_kwargs)
                 legacy_kwargs["max_tokens"] = legacy_kwargs.pop("max_completion_tokens")
+                shape = _request_shape(legacy_kwargs, "chat_completions", 2, request)
                 try:
                     response = await client.chat.completions.create(**legacy_kwargs)
                     parsed = _parse_response(response, deployment.id, sensitive_values,
@@ -966,6 +1019,7 @@ class LiteLLMClient:
                         deployment.id,
                         retry_error,
                         sensitive_values,
+                        request_shape=shape, prior_diagnostic=prior,
                     )
             elif (
                 client is not None
@@ -979,6 +1033,7 @@ class LiteLLMClient:
                     base_url=cast(str, _api_base_with_v1(deployment.api_base)),
                     max_retries=0,
                 )
+                shape = _request_shape(create_kwargs, "chat_completions", 2, request)
                 try:
                     response = await client.chat.completions.create(**create_kwargs)
                     parsed = _parse_response(response, deployment.id, sensitive_values,
@@ -993,9 +1048,10 @@ class LiteLLMClient:
                         deployment.id,
                         retry_error,
                         sensitive_values,
+                        request_shape=shape, prior_diagnostic=prior,
                     )
             else:
-                safe_failure = safe_model_client_error(deployment.id, error, sensitive_values)
+                safe_failure = safe_model_client_error(deployment.id, error, sensitive_values, request_shape=shape)
 
         if safe_failure is not None:
             if client is not None:
@@ -1025,6 +1081,7 @@ class LiteLLMClient:
         except ResponsesContractError:
             return ModelResponseError("model response contract configuration rejected")
         sensitive_values = _sensitive_values(request, api_key)
+        shape = _request_shape(kwargs, "responses", 1, request)
         client: _OpenAIClient | None = None
         outcome: ModelResponse | Exception | _CancelledOutcome
         try:
@@ -1041,7 +1098,7 @@ class LiteLLMClient:
         except ResponsesContractError as error:
             outcome = ModelResponseError("model response rejected", evidence=error.evidence)
         except Exception as error:  # noqa: BLE001 - preserve the safe transport boundary
-            outcome = safe_model_client_error(deployment.id, error, sensitive_values)
+            outcome = safe_model_client_error(deployment.id, error, sensitive_values, request_shape=shape)
         if client is not None:
             close_error = await _close_received_client(client.close, request.timeout_seconds)
             if isinstance(close_error, asyncio.CancelledError):
@@ -1054,6 +1111,7 @@ class LiteLLMClient:
         request: ModelRequest,
         api_key: str,
         sensitive_values: Sequence[str],
+        shape_sink: list[RequestShape | None] | None = None,
     ) -> tuple[_OpenAIClient, object]:
         client = self._client_factory(
             api_key=api_key,
@@ -1061,6 +1119,9 @@ class LiteLLMClient:
             max_retries=0,
         )
         create_kwargs = _chat_completion_create_kwargs(deployment, request, stream=True)
+        shape = _request_shape(create_kwargs, "chat_completions", 1, request)
+        if shape_sink is not None:
+            shape_sink[0] = shape
         try:
             stream = await client.chat.completions.create(**create_kwargs)
             return client, stream
@@ -1068,9 +1129,13 @@ class LiteLLMClient:
             await _close_ignoring_failures(client)
             raise
         except Exception as error:  # noqa: BLE001 - startup failures need compatibility retries
+            prior = _capture_provider_diagnostic(error, shape)
             if _should_retry_with_legacy_max_tokens(error):
                 legacy_kwargs = dict(create_kwargs)
                 legacy_kwargs["max_tokens"] = legacy_kwargs.pop("max_completion_tokens")
+                shape = _request_shape(legacy_kwargs, "chat_completions", 2, request)
+                if shape_sink is not None:
+                    shape_sink[0] = shape
                 try:
                     stream = await client.chat.completions.create(**legacy_kwargs)
                     return client, stream
@@ -1084,6 +1149,7 @@ class LiteLLMClient:
                         deployment.id,
                         retry_error,
                         sensitive_values,
+                        request_shape=shape, prior_diagnostic=prior,
                     ) from None
             if _should_retry_root_base_with_v1(error, deployment.api_base):
                 if await _close_ignoring_failures(client):
@@ -1093,6 +1159,9 @@ class LiteLLMClient:
                     base_url=cast(str, _api_base_with_v1(deployment.api_base)),
                     max_retries=0,
                 )
+                shape = _request_shape(create_kwargs, "chat_completions", 2, request)
+                if shape_sink is not None:
+                    shape_sink[0] = shape
                 try:
                     stream = await client.chat.completions.create(
                         **create_kwargs
@@ -1108,10 +1177,11 @@ class LiteLLMClient:
                         deployment.id,
                         retry_error,
                         sensitive_values,
+                        request_shape=shape, prior_diagnostic=prior,
                     ) from None
             if await _close_ignoring_failures(client):
                 raise asyncio.CancelledError
-            raise safe_model_client_error(deployment.id, error, sensitive_values) from None
+            raise safe_model_client_error(deployment.id, error, sensitive_values, request_shape=shape) from None
 
     async def _messages_outcome(
         self,
@@ -1122,6 +1192,8 @@ class LiteLLMClient:
         sensitive_values = _sensitive_values(request, api_key)
         client = self._http_client_factory(timeout=request.timeout_seconds)
         outcome: ModelResponse | Exception | _CancelledOutcome
+        wire_payload = _messages_endpoint_payload(deployment, request)
+        shape = _request_shape(wire_payload, "messages", 1, request)
         try:
             response = await client.post(
                 deployment.api_base,
@@ -1129,12 +1201,17 @@ class LiteLLMClient:
                     "Authorization": f"Bearer {api_key}",
                     "Content-Type": "application/json",
                 },
-                json=_messages_endpoint_payload(deployment, request),
+                json=wire_payload,
             )
             if response.status_code >= 400:
+                try:
+                    diagnostic = provider_diagnostics.capture_response(response, shape)
+                except Exception:  # noqa: BLE001 - preserve the original HTTP failure.
+                    diagnostic = None
                 outcome = ModelTransportError(
                     f"messages endpoint failed for deployment {deployment.id!r}",
                     status_code=response.status_code,
+                    diagnostic=diagnostic,
                 )
             else:
                 try:
@@ -1151,7 +1228,7 @@ class LiteLLMClient:
         except ModelResponseError as error:
             outcome = _safe_response_error(error)
         except Exception as error:  # noqa: BLE001 - redact direct HTTP/provider failures
-            outcome = safe_model_client_error(deployment.id, error, sensitive_values)
+            outcome = safe_model_client_error(deployment.id, error, sensitive_values, request_shape=shape)
         close_error = await _close_received_client(client.aclose, request.timeout_seconds)
         if isinstance(close_error, asyncio.CancelledError):
             return _cancelled_outcome(outcome)

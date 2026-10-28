@@ -67,6 +67,7 @@ from agent_hub.runtime.delivery_followup import delivery_followup_guidance
 from agent_hub.runtime.direct import DirectRuntime
 from agent_hub.runtime.engineering_admission import _required as engineering_scope
 from agent_hub.runtime.engineering_admission import with_engineering_admission
+from agent_hub.runtime.engineering_role_context import engineering_software_context
 from agent_hub.runtime.hermes_context import runtime_memory_context_text
 from agent_hub.runtime.hybrid import HybridRuntime
 from agent_hub.runtime.project_preflight_context import project_preflight_context_text
@@ -1097,6 +1098,7 @@ class ConfigBackedDispatchRuntime:
             routing_decision=context.routing_decision,
         )
         deployment_constraint = _deployment_routing_constraint(config, context.routing_decision)
+        profile, profiles = _context_task_profiles(context, intent_version=intent_version)
         selected_roles = _selected_config_role_assignments(
             context,
             config,
@@ -1110,8 +1112,8 @@ class ConfigBackedDispatchRuntime:
                 RolePlanningRequest(
                     task=_role_planning_task(context.request, intent_version=intent_version),
                     mode=TaskMode.DISPATCH,
-                    profile=_task_profile(context.request, intent_version=intent_version),
-                    profiles=_task_profiles(context.request, intent_version=intent_version),
+                    profile=profile,
+                    profiles=profiles,
                     high_risk=_high_risk_task(context.request),
                     requested_skills=_requested_skills(context),
                     default_model=logical_model,
@@ -1303,6 +1305,7 @@ class ConfigBackedDiscussionRuntime:
             routing_decision=context.routing_decision,
         )
         deployment_constraint = _deployment_routing_constraint(config, context.routing_decision)
+        profile, profiles = _context_task_profiles(context, intent_version=intent_version)
         selected_roles = _selected_config_role_assignments(
             context,
             config,
@@ -1316,8 +1319,8 @@ class ConfigBackedDiscussionRuntime:
                 RolePlanningRequest(
                     task=_role_planning_task(context.request, intent_version=intent_version),
                     mode=TaskMode.DISCUSS,
-                    profile=_task_profile(context.request, intent_version=intent_version),
-                    profiles=_task_profiles(context.request, intent_version=intent_version),
+                    profile=profile,
+                    profiles=profiles,
                     high_risk=_high_risk_task(context.request),
                     requested_skills=_requested_skills(context),
                     default_model=logical_model,
@@ -1486,8 +1489,7 @@ class ConfigBackedHybridRuntime:
             routing_decision=context.routing_decision,
         )
         deployment_constraint = _deployment_routing_constraint(config, context.routing_decision)
-        profile = _task_profile(context.request, intent_version=intent_version)
-        profiles = _task_profiles(context.request, intent_version=intent_version)
+        profile, profiles = _context_task_profiles(context, intent_version=intent_version)
         high_risk = _high_risk_task(context.request)
         selected_dispatch_roles = _selected_config_role_assignments(
             context,
@@ -4944,12 +4946,35 @@ def _role_planning_task(task: object, *, intent_version: int = 0) -> str:
     return f"{text[:prefix_length].rstrip()}{marker}{text[-suffix_length:].lstrip()}"
 
 
+def _context_task_profiles(
+    context: TaskContext, *, intent_version: int,
+) -> tuple[TaskProfile, tuple[TaskProfile, ...]]:
+    profile = _task_profile(context.request, intent_version=intent_version)
+    profiles = _task_profiles(context.request, intent_version=intent_version)
+    if intent_version == 3 and engineering_software_context(context):
+        return TaskProfile.SOFTWARE, (
+            TaskProfile.SOFTWARE,
+            *(value for value in profiles if value not in (TaskProfile.SOFTWARE, TaskProfile.GENERAL)),
+            TaskProfile.GENERAL,
+        )
+    return profile, profiles
+
+
+def _software_task(text: str, *, intent_version: int) -> bool:
+    return any(keyword in text for keyword in _SOFTWARE_TASK_KEYWORDS) or (
+        intent_version == 3 and re.search(
+            r"(?<![a-z0-9_])(?:cli|command[- ]line)(?![a-z0-9_])|命令行(?:工具|程序|应用)",
+            text,
+        ) is not None
+    )
+
+
 def _task_profile(task: object, *, intent_version: int = 0) -> TaskProfile:
     text = role_planning_intent_view(task, version=intent_version).lower()
-    if (deployment_intent(text) if intent_version == 2 else
+    if (deployment_intent(text) if intent_version >= 2 else
             any(keyword in text for keyword in ("deploy", "部署", "install", "安装", "server"))):
         return TaskProfile.DEPLOYMENT
-    if any(keyword in text for keyword in _SOFTWARE_TASK_KEYWORDS):
+    if _software_task(text, intent_version=intent_version):
         return TaskProfile.SOFTWARE
     if any(keyword in text for keyword in ("research", "调研", "分析", "报告", "市场")):
         return TaskProfile.RESEARCH
@@ -4961,10 +4986,10 @@ def _task_profile(task: object, *, intent_version: int = 0) -> TaskProfile:
 def _task_profiles(task: object, *, intent_version: int = 0) -> tuple[TaskProfile, ...]:
     text = role_planning_intent_view(task, version=intent_version).lower()
     profiles: list[TaskProfile] = []
-    if (deployment_intent(text) if intent_version == 2 else
+    if (deployment_intent(text) if intent_version >= 2 else
             any(keyword in text for keyword in ("deploy", "部署", "install", "安装", "server"))):
         profiles.append(TaskProfile.DEPLOYMENT)
-    if any(keyword in text for keyword in _SOFTWARE_TASK_KEYWORDS):
+    if _software_task(text, intent_version=intent_version):
         profiles.append(TaskProfile.SOFTWARE)
     if any(
         keyword in text

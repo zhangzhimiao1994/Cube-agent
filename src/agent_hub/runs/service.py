@@ -679,7 +679,7 @@ class RunService:
             "python_dependency_preflight_submission_version": 1,
             "engineering_prerequisite_repair_submission_version": 1,
             "engineering_action_admission_submission_version": 1,
-            "role_planning_intent_version": 2,
+            "role_planning_intent_version": 3,
             "workspace_maintenance_contract_version": 1,
             "workspace_maintenance_intent_version": 2,
             "post_tool_finalization_growth_version": 1,
