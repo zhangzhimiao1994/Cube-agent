@@ -171,6 +171,7 @@ from agent_hub.runtime.self_repair_context import (
     project_repair_failure_text,
     self_repair_context_text,
 )
+from agent_hub.runtime.source_preview_projection import project_source_preview
 from agent_hub.subprocess_cleanup import ProcessCleanupIncomplete
 
 _ID = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,127}$")
@@ -292,9 +293,13 @@ def _bounded_prompt_json(value: object, *, max_text_bytes: int) -> object:
 
 
 def _artifact_prompt_content(artifact: Artifact) -> object:
-    return _bounded_prompt_json(
+    content = _bounded_prompt_json(
         artifact.content, max_text_bytes=_MAX_SOURCE_ARTIFACT_TEXT_BYTES
     )
+    content, notice = project_source_preview(artifact, content)
+    if notice is not None and isinstance(content, Mapping):
+        return {**content, 'source_preview': notice}
+    return content
 
 
 def _artifact_text_preview(artifact: Artifact, *, max_bytes: int = 2_000) -> str | None:

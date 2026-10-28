@@ -77,6 +77,7 @@ from agent_hub.runtime.project_scale_artifact import (
     project_scale_artifact_zip_files,
 )
 from agent_hub.runtime.self_repair_context import self_repair_context_text
+from agent_hub.runtime.source_preview_projection import source_preview_excerpt
 from agent_hub.skills.sandbox.python_dependency_protocol import PythonDependencyClosureError
 from agent_hub.skills.sandbox.python_input_supply_protocol import SupplyError
 from agent_hub.skills.sandbox.python_metadata_preparation_client import PUBLIC_FAILURE_CODES
@@ -1377,11 +1378,13 @@ def _serialized_prior_artifacts(
     entries: list[dict[str, object]] = []
     source_ids: list[str] = []
     source_texts: list[str | None] = []
+    original_sources: dict[int, Artifact] = {}
     for artifact in artifacts:
         artifact_text: object
         if include_original and artifact.type == "original_project_observation":
             artifact_text = json.dumps(dict(artifact.content), default=dict, ensure_ascii=False,
                                        allow_nan=False, sort_keys=True, separators=(",", ":"))
+            original_sources[len(entries)] = artifact
         elif artifact.type == "text":
             artifact_text = artifact.content.get("text")
         else:
@@ -1418,6 +1421,10 @@ def _serialized_prior_artifacts(
             max_tokens=per_artifact_tokens,
             max_bytes=per_artifact_bytes,
         )
+        if index in original_sources:
+            notice = source_preview_excerpt(original_sources[index], text, cast(str, entries[index]["text"]))
+            if notice is not None:
+                entries[index]['source_preview'] = notice
         candidate = json.dumps(
             {
                 "artifacts": entries,
@@ -1427,12 +1434,13 @@ def _serialized_prior_artifacts(
             allow_nan=False,
             sort_keys=True,
             separators=(",", ":"),
-        )
+        ).replace("<", "\\u003c").replace(">", "\\u003e")
         if (
             len(candidate.encode("utf-8")) > bounded_byte_budget
             or _estimate_text_tokens(candidate) > bounded_token_budget
         ):
             entries[index].pop("text", None)
+            entries[index].pop('source_preview', None)
             continue
         included_text += 1
 

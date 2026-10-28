@@ -123,6 +123,7 @@ from agent_hub.runtime.generated_draft_feedback import (
     generated_draft_history_feedback,
 )
 from agent_hub.runtime.project_prerequisite_feedback import project_prerequisite_feedback
+from agent_hub.runtime.source_preview_projection import project_source_preview
 
 if TYPE_CHECKING:
     from agent_hub.runtime.provider_continuation import ProviderContinuationRepository
@@ -1524,6 +1525,9 @@ def _artifact_prompt_payload(
     payload["content"] = _bounded_prompt_json(
         content, max_text_bytes=max_text_bytes
     )
+    payload["content"], notice = project_source_preview(artifact, payload["content"])
+    if notice is not None:
+        payload["source_preview"] = notice
     return payload
 
 
@@ -1551,6 +1555,9 @@ def _artifact_final_synthesis_payload(
         "mode": "summary",
         "note": "Full artifact is stored separately; this final synthesis input is bounded to keep production model calls reliable.",
     }
+    payload["content"], notice = project_source_preview(artifact, payload["content"])
+    if notice is not None:
+        payload["source_preview"] = notice
     return payload
 
 
@@ -1579,6 +1586,9 @@ def _artifact_review_packet_payload(
             artifact.content,
             max_text_bytes=512,
         )
+        packet["content_preview"], notice = project_source_preview(artifact, packet["content_preview"])
+        if notice is not None:
+            packet["source_preview"] = notice
     return {"artifact_review_packet": packet}
 
 
