@@ -34,7 +34,7 @@ from agent_hub.capabilities.scoped_read import _read_no_links, authorized_worksp
 from agent_hub.domain.runs import RunStatus
 from agent_hub.harness.tool_gateway import HarnessToolGateway
 from agent_hub.harness.types import HarnessToolCallRequest
-from agent_hub.runs.project_source_context import original_source_context
+from agent_hub.runs.project_source_context import OriginalSourceContext, original_source_context
 from agent_hub.runs.repository import (
     RunConflict,
     RunRecord,
@@ -474,47 +474,41 @@ class OriginalProjectPreparer:
                     != reference.input_source_sha256):
             raise RuntimeError(_FAILURE)
         saved_observation = validate_observation(saved_observation)
-        source_context = await asyncio.to_thread(
-            original_source_context, stored, byte_budget=min(96_000, max(4096, context.token_budget)),
-        )
         source_index: Mapping[str, JsonValue] = {}
         if python_inputs is not None:
             source_index = {'python_source_index': await asyncio.to_thread(
                 python_original_source_index, stored, source_limit_bytes=invocation.source_limit_bytes,
                 file_limit=invocation.file_limit)}
-        artifact = Artifact(
-            id=uuid5(NAMESPACE_URL, f'original-project:{context.tenant_id}:{context.run_id}:'
-                     f'{state["observation_sha256"]}'),
-            type='original_project_observation', producer='original_project_preparer',
-            content={'schema_version': 1, 'original_source_sha256': reference.input_source_sha256,
-                     'protected_sha256': stored.contract.protected_sha256,
-                     **({'baseline_reference': cast(Mapping[str, JsonValue], reference.to_payload())}
-                        if (python_inputs is None
-                            and type(context.routing_decision.get('role_planning_intent_version')) is int
-                            and context.routing_decision['role_planning_intent_version'] == 3) else {}),
-                     'editable_paths': selection.editable_paths, 'observation': saved_observation,
-                     'source_context': cast(Mapping[str, JsonValue], source_context),
-                     **source_index,
-                     'summary': 'Existing user project. Inspect its source with read_context; repair only '
-                                'explicit editable paths. Original checks and configuration must remain unchanged. '
-                                'Re-run project.verify after repair, then deliver with workspace.bundle.'})
-        artifacts = (*context.artifacts, artifact)
+        artifact_id = uuid5(NAMESPACE_URL, f'original-project:{context.tenant_id}:{context.run_id}:'
+                           f'{state["observation_sha256"]}')
+        fixed_content: dict[str, JsonValue] = {
+            'schema_version': 1, 'original_source_sha256': reference.input_source_sha256,
+            'protected_sha256': stored.contract.protected_sha256,
+            **({'baseline_reference': cast(Mapping[str, JsonValue], reference.to_payload())}
+               if (python_inputs is None
+                   and type(context.routing_decision.get('role_planning_intent_version')) is int
+                   and context.routing_decision['role_planning_intent_version'] == 3) else {}),
+            'editable_paths': selection.editable_paths, 'observation': saved_observation,
+            **source_index,
+            'summary': 'Existing user project. Inspect its source with read_context; repair only '
+                       'explicit editable paths. Original checks and configuration must remain unchanged. '
+                       'Re-run project.verify after repair, then deliver with workspace.bundle.',
+        }
+        following: tuple[Artifact, ...] = ()
         if supply_state is not None:
             from agent_hub.capabilities.python_input_preparation import supply_state_plan
 
             supply_state_plan(supply_state)
             if supply_state.get('phase') != 'supplied':
                 raise RuntimeError(_FAILURE)
-            artifacts = (*artifacts, Artifact(
+            following = (*following, Artifact(
                 id=uuid5(NAMESPACE_URL, f'python-input-supply:{context.tenant_id}:{context.run_id}:'
                          f'{supply_state["plan_sha256"]}'), type='python_project_input_supply',
                 producer='original_project_preparer', content={
                     'schema_version': 1, 'kind': 'published_inputs_not_installation',
                     'plan_sha256': supply_state['plan_sha256'], 'receipt': supply_state['receipt']}))
-        history_route: Mapping[str, JsonValue] = {}
+        trusted: PythonOriginalContext | None = None
         if python_inputs is not None:
-            from agent_hub.runtime.python_project_history import HISTORY_KEY, build_python_history
-
             trusted = await self.verifier.python_original_context(context.tenant_id, context.run_id)
             if (trusted is None or trusted.inputs != python_inputs or trusted.stored.reference != reference
                     or trusted.observation != saved_observation or await self._state(context) != state):
@@ -524,12 +518,36 @@ class OriginalProjectPreparer:
                          f'{python_inputs.sha256}:{state["observation_sha256"]}'),
                 type='original_python_project_context', producer='original_project_preparer',
                 content=python_original_context_metadata(trusted),
-                source_ids=(str(artifact.id),),
+                source_ids=(str(artifact_id),),
             )
-            artifacts = (*artifacts, metadata)
-            history_route = {HISTORY_KEY: build_python_history(trusted, artifact)}
-        return context.model_copy(update={
-            'routing_decision': {**route, 'project_input_preparation': state, **history_route,
-                                **({'python_input_supply': supply_state} if supply_state is not None else {})},
-            'artifacts': artifacts,
-        }).validated_internal_clone()
+            following = (*following, metadata)
+
+        def prepared_with_preview(preview: OriginalSourceContext) -> TaskContext:
+            artifact = Artifact(id=artifact_id, type='original_project_observation',
+                producer='original_project_preparer', content={
+                    **fixed_content, 'source_context': cast(Mapping[str, JsonValue], preview)})
+            history_route: Mapping[str, JsonValue] = {}
+            if trusted is not None:
+                from agent_hub.runtime.python_project_history import (
+                    HISTORY_KEY,
+                    build_python_history,
+                )
+
+                history_route = {HISTORY_KEY: build_python_history(trusted, artifact)}
+            return context.model_copy(update={
+                'routing_decision': {**route, 'project_input_preparation': state, **history_route,
+                                    **({'python_input_supply': supply_state} if supply_state is not None else {})},
+                'artifacts': (*context.artifacts, artifact, *following),
+            }).validated_internal_clone()
+
+        def fits(preview: OriginalSourceContext) -> bool:
+            try:
+                prepared_with_preview(preview)
+            except (ValueError, TypeError):
+                return False
+            return True
+
+        source_context = await asyncio.to_thread(
+            original_source_context, stored, byte_budget=min(96_000, max(4096, context.token_budget)), fits=fits,
+        )
+        return prepared_with_preview(source_context)
