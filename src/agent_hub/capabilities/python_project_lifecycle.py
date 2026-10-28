@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import math
 import re
@@ -17,9 +18,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from agent_hub.capabilities.project_verification import ProjectVerificationService
 from agent_hub.capabilities.python_project_service import PythonOriginalContext
 from agent_hub.capabilities.scoped_read import authorized_workspace_scope
-from agent_hub.db.models import RunApprovalRow, RunCheckpointRow, RunRow
+from agent_hub.db.models import RunApprovalRow, RunCheckpointRow, RunRow, RuntimeArtifactRow
 from agent_hub.domain.runs import RunStatus, TaskMode
+from agent_hub.runs.artifacts import PostgresArtifactRepository
 from agent_hub.runs.repository import RunRepository
+from agent_hub.runtime.contracts import Artifact, RuntimeCheckpoint
 from agent_hub.skills.sandbox.python_project_client import PythonProjectSystemdSandbox
 from agent_hub.skills.sandbox.python_project_protocol import (
     PythonEnvironmentReference,
@@ -96,7 +99,10 @@ def _uncertain(value: object) -> bool:
     return False
 
 
-def _terminal_model_history_only(value: object, run_id: UUID) -> bool:
+def _terminal_model_history_only(
+    value: object, run_id: UUID, *, verified_failed: frozenset[str] = frozenset(),
+    verified_terminal: bool = False,
+) -> bool:
     """Recognize only the opted-in terminal model snapshot paths; never rewrite them.
 
     Caller already holds the terminal run lock and checks the persisted policy,
@@ -135,12 +141,13 @@ def _terminal_model_history_only(value: object, run_id: UUID) -> bool:
             if any(row[name] is not None for name in ('artifact_id', 'sha256', 'provenance')):
                 return False
             allowed_paths.add(('models', key, 'status'))
-    if len(allowed_paths) == 1:
+    if len(allowed_paths) == 1 and not verified_terminal:
         return False
     for key, row in value['tools'].items():
         if (type(key) is not str or re.fullmatch('[a-f0-9]{64}', key) is None
                 or type(row) is not dict or type(row.get('status')) is not str
-                or row['status'] not in {'succeeded', 'rejected'}
+                or (row['status'] not in {'succeeded', 'rejected'}
+                    and not (row['status'] == 'failed' and key in verified_failed))
                 or not {'step_id', 'attempt', 'round', 'tool_index', 'name', 'arguments_sha256',
                         'trigger_model_artifact_id', 'replay_safe', 'artifact_id', 'sha256'} <= row.keys()):
             return False
@@ -165,6 +172,185 @@ def _terminal_model_history_only(value: object, run_id: UUID) -> bool:
               or type(current) is float and not math.isfinite(current)):
             return False
     return True
+
+
+def _bound_checkpoint(payload: object, tenant: UUID, run: UUID) -> RuntimeCheckpoint:
+    # The DTO intentionally auto-fills an absent digest for builders. Cleanup must
+    # instead demand the original persisted hash before invoking that constructor.
+    if (type(payload) is not dict or type(payload.get('state_sha256')) is not str
+            or re.fullmatch('[a-f0-9]{64}', payload['state_sha256']) is None):
+        raise ValueError('unproven checkpoint')
+    checkpoint = RuntimeCheckpoint.from_payload(payload)
+    if checkpoint.tenant_id != tenant or checkpoint.run_id != run:
+        raise ValueError('foreign checkpoint')
+    return checkpoint
+
+
+async def _verified_failed_history(
+    session: AsyncSession, state: dict[str, object], tenant: UUID, run: UUID,
+) -> bool:
+    """Metadata-only proof; never hydrate a runtime, restore it, or acquire retry authority."""
+    from agent_hub.runtime.crew.adapter import CrewDispatchRuntime, _execution_failure_result
+
+    try:
+        rows = (await session.scalars(select(RunCheckpointRow).where(
+            RunCheckpointRow.tenant_id == tenant, RunCheckpointRow.run_id == run,
+        ).order_by(RunCheckpointRow.sequence.desc()).limit(1))).all()
+        if len(rows) != 1:
+            return False
+        saved = rows[0]
+        outer = _bound_checkpoint(saved.payload, tenant, run)
+        if ((saved.tenant_id, saved.run_id, saved.id, saved.runtime_type, saved.runtime_version, saved.mode)
+                != (tenant, run, outer.id, outer.runtime_type, outer.runtime_version, outer.mode.value)
+                or saved.state != state or outer.to_payload()['state'] != state
+                or saved.state_sha256 != outer.state_sha256):
+            return False
+        child = outer
+        if outer.runtime_type == 'hybrid':
+            required = {
+                'plan_digest', 'artifact_registry', 'output_artifact_registry', 'next_sequence',
+                'next_stage', 'terminal', 'reason', 'remaining_token_budget', 'token_budget_grant',
+                'token_budget_spent', 'remaining_timeout_seconds', 'remaining_absolute_timeout_seconds',
+                'timeout_progress_units', 'last_child_progress_fingerprint', 'child_checkpoint',
+            }
+            if (outer.runtime_version != '3' or outer.mode is not TaskMode.HYBRID
+                    or not required <= state.keys()
+                    or state.keys() - required - {'terminal_diagnostic', 'engineering_hybrid_report_version'}
+                    or ('engineering_hybrid_report_version' in state and (
+                        type(state['engineering_hybrid_report_version']) is not int
+                        or state['engineering_hybrid_report_version'] != 1))
+                    or type(state['next_stage']) is not int or state['next_stage'] not in (0, 1)
+                    or state['terminal'] is not False or state['reason'] is not None
+                    or _uncertain({key: value for key, value in state.items() if key != 'child_checkpoint'})):
+                return False
+            child = _bound_checkpoint(state['child_checkpoint'], tenant, run)
+        if child.runtime_type != 'crew' or child.runtime_version != '11' or child.mode is not TaskMode.DISPATCH:
+            return False  # One supported wrapper only; never recursively discover a convenient ledger.
+        body = cast(dict[str, object], child.to_payload()['state'])
+        models, tools, registry = body.get('models'), body.get('tools'), body.get('artifact_registry')
+        if (type(models) is not dict or not models or type(tools) is not dict
+                or type(registry) is not dict or len(models) + len(tools) > 16_384):
+            return False
+        expected: dict[str, str] = {}
+        model_rows: dict[str, Mapping[str, object]] = {}
+        private = child.state.get('rejected_outputs')
+        if not isinstance(private, Mapping):
+            return False
+        rejected_keys = set()
+        for key, model in models.items():
+            if type(model) is not dict or model.get('status') not in {'succeeded', 'rejected'}:
+                return False
+            if model['status'] == 'rejected':
+                rejected_keys.add(key)
+                receipt = private.get(key)
+                if (not isinstance(receipt, Mapping) or receipt.get('disposition') != 'rejected'
+                        or receipt.get('text_sha256') != model.get('sha256')
+                        or receipt.get('provenance') != model.get('provenance')
+                        or model.get('failure_reason') != 'structured output rejected'
+                        or type(receipt.get('version')) is not int or receipt['version'] != 1
+                        or model.get('artifact_id') is not None):
+                    return False
+                rejected = CrewDispatchRuntime._rejected_from_private(receipt)
+                evidence = rejected.evidence
+                if (evidence is None or evidence.status != 'completed'
+                        or evidence.usage_status != 'known' or evidence.usage is None):
+                    return False
+            else:
+                artifact_id, digest = model.get('artifact_id'), model.get('sha256')
+                if type(artifact_id) is not str or type(digest) is not str or artifact_id in expected:
+                    return False
+                expected[artifact_id] = digest
+                model_rows[artifact_id] = model
+        if set(private) != rejected_keys:
+            return False
+        tool_fields = {'status', 'step_id', 'attempt', 'round', 'tool_index', 'name', 'arguments_sha256',
+                       'trigger_model_artifact_id', 'replay_safe', 'artifact_id', 'sha256'}
+        for tool in tools.values():
+            if (type(tool) is not dict or set(tool) != tool_fields
+                    or tool['status'] not in {'succeeded', 'rejected', 'failed'}
+                    or type(tool['artifact_id']) is not str or type(tool['sha256']) is not str
+                    or tool['artifact_id'] in expected):
+                return False
+            expected[tool['artifact_id']] = tool['sha256']
+        if any(registry.get(key) != digest for key, digest in expected.items()):
+            return False
+        ids = tuple(UUID(key) for key in expected)
+        artifacts: dict[str, Artifact] = {}
+        total = 0
+        for offset in range(0, len(ids), 64):
+            batch = ids[offset:offset + 64]
+            stored = (await session.scalars(select(RuntimeArtifactRow).where(
+                RuntimeArtifactRow.tenant_id == tenant, RuntimeArtifactRow.run_id == run,
+                RuntimeArtifactRow.id.in_(batch),
+            ).limit(len(batch) + 1))).all()
+            if len(stored) != len(batch):
+                return False
+            for item in stored:
+                if ((item.tenant_id, item.run_id) != (tenant, run) or item.id not in batch
+                        or type(item.byte_size) is not int or not 0 < item.byte_size <= 1_048_576):
+                    return False
+                total += item.byte_size
+                if total > 64 * 1024 * 1024 or str(item.id) in artifacts:
+                    return False
+                artifact = PostgresArtifactRepository._hydrate(item)
+                if expected.get(str(artifact.id)) != artifact.content_sha256:
+                    return False
+                artifacts[str(artifact.id)] = artifact
+        if set(artifacts) != set(expected):
+            return False
+        calls: dict[tuple[object, ...], tuple[object, str, str]] = {}
+        for artifact_id, model in model_rows.items():
+            artifact = artifacts[artifact_id]
+            if (artifact.producer != model.get('actor') or artifact.provenance is None
+                    or artifact.provenance.to_payload() != model.get('provenance')):
+                return False
+            completion = CrewDispatchRuntime._completion_from_model_artifact(artifact)
+            if completion.response.usage is None:
+                return False
+            for index, call in enumerate(completion.response.tool_calls):
+                if model['purpose'] != 'step':
+                    return False
+                arguments = json.dumps(dict(call.arguments), default=dict, ensure_ascii=False,
+                    allow_nan=False, sort_keys=True, separators=(',', ':'))
+                coordinate = (model['step_id'], model['attempt'], model['call_index'], index)
+                if coordinate in calls:
+                    return False
+                calls[coordinate] = (call.name, hashlib.sha256(arguments.encode()).hexdigest(), artifact_id)
+        failed_keys = set()
+        consumed = set()
+        for key, tool in tools.items():
+            if (any(type(tool[name]) is not int or not 0 <= tool[name] <= 2**31 - 1
+                    for name in ('attempt', 'round', 'tool_index')) or type(tool['replay_safe']) is not bool):
+                return False
+            coordinate = (tool['step_id'], tool['attempt'], tool['round'], tool['tool_index'])
+            if coordinate in consumed or calls.get(coordinate) != (
+                tool['name'], tool['arguments_sha256'], tool['trigger_model_artifact_id'],
+            ):
+                return False
+            consumed.add(coordinate)
+            base = f"{run}:{tool['step_id']}:{tool['attempt']}:{tool['round']}:{tool['tool_index']}:{tool['name']}:{tool['arguments_sha256']}"
+            if key not in {hashlib.sha256(base.encode()).hexdigest(), hashlib.sha256(
+                f"{base}:trigger:{tool['trigger_model_artifact_id']}".encode()).hexdigest()}:
+                return False
+            artifact = artifacts[tool['artifact_id']]
+            trigger = artifacts[tool['trigger_model_artifact_id']]
+            if (artifact.type != 'tool_result' or artifact.producer != trigger.producer
+                    or artifact.source_ids != (str(trigger.id),)):
+                return False
+            if tool['status'] == 'failed':
+                result = artifact.content.get('result')
+                if (artifact.content.get('tool_name') != tool['name']
+                        or artifact.content.get('arguments_sha256') != tool['arguments_sha256']
+                        or not isinstance(result, Mapping)
+                        or _execution_failure_result(result, tool_name=tool['name']) != result):
+                    return False
+                failed_keys.add(key)
+        if set(calls) != consumed:
+            return False  # Missing even one batch member is not a fully terminal tool history.
+        return _terminal_model_history_only(body, run, verified_failed=frozenset(failed_keys),
+                                            verified_terminal=True)
+    except (ValueError, TypeError, KeyError, AttributeError, RuntimeError, OverflowError, RecursionError):
+        return False
 
 
 def _generated_preparation(route: Mapping[str, object]) -> Mapping[str, object] | None:
@@ -290,13 +476,25 @@ class PythonProjectTerminalHook:
                     .limit(1)
                 )
             ).all()
-            if not states or any(
-                not isinstance(state, dict) or (_uncertain(state) and not (
+            if not states:
+                return
+            for state in states:
+                if not isinstance(state, dict):
+                    return
+                tools = state.get('tools')
+                extended_failed = status is RunStatus.FAILED and (
+                    'child_checkpoint' in state or (isinstance(tools, dict) and any(
+                        isinstance(tool, dict) and tool.get('status') == 'failed' for tool in tools.values()
+                    ))
+                )
+                if extended_failed:
+                    if not await _verified_failed_history(session, state, tenant_id, run_id):
+                        return
+                elif _uncertain(state) and not (
                     status in {RunStatus.CANCELLED, RunStatus.FAILED}
                     and _terminal_model_history_only(state, run_id)
-                )) for state in states
-            ):
-                return
+                ):
+                    return
             project, workspace_session = authorized_workspace_scope(
                 row,
                 tenant_id=tenant_id,
