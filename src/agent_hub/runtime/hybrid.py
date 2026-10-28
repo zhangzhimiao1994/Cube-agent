@@ -31,6 +31,7 @@ from agent_hub.runtime.contracts import (
     RunEvent,
     RuntimeCheckpoint,
     TaskContext,
+    validate_publication_checkpoint,
 )
 from agent_hub.runtime.direct import (
     _is_workspace_project_delivery,
@@ -979,6 +980,17 @@ class HybridRuntime:
                 **({hybrid_delivery_report.POLICY: 1} if hybrid_delivery_report.selected(context) else {}),
             },
         )
+
+    def validate_publication_checkpoint(
+        self, checkpoint: RuntimeCheckpoint, context: TaskContext,
+    ) -> None:
+        """Validate against this exact plan and, when present, its real Direct child."""
+        self._validate_checkpoint(checkpoint, context)
+        child = _child_checkpoint_from_state(checkpoint)
+        if child is not None and child.mode is TaskMode.DIRECT:
+            validate_publication_checkpoint(self._synthesizer, child, context.model_copy(update={
+                "mode": TaskMode.DIRECT, "checkpoint": child,
+            }))
 
     def _validate_checkpoint(self, checkpoint: RuntimeCheckpoint, context: TaskContext) -> None:
         if (

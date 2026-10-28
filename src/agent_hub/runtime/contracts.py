@@ -1315,6 +1315,21 @@ class ExecutionRuntime(Protocol):
     async def cancel(self) -> None: ...
 
 
+def validate_publication_checkpoint(
+    runtime: object, checkpoint: RuntimeCheckpoint, context: TaskContext,
+) -> None:
+    """Delegate read-only validation to the actual execution, never rebuild it.
+
+    This optional interface does not extend the legacy ExecutionRuntime protocol.
+    Selected final-report publishers must implement it; wrappers forward only to
+    their owned active child. It must not run, restore, or reserve any work.
+    """
+    validator = getattr(runtime, "validate_publication_checkpoint", None)
+    if getattr(runtime, "mode", None) is not context.mode or not callable(validator):
+        raise RuntimeContractError("native publication checkpoint validation unavailable")
+    validator(checkpoint, context)
+
+
 Artifact.__hash__ = None  # type: ignore[assignment]
 RuntimeCheckpoint.__hash__ = None  # type: ignore[assignment]
 RunEvent.__hash__ = None  # type: ignore[assignment]

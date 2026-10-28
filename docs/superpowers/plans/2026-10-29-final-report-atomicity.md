@@ -20,6 +20,8 @@
 ## Files
 
 - Modify `src/agent_hub/runs/service.py`: dispatch Direct/Hybrid final publication envelopes into the existing transaction loop; keep Discuss behavior.
+- Modify `runtime/contracts.py`, `runtime/direct.py`, `runtime/hybrid.py`: optional read-only publication validation interface delegating to the complete existing native recovery validators, including the actual Hybrid synthesizer child.
+- Modify `runtime/defaults.py`, `runtime/engineering_admission.py`: explicit forwarding through the actual active ConfigBacked/Planned/Admission chain. ConfigBacked binds the original tenant/run/execution token and removes that binding when execution exits; Admission requires its child to have started.
 - Create `tests/unit/runs/test_final_report_atomicity_oct29.py`: real native fixture output, bounded envelope defects, service rollback and cold recovery, Discuss/legacy compatibility.
 - Runtime producers may change only if actual event fixtures prove an unavoidable boundary defect; do not change Crew.
 
@@ -44,7 +46,7 @@
 - [x] Run Ruff and strict mypy on changed production code; review the finite diff and confirm no Crew/package changes.
 - [x] Record actual counts/limitations in local handoff, update this checklist, and commit only the plan, product change and dedicated test file on a local branch. No push or deployment.
 
-## Verification snapshot and limits
+## Initial local commit 841dac76 and verification limits
 
 - Dedicated regression file: **33 PASS**. Direct RED: seven behavioral assertions; Hybrid terminal-envelope RED: thirteen behavioral assertions. Final recovery-identity RED also observed before its guard.
 - Unchanged-a10 transaction negative controls: **2 expected failures**; Direct leaked `(events=1, Main=1, checkpoints=0)`, Hybrid leaked `(3,1,2)`. New implementation: all three counts zero after terminal checkpoint INSERT failure.
@@ -52,3 +54,11 @@
 - Adjacent Direct/Hybrid final-report and service followup-policy files: **34 PASS**; `test_terminal_hooks.py`: **70 PASS**. Ruff on both Python files and strict mypy on `service.py` PASS; `git diff --check` clean.
 - SQL evidence uses real SQLite transactions with existing project type adaptation, not PostgreSQL. PostgreSQL locking/concurrency and the authenticated full RunService/worker journey are not verified. Hybrid private hydration uses the existing in-memory native artifact fixture; public persisted bytes come from real repository/session reconstruction.
 - **Local, not deployed.** No frozen 567 package changes, network, secrets, models, GitHub or CI. Crew reviewer publication remains the second slice. Parent independent review is pending.
+
+## Independent-review follow-up
+
+- Native-invalid CP regressions first reproduced **2 RED**: Direct `next_sequence=0` and Hybrid terminal `remaining_timeout_seconds=-1.0` passed the initial publication gate despite native rejection. Publication now calls the complete native validator on the real execution; the handwritten token-budget subset was removed.
+- Live ConfigBacked/Planned/Admission regressions first reproduced **2 RED** for forging both CP/context tenant while retaining the same run/token. Both now pass, with original tenant registration, strict active run/token binding, missing/stale-token and post-exit rejection, and no `_runtime_for` calls during validation.
+- Native validation merges original context artifacts with current events, rejecting conflicting identities/hashes. Current-run Hybrid lineage remains a separate registry. Regressions include a real generated Direct CP whose original inspection is not re-emitted, preserved Hybrid inputs, and an original/new artifact conflict.
+- Current dedicated file: **40 cases**. The dedicated file, Direct/Hybrid final-report, followup-policy, generated Direct entry, engineering admission and terminal hooks: **188 PASS**. ConfigBacked Direct/Hybrid and Planned selectors in `test_configured_runtime.py`: **19 PASS**. Ruff on all changed Python files and strict mypy on all **6 production files** PASS. Local only; the PostgreSQL/full-worker limitations above still apply.
+- The optional interface does not change the legacy ExecutionRuntime protocol or authorize/model/tool behavior. Native producer/restore algorithms are unchanged. Database lease expiry remains checked by the existing service transaction; wrapper validation checks the original identity and current active execution registration.

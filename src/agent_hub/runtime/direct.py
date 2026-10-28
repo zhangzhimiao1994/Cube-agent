@@ -3999,6 +3999,12 @@ class DirectRuntime:
                 outcome.__cause__ = None
         del outcome, outcomes, task
 
+    def validate_publication_checkpoint(
+        self, checkpoint: RuntimeCheckpoint, context: TaskContext,
+    ) -> None:
+        """Use the same full validation as native recovery, without restoring work."""
+        self._validate_checkpoint_for_context(checkpoint, context)
+
     def _validate_checkpoint_for_context(
         self, checkpoint: RuntimeCheckpoint, context: TaskContext
     ) -> None:

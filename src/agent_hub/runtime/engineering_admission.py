@@ -18,6 +18,7 @@ from agent_hub.runtime.contracts import (
     RunEvent,
     RuntimeCheckpoint,
     TaskContext,
+    validate_publication_checkpoint,
 )
 from agent_hub.runtime.streams import closing_runtime_events
 
@@ -182,6 +183,13 @@ class EngineeringAdmissionRuntime:
         else:
             await self._child.restore_checkpoint(checkpoint)
             self._delegated = True
+
+    def validate_publication_checkpoint(
+        self, checkpoint: RuntimeCheckpoint, context: TaskContext,
+    ) -> None:
+        if not self._child_started:
+            raise RuntimeError('engineering admission child checkpoint unavailable')
+        validate_publication_checkpoint(self._child, checkpoint, context)
 
     async def save_checkpoint(self) -> RuntimeCheckpoint:
         if self._child_started:
