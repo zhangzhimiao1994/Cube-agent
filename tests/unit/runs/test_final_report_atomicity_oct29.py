@@ -419,30 +419,16 @@ async def test_legacy_direct_publication_is_not_retrofitted(tmp_path: Path, vers
 
 
 async def test_discuss_existing_atomic_envelope_is_unchanged() -> None:
-    from uuid import uuid4
+    from tests.unit.runs.test_discuss_publication_native_oct29 import make_case
 
-    from agent_hub.runtime.autogen.delivery_report import FINAL_REPORT_ACTOR, FINAL_REPORT_POLICY
-    from agent_hub.runtime.contracts import Artifact
-
-    ctx = report_context().model_copy(update={'mode': TaskMode.DISCUSS,
-        'routing_decision': {FINAL_REPORT_POLICY: 1}})
-    report = Artifact(id=uuid4(), type='text', producer=FINAL_REPORT_ACTOR,
-                      content={'text': REPORT, 'presentation': 'final_answer'})
-    checkpoint = RuntimeCheckpoint(id=uuid4(), runtime_type='autogen', runtime_version='2',
-        run_id=ctx.run_id, tenant_id=ctx.tenant_id, mode=ctx.mode, state={
-            FINAL_REPORT_POLICY: 1, 'model_ledger': ({'status': 'succeeded', 'report_binding': {
-                'version': 1, 'run_id': str(ctx.run_id), 'tenant_id': str(ctx.tenant_id),
-                'owner': FINAL_REPORT_ACTOR}},),
-            'artifact_registry': {str(report.id): report.content_sha256},
-        })
-    ctx = ctx.model_copy(update={'checkpoint': checkpoint})
-    envelope = (
-        RunEvent(kind=EventKind.MESSAGE_CREATED, sequence=1, run_id=ctx.run_id,
-                 actor=FINAL_REPORT_ACTOR, message=REPORT),
-        RunEvent(kind=EventKind.ARTIFACT_CREATED, sequence=2, run_id=ctx.run_id, artifact=report),
-        RunEvent(kind=EventKind.CHECKPOINT_SAVED, sequence=3, run_id=ctx.run_id, checkpoint=checkpoint),
-    )
-    groups = [group async for group in _delivery_publication_batches(stream(envelope), ctx)]
+    case = await make_case()
+    envelope = case.events[case.report_index - 1:case.report_index + 2]
+    previous = next(item.checkpoint for item in reversed(case.events[:case.report_index - 1])
+                    if item.checkpoint is not None)
+    ctx = case.task.model_copy(update={'checkpoint': previous})
+    groups = [group async for group in _delivery_publication_batches(
+        stream(envelope), ctx, runtime=case.runtime,
+    )]
     assert groups == [envelope]
 
 

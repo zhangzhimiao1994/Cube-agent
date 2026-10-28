@@ -4475,6 +4475,23 @@ class AutoGenDiscussionRuntime:
             run_id=context.run_id, tenant_id=context.tenant_id, mode=self.mode, state=state,
         )
 
+    def validate_publication_checkpoint(
+        self, checkpoint: RuntimeCheckpoint, context: TaskContext,
+    ) -> None:
+        """Use the native restore gates without restoring or performing work.
+
+        A valid report may be checkpointed before discussion termination. Keep
+        that recovery boundary; do not equate publication with terminal=True.
+        Report/model/tool binding remains checked by engineering_report_valid
+        in the native report construction and recovery paths.
+        """
+        self._validate_checkpoint(checkpoint, context)
+        if checkpoint.runtime_version == _RUNTIME_VERSION:
+            _DiscussionControl.from_state(
+                checkpoint.state["discussion_control"], self._plan, context,
+                self._restored_usage(checkpoint),
+            )
+
     def _validate_checkpoint(self, checkpoint: RuntimeCheckpoint, context: TaskContext) -> None:
         if (
             checkpoint.runtime_type != _RUNTIME_TYPE

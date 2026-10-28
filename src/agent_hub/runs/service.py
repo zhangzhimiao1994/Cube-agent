@@ -6160,6 +6160,7 @@ async def _delivery_publication_batches(
     """Commit the selected no-effect report envelope and its checkpoint atomically."""
     from agent_hub.runtime import direct_delivery_report
     from agent_hub.runtime.autogen.delivery_report import FINAL_REPORT_ACTOR, FINAL_REPORT_POLICY
+    from agent_hub.runtime.contracts import validate_publication_checkpoint
     from agent_hub.runtime.crew import delivery_report
 
     if (context.mode is TaskMode.DISPATCH
@@ -6203,6 +6204,27 @@ async def _delivery_publication_batches(
     report: Artifact | None = None
     report_id: str | None = None
     report_sha: str | None = None
+    published_reports: dict[str, Artifact] = {}
+    if selected and context.checkpoint is not None and recovery_events:
+        saved = context.checkpoint
+        saved_registry = saved.state.get("artifact_registry")
+        for previous in recovery_events:
+            if previous.run_id != context.run_id:
+                raise RuntimeError("final report publication recovery scope is invalid")
+            if previous.checkpoint is not None and previous.checkpoint.id == saved.id:
+                if previous.checkpoint != saved:
+                    raise RuntimeError("final report publication recovery checkpoint is invalid")
+                break
+            item = previous.artifact
+            if (item is not None and item.type == "text" and item.producer == FINAL_REPORT_ACTOR
+                    and isinstance(saved_registry, Mapping)
+                    and saved_registry.get(str(item.id)) == item.content_sha256):
+                if (item.content_sha256 != item.recompute_content_sha256()
+                        or str(item.id) in published_reports and published_reports[str(item.id)] != item):
+                    raise RuntimeError("final report publication recovery artifact is invalid")
+                published_reports[str(item.id)] = item
+        else:
+            raise RuntimeError("final report publication recovery checkpoint is missing")
     async for event in events:
         if not pending:
             if selected and event.kind is EventKind.CHECKPOINT_SAVED:
@@ -6253,6 +6275,22 @@ async def _delivery_publication_batches(
                 or not isinstance(registry, Mapping) or report_id is None
                 or registry.get(report_id) != report_sha):
             raise RuntimeError("final report publication checkpoint is invalid")
+        try:
+            validate_publication_checkpoint(runtime, checkpoint, context)
+        except (TypeError, ValueError, RuntimeError, KeyError):
+            raise RuntimeError("final report publication native checkpoint is invalid") from None
+        if report is not None:
+            previous_report = published_reports.get(str(report.id))
+            if previous_report is not None:
+                if previous_report != report:
+                    raise RuntimeError("final report publication recovery artifact is invalid")
+                # Only an exact report already in the durable checkpoint prefix
+                # may be suppressed. Keep the new CP and completion references;
+                # their native cursors are independent of public DB sequences.
+                pending = [item for item in pending if item.artifact != report
+                           and not (item.kind is EventKind.MESSAGE_CREATED
+                                    and item.actor == FINAL_REPORT_ACTOR)]
+            published_reports[str(report.id)] = report
         yield tuple(pending)
         pending, report, report_id, report_sha = [], None, None, None
     if pending:
