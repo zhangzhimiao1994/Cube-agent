@@ -1,0 +1,524 @@
+"""Final Main publication boundaries; all models/tools are owned offline fixtures."""
+from __future__ import annotations
+
+from collections.abc import AsyncIterator
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+from uuid import UUID
+
+import pytest
+from sqlalchemy import JSON, Column, MetaData, String, Table, UniqueConstraint, func, select
+from sqlalchemy import event as sql_event
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import UUID as PGUUID
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+from agent_hub.db.models import RunArtifactRow, RunCheckpointRow, RunEventRow, RunRow
+from agent_hub.domain.runs import TaskMode
+from agent_hub.runs.repository import RunRepository
+from agent_hub.runs.service import _delivery_publication_batches
+from agent_hub.runtime.artifacts import InMemoryArtifactRepository
+from agent_hub.runtime.contracts import EventKind, RunEvent, RuntimeCheckpoint, TaskContext
+from agent_hub.runtime.hybrid import HybridRuntime
+from tests.unit.runtime.crew.test_framework_parser_boundary import (
+    installed_parser,  # noqa: F401
+    offline_only,  # noqa: F401
+)
+from tests.unit.runtime.test_direct_final_report import REPORT, report_context
+from tests.unit.runtime.test_direct_project_verification import FIXED, Model, batch, runner
+
+
+@dataclass
+class HybridCase:
+    context: TaskContext
+    events: tuple[RunEvent, ...]
+    runtime: HybridRuntime
+    repository: InMemoryArtifactRepository
+    reporter: Model
+
+    @property
+    def main_index(self) -> int:
+        return next(i for i, event in enumerate(self.events)
+                    if event.artifact is not None and event.artifact.producer == 'main'
+                    and 'delivery_report_binding' in event.artifact.content)
+
+
+@pytest.fixture
+async def hybrid_case(tmp_path: Path, request: pytest.FixtureRequest) -> HybridCase:
+    from agent_hub.runtime.direct import DirectRuntime
+    from tests.unit.capabilities.test_project_verification import Executor
+    from tests.unit.runtime.crew.test_adapter_failure_reason import WorkspaceDeliverySequenceGateway
+    from tests.unit.runtime.crew.test_delivery_report import context, responses, subject
+    from tests.unit.runtime.crew.test_engineering_delivery_execution import ActualCapabilityHarness
+    from tests.unit.runtime.test_hybrid import MultiArtifactRuntime, artifact
+
+    parser = request.getfixturevalue('installed_parser')
+    base = context()
+    ctx = base.model_copy(update={'mode': TaskMode.HYBRID, 'routing_decision': {
+        **base.routing_decision, 'engineering_delivery_contract_version': 1,
+        'engineering_hybrid_report_version': 1,
+    }})
+    repository = InMemoryArtifactRepository()
+    reporter = Model(REPORT)
+    native = HybridRuntime(
+        subject(WorkspaceDeliverySequenceGateway(responses()),
+                ActualCapabilityHarness(tmp_path, Executor()), repository, parser),
+        MultiArtifactRuntime(TaskMode.DISCUSS, (artifact('reviewer', 'Reviewed.'),)),
+        DirectRuntime(reporter, logical_model='main'), artifact_repository=repository,
+    )
+    events = tuple([event async for event in native.run(ctx)])
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    return HybridCase(ctx, events, native, repository, reporter)
+
+
+def changed_checkpoint(payload: dict) -> RuntimeCheckpoint:
+    payload.pop('state_sha256', None)
+    for name in ('id', 'run_id', 'tenant_id'):
+        payload[name] = UUID(str(payload[name]))
+    payload['mode'] = TaskMode(payload['mode'])
+    return RuntimeCheckpoint(**payload)
+
+
+async def stream(events: tuple[RunEvent, ...]) -> AsyncIterator[RunEvent]:
+    for event in events:
+        yield event
+
+
+async def test_direct_main_without_checkpoint_is_never_published(tmp_path: Path) -> None:
+    context = report_context()
+    runtime, _, _, _ = runner(tmp_path, context, Model(batch({'main.py': FIXED}), REPORT))
+    events = tuple([event async for event in runtime.run(context)])
+    main_index = next(i for i, event in enumerate(events)
+                      if event.kind is EventKind.ARTIFACT_CREATED
+                      and event.artifact is not None and event.artifact.producer == 'main')
+    main = events[main_index].artifact
+    published = []
+    with pytest.raises(RuntimeError, match='publication.*checkpoint'):
+        async for group in _delivery_publication_batches(stream(events[:main_index + 1]), context):
+            published.extend(group)
+            assert not any(event.artifact == main for event in published), (
+                'Main was publicly emitted before its recovery checkpoint'
+            )
+
+
+async def test_direct_main_and_checkpoint_are_one_publication(tmp_path: Path) -> None:
+    context = report_context()
+    runtime, _, _, _ = runner(tmp_path, context, Model(batch({'main.py': FIXED}), REPORT))
+    events = tuple([event async for event in runtime.run(context)])
+    groups = [group async for group in _delivery_publication_batches(stream(events), context)]
+    main_group = next(group for group in groups if any(
+        event.artifact is not None and event.artifact.producer == 'main' for event in group))
+    assert [event.kind for event in main_group] == [
+        EventKind.ARTIFACT_CREATED, EventKind.CHECKPOINT_SAVED,
+    ]
+
+
+@pytest.mark.parametrize('defect', ['run', 'tenant', 'hash', 'policy', 'runtime'])
+async def test_direct_checkpoint_mismatch_never_publishes_main(tmp_path: Path, defect: str) -> None:
+    from uuid import uuid4
+
+    context = report_context()
+    runtime, _, _, _ = runner(tmp_path, context, Model(batch({'main.py': FIXED}), REPORT))
+    events = [event async for event in runtime.run(context)]
+    main_index = next(i for i, event in enumerate(events)
+                      if event.artifact is not None and event.artifact.producer == 'main')
+    main_event = events[main_index]
+    checkpoint_event = events[main_index + 1]
+    checkpoint = checkpoint_event.checkpoint
+    assert checkpoint is not None
+    payload = checkpoint.to_payload()
+    if defect in {'run', 'tenant'}:
+        payload[defect + '_id'] = str(uuid4())
+    elif defect == 'hash':
+        payload['state']['artifact_sha256'] = 'f' * 64
+    elif defect == 'policy':
+        payload['state']['delivery_report_policy']['engineering_direct_report_version'] = True
+    else:
+        payload['runtime_type'] = 'unrelated'
+    bad = changed_checkpoint(payload)
+    changed = checkpoint_event.model_copy(update={'checkpoint': bad})
+    published = []
+    with pytest.raises(RuntimeError, match='publication'):
+        async for group in _delivery_publication_batches(
+            stream((*events[:main_index + 1], changed)), context,
+        ):
+            published.extend(group)
+    assert main_event not in published
+
+
+async def test_hybrid_main_and_terminal_parent_checkpoint_are_one_publication(
+    hybrid_case: HybridCase,
+) -> None:
+    case = hybrid_case
+    groups = [group async for group in _delivery_publication_batches(stream(case.events), case.context)]
+    selected = next(group for group in groups if case.events[case.main_index] in group)
+    assert [event.kind for event in selected] == [
+        EventKind.ARTIFACT_CREATED, EventKind.CHECKPOINT_SAVED,
+        EventKind.CHECKPOINT_SAVED, EventKind.CHECKPOINT_SAVED,
+    ]
+    terminal = selected[-1].checkpoint
+    assert terminal is not None and terminal.runtime_type == 'hybrid'
+    assert terminal.state['terminal'] is True
+    assert terminal.state['next_stage'] == 3
+    assert terminal.state['child_checkpoint'] is None
+
+
+@pytest.mark.parametrize('checkpoint_count', [0, 1, 2])
+async def test_hybrid_main_without_terminal_checkpoint_is_never_published(
+    hybrid_case: HybridCase, checkpoint_count: int,
+) -> None:
+    case = hybrid_case
+    published = []
+    with pytest.raises(RuntimeError, match='publication.*checkpoint'):
+        async for group in _delivery_publication_batches(
+            stream(case.events[:case.main_index + 1 + checkpoint_count]), case.context,
+        ):
+            published.extend(group)
+            assert case.events[case.main_index] not in published
+
+
+@pytest.mark.parametrize('defect', [
+    'run', 'tenant', 'child_run', 'child_tenant', 'child_hash', 'missing_lineage',
+    'output_hash', 'main_sources',
+])
+async def test_hybrid_checkpoint_requires_current_child_and_lineage(
+    hybrid_case: HybridCase, defect: str,
+) -> None:
+    from uuid import uuid4
+
+    case = hybrid_case
+    main_event = case.events[case.main_index]
+    main = main_event.artifact
+    checkpoint_event = case.events[case.main_index + 1]
+    assert main is not None and checkpoint_event.checkpoint is not None
+    payload = checkpoint_event.checkpoint.to_payload()
+    state = payload['state']
+    if defect in {'run', 'tenant'}:
+        payload[defect + '_id'] = str(uuid4())
+    elif defect.startswith('child_'):
+        child = state['child_checkpoint']
+        assert child is not None
+        if defect == 'child_hash':
+            child['state']['artifact_sha256'] = 'f' * 64
+        else:
+            child[defect.removeprefix('child_') + '_id'] = str(uuid4())
+        state['child_checkpoint'] = changed_checkpoint(child).to_payload()
+    elif defect == 'missing_lineage':
+        reference = next(key for key in main.source_ids if key != str(main.id))
+        state['artifact_registry'].pop(reference, None)
+        state['output_artifact_registry'].pop(reference, None)
+    elif defect == 'output_hash':
+        state['output_artifact_registry'][str(main.id)] = 'f' * 64
+    else:
+        main_event = main_event.model_copy(update={'artifact': main.model_copy(update={'source_ids': ()})})
+    changed = checkpoint_event.model_copy(update={'checkpoint': changed_checkpoint(payload)})
+    published = []
+    with pytest.raises(RuntimeError, match='publication'):
+        async for group in _delivery_publication_batches(
+            stream((*case.events[:case.main_index], main_event, changed,
+                    *case.events[case.main_index + 2:])), case.context,
+        ):
+            published.extend(group)
+    assert main_event not in published
+
+
+async def test_hybrid_atomic_terminal_checkpoint_recovers_at_zero_budget(
+    hybrid_case: HybridCase,
+) -> None:
+    from tests.unit.runtime.test_hybrid import UnusedRuntime
+
+    case = hybrid_case
+    groups = [group async for group in _delivery_publication_batches(stream(case.events), case.context)]
+    group = next(group for group in groups if case.events[case.main_index] in group)
+    checkpoint = group[-1].checkpoint
+    assert checkpoint is not None and checkpoint.state['terminal'] is True
+    payload = checkpoint.to_payload()
+    payload['state'].update(remaining_token_budget=0, remaining_timeout_seconds=0.0,
+                            remaining_absolute_timeout_seconds=0.0,
+                            token_budget_spent=payload['state']['token_budget_grant'])
+    zero = changed_checkpoint(payload)
+    restored = HybridRuntime(
+        UnusedRuntime(TaskMode.DISPATCH, 'no tools'),
+        UnusedRuntime(TaskMode.DISCUSS, 'no models'),
+        UnusedRuntime(TaskMode.DIRECT, 'no synthesis'), artifact_repository=case.repository,
+    )
+    await restored.restore_checkpoint(zero)
+    recovered = [event async for event in restored.run(
+        case.context.model_copy(update={'checkpoint': zero}),
+    )]
+    assert [event.kind for event in recovered] == [EventKind.RUNTIME_COMPLETED], [
+        (event.reason, dict(event.payload)) for event in recovered
+    ]
+    assert len(case.reporter.requests) == 1
+
+
+@dataclass
+class PublicationCase:
+    context: TaskContext
+    events: tuple[RunEvent, ...]
+    main_index: int
+    hybrid: HybridCase | None
+
+
+@pytest.fixture(params=[TaskMode.DIRECT, TaskMode.HYBRID])
+async def publication_case(
+    request: pytest.FixtureRequest, tmp_path: Path, hybrid_case: HybridCase,
+) -> PublicationCase:
+    if request.param is TaskMode.HYBRID:
+        case = hybrid_case
+        return PublicationCase(case.context, case.events, case.main_index, case)
+    ctx = report_context()
+    native, _, _, _ = runner(tmp_path, ctx, Model(batch({'main.py': FIXED}), REPORT))
+    events = tuple([item async for item in native.run(ctx)])
+    main_index = next(i for i, item in enumerate(events)
+                      if item.artifact is not None and item.artifact.producer == 'main')
+    return PublicationCase(ctx, events, main_index, None)
+
+
+@pytest.fixture
+async def session_repository(publication_case: PublicationCase) -> AsyncIterator[Any]:
+    # Same real SQLAlchemy/SQLite type adaptation as test_diagnostic_checkpoint_transition.py.
+    # PostgreSQL lease locking/concurrent reader isolation is deliberately not claimed here.
+    engine = create_async_engine('sqlite+aiosqlite:///:memory:')
+    metadata = MetaData()
+    for model in (RunRow, RunEventRow, RunArtifactRow, RunCheckpointRow):
+        columns = [Column(c.name, JSON() if isinstance(c.type, JSONB)
+                          else String(32) if isinstance(c.type, PGUUID) else c.type,
+                          primary_key=c.primary_key, nullable=c.nullable,
+                          server_default=c.server_default) for c in model.__table__.columns]
+        constraints = [UniqueConstraint(*(c.name for c in constraint.columns))
+                       for constraint in model.__table__.constraints
+                       if isinstance(constraint, UniqueConstraint)]
+        Table(model.__tablename__, metadata, *columns, *constraints)
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(metadata.create_all)
+        factory = async_sessionmaker(engine, expire_on_commit=False)
+        context = publication_case.context
+        async with factory.begin() as session:
+            session.add(RunRow(id=context.run_id, tenant_id=context.tenant_id,
+                actor_id=context.actor_id, actor_role='operator', request=context.request,
+                mode=context.mode.value, status='running', version=1,
+                routing_decision=dict(context.routing_decision)))
+        yield RunRepository(factory), factory, engine
+    finally:
+        await engine.dispose()
+
+
+async def persist_delivery_tail(repository: RunRepository, case: PublicationCase) -> None:
+    # Exercise the exact existing per-batch session.begin/persist_event transaction boundary.
+    # Ignore preceding native activity: only the Main publication and its checkpoints are under test.
+    started = False
+    async for group in _delivery_publication_batches(stream(case.events), case.context):
+        if case.events[case.main_index] in group:
+            started = True
+        if not started or group[0].kind is EventKind.RUNTIME_COMPLETED:
+            continue
+        async with await repository.run_transaction() as session, session.begin():
+            await repository.get_for_update(session, case.context.run_id)
+            for item in group:
+                sequence = await repository.next_event_sequence(session, case.context.run_id)
+                await repository.persist_event(session, tenant_id=case.context.tenant_id,
+                    run_id=case.context.run_id, event=item.model_copy(update={'sequence': sequence}))
+
+
+async def test_real_repository_checkpoint_insert_failure_rolls_back_main(
+    publication_case: PublicationCase, session_repository: Any,
+) -> None:
+    repository, factory, engine = session_repository
+    checkpoints = 0
+
+    class SaveFailed(RuntimeError):
+        pass
+
+    def fail_terminal_insert(connection, cursor, statement, parameters, execution_context, many):
+        nonlocal checkpoints
+        if statement.startswith('INSERT INTO ' + RunCheckpointRow.__tablename__):
+            checkpoints += 1
+            if checkpoints == (3 if publication_case.hybrid else 1):
+                raise SaveFailed('injected terminal checkpoint INSERT failure')
+
+    sql_event.listen(engine.sync_engine, 'before_cursor_execute', fail_terminal_insert)
+    try:
+        with pytest.raises(SaveFailed):
+            await persist_delivery_tail(repository, publication_case)
+    finally:
+        sql_event.remove(engine.sync_engine, 'before_cursor_execute', fail_terminal_insert)
+    async with factory() as session:
+        counts = tuple([await session.scalar(select(func.count()).select_from(model))
+                        for model in (RunEventRow, RunArtifactRow, RunCheckpointRow)])
+    assert counts == (0, 0, 0), 'SQL transaction leaked a partial Main publication'
+
+
+async def test_real_repository_committed_envelope_cold_recovers_without_work(
+    publication_case: PublicationCase, session_repository: Any,
+) -> None:
+    from agent_hub.runtime.direct import DirectRuntime
+    from tests.unit.runtime.test_hybrid import UnusedRuntime
+
+    case = publication_case
+    repository, factory, _ = session_repository
+    if case.hybrid is not None:
+        events = list(case.events)
+        terminal = events[case.main_index + 3]
+        assert terminal.checkpoint is not None
+        payload = terminal.checkpoint.to_payload()
+        payload['state'].update(remaining_token_budget=0, remaining_timeout_seconds=0.0,
+            remaining_absolute_timeout_seconds=0.0,
+            token_budget_spent=payload['state']['token_budget_grant'])
+        events[case.main_index + 3] = terminal.model_copy(update={
+            'checkpoint': changed_checkpoint(payload),
+        })
+        case = PublicationCase(case.context, tuple(events), case.main_index, case.hybrid)
+    await persist_delivery_tail(repository, case)
+    # New repository and new sessions reconstruct actual stored event/artifact/checkpoint bytes.
+    cold = RunRepository(factory)
+    raw = await cold.raw_events(case.context.tenant_id, case.context.run_id)
+    async with factory() as session:
+        checkpoint = await cold.latest_checkpoint(session, tenant_id=case.context.tenant_id,
+                                                  run_id=case.context.run_id)
+    assert checkpoint is not None
+    assert len(raw) == (4 if case.hybrid else 2)
+    assert not any(item.kind is EventKind.RUNTIME_COMPLETED for item in raw)
+    artifacts = tuple(item.artifact for item in raw if item.artifact is not None)
+    assert len(artifacts) == 1
+    unused = Model()
+    if case.hybrid is None:
+        restored = DirectRuntime(unused, logical_model='main')
+    else:
+        restored = HybridRuntime(UnusedRuntime(TaskMode.DISPATCH, 'no tools'),
+            UnusedRuntime(TaskMode.DISCUSS, 'no models'), UnusedRuntime(TaskMode.DIRECT, 'no main'),
+            artifact_repository=case.hybrid.repository)
+    await restored.restore_checkpoint(checkpoint)
+    recovered = [item async for item in restored.run(case.context.model_copy(update={
+        'checkpoint': checkpoint, 'artifacts': artifacts,
+    }))]
+    assert [item.kind for item in recovered] == [EventKind.RUNTIME_COMPLETED]
+    assert not unused.requests
+
+
+@pytest.mark.parametrize('version', [None, True, 2])
+async def test_legacy_direct_publication_is_not_retrofitted(tmp_path: Path, version: object) -> None:
+    context = report_context()
+    runtime, _, _, _ = runner(tmp_path, context, Model(batch({'main.py': FIXED}), REPORT))
+    events = tuple([item async for item in runtime.run(context)])
+    route = dict(context.routing_decision)
+    if version is None:
+        route.pop('engineering_direct_report_version')
+    else:
+        route['engineering_direct_report_version'] = version
+    legacy = context.model_copy(update={'routing_decision': route})
+    groups = [group async for group in _delivery_publication_batches(stream(events), legacy)]
+    assert groups == [(item,) for item in events]
+
+
+async def test_discuss_existing_atomic_envelope_is_unchanged() -> None:
+    from uuid import uuid4
+
+    from agent_hub.runtime.autogen.delivery_report import FINAL_REPORT_ACTOR, FINAL_REPORT_POLICY
+    from agent_hub.runtime.contracts import Artifact
+
+    ctx = report_context().model_copy(update={'mode': TaskMode.DISCUSS,
+        'routing_decision': {FINAL_REPORT_POLICY: 1}})
+    report = Artifact(id=uuid4(), type='text', producer=FINAL_REPORT_ACTOR,
+                      content={'text': REPORT, 'presentation': 'final_answer'})
+    checkpoint = RuntimeCheckpoint(id=uuid4(), runtime_type='autogen', runtime_version='2',
+        run_id=ctx.run_id, tenant_id=ctx.tenant_id, mode=ctx.mode, state={
+            FINAL_REPORT_POLICY: 1, 'model_ledger': ({'status': 'succeeded', 'report_binding': {
+                'version': 1, 'run_id': str(ctx.run_id), 'tenant_id': str(ctx.tenant_id),
+                'owner': FINAL_REPORT_ACTOR}},),
+            'artifact_registry': {str(report.id): report.content_sha256},
+        })
+    ctx = ctx.model_copy(update={'checkpoint': checkpoint})
+    envelope = (
+        RunEvent(kind=EventKind.MESSAGE_CREATED, sequence=1, run_id=ctx.run_id,
+                 actor=FINAL_REPORT_ACTOR, message=REPORT),
+        RunEvent(kind=EventKind.ARTIFACT_CREATED, sequence=2, run_id=ctx.run_id, artifact=report),
+        RunEvent(kind=EventKind.CHECKPOINT_SAVED, sequence=3, run_id=ctx.run_id, checkpoint=checkpoint),
+    )
+    groups = [group async for group in _delivery_publication_batches(stream(envelope), ctx)]
+    assert groups == [envelope]
+
+
+async def test_hybrid_resume_uses_only_exact_claimed_checkpoint_event_prefix(
+    hybrid_case: HybridCase,
+) -> None:
+    case = hybrid_case
+    boundary = max(i for i, item in enumerate(case.events[:case.main_index])
+                   if item.checkpoint is not None)
+    checkpoint = case.events[boundary].checkpoint
+    assert checkpoint is not None
+    resumed = case.context.model_copy(update={'checkpoint': checkpoint})
+    groups = [group async for group in _delivery_publication_batches(
+        stream(case.events[boundary + 1:]), resumed, recovery_events=case.events[:boundary + 1],
+    )]
+    assert len(next(group for group in groups if case.events[case.main_index] in group)) == 4
+
+
+async def test_historical_context_cannot_replace_current_hybrid_lineage(
+    hybrid_case: HybridCase,
+) -> None:
+    case = hybrid_case
+    history = tuple(item.artifact for item in case.events[:case.main_index]
+                    if item.artifact is not None)
+    context = case.context.model_copy(update={'artifacts': history})
+    published = []
+    with pytest.raises(RuntimeError, match='publication.*lineage'):
+        async for group in _delivery_publication_batches(stream(case.events[case.main_index:]), context):
+            published.extend(group)
+    assert not published
+
+
+async def test_legacy_hybrid_is_not_retrofitted(hybrid_case: HybridCase) -> None:
+    case = hybrid_case
+    route = dict(case.context.routing_decision)
+    route.pop('engineering_hybrid_report_version')
+    legacy = case.context.model_copy(update={'routing_decision': route})
+    groups = [group async for group in _delivery_publication_batches(stream(case.events), legacy)]
+    assert groups == [(item,) for item in case.events]
+
+
+async def test_unrestorable_hybrid_terminal_budget_never_publishes_main(
+    hybrid_case: HybridCase,
+) -> None:
+    case = hybrid_case
+    events = list(case.events)
+    terminal = events[case.main_index + 3]
+    assert terminal.checkpoint is not None
+    payload = terminal.checkpoint.to_payload()
+    # The failed zero-budget fixture exposed this native-invalid state: no new budget is granted.
+    payload['state']['remaining_token_budget'] = 0
+    assert payload['state']['token_budget_grant'] > payload['state']['token_budget_spent']
+    events[case.main_index + 3] = terminal.model_copy(update={
+        'checkpoint': changed_checkpoint(payload),
+    })
+    published = []
+    with pytest.raises(RuntimeError, match='publication.*checkpoint'):
+        async for group in _delivery_publication_batches(stream(tuple(events)), case.context):
+            published.extend(group)
+    assert case.events[case.main_index] not in published
+
+
+async def test_conflicting_recovery_artifact_identity_is_not_hidden_by_equal_content_hash(
+    hybrid_case: HybridCase,
+) -> None:
+    from uuid import uuid4
+
+    case = hybrid_case
+    boundary = max(i for i, item in enumerate(case.events[:case.main_index])
+                   if item.checkpoint is not None)
+    checkpoint = case.events[boundary].checkpoint
+    assert checkpoint is not None
+    prefix = list(case.events[:boundary + 1])
+    original = next(item for item in prefix if item.artifact is not None
+                    and item.artifact.type == 'model_response'
+                    and str(item.artifact.id) in checkpoint.state['artifact_registry'])
+    changed = original.artifact.model_copy(update={'source_ids': (str(uuid4()),)})
+    prefix.insert(prefix.index(original) + 1, original.model_copy(update={'artifact': changed}))
+    prefix = [item.model_copy(update={'sequence': i + 1}) for i, item in enumerate(prefix)]
+    with pytest.raises(RuntimeError, match='publication.*ambiguous'):
+        _ = [group async for group in _delivery_publication_batches(
+            stream(case.events[boundary + 1:]), case.context.model_copy(update={'checkpoint': checkpoint}),
+            recovery_events=tuple(prefix),
+        )]

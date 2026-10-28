@@ -2221,6 +2221,7 @@ class RunService:
             )
             non_progress_artifact_ids: frozenset[str] = frozenset()
             checkpoint_progress_keys: dict[str, str | None] = {}
+            publication_recovery_events: tuple[RunEvent, ...] = ()
             meaningful_progress = (
                 runtime_routing_decision.get("runtime_progress_policy") == "semantic_workspace_v1"
                 or checkpoint is None
@@ -2230,11 +2231,12 @@ class RunService:
                 checkpoint_registry := checkpoint.state.get("artifact_registry"), Mapping
             ):
                 # Only the checkpoint's exact historical prefix may seed observation credit.
+                publication_recovery_events = await self._repository.raw_events(tenant_id, run_id)
                 checkpoint_progress_keys = {
                     str(event.artifact.id): _runtime_artifact_progress_key(
                         event.artifact, meaningful_progress=meaningful_progress,
                     )
-                    for event in await self._repository.raw_events(tenant_id, run_id)
+                    for event in publication_recovery_events
                     if event.artifact is not None
                     and checkpoint_registry.get(str(event.artifact.id)) == event.artifact.content_sha256
                 }
@@ -2491,7 +2493,9 @@ class RunService:
                 )
                 async with asyncio.timeout(None) as approval_timeout, aclosing(runtime_events):
                     approval_drain.timeout = approval_timeout
-                    async for event_batch in _delivery_publication_batches(runtime_events, context):
+                    async for event_batch in _delivery_publication_batches(
+                        runtime_events, context, recovery_events=publication_recovery_events,
+                    ):
                         event = event_batch[0]
                         cancel_runtime = False
                         stop_runtime_loop = False
@@ -5857,11 +5861,184 @@ def _with_runtime_token_budget_policy(
     return decision
 
 
+def _main_report_checkpoint_matches(
+    checkpoint: RuntimeCheckpoint, context: TaskContext, report: Artifact,
+) -> bool:
+    from agent_hub.runtime import direct_delivery_report
+
+    policy = checkpoint.state.get(direct_delivery_report.CHECKPOINT_POLICY)
+    return (
+        checkpoint.run_id == context.run_id and checkpoint.tenant_id == context.tenant_id
+        and checkpoint.mode is TaskMode.DIRECT
+        and checkpoint.runtime_type == "direct" and checkpoint.runtime_version == "1"
+        and checkpoint.state_sha256 == checkpoint.recompute_state_sha256()
+        and checkpoint.state.get("completed") is True
+        and checkpoint.state.get("artifact_id") == str(report.id)
+        and checkpoint.state.get("artifact_sha256") == report.content_sha256
+        and isinstance(policy, Mapping)
+        and set(policy) == set(direct_delivery_report.policy_identity(context))
+        and all(type(value) is int and value == 1 for value in policy.values())
+    )
+
+
+async def _main_delivery_publication_batches(
+    events: AsyncIterator[RunEvent], context: TaskContext, *, recovery_events: tuple[RunEvent, ...],
+) -> AsyncGenerator[tuple[RunEvent, ...], None]:
+    from agent_hub.runtime import direct_delivery_report
+    from agent_hub.runtime.contracts import _mutable_json
+
+    pending: list[RunEvent] = []
+    artifacts: dict[str, Artifact] = {}
+    references: dict[str, str] = {}
+    stages = 0
+    plan_digest: JsonValue = None
+    if context.mode is TaskMode.HYBRID and context.checkpoint is not None:
+        checkpoint = context.checkpoint
+        registry = checkpoint.state.get("artifact_registry")
+        if isinstance(registry, Mapping):
+            for previous in recovery_events:
+                if previous.run_id != context.run_id:
+                    raise RuntimeError("final report publication recovery scope is invalid")
+                if previous.checkpoint is not None and previous.checkpoint.id == checkpoint.id:
+                    if previous.checkpoint != checkpoint:
+                        raise RuntimeError("final report publication recovery checkpoint is invalid")
+                    break
+                item = previous.artifact
+                if item is not None and registry.get(str(item.id)) == item.content_sha256:
+                    existing = artifacts.get(str(item.id))
+                    if existing is not None and existing != item:
+                        raise RuntimeError("final report publication recovery artifact registry is ambiguous")
+                    artifacts[str(item.id)] = item
+            else:
+                if recovery_events:
+                    raise RuntimeError("final report publication recovery checkpoint is missing")
+    async for event in events:
+        if pending:
+            report = pending[0].artifact
+            assert report is not None
+            if (event.kind is not EventKind.CHECKPOINT_SAVED or event.checkpoint is None
+                    or event.run_id != context.run_id):
+                raise RuntimeError("final report publication checkpoint is invalid")
+            checkpoint = event.checkpoint
+            if context.mode is TaskMode.DIRECT:
+                if not _main_report_checkpoint_matches(checkpoint, context, report):
+                    raise RuntimeError("final report publication checkpoint is invalid")
+                yield (pending[0], event)
+                pending = []
+                continue
+            count = _hybrid_publication_checkpoint_stages(checkpoint, context)
+            if len(pending) == 1:
+                child = checkpoint.state.get("child_checkpoint")
+                try:
+                    direct = RuntimeCheckpoint.from_payload(_mutable_json(child)) if isinstance(child, Mapping) else None
+                except (TypeError, ValueError):
+                    direct = None
+                if (direct is None or not _main_report_checkpoint_matches(direct, context, report)
+                        or checkpoint.state.get("terminal") is not False
+                        or checkpoint.state.get("next_stage") != count - 1):
+                    raise RuntimeError("final report publication child checkpoint is invalid")
+                references = _hybrid_publication_lineage(checkpoint, context, report, artifacts)
+                stages, plan_digest = count, checkpoint.state.get("plan_digest")
+            elif (count != stages or checkpoint.state.get("plan_digest") != plan_digest
+                    or checkpoint.state.get("next_stage") != stages
+                    or checkpoint.state.get("child_checkpoint") is not None
+                    or checkpoint.state.get("terminal") is not (len(pending) == 3)):
+                raise RuntimeError("final report publication terminal checkpoint is invalid")
+            for key in ("artifact_registry", "output_artifact_registry"):
+                registry = checkpoint.state.get(key)
+                if not isinstance(registry, Mapping) or any(registry.get(k) != v for k, v in references.items()):
+                    raise RuntimeError("final report publication lineage checkpoint is invalid")
+            pending.append(event)
+            if len(pending) == 4:
+                if checkpoint.state.get("reason") != "explicit_completion":
+                    raise RuntimeError("final report publication terminal reason is invalid")
+                yield tuple(pending)
+                pending = []
+            continue
+        artifact = event.artifact
+        if context.mode is TaskMode.HYBRID and artifact is not None:
+            previous_artifact = artifacts.get(str(artifact.id))
+            if event.run_id != context.run_id or previous_artifact is not None and previous_artifact != artifact:
+                raise RuntimeError("final report publication artifact registry is ambiguous")
+            artifacts[str(artifact.id)] = artifact
+        binding = None if artifact is None else artifact.content.get("delivery_report_binding")
+        if (event.kind is EventKind.ARTIFACT_CREATED and event.artifact is not None
+                and "delivery_report_binding" in event.artifact.content
+                and not (isinstance(binding, Mapping) and binding.get("runtime") == "crew")):
+            if event.run_id != context.run_id or not direct_delivery_report.valid(context, event.artifact):
+                raise RuntimeError("final report publication artifact is invalid")
+            pending = [event]
+        else:
+            yield (event,)
+    if pending:
+        raise RuntimeError("final report publication ended before checkpoint")
+
+
+def _hybrid_publication_checkpoint_stages(checkpoint: RuntimeCheckpoint, context: TaskContext) -> int:
+    from agent_hub.runtime.hybrid import HybridPlan, HybridUpgrade
+
+    if (checkpoint.run_id != context.run_id or checkpoint.tenant_id != context.tenant_id
+            or checkpoint.mode is not TaskMode.HYBRID or checkpoint.runtime_type != "hybrid"
+            or checkpoint.runtime_version != "3"
+            or checkpoint.state_sha256 != checkpoint.recompute_state_sha256()
+            or type(checkpoint.state.get("engineering_hybrid_report_version")) is not int
+            or checkpoint.state.get("engineering_hybrid_report_version") != 1):
+        raise RuntimeError("final report publication checkpoint is invalid")
+    grant, spent, remaining = (checkpoint.state.get(key) for key in (
+        "token_budget_grant", "token_budget_spent", "remaining_token_budget",
+    ))
+    if (type(grant) is not int or not 0 <= grant <= 10_000_000
+            or type(spent) is not int or not 0 <= spent <= 10_000_000
+            or type(remaining) is not int or remaining != max(0, grant - spent)):
+        raise RuntimeError("final report publication budget checkpoint is invalid")
+    for upgrade in HybridUpgrade:
+        if checkpoint.state.get("plan_digest") == HybridPlan(upgrade=upgrade).digest:
+            return 4 if upgrade is HybridUpgrade.DISCUSS_DISPATCH_DISCUSS else 3
+    raise RuntimeError("final report publication plan is invalid")
+
+
+def _hybrid_publication_lineage(
+    checkpoint: RuntimeCheckpoint, context: TaskContext, report: Artifact,
+    artifacts: Mapping[str, Artifact],
+) -> dict[str, str]:
+    from agent_hub.runtime import direct_delivery_report, hybrid_delivery_report
+
+    registry, outputs = (checkpoint.state.get(key) for key in (
+        "artifact_registry", "output_artifact_registry",
+    ))
+    if not isinstance(registry, Mapping) or not isinstance(outputs, Mapping):
+        raise RuntimeError("final report publication lineage registry is invalid")  # noqa: TRY004 - protocol failure
+    if any(registry.get(key) != value for key, value in outputs.items()):
+        raise RuntimeError("final report publication output registry is invalid")
+    current = tuple(item for key, item in artifacts.items()
+                    if outputs.get(key) == item.content_sha256
+                    and item.content_sha256 == item.recompute_content_sha256())
+    try:
+        expected, required = hybrid_delivery_report.delivery(
+            context, current, output_ids={item.id for item in current},
+        )
+        source_ids = {str(item.id) for item in required}
+        if (outputs.get(str(report.id)) != report.content_sha256
+                or direct_delivery_report.digest(expected)
+                != direct_delivery_report.digest(report.content.get("workspace_delivery"))
+                or not source_ids.issubset(report.source_ids)):
+            raise ValueError("report lineage mismatch")
+    except (TypeError, ValueError, RecursionError):
+        raise RuntimeError("final report publication native lineage is invalid") from None
+    return {str(item.id): item.content_sha256 for item in (report, *required)}
+
+
 async def _delivery_publication_batches(
-    events: AsyncIterator[RunEvent], context: TaskContext,
+    events: AsyncIterator[RunEvent], context: TaskContext, *, recovery_events: tuple[RunEvent, ...] = (),
 ) -> AsyncGenerator[tuple[RunEvent, ...], None]:
     """Commit the selected no-effect report envelope and its checkpoint atomically."""
+    from agent_hub.runtime import direct_delivery_report
     from agent_hub.runtime.autogen.delivery_report import FINAL_REPORT_ACTOR, FINAL_REPORT_POLICY
+
+    if context.mode in (TaskMode.DIRECT, TaskMode.HYBRID) and direct_delivery_report.selected(context):
+        async for group in _main_delivery_publication_batches(events, context, recovery_events=recovery_events):
+            yield group
+        return
 
     selected = (context.mode is TaskMode.DISCUSS
                 and type(context.routing_decision.get(FINAL_REPORT_POLICY)) is int
