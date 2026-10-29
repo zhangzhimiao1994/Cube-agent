@@ -56,3 +56,21 @@
 - Ruling: native restore already requires the matching `TaskContext.checkpoint`; preserve that identity guard rather than introduce a second restore API. Its negative regression proves zero additional model/tool calls.
 - Final review: self-review (no subagent tool). Checked all three source diffs for admission proof, attempt encoding, UNKNOWN, usage, private history, per-candidate receipt selection, carrier integrity and atomic final publication. Parent and Hooke independent review remains pending.
 - Deliberately outside this slice: adding reviewers to default plans, revision in Direct/Discuss/Hybrid final Main, deployment and live paid acceptance. Existing routing remains unchanged; production c1e15/run7732 were not accessed.
+
+## Follow-up P2: preserve public review/retry trace
+
+- [x] Reproduce Hooke's terminal-filter finding with the real revision fixture: public revise/approve metadata plus one reporter retry, without old draft or feedback body.
+- [x] After unchanged native graph/hash validation, preserve whitelisted trace metadata in the terminal atomic group. Use the UI's existing `decision.*` representation for review metadata with exact native event/candidate/model references; never fabricate a native REVIEW_COMPLETED with empty inputs or a replacement Artifact. Keep native records private and unchanged.
+- [x] Verify cold restore reuses model/tool receipts and exposes only correctly attributed newly emitted trace, without replaying historical trace; verify completed restore does not duplicate review/retry records.
+- [x] Run the P2-focused tests, necessary neighboring publication/projection checks, strict mypy and Ruff; self-review and local follow-up commit only. No server/deploy/model/GitHub action.
+
+### P2 follow-up evidence
+
+- Independent finding: final-only filter suppressed two reviewer verdicts and the reporter revision retry. Actual RED: the real fixture produced no public verdict metadata instead of revise/approve (1 failed, 3.21s).
+- Only source change is `runs/service.py`: after the unchanged full native terminal graph/hash checks, project native reviews as `decision.report_review` metadata and retain sanitized `step.retrying`. Existing UI recognizes `decision.*` verdict records and `step.retrying` intent records. Extension-event actor/step identity stays in payload as required by the existing contract.
+- Metadata contains a projection label, native event kind/sequence, exact model call key, candidate ID/hash, reviewer model ID/hash and business attempt. Native inputs, candidate/model artifacts and raw feedback are unchanged and private. No fabricated native REVIEW_COMPLETED or replacement Artifact is created.
+- Verify native actor/verdict/retry against the linked actual reviewer receipt, including the existing fenced-JSON format. No free-text model feedback enters the projection. Metadata joins the original terminal atomic group.
+- Final P2 + necessary adjacent carrier/transaction/restore/rejection verification:46PASS (23.19s); P2 metadata/trace/restore focus11PASS (7.66s). Strict mypy service1 file PASS, Ruff service/test2 files PASS, whitespace check PASS.
+- Cold restore tests cover reporter feedback/prepared/running/succeeded/completed and second-reviewer prepared/succeeded. Successful receipts are reused, trace candidate/call identity is preserved, historical review/retry events are not replayed, completed recovery adds no duplicate trace. Verdict/actor/retry relabels are rejected.
+- Final self-review: no remaining blocking finding within this P2. Follow-up independent review by parent/Hooke is pending. Only service, this plan and the corresponding revision test file enter the follow-up commit; adapter/delivery_report are parent-owned and unchanged here.
+- Parent reports run7732 FAILED at19:32:19 due to tester post-tool finalization growth exhaustion, before its20:03 deadline. Parent/Hooke own that separate diagnosis; no growth, model, routing, deployed pins, server or paid-run action was taken here.

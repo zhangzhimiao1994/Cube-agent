@@ -11,7 +11,7 @@ import pytest
 from agent_hub.models.types import ModelResponse, TokenUsage
 from agent_hub.runs.service import _delivery_publication_batches
 from agent_hub.runtime.artifacts import ArtifactReference, InMemoryArtifactRepository
-from agent_hub.runtime.contracts import Artifact, EventKind, RuntimeCheckpoint
+from agent_hub.runtime.contracts import Artifact, EventKind, RunEvent, RuntimeCheckpoint
 from agent_hub.runtime.crew import adapter, delivery_report
 from tests.unit.capabilities.test_project_verification import Executor
 from tests.unit.runs.test_crew_report_publication_red_oct29 import (
@@ -115,6 +115,51 @@ async def test_fresh_reviewed_plan_publishes_only_approved_revision(revision_cas
     assert any(event.artifact == final for event in terminal_group)
 
 
+async def test_public_revision_keeps_review_and_retry_metadata_without_private_bodies(
+    revision_case: NativeCase,
+) -> None:
+    case = revision_case
+    groups = [group async for group in _delivery_publication_batches(
+        stream(case.events), case.context, runtime=case.runtime)]
+    public = [event for group in groups for event in group]
+    reviews = [event for event in public if event.payload.get("source_event_kind") == "review.completed"]
+    retries = [event for event in public if event.kind is EventKind.STEP_RETRYING
+               and event.actor == "reporter"]
+    assert [event.payload["verdict"] for event in reviews] == ["revise", "approve"]
+    assert len(retries) == 1 and retries[0].payload["attempt"] == 2
+    terminal = await case.runtime.save_checkpoint()
+    original_reviews = [event for event in case.events if event.kind is EventKind.REVIEW_COMPLETED]
+    for projected, original in zip(reviews, original_reviews, strict=True):
+        candidate = original.inputs[0]
+        assert projected.kind == "decision.report_review"
+        assert projected.run_id == original.run_id
+        assert projected.payload["actor"] == original.actor == "reviewer"
+        assert projected.payload["step_id"] == "report"
+        assert projected.actor is None and projected.step_id is None  # Extension-event contract.
+        assert not projected.inputs and projected.artifact is None
+        assert projected.payload["source_event_sequence"] == original.sequence
+        assert projected.payload["candidate_artifact_id"] == str(candidate.id)
+        assert projected.payload["candidate_sha256"] == candidate.content_sha256
+        assert projected.payload["attempt"] == candidate.version
+        row = terminal.state["models"][projected.payload["model_call_key"]]
+        assert row["purpose"] == "review" and row["actor"] == original.actor
+        assert row["artifact_id"] == projected.payload["review_model_artifact_id"]
+        assert row["sha256"] == projected.payload["review_model_sha256"]
+        assert RunEvent.from_payload(projected.to_payload()) == projected
+    retry = retries[0]
+    original_retry = next(event for event in case.events if event.kind is EventKind.STEP_RETRYING
+                          and event.actor == "reporter")
+    assert retry.payload["source_event_kind"] == "step.retrying"
+    assert retry.payload["source_event_sequence"] == original_retry.sequence
+    assert retry.step_id == original_retry.step_id == "report"
+    assert RunEvent.from_payload(retry.to_payload()) == retry
+    assert not any(OLD in public_json(event) or '"feedback"' in public_json(event) for event in public)
+    publication = next(group for group in groups if any(event.checkpoint == terminal for event in group))
+    assert all(event in publication for event in (*reviews, *retries))
+    assert all(event.inputs for event in original_reviews), "native input contract was rewritten"
+    assert len(case.gateway.requests) == 8 and len(case.harness.calls) == 3
+
+
 @pytest.mark.parametrize("phase", ["feedback", "prepared", "running", "succeeded", "completed"])
 async def test_revision_cold_restore_keeps_receipts_budget_and_unknown_stop(
     revision_case: NativeCase, installed_parser: types.ModuleType, phase: str,  # noqa: F811
@@ -146,7 +191,69 @@ async def test_revision_cold_restore_keeps_receipts_budget_and_unknown_stop(
         public = [event for group in [group async for group in _delivery_publication_batches(
             stream(events), task, runtime=cold)] for event in group]
         assert not any(OLD in public_json(event) for event in public)
+        traces = [event for event in public if event.payload.get("source_event_kind") == "review.completed"]
+        assert [event.payload["verdict"] for event in traces] == ([] if phase == "completed" else ["approve"])
+        assert not any(event.kind is EventKind.STEP_RETRYING for event in public)
+        if traces:
+            native_review = next(event for event in events if event.kind is EventKind.REVIEW_COMPLETED)
+            assert traces[0].payload["candidate_artifact_id"] == str(native_review.inputs[0].id)
+            assert traces[0].payload["source_event_sequence"] == native_review.sequence
+            assert traces[0].payload["actor"] == "reviewer" and traces[0].payload["attempt"] == 2
     assert len(case.harness.calls) == 3
+
+
+@pytest.mark.parametrize("phase", ["prepared", "succeeded"])
+async def test_cold_review_trace_keeps_native_candidate_and_call_identity_without_replay(
+    revision_case: NativeCase, installed_parser: types.ModuleType, phase: str,  # noqa: F811
+) -> None:
+    case = revision_case
+    cp = next(event.checkpoint for event in case.events if event.checkpoint is not None and any(
+        row["step_id"] == "report" and row["purpose"] == "review" and row["attempt"] > 0
+        and row["status"] == phase for row in event.checkpoint.state["models"].values()))
+    key, row = next((key, row) for key, row in cp.state["models"].items()
+                    if row["step_id"] == "report" and row["purpose"] == "review" and row["attempt"] > 0)
+    expected_candidate = next(event.artifact for event in case.events if event.artifact is not None
+                              and event.artifact.producer == "reporter" and event.artifact.type == "text"
+                              and event.artifact.version == 2)
+    gateway = WorkspaceDeliverySequenceGateway((APPROVE,) if phase == "prepared" else ())
+    cold = runtime(gateway, case.harness, await repository_from(case, await private_prefix(case, cp)), installed_parser)
+    await cold.restore_checkpoint(cp)
+    task = case.context.model_copy(update={"checkpoint": cp})
+    events = tuple([event async for event in cold.run(task)])
+    public = [event for group in [group async for group in _delivery_publication_batches(
+        stream(events), task, runtime=cold)] for event in group]
+    traces = [event for event in public if event.payload.get("source_event_kind") == "review.completed"]
+    assert len(traces) == 1 and traces[0].payload["verdict"] == "approve"
+    assert traces[0].payload["model_call_key"] == key
+    assert expected_candidate is not None
+    assert traces[0].payload["candidate_artifact_id"] == str(expected_candidate.id)
+    assert traces[0].payload["candidate_sha256"] == expected_candidate.content_sha256
+    if phase == "succeeded":
+        assert traces[0].payload["review_model_artifact_id"] == row["artifact_id"]
+    assert len(gateway.requests) == (1 if phase == "prepared" else 0)
+    assert len(case.harness.calls) == 3
+    assert not any(OLD in public_json(event) for event in public)
+
+
+@pytest.mark.parametrize("field", ["verdict", "reviewer", "retry_attempt"])
+async def test_public_trace_cannot_relabel_native_verdict_actor_or_retry(
+    revision_case: NativeCase, field: str,
+) -> None:
+    case = revision_case
+    events = list(case.events)
+    index = next(i for i, event in enumerate(events) if (
+        event.kind is EventKind.REVIEW_COMPLETED if field != "retry_attempt" else
+        event.kind is EventKind.STEP_RETRYING and event.actor == "reporter"))
+    event = events[index]
+    if field == "reviewer":
+        updates = {"actor": "foreign_reviewer"}
+    else:
+        updates = {"payload": {**event.payload, **(
+            {"verdict": "approve"} if field == "verdict" else {"attempt": 3})}}
+    events[index] = event.model_copy(update=updates)
+    with pytest.raises(RuntimeError, match="crew report publication review trace is invalid"):
+        _ = [group async for group in _delivery_publication_batches(
+            stream(tuple(events)), case.context, runtime=case.runtime)]
 
 
 @pytest.mark.parametrize("defect", ["candidate", "model", "reviewer", "feedback"])
