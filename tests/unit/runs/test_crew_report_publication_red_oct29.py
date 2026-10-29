@@ -503,16 +503,16 @@ async def test_native_report_revision_keeps_the_single_model_attempt_boundary(
     )})
     task = context()
     events = []
-    with pytest.raises(adapter.RuntimeExecutionError, match="single native model call"):
-        async for event in runtime.run(task):
-            events.append(event)
+    async for event in runtime.run(task):
+        events.append(event)
     groups = [group async for group in _delivery_publication_batches(stream(events), task, runtime=runtime)]
     public = [item for group in groups for item in group]
     assert not any(old in public_json(item) for item in public)
-    assert not any(item.kind is EventKind.RUNTIME_COMPLETED for item in public)
-    assert len(gateway.requests) == 6 and len(harness.calls) == 3
+    assert any(REPORT in public_json(item) for item in public)
+    assert sum(item.kind is EventKind.RUNTIME_COMPLETED for item in public) == 1
+    assert len(gateway.requests) == 8 and len(harness.calls) == 3
     saved = await runtime.save_checkpoint()
-    assert len(saved.state["models"]) == 6
+    assert len(saved.state["models"]) == 8
 
 
 async def test_pending_without_terminal_checkpoint_fails_closed(native_case: NativeCase) -> None:

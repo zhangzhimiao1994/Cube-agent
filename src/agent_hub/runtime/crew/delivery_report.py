@@ -20,6 +20,7 @@ from agent_hub.runtime.original_project_progress import original_contract_bindin
 from agent_hub.runtime.python_project_history import python_history_selected
 
 POLICY = "engineering_dispatch_report_version"
+REVISION_POLICY = "engineering_dispatch_report_revision_version"
 BINDING = "delivery_report_binding"
 PROMPT = (
     "Write the final delivery report as ordinary Markdown in the user's language. "
@@ -226,10 +227,12 @@ def report_binding(
     *, context: TaskContext, plan: DispatchPlan, step: DispatchStep, text: str,
     states: Mapping[str, Mapping[str, JsonValue]], artifacts: Mapping[str, Artifact],
     models: Mapping[str, Mapping[str, JsonValue]], model_artifacts: Mapping[str, Artifact],
+    model_artifact_id: str | None = None,
 ) -> dict[str, JsonValue]:
     phase, _ = delivery_evidence(context, plan, step, states, artifacts)
     rows = [(key, row) for key, row in models.items()
-            if row.get("step_id") == step.id and row.get("purpose") == "step"]
+            if row.get("step_id") == step.id and row.get("purpose") == "step"
+            and (model_artifact_id is None or row.get("artifact_id") == model_artifact_id)]
     if len(rows) != 1 or rows[0][1].get("status") != "succeeded":
         raise ValueError("delivery report requires its single succeeded native model outcome")
     key, row = rows[0]
@@ -251,6 +254,7 @@ def validate_report(
     report: Artifact, *, context: TaskContext, plan: DispatchPlan, step: DispatchStep,
     states: Mapping[str, Mapping[str, JsonValue]], artifacts: Mapping[str, Artifact],
     models: Mapping[str, Mapping[str, JsonValue]], model_artifacts: Mapping[str, Artifact],
+    allow_revisions: bool = False,
 ) -> None:
     text = report.content.get("text")
     if type(text) is not str:
@@ -259,7 +263,8 @@ def validate_report(
     if not isinstance(binding, Mapping) or not isinstance(binding.get("model_artifact_id"), str):
         raise ValueError("delivery report persisted binding is invalid")  # noqa: TRY004 - Invalid native evidence.
     expected = report_binding(context=context, plan=plan, step=step, text=text, states=states,
-                              artifacts=artifacts, models=models, model_artifacts=model_artifacts)
+                              artifacts=artifacts, models=models, model_artifacts=model_artifacts,
+                              model_artifact_id=cast(str, binding["model_artifact_id"]) if allow_revisions else None)
     model = next(item for item in model_artifacts.values() if str(item.id) == expected["model_artifact_id"])
     if (report.content.get(BINDING) != expected or set(report.content) != {"text", BINDING}
         or expected["model_artifact_id"] not in report.source_ids

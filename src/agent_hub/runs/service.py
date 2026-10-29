@@ -6058,12 +6058,16 @@ async def _crew_delivery_publication_batches(
     pending: list[RunEvent] = []
     report_steps: set[str] = set()
     actors: set[str] = set()
+    model_refs: dict[str, tuple[str, str]] = {}
+    revisions = False
     publication_checkpoint: RuntimeCheckpoint | None = None
     published_reports: dict[str, Artifact] = {}
 
     def observe(checkpoint: RuntimeCheckpoint) -> None:
+        nonlocal revisions
         if checkpoint.run_id != context.run_id or checkpoint.tenant_id != context.tenant_id:
             raise RuntimeError("crew report publication checkpoint scope is invalid")
+        revisions = checkpoint.state.get(delivery_report.REVISION_POLICY) == 1
         models = checkpoint.state.get("models")
         if not isinstance(models, Mapping):
             return
@@ -6077,6 +6081,10 @@ async def _crew_delivery_publication_batches(
         for row in rows:
             if row.get("step_id") in report_steps and isinstance(row.get("actor"), str):
                 actors.add(cast(str, row["actor"]))
+                if isinstance(row.get("artifact_id"), str) and isinstance(row.get("sha256"), str):
+                    model_refs[cast(str, row["artifact_id"])] = (
+                        cast(str, row["sha256"]), cast(str, row["actor"]),
+                    )
 
     def bound_report(artifact: Artifact) -> bool:
         binding = artifact.content.get(delivery_report.BINDING)
@@ -6121,6 +6129,22 @@ async def _crew_delivery_publication_batches(
                 event.artifact.type == "model_response" and event.artifact.producer in actors
             ))
         ) or any(bound_report(item) for item in event.inputs)
+        # Revision feedback and retry inputs may quote a discarded draft. Keep
+        # them private too, without delaying native intent/receipt checkpoints.
+        if revisions and checkpoint is None:
+            model = event.artifact
+            if model is not None and str(model.id) in model_refs:
+                digest, owner = model_refs[str(model.id)]
+                if (model.type != "model_response" or model.producer != owner
+                        or model.content_sha256 != digest or model.recompute_content_sha256() != digest):
+                    raise RuntimeError("crew report publication model artifact is invalid")
+                body = True
+            body = body or (event.artifact is not None and event.actor in actors)
+            body = body or (
+                event.artifact is not None and event.artifact.type == "review_feedback"
+                and event.artifact.producer in actors
+            ) or any(item.type == "review_feedback" and item.producer in actors for item in event.inputs)
+            body = body or (event.kind is EventKind.STEP_RETRYING and event.step_id in report_steps)
         if body:
             for report in report_carriers(event):
                 binding = report.content.get(delivery_report.BINDING)
@@ -6142,13 +6166,38 @@ async def _crew_delivery_publication_batches(
             refs = checkpoint.state.get("artifact_refs")
             reports = [item.artifact for item in pending
                        if item.artifact is not None and bound_report(item.artifact)]
+            revision = checkpoint.state.get(delivery_report.REVISION_POLICY) == 1
+            registry = checkpoint.state.get("artifact_registry")
             if not isinstance(refs, Mapping) or not reports or any(
                 not isinstance(binding := report.content.get(delivery_report.BINDING), Mapping)
-                or refs.get(cast(str, binding.get("final_step_id"))) != {
+                or (refs.get(cast(str, binding.get("final_step_id"))) != {
                     "id": str(report.id), "sha256": report.content_sha256,
-                } for item in pending for report in report_carriers(item)
+                } and not (revision and isinstance(registry, Mapping)
+                           and registry.get(str(report.id)) == report.content_sha256))
+                for item in pending for report in report_carriers(item)
             ):
                 raise RuntimeError("crew report publication final artifact is invalid")
+            if revision:
+                for held in pending:
+                    model = held.artifact
+                    if model is not None and (model.type == "model_response" or str(model.id) in model_refs):
+                        expected_model = model_refs.get(str(model.id))
+                        if (expected_model != (model.content_sha256, model.producer)
+                                or model.recompute_content_sha256() != model.content_sha256):
+                            raise RuntimeError("crew report publication model artifact is invalid")
+                final_reports = [report for report in reports if any(
+                    ref == {"id": str(report.id), "sha256": report.content_sha256}
+                    for ref in refs.values()
+                )]
+                if len(final_reports) != 1:
+                    raise RuntimeError("crew report publication final artifact is invalid")
+                approved = final_reports[0]
+                approved_binding = cast(Mapping[str, JsonValue], approved.content[delivery_report.BINDING])
+                ids = {str(approved.id), approved_binding["model_artifact_id"]}
+                pending = [item for item in pending if (
+                    item.artifact is not None and str(item.artifact.id) in ids
+                ) or (item.kind is EventKind.STEP_COMPLETED and item.inputs == (approved,))]
+                reports = final_reports
             yield (*pending, event)
             publication_checkpoint = checkpoint
             published_reports = {str(report.id): report for report in reports}

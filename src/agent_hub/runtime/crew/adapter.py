@@ -4037,6 +4037,7 @@ class _RunState:
     post_tool_finalization_growth_version: int = 0
     workspace_maintenance_feedback_version: int = 0
     engineering_dispatch_report_version: int = 0
+    engineering_dispatch_report_revision_version: int = 0
     deadline: float | None = None
     adaptive_deadline: AdaptiveDeadline | None = None
     crew_generation: CrewStepGeneration | None = None
@@ -4327,6 +4328,15 @@ class CrewDispatchRuntime:
                 cast(int, restored.state.get(_delivery_report.POLICY, 0))
                 if restored is not None else report_version
             )
+            revision_version = int(report_version == 1 and any(
+                _delivery_report.selected(context, plan, step)
+                and step.reviewer is not None and step.reviewer_retries > 0
+                for step in plan.steps
+            ))
+            state.engineering_dispatch_report_revision_version = (
+                cast(int, restored.state.get(_delivery_report.REVISION_POLICY, 0))
+                if restored is not None else revision_version
+            )
             state.native_tool_continuation = self._provider_continuation_repository is not None
             maintenance_version = context.routing_decision.get("workspace_maintenance_contract_version", 0)
             if (type(maintenance_version) is not int or maintenance_version not in {0, 1}
@@ -4496,6 +4506,7 @@ class CrewDispatchRuntime:
                                     completed[report_step.id], context=context, plan=plan, step=report_step,
                                     states=tool_ledger.states, artifacts=tool_ledger.artifacts,
                                     models=model_ledger.states, model_artifacts=model_ledger.artifacts,
+                                    allow_revisions=state.engineering_dispatch_report_revision_version == 1,
                                 )
                             except ValueError as error:
                                 _fail(str(error))
@@ -5365,6 +5376,7 @@ class CrewDispatchRuntime:
                     step, completion, artifact_sources, retries + 1, model_ledger,
                     agents.get(step.reviewer) if step.reviewer is not None else None,
                     context=context, tool_ledger=tool_ledger,
+                    allow_report_revisions=run_state.engineering_dispatch_report_revision_version == 1,
                 ) or self._artifact(
                     step,
                     completion,
@@ -5378,6 +5390,8 @@ class CrewDispatchRuntime:
                             text=cast(str, completion.response.text),
                             states=tool_ledger.states, artifacts=tool_ledger.artifacts,
                             models=model_ledger.states, model_artifacts=model_ledger.artifacts,
+                            model_artifact_id=(str(evidence[-1].id)
+                                if run_state.engineering_dispatch_report_revision_version == 1 else None),
                         )
                     except ValueError as error:
                         _fail(str(error))
@@ -6824,6 +6838,31 @@ class CrewDispatchRuntime:
             receipt, actor, step_id, key, rejected_state, None, private_output=private,
         ), run_state)
 
+    def _validate_report_revision_call(
+        self, context: TaskContext, step: DispatchStep, attempt: int, index: int,
+        sources: tuple[Artifact, ...], ledger: _ModelLedger,
+    ) -> None:
+        agent = next(item for item in self._plan.agents if item.id == step.agent)
+        recovery_limit = _subagent_recovery_attempt_limit(agent)
+        business_attempt = _subagent_business_attempt(attempt, recovery_limit)
+        if (index != 0 or attempt != _subagent_model_attempt(business_attempt, 0, recovery_limit)
+                or not 0 <= business_attempt <= step.reviewer_retries):
+            _fail("delivery report allows only one native model call per reviewed revision")
+        if business_attempt == 0:
+            return
+        checkpoint = self._last_checkpoint or self._restored_checkpoint or context.checkpoint
+        if (step.reviewer is None or checkpoint is None
+                or checkpoint.state.get(_delivery_report.REVISION_POLICY) != 1
+                or checkpoint.state["models"] != ledger.states
+                or cast(Mapping[str, int], checkpoint.state["retries"]).get(step.id) != business_attempt):
+            _fail("delivery report revision requires durable native review feedback")
+        self._validate_owned_report_checkpoint(checkpoint, context, require_completed=False)
+        reference = cast(Mapping[str, JsonValue], checkpoint.state["review_refs"]).get(step.id)
+        if (not isinstance(reference, Mapping)
+                or not any(str(item.id) == reference["id"] and item.content_sha256 == reference["sha256"]
+                           for item in sources)):
+            _fail("delivery report revision requires its current native feedback")
+
     async def _execute_model_request(
         self, context: TaskContext, step: DispatchStep, actor: str,
         request: ModelRequest, *, purpose: Literal["step", "review"], attempt: int,
@@ -6849,7 +6888,9 @@ class CrewDispatchRuntime:
         report_phase: Mapping[str, JsonValue] | None = None
         if (run_state.engineering_dispatch_report_version == 1 and purpose == "step"
                 and _delivery_report.selected(context, self._plan, step)):
-            if index != 0 or attempt != 0:
+            if run_state.engineering_dispatch_report_revision_version == 1:
+                self._validate_report_revision_call(context, step, attempt, index, sources, ledger)
+            elif index != 0 or attempt != 0:
                 _fail("delivery report allows only its existing single native model call")
             if tool_ledger is None or request.tools or request.response_schema is not None:
                 _fail("delivery report requires a no-tool native model request")
@@ -10563,7 +10604,7 @@ class CrewDispatchRuntime:
     def _persisted_review_candidate(
         self, step: DispatchStep, completion: GatewayCompletion, sources: tuple[Artifact, ...],
         version: int, ledger: _ModelLedger, reviewer: AgentSpec | None,
-        *, context: TaskContext, tool_ledger: _ToolLedger,
+        *, context: TaskContext, tool_ledger: _ToolLedger, allow_report_revisions: bool = False,
     ) -> Artifact | None:
         if reviewer is None:
             return None
@@ -10612,6 +10653,7 @@ class CrewDispatchRuntime:
                     candidates[0], context=context, plan=self._plan, step=step,
                     states=tool_ledger.states, artifacts=tool_ledger.artifacts,
                     models=ledger.states, model_artifacts=ledger.artifacts,
+                    allow_revisions=allow_report_revisions,
                 )
             except ValueError as error:
                 _fail(str(error))
@@ -10773,6 +10815,8 @@ class CrewDispatchRuntime:
                 "plan_digest": plan.digest,
                 **({_delivery_report.POLICY: 1}
                    if run_state.engineering_dispatch_report_version == 1 else {}),
+                **({_delivery_report.REVISION_POLICY: 1}
+                   if run_state.engineering_dispatch_report_revision_version == 1 else {}),
                 "workspace_delivery_continuation": run_state.workspace_delivery_continuation,
                 **({"context_window_compaction_version": 1}
                    if run_state.context_window_compaction_version == 1 else {}),
@@ -10901,6 +10945,7 @@ class CrewDispatchRuntime:
         }
         optional_state_keys = {
             _delivery_report.POLICY,
+            _delivery_report.REVISION_POLICY,
             "context_window_compaction_version",
             "workspace_productive_boundary",
             "native_tool_continuation",
@@ -10933,6 +10978,15 @@ class CrewDispatchRuntime:
             ))
         ):
             _fail("delivery report checkpoint policy is invalid")
+        if _delivery_report.REVISION_POLICY in state and (
+            type(state[_delivery_report.REVISION_POLICY]) is not int
+            or state[_delivery_report.REVISION_POLICY] != 1
+            or state.get(_delivery_report.POLICY) != 1
+            or not any(step.final_synthesizer and not step.tools
+                       and step.reviewer is not None and step.reviewer_retries > 0
+                       for step in plan.steps)
+        ):
+            _fail("delivery report revision checkpoint policy is invalid")
         completed = state["completed"]
         retries = state["retries"]
         refs = state["artifact_refs"]
@@ -11457,6 +11511,9 @@ class CrewDispatchRuntime:
                 or _SHA256.fullmatch(value["request_sha256"]) is None
             ):
                 _fail("runtime checkpoint is incompatible")
+            if (report_row and state.get(_delivery_report.REVISION_POLICY) == 1
+                    and (call_index != 0 or attempt % (recovery_limit + 1) != 0)):
+                _fail("delivery report revision checkpoint has a non-native call attempt")
             if actor != model_agent_id or key != self._model_call_key(
                 context.run_id,
                 model_step_id,
@@ -12030,6 +12087,7 @@ class CrewDispatchRuntime:
         workspace_context_refresh: bool = False,
         post_tool_finalization_growth_version: int = 0,
         native_tool_continuation: bool = False,
+        allow_report_revisions: bool = False,
     ) -> None:
         by_id = {str(artifact.id): artifact for artifact in artifacts}
         if len(by_id) != len(artifacts):
@@ -12441,6 +12499,7 @@ class CrewDispatchRuntime:
                                 candidate, context=context, plan=plan, step=step,
                                 states=tool_ledger.states, artifacts=tool_ledger.artifacts,
                                 models=model_ledger.states, model_artifacts=model_ledger.artifacts,
+                                allow_revisions=allow_report_revisions,
                             )
                         except ValueError as error:
                             _fail(str(error))
@@ -12797,6 +12856,7 @@ class CrewDispatchRuntime:
                 tuple[Mapping[str, str], ...], checkpoint.state["input_refs"],
             )),
             checkpoint.runtime_version,
+            allow_report_revisions=checkpoint.state.get(_delivery_report.REVISION_POLICY) == 1,
             workspace_delivery_continuation=cast(
                 bool, checkpoint.state.get("workspace_delivery_continuation", False),
             ),
@@ -12837,6 +12897,11 @@ class CrewDispatchRuntime:
     def validate_publication_checkpoint(
         self, checkpoint: RuntimeCheckpoint, context: TaskContext,
     ) -> None:
+        self._validate_owned_report_checkpoint(checkpoint, context, require_completed=True)
+
+    def _validate_owned_report_checkpoint(
+        self, checkpoint: RuntimeCheckpoint, context: TaskContext, *, require_completed: bool,
+    ) -> None:
         """Validate a final report against this execution's private native graph.
 
         No restore/provider continuation call is allowed at publication. These
@@ -12845,7 +12910,8 @@ class CrewDispatchRuntime:
         """
         plan = DispatchPlan.revalidate(self._plan)
         self._validate_checkpoint(checkpoint, context, plan)
-        if checkpoint.state["terminal"] is not True or checkpoint.state["phase"] != "completed":
+        if require_completed and (
+                checkpoint.state["terminal"] is not True or checkpoint.state["phase"] != "completed"):
             _fail("delivery report publication checkpoint is not completed")
         raw = cast(Mapping[str, str], checkpoint.state["artifact_registry"])
         registry: dict[str, Artifact] = {}
@@ -12882,7 +12948,10 @@ class CrewDispatchRuntime:
             workspace_context_refresh=checkpoint.state.get("workspace_context_refresh") is True,
             post_tool_finalization_growth_version=cast(int, checkpoint.state.get("post_tool_finalization_growth_version", 0)),
             native_tool_continuation=checkpoint.state.get("native_tool_continuation") is True,
+            allow_report_revisions=checkpoint.state.get(_delivery_report.REVISION_POLICY) == 1,
         )
+        if not require_completed:
+            return
         reports = [step for step in plan.steps if _delivery_report.selected(context, plan, step)]
         if len(reports) != 1 or reports[0].id not in completed:
             _fail("delivery report publication final step is unavailable")
@@ -12891,6 +12960,7 @@ class CrewDispatchRuntime:
                 completed[reports[0].id], context=context, plan=plan, step=reports[0],
                 states=tools.states, artifacts=tools.artifacts,
                 models=models.states, model_artifacts=models.artifacts,
+                allow_revisions=checkpoint.state.get(_delivery_report.REVISION_POLICY) == 1,
             )
         except ValueError as error:
             _fail(str(error))
