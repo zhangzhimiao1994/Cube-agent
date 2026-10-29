@@ -18,8 +18,10 @@ from tests.unit.runs.test_crew_report_publication_red_oct29 import (
     REPORT,
     NativeCase,
     ReviewGateway,
+    persist_group,
     public_json,
     reviewed_runtime,
+    sql_repository,
     stream,
 )
 from tests.unit.runtime.crew.test_adapter_failure_reason import WorkspaceDeliverySequenceGateway
@@ -155,9 +157,81 @@ async def test_public_revision_keeps_review_and_retry_metadata_without_private_b
     assert RunEvent.from_payload(retry.to_payload()) == retry
     assert not any(OLD in public_json(event) or '"feedback"' in public_json(event) for event in public)
     publication = next(group for group in groups if any(event.checkpoint == terminal for event in group))
-    assert all(event in publication for event in (*reviews, *retries))
+    assert all(event not in publication for event in (*reviews, *retries))
+    for projected in (*reviews, *retries):
+        earlier = public[:public.index(projected)]
+        receipt = next(event.checkpoint for event in reversed(earlier) if event.checkpoint is not None)
+        assert receipt is not None
+        row = receipt.state["models"][projected.payload["model_call_key"]]
+        assert row["status"] == "succeeded" and row["actor"] == "reviewer"
+        assert row["sha256"] == projected.payload["review_model_sha256"]
     assert all(event.inputs for event in original_reviews), "native input contract was rewritten"
     assert len(case.gateway.requests) == 8 and len(case.harness.calls) == 3
+
+
+@pytest.mark.parametrize("crash_after", ["review", "retry", "prepared"])
+async def test_real_db_prefix_crash_restore_preserves_merged_review_retry_history(
+    revision_case: NativeCase, installed_parser: types.ModuleType, crash_after: str,  # noqa: F811
+) -> None:
+    case = revision_case
+    if crash_after == "prepared":
+        stop = next(i for i, event in enumerate(case.events) if event.checkpoint == boundary(case, "prepared"))
+    else:
+        stop = next(i for i, event in enumerate(case.events) if (
+            event.kind is EventKind.REVIEW_COMPLETED if crash_after == "review" else
+            event.kind is EventKind.STEP_RETRYING and event.actor == "reporter"))
+
+    class WorkerDied(Exception):
+        pass
+
+    async def interrupted():
+        for event in case.events[:stop + 1]:
+            yield event
+        raise WorkerDied
+
+    async with sql_repository(case.context) as (repository, factory, _):
+        with pytest.raises(WorkerDied):
+            async for group in _delivery_publication_batches(interrupted(), case.context, runtime=case.runtime):
+                await persist_group(repository, case.context, group)
+        before = await repository.events(case.context.tenant_id, case.context.run_id)
+        initial_reviews = [event for event in before
+                           if event["payload"].get("source_event_kind") == "review.completed"]
+        initial_retries = [event for event in before if event["kind"] == "step.retrying"]
+        assert [event["payload"]["verdict"] for event in initial_reviews] == ["revise"]
+        assert len(initial_retries) == (0 if crash_after == "review" else 1)
+        assert OLD not in json.dumps(before, default=str) and REPORT not in json.dumps(before, default=str)
+        async with factory() as session:
+            cp = await repository.latest_checkpoint(session, tenant_id=case.context.tenant_id,
+                                                     run_id=case.context.run_id)
+        assert cp is not None and cp.state["terminal"] is False
+        prefix = await repository.raw_events(case.context.tenant_id, case.context.run_id)
+        gateway = WorkspaceDeliverySequenceGateway((SECOND, APPROVE))
+        cold = runtime(gateway, case.harness, await repository_from(case, await private_prefix(case, cp)), installed_parser)
+        await cold.restore_checkpoint(cp)
+        task = case.context.model_copy(update={"checkpoint": cp})
+        native = tuple([event async for event in cold.run(task)])
+        for group in [group async for group in _delivery_publication_batches(
+            stream(native), task, runtime=cold, recovery_events=prefix)]:
+            await persist_group(repository, task, group)
+        merged = await repository.events(task.tenant_id, task.run_id)
+        reviews = [event for event in merged
+                   if event["payload"].get("source_event_kind") == "review.completed"]
+        retries = [event for event in merged if event["kind"] == "step.retrying"]
+        assert [event["payload"]["verdict"] for event in reviews] == ["revise", "approve"]
+        assert len(retries) == 1 and retries[0]["payload"]["attempt"] == 2
+        identities = [(event["payload"]["source_event_kind"], event["payload"]["model_call_key"])
+                      for event in (*reviews, *retries)]
+        assert len(identities) == len(set(identities)) == 3
+        assert reviews[0] == initial_reviews[0], "cold recovery rewrote the persisted native source coordinates"
+        assert OLD not in json.dumps(merged, default=str)
+        assert '"feedback"' not in json.dumps(merged, default=str)
+        assert sum(event["kind"] == "runtime.completed" for event in merged) == 1
+        assert [event["sequence"] for event in merged] == list(range(1, len(merged) + 1))
+        assert len(gateway.requests) == 2 and len(case.harness.calls) == 3
+        final = await cold.save_checkpoint()
+        async with factory() as session:
+            stored = await repository.latest_checkpoint(session, tenant_id=task.tenant_id, run_id=task.run_id)
+        assert stored == final and stored.state_sha256 == final.recompute_state_sha256()
 
 
 @pytest.mark.parametrize("phase", ["feedback", "prepared", "running", "succeeded", "completed"])
@@ -192,13 +266,82 @@ async def test_revision_cold_restore_keeps_receipts_budget_and_unknown_stop(
             stream(events), task, runtime=cold)] for event in group]
         assert not any(OLD in public_json(event) for event in public)
         traces = [event for event in public if event.payload.get("source_event_kind") == "review.completed"]
-        assert [event.payload["verdict"] for event in traces] == ([] if phase == "completed" else ["approve"])
+        # This checks only the resumed segment. Durable merged history is tested
+        # with an actual persisted SQL prefix above, not inferred from this list.
+        assert [event.payload["verdict"] for event in traces] == [
+            event.payload["verdict"] for event in events if event.kind is EventKind.REVIEW_COMPLETED]
         assert not any(event.kind is EventKind.STEP_RETRYING for event in public)
         if traces:
             native_review = next(event for event in events if event.kind is EventKind.REVIEW_COMPLETED)
             assert traces[0].payload["candidate_artifact_id"] == str(native_review.inputs[0].id)
             assert traces[0].payload["source_event_sequence"] == native_review.sequence
             assert traces[0].payload["actor"] == "reviewer" and traces[0].payload["attempt"] == 2
+    assert len(case.harness.calls) == 3
+
+
+async def test_review_trace_waits_for_delivered_succeeded_receipt_checkpoint(revision_case: NativeCase) -> None:
+    case = revision_case
+    review_index = next(i for i, event in enumerate(case.events) if event.kind is EventKind.REVIEW_COMPLETED)
+    cp_index = next(i for i, event in enumerate(case.events[:review_index])
+                    if event.checkpoint is not None and any(
+                        row["purpose"] == "review" and row["status"] == "succeeded"
+                        for row in event.checkpoint.state["models"].values()))
+    delivered: list[RunEvent] = []
+
+    class WorkerDied(Exception):
+        pass
+
+    async def delayed_receipt():
+        for event in case.events[:review_index + 1]:
+            if event.checkpoint is None or not any(
+                row["purpose"] == "review" and row["status"] == "succeeded"
+                for row in event.checkpoint.state["models"].values()
+            ):
+                yield event
+        assert not any(event.payload.get("projection") == "crew_report_trace_v1" for event in delivered)
+        yield case.events[cp_index]
+        raise WorkerDied
+
+    groups = []
+    with pytest.raises(WorkerDied):
+        async for group in _delivery_publication_batches(delayed_receipt(), case.context, runtime=case.runtime):
+            groups.append(group)
+            delivered.extend(group)
+    trace = next(event for event in delivered if event.payload.get("projection") == "crew_report_trace_v1")
+    assert trace.payload["verdict"] == "revise"
+    group = next(group for group in groups if trace in group)
+    assert group[0] == case.events[cp_index], "trace was not committed with its delayed receipt proof"
+    assert OLD not in "".join(public_json(event) for event in delivered)
+
+
+@pytest.mark.parametrize("field", ["verdict", "candidate_sha256"])
+async def test_conflicting_persisted_review_trace_is_not_silently_deduplicated(
+    revision_case: NativeCase, installed_parser: types.ModuleType, field: str,  # noqa: F811
+) -> None:
+    case = revision_case
+    groups = []
+    iterator = _delivery_publication_batches(stream(case.events), case.context, runtime=case.runtime)
+    try:
+        async for group in iterator:
+            groups.extend(group)
+            if any(event.payload.get("source_event_kind") == "review.completed" for event in group):
+                break
+    finally:
+        await iterator.aclose()
+    cp = next(event.checkpoint for event in reversed(groups) if event.checkpoint is not None)
+    assert cp is not None
+    index = next(i for i, event in enumerate(groups) if event.payload.get("projection") == "crew_report_trace_v1")
+    item = groups[index]
+    groups[index] = item.model_copy(update={"payload": {
+        **item.payload, field: "approve" if field == "verdict" else "f" * 64,
+    }})
+    gateway = WorkspaceDeliverySequenceGateway((SECOND, APPROVE))
+    cold = runtime(gateway, case.harness, await repository_from(case, await private_prefix(case, cp)), installed_parser)
+    await cold.restore_checkpoint(cp)
+    task = case.context.model_copy(update={"checkpoint": cp})
+    with pytest.raises(RuntimeError, match="recovered trace is invalid"):
+        _ = [group async for group in _delivery_publication_batches(
+            cold.run(task), task, runtime=cold, recovery_events=tuple(groups))]
     assert len(case.harness.calls) == 3
 
 

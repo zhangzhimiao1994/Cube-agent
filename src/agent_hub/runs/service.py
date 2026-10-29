@@ -6046,8 +6046,30 @@ def _hybrid_publication_lineage(
 
 def _crew_report_trace_projection(
     event: RunEvent, candidate: Artifact, reviewer: Artifact, call_key: str,
+    checkpoint: RuntimeCheckpoint,
 ) -> RunEvent:
     """Public metadata, never a replacement native event or artifact receipt."""
+    binding = cast(Mapping[str, JsonValue], candidate.content["delivery_report_binding"])
+    registry = checkpoint.state.get("artifact_registry")
+    models = checkpoint.state.get("models")
+    row = models.get(call_key) if isinstance(models, Mapping) else None
+    if (checkpoint.run_id != event.run_id or str(checkpoint.tenant_id) != binding.get("tenant_id")
+            or checkpoint.state_sha256 != checkpoint.recompute_state_sha256()
+            or binding.get("run_id") != str(event.run_id)
+            or binding.get("plan_digest") != checkpoint.state.get("plan_digest")
+            or binding.get("actor") != candidate.producer
+            or not isinstance(registry, Mapping) or not isinstance(row, Mapping)
+            or registry.get(str(candidate.id)) != candidate.content_sha256
+            or candidate.recompute_content_sha256() != candidate.content_sha256
+            or registry.get(str(reviewer.id)) != reviewer.content_sha256
+            or reviewer.recompute_content_sha256() != reviewer.content_sha256
+            or reviewer.type != "model_response" or reviewer.provenance is None
+            or any(row.get(k) != v for k, v in {
+                "status": "succeeded", "purpose": "review", "actor": reviewer.producer,
+                "step_id": binding.get("final_step_id"), "artifact_id": str(reviewer.id),
+                "sha256": reviewer.content_sha256, "provenance": reviewer.provenance.to_payload(),
+            }.items())):
+        raise RuntimeError("crew report publication review trace is invalid")
     text = reviewer.content.get("text")
     if not isinstance(text, str) or not reviewer.source_ids:
         raise RuntimeError("crew report publication review trace is invalid")
@@ -6065,7 +6087,6 @@ def _crew_report_trace_projection(
             or (not retry and (event.actor != reviewer.producer
                                or event.payload.get("verdict") != verdict))):
         raise RuntimeError("crew report publication review trace is invalid")
-    binding = cast(Mapping[str, JsonValue], candidate.content["delivery_report_binding"])
     return RunEvent(
         kind=EventKind.STEP_RETRYING if retry else "decision.report_review",
         sequence=event.sequence, run_id=event.run_id, actor=event.actor if retry else None,
@@ -6088,6 +6109,7 @@ def _crew_report_trace_projection(
 
 async def _crew_delivery_publication_batches(
     events: AsyncIterator[RunEvent], context: TaskContext, *, runtime: ExecutionRuntime | None,
+    recovery_events: tuple[RunEvent, ...] = (),
 ) -> AsyncGenerator[tuple[RunEvent, ...], None]:
     """Defer only report body carriers; native intents/receipts remain durable.
 
@@ -6102,14 +6124,17 @@ async def _crew_delivery_publication_batches(
     actors: set[str] = set()
     model_refs: dict[str, tuple[str, str]] = {}
     revisions = False
+    receipt_checkpoint: RuntimeCheckpoint | None = None
+    published_traces: dict[tuple[str, str], RunEvent] = {}
     publication_checkpoint: RuntimeCheckpoint | None = None
     published_reports: dict[str, Artifact] = {}
 
     def observe(checkpoint: RuntimeCheckpoint) -> None:
-        nonlocal revisions
+        nonlocal revisions, receipt_checkpoint
         if checkpoint.run_id != context.run_id or checkpoint.tenant_id != context.tenant_id:
             raise RuntimeError("crew report publication checkpoint scope is invalid")
         revisions = checkpoint.state.get(delivery_report.REVISION_POLICY) == 1
+        receipt_checkpoint = checkpoint
         models = checkpoint.state.get("models")
         if not isinstance(models, Mapping):
             return
@@ -6136,14 +6161,84 @@ async def _crew_delivery_publication_batches(
         return tuple(item for item in (event.artifact, *event.inputs)
                      if item is not None and bound_report(item))
 
+    def trace_identity(event: RunEvent) -> tuple[str, str]:
+        return cast(str, event.payload["source_event_kind"]), cast(str, event.payload["model_call_key"])
+
+    def safe_traces() -> tuple[RunEvent, ...]:
+        nonlocal pending
+        saved = receipt_checkpoint
+        if not revisions or saved is None:
+            return ()
+        rows = cast(Mapping[str, Mapping[str, JsonValue]], saved.state["models"])
+        registry = cast(Mapping[str, str], saved.state["artifact_registry"])
+        review_rows = {row["artifact_id"]: key for key, row in rows.items()
+                       if row.get("purpose") == "review" and row.get("status") == "succeeded"
+                       and row.get("step_id") in report_steps}
+        receipts = {model.source_ids[0]: (model, review_rows[str(model.id)])
+                    for held in pending if (model := held.artifact) is not None
+                    and str(model.id) in review_rows and model.source_ids}
+        candidates = {report.version: report for held in pending for report in report_carriers(held)}
+        result: list[RunEvent] = []
+        retained: list[RunEvent] = []
+        for held in pending:
+            review = held.kind is EventKind.REVIEW_COMPLETED
+            retry = held.kind is EventKind.STEP_RETRYING and held.actor in {
+                candidate.producer for candidate in candidates.values()}
+            if not review and not retry:
+                retained.append(held)
+                continue
+            candidate = (held.inputs[0] if review and len(held.inputs) == 1 else
+                         candidates.get(cast(int, held.payload.get("attempt", 0)) - 1))
+            receipt = receipts.get(str(candidate.id)) if candidate is not None else None
+            if candidate is None or receipt is None or str(candidate.id) not in registry:
+                retained.append(held)
+                continue
+            if retry:
+                counts = cast(Mapping[str, int], saved.state["retries"])
+                binding = cast(Mapping[str, JsonValue], candidate.content[delivery_report.BINDING])
+                if counts.get(cast(str, binding["final_step_id"]), 0) < candidate.version:
+                    retained.append(held)
+                    continue
+            projected = _crew_report_trace_projection(held, candidate, *receipt, saved)
+            identity = trace_identity(projected)
+            previous = published_traces.get(identity)
+            if previous is not None:
+                def comparable(item: RunEvent) -> dict[str, object]:
+                    payload = item.to_payload()
+                    payload.pop("sequence")
+                    payload["payload"] = {k: v for k, v in item.payload.items() if k != "source_event_sequence"}
+                    return payload
+                if comparable(previous) != comparable(projected):
+                    raise RuntimeError("crew report publication recovered trace is invalid")
+            else:
+                published_traces[identity] = projected
+                result.append(projected)
+        pending = retained
+        return tuple(result)
+
     if context.checkpoint is not None:
         observe(context.checkpoint)
+    if revisions and context.checkpoint is not None:
+        found = not recovery_events
+        for previous in recovery_events:
+            if previous.run_id != context.run_id:
+                raise RuntimeError("crew report publication recovered trace scope is invalid")
+            if previous.checkpoint is not None and previous.checkpoint.id == context.checkpoint.id:
+                if previous.checkpoint != context.checkpoint:
+                    raise RuntimeError("crew report publication recovered checkpoint is invalid")
+                found = True
+            if previous.payload.get("projection") == "crew_report_trace_v1":
+                published_traces[trace_identity(previous)] = previous
+        if not found:
+            raise RuntimeError("crew report publication recovered checkpoint is missing")
     async for event in events:
         if event.run_id != context.run_id:
             raise RuntimeError("crew report publication event scope is invalid")
         checkpoint = event.checkpoint
+        metadata: tuple[RunEvent, ...] = ()
         if checkpoint is not None:
             observe(checkpoint)
+            metadata = safe_traces()
         if event.kind is EventKind.RUNTIME_COMPLETED and (report_steps or pending
                 or any(bound_report(item) for item in event.inputs)):
             saved = publication_checkpoint or context.checkpoint
@@ -6198,6 +6293,9 @@ async def _crew_delivery_publication_batches(
                         or binding.get("final_step_id") not in report_steps):
                     raise RuntimeError("crew report publication artifact is invalid")
             pending.append(event)
+            metadata = safe_traces()
+            if metadata:
+                yield metadata
             continue
         if (checkpoint is not None and checkpoint.state.get("terminal") is True
                 and checkpoint.state.get("phase") == "completed" and pending):
@@ -6236,32 +6334,15 @@ async def _crew_delivery_publication_batches(
                 approved = final_reports[0]
                 approved_binding = cast(Mapping[str, JsonValue], approved.content[delivery_report.BINDING])
                 ids = {str(approved.id), approved_binding["model_artifact_id"]}
-                # The private graph was validated above. Link trace projections
-                # to its exact native reviewer receipt, not free-text feedback.
-                review_rows = {row["artifact_id"]: key for key, row in cast(
-                    Mapping[str, Mapping[str, JsonValue]], checkpoint.state["models"],
-                ).items() if row["purpose"] == "review" and row["status"] == "succeeded"
-                    and row["step_id"] == approved_binding["final_step_id"]}
-                review_receipts = {model.source_ids[0]: (model, review_rows[str(model.id)])
-                    for held in pending if (model := held.artifact) is not None
-                    and str(model.id) in review_rows and model.source_ids}
-                candidates = {report.version: report for held in pending for report in report_carriers(held)}
-                projected: list[RunEvent] = []
-                for item in pending:
-                    if item.kind is EventKind.REVIEW_COMPLETED or (
-                            item.kind is EventKind.STEP_RETRYING and item.actor == approved.producer):
-                        candidate = (item.inputs[0] if item.kind is EventKind.REVIEW_COMPLETED else
-                                     candidates.get(cast(int, item.payload.get("attempt", 0)) - 1))
-                        receipt = review_receipts.get(str(candidate.id)) if candidate is not None else None
-                        if candidate is None or receipt is None:
-                            raise RuntimeError("crew report publication review trace is invalid")
-                        projected.append(_crew_report_trace_projection(item, candidate, *receipt))
-                    elif ((item.artifact is not None and str(item.artifact.id) in ids)
-                          or (item.kind is EventKind.STEP_COMPLETED and item.inputs == (approved,))):
-                        projected.append(item)
-                pending = projected
+                if any(item.kind is EventKind.REVIEW_COMPLETED or (
+                    item.kind is EventKind.STEP_RETRYING and item.actor == approved.producer
+                ) for item in pending):
+                    raise RuntimeError("crew report publication review trace is invalid")
+                pending = [item for item in pending if (
+                    item.artifact is not None and str(item.artifact.id) in ids
+                ) or (item.kind is EventKind.STEP_COMPLETED and item.inputs == (approved,))]
                 reports = final_reports
-            yield (*pending, event)
+            yield (*pending, *metadata, event)
             publication_checkpoint = checkpoint
             published_reports = {str(report.id): report for report in reports}
             pending = []
@@ -6273,7 +6354,7 @@ async def _crew_delivery_publication_batches(
             pending = []
         if event.kind is EventKind.RUNTIME_COMPLETED and pending:
             raise RuntimeError("crew report publication ended before completed checkpoint")
-        yield (event,)
+        yield (event, *metadata)
     if pending:
         raise RuntimeError("crew report publication incomplete stream")
 
@@ -6291,7 +6372,9 @@ async def _delivery_publication_batches(
     if (context.mode is TaskMode.DISPATCH
             and type(context.routing_decision.get(delivery_report.POLICY)) is int
             and context.routing_decision.get(delivery_report.POLICY) == 1):
-        async for group in _crew_delivery_publication_batches(events, context, runtime=runtime):
+        async for group in _crew_delivery_publication_batches(
+            events, context, runtime=runtime, recovery_events=recovery_events,
+        ):
             yield group
         return
 
