@@ -16,6 +16,8 @@ from agent_hub.runtime.crew.engineering_delivery import (
 )
 from agent_hub.runtime.crew.plan import DispatchPlan, DispatchStep, _identifier
 from agent_hub.runtime.direct_delivery_report import is_whole_body_json
+from agent_hub.runtime.original_project_progress import original_contract_binding_matches
+from agent_hub.runtime.python_project_history import python_history_selected
 
 POLICY = "engineering_dispatch_report_version"
 BINDING = "delivery_report_binding"
@@ -75,6 +77,65 @@ def _digest(value: JsonValue) -> str:
                                     sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
+def _verified_successor_verification(
+    *, context: TaskContext, plan: DispatchPlan, report_step: DispatchStep, writer: DispatchStep,
+    key: str, row: Mapping[str, JsonValue], artifacts: Mapping[str, Artifact],
+    verified: Mapping[str, JsonValue], bundle: Mapping[str, JsonValue],
+) -> bool:
+    """Only a source-bound original Python/Node check may follow the final writer.
+
+    The caller still validates the complete native tool prefix. This exception
+    neither replaces the writer's receipt/bundle nor authorizes another action.
+    Cross-step order comes from the plan DAG, not incomparable round counters.
+    """
+    if row.get("name") != "project.verify" or row.get("status") != "succeeded":
+        return False
+    owner = next((step for step in plan.steps if step.id == row.get("step_id")), None)
+    if (owner is None or "project.verify" not in owner.tools
+            or writer.id not in plan._ancestors(owner.id)
+            or owner.id not in plan._ancestors(report_step.id)):
+        return False
+    result = _trusted_result(key, row, owner.agent, artifacts)
+    source = _successful_source(verified, context=context)
+    contract = verified.get("original_check_contract")
+    if (result is None or source is None or not isinstance(contract, Mapping)
+            or not original_contract_binding_matches(context, verified, source)
+            or _successful_source(result, context=context) != source
+            or not original_contract_binding_matches(context, result, source)
+            or result.get("original_check_contract") != contract
+            or bundle.get("verification_source_sha256") != source):
+        return False
+    expected, observed = verified.get("verification"), result.get("verification")
+    if not isinstance(expected, Mapping) or not isinstance(observed, Mapping):
+        return False
+    # A second real check has its own execution/receipt identity. It must still
+    # attest the same recipe, runtime and environment as the delivered source.
+    if python_history_selected(context):
+        return all(observed.get(field) == expected.get(field) for field in (
+            "schema_version", "kind", "source_sha256", "recipe_sha256",
+            "environment_input_sha256", "environment_sha256", "runtime",
+        ))
+    # Select the existing Node original-input protocol from trusted preparation,
+    # never a payload's claimed kind. Reuse its exact native receipt validator.
+    route = context.routing_decision
+    preparation = route.get("project_input_preparation")
+    if (type(route.get("project_input_contract_version")) is not int
+            or route["project_input_contract_version"] != 1
+            or not isinstance(preparation, Mapping)
+            or type(preparation.get("schema_version")) is not int
+            or preparation["schema_version"] != 1):
+        return False
+    from agent_hub.capabilities.node_verification_recovery import _validate_receipt
+    from agent_hub.capabilities.project_verification import ProjectVerificationError
+
+    try:
+        _validate_receipt(expected, source)
+        _validate_receipt(observed, source)
+    except (ValueError, TypeError, KeyError, ProjectVerificationError):
+        return False
+    return observed["runtime"] == expected["runtime"]
+
+
 def delivery_evidence(
     context: TaskContext, plan: DispatchPlan, step: DispatchStep,
     states: Mapping[str, Mapping[str, JsonValue]], artifacts: Mapping[str, Artifact],
@@ -110,11 +171,16 @@ def delivery_evidence(
     # may observe but cannot silently change that delivered workspace.
     readonly = {"read_context", "workspace.read", "workspace_read", "workspace.list",
                 "workspace.search", "project.inspect"}
+    successor_verifications: list[tuple[str, Mapping[str, JsonValue]]] = []
     for key, row in states.items():
-        if (row.get("status") in {"prepared", "running", "uncertain", "UNKNOWN", "received_cancelled"}
-            or (row.get("step_id") not in engineering_ids | ancestors
-                and row.get("name") not in readonly)):
+        if row.get("status") in {"prepared", "running", "uncertain", "UNKNOWN", "received_cancelled"}:
             raise ValueError("delivery report tool prefix is unresolved or unproven")
+        if row.get("step_id") not in engineering_ids | ancestors and row.get("name") not in readonly:
+            if row.get("name") != "project.verify" or row.get("status") != "succeeded":
+                raise ValueError("delivery report tool prefix is unresolved or unproven")
+            # Defer, never whitelist: each candidate must pass the independently
+            # source/contract-bound predicate below before any report is issued.
+            successor_verifications.append((key, row))
         if row.get("artifact_id") is not None:
             owner = by_step.get(cast(str, row.get("step_id")))
             if owner is None or _trusted_result(key, row, owner.agent, artifacts) is None:
@@ -134,6 +200,12 @@ def delivery_evidence(
     verify_result = verify.content.get("result")
     if not isinstance(bundle_result, Mapping) or not isinstance(verify_result, Mapping):
         raise ValueError("delivery report outcome is invalid")  # noqa: TRY004
+    for key, row in successor_verifications:
+        if not _verified_successor_verification(
+            context=context, plan=plan, report_step=step, writer=final,
+            key=key, row=row, artifacts=artifacts, verified=verify_result, bundle=bundle_result,
+        ):
+            raise ValueError("delivery report tool prefix is unresolved or unproven")
     binding: dict[str, JsonValue] = {
         "schema_version": 1, "runtime": "crew", "run_id": str(context.run_id),
         "tenant_id": str(context.tenant_id), "final_step_id": step.id, "actor": step.agent,
