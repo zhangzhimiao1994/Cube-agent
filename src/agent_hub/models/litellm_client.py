@@ -39,6 +39,7 @@ from agent_hub.models.types import (
     ModelResponse,
     RejectedOutputEvidence,
     RejectedOutputReason,
+    RejectedOutputStatus,
     RejectedUsageStatus,
     TokenUsage,
     ToolCall,
@@ -516,6 +517,7 @@ def _parse_response(
     sensitive_values: Sequence[str],
     *,
     native_tool_continuation: bool = False,
+    required_tool: str | None = None,
 ) -> ModelResponse:
     if type(native_tool_continuation) is not bool:
         raise ValueError("native capture flag must be a boolean")
@@ -536,10 +538,17 @@ def _parse_response(
     def rejected(
         reason: RejectedOutputReason, *, choice: object = None, content: object = None,
     ) -> ModelResponseError:
+        # Terminal provider evidence is independent of whether private text may
+        # be retained. A completed tool-only rejection still consumed a result.
+        status: RejectedOutputStatus = (
+            "incomplete" if reason == "incomplete" else "refused" if reason == "refusal"
+            else "completed" if _attribute(choice, "finish_reason") in ("stop", "tool_calls")
+            else "unknown"
+        )
         final_text: str | None = None
         if (
             type(content) is str
-            and _attribute(choice, "finish_reason") in ("stop", "tool_calls")
+            and status == "completed"
             and not _contains_sensitive(content, sensitive_values)
         ):
             try:
@@ -551,7 +560,7 @@ def _parse_response(
             "model response rejected",
             evidence=RejectedOutputEvidence(
                 final_text=final_text, usage=usage, usage_status=usage_status,
-                status="completed" if final_text is not None else "unknown", reason=reason,
+                status=status, reason=reason,
             ),
         )
 
@@ -566,13 +575,26 @@ def _parse_response(
             raise rejected(reason)
         choice = choices[0]
         message = _attribute(choice, "message")
+        # Stop before decoding even apparently valid calls from a truncated,
+        # refused or unconfirmed tool response; preserve legacy text metadata.
+        finish_reason = _attribute(choice, "finish_reason")
+        if finish_reason == "length":
+            reason = "incomplete"
+            raise rejected(reason, choice=choice)
+        if finish_reason == "content_filter" or _attribute(message, "refusal") is not None:
+            reason = "refusal"
+            raise rejected(reason, choice=choice)
+        raw_tool_calls = _attribute(message, "tool_calls")
+        if finish_reason not in ("stop", "tool_calls") and (raw_tool_calls or required_tool is not None):
+            reason = "invalid_tool"
+            raise rejected(reason, choice=choice)
         if message is None:
             raise rejected(reason)
         content = _attribute(message, "content")
         if content is not None and not isinstance(content, str):
             raise rejected(reason)
         reason = "invalid_tool"
-        tool_calls = _parse_tool_calls(_attribute(message, "tool_calls"), deployment_id)
+        tool_calls = _parse_tool_calls(raw_tool_calls, deployment_id)
         reason = "invalid_output"
         native: NativeAssistantMessage | None = None
         if native_tool_continuation:
@@ -968,7 +990,8 @@ class LiteLLMClient:
             shape = _request_shape(create_kwargs, "chat_completions", 1, request)
             response = await client.chat.completions.create(**create_kwargs)
             parsed = _parse_response(response, deployment.id, sensitive_values,
-                                     native_tool_continuation=request.native_tool_continuation)
+                                     native_tool_continuation=request.native_tool_continuation,
+                                     required_tool=request.required_tool)
         except asyncio.CancelledError:
             await _close_ignoring_failures(client)
             return _CANCELLED
@@ -988,7 +1011,8 @@ class LiteLLMClient:
                 try:
                     response = await client.chat.completions.create(**negotiated_kwargs)
                     parsed = _parse_response(response, deployment.id, sensitive_values,
-                                             native_tool_continuation=request.native_tool_continuation)
+                                             native_tool_continuation=request.native_tool_continuation,
+                                             required_tool=request.required_tool)
                 except asyncio.CancelledError:
                     await _close_ignoring_failures(client)
                     return _NegotiatedOutcome(_CANCELLED)
@@ -1008,7 +1032,8 @@ class LiteLLMClient:
                 try:
                     response = await client.chat.completions.create(**legacy_kwargs)
                     parsed = _parse_response(response, deployment.id, sensitive_values,
-                                             native_tool_continuation=request.native_tool_continuation)
+                                             native_tool_continuation=request.native_tool_continuation,
+                                             required_tool=request.required_tool)
                 except asyncio.CancelledError:
                     await _close_ignoring_failures(client)
                     return _CANCELLED
@@ -1037,7 +1062,8 @@ class LiteLLMClient:
                 try:
                     response = await client.chat.completions.create(**create_kwargs)
                     parsed = _parse_response(response, deployment.id, sensitive_values,
-                                             native_tool_continuation=request.native_tool_continuation)
+                                             native_tool_continuation=request.native_tool_continuation,
+                                             required_tool=request.required_tool)
                 except asyncio.CancelledError:
                     await _close_ignoring_failures(client)
                     return _CANCELLED

@@ -284,7 +284,10 @@ async def test_partial_or_uncertain_tool_ledger_cannot_enter_correction(
     assert len(gateway.requests) == 2 and len(harness.calls) == 1
 
 
-async def test_actual_chat_parser_gateway_and_bridge_preserve_completed_tool_results() -> None:
+@pytest.mark.parametrize("rejected_text", [PRIVATE, None], ids=["text", "tool-only"])
+async def test_actual_chat_parser_gateway_and_bridge_preserve_completed_tool_results(
+    rejected_text: str | None,
+) -> None:
     """The OpenAI SDK has only a MockTransport; no sockets or provider calls."""
     wire: list[dict[str, Any]] = []
     clients: list[AsyncOpenAI] = []
@@ -295,7 +298,7 @@ async def test_actual_chat_parser_gateway_and_bridge_preserve_completed_tool_res
         index = len(wire)
         assert index <= 4
         message: dict[str, Any] = {"role": "assistant", "content": (
-            PRIVATE if index == 2 else '{"summary":"complete handoff"}' if index == 3
+            rejected_text if index == 2 else '{"summary":"complete handoff"}' if index == 3
             else "actual final answer" if index == 4 else None)}
         if index <= 2:
             message["tool_calls"] = [{
@@ -343,7 +346,7 @@ async def test_actual_chat_parser_gateway_and_bridge_preserve_completed_tool_res
         assert len(receipts) == 1
         evidence = receipts[0].evidence
         assert evidence is not None and evidence.reason == "invalid_tool"
-        assert evidence.final_text == PRIVATE and evidence.usage_status == "known"
+        assert evidence.final_text == rejected_text and evidence.usage_status == "known"
         scope = get_gateway_scope_diagnostic(receipts[0])
         assert scope is not None and scope.transport_entered_count == 1
         assert not wire[2].get("tools")

@@ -41,6 +41,8 @@ async def test_chat_rejected_receipt_accounts_without_execution_or_paid_replay(
 ) -> None:
     sdk_validation = output_kind == "sdk_validation"
     accounted = usage_status == "known" and not sdk_validation
+    correctable = accounted and contract != "structured" and output_kind in {"invalid_tool", "mixed_tool"}
+    received_count = 2 if correctable else 1
     private = "PRIVATE_MALFORMED_TOOL_ARGUMENT"
     malformed = {
         "id": "broken", "type": "function",
@@ -135,17 +137,20 @@ async def test_chat_rejected_receipt_accounts_without_execution_or_paid_replay(
         assert wire_calls, str(failure.value)
         checkpoint = await runtime.save_checkpoint()
         expected_usage = {
-            "tokens": 21 if accounted else 0,
-            "cost_usd": "0.000030" if accounted else "0",
+            "tokens": 21 * received_count if accounted else 0,
+            "cost_usd": ("0.000060" if correctable else "0.000030") if accounted else "0",
         }
         assert checkpoint.state["usage"] == expected_usage
-        assert len(wire_calls) == 1
-        assert len(capacity.releases) == 1
+        assert len(wire_calls) == received_count
+        assert len(capacity.releases) == received_count
+        if correctable:
+            assert not wire_calls[1].get("tools")
+            assert private not in json.dumps(wire_calls[1])
         assert capabilities.calls == []
         assert harness.calls == []
         assert checkpoint.state["tools"] == {}
         rejected = cast(Mapping[str, Mapping[str, Any]], checkpoint.state["rejected_outputs"])
-        assert len(rejected) == 1
+        assert len(rejected) == received_count
         receipt = next(iter(rejected.values()))
         assert receipt["final_text"] == (None if usage_status == "invalid" else safe_text)
         assert receipt["usage_status"] == ("missing" if sdk_validation else usage_status)
@@ -158,7 +163,13 @@ async def test_chat_rejected_receipt_accounts_without_execution_or_paid_replay(
         if sdk_validation:
             assert receipt["output_status"] == "unknown"
             assert receipt["text_sha256"] is None
-        assert checkpoint.state["structured_repairs"] == {}
+        if correctable:
+            repairs = checkpoint.state["structured_repairs"]
+            assert len(repairs) == 1
+            repair = next(iter(repairs.values()))
+            assert repair["mode"] == "invalid_tool_correction" and repair["status"] == "rejected"
+        else:
+            assert checkpoint.state["structured_repairs"] == {}
         if not accounted:
             assert checkpoint.state["phase"] == "unaccounted"
             assert str(failure.value) == "dispatch usage unaccounted"
@@ -168,7 +179,7 @@ async def test_chat_rejected_receipt_accounts_without_execution_or_paid_replay(
         assert private not in public
         assert "PRIVATE_SAFE_REJECTED_TEXT" not in public
         models = cast(Mapping[str, Mapping[str, Any]], checkpoint.state["models"])
-        assert [model["status"] for model in models.values()] == ["rejected"]
+        assert [model["status"] for model in models.values()] == ["rejected"] * received_count
         before = deepcopy(checkpoint.to_payload())
         before_state = cast(Mapping[str, object], before["state"])
         accounting_before = {
@@ -188,8 +199,8 @@ async def test_chat_rejected_receipt_accounts_without_execution_or_paid_replay(
         with pytest.raises(RuntimeExecutionError) as replay_failure:
             async for event in replay.run(_context(checkpoint=checkpoint, token_budget=100_000)):
                 replay_events.append(event)
-        assert len(wire_calls) == 1
-        assert len(capacity.releases) == 1
+        assert len(wire_calls) == received_count
+        assert len(capacity.releases) == received_count
         assert capabilities.calls == []
         assert harness.calls == []
         assert str(replay_failure.value) == (
