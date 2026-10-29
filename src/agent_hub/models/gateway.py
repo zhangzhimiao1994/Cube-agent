@@ -605,7 +605,8 @@ class ConservativeTokenEstimator:
                 for message in request.messages
             ],
             "required_capabilities": sorted(str(item) for item in request.required_capabilities),
-            "timeout_seconds": request.timeout_seconds,
+            # Operational deadlines are not model input and are excluded from
+            # request fingerprints. Counting them makes replay compaction drift.
             "allow_fallback": request.allow_fallback,
             "max_output_tokens": request.max_output_tokens,
             "response_schema": None,
@@ -1224,6 +1225,13 @@ class ModelGateway:
     ) -> int | None:
         if not any(item.context_window_tokens is not None for item in deployments):
             return None
+        return self.estimate_input_tokens(request)
+
+    def estimate_input_tokens(self, request: ModelRequest) -> int:
+        """Use the admission estimator without reserving or submitting anything."""
+        # Custom estimators also receive a stable operational deadline. This is
+        # an estimate-only view; the original transport timeout never changes.
+        request = replace(request, timeout_seconds=1)
         estimate_input = getattr(self._token_estimator, "estimate_input", None)
         if callable(estimate_input):
             estimated_input = estimate_input(request)

@@ -6082,6 +6082,10 @@ async def _crew_delivery_publication_batches(
         binding = artifact.content.get(delivery_report.BINDING)
         return isinstance(binding, Mapping) and binding.get("runtime") == "crew"
 
+    def report_carriers(event: RunEvent) -> tuple[Artifact, ...]:
+        return tuple(item for item in (event.artifact, *event.inputs)
+                     if item is not None and bound_report(item))
+
     if context.checkpoint is not None:
         observe(context.checkpoint)
     async for event in events:
@@ -6118,6 +6122,15 @@ async def _crew_delivery_publication_batches(
             ))
         ) or any(bound_report(item) for item in event.inputs)
         if body:
+            for report in report_carriers(event):
+                binding = report.content.get(delivery_report.BINDING)
+                if (not isinstance(binding, Mapping) or report.type != "text"
+                        or report.content_sha256 != report.recompute_content_sha256()
+                        or report.producer not in actors or binding.get("actor") != report.producer
+                        or binding.get("run_id") != str(context.run_id)
+                        or binding.get("tenant_id") != str(context.tenant_id)
+                        or binding.get("final_step_id") not in report_steps):
+                    raise RuntimeError("crew report publication artifact is invalid")
             pending.append(event)
             continue
         if (checkpoint is not None and checkpoint.state.get("terminal") is True
@@ -6133,7 +6146,7 @@ async def _crew_delivery_publication_batches(
                 not isinstance(binding := report.content.get(delivery_report.BINDING), Mapping)
                 or refs.get(cast(str, binding.get("final_step_id"))) != {
                     "id": str(report.id), "sha256": report.content_sha256,
-                } for report in reports
+                } for item in pending for report in report_carriers(item)
             ):
                 raise RuntimeError("crew report publication final artifact is invalid")
             yield (*pending, event)

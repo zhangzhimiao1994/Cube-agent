@@ -389,7 +389,7 @@ async def test_existing_gateway_caps_the_grown_request_before_transport(
         agent.model_copy(update={"max_output_tokens": source_cap}) for agent in base.agents
     )})
     runtime = subject(gateway, dispatch, InMemoryArtifactRepository(), harness)
-    await collect(runtime, fail="structured correction failed" if expected is None else None)
+    await collect(runtime, fail="required model context exceeds configured window" if expected is None else None)
     assert len(transport.gateway.requests) == (2 if expected is None else 4)
     assert len(harness.calls) == 1
     if expected is not None:
@@ -400,8 +400,14 @@ async def test_existing_gateway_caps_the_grown_request_before_transport(
             assert finalization.max_output_tokens + max(estimator.finalization_inputs) == 10000
     else:
         assert estimator.finalization_inputs and max(estimator.finalization_inputs) > 10000
-    repair = mapping(mapping((await runtime.save_checkpoint()).state["structured_repairs"])["draft"])
-    assert repair["max_output_tokens"] == source_cap * 2
+    repairs = mapping((await runtime.save_checkpoint()).state["structured_repairs"])
+    if expected is None:
+        # An irreducible input is rejected before freezing or submitting a new
+        # correction. The original known receipt and successful tool stay spent.
+        assert "draft" not in repairs
+    else:
+        repair = mapping(repairs["draft"])
+        assert repair["max_output_tokens"] == source_cap * 2
 
 
 async def test_grown_finalization_never_extends_original_deadline(monkeypatch: pytest.MonkeyPatch) -> None:

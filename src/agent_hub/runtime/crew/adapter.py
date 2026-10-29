@@ -4028,6 +4028,7 @@ class _RunState:
     workspace_refresh_round_continuation: bool = True
     workspace_productive_boundary: bool = True
     native_tool_continuation: bool = False
+    context_window_compaction_version: int = 1
     builtin_tool_input_contract: bool = True
     incomplete_recovery_output_growth: bool = True
     first_tool_incomplete_recovery_output_growth: bool = True
@@ -4159,6 +4160,16 @@ class CrewDispatchRuntime:
     @staticmethod
     def _default_crewai_storage_dir() -> Path:
         return _default_crewai_storage_dir()
+
+    def _fit_context_request(self, request: ModelRequest, run_state: _RunState) -> ModelRequest:
+        if run_state.context_window_compaction_version != 1:
+            return request
+        from agent_hub.runtime.crew.context_window import fit_request
+
+        try:
+            return fit_request(request, self._gateway)
+        except ValueError as error:
+            _fail(str(error))
 
     def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
         source_context = context
@@ -4384,6 +4395,9 @@ class CrewDispatchRuntime:
                 )
                 state.native_tool_continuation = cast(
                     bool, restored.state.get("native_tool_continuation", False),
+                )
+                state.context_window_compaction_version = cast(
+                    int, restored.state.get("context_window_compaction_version", 0),
                 )
                 if state.native_tool_continuation and self._provider_continuation_repository is None:
                     _fail("private provider continuation repository is unavailable")
@@ -6829,6 +6843,7 @@ class CrewDispatchRuntime:
         index = cursor.value
         cursor.value += 1
         key = self._model_call_key(context.run_id, step.id, attempt, purpose, actor, index)
+        request = self._fit_context_request(request, run_state)
         request_sha = self._model_request_sha256(request)
         existing = ledger.states.get(key)
         report_phase: Mapping[str, JsonValue] | None = None
@@ -7363,6 +7378,7 @@ class CrewDispatchRuntime:
             timeout_seconds=self._remaining_timeout(run_state, step_deadline),
             max_output_tokens=output_limit,
         )
+        correction = self._fit_context_request(correction, run_state)
         reservation: Mapping[str, JsonValue] = {
             "version": 1, "actor": actor, "purpose": purpose, "source_key": key,
             "source_text_sha256": evidence.text_sha256,
@@ -7607,11 +7623,13 @@ class CrewDispatchRuntime:
             ),
             max_output_tokens=output_tokens,
         )
+        correction = self._fit_context_request(correction, run_state)
         if run_state.post_tool_finalization_growth_version == 1 and previous is None:
             output_tokens = self._post_tool_output_capacity(correction, output_tokens, remaining)
             if output_tokens <= 0:
                 _fail("post-tool finalization capacity exhausted")
             correction = replace(correction, max_output_tokens=output_tokens)
+        correction = self._fit_context_request(correction, run_state)
         reservation: Mapping[str, JsonValue] = {
             "version": 2, "mode": "post_tool_finalization", "actor": actor, "purpose": "step",
             "source_key": key, "source_text_sha256": None,
@@ -7673,6 +7691,7 @@ class CrewDispatchRuntime:
                     if self._post_tool_output_capacity(correction, cap) < cap:
                         _fail("post-tool finalization deployment capacity changed")
                 correction = replace(correction, max_output_tokens=cap)
+                correction = self._fit_context_request(correction, run_state)
                 growth_link = self._post_tool_growth_link(
                     root, saturated.key, ledger, self._model_request_sha256(correction),
                 )
@@ -8073,6 +8092,7 @@ class CrewDispatchRuntime:
             if (request.native_tool_continuation and not has_native_history
                     and callable(native_support) and not native_support(request)):
                 request = replace(request, native_tool_continuation=False)
+            request = self._fit_context_request(request, run_state)
             model_attempt_index = _subagent_model_attempt(
                 retries,
                 recovery_attempt,
@@ -8088,6 +8108,7 @@ class CrewDispatchRuntime:
                         preserve_feedback=workspace_continuation and run_state.workspace_feedback_retention,
                         preserve_maintenance_control=maintenance_feedback,
                     ))
+                    request = self._fit_context_request(request, run_state)
                     cached_key = self._model_call_key(
                         context.run_id, step.id, model_attempt_index, "step", agent.id, call_cursor.value,
                     )
@@ -8117,6 +8138,7 @@ class CrewDispatchRuntime:
                                 preserve_feedback=workspace_continuation and run_state.workspace_feedback_retention,
                                 preserve_maintenance_control=maintenance_feedback,
                             ))
+                            candidate = self._fit_context_request(candidate, run_state)
                             if self._model_request_sha256(candidate) == cached_model["request_sha256"]:
                                 if (cached_model["status"] == "rejected"
                                         and run_state.initial_incomplete_chain_growth
@@ -8151,6 +8173,7 @@ class CrewDispatchRuntime:
                                 if message.role == "system" and message.content == _GENERATED_DRAFT_HISTORY_PROMPT
                                 else message for message in request.messages
                             ))
+                            historical_request = self._fit_context_request(historical_request, run_state)
                             if self._model_request_sha256(historical_request) == cached_draft_model["request_sha256"]:
                                 request = historical_request
                     completion, model_artifact = await self._execute_model_request(
@@ -8201,6 +8224,7 @@ class CrewDispatchRuntime:
                     request = replace(request, max_output_tokens=cap, timeout_seconds=min(
                         request.timeout_seconds, self._remaining_timeout(run_state, step_deadline),
                     ))
+                    request = self._fit_context_request(request, run_state)
             if run_state.initial_incomplete_chain_growth and model_attempt_index == 1:
                 # Provisional tools are already keyed by the successful model call_index.
                 _round = call_cursor.value - 1
@@ -10750,6 +10774,8 @@ class CrewDispatchRuntime:
                 **({_delivery_report.POLICY: 1}
                    if run_state.engineering_dispatch_report_version == 1 else {}),
                 "workspace_delivery_continuation": run_state.workspace_delivery_continuation,
+                **({"context_window_compaction_version": 1}
+                   if run_state.context_window_compaction_version == 1 else {}),
                 **({"native_tool_continuation": True} if run_state.native_tool_continuation else {}),
                 **({"workspace_productive_boundary": True}
                    if run_state.workspace_productive_boundary and meaningful_progress
@@ -10875,6 +10901,7 @@ class CrewDispatchRuntime:
         }
         optional_state_keys = {
             _delivery_report.POLICY,
+            "context_window_compaction_version",
             "workspace_productive_boundary",
             "native_tool_continuation",
             "repair_reopened_contract_ids", "workspace_delivery_continuation",
@@ -10925,6 +10952,11 @@ class CrewDispatchRuntime:
         timeout_progress_units = state.get("timeout_progress_units")
         if (
             type(state.get("native_tool_continuation", False)) is not bool
+            or ("context_window_compaction_version" in state and (
+                type(state["context_window_compaction_version"]) is not int
+                or state["context_window_compaction_version"] != 1
+                or checkpoint.runtime_version != _RUNTIME_VERSION
+            ))
             or type(state.get("workspace_productive_boundary", False)) is not bool
             or (state.get("workspace_productive_boundary", False) and (
                 checkpoint.runtime_version != _RUNTIME_VERSION
