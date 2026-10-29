@@ -193,15 +193,17 @@ async def test_fresh_policy_hashes_the_actual_request_and_restores_old_policy() 
     events = [event async for event in runtime.run(task)]
     assert events[-1].kind is EventKind.RUNTIME_COMPLETED
     checkpoint = await runtime.save_checkpoint()
-    assert checkpoint.state['context_window_compaction_version'] == 1
+    assert checkpoint.state['context_window_compaction_version'] == 2
     assert gateway.estimates >= len(gateway.requests)
     for row in checkpoint.state['models'].values():
         assert row['request_sha256'] == runtime._model_request_sha256(gateway.requests[row['call_index']])
 
-    for legacy in (False, True):
+    for version in (0, 1, 2):
         state = dict(checkpoint.state)
-        if legacy:
+        if version == 0:
             state.pop('context_window_compaction_version')
+        else:
+            state['context_window_compaction_version'] = version
         restored_checkpoint = type(checkpoint)(id=checkpoint.id, runtime_type=checkpoint.runtime_type,
             runtime_version=checkpoint.runtime_version, run_id=checkpoint.run_id,
             tenant_id=checkpoint.tenant_id, mode=checkpoint.mode, state=state)
@@ -212,7 +214,7 @@ async def test_fresh_policy_hashes_the_actual_request_and_restores_old_policy() 
         assert restored_events[-1].kind is EventKind.RUNTIME_COMPLETED
         assert unused.requests == []
         saved = await restored.save_checkpoint()
-        assert saved.state.get('context_window_compaction_version', 0) == (0 if legacy else 1)
+        assert saved.state.get('context_window_compaction_version', 0) == version
 
 
 async def test_recovery_reservation_binds_the_context_fitted_request(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -232,7 +234,7 @@ async def test_recovery_reservation_binds_the_context_fitted_request(monkeypatch
 
     # Force the boundary case where adding the recovery control needs another
     # projection. The pure tests above exercise the actual token calculation.
-    def fit(value: ModelRequest, gateway: object) -> ModelRequest:
+    def fit(value: ModelRequest, gateway: object, *, reserve_output: bool = False) -> ModelRequest:
         if (any('POST_TOOL_FINALIZATION:' in m.content for m in value.messages)
                 and not any(m.content == 'CONTEXT_FIT_TEST_MARKER' for m in value.messages)):
             return replace(value, messages=(*value.messages, ModelMessage('system','CONTEXT_FIT_TEST_MARKER')))

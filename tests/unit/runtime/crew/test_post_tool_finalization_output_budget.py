@@ -407,7 +407,9 @@ async def test_existing_gateway_caps_the_grown_request_before_transport(
         assert "draft" not in repairs
     else:
         repair = mapping(repairs["draft"])
-        assert repair["max_output_tokens"] == source_cap * 2
+        # Fresh output-room policy freezes the actual context-fitted cap. A
+        # provider-only transport clamp retains the existing reservation shape.
+        assert repair["max_output_tokens"] == (expected if bound == "context" else source_cap * 2)
 
 
 async def test_grown_finalization_never_extends_original_deadline(monkeypatch: pytest.MonkeyPatch) -> None:

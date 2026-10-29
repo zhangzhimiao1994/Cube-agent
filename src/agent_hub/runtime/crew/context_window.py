@@ -23,12 +23,16 @@ def _observation(message: ModelMessage) -> bool:
                     and row["name"] in _OBSERVATIONS for row in rows))
 
 
-def fit_request(request: ModelRequest, gateway: object) -> ModelRequest:
+def fit_request(
+    request: ModelRequest, gateway: object, *, reserve_output: bool = False,
+) -> ModelRequest:
     """Fit before hashing/submission, using the gateway's exact local estimate.
 
     Original instructions, ordinary messages, tools and schemas are immutable.
     Only older complete result exchanges may leave the prompt; their durable
     artifacts/receipts remain untouched. The latest result exchange is required.
+    Fresh output-room callers may lower an unreachable output cap after keeping
+    every required exchange; legacy callers retain the original input-only fit.
     No call, retry, capacity reservation or model configuration change occurs.
     """
     window_for = getattr(gateway, "context_window_tokens", None)
@@ -47,7 +51,11 @@ def fit_request(request: ModelRequest, gateway: object) -> ModelRequest:
             raise ValueError("invalid model input estimate")
         return count
 
-    if tokens(request) < window:
+    def fits(candidate: ModelRequest) -> bool:
+        count = tokens(candidate)
+        return (count + candidate.max_output_tokens <= window if reserve_output else count < window)
+
+    if fits(request):
         return request
     messages = request.messages
     groups: list[tuple[int, ...]] = []
@@ -83,6 +91,7 @@ def fit_request(request: ModelRequest, gateway: object) -> ModelRequest:
     # Keep the latest full observation even if it alone cannot fit. In that case
     # fail before transport, rather than manufacture a truncated successful read.
     omitted: set[int] = set()
+    candidate = request
     for group_index in removable:
         if group_index == latest_exchange:
             continue
@@ -98,6 +107,22 @@ def fit_request(request: ModelRequest, gateway: object) -> ModelRequest:
             f"no execution or completion. omitted_messages={len(omitted)} sha256={digest}"
         ))
         candidate = replace(request, messages=(marker, *(message for i, message in enumerate(messages) if i not in omitted)))
-        if tokens(candidate) < window:
+        if fits(candidate):
             return candidate
+    if reserve_output:
+        # Required instructions/latest/native groups stay complete. If the
+        # desired output cannot fit, use only a verified smaller positive cap.
+        # Re-estimate each cap because estimators may include request controls.
+        low, high = 1, request.max_output_tokens
+        clipped: ModelRequest | None = None
+        while low <= high:
+            cap = (low + high) // 2
+            projected = replace(candidate, max_output_tokens=cap)
+            if fits(projected):
+                clipped = projected
+                low = cap + 1
+            else:
+                high = cap - 1
+        if clipped is not None:
+            return clipped
     raise ValueError("required model context exceeds configured window")

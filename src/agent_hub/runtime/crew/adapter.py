@@ -4028,7 +4028,7 @@ class _RunState:
     workspace_refresh_round_continuation: bool = True
     workspace_productive_boundary: bool = True
     native_tool_continuation: bool = False
-    context_window_compaction_version: int = 1
+    context_window_compaction_version: int = 2
     builtin_tool_input_contract: bool = True
     incomplete_recovery_output_growth: bool = True
     first_tool_incomplete_recovery_output_growth: bool = True
@@ -4163,12 +4163,14 @@ class CrewDispatchRuntime:
         return _default_crewai_storage_dir()
 
     def _fit_context_request(self, request: ModelRequest, run_state: _RunState) -> ModelRequest:
-        if run_state.context_window_compaction_version != 1:
+        if run_state.context_window_compaction_version not in {1, 2}:
             return request
         from agent_hub.runtime.crew.context_window import fit_request
 
         try:
-            return fit_request(request, self._gateway)
+            if run_state.context_window_compaction_version == 1:
+                return fit_request(request, self._gateway)
+            return fit_request(request, self._gateway, reserve_output=True)
         except ValueError as error:
             _fail(str(error))
 
@@ -7509,6 +7511,41 @@ class CrewDispatchRuntime:
                 cap = min(cap, max(0, candidate.context_window_tokens - input_tokens))
         return cap
 
+    def _post_tool_fitted_request(
+        self, request: ModelRequest, desired: int, remaining: int, run_state: _RunState,
+    ) -> ModelRequest:
+        """Choose new v2 output room without using the old prompt headroom first.
+
+        Every projection starts from the same unprojected correction request.
+        Only a fixed point at the final cap may be hashed or reserved; this also
+        makes the stored cap sufficient to rebuild the request on cold restore.
+        """
+        registry = getattr(self._gateway, "_registry", None)
+        if not isinstance(registry, ModelRegistry):
+            _fail("post-tool finalization deployment capacity unavailable")
+        candidates = registry.candidates(request.logical_model, request.required_capabilities)
+        if not candidates:
+            _fail("post-tool finalization deployment capacity unavailable")
+        cap = min(desired, remaining, 1_000_000)
+        for candidate in candidates:
+            if candidate.max_output_tokens is None and candidate.context_window_tokens is None:
+                _fail("post-tool finalization deployment capacity unavailable")
+            if candidate.max_output_tokens is not None:
+                cap = min(cap, candidate.max_output_tokens)
+            if candidate.context_window_tokens is not None:
+                cap = min(cap, candidate.context_window_tokens - 1)
+        # Each reduction can cross an exchange boundary or an estimator's
+        # numeric-control boundary. A nonconvergent estimator fails closed.
+        for _ in range(len(request.messages) + 16):
+            if cap <= 0:
+                _fail("post-tool finalization capacity exhausted")
+            fitted = self._fit_context_request(replace(request, max_output_tokens=cap), run_state)
+            actual = self._post_tool_output_capacity(fitted, fitted.max_output_tokens, remaining)
+            if actual == cap and fitted.max_output_tokens == cap:
+                return fitted
+            cap = min(cap, actual, fitted.max_output_tokens)
+        _fail("post-tool finalization capacity exhausted")
+
     def _validate_post_tool_request_budget(
         self, context: TaskContext, step: DispatchStep, ledger: _ModelLedger, key: str, index: int,
         request: ModelRequest, run_state: _RunState, step_deadline: float,
@@ -7664,13 +7701,26 @@ class CrewDispatchRuntime:
             ),
             max_output_tokens=output_tokens,
         )
-        correction = self._fit_context_request(correction, run_state)
-        if run_state.post_tool_finalization_growth_version == 1 and previous is None:
-            output_tokens = self._post_tool_output_capacity(correction, output_tokens, remaining)
-            if output_tokens <= 0:
-                _fail("post-tool finalization capacity exhausted")
-            correction = replace(correction, max_output_tokens=output_tokens)
-        correction = self._fit_context_request(correction, run_state)
+        correction_base = correction
+        output_room = run_state.context_window_compaction_version == 2
+        if output_room:
+            if previous is None and run_state.post_tool_finalization_growth_version == 1:
+                correction = self._post_tool_fitted_request(correction_base, output_tokens, remaining, run_state)
+                output_tokens = correction.max_output_tokens
+            else:
+                correction = self._fit_context_request(correction_base, run_state)
+                if previous is None:
+                    output_tokens = correction.max_output_tokens
+                elif correction.max_output_tokens != output_tokens:
+                    _fail("post-tool finalization request changed after checkpoint")
+        else:
+            correction = self._fit_context_request(correction, run_state)
+            if run_state.post_tool_finalization_growth_version == 1 and previous is None:
+                output_tokens = self._post_tool_output_capacity(correction, output_tokens, remaining)
+                if output_tokens <= 0:
+                    _fail("post-tool finalization capacity exhausted")
+                correction = replace(correction, max_output_tokens=output_tokens)
+            correction = self._fit_context_request(correction, run_state)
         reservation: Mapping[str, JsonValue] = {
             "version": 2, "mode": "post_tool_finalization", "actor": actor, "purpose": "step",
             "source_key": key, "source_text_sha256": None,
@@ -7713,12 +7763,26 @@ class CrewDispatchRuntime:
                 )
             except _PostToolSaturatedResponse as saturated:
                 root = ledger.structured_repairs[step.id]
-                self._post_tool_growth_tail(step, root, ledger)
+                self._post_tool_growth_tail(step, root, ledger, native_continuation=native_continuation)
                 next_key = self._model_call_key(context.run_id, step.id, attempt, "step", actor, cursor.value)
                 saved = ledger.states.get(next_key)
-                cap = (cast(int, saved["reserved_max_output_tokens"]) if saved is not None else
-                       self._post_tool_output_capacity(correction, 2 * correction.max_output_tokens,
-                           self._incomplete_recovery_remaining_tokens(context, step, ledger, next_key)))
+                grown: ModelRequest | None = None
+                if output_room:
+                    if saved is None:
+                        grown = self._post_tool_fitted_request(
+                            correction_base, 2 * correction.max_output_tokens,
+                            self._incomplete_recovery_remaining_tokens(context, step, ledger, next_key), run_state,
+                        )
+                    else:
+                        saved_cap = cast(int, saved["reserved_max_output_tokens"])
+                        grown = self._fit_context_request(replace(correction_base, max_output_tokens=saved_cap), run_state)
+                        if grown.max_output_tokens != saved_cap:
+                            _fail("post-tool finalization request changed after checkpoint")
+                    cap = grown.max_output_tokens
+                else:
+                    cap = (cast(int, saved["reserved_max_output_tokens"]) if saved is not None else
+                           self._post_tool_output_capacity(correction, 2 * correction.max_output_tokens,
+                               self._incomplete_recovery_remaining_tokens(context, step, ledger, next_key)))
                 if cap <= correction.max_output_tokens:
                     _fail("post-tool finalization growth exhausted")
                 if saved is None or saved["status"] == "prepared":
@@ -7729,10 +7793,10 @@ class CrewDispatchRuntime:
                     self._validate_incomplete_recovery_budget(
                         context, step, ledger, next_key, cap, run_state, step_deadline,
                     )
-                    if self._post_tool_output_capacity(correction, cap) < cap:
+                    if self._post_tool_output_capacity(grown if grown is not None else correction, cap) < cap:
                         _fail("post-tool finalization deployment capacity changed")
-                correction = replace(correction, max_output_tokens=cap)
-                correction = self._fit_context_request(correction, run_state)
+                correction = (grown if grown is not None else
+                              self._fit_context_request(replace(correction, max_output_tokens=cap), run_state))
                 growth_link = self._post_tool_growth_link(
                     root, saturated.key, ledger, self._model_request_sha256(correction),
                 )
@@ -10818,8 +10882,8 @@ class CrewDispatchRuntime:
                 **({_delivery_report.REVISION_POLICY: 1}
                    if run_state.engineering_dispatch_report_revision_version == 1 else {}),
                 "workspace_delivery_continuation": run_state.workspace_delivery_continuation,
-                **({"context_window_compaction_version": 1}
-                   if run_state.context_window_compaction_version == 1 else {}),
+                **({"context_window_compaction_version": run_state.context_window_compaction_version}
+                   if run_state.context_window_compaction_version in {1, 2} else {}),
                 **({"native_tool_continuation": True} if run_state.native_tool_continuation else {}),
                 **({"workspace_productive_boundary": True}
                    if run_state.workspace_productive_boundary and meaningful_progress
@@ -11008,7 +11072,7 @@ class CrewDispatchRuntime:
             type(state.get("native_tool_continuation", False)) is not bool
             or ("context_window_compaction_version" in state and (
                 type(state["context_window_compaction_version"]) is not int
-                or state["context_window_compaction_version"] != 1
+                or state["context_window_compaction_version"] not in {1, 2}
                 or checkpoint.runtime_version != _RUNTIME_VERSION
             ))
             or type(state.get("workspace_productive_boundary", False)) is not bool
