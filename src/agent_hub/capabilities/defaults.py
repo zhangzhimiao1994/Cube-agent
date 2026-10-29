@@ -684,14 +684,18 @@ def build_runtime_capability_stack(
         plugin_backend=plugin_backend,
         raise_backend_errors=True,
     )
+    cleanup_hook = build_python_project_terminal_hook(
+        run_repository, getattr(runtime_gateway, "_project_verification", None),
+    )
+    preparer = runtime_gateway.original_project_preparer(harness_tool_gateway)
+    if preparer is not None and cleanup_hook is not None:
+        preparer.capacity_maintenance = cleanup_hook.maintain_capacity
     return RuntimeCapabilityStack(
         runtime_gateway=runtime_gateway,
         policy_gateway=policy_gateway,
         harness_tool_gateway=harness_tool_gateway,
-        project_input_preparer=runtime_gateway.original_project_preparer(harness_tool_gateway),
-        project_cache_cleanup_hook=build_python_project_terminal_hook(
-            run_repository, getattr(runtime_gateway, "_project_verification", None),
-        ),
+        project_input_preparer=preparer,
+        project_cache_cleanup_hook=cleanup_hook,
     )
 
 

@@ -12,6 +12,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import tomllib
 from collections.abc import Awaitable, Mapping
 from contextlib import ExitStack
@@ -743,6 +744,70 @@ class PythonProjectService:
                 result.append(reference)
             controls.check()
         return tuple(result)
+
+    async def expired_environment_invocation(
+        self, tenant_id: UUID, run_id: UUID,
+    ) -> PythonProjectInvocation | None:
+        """Internal metadata-only cache selector, never an execution context.
+
+        Expired dependency cleanup does not require mutable projects/baselines to
+        remain present. Lifecycle owns locked terminal/history eligibility; Root
+        independently obtains and verifies its native reference, TTL and fences.
+        This deliberately does not call normal generated.load/original.select.
+        """
+        try:
+            record = await self._record(tenant_id, run_id)
+            route = getattr(record, 'routing_decision', None)
+            _need(isinstance(route, Mapping))
+            assert isinstance(route, Mapping)
+            if {'generated_project_contract_version', 'generated_project_preparation'} & route.keys():
+                from agent_hub.capabilities.generated_project_service import (
+                    generated_authority,
+                    validate_generated_preparation,
+                )
+
+                _need(not {'project_input', 'project_input_contract_version', 'project_input_preparation'} & route.keys())
+                _need(type(route.get('generated_project_contract_version')) is int
+                      and route['generated_project_contract_version'] == 1)
+                authority = generated_authority(record, tenant_id, run_id, readonly=True)
+                state = validate_generated_preparation(route.get('generated_project_preparation'))
+                _need(state['stack'] == 'python' and state['phase'] == 'python_ready'
+                      and state['user_id'] == str(authority.user_id)
+                      and state['request_sha256'] == authority.request_sha256)
+                base, source_kind = authority.invocation, 'candidate'
+            else:
+                value = route.get('project_input_preparation')
+                if value is None:
+                    return None
+                _need(isinstance(value, Mapping) and set(value) == {
+                    'schema_version', 'phase', 'reference', 'python_recipe', 'execution_id'})
+                assert isinstance(value, Mapping)
+                _need(type(value['schema_version']) is int and value['schema_version'] == 2
+                      and value['phase'] == 'executing'
+                      and type(value['execution_id']) is str
+                      and re.fullmatch(r'[a-z0-9][a-z0-9_-]{0,127}', value['execution_id']) is not None
+                      and type(route.get('project_input_contract_version')) is int
+                      and route['project_input_contract_version'] == 1)
+                ManagedProjectInput.from_payload(route.get('project_input'))
+                state = value
+                base, _, _ = self._base(record, tenant_id, run_id, readonly=True)
+                source_kind = 'original'
+            reference = ProjectBaselineReference.from_payload(state['reference'])
+            marker = state['python_recipe']
+            _need(isinstance(marker, Mapping) and set(marker) == {
+                'schema_version', 'recipe_sha256', 'environment_input_sha256'})
+            assert isinstance(marker, Mapping)
+            _need(type(marker['schema_version']) is int and marker['schema_version'] == 1)
+            return PythonProjectInvocation.model_validate(base.model_dump() | {
+                'execution_id': 'python_release_expired_' + uuid4().hex,
+                'install_allowed': False, 'timeout_seconds': 30, 'source_kind': source_kind,
+                'original_reference': reference.to_payload(), 'recipe_sha256': marker['recipe_sha256'],
+                'environment_input_sha256': marker['environment_input_sha256'],
+            }, strict=True)
+        except ProjectVerificationError:
+            raise
+        except Exception:  # noqa: BLE001 - no raw persisted metadata/path reaches diagnostics.
+            raise ProjectVerificationError('python_expired_environment_metadata_invalid') from None
 
     async def original_context(self, tenant_id: UUID, run_id: UUID) -> PythonOriginalContext | None:
         """Read history for modes/terminal cleanup without reexecution or approval."""

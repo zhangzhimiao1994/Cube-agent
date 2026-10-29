@@ -58,6 +58,7 @@ if TYPE_CHECKING:
         PythonProjectInspectEnvironmentRequest,
         PythonProjectProbeRequest,
         PythonProjectReleaseEnvironmentRequest,
+        PythonProjectReleaseExpiredEnvironmentRequest,
     )
     from agent_hub.skills.sandbox.toolchain_protocol import ToolchainRequest, ToolchainResponse
 
@@ -357,7 +358,7 @@ class SkillBroker:
         return await self._project_broker.handle(request, peer_uid=peer_uid)
 
     async def handle_python_project(
-        self, request: PythonProjectBrokerRequest | PythonProjectProbeRequest | PythonProjectInspectEnvironmentRequest | PythonProjectReleaseEnvironmentRequest,
+        self, request: PythonProjectBrokerRequest | PythonProjectProbeRequest | PythonProjectInspectEnvironmentRequest | PythonProjectReleaseEnvironmentRequest | PythonProjectReleaseExpiredEnvironmentRequest,
         *, peer_uid: int, product_sink: ProductSink | None = None,
     ) -> PythonProjectBrokerResponse:
         from agent_hub.skills.sandbox.python_project_broker import handle_python_project
@@ -599,7 +600,7 @@ async def _serve_client(
     is_toolchain = False
     toolchain_request: ToolchainRequest | None = None
     supply_request: PythonInputSupplyRequest | None = None
-    python_request: PythonProjectBrokerRequest | PythonProjectProbeRequest | PythonProjectInspectEnvironmentRequest | PythonProjectReleaseEnvironmentRequest | None = None
+    python_request: PythonProjectBrokerRequest | PythonProjectProbeRequest | PythonProjectInspectEnvironmentRequest | PythonProjectReleaseEnvironmentRequest | PythonProjectReleaseExpiredEnvironmentRequest | None = None
     response: BrokerResponse | PythonProjectBrokerResponse | PythonInputSupplyResponse | PythonProjectProfileResponse | ToolchainResponse | PythonDependencyClosureResponse | PythonMetadataPlanningResponse | PythonMetadataPreparationResponse
     try:
         peer_uid = _peer_uid(writer)
@@ -717,6 +718,7 @@ async def _serve_client(
                 PythonProjectInspectEnvironmentRequest,
                 PythonProjectProbeRequest,
                 PythonProjectReleaseEnvironmentRequest,
+                PythonProjectReleaseExpiredEnvironmentRequest,
             )
 
             action = envelope.get("action")
@@ -728,6 +730,11 @@ async def _serve_client(
                 python_request = PythonProjectInspectEnvironmentRequest.model_validate_json(payload, strict=True)
             elif action == "release_python_project_environment":
                 python_request = PythonProjectReleaseEnvironmentRequest.model_validate_json(payload, strict=True)
+            elif action == 'release_expired_python_project_environment':
+                try:
+                    python_request = PythonProjectReleaseExpiredEnvironmentRequest.model_validate_json(payload, strict=True)
+                except (ValueError, TypeError):
+                    raise BrokerRequestError('invalid Python expired release request') from None
             else:
                 raise BrokerRequestError("invalid Python broker action")
             if (isinstance(python_request, PythonProjectBrokerRequest)

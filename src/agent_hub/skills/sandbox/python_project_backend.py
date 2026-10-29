@@ -92,6 +92,7 @@ from agent_hub.skills.sandbox.python_project_protocol import (
     PythonProjectInspectEnvironmentRequest,
     PythonProjectProbeRequest,
     PythonProjectReleaseEnvironmentRequest,
+    PythonProjectReleaseExpiredEnvironmentRequest,
     PythonProjectScope,
     base_python_invocation,
 )
@@ -123,6 +124,7 @@ _Request = (
     | PythonProjectProbeRequest
     | PythonProjectInspectEnvironmentRequest
     | PythonProjectReleaseEnvironmentRequest
+    | PythonProjectReleaseExpiredEnvironmentRequest
 )
 _CONFIG_PATH = Path("/etc/agent-hub/python-project.json")
 _MAX_CONTROL = 16 * 1024
@@ -1176,14 +1178,14 @@ def _release_scope_guard(
             pin.check()
 
 
-def _release(
+def _release_guard(
     request: PythonProjectReleaseEnvironmentRequest,
     policy: BrokerPolicy,
     config: RootConfig,
     deadline: float,
     *,
     stage: Path | None = None,
-) -> PythonProjectBrokerResponse:
+) -> None:
     """Called under shared admission, without staging or running project code."""
     from agent_hub.skills.sandbox.python_project_broker import PythonRootExecution
 
@@ -1206,6 +1208,17 @@ def _release(
     except (OSError, ValueError, RuntimeError, TimeoutError, TypeError, KeyError, AttributeError):
         raise ProcessCleanupIncomplete("python_project_cleanup_incomplete") from None
     _check(deadline)
+
+
+def _release(
+    request: PythonProjectReleaseEnvironmentRequest,
+    policy: BrokerPolicy,
+    config: RootConfig,
+    deadline: float,
+    *,
+    stage: Path | None = None,
+) -> PythonProjectBrokerResponse:
+    _release_guard(request, policy, config, deadline, stage=stage)
     cache = PythonProjectEnvironmentCache(config.environment_root, config.cache_policy)
     removed = cache.release_completed(
         request.invocation, request.expected_environment, deadline=deadline
@@ -1218,6 +1231,34 @@ def _release(
         released_environment=request.expected_environment,
         release_outcome="released" if removed else "absent",
     )
+
+
+def _release_expired(
+    request: PythonProjectReleaseExpiredEnvironmentRequest,
+    policy: BrokerPolicy,
+    config: RootConfig,
+    deadline: float,
+    *,
+    stage: Path,
+) -> PythonProjectBrokerResponse:
+    """Under shared admission, select only this scope's expired measured READY."""
+    cache = PythonProjectEnvironmentCache(config.environment_root, config.cache_policy)
+    selected = cache.inspect_expired(request.invocation, deadline=deadline)
+    removed = False
+    if selected is not None:
+        release = PythonProjectReleaseEnvironmentRequest(
+            invocation=request.invocation, expected_environment=selected.reference,
+        )
+        try:
+            _release_guard(release, policy, config, deadline, stage=stage)
+        except ProcessCleanupIncomplete:
+            # No cache mutation has begun. Refuse without inventing an UNKNOWN
+            # outcome for this new maintenance execution; retain every old fence.
+            raise PythonProjectBackendError('python_project_cleanup_incomplete') from None
+        removed = cache.release_expired(request.invocation, selected, deadline=deadline)
+    _need(type(removed) is bool, 'python_project_environment_changed')
+    return PythonProjectBrokerResponse(action=request.action,
+        execution_id=request.invocation.execution_id, ok=True, expired_environment_released=removed)
 
 
 def _run(
@@ -1397,6 +1438,7 @@ def execute_python_project_request(
             PythonProjectProbeRequest,
             PythonProjectInspectEnvironmentRequest,
             PythonProjectReleaseEnvironmentRequest,
+            PythonProjectReleaseExpiredEnvironmentRequest,
         },
         "python_project_request_invalid",
     )
@@ -1415,6 +1457,10 @@ def execute_python_project_request(
             ) as roots,
             _admission(roots.stage_root_fd, deadline),
         ):
+            if isinstance(request, PythonProjectReleaseExpiredEnvironmentRequest):
+                response = _release_expired(request, policy, configuration, deadline, stage=stage)
+                response.require_for(request)
+                return response
             if isinstance(request, PythonProjectReleaseEnvironmentRequest):
                 response = _release(request, policy, configuration, deadline, stage=stage)
                 response.require_for(request)
@@ -1488,6 +1534,7 @@ def _request(raw: bytes) -> _Request:
             "run_python_project": PythonProjectBrokerRequest,
             "inspect_python_project_environment": PythonProjectInspectEnvironmentRequest,
             "release_python_project_environment": PythonProjectReleaseEnvironmentRequest,
+            'release_expired_python_project_environment': PythonProjectReleaseExpiredEnvironmentRequest,
         }
         action = payload.get("action")
         _need(type(action) is str and action in classes, "python_project_request_invalid")

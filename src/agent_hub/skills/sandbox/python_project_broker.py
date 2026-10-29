@@ -37,6 +37,7 @@ from agent_hub.skills.sandbox.python_project_protocol import (
     PythonProjectInvocation,
     PythonProjectProbeRequest,
     PythonProjectReleaseEnvironmentRequest,
+    PythonProjectReleaseExpiredEnvironmentRequest,
     base_python_invocation,
 )
 from agent_hub.subprocess_cleanup import ProcessCleanupIncomplete
@@ -48,6 +49,7 @@ if TYPE_CHECKING:
 type _Request = (
     PythonProjectBrokerRequest | PythonProjectProbeRequest | PythonProjectInspectEnvironmentRequest
     | PythonProjectReleaseEnvironmentRequest
+    | PythonProjectReleaseExpiredEnvironmentRequest
 )
 type ProductSink = Callable[[Path, PythonProjectBrokerResponse, PythonProjectInvocation],
                            Awaitable[PythonProductDescriptor | None]]
@@ -191,6 +193,7 @@ async def handle_python_project(
             PythonProjectProbeRequest,
             PythonProjectInspectEnvironmentRequest,
             PythonProjectReleaseEnvironmentRequest,
+            PythonProjectReleaseExpiredEnvironmentRequest,
         }:
             raise ValueError("python_project_request_invalid")
         request = type(request).model_validate_json(request.model_dump_json(), strict=True)

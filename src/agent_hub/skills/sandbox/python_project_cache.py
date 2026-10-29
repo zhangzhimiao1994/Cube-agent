@@ -59,6 +59,7 @@ from agent_hub.skills.sandbox.python_project_protocol import (
     PythonProjectScope,
     base_python_invocation,
 )
+from agent_hub.subprocess_cleanup import ProcessCleanupIncomplete
 
 _Reason = Literal[
     "cache_invalid",
@@ -782,6 +783,14 @@ class PythonProjectCacheLease:
         return result
 
 
+@dataclass(frozen=True)
+class PythonProjectExpiredEnvironment:
+    """Root-measured READY selection; never supplied over the service RPC."""
+
+    reference: PythonEnvironmentReference
+    reservation_sha256: str
+
+
 class PythonProjectEnvironmentCache:
     def __init__(self, root: Path, policy: PythonProjectCachePolicy) -> None:
         _need(
@@ -1039,6 +1048,71 @@ class PythonProjectEnvironmentCache:
             )
             _need(ready.reference == expected, "cache_changed")
             return ready.reference
+
+    @_io_errors()
+    def inspect_expired(
+        self, invocation: PythonProjectInvocation, *, deadline: float,
+    ) -> PythonProjectExpiredEnvironment | None:
+        """Select only this key, validating complete READY even before TTL check."""
+        key = python_project_cache_key(invocation)
+        _need(not invocation.install_allowed, 'cache_invalid')
+        with self._locked(deadline, create=False) as locked:
+            if locked is None:
+                return None
+            parent, stack, pins = locked
+            if key not in self._catalog(parent, deadline):
+                return None
+            entry = _open_directory(parent, key, 0, stack, pins, mode=0o700)
+            reservation = _reservation(entry, key, self.policy, pins)
+            ready = _ready(entry, self.root / key, reservation,
+                           ScanLimits(reservation['environment_limit_bytes']), stack, pins, deadline)
+            _expected(invocation, ready.reference)
+            if time.time() < reservation['expires_at']:
+                return None
+            for observed in pins:
+                observed.check()
+            return PythonProjectExpiredEnvironment(
+                ready.reference, hashlib.sha256(_encoded(reservation)).hexdigest(),
+            )
+
+    def release_expired(
+        self, invocation: PythonProjectInvocation, expected: PythonProjectExpiredEnvironment,
+        *, deadline: float,
+    ) -> bool:
+        """Caller holds native admission and proves whole-run quiet; no broad GC."""
+        key = python_project_cache_key(invocation)
+        _need(type(expected) is PythonProjectExpiredEnvironment and not invocation.install_allowed
+              and type(expected.reservation_sha256) is str
+              and _SHA.fullmatch(expected.reservation_sha256) is not None, 'cache_invalid')
+        _expected(invocation, expected.reference)
+        mutating = False
+        try:
+            with _io_errors(), self._locked(deadline, create=False) as locked:
+                if locked is None:
+                    return False
+                parent, stack, root_pins = locked
+                if key not in self._catalog(parent, deadline):
+                    return False
+                # Entry pins become intentionally invalid when erased. Root/lock
+                # identity checks still run on lock exit, as for completed release.
+                pins: list[_Observed] = []
+                entry = _open_directory(parent, key, 0, stack, pins, mode=0o700)
+                reservation = _reservation(entry, key, self.policy, pins)
+                _need(hashlib.sha256(_encoded(reservation)).hexdigest() == expected.reservation_sha256,
+                      'cache_changed')
+                _need(time.time() >= reservation['expires_at'], 'cache_changed')
+                ready = _ready(entry, self.root / key, reservation,
+                               ScanLimits(reservation['environment_limit_bytes']), stack, pins, deadline)
+                _need(ready.reference == expected.reference, 'cache_changed')
+                for observed in (*root_pins, *pins):
+                    observed.check()
+                mutating = True
+                _erase_ready(parent, key, entry, ready, deadline)
+                return True
+        except BaseException:
+            if mutating:
+                raise ProcessCleanupIncomplete('python_project_cleanup_incomplete') from None
+            raise
 
     @_io_errors()
     def prune_expired(

@@ -5,8 +5,9 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import re
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, cast
@@ -205,6 +206,8 @@ class OriginalProjectPreparer:
         self.authorizer, self.verifier = authorizer, verifier
         self.input_supply = input_supply
         self.artifact_repository = artifact_repository
+        # Bootstrap-only maintenance, never populated from a request or model.
+        self.capacity_maintenance: Callable[[], Awaitable[int]] | None = None
 
     def bind_artifact_repository(self, repository: ArtifactRepository) -> None:
         """Bootstrap-only private continuation reads; verifier/gateway remain unchanged."""
@@ -459,6 +462,20 @@ class OriginalProjectPreparer:
                     or allowed.call_id != request.call_id or allowed.tool_name != request.tool_name
                     or allowed.payload.get('authorized') is not True):
                 raise RuntimeError('original project preparation authorization required or denied')
+            if python_inputs is not None and self.capacity_maintenance is not None:
+                remaining = context.timeout_seconds - (asyncio.get_running_loop().time() - started)
+                if remaining <= 0:
+                    raise TimeoutError('original project preparation deadline exhausted')
+                try:
+                    removed = await asyncio.wait_for(self.capacity_maintenance(),
+                                                     timeout=min(30.0, remaining))
+                    if type(removed) is not int or removed < 0:
+                        raise TypeError('invalid capacity maintenance result')
+                except Exception as error:  # noqa: BLE001 - Keep normal native admission authoritative.
+                    logging.getLogger(__name__).warning(
+                        'python_project_capacity_maintenance_failed error_type=%s',
+                        type(error).__name__,
+                    )
             state = await self._state(context, expected=state, replace={
                 **state, 'phase': 'executing', 'execution_id': invocation.execution_id,
             }, supply_binding=supply_state)

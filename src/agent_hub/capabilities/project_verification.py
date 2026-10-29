@@ -411,6 +411,12 @@ class ProjectVerificationService:
     async def python_original_context(self, tenant_id: UUID, run_id: UUID) -> PythonOriginalContext | None:
         return await self._python.original_context(tenant_id, run_id)
 
+    async def python_expired_environment_invocation(
+        self, tenant_id: UUID, run_id: UUID,
+    ) -> PythonProjectInvocation | None:
+        """Readonly internal maintenance selector; never a model tool/grant."""
+        return await self._python.expired_environment_invocation(tenant_id, run_id)
+
     async def _original_scope(
         self, invocation: ProjectInvocation, *, reference: ProjectBaselineReference | None = None,
         original: bool = False,

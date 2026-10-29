@@ -160,6 +160,19 @@ class PythonProjectReleaseEnvironmentRequest(_PythonRequest):
         return self
 
 
+class PythonProjectReleaseExpiredEnvironmentRequest(_PythonRequest):
+    """Internal scoped expiry RPC; Root selects the reference and actual TTL."""
+
+    action: Literal['release_expired_python_project_environment'] = 'release_expired_python_project_environment'
+    invocation: PythonProjectInvocation
+
+    @model_validator(mode='after')
+    def no_install_authority(self) -> Self:
+        if self.invocation.install_allowed:
+            raise ValueError('invalid Python expired release context')
+        return self
+
+
 class PythonProjectInputsObservation(BaseModel):
     """Measured inputs from the root probe; not an installed environment."""
 
@@ -237,6 +250,7 @@ class PythonProjectBrokerResponse(_PythonRequest):
     action: Literal[
         "probe_python_project", "run_python_project", "inspect_python_project_environment",
         "release_python_project_environment",
+        'release_expired_python_project_environment',
     ]
     execution_id: str = Field(pattern=r"^[a-z0-9][a-z0-9_-]{0,127}$")
     ok: bool
@@ -245,6 +259,7 @@ class PythonProjectBrokerResponse(_PythonRequest):
     environment_reference: PythonEnvironmentReference | None = None
     released_environment: PythonEnvironmentReference | None = None
     release_outcome: Literal["released", "absent"] | None = None
+    expired_environment_released: bool | None = None
     error: PythonProjectBrokerError | None = None
     product: PythonProductDescriptor | None = None
     _product_stream: BinaryIO | None = PrivateAttr(default=None)
@@ -258,12 +273,22 @@ class PythonProjectBrokerResponse(_PythonRequest):
                 value is not None
                 for value in (
                     self.result, self.observation, self.environment_reference,
-                    self.released_environment, self.release_outcome
+                    self.released_environment, self.release_outcome, self.expired_environment_released
                 )
             ):
                 raise ValueError("invalid Python broker failure")
         elif self.error is not None:
             raise ValueError("invalid Python broker outcome")
+        elif self.action == 'release_expired_python_project_environment':
+            if type(self.expired_environment_released) is not bool or any(
+                value is not None for value in (
+                    self.result, self.observation, self.environment_reference,
+                    self.released_environment, self.release_outcome,
+                )
+            ):
+                raise ValueError('invalid Python expired release outcome')
+        elif self.expired_environment_released is not None:
+            raise ValueError('unexpected Python expired release outcome')
         elif self.action == "release_python_project_environment":
             if self.released_environment is None or self.release_outcome is None or any(
                 value is not None for value in (
@@ -296,7 +321,8 @@ class PythonProjectBrokerResponse(_PythonRequest):
         request: PythonProjectBrokerRequest
         | PythonProjectProbeRequest
         | PythonProjectInspectEnvironmentRequest
-        | PythonProjectReleaseEnvironmentRequest,
+        | PythonProjectReleaseEnvironmentRequest
+        | PythonProjectReleaseExpiredEnvironmentRequest,
     ) -> None:
         """Bind the authenticated root reply to the actual invocation, not report fields."""
         if type(request) not in {
@@ -304,6 +330,7 @@ class PythonProjectBrokerResponse(_PythonRequest):
             PythonProjectProbeRequest,
             PythonProjectInspectEnvironmentRequest,
             PythonProjectReleaseEnvironmentRequest,
+            PythonProjectReleaseExpiredEnvironmentRequest,
         }:
             raise ValueError("invalid Python broker request type")
         invocation = request.invocation

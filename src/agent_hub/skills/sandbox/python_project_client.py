@@ -39,12 +39,14 @@ from agent_hub.skills.sandbox.python_project_protocol import (
     PythonProjectProbeInvocation,
     PythonProjectProbeRequest,
     PythonProjectReleaseEnvironmentRequest,
+    PythonProjectReleaseExpiredEnvironmentRequest,
 )
 from agent_hub.subprocess_cleanup import ProcessCleanupIncomplete
 
 type _PythonRequest = (
     PythonProjectBrokerRequest | PythonProjectProbeRequest | PythonProjectInspectEnvironmentRequest
     | PythonProjectReleaseEnvironmentRequest
+    | PythonProjectReleaseExpiredEnvironmentRequest
 )
 _REQUEST_GRACE_SECONDS = 10.0
 _CLEANUP_SECONDS = 10.0
@@ -57,6 +59,7 @@ def _validated_request(request: _PythonRequest) -> _PythonRequest:
             PythonProjectProbeRequest,
             PythonProjectInspectEnvironmentRequest,
             PythonProjectReleaseEnvironmentRequest,
+            PythonProjectReleaseExpiredEnvironmentRequest,
         }:
             raise ValueError("invalid request type")
         # Frozen models can still be constructed/copied without validation. Reparse
@@ -188,6 +191,12 @@ class PythonProjectSystemdSandbox:
         ))
         assert response.released_environment is not None
         return response.released_environment
+
+    async def release_expired(self, invocation: PythonProjectInvocation) -> bool:
+        """Trusted service lifecycle only; no paths, expiry claims or model tool."""
+        response = await self._exchange(PythonProjectReleaseExpiredEnvironmentRequest(invocation=invocation))
+        assert response.expired_environment_released is not None
+        return response.expired_environment_released
 
     async def _exchange(self, request: _PythonRequest) -> PythonProjectBrokerResponse:
         if not _systemd_supported():

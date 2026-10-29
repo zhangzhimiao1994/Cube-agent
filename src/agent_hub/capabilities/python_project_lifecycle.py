@@ -9,6 +9,7 @@ import logging
 import math
 import re
 from collections.abc import Mapping
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Protocol, cast
 from uuid import UUID, uuid4
 
@@ -18,7 +19,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from agent_hub.capabilities.project_verification import ProjectVerificationService
 from agent_hub.capabilities.python_project_service import PythonOriginalContext
 from agent_hub.capabilities.scoped_read import authorized_workspace_scope
-from agent_hub.db.models import RunApprovalRow, RunCheckpointRow, RunRow, RuntimeArtifactRow
+from agent_hub.db.models import (
+    ProviderContinuationRow,
+    RunApprovalRow,
+    RunCheckpointRow,
+    RunEventRow,
+    RunOutboxRow,
+    RunRow,
+    RuntimeArtifactRow,
+    RunUsageRow,
+)
 from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.runs.artifacts import PostgresArtifactRepository
 from agent_hub.runs.repository import RunRepository
@@ -38,6 +48,11 @@ _LOGGER = logging.getLogger(__name__)
 _RELEASE_MARKER = "python_project_cache_release"
 _CANCEL_VERSION = 'python_project_cancel_cleanup_version'
 _FAILED_VERSION = 'terminal_failed_python_environment_cleanup_version'
+_MAX_RETENTION_SECONDS = 86400
+_CAPACITY_TIMEOUT_SECONDS = 30.0
+_PRE_MODEL_EVENT_KINDS = (
+    'context.loaded', 'harness.started', 'runtime.failed', 'repair.classified', 'terminal.notified',
+)
 
 
 class _Repository(Protocol):
@@ -45,6 +60,10 @@ class _Repository(Protocol):
 
 
 class _ContextReader(Protocol):
+    async def python_expired_environment_invocation(
+        self, tenant_id: UUID, run_id: UUID,
+    ) -> PythonProjectInvocation | None: ...
+
     async def python_original_context(
         self,
         tenant_id: UUID,
@@ -59,6 +78,8 @@ class _GeneratedContextReader(Protocol):
 
 
 class _Releaser(Protocol):
+    async def release_expired(self, invocation: PythonProjectInvocation) -> bool: ...
+
     async def release_completed(
         self,
         invocation: PythonProjectInvocation,
@@ -386,6 +407,135 @@ class PythonProjectTerminalHook:
         self.executor = executor
         self.generated_reader = generated_reader
         self._retry_cursor: UUID | None = None
+        self._capacity_cursor: UUID | None = None
+        self._capacity_lock = asyncio.Lock()
+
+    async def _release_expired_pre_model(
+        self, tenant: UUID, run: UUID, cutoff: datetime,
+    ) -> bool:
+        async with (
+            asyncio.timeout(_CAPACITY_TIMEOUT_SECONDS),
+            await self.repository.run_transaction() as session,
+            session.begin(),
+        ):
+            row = await session.scalar(select(RunRow).where(
+                RunRow.tenant_id == tenant, RunRow.id == run,
+            ).with_for_update())
+            if (row is None or (row.tenant_id, row.id, row.status) != (tenant, run, 'failed')
+                    or not isinstance(row.updated_at, datetime) or row.updated_at.tzinfo is None
+                    or row.updated_at > cutoff or any(value is not None for value in (
+                        row.worker_id, row.worker_lease_token,
+                        row.worker_lease_expires_at, row.worker_heartbeat_at))):
+                return False
+            route = row.routing_decision
+            if (type(route) is not dict or _RELEASE_MARKER in route
+                    or route.get('source') == 'self_repair'
+                    or any(not isinstance(key, str) or key.startswith('self_repair_') for key in route)):
+                return False
+            generated = bool({'generated_project_contract_version', 'generated_project_preparation'} & route.keys())
+            state: Mapping[str, object] | None
+            if generated:
+                state = _generated_preparation(route)
+                if state is None or row.mode != 'direct' or _uncertain(route):
+                    return False
+            else:
+                original_state = route.get('project_input_preparation')
+                if not isinstance(original_state, dict):
+                    return False
+                state = original_state
+                if (type(state) is not dict or set(state) != {
+                    'schema_version', 'phase', 'execution_id', 'reference', 'python_recipe'}
+                    or type(state['schema_version']) is not int or state['schema_version'] != 2
+                    or state['phase'] != 'executing'):
+                    return False
+                # This exact producer phase is not an execution proof. Any
+                # other UNKNOWN/partial marker remains a veto.
+                check_route = {**route, 'project_input_preparation': {**state, 'phase': 'captured'}}
+                if _uncertain(check_route):
+                    return False
+            assert state is not None
+            probes = [
+                select(ProviderContinuationRow.id).where(ProviderContinuationRow.tenant_id == tenant,
+                                                        ProviderContinuationRow.run_id == run),
+                select(RunApprovalRow.id).where(RunApprovalRow.tenant_id == tenant,
+                    RunApprovalRow.run_id == run, RunApprovalRow.status.not_in(('approved', 'rejected', 'expired'))),
+                select(RunOutboxRow.id).where(RunOutboxRow.tenant_id == tenant,
+                    RunOutboxRow.run_id == run, RunOutboxRow.delivered.is_(False)),
+            ]
+            if not generated:
+                probes += [
+                    select(RunCheckpointRow.id).where(RunCheckpointRow.tenant_id == tenant,
+                                                     RunCheckpointRow.run_id == run),
+                    select(RunUsageRow.id).where(RunUsageRow.tenant_id == tenant, RunUsageRow.run_id == run),
+                    select(RunEventRow.id).where(RunEventRow.tenant_id == tenant, RunEventRow.run_id == run,
+                                                 RunEventRow.kind.not_in(_PRE_MODEL_EVENT_KINDS)),
+                ]
+            for query in probes:
+                if await session.scalar(query.limit(1)) is not None:
+                    return False
+            if generated:
+                from agent_hub.capabilities.python_direct_expiry import verified_direct_expiry
+
+                if not await verified_direct_expiry(session, row):
+                    return False
+            project, workspace = authorized_workspace_scope(row, tenant_id=tenant, run_id=run)
+            item = await self.verifier.python_expired_environment_invocation(tenant, run)
+            if item is None:
+                return False
+            item = PythonProjectInvocation.model_validate(item.model_dump(), strict=True)
+            recipe = state['python_recipe']
+            if (item.install_allowed is not False or item.source_kind != ('candidate' if generated else 'original')
+                    or (item.tenant_id, item.run_id, item.project_id, item.session_id)
+                    != (tenant, run, project, workspace)
+                    or item.original_reference.model_dump(mode='json') != state['reference']
+                    or not isinstance(recipe, Mapping) or set(recipe) != {
+                        'schema_version', 'recipe_sha256', 'environment_input_sha256'}
+                    or type(recipe['schema_version']) is not int or recipe['schema_version'] != 1
+                    or (item.recipe_sha256, item.environment_input_sha256)
+                    != (recipe['recipe_sha256'], recipe['environment_input_sha256'])):
+                return False
+            released = await self.executor.release_expired(item)
+            if type(released) is not bool:
+                raise ValueError('invalid Python expired cleanup response')
+            # No run transition, marker, version, request or flag is backfilled.
+            return released
+
+    async def maintain_capacity(self) -> int:
+        """Bounded internal maintenance; DB locks remain held through each RPC.
+
+        Eligibility is not a root deletion proof. Root obtains the native READY
+        ref itself and must independently enforce TTL/retained/unit/stage fences.
+        """
+        if self._capacity_lock.locked():
+            # Prepare must not race an already-running periodic cleanup against
+            # the same full cache. Wait for it without launching another batch.
+            async with self._capacity_lock:
+                return 0
+        async with self._capacity_lock:
+            cutoff = datetime.now(UTC) - timedelta(seconds=_MAX_RETENTION_SECONDS)
+            query = select(RunRow).where(
+                RunRow.status == RunStatus.FAILED.value, RunRow.updated_at <= cutoff,
+                or_(RunRow.routing_decision.contains({
+                        'project_input_preparation': {'schema_version': 2, 'phase': 'executing'}}),
+                    and_(RunRow.mode == 'direct', RunRow.routing_decision.contains({
+                        'generated_project_contract_version': 1, 'generated_project_preparation': {
+                            'schema_version': 1, 'phase': 'python_ready', 'stack': 'python'}}))),
+            ).order_by(RunRow.id).limit(8)
+            if self._capacity_cursor is not None:
+                query = query.where(RunRow.id > self._capacity_cursor)
+            async with await self.repository.run_transaction() as session:
+                rows = (await session.scalars(query)).all()
+                candidates = tuple((row.tenant_id, row.id) for row in rows)
+            if not candidates:
+                self._capacity_cursor = None
+            released = 0
+            for tenant, run in candidates:
+                try:
+                    released += int(await self._release_expired_pre_model(tenant, run, cutoff))
+                except Exception:  # noqa: BLE001 - UNKNOWN is not false/absent and never grants deletion.
+                    _LOGGER.warning('python_expired_environment_maintenance_blocked run_id=%s', run)
+                self._capacity_cursor = run
+            return released
 
     async def __call__(
         self,
@@ -620,6 +770,7 @@ class PythonProjectTerminalHook:
         while not stop.is_set():
             try:
                 await self.retry_completed()
+                await self.maintain_capacity()
             except Exception as error:  # noqa: BLE001 - DB outage is not cleanup authority.
                 _LOGGER.warning(
                     "python_project_cleanup_scan_failed error_type=%s", type(error).__name__
