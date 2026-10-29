@@ -39,7 +39,7 @@ from agent_hub.db.models import (
 )
 from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.runs.artifacts import PostgresArtifactRepository
-from agent_hub.runs.repository import RunRepository
+from agent_hub.runs.repository import RunRepository, _database_uuid
 from agent_hub.runtime.contracts import Artifact, RuntimeCheckpoint
 from agent_hub.skills.sandbox.python_project_client import PythonProjectSystemdSandbox
 from agent_hub.skills.sandbox.python_project_protocol import (
@@ -617,7 +617,9 @@ class PythonProjectTerminalHook:
                 query = query.where(RunRow.id > self._capacity_cursor)
             async with await self.repository.run_transaction() as session:
                 rows = (await session.scalars(query)).all()
-                candidates = tuple((row.tenant_id, row.id) for row in rows)
+                candidates = tuple(
+                    (_database_uuid(row.tenant_id), _database_uuid(row.id)) for row in rows
+                )
             if not candidates:
                 self._capacity_cursor = None
             released = 0
@@ -836,7 +838,10 @@ class PythonProjectTerminalHook:
             query = query.where(RunRow.id > self._retry_cursor)
         async with await self.repository.run_transaction() as session:
             rows = (await session.scalars(query)).all()
-            candidates = tuple((row.tenant_id, row.id, RunStatus(row.status)) for row in rows)
+            candidates = tuple(
+                (_database_uuid(row.tenant_id), _database_uuid(row.id), RunStatus(row.status))
+                for row in rows
+            )
         if not candidates:
             self._retry_cursor = None
         for tenant_id, run_id, status in candidates:
