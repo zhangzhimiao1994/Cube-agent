@@ -8,15 +8,23 @@ import json
 import logging
 import math
 import re
+import sys
+from collections import deque
 from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from types import TracebackType
 from typing import TYPE_CHECKING, Protocol, cast
 from uuid import UUID, uuid4
 
 from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from agent_hub.capabilities.project_verification import ProjectVerificationService
+from agent_hub.capabilities.project_baselines import ProjectBaselineError
+from agent_hub.capabilities.project_verification import (
+    ProjectVerificationError,
+    ProjectVerificationService,
+)
 from agent_hub.capabilities.python_project_service import PythonOriginalContext
 from agent_hub.capabilities.scoped_read import authorized_workspace_scope
 from agent_hub.db.models import (
@@ -53,6 +61,75 @@ _CAPACITY_TIMEOUT_SECONDS = 30.0
 _PRE_MODEL_EVENT_KINDS = (
     'context.loaded', 'harness.started', 'runtime.failed', 'repair.classified', 'terminal.notified',
 )
+_DIAGNOSTIC_ROOT = Path(__file__).parent.parent
+_DIAGNOSTIC_ERROR_TYPES = (
+    ProjectVerificationError, ProjectBaselineError, ValueError, TypeError, RuntimeError,
+    OSError, PermissionError, FileNotFoundError, TimeoutError, KeyError, AttributeError,
+)
+
+
+def _retry_error_type(error: BaseException) -> str:
+    # Unknown exception class names can themselves contain private text/newlines.
+    for known in _DIAGNOSTIC_ERROR_TYPES:
+        if type(error) is known:
+            return known.__name__
+    return "Exception"
+
+
+def _retry_failure_frame(tb: TracebackType) -> dict[str, str | int] | None:
+    frame = tb.tb_frame
+    name = frame.f_globals.get("__name__")
+    if not isinstance(name, str) or not name.startswith("agent_hub."):
+        return None
+    module = sys.modules.get(name)
+    if module is None or module.__dict__ is not frame.f_globals:
+        return None
+    filename = Path(frame.f_code.co_filename)
+    if ".." in filename.parts:
+        return None
+    try:
+        relative = filename.relative_to(_DIAGNOSTIC_ROOT).as_posix()
+    except ValueError:
+        return None
+    function = frame.f_code.co_name
+    if (len(relative) > 240
+            or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*(?:/[A-Za-z_][A-Za-z0-9_]*)*\.py", relative)
+            is None
+            or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}|<(?:module|lambda|listcomp|dictcomp|setcomp|genexpr)>",
+                            function) is None):
+        return None
+    return {"module": relative, "function": function, "line": tb.tb_lineno}
+
+
+def _retry_failure_diagnosis(error: BaseException) -> str:
+    """Bounded location metadata only, including context hidden by `from None`."""
+    exceptions: list[dict[str, object]] = []
+    frames: deque[tuple[int, dict[str, str | int]]] = deque(maxlen=12)
+    seen: set[int] = set()
+    current: BaseException | None = error
+    truncated = False
+    while current is not None and len(exceptions) < 4 and id(current) not in seen:
+        seen.add(id(current))
+        index = len(exceptions)
+        exceptions.append({"type": _retry_error_type(current), "frames": []})
+        tb = current.__traceback__
+        # Bound scanning as well as output, even with a large external traceback.
+        for _ in range(128):
+            if tb is None:
+                break
+            item = _retry_failure_frame(tb)
+            if item is not None:
+                truncated |= len(frames) == 12
+                frames.append((index, item))
+            tb = tb.tb_next
+        truncated |= tb is not None
+        current = current.__cause__ if current.__cause__ is not None else current.__context__
+    truncated |= current is not None
+    # Keep the innermost cause's frames when the global output budget is full.
+    for index, item in frames:
+        cast(list[dict[str, str | int]], exceptions[index]["frames"]).append(item)
+    return json.dumps({"schema_version": 1, "exceptions": exceptions, "truncated": truncated},
+                      ensure_ascii=True, separators=(",", ":"))
 
 
 class _Repository(Protocol):
@@ -774,9 +851,10 @@ class PythonProjectTerminalHook:
                 )
             except Exception as error:  # noqa: BLE001 - retry later, never relax the gate.
                 _LOGGER.warning(
-                    "python_project_cleanup_retry_failed run_id=%s error_type=%s",
+                    "python_project_cleanup_retry_failed run_id=%s error_type=%s diagnosis=%s",
                     run_id,
-                    type(error).__name__,
+                    _retry_error_type(error),
+                    _retry_failure_diagnosis(error),
                 )
             self._retry_cursor = run_id
         return len(candidates)
