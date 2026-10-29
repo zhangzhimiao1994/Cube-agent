@@ -56,6 +56,8 @@ class EvidenceSession(Session):
 @pytest.fixture
 async def evidence(request: pytest.FixtureRequest, tmp_path: Path) -> EvidenceSession:
     python_failure = getattr(request, 'param', '') == 'python'
+    post_tool = getattr(request, 'param', '') in {'post_tool', 'post_tool_growth'}
+    growth = getattr(request, 'param', '') == 'post_tool_growth'
     diagnostic_payload: dict[str, Any] = {"execution_diagnostic": dict(ExecutionDiagnostic(
         "python", SkillResult(exit_code=1, stdout="", stderr="failed", timed_out=False)).to_payload())}
     if python_failure:
@@ -95,10 +97,18 @@ async def evidence(request: pytest.FixtureRequest, tmp_path: Path) -> EvidenceSe
         plan = plan.model_copy(update={"allowed_tools": ("project.verify",),
             "agents": (plan.agents[0].model_copy(update={"allowed_tools": ("project.verify",)}), *plan.agents[1:]),
             "steps": (plan.steps[0].model_copy(update={"tools": ("project.verify",)}), *plan.steps[1:])})
-    runtime = subject(Gateway("tool"), plan, repository, Harness())
+    if post_tool:
+        from tests.unit.runtime.crew.test_post_tool_finalization_growth import SaturatedGateway
+
+        runtime = subject(SaturatedGateway('tool', 'incomplete', 'incomplete', capacity=8192),
+                          plan, repository, RecordingHarnessToolGateway())
+    else:
+        runtime = subject(Gateway("tool"), plan, repository, Harness())
     events = []
-    context = _context(token_budget=30_000).model_copy(update={"run_id": UUID(int=2), "tenant_id": UUID(int=1)})
-    with pytest.raises(RuntimeExecutionError, match="structured output invalid"):
+    context = _context(token_budget=30_000, routing_decision={
+        'post_tool_finalization_growth_version': 1,
+    } if growth else {}).model_copy(update={"run_id": UUID(int=2), "tenant_id": UUID(int=1)})
+    with pytest.raises(RuntimeExecutionError, match='growth exhausted' if growth else 'structured output invalid'):
         async for event in runtime.run(context):
             events.append(event)
     child = next(event.checkpoint for event in reversed(events)
@@ -127,6 +137,22 @@ async def evidence(request: pytest.FixtureRequest, tmp_path: Path) -> EvidenceSe
         session.private_rows.append(RuntimeArtifactRow(id=artifact_id, tenant_id=tenant, run_id=run,
             content_sha256=artifact.content_sha256, payload=raw, byte_size=len(raw.encode("utf-8"))))
     return session
+
+
+@pytest.mark.parametrize('evidence', ['post_tool', 'post_tool_growth'], indirect=True)
+async def test_known_incomplete_model_receipts_release_only_the_safe_terminal_environment(
+    evidence: EvidenceSession,
+) -> None:
+    before = copy.deepcopy(evidence.saved.payload), copy.deepcopy(evidence.checkpoints)
+    child = cast(Any, evidence.saved.payload)['state']['child_checkpoint']['state']
+    assert any(row['failure_reason'] == 'model post-tool incomplete'
+               for row in child['models'].values())
+    assert all(row['status'] in {'succeeded', 'rejected'} for row in child['models'].values())
+    assert any(row['output_status'] == 'incomplete' and row['usage_status'] == 'known'
+               for row in child['rejected_outputs'].values())
+    assert await invoke(evidence, callback_status=RunStatus.FAILED) == ['context', 'release']
+    assert evidence.row.status == 'failed' and RELEASE in evidence.row.routing_decision
+    assert (evidence.saved.payload, evidence.checkpoints) == before
 
 
 async def test_verified_hybrid_failed_tool_releases_only_environment_and_preserves_history(
@@ -188,6 +214,43 @@ def rehash(session: EvidenceSession) -> None:
     session.saved.state = cast(dict[str, object], session.saved.payload['state'])
     session.saved.state_sha256 = checkpoint.state_sha256
     session.checkpoints = [session.saved.state]
+
+
+@pytest.mark.parametrize('evidence', ['post_tool_growth'], indirect=True)
+@pytest.mark.parametrize('defect', [
+    'unknown_outcome', 'unknown_usage', 'no_usage', 'wrong_provenance',
+    'unexpected_reason', 'unexpected_failure', 'model_running', 'tool_running', 'missing_receipt',
+])
+async def test_incomplete_cleanup_never_turns_uncertainty_or_bad_receipts_into_authority(
+    evidence: EvidenceSession, defect: str,
+) -> None:
+    child = cast(Any, evidence.saved.payload)['state']['child_checkpoint']['state']
+    key, row = next((key, row) for key, row in child['models'].items()
+                    if row['failure_reason'] == 'model post-tool incomplete')
+    receipt = child['rejected_outputs'][key]
+    if defect == 'unknown_outcome':
+        receipt['output_status'] = 'unknown'
+    elif defect == 'unknown_usage':
+        receipt['usage_status'], receipt['usage'] = 'unknown', None
+    elif defect == 'no_usage':
+        receipt['usage'] = None
+    elif defect == 'wrong_provenance':
+        receipt['provenance'] = {}
+    elif defect == 'unexpected_reason':
+        receipt['reason'] = 'invalid_json'
+    elif defect == 'unexpected_failure':
+        row['failure_reason'] = 'unclassified model failure'
+    elif defect == 'model_running':
+        row['status'] = 'running'
+    elif defect == 'tool_running':
+        next(iter(child['tools'].values()))['status'] = 'running'
+    elif defect == 'missing_receipt':
+        child['rejected_outputs'].pop(key)
+    rehash(evidence)
+    before = copy.deepcopy(evidence.saved.payload)
+    assert await invoke(evidence, callback_status=RunStatus.FAILED) == []
+    assert RELEASE not in evidence.row.routing_decision
+    assert evidence.saved.payload == before
 
 
 async def test_fully_verified_direct_crew_failed_history_uses_same_gate(evidence: EvidenceSession) -> None:

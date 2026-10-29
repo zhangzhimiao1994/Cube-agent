@@ -267,14 +267,29 @@ async def _verified_failed_history(
                 if (not isinstance(receipt, Mapping) or receipt.get('disposition') != 'rejected'
                         or receipt.get('text_sha256') != model.get('sha256')
                         or receipt.get('provenance') != model.get('provenance')
-                        or model.get('failure_reason') != 'structured output rejected'
                         or type(receipt.get('version')) is not int or receipt['version'] != 1
                         or model.get('artifact_id') is not None):
                     return False
                 rejected = CrewDispatchRuntime._rejected_from_private(receipt)
                 evidence = rejected.evidence
-                if (evidence is None or evidence.status != 'completed'
-                        or evidence.usage_status != 'known' or evidence.usage is None):
+                if (evidence is None or evidence.usage_status != 'known' or evidence.usage is None):
+                    return False
+                if evidence.status == 'completed':
+                    if model.get('failure_reason') != 'structured output rejected':
+                        return False
+                elif evidence.status == 'incomplete':
+                    # A confirmed incomplete response has returned, unlike an
+                    # uncertain transport/model outcome. Its rejected batch did
+                    # not execute. The complete succeeded-call/tool receipt
+                    # reconciliation below still fences every actual side effect.
+                    if (evidence.reason != 'incomplete' or evidence.final_text is not None
+                            or model.get('failure_reason') not in {
+                                'structured output rejected', 'model response incomplete',
+                                'model post-tool incomplete', 'model post-tool growth incomplete',
+                                'model initial-chain incomplete',
+                            }):
+                        return False
+                else:
                     return False
             else:
                 artifact_id, digest = model.get('artifact_id'), model.get('sha256')
