@@ -2907,13 +2907,17 @@ def _known_incomplete_recovery_eligible(
     repair: Mapping[str, JsonValue] | None, evidence: RejectedOutputEvidence | None,
     tool_ledger: _ToolLedger | None,
     attempt: int = 0, call_index: int = 0, allow_later_tools: bool = False,
+    allow_required_tool: bool = False,
 ) -> bool:
     first_tool_call = (
         bool(step.tools) and attempt == 0 and call_index == 0
-        and tuple(tool.name for tool in request.tools) == tuple(sorted(_tool_name_mapping(step.tools)))
+        and (tuple(tool.name for tool in request.tools) == tuple(sorted(_tool_name_mapping(step.tools)))
+             or (allow_required_tool and step.engineering_action_version == 1
+                 and len(request.tools) == 1 and request.required_tool == request.tools[0].name
+                 and _tool_name_mapping(step.tools).get(request.required_tool) == "project.inspect"))
     )
     return (
-        repair is None and purpose == "step" and request.response_schema is not None
+        repair is None and purpose == "step" and (request.response_schema is not None or allow_required_tool)
         and ((step.tools == () and request.tools == ()) or first_tool_call)
         and evidence is not None and evidence.status == "incomplete"
         and evidence.reason == "incomplete" and evidence.usage_status == "known"
@@ -4343,7 +4347,7 @@ class CrewDispatchRuntime:
             state.native_tool_continuation = self._provider_continuation_repository is not None
             state.required_tool_correction_version = (
                 cast(int, restored.state.get("required_tool_correction_version", 0))
-                if restored is not None else int(any(step.engineering_action_version == 1 for step in plan.steps))
+                if restored is not None else 2 * int(any(step.engineering_action_version == 1 for step in plan.steps))
             )
             maintenance_version = context.routing_decision.get("workspace_maintenance_contract_version", 0)
             if (type(maintenance_version) is not int or maintenance_version not in {0, 1}
@@ -6578,7 +6582,6 @@ class CrewDispatchRuntime:
     ) -> RejectedOutputEvidence:
         if (
             (step.tools and attempt != 1) or attempt < 1 or attempt % (recovery_limit + 1) != 1
-            or _agent_response_schema(agent) is None
         ):
             _fail("runtime checkpoint incomplete reservation is invalid")
         key = self._model_call_key(run_id, step.id, attempt - 1, "step", agent.id, 0)
@@ -6590,6 +6593,9 @@ class CrewDispatchRuntime:
             or source["purpose"] != "step" or source["attempt"] != attempt - 1
             or source["call_index"] != 0 or source.get("failure_reason") != "model response incomplete"
             or receipt["disposition"] != "rejected"
+            or (_agent_response_schema(agent) is None and not (
+                step.engineering_action_version == 1 and source.get("required_tool_initial_incomplete") == 1
+            ))
         ):
             _fail("runtime checkpoint incomplete reservation is invalid")
         evidence = self._rejected_from_private(receipt).evidence
@@ -6653,8 +6659,17 @@ class CrewDispatchRuntime:
         tools: Mapping[str, Mapping[str, JsonValue]], tool_artifacts: Mapping[str, Artifact],
         source_ids: tuple[str, ...], *, closed: bool = False, source_artifacts: Sequence[Artifact] = (),
         native_continuation: bool = False,
+        initial_recovery: _ModelLedger | None = None,
     ) -> str | None:
-        if actor != step.agent or attempt != 0 or call_index < 1 or not step.tools or (
+        recovered = (
+            attempt == 1 and initial_recovery is not None
+            and self._required_tool_initial_recovery_link(step, initial_recovery) is not None
+            and any(row["step_id"] == step.id and row["attempt"] == 1 and row["call_index"] == 0
+                    and row.get("initial_incomplete_recovery")
+                    == self._required_tool_initial_recovery_link(step, initial_recovery)
+                    for row in initial_recovery.states.values())
+        )
+        if actor != step.agent or (attempt != 0 and not recovered) or call_index < 1 or not step.tools or (
             _is_project_scale_tool_contract_step(step)
             or (_is_incremental_workspace_contract_step(step) and not native_continuation)
         ):
@@ -6882,6 +6897,7 @@ class CrewDispatchRuntime:
         reserved_max_output_tokens: int | None = None,
         initial_incomplete_chain: Mapping[str, JsonValue] | None = None,
         post_tool_growth: Mapping[str, JsonValue] | None = None,
+        initial_recovery_link: Mapping[str, JsonValue] | None = None,
     ) -> tuple[GatewayCompletion, Artifact]:
         if request.response_schema is not None:
             _structured_validator(request.response_schema)
@@ -6892,9 +6908,11 @@ class CrewDispatchRuntime:
         request = self._fit_context_request(request, run_state)
         request_sha = self._model_request_sha256(request)
         existing = ledger.states.get(key)
+        if existing is not None and existing.get("initial_incomplete_recovery") != initial_recovery_link:
+            _fail("initial incomplete recovery linkage changed")
         required_correction = repair is not None and repair.get("version") == 4
         if required_correction and (
-            run_state.required_tool_correction_version != 1 or step.engineering_action_version != 1
+            run_state.required_tool_correction_version not in {1, 2} or step.engineering_action_version != 1
             or repair is None or repair.get("mode") != "required_tool_correction"
             or not request.required_tool or len(request.tools) != 1
             or request.tools[0].name != request.required_tool or request.allow_fallback
@@ -7001,6 +7019,8 @@ class CrewDispatchRuntime:
                    if reserved_max_output_tokens is not None else {}),
                 **({"initial_incomplete_chain": initial_incomplete_chain}
                    if initial_incomplete_chain is not None else {}),
+                **({"initial_incomplete_recovery": initial_recovery_link}
+                   if initial_recovery_link is not None else {}),
                 **({"post_tool_growth": post_tool_growth} if post_tool_growth is not None else {}),
             }
             await model_boundary(key, prepared, repair=repair)
@@ -7233,6 +7253,16 @@ class CrewDispatchRuntime:
                 )
                 return completion, artifact
             private = self._rejected_private_payload(rejected, sources)
+            initial_scope = get_gateway_scope_diagnostic(rejected)
+            required_initial = (
+                run_state.required_tool_correction_version == 2 and step.engineering_action_version == 1
+                and request.required_tool is not None and not rejected.fallback_used
+                and rejected.logical_model == request.logical_model
+                and initial_scope is not None and initial_scope.phase is ScopeIncompletePhase.TRANSPORT
+                and initial_scope.reason is ScopeIncompleteReason.REJECTED_OUTPUT
+                and initial_scope.transport_entered_count == 1 and initial_scope.failure_attempt_count == 0
+                and get_gateway_failure_receipt(rejected) is None
+            )
             qualified_initial_chain = (
                 run_state.initial_incomplete_chain_growth and run_state.incomplete_recovery_output_growth
                 and (not step.tools or run_state.first_tool_incomplete_recovery_output_growth)
@@ -7250,6 +7280,7 @@ class CrewDispatchRuntime:
                     step=step, request=request, purpose=purpose, repair=repair,
                     evidence=rejected.evidence, tool_ledger=tool_ledger,
                     attempt=attempt, call_index=index,
+                    allow_required_tool=required_initial,
                 )
             )
             qualified_post_tool = (
@@ -7291,6 +7322,8 @@ class CrewDispatchRuntime:
                     )
                 ),
             )
+            if qualified_incomplete and required_initial:
+                rejected_state["required_tool_initial_incomplete"] = 1
             await self._run_commit(usage_boundary(
                 rejected, actor, step.id, key, rejected_state, None, private_output=private,
             ), run_state)
@@ -7323,11 +7356,13 @@ class CrewDispatchRuntime:
             attempt=attempt, call_index=index, allow_later_tools=(
                 existing is not None and _first_incomplete_recovery_succeeded(step, ledger.states)
             ),
+            allow_required_tool=(run_state.required_tool_correction_version == 2
+                                 and ledger.states[key].get("required_tool_initial_incomplete") == 1),
         ):
             raise _KnownIncompleteResponse(rejected.logical_model)
         previous_repair = ledger.structured_repairs.get(step.id)
         required_tool_repair = (
-            run_state.required_tool_correction_version == 1 and step.engineering_action_version == 1
+            run_state.required_tool_correction_version in {1, 2} and step.engineering_action_version == 1
             and request.required_tool is not None and len(request.tools) == 1
             and request.tools[0].name == request.required_tool
             and _tool_name_mapping(step.tools).get(request.required_tool)
@@ -7516,7 +7551,12 @@ class CrewDispatchRuntime:
         models: _ModelLedger, tools: _ToolLedger | None, sources: Sequence[Artifact],
     ) -> str | None:
         # A correction's tools belong to its own later model slot, never the source prefix.
-        if attempt != 0 or actor != step.agent or tools is None:
+        if attempt not in {0, 1} or actor != step.agent or tools is None:
+            return None
+        recovery_link = self._required_tool_initial_recovery_link(step, models) if attempt == 1 else None
+        if attempt == 1 and (recovery_link is None or any(
+            row["step_id"] == step.id and row["attempt"] != 1 for row in tools.states.values()
+        )):
             return None
         prefix_models = {key: row for key, row in models.states.items()
                          if row["step_id"] == step.id and row["attempt"] == attempt
@@ -7525,12 +7565,56 @@ class CrewDispatchRuntime:
                         if row["step_id"] == step.id and row["attempt"] == attempt
                         and cast(int, row["round"]) < index}
         ids = tuple(str(source.id) for source in sources)
+        if attempt == 1:
+            first_entry = next(((key, row) for key, row in prefix_models.items() if row["call_index"] == 0), None)
+            if first_entry is None or recovery_link is None:
+                return None
+            first_key, first = first_entry
+            first_artifact = models.artifacts.get(first_key)
+            initial_private = models.rejected_outputs[cast(str, recovery_link["source_key"])]
+            if (first.get("initial_incomplete_recovery") != recovery_link or first_artifact is None
+                    or first_artifact.source_ids != initial_private["source_ids"]
+                    or first_artifact.provenance is None
+                    or first_artifact.provenance.logical_model
+                    != cast(Mapping[str, JsonValue], initial_private["provenance"])["logical_model"]):
+                return None
         if index == 0:
-            return self._post_tool_digest({"source_ids": ids}) if not prefix_tools else None
+            return self._post_tool_digest({"source_ids": ids}) if not prefix_tools and attempt == 0 else None
         return self._post_tool_history_sha256(
             step, actor, attempt, index, prefix_models, models.artifacts, prefix_tools, tools.artifacts, ids,
             source_artifacts=sources, native_continuation=True,
+            initial_recovery=models if attempt == 1 else None,
         )
+
+    def _required_tool_initial_recovery_link(
+        self, step: DispatchStep, ledger: _ModelLedger,
+    ) -> Mapping[str, JsonValue] | None:
+        rows = {key: row for key, row in ledger.states.items()
+                if row["step_id"] == step.id and row["purpose"] == "step"}
+        if step.engineering_action_version != 1 or any(
+            row["actor"] != step.agent or row["attempt"] not in {0, 1} for row in rows.values()
+        ):
+            return None
+        roots = [(key, row) for key, row in rows.items() if row["attempt"] == 0]
+        if len(roots) != 1:
+            return None
+        key, root = roots[0]
+        private = ledger.rejected_outputs.get(key)
+        if (root["status"] != "rejected" or root["call_index"] != 0
+                or type(root.get("required_tool_initial_incomplete")) is not int
+                or root.get("required_tool_initial_incomplete") != 1
+                or root.get("failure_reason") != "model response incomplete" or private is None):
+            return None
+        receipt = self._rejected_from_private(private)
+        evidence = receipt.evidence
+        agent = next(agent for agent in self._plan.agents if agent.id == step.agent)
+        if (receipt.fallback_used or receipt.logical_model != agent.logical_model
+                or evidence is None or evidence.reason != "incomplete"
+                or evidence.status != "incomplete" or evidence.usage_status != "known"
+                or evidence.usage is None or evidence.final_text is not None):
+            return None
+        return {"version": 1, "source_key": key, "source_request_sha256": root["request_sha256"],
+                "source_receipt_sha256": self._post_tool_digest(private)}
 
     @staticmethod
     def _invalid_tool_history_quiet(step: DispatchStep, ledger: _ToolLedger | None) -> bool:
@@ -8365,6 +8449,13 @@ class CrewDispatchRuntime:
                             historical_request = self._fit_context_request(historical_request, run_state)
                             if self._model_request_sha256(historical_request) == cached_draft_model["request_sha256"]:
                                 request = historical_request
+                    initial_link = None
+                    if (run_state.required_tool_correction_version == 2 and step.engineering_action_version == 1
+                            and incomplete_recovery_model is not None and model_attempt_index == 1
+                            and call_cursor.value == 0):
+                        initial_link = self._required_tool_initial_recovery_link(step, model_ledger)
+                        if initial_link is None:
+                            _fail("initial incomplete recovery source is unavailable")
                     completion, model_artifact = await self._execute_model_request(
                         context, step, agent.id, request, purpose="step", attempt=model_attempt_index,
                         cursor=call_cursor, ledger=model_ledger,
@@ -8376,6 +8467,7 @@ class CrewDispatchRuntime:
                         allow_structured_repair=incomplete_recovery_model is None,
                         reserved_max_output_tokens=round_reservation,
                         initial_incomplete_chain=chain_link,
+                        initial_recovery_link=initial_link,
                     )
                     break
                 except _InitialIncompleteResponse as error:
@@ -10992,8 +11084,8 @@ class CrewDispatchRuntime:
                    and meaningful_progress and run_state.workspace_context_refresh else {}),
                 "incomplete_recovery_output_growth": run_state.incomplete_recovery_output_growth,
                 "initial_incomplete_chain_growth": run_state.initial_incomplete_chain_growth,
-                **({"required_tool_correction_version": 1}
-                   if run_state.required_tool_correction_version == 1 else {}),
+                **({"required_tool_correction_version": run_state.required_tool_correction_version}
+                   if run_state.required_tool_correction_version in {1, 2} else {}),
                 **({"post_tool_finalization_growth_version": 1}
                    if run_state.post_tool_finalization_growth_version == 1 else {}),
                 **({"workspace_maintenance_feedback_version": 1}
@@ -11185,7 +11277,7 @@ class CrewDispatchRuntime:
             ))
             or ("required_tool_correction_version" in state and (
                 type(state["required_tool_correction_version"]) is not int
-                or state["required_tool_correction_version"] != 1
+                or state["required_tool_correction_version"] not in {1, 2}
                 or checkpoint.runtime_version != _RUNTIME_VERSION
                 or not any(step.engineering_action_version == 1 for step in plan.steps)
             ))
@@ -11603,7 +11695,7 @@ class CrewDispatchRuntime:
                     not model_state_keys <= set(value)
                     or set(value) - model_state_keys - {
                         "failure_reason", "reserved_max_output_tokens", "initial_incomplete_chain", "post_tool_growth",
-                        "provider_continuation",
+                        "provider_continuation", "required_tool_initial_incomplete", "initial_incomplete_recovery",
                         _delivery_report.BINDING,
                     }
                 )
@@ -11930,8 +12022,16 @@ class CrewDispatchRuntime:
                 if (
                     state["status"] != "rejected" or state["purpose"] != "step"
                     or state["actor"] != step.agent or state["call_index"] != 0
-                    or _agent_response_schema(agent) is None
-                    or (step.tools and (
+                    or (_agent_response_schema(agent) is None and not (
+                        checkpoint.state.get("required_tool_correction_version") == 2
+                        and state.get("required_tool_initial_incomplete") == 1
+                        and step.engineering_action_version == 1
+                    ))
+                    or (step.tools and not (
+                        checkpoint.state.get("required_tool_correction_version") == 2
+                        and state.get("required_tool_initial_incomplete") == 1
+                        and step.engineering_action_version == 1
+                    ) and (
                         state["attempt"] != 0 or _is_project_scale_tool_contract_step(step)
                         or _is_incremental_workspace_contract_step(step)
                     ))
@@ -11947,6 +12047,21 @@ class CrewDispatchRuntime:
                     _fail("runtime checkpoint incomplete qualification is invalid")
         agents = {agent.id: agent for agent in plan.agents}
         steps = {step.id: step for step in plan.steps}
+        required_ledger = _ModelLedger(
+            states=dict(models), rejected_outputs=dict(cast(Mapping[str, Mapping[str, JsonValue]], private)),
+        )
+        for key, row in models.items():
+            if "required_tool_initial_incomplete" in row or "initial_incomplete_recovery" in row:
+                initial_proof = self._required_tool_initial_recovery_link(steps[cast(str, row["step_id"])], required_ledger)
+                if checkpoint.state.get("required_tool_correction_version") != 2 or initial_proof is None:
+                    _fail("runtime checkpoint initial recovery source is invalid")
+                if "required_tool_initial_incomplete" in row and initial_proof["source_key"] != key:
+                    _fail("runtime checkpoint initial recovery source is invalid")
+                if "initial_incomplete_recovery" in row and (
+                    row["attempt"] != 1 or row["call_index"] != 0 or row["purpose"] != "step"
+                    or row["initial_incomplete_recovery"] != initial_proof
+                ):
+                    _fail("runtime checkpoint initial recovery linkage is invalid")
         growth = checkpoint.state.get("incomplete_recovery_output_growth", False)
         first_tool_growth = checkpoint.state.get("first_tool_incomplete_recovery_output_growth", False)
         continuation_growth = checkpoint.state.get("incomplete_continuation_output_growth", False)
@@ -12050,7 +12165,7 @@ class CrewDispatchRuntime:
             attempt = cast(int, row["attempt"])
             limit = _checkpoint_recovery_attempt_limit(agent, checkpoint.runtime_version)
             row_repair = repairs.get(step.id)
-            if (isinstance(row_repair, Mapping) and row_repair.get("version") == 3
+            if (isinstance(row_repair, Mapping) and row_repair.get("version") in {3, 4}
                     and row_repair.get("correction_key") == key):
                 # This response has its own smaller reservation, validated below; it is
                 # not another continuation request from initial-incomplete recovery.
@@ -12178,7 +12293,7 @@ class CrewDispatchRuntime:
                 ):
                     _fail("runtime checkpoint invalid-tool linkage is invalid")
                 if required_tool and (
-                    checkpoint.state.get("required_tool_correction_version") != 1
+                    checkpoint.state.get("required_tool_correction_version") not in {1, 2}
                     or steps[step_id].engineering_action_version != 1
                     or type(value["tool_history_sha256"]) is not str
                     or _SHA256.fullmatch(value["tool_history_sha256"]) is None

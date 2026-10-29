@@ -16,6 +16,9 @@ from agent_hub.models.gateway import (
     GatewayCompletion,
     GatewayRejectedOutput,
     ModelGateway,
+    ScopeIncompletePhase,
+    ScopeIncompleteReason,
+    _GatewayFailureHistory,
     get_gateway_scope_diagnostic,
 )
 from agent_hub.models.litellm_client import LiteLLMClient, OpenAIClientFactory
@@ -24,6 +27,7 @@ from agent_hub.models.types import (
     ModelCapability,
     ModelRequest,
     ModelResponse,
+    RejectedOutputEvidence,
     StructuredResponseSchema,
     TokenUsage,
     ToolCall,
@@ -66,6 +70,35 @@ class RequiredGateway(WorkspaceDeliverySequenceGateway):
         return await super().complete_with_context(request)
 
 
+class IncompleteRequiredGateway(RequiredGateway):
+    """A known, zero-dispatch first response precedes the existing compact recovery."""
+    reject_at = frozenset({2})
+    initial_change = ""
+
+    async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+        if not self.requests:
+            self.requests.append(request)
+            evidence = RejectedOutputEvidence(
+                final_text=None, usage=TokenUsage(10, request.max_output_tokens, 10 + request.max_output_tokens),
+                usage_status="known", status="incomplete", reason="incomplete",
+            )
+            if self.initial_change == "usage":
+                evidence = replace(evidence, usage_status="missing", usage=None)
+            elif self.initial_change == "unknown":
+                evidence = replace(evidence, status="unknown")
+            error = GatewayRejectedOutput(
+                evidence=evidence, deployment_id="primary", logical_model=request.logical_model,
+                provider_id="deepseek", provider_model="deepseek/chat", cost_usd=Decimal("0.02"),
+                fallback_used=self.initial_change == "fallback",
+            )
+            scope = _GatewayFailureHistory(entered_count=2 if self.initial_change == "multiple" else 1)
+            scope.mark_incomplete(ScopeIncompletePhase.TRANSPORT, ScopeIncompleteReason.REJECTED_OUTPUT)
+            if self.initial_change != "untrusted":
+                scope.attach_diagnostic(error)
+            raise error
+        return replace(await super().complete_with_context(request), cost_usd=Decimal("0.01"))
+
+
 def subject(model: Any, harness: Any, artifacts: Any, provider: Any) -> CrewDispatchRuntime:
     base = engineering_runtime(model, harness, artifacts)
     plan = base._plan.model_copy(update={"total_token_budget": 100_000, "total_cost_usd": Decimal(1), "steps": (
@@ -86,6 +119,11 @@ def gateway(*, native_history: bool = True) -> RequiredGateway:
     ), usage=TokenUsage(1, 1, 2))
     responses = (inspect, FINAL, verify_response(), FINAL, _workspace_delivery_bundle_response(), FINAL)
     return RequiredGateway(tuple(native(response) if native_history else response for response in responses))
+
+
+def incomplete_gateway(*, native_history: bool = True) -> IncompleteRequiredGateway:
+    responses = (FINAL, *gateway(native_history=native_history).responses)
+    return IncompleteRequiredGateway(responses)
 
 
 def context() -> Any:
@@ -119,7 +157,7 @@ async def test_required_verify_rejection_corrects_once_without_replaying_inspect
     assert len(model.requests) == 6
     assert not any(event.kind is EventKind.STEP_RETRYING for event in events)
     saved = await runtime.save_checkpoint()
-    assert saved.state["required_tool_correction_version"] == 1
+    assert saved.state["required_tool_correction_version"] == 2
     repair = saved.state["structured_repairs"]["implementer_step"]
     assert repair["version"] == 4 and repair["status"] == "succeeded"
     assert "PRIVATE_NATIVE_CONTINUATION" not in json.dumps(saved.to_payload())
@@ -131,6 +169,177 @@ async def test_required_verify_rejection_corrects_once_without_replaying_inspect
     replay = [event async for event in restored.run(context().model_copy(update={"checkpoint": saved}))]
     assert replay[-1].kind is EventKind.RUNTIME_COMPLETED
     assert not cached.requests and len(harness.calls) == 3
+
+
+@pytest.mark.parametrize("native_history", [False, True])
+async def test_known_initial_incomplete_then_required_rejection_has_one_linked_correction(
+    tmp_path: Path, native_history: bool,
+) -> None:
+    model = incomplete_gateway(native_history=native_history)
+    harness = ActualCapabilityHarness(tmp_path, Executor())
+    artifacts = InMemoryArtifactRepository()
+    provider = InMemoryProviderContinuationRepository() if native_history else None
+    runtime = subject(model, harness, artifacts, provider)
+    events = [event async for event in runtime.run(context())]
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert [call.tool_name for call in harness.calls] == ["project.inspect", "project.verify", "workspace.bundle"]
+    assert len(model.requests) == 7
+    assert sum(event.kind is EventKind.STEP_RETRYING for event in events) == 1
+    rejected, correction = model.requests[2:4]
+    assert rejected.required_tool == correction.required_tool == "project_verify"
+    assert rejected.tools == correction.tools and rejected.response_schema == correction.response_schema
+    assert rejected.messages == correction.messages[:-1]
+    assert all(not request.allow_fallback for request in model.requests[1:])
+    saved = await runtime.save_checkpoint()
+    models = sorted(saved.state["models"].values(), key=lambda row: (row["attempt"], row["call_index"]))
+    assert [(row["attempt"], row["call_index"], row["status"]) for row in models] == [
+        (0, 0, "rejected"), (1, 0, "succeeded"), (1, 1, "rejected"), (1, 2, "succeeded"),
+        (1, 3, "succeeded"), (1, 4, "succeeded"), (1, 5, "succeeded"),
+    ]
+    assert models[0]["required_tool_initial_incomplete"] == 1
+    assert models[1]["initial_incomplete_recovery"]["source_request_sha256"] == models[0]["request_sha256"]
+    assert saved.state["structured_repairs"]["implementer_step"]["version"] == 4
+    assert saved.state["usage"]["tokens"] == 4133
+    assert Decimal(saved.state["usage"]["cost_usd"]) == Decimal("0.08")
+    cached = WorkspaceDeliverySequenceGateway(())
+    restored = subject(cached, harness, artifacts, provider)
+    await restored.restore_checkpoint(saved)
+    replay = [event async for event in restored.run(context().model_copy(update={"checkpoint": saved}))]
+    assert replay[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert not cached.requests and len(harness.calls) == 3
+
+
+@pytest.mark.parametrize("change", ["usage", "unknown", "untrusted", "multiple", "fallback"])
+async def test_unproven_initial_incomplete_never_enters_the_combined_recovery(
+    tmp_path: Path, change: str,
+) -> None:
+    model = incomplete_gateway()
+    model.initial_change = change
+    harness = ActualCapabilityHarness(tmp_path, Executor())
+    runtime = subject(model, harness, InMemoryArtifactRepository(), InMemoryProviderContinuationRepository())
+    with pytest.raises(RuntimeExecutionError):
+        _ = [event async for event in runtime.run(context())]
+    assert len(model.requests) == 1 and not harness.calls
+    saved = await runtime.save_checkpoint()
+    assert not saved.state["structured_repairs"]
+    assert all("required_tool_initial_incomplete" not in row for row in saved.state["models"].values())
+
+
+async def completed_combination(tmp_path: Path) -> tuple[Any, ...]:
+    model = incomplete_gateway()
+    harness = ActualCapabilityHarness(tmp_path, Executor())
+    artifacts = InMemoryArtifactRepository()
+    provider = InMemoryProviderContinuationRepository()
+    runtime = subject(model, harness, artifacts, provider)
+    events = [event async for event in runtime.run(context())]
+    return runtime, artifacts, provider, events
+
+
+def combination_boundary(events: Any, phase: str) -> RuntimeCheckpoint:
+    for event in events:
+        checkpoint = event.checkpoint
+        if checkpoint is None or checkpoint.state["phase"] != "running":
+            continue
+        if phase == "source":
+            if (len(checkpoint.state["models"]) == 3 and not checkpoint.state["structured_repairs"]
+                    and any(row["attempt"] == 1 and row["call_index"] == 1 and row["status"] == "rejected"
+                            for row in checkpoint.state["models"].values())):
+                return checkpoint
+        else:
+            repair = checkpoint.state["structured_repairs"].get("implementer_step")
+            if repair and checkpoint.state["models"][repair["correction_key"]]["status"] == phase:
+                return checkpoint
+    raise AssertionError(f"missing combined {phase} boundary")
+
+
+@pytest.mark.parametrize("phase", ["source", "prepared", "running", "succeeded"])
+async def test_combined_recovery_cold_only_consumes_its_reserved_correction_slot(
+    tmp_path: Path, phase: str,
+) -> None:
+    original, artifacts, provider, events = await completed_combination(tmp_path)
+    checkpoint = combination_boundary(events, phase)
+    prefix_provider = InMemoryProviderContinuationRepository()
+    for row in checkpoint.state["models"].values():
+        reference = row.get("provider_continuation")
+        if reference:
+            await prefix_provider.put(await provider.get(
+                checkpoint.tenant_id, checkpoint.run_id, UUID(reference["id"]), reference["sha256"],
+            ))
+    responses = (native(verify_response()), native(FINAL), native(_workspace_delivery_bundle_response()), native(FINAL))
+
+    class PaidGateway(WorkspaceDeliverySequenceGateway):
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+            return replace(await super().complete_with_context(request), cost_usd=Decimal("0.01"))
+
+    model = PaidGateway(responses if phase == "prepared" else responses[1:])
+    harness = ActualCapabilityHarness(tmp_path, Executor())
+    runtime = subject(model, harness, artifacts, prefix_provider)
+    await runtime.restore_checkpoint(checkpoint)
+    task = context().model_copy(update={"checkpoint": checkpoint})
+    if phase in {"source", "running"}:
+        with pytest.raises(RuntimeExecutionError, match="structured output invalid|outcome requires confirmation"):
+            _ = [event async for event in runtime.run(task)]
+        assert not model.requests and not harness.calls
+    else:
+        replay = [event async for event in runtime.run(task)]
+        assert replay[-1].kind is EventKind.RUNTIME_COMPLETED
+        assert len(model.requests) == (4 if phase == "prepared" else 3)
+        assert [call.tool_name for call in harness.calls] == ["project.verify", "workspace.bundle"]
+        saved = await runtime.save_checkpoint()
+        expected = await original.save_checkpoint()
+        assert saved.state["usage"]["tokens"] == expected.state["usage"]["tokens"]
+        assert Decimal(saved.state["usage"]["cost_usd"]) == Decimal("0.08")
+
+
+@pytest.mark.parametrize("change", ["no_link", "link_hash", "no_marker", "usage", "unknown", "multi_attempt", "old_policy"])
+async def test_initial_recovery_link_cannot_be_missing_forged_or_borrowed(
+    tmp_path: Path, change: str,
+) -> None:
+    _, artifacts, provider, events = await completed_combination(tmp_path)
+    payload = combination_boundary(events, "prepared").to_payload()
+    state = payload["state"]
+    root_key, root = next((key, row) for key, row in state["models"].items() if row["attempt"] == 0)
+    first = next(row for row in state["models"].values() if row["attempt"] == 1 and row["call_index"] == 0)
+    if change == "no_link":
+        first.pop("initial_incomplete_recovery")
+    elif change == "link_hash":
+        first["initial_incomplete_recovery"]["source_receipt_sha256"] = "a" * 64
+    elif change == "no_marker":
+        root.pop("required_tool_initial_incomplete")
+    elif change == "usage":
+        state["rejected_outputs"][root_key].update(usage_status="missing", usage=None)
+    elif change == "unknown":
+        state["rejected_outputs"][root_key]["output_status"] = "unknown"
+    elif change == "multi_attempt":
+        first["attempt"] = 2
+    else:
+        state["required_tool_correction_version"] = 1
+    payload["state_sha256"] = ""
+    checkpoint = RuntimeCheckpoint.from_payload(payload)
+    model = WorkspaceDeliverySequenceGateway(())
+    harness = ActualCapabilityHarness(tmp_path, Executor())
+    runtime = subject(model, harness, artifacts, provider)
+    with pytest.raises(RuntimeExecutionError):
+        await runtime.restore_checkpoint(checkpoint)
+        _ = [event async for event in runtime.run(context().model_copy(update={"checkpoint": checkpoint}))]
+    assert not model.requests and not harness.calls
+
+
+async def test_prior_v1_attempt_zero_correction_is_not_upgraded_on_restore(tmp_path: Path) -> None:
+    _, _, _, artifacts, provider, events = await completed(tmp_path)
+    checkpoint = next(event.checkpoint for event in reversed(events) if event.checkpoint is not None)
+    payload = checkpoint.to_payload()
+    payload["state"]["required_tool_correction_version"] = 1
+    payload["state_sha256"] = ""
+    old = RuntimeCheckpoint.from_payload(payload)
+    model = WorkspaceDeliverySequenceGateway(())
+    harness = ActualCapabilityHarness(tmp_path, Executor())
+    runtime = subject(model, harness, artifacts, provider)
+    await runtime.restore_checkpoint(old)
+    replay = [event async for event in runtime.run(context().model_copy(update={"checkpoint": old}))]
+    assert replay[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert not model.requests and not harness.calls
+    assert (await runtime.save_checkpoint()).state["required_tool_correction_version"] == 1
 
 
 async def completed(tmp_path: Path) -> tuple[Any, ...]:
@@ -347,6 +556,7 @@ async def test_changed_link_or_prefix_is_rejected_before_any_call(tmp_path: Path
 @pytest.mark.parametrize(("bad_batch", "negotiate"), [
     ("wrong", False), ("malformed", False), ("wrong", True),
     ("duplicate_verify", False), ("duplicate_bundle", False),
+    ("initial_wrong", False),
 ])
 async def test_actual_named_tool_native_client_corrects_without_dispatching_the_invalid_batch(
     tmp_path: Path, bad_batch: str, negotiate: bool,
@@ -358,8 +568,9 @@ async def test_actual_named_tool_native_client_corrects_without_dispatching_the_
     index = 0
     negotiated = False
     duplicate = bad_batch.startswith("duplicate_")
+    initial = bad_batch == "initial_wrong"
     bundle = bad_batch == "duplicate_bundle"
-    source_index = 3 if bundle else 1
+    source_index = (3 if bundle else 1) + int(initial)
     required_name = "workspace_bundle" if bundle else "project_verify"
     inspect = ModelResponse(text=None, tool_calls=(ToolCall(
         id="inspect-once", name="project.inspect", arguments={},
@@ -367,6 +578,8 @@ async def test_actual_named_tool_native_client_corrects_without_dispatching_the_
     responses = ((inspect, verify_response(), FINAL, FINAL, _workspace_delivery_bundle_response(), FINAL)
                  if bundle else (inspect, FINAL, verify_response("corrected-verify"), FINAL,
                                  _workspace_delivery_bundle_response(), FINAL))
+    if initial:
+        responses = (FINAL, *responses)
 
     def handle(request: httpx.Request) -> httpx.Response:
         nonlocal index, negotiated
@@ -396,11 +609,16 @@ async def test_actual_named_tool_native_client_corrects_without_dispatching_the_
             first = message["tool_calls"][0]
             message["tool_calls"].append({**first, "id": "duplicate-never-execute"})
         index += 1
+        incomplete = initial and index == 1
+        if incomplete:
+            message["content"] = None
         return httpx.Response(200, json={
             "id": f"response-{index}", "object": "chat.completion", "created": 1, "model": "mock-model",
-            "choices": [{"index": 0, "finish_reason": "tool_calls" if message.get("tool_calls") else "stop",
+            "choices": [{"index": 0, "finish_reason": (
+                "length" if incomplete else "tool_calls" if message.get("tool_calls") else "stop"),
                          "message": message}],
-            "usage": {"prompt_tokens": 1, "completion_tokens": 16, "total_tokens": 17},
+            "usage": ({"prompt_tokens": 10, "completion_tokens": 4096, "total_tokens": 4106}
+                      if incomplete else {"prompt_tokens": 1, "completion_tokens": 16, "total_tokens": 17}),
         })
 
     def factory(*, api_key: str, base_url: str, max_retries: int) -> AsyncOpenAI:
@@ -425,7 +643,7 @@ async def test_actual_named_tool_native_client_corrects_without_dispatching_the_
         }), request_model="mock-model", api_base="https://offline.example/v1",
         input_per_million_usd=Decimal(1), output_per_million_usd=Decimal(2),
     )])
-    capacity = CapacityStub([lease("primary") for _ in range(6)])
+    capacity = CapacityStub([lease("primary") for _ in range(7 if initial else 6)])
     await capacity.initialize()
     model = RecordingGateway(registry, capacity, SecretStub([]),
                              LiteLLMClient(client_factory=cast(OpenAIClientFactory, factory)))
@@ -442,13 +660,13 @@ async def test_actual_named_tool_native_client_corrects_without_dispatching_the_
             events = [event async for event in runtime.run(context())]
             assert events[-1].kind is EventKind.RUNTIME_COMPLETED
             assert [call.tool_name for call in harness.calls] == ["project.inspect", "project.verify", "workspace.bundle"]
-        expected_calls = source_index + 2 if duplicate else 6
+        expected_calls = source_index + 2 if duplicate else 6 + int(initial)
         assert len(requests) == expected_calls and len(wire) == expected_calls + int(negotiate)
-        assert len(receipts) == 1
-        evidence = receipts[0].evidence
+        assert len(receipts) == 1 + int(initial)
+        evidence = receipts[int(initial)].evidence
         assert evidence is not None and evidence.reason == "invalid_tool"
         assert evidence.status == "completed" and evidence.usage_status == "known" and evidence.final_text is None
-        scope = get_gateway_scope_diagnostic(receipts[0])
+        scope = get_gateway_scope_diagnostic(receipts[int(initial)])
         assert scope is not None and scope.transport_entered_count == 1 and scope.failure_attempt_count == 0
         original, corrected = requests[source_index:source_index + 2]
         assert original.required_tool == corrected.required_tool == required_name
@@ -460,7 +678,11 @@ async def test_actual_named_tool_native_client_corrects_without_dispatching_the_
         assert "invalid-never-execute" not in json.dumps(correction_wire) and PRIVATE not in json.dumps(correction_wire)
         assert any(message.get("tool_call_id") == "inspect-once" for message in correction_wire["messages"])
         saved = await runtime.save_checkpoint()
-        assert saved.state["usage"]["tokens"] == expected_calls * 17
+        assert saved.state["usage"]["tokens"] == (4208 if initial else expected_calls * 17)
+        if initial:
+            root = next(row for row in saved.state["models"].values() if row["attempt"] == 0)
+            assert root["required_tool_initial_incomplete"] == 1
+            assert all(not request.allow_fallback for request in requests[1:])
         if duplicate:
             assert saved.state["structured_repairs"]["implementer_step"]["status"] == "rejected"
             assert len(saved.state["rejected_outputs"]) == 2
