@@ -213,6 +213,20 @@ def _bind_physical_admission(scope: _PhysicalAdmissionScope) -> Iterator[None]:
 
 
 @contextmanager
+def _resume_physical_admission(
+    scope: _PhysicalAdmissionScope, *, check: bool = True,
+) -> Iterator[None]:
+    """Restore an owner's existing scope; cleanup binding never authorizes I/O."""
+    if check:
+        scope.check()
+    token = _scope.set(scope)
+    try:
+        yield
+    finally:
+        _scope.reset(token)
+
+
+@contextmanager
 def _bind_physical_call(call: _PhysicalCall | None) -> Iterator[None]:
     token = _call.set(call)
     try:
@@ -296,10 +310,15 @@ class _PhysicalCall:
                         attempt.permit, attempt.receipt, deadline=self.scope.deadline,
                     )
                 attempt.delivered = True
-                if (attempt.receipt.usage_status != "known"
-                        or attempt.receipt.outcome in ("cancelled", "unknown")):
-                    # The adapter may later reconcile, but this process cannot
-                    # infer a refund or replay from missing/invalid usage.
+                if (attempt.receipt.usage_status == "invalid"
+                        or attempt.receipt.outcome == "cancelled"
+                        or (self.scope._purpose == "review" and (
+                            attempt.receipt.usage_status != "known"
+                            or attempt.receipt.outcome == "unknown"
+                        ))):
+                    # A delivered primary UNKNOWN keeps its original hold;
+                    # a new attempt must reserve a distinct permit from remaining
+                    # capacity. Review UNKNOWN and invalid/cancelled still stop.
                     self.scope.stop()
             except asyncio.CancelledError:
                 self.scope.stop()
@@ -333,7 +352,10 @@ class _GuardedTransport(httpx.AsyncBaseTransport):
             call.scope.stop()
             raise
         except Exception:
-            call.scope.stop()  # issued + unknown is never permission to resend
+            if call.scope._purpose == "review":
+                call.scope.stop()
+            # Primary accounting must first deliver this issued UNKNOWN; later
+            # authorized calls get a new permit, never a replay/refund of this one.
             raise
 
     async def aclose(self) -> None:

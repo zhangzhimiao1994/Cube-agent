@@ -19,7 +19,7 @@ from tests.contracts.test_required_tool_transport import (
     request,
     transport,
 )
-from tests.unit.models.test_physical_admission import Admission, admission_scope
+from tests.unit.models.test_physical_admission import Admission, RemainingAdmission, admission_scope
 
 
 @pytest.mark.parametrize("kind", ["legacy", "root", "tool_choice"])
@@ -243,9 +243,9 @@ async def test_two_competing_real_sdk_calls_share_one_scope(streaming: bool) -> 
 
 
 @pytest.mark.parametrize("protocol", ["chat_completions", "responses", "messages"])
-async def test_missing_or_invalid_usage_cannot_become_zero_or_retry(protocol: str) -> None:
-    admission = Admission()
-    scope = admission_scope(admission, purpose="primary", max_attempts=2)
+async def test_primary_missing_usage_holds_and_new_permits_use_remaining(protocol: str) -> None:
+    admission = RemainingAdmission()
+    scope = admission_scope(admission, purpose="primary", max_attempts=3)
     wire: list[httpx.Request] = []
 
     def handle(req: httpx.Request) -> httpx.Response:
@@ -262,15 +262,19 @@ async def test_missing_or_invalid_usage_cannot_become_zero_or_retry(protocol: st
     client = LiteLLMClient(_network_delegate_factory=lambda: httpx.MockTransport(handle))
     req = request(protocol, tools=(), required_tool=None)
     with _bind_physical_admission(scope):
-        try:
-            await client.complete(selected, req, "mock-key")
-        except ModelResponseError:
-            pass
+        for _ in range(2):
+            try:
+                await client.complete(selected, req, "mock-key")
+            except ModelResponseError:
+                pass
         with pytest.raises(_PhysicalAdmissionStopped):
             await client.complete(selected, req, "mock-key")
-    assert len(wire) == 1
-    assert admission.receipts[0][1].usage is None
-    assert admission.receipts[0][1].usage_status == "missing"
+    assert len(wire) == 2
+    assert admission.remaining == 0 and admission.reserve_calls == 3
+    assert [p.attempt_id.int for p, _ in admission.receipts] == [1, 2]
+    assert [a.permit.attempt_id.int for a in scope.attempts] == [1, 2]
+    assert list(admission.holds.values()) == [100, 100]
+    assert all(r.usage is None and r.usage_status == "missing" for _, r in admission.receipts)
 
 
 @pytest.mark.parametrize("protocol", ["chat_completions", "messages"])
@@ -323,25 +327,37 @@ async def test_receipt_delivery_failure_still_closes_controlled_client(streaming
 
 
 async def test_issued_network_unknown_keeps_identity_and_primary_error() -> None:
-    admission = Admission()
-    scope = admission_scope(admission, purpose="primary", max_attempts=2)
+    admission = RemainingAdmission()
+    scope = admission_scope(admission, purpose="primary", max_attempts=3)
     wire: list[httpx.Request] = []
 
     def handle(req: httpx.Request) -> httpx.Response:
         wire.append(req)
-        raise httpx.ReadError("private transport failure")
+        if len(wire) == 1:
+            raise httpx.ReadError("private transport failure")
+        return httpx.Response(200, json=provider_response("chat_completions"))
 
     client = LiteLLMClient(_network_delegate_factory=lambda: httpx.MockTransport(handle))
     with _bind_physical_admission(scope):
         with pytest.raises(ModelTransportError):
             await client.complete(deployment("chat_completions"), request("chat_completions"), "mock-key")
+        issued = scope.attempts[0]
+        unknown_receipt = issued.receipt
+        result = await client.complete(replace(deployment("chat_completions"), id="fallback"),
+                                       request("chat_completions"), "mock-key")
+        assert result.usage == TokenUsage(2, 3, 5)
+        assert scope.attempts[0] is issued and issued.receipt is unknown_receipt
+        assert issued.delivered
+        assert scope.attempts[1].permit.attempt_id != issued.permit.attempt_id
         with pytest.raises(_PhysicalAdmissionStopped):
             await client.complete(deployment("chat_completions"), request("chat_completions"), "mock-key")
-    assert len(wire) == 1
-    assert admission.receipts[0][0] == scope.attempts[0].permit
-    assert admission.receipts[0][1].outcome == "error"
-    assert admission.receipts[0][1].http_status is None
-    assert admission.receipts[0][1].delegated
+    assert len(wire) == 2
+    assert [p.attempt_id.int for p, _ in admission.receipts] == [1, 2]
+    assert admission.remaining == 0 and admission.reserve_calls == 3
+    assert list(admission.holds.values()) == [100, 100]
+    assert admission.metadata[1].deployment_id == "fallback"
+    assert unknown_receipt.outcome == "error" and unknown_receipt.usage is None
+    assert unknown_receipt.http_status is None and unknown_receipt.delegated
 
 
 @pytest.mark.parametrize("streaming", [False, True])
