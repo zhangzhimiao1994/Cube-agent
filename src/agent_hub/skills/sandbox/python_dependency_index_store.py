@@ -376,7 +376,7 @@ def publish_dependency_metadata_index(
                     raw, wheel_pin = _read_file(cache, entry.filename, entry.size_bytes, wheel_stack,
                         deadline, expected_size=entry.size_bytes, private=False)
                     _check(deadline)
-                    records.append(extract_python_wheel_metadata(entry, raw))
+                    records.append(extract_python_wheel_metadata(entry, raw, deadline=deadline))
                     _check(deadline)
                     wheel_pin.check()
                     files.append((cache, entry.filename, wheel_pin.identity))

@@ -34,6 +34,7 @@ from agent_hub.skills.sandbox.python_metadata_preparation_worker import error_co
 from agent_hub.skills.sandbox.python_project_backend import read_root_configuration
 from agent_hub.skills.sandbox.python_project_broker import PythonRootExecution, _admit_unit
 from agent_hub.skills.sandbox.python_project_profile import PythonProjectProfileScope
+from agent_hub.skills.sandbox.python_resolution_protocol import ResolutionRequest, ResolutionStatus
 from agent_hub.subprocess_cleanup import ProcessCleanupIncomplete
 
 if TYPE_CHECKING:
@@ -44,6 +45,10 @@ if TYPE_CHECKING:
 
 class _MetadataPreparationExecution(_Execution):
     """Identify live v10 work without attributing another protocol's unit to it."""
+
+
+class _ResolutionPreparationExecution(_Execution):
+    """v11 uses the same constrained Root/write and non-Root fetch lifetime."""
 
 
 def build_metadata_preparation_root_command(
@@ -59,7 +64,7 @@ def build_metadata_preparation_root_command(
         if item == module else item for item in command)
 
 
-def _write_request(stage: Path, request: PythonMetadataPreparationRequest) -> None:
+def _write_request(stage: Path, request: PythonMetadataPreparationRequest | ResolutionRequest) -> None:
     if sys.platform != "linux":
         raise ValueError("metadata_prepare_unavailable")
     raw = request.model_dump_json().encode("utf-8")
@@ -94,10 +99,14 @@ def _inspection_state(broker: ProjectExecutionBroker, request: PythonMetadataPre
     return response
 
 
-async def handle_metadata_preparation(
-    broker: ProjectExecutionBroker, request: PythonMetadataPreparationRequest, *, peer_uid: int,
-) -> PythonMetadataPreparationResponse:
-    def failure(code: MetadataPreparationError) -> PythonMetadataPreparationResponse:
+async def _handle_preparation(
+    broker: ProjectExecutionBroker, request: PythonMetadataPreparationRequest | ResolutionRequest, *, peer_uid: int,
+) -> PythonMetadataPreparationResponse | ResolutionStatus:
+    resolution = type(request) is ResolutionRequest
+
+    def failure(code: MetadataPreparationError) -> PythonMetadataPreparationResponse | ResolutionStatus:
+        if isinstance(request, ResolutionRequest):
+            return ResolutionStatus(state="unknown", key=request.key)
         return PythonMetadataPreparationResponse(action=request.action,
             scope=PythonProjectProfileScope.for_invocation(request.invocation), ok=False, error=code)
 
@@ -106,10 +115,11 @@ async def handle_metadata_preparation(
     if not _systemd_supported():
         return failure("metadata_prepare_unavailable")
     try:
-        if type(request) is not PythonMetadataPreparationRequest:
+        if type(request) not in {PythonMetadataPreparationRequest, ResolutionRequest}:
             return failure("metadata_prepare_request_invalid")
         try:
-            request = PythonMetadataPreparationRequest.model_validate(request, strict=True)
+            request = (ResolutionRequest.model_validate(request, strict=True) if resolution
+                else PythonMetadataPreparationRequest.model_validate(request, strict=True))
         except (ValueError, TypeError, AttributeError, RecursionError):
             return failure("metadata_prepare_request_invalid")
         invocation = ProjectInvocation.model_validate(vars(request.invocation), strict=True)
@@ -118,7 +128,8 @@ async def handle_metadata_preparation(
             return failure("metadata_prepare_consumed")
         configuration, supply = read_root_configuration(), read_supply_configuration()
         validate_configuration(broker.policy, configuration, supply)
-        job = _MetadataPreparationExecution(invocation, asyncio.current_task())
+        execution_type = _ResolutionPreparationExecution if resolution else _MetadataPreparationExecution
+        job = execution_type(invocation, asyncio.current_task())
         helper = PythonRootExecution(invocation, job.task)
         broker.executions[key] = job
         stopping: asyncio.Task[None] | None = None
@@ -170,6 +181,8 @@ async def handle_metadata_preparation(
 
         try:
             deadline = asyncio.get_running_loop().time() + invocation.timeout_seconds
+            if isinstance(request, ResolutionRequest):
+                deadline = min(deadline, request.claim.deadline)
             async with asyncio.timeout_at(deadline):
                 await broker.slots.acquire()
                 job.slot_acquired = True
@@ -182,6 +195,11 @@ async def handle_metadata_preparation(
                 _write_request(job.stage, request)
                 command = build_metadata_preparation_root_command(invocation, broker.policy,
                     configuration=configuration, supply=supply, stage=job.stage)
+                if resolution:
+                    module = "agent_hub.skills.sandbox.python_metadata_preparation_worker"
+                    if command.count(module) != 1:
+                        raise ValueError("resolution_request_invalid")
+                    command = tuple("agent_hub.skills.sandbox.python_resolution_worker" if item == module else item for item in command)
                 remaining = deadline - asyncio.get_running_loop().time()
                 if remaining <= 0:
                     raise TimeoutError
@@ -196,6 +214,11 @@ async def handle_metadata_preparation(
                 if result.exit_code != 0 or result.timed_out:
                     return failure("metadata_prepare_unavailable")
                 payload = json.loads(result.stdout, object_pairs_hook=_object)
+                if isinstance(request, ResolutionRequest):
+                    resolution_response = ResolutionStatus.model_validate_json(_encoded(payload), strict=True)
+                    if resolution_response.key != request.key:
+                        raise ValueError("resolution_response_invalid")
+                    return resolution_response
                 response = PythonMetadataPreparationResponse.model_validate_json(_encoded(payload), strict=True)
                 response.require_for(request)
                 return _inspection_state(broker, request, response)
@@ -205,3 +228,21 @@ async def handle_metadata_preparation(
         return failure("metadata_prepare_cleanup_incomplete")
     except (ValueError, RuntimeError, OSError, TimeoutError, TypeError, AttributeError) as error:
         return failure(error_code(error))
+
+
+async def handle_metadata_preparation(
+    broker: ProjectExecutionBroker, request: PythonMetadataPreparationRequest, *, peer_uid: int,
+) -> PythonMetadataPreparationResponse:
+    result = await _handle_preparation(broker, request, peer_uid=peer_uid)
+    if type(result) is not PythonMetadataPreparationResponse:
+        raise ValueError("metadata_prepare_response_invalid")
+    return result
+
+
+async def handle_resolution_preparation(
+    broker: ProjectExecutionBroker, request: ResolutionRequest, *, peer_uid: int,
+) -> ResolutionStatus:
+    result = await _handle_preparation(broker, request, peer_uid=peer_uid)
+    if type(result) is not ResolutionStatus:
+        raise ValueError("resolution_response_invalid")
+    return result

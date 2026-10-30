@@ -24,6 +24,7 @@ from agent_hub.skills.sandbox.python_registry_protocol import (
     target_environment,
 )
 from agent_hub.skills.sandbox.python_registry_read import RegistryReader
+from agent_hub.subprocess_cleanup import ProcessCleanupIncomplete
 
 
 async def resolve_dependencies(
@@ -114,6 +115,9 @@ async def resolve_dependencies(
                 tuple(selected[name] for name in sorted(selected)),
                 tuple(sorted(edges)),
             )
+    except ProcessCleanupIncomplete:
+        # Cleanup uncertainty must survive even when the original deadline expired.
+        raise
     except ResolutionError:
         raise
     except (OSError, ValueError, TypeError, KeyError, RuntimeError, RecursionError):

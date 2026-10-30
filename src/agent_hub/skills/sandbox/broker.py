@@ -598,16 +598,37 @@ async def _serve_client(
     is_metadata_preparation = False
     is_supply = False
     is_profile = False
+    is_resolution = False
     is_toolchain = False
     toolchain_request: ToolchainRequest | None = None
     supply_request: PythonInputSupplyRequest | None = None
     python_request: PythonProjectBrokerRequest | PythonProjectProbeRequest | PythonProjectInspectEnvironmentRequest | PythonProjectReleaseEnvironmentRequest | PythonProjectReleaseExpiredEnvironmentRequest | PythonFailedMaintenanceRequest | None = None
-    response: BrokerResponse | PythonProjectBrokerResponse | PythonInputSupplyResponse | PythonProjectProfileResponse | ToolchainResponse | PythonDependencyClosureResponse | PythonMetadataPlanningResponse | PythonMetadataPreparationResponse
+    response: BrokerResponse | PythonProjectBrokerResponse | PythonInputSupplyResponse | PythonProjectProfileResponse | ToolchainResponse | PythonDependencyClosureResponse | PythonMetadataPlanningResponse | PythonMetadataPreparationResponse | ResolutionStatus
     try:
         peer_uid = _peer_uid(writer)
         payload = await _read_frame(reader, _MAX_REQUEST_BYTES)
         envelope = json.loads(payload)
         if isinstance(envelope, dict) and (
+            type(envelope.get('version')) is int and envelope['version'] == 11
+            or isinstance(envelope.get('action'), str) and envelope['action'] in {
+                'resolve_python_inputs', 'freeze_python_resolution',
+                'publish_python_resolution', 'inspect_python_resolution',
+            }
+        ):
+            is_resolution = True
+            if peer_uid != broker._policy.allowed_uid:
+                raise BrokerRequestError('caller uid is not authorized')
+            from agent_hub.skills.sandbox.python_resolution_protocol import (
+                ResolutionRequest,
+                ResolutionStatus,
+                decode,
+            )
+            from agent_hub.skills.sandbox.python_resolution_worker import handle_resolution
+
+            decode(payload)
+            resolution_request = ResolutionRequest.model_validate_json(payload, strict=True)
+            response = await handle_resolution(broker._project_broker, resolution_request, peer_uid=peer_uid)
+        elif isinstance(envelope, dict) and (
             type(envelope.get('version')) is int and envelope['version'] == 10
             or isinstance(envelope.get('action'), str) and envelope['action'] in {
                 'prepare_python_dependency_metadata', 'inspect_python_dependency_metadata_preparation',
@@ -807,7 +828,8 @@ async def _serve_client(
                 error="input_supply_unavailable")
         else:
             response = BrokerResponse(ok=False,
-                error='metadata_prepare_request_invalid' if is_metadata_preparation else
+                error='resolution_request_invalid' if is_resolution else
+                    'metadata_prepare_request_invalid' if is_metadata_preparation else
                     'metadata_plan_request_invalid' if is_metadata_plan else
                     'python_dependency_request_invalid' if is_dependency else
                     'toolchain_request_invalid' if is_toolchain else

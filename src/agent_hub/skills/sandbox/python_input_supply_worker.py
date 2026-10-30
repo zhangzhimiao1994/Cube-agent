@@ -16,12 +16,13 @@ from contextlib import ExitStack
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from agent_hub.skills.sandbox.base import run_subprocess_with_limits
+from agent_hub.skills.sandbox.base import SkillResult, run_subprocess_with_limits
 from agent_hub.skills.sandbox.project import (
     ProjectExecutionBroker,
     ProjectInvocation,
     _Execution,
     _Limits,
+    _uninterrupted,
 )
 from agent_hub.skills.sandbox.project_contract_broker import (
     _encoded,
@@ -131,6 +132,71 @@ async def _fetch_inputs(
         policy, configuration, supply, deadline)
 
 
+async def _run_fetch_unit(
+    invocation: ProjectInvocation, policy: BrokerPolicy, configuration: RootConfig,
+    supply: RootSupplyConfig, deadline: float, *, payload_raw: bytes, maximum: int,
+    registry: bool = False,
+) -> SkillResult:
+    """Shared fixed fetch-unit lifetime; callers validate their own bounded data schema."""
+    from agent_hub.skills.sandbox.python_input_supply_catalog import InputSupplyError
+
+    if type(invocation) is not ProjectInvocation or invocation.install_allowed is not False:
+        raise InputSupplyError("input_supply_request_invalid")
+    invocation = ProjectInvocation.model_validate(vars(invocation), strict=True)
+    if (type(registry) is not bool or type(payload_raw) is not bytes
+        or not 0 < len(payload_raw) <= 512 * 1024 or type(maximum) is not int
+        or not 0 < maximum <= 96 * 1024**2):
+        raise InputSupplyError("input_supply_request_invalid")
+    remaining = min(deadline - time.monotonic(), supply.fetch_timeout_seconds)
+    if remaining <= 0:
+        raise InputSupplyError("input_supply_timeout")
+    job = _Execution(invocation, None)
+    command = build_fetch_command(invocation, policy, configuration=configuration, supply=supply)
+
+    if registry:
+        module = "agent_hub.skills.sandbox.python_input_fetch"
+        if command.count(module) != 1 or command[-1] != "--worker-batch":
+            raise InputSupplyError("input_supply_request_invalid")
+        command = tuple("agent_hub.skills.sandbox.python_registry_fetch" if item == module
+            else "--metadata-worker" if item == "--worker-batch" else item for item in command)
+
+    async def stop() -> None:
+        try:
+            async with asyncio.timeout(3):
+                await run_subprocess_with_limits((policy.systemctl, "kill", "--kill-who=all",
+                    "--signal=SIGKILL", job.unit), _Limits(1, 8192), stdin_payload=b"")
+                until = asyncio.get_running_loop().time() + 1.5
+                while asyncio.get_running_loop().time() < until:
+                    quiet = await run_subprocess_with_limits((policy.systemctl, "show", job.unit,
+                        "--no-pager", "--property=LoadState,ActiveState,SubState,MainPID,ControlPID,ControlGroup,TasksCurrent"),
+                        _Limits(0.5, 8192), stdin_payload=b"")
+                    if ProjectExecutionBroker._unit_quiet(job, quiet):
+                        return
+                    await asyncio.sleep(0.1)
+        except TimeoutError:
+            raise ProcessCleanupIncomplete("input_supply_cleanup_incomplete") from None
+        else:
+            raise ProcessCleanupIncomplete("input_supply_cleanup_incomplete")
+
+    initial = await run_subprocess_with_limits((policy.systemctl, "show", job.unit,
+        "--no-pager", "--property=LoadState,ActiveState,SubState,MainPID,ControlPID,ControlGroup,TasksCurrent"),
+        _Limits(min(3, remaining), 8192), stdin_payload=b"")
+    if not ProjectExecutionBroker._unit_quiet(job, initial):
+        raise ProcessCleanupIncomplete("input_supply_cleanup_incomplete")
+    try:
+        remaining = min(deadline - time.monotonic(), supply.fetch_timeout_seconds)
+        if remaining <= 0:
+            raise InputSupplyError("input_supply_timeout")
+        result = await run_subprocess_with_limits(command,
+            _Limits(remaining + 2, maximum), stdin_payload=payload_raw,
+            on_forced_terminate=stop)
+    finally:
+        await _uninterrupted(stop())
+    if result.exit_code != 0 or result.timed_out:
+        raise InputSupplyError("input_supply_unavailable")
+    return result
+
+
 async def fetch_catalog_wheels(
     entries: tuple[WheelDownload, ...], invocation: ProjectInvocation, policy: BrokerPolicy,
     configuration: RootConfig, supply: RootSupplyConfig, deadline: float,
@@ -154,41 +220,9 @@ async def fetch_catalog_wheels(
     total = sum(entry.size_bytes for entry in entries)
     if total > supply.max_total_bytes or len(payload_raw) > 512 * 1024:
         raise InputSupplyError("input_supply_quota")
-    job = _Execution(baseinvocation, None)
-    command = build_fetch_command(baseinvocation, policy, configuration=configuration, supply=supply)
-
-    async def stop() -> None:
-        try:
-            async with asyncio.timeout(3):
-                await run_subprocess_with_limits((policy.systemctl, "kill", "--kill-who=all",
-                    "--signal=SIGKILL", job.unit), _Limits(1, 8192), stdin_payload=b"")
-                until = asyncio.get_running_loop().time() + 1.5
-                while asyncio.get_running_loop().time() < until:
-                    quiet = await run_subprocess_with_limits((policy.systemctl, "show", job.unit,
-                        "--no-pager", "--property=LoadState,ActiveState,SubState,MainPID,ControlPID,ControlGroup,TasksCurrent"),
-                        _Limits(0.5, 8192), stdin_payload=b"")
-                    if ProjectExecutionBroker._unit_quiet(job, quiet):
-                        return
-                    await asyncio.sleep(0.1)
-        except TimeoutError:
-            raise ProcessCleanupIncomplete("input_supply_cleanup_incomplete") from None
-        else:
-            raise ProcessCleanupIncomplete("input_supply_cleanup_incomplete")
-
-    initial = await run_subprocess_with_limits((policy.systemctl, "show", job.unit,
-        "--no-pager", "--property=LoadState,ActiveState,SubState,MainPID,ControlPID,ControlGroup,TasksCurrent"),
-        _Limits(3, 8192), stdin_payload=b"")
-    if not ProjectExecutionBroker._unit_quiet(job, initial):
-        raise ProcessCleanupIncomplete("input_supply_cleanup_incomplete")
-    try:
-        maximum = sum(4 * math.ceil(entry.size_bytes / 3) + 6 * len(entry.filename) + 256 for entry in entries) + 8192
-        result = await run_subprocess_with_limits(command,
-            _Limits(remaining + 2, maximum), stdin_payload=payload_raw,
-            on_forced_terminate=stop)
-    finally:
-        await stop()
-    if result.exit_code != 0 or result.timed_out:
-        raise InputSupplyError("input_supply_unavailable")
+    maximum = sum(4 * math.ceil(entry.size_bytes / 3) + 6 * len(entry.filename) + 256 for entry in entries) + 8192
+    result = await _run_fetch_unit(baseinvocation,policy,configuration,supply,deadline,
+        payload_raw=payload_raw,maximum=maximum)
     try:
         payload = json.loads(result.stdout, object_pairs_hook=_object)
         if (type(payload) is not dict or set(payload) != {"schema_version", "artifacts"}

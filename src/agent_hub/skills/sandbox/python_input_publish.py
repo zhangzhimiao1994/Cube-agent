@@ -115,7 +115,7 @@ def _validate(entry: WheelDownload, data: bytes, deadline: float) -> None:
               "python_input_publish_invalid_wheel")
         from agent_hub.skills.sandbox.python_input_fetch import validate_wheel_bytes
 
-        validate_wheel_bytes(entry, data)
+        validate_wheel_bytes(entry, data, deadline=deadline)
     except Exception:  # noqa: BLE001 - static validator details must not expose wheel contents.
         raise PythonInputPublishError("python_input_publish_invalid_wheel") from None
     _deadline(deadline)

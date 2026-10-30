@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from agent_hub.skills.sandbox import python_dependency_index_store as store
+from agent_hub.skills.sandbox.project import ProjectInvocation
 from agent_hub.skills.sandbox.project_contract_broker import (
     _encoded,
     _object,
@@ -121,8 +122,8 @@ def _check(deadline: float) -> None:
         and time.monotonic() < deadline, "metadata_prepare_timeout")
 
 
-def _stage_identity(stage: Path, root: RootConfig, request: PythonMetadataPreparationRequest) -> None:
-    prefix = request.invocation.execution_id + "-"
+def _stage_identity(stage: Path, root: RootConfig, invocation: ProjectInvocation) -> None:
+    prefix = invocation.execution_id + "-"
     _need(stage.parent == root.stage_root and stage.name.startswith(prefix)
         and re.fullmatch(r"[a-z0-9_]{8}", stage.name[len(prefix):]) is not None,
         "metadata_prepare_request_invalid")
@@ -288,7 +289,7 @@ async def execute(
     request = PythonMetadataPreparationRequest.model_validate(request, strict=True)
     _check(deadline)
     configuration, supply = replace(configuration), replace(supply)
-    _stage_identity(stage, configuration, request)
+    _stage_identity(stage, configuration, request.invocation)
     validate_configuration(policy, configuration, supply)
     with _roots(policy, configuration, stage, False) as roots:
         if request.action == "inspect_python_dependency_metadata_preparation":
@@ -374,7 +375,7 @@ def main() -> int:
             _need(0 < len(raw) <= _MAX_REQUEST, "metadata_prepare_request_invalid")
             request = PythonMetadataPreparationRequest.model_validate_json(
                 _encoded(json.loads(raw, object_pairs_hook=_object)), strict=True)
-            _stage_identity(args.stage, root, request)
+            _stage_identity(args.stage, root, request.invocation)
             _pins(pins, time.monotonic() + request.invocation.timeout_seconds)
         deadline = time.monotonic() + request.invocation.timeout_seconds
         response = asyncio.run(execute(request, load_broker_policy(), root, supply,
