@@ -1,5 +1,6 @@
 """Fresh original worker/pool selection with real policy/backend and fixed wire."""
 
+import asyncio
 import json
 from contextlib import ExitStack
 from dataclasses import replace
@@ -268,3 +269,103 @@ async def test_selected_plain_runtime_cannot_run_after_worker_scope_exit(tmp_pat
         async with closing_runtime_events(selected.run(s.task)) as stream:
             _ = [event async for event in stream]
     assert not s.wire and not s.calls and s.fixed.calls == 0
+
+
+async def test_plain_note_cost_checkpoint_restores_through_fresh_factory(tmp_path):
+    s = note_case(tmp_path)
+    with (
+        bind_execution_authority(s.task, worker_id=s.budget.lease.worker_id),
+        _bind_run_budget(s.budget),
+    ):
+        async with closing_runtime_events(s.runtime.run(s.task)) as stream:
+            events = [event async for event in stream]
+        assert any(event.kind is EventKind.COST_RECORDED for event in events)
+        checkpoint_event = next(
+            event for event in events if event.kind is EventKind.CHECKPOINT_SAVED
+        )
+        checkpoint = checkpoint_event.checkpoint
+        assert checkpoint.state["next_sequence"] == checkpoint_event.sequence + 1
+        assert events[-1].sequence == checkpoint.state["next_sequence"]
+        assert [event.sequence for event in events] == list(range(1, len(events) + 1))
+        current = s.task.model_copy(
+            update={
+                "checkpoint": checkpoint,
+                "artifacts": tuple(
+                    event.artifact for event in events if event.artifact is not None
+                ),
+            }
+        )
+        # Simulate delivery after checkpoint persistence in a new actual factory/target.
+        restored = ConfigBackedDirectRuntime(
+            config_service=s.runtime._config_service,
+            secret_service=s.runtime._secret_service,
+            capacity_factory=s.runtime._capacity_factory,
+            transport=s.runtime._transport,
+            artifact_repository=s.runtime._artifact_repository,
+            capability_gateway=s.backend,
+            harness_tool_gateway=s.harness,
+            action_capability_gateway=s.backend,
+            action_harness_tool_gateway=s.harness,
+        )
+        assert type(await restored._runtime_for(current)) is DirectRuntime
+        await restored.restore_checkpoint(checkpoint)
+        async with closing_runtime_events(restored.run(current)) as stream:
+            resumed = [event async for event in stream]
+    assert [(event.kind, event.sequence) for event in resumed] == [
+        (EventKind.RUNTIME_COMPLETED, checkpoint.state["next_sequence"])
+    ]
+    root = ProjectWorkspaceStore(tmp_path).session_root(s.task.tenant_id, "demo", "session")
+    assert (root / s.path).read_bytes() == s.content.encode()
+    assert len(s.wire) == s.fixed.calls == len(s.calls) == 1
+    assert [row.consumed for row in s.db.rows if type(row) is RunReviewIntentRow] == [True]
+
+
+async def test_cancel_during_plain_note_budget_check_sends_no_primary(tmp_path):
+    s = note_case(tmp_path)
+    with (
+        bind_execution_authority(s.task, worker_id=s.budget.lease.worker_id),
+        _bind_run_budget(s.budget),
+    ):
+        selected = await s.runtime._runtime_for(s.task)
+        entered, release = asyncio.Event(), asyncio.Event()
+        actual = s.budget.require_current
+
+        async def pause_after_current():
+            await actual()
+            entered.set()
+            await release.wait()
+
+        s.budget.require_current = pause_after_current
+        events = []
+
+        async def drain():
+            async with closing_runtime_events(selected.run(s.task)) as stream:
+                async for event in stream:
+                    events.append(event)
+
+        runner = asyncio.create_task(drain())
+        canceller = None
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=10)
+            assert [event.kind for event in events] == [EventKind.MODEL_STARTED]
+            assert not s.wire and not s.calls
+            canceller = asyncio.create_task(selected.cancel())
+            # cancel() sets the flag before waiting for the paused producer to drain.
+            await asyncio.sleep(0)
+            assert selected._cancel_requested
+            release.set()
+            outcomes = await asyncio.wait_for(
+                asyncio.gather(runner, canceller, return_exceptions=True), timeout=10
+            )
+        finally:
+            release.set()
+            if not runner.done():
+                runner.cancel()
+            await asyncio.gather(
+                *(task for task in (runner, canceller) if task is not None), return_exceptions=True
+            )
+    assert isinstance(outcomes[0], asyncio.CancelledError) and outcomes[1] is None
+    assert not s.wire and not s.calls and s.fixed.calls == 0
+    assert not any(type(row) is RunReviewIntentRow for row in s.db.rows)
+    root = ProjectWorkspaceStore(tmp_path).session_root(s.task.tenant_id, "demo", "session")
+    assert not (root / s.path).exists()

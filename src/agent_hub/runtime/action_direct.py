@@ -22,7 +22,6 @@ from uuid import UUID, uuid4
 from agent_hub.auth.models import Role
 from agent_hub.capabilities.action_preparation import CONTRACT_ROUTE_KEYS as _CONTRACT_ROUTE_KEYS
 from agent_hub.capabilities.generated_project_service import validate_generated_preparation
-from agent_hub.harness.events import gateway_completion_events
 from agent_hub.harness.types import HarnessToolCallRequest, HarnessToolCallResult
 from agent_hub.models.types import ModelMessage
 from agent_hub.runtime.action_approval_capture import capture_action_approval
@@ -496,6 +495,8 @@ class ActionApprovedDirectRuntime(DirectRuntime):
         yield RunEvent(kind=EventKind.MODEL_STARTED, sequence=1, run_id=context.run_id,
                        actor='main_agent', payload={'logical_model': self._logical_model})
         await budget.require_current()
+        if self._cancel_requested:
+            raise asyncio.CancelledError
         if current_budget() is not budget:
             raise RuntimeExecutionError('plain file original worker budget changed')
         task = asyncio.create_task(self._complete_with_scope(request))
@@ -533,9 +534,7 @@ class ActionApprovedDirectRuntime(DirectRuntime):
         if usage.usage is None or usage.completion_exceeded_request:
             raise RuntimeExecutionError(usage.error_code or 'plain file response budget is invalid')
         sequence = 2
-        for event in gateway_completion_events(completion, run_id=context.run_id, start_sequence=sequence):
-            yield event
-            sequence += 1
+        # Use the base Direct lifecycle; generated model events have a separate checkpoint layout.
         if completion.cost_usd is not None:
             yield RunEvent(kind=EventKind.COST_RECORDED, sequence=sequence, run_id=context.run_id,
                 actor='main_agent', provider_id=completion.provider_id, cost_usd=completion.cost_usd, currency='USD',
