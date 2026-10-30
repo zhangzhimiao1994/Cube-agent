@@ -4,13 +4,16 @@ import asyncio
 import json
 import time
 from dataclasses import dataclass, replace
+from datetime import timedelta
 from decimal import Decimal
+from uuid import uuid4
 
 import httpx
 import pytest
 import pytest_asyncio
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 
+from agent_hub.auth.models import AuthenticatedPrincipal
 from agent_hub.capabilities.model_review import ModelApprovalReviewService, _LiveReviewContext
 from agent_hub.capabilities.review_contracts import ApprovalReviewConfig
 from agent_hub.capabilities.review_repository import (
@@ -30,6 +33,7 @@ from agent_hub.models.admission_bounds import TrustedContextBound
 from agent_hub.models.physical_budget import _bind_run_budget, _RunBudgetContext
 from agent_hub.models.run_admission_repository import RunAdmissionRepository
 from agent_hub.models.types import Deployment, ModelCapability
+from agent_hub.runs.authorization import _capture_authenticated_input, _persist_authenticated_input
 from tests.integration.capabilities.test_review_repository import (
     database_url as database_url,  # noqa: PLC0414 - imported pytest fixture
 )
@@ -323,3 +327,121 @@ async def test_concurrent_primary_hold_blocks_review_before_extra_network(compos
             await primary
     pool = await RunAdmissionRepository(c.factory).get_pool(c.context.tenant_id, c.context.run_id)
     assert pool.token_charged == 5 and pool.review_count_charged == 0
+
+
+@pytest.mark.parametrize(
+    "invalid", ["lease_expired", "lease_replaced", "run_cancelled", "turn_replaced"]
+)
+async def test_post_issue_stale_fence_refuses_new_allow_after_known_accounting(
+    composition, invalid
+):
+    """Commit real state changes while actual guarded HTTP is already issued."""
+    c = composition
+    action, wires = snapshot(c.context), []
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def handle(req):
+        wires.append(req)
+        entered.set()
+        await release.wait()
+        return httpx.Response(200, json=response(verdict(action)))
+
+    gw, _ = gateway([c.primary, c.reviewer], handle)
+    live = _LiveReviewContext(c.context, materials_trusted=True, contains_secrets=False)
+    with _bind_run_budget(c.context):
+        task = asyncio.create_task(
+            ModelApprovalReviewService(gw, ReviewRepository(c.factory)).review(action, live)
+        )
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=5)
+            async with c.factory() as session, session.begin():
+                row = await session.scalar(
+                    select(RunRow).where(RunRow.id == c.context.run_id).with_for_update()
+                )
+                issued = (
+                    await session.scalars(
+                        select(RunAdmissionAttemptRow).where(
+                            RunAdmissionAttemptRow.run_id == c.context.run_id
+                        )
+                    )
+                ).one()
+                assert issued.state == "issued" and issued.physical_transport_id is not None
+                now = await session.scalar(select(func.clock_timestamp()))
+                if invalid == "lease_expired":
+                    row.worker_lease_expires_at = now - timedelta(seconds=1)
+                elif invalid == "lease_replaced":
+                    row.worker_lease_token = uuid4()
+                elif invalid == "run_cancelled":
+                    row.status = "cancelled"
+                else:
+                    original = c.context.evidence
+                    replacement = _capture_authenticated_input(
+                        AuthenticatedPrincipal(
+                            tenant_id=c.context.tenant_id,
+                            user_id=original.actor_id,
+                            role=original.actor_role,
+                        ),
+                        "A new authenticated instruction supersedes the original turn.",
+                        json.loads(original.input_scope),
+                    )
+                    await _persist_authenticated_input(
+                        session, row, replacement, submitted_message=replacement.message
+                    )
+            # Local continuity deliberately remains active: only the persisted
+            # fence can reject this late result; heartbeat notifications lag.
+            assert c.context._active
+            c.context.check()
+            release.set()
+            result = await asyncio.wait_for(task, timeout=10)
+            assert result.status == "needs_human" and result.reason_code == "review_unavailable"
+            assert len(wires) == 1
+
+            async with c.factory() as session:
+                intent = (
+                    await session.scalars(
+                        select(RunReviewIntentRow).where(
+                            RunReviewIntentRow.run_id == c.context.run_id
+                        )
+                    )
+                ).one()
+                attempt = await session.get(RunAdmissionAttemptRow, intent.attempt_id)
+                # Late accounting remains committed; no stale fence is put
+                # inside finish, and its known usage/receipt is not rolled back.
+                assert intent.status == "allow" and attempt.state == "completed"
+                receipt = json.loads(intent.private_receipt)
+                assert receipt["accounting_receipt_sha256"] == attempt.receipt_sha256
+                assert receipt["evidence"]["usage"] == attempt.receipt["usage"]
+                assert attempt.receipt["usage"]["total_tokens"] == 5
+                assert attempt.receipt["usage"]["cost_usd"] == "0.000008"
+                original_receipts = (intent.receipt_sha256, attempt.receipt_sha256)
+
+            repeated = await ModelApprovalReviewService(gw, ReviewRepository(c.factory)).review(
+                action, live
+            )
+            assert repeated.status == "needs_human" and len(wires) == 1
+            cold = RunAdmissionRepository(c.factory)
+            pool = await cold.get_pool(c.context.tenant_id, c.context.run_id)
+            assert pool.token_charged == 5 and pool.review_count_charged == 1
+            assert pool.original_deadline == c.context._pool.original_deadline
+            async with c.factory() as session:
+                intents = (
+                    await session.scalars(
+                        select(RunReviewIntentRow).where(
+                            RunReviewIntentRow.run_id == c.context.run_id
+                        )
+                    )
+                ).all()
+                attempts = (
+                    await session.scalars(
+                        select(RunAdmissionAttemptRow).where(
+                            RunAdmissionAttemptRow.run_id == c.context.run_id
+                        )
+                    )
+                ).all()
+                assert len(intents) == len(attempts) == 1
+                assert (intents[0].receipt_sha256, attempts[0].receipt_sha256) == original_receipts
+        finally:
+            release.set()
+            if not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)

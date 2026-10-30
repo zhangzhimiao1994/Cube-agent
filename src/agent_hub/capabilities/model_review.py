@@ -420,10 +420,23 @@ class ModelApprovalReviewService:
             raise cancelled
         if committed is None:
             return _human(snapshot, "review_unavailable")
+        current = True
+        if committed.status == "allow" and admission.physical_id is not None:
+            try:
+                # finish intentionally accepts late facts. A new allow requires
+                # the ORIGINAL run/turn/lease/config to still be current in DB,
+                # in a separate read-only transaction after those facts commit.
+                await live_context.budget.require_current()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - no DB/lease details cross this boundary
+                current = False
         try:
             live_context.budget.check()
         except _PhysicalAdmissionStopped:
             return _human(snapshot, "missing_context")
+        if not current:
+            return _human(snapshot, "review_unavailable")
         # Existing effects never authorize another paid call or a new allow.
         if (
             not committed.created

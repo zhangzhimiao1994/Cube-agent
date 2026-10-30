@@ -23,6 +23,7 @@ from tests.unit.models.test_physical_budget import (
     budget_module,
     configured,
     gateway,
+    invalidate_current,
     logical_request,
     response,
 )
@@ -371,3 +372,94 @@ async def test_distinct_rejects_same_actual_request_model_behind_different_deplo
             action, m._LiveReviewContext(context, materials_trusted=True, contains_secrets=False)
         )
     assert result.status == "needs_human" and len(wires) == 1 and store.begins == 0
+
+
+@pytest.mark.parametrize(
+    "kind", ["lease_expired", "lease_replaced", "run_cancelled", "turn_replaced"]
+)
+async def test_post_issue_current_db_failure_cannot_return_new_allow(kind):
+    b, m = budget_module(), service_module()
+    context, budget, primary, reviewer = configured()
+    action, store, wires = snapshot(context), ReviewStore(budget), []
+
+    def handle(req):
+        wires.append(req)
+        assert store.intent.status == "issued"
+        invalidate_current(budget, kind)
+        return httpx.Response(200, json=response(verdict(action)))
+
+    gw, _ = gateway([primary, reviewer], handle)
+    live = m._LiveReviewContext(context, materials_trusted=True, contains_secrets=False)
+    with b._bind_run_budget(context):
+        result = await m.ModelApprovalReviewService(gw, store).review(action, live)
+        repeated = await m.ModelApprovalReviewService(gw, store).review(action, live)
+    assert result.status == repeated.status == "needs_human" and len(wires) == 1
+    assert store.intent.status == "allow" and budget.charged == 5
+    assert budget.current_reads and all(finishes == 1 for _, finishes in budget.current_reads)
+
+
+async def test_current_db_read_error_redacts_and_preserves_committed_accounting():
+    from sqlalchemy.exc import SQLAlchemyError
+
+    b, m = budget_module(), service_module()
+    context, budget, primary, reviewer = configured()
+    action, store, wires = snapshot(context), ReviewStore(budget), []
+
+    def handle(req):
+        wires.append(req)
+        budget.current_read_error = SQLAlchemyError("private lease database detail")
+        return httpx.Response(200, json=response(verdict(action)))
+
+    gw, _ = gateway([primary, reviewer], handle)
+    with b._bind_run_budget(context):
+        result = await m.ModelApprovalReviewService(gw, store).review(
+            action, m._LiveReviewContext(context, materials_trusted=True, contains_secrets=False)
+        )
+    assert result.status == "needs_human" and result.reason_code == "review_unavailable"
+    assert "private lease database detail" not in json.dumps(result.public_summary())
+    assert store.intent.status == "allow" and budget.charged == 5 and len(wires) == 1
+
+
+@pytest.mark.parametrize("interrupt", ["cancel", "revoke"])
+async def test_current_db_read_preserves_final_cancel_and_revoke_checks(interrupt):
+    b, m = budget_module(), service_module()
+    context, budget, primary, reviewer = configured()
+    action, store, wires = snapshot(context), ReviewStore(budget), []
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def before_current_read():
+        entered.set()
+        await release.wait()
+
+    budget.before_current_read = before_current_read
+
+    def handle(req):
+        wires.append(req)
+        return httpx.Response(200, json=response(verdict(action)))
+
+    gw, _ = gateway([primary, reviewer], handle)
+    with b._bind_run_budget(context):
+        task = asyncio.create_task(
+            m.ModelApprovalReviewService(gw, store).review(
+                action,
+                m._LiveReviewContext(context, materials_trusted=True, contains_secrets=False),
+            )
+        )
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=3)
+            assert budget.charged == 5 and store.intent.status == "allow"
+            if interrupt == "cancel":
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            else:
+                context.revoke()
+                release.set()
+                result = await task
+                assert result.status == "needs_human"
+        finally:
+            release.set()
+            if not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+    assert len(wires) == 1 and len(store.finishes) == 1 and budget.charged == 5

@@ -232,6 +232,19 @@ class _RunBudgetContext:
         if not self._active or time.monotonic() >= self.deadline:
             raise _PhysicalAdmissionStopped()
 
+    async def require_current(self) -> None:
+        """Confirm the ORIGINAL persisted binding without changing its grant."""
+        self.check()
+        async with asyncio.timeout_at(self.deadline):
+            await self.repository.require_current(
+                tenant_id=self.tenant_id,
+                run_id=self.run_id,
+                authorization_turn_id=self.evidence.turn_id,
+                lease=self.lease,
+                config_sha256=_config_sha(self.config),
+            )
+        self.check()
+
     def bounds(
         self,
         deployment: Deployment,

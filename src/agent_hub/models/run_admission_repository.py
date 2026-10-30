@@ -425,6 +425,26 @@ class RunAdmissionRepository:
             attempt_id=None if attempt is None else attempt.attempt_id, kind=kind, evidence=evidence))
         await session.flush()
 
+    async def require_current(self, **a: Unpack[_ExecutionArguments]) -> None:
+        """Read-only current fence; no reservation, receipt, permit or new grant.
+
+        Use a separate transaction AFTER accounting commits. The original
+        binding is copied before lock waits; no current DB lease is adopted.
+        Run/pool locks serialize these reads and clock_timestamp is checked by
+        the existing fence after the authorization read. Confirmation is only
+        a point-in-time check, never authority for a later tool dispatch.
+        """
+        _binding(a['tenant_id'], a['run_id'], a['authorization_turn_id'],
+                 a['lease'], a['config_sha256'])
+        tenant_id, run_id = a['tenant_id'], a['run_id']
+        turn_id, config = a['authorization_turn_id'], a['config_sha256']
+        lease = _WorkerLease(a['lease'].worker_id, a['lease'].token)
+        async with self._transaction() as session:
+            run, pool = await self._locked(session, tenant_id, run_id)
+            if pool is None or pool.closed:
+                raise AdmissionConflict(_CONFLICT)
+            await self._fence(session, run, pool, turn_id, lease, config)
+
     async def open_pool(self, **arguments: Unpack[_OpenArguments]) -> PoolSnapshot:
         async with self._transaction() as session:
             return await self._open_pool_in_session(session, **arguments)

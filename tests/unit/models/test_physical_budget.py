@@ -9,6 +9,7 @@ import warnings
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, localcontext
+from types import SimpleNamespace
 from uuid import uuid4
 
 import httpx
@@ -17,6 +18,12 @@ import pytest
 from agent_hub.auth.models import AuthenticatedPrincipal, Role
 from agent_hub.capabilities.review_contracts import ApprovalReviewConfig
 from agent_hub.capabilities.review_repository import review_config_sha256
+from agent_hub.db.models import (
+    RunAdmissionPoolRow,
+    RunAuthenticatedInputRow,
+    RunInputAuthorizationRow,
+    RunRow,
+)
 from agent_hub.models.admission_bounds import (
     KnownPricing,
     TrustedContextBound,
@@ -104,6 +111,136 @@ class BudgetStore(RunAdmissionRepository):
         return item
 
 
+class _CurrentFenceSession:
+    """Read-only ORM/clock results for unchanged production _locked/_fence."""
+
+    def __init__(self, store):
+        self.store = store
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return False
+
+    def begin(self):
+        return self
+
+    def in_transaction(self):
+        return True
+
+    def _observed(self, kind):
+        finishes = sum(name == "finish" for name, _ in self.store.calls)
+        self.store.current_reads.append((kind, finishes))
+
+    async def scalar(self, statement):
+        entity = statement.column_descriptions[0]["entity"]
+        if entity is RunRow:
+            self._observed("run")
+            if self.store.before_current_read is not None:
+                await self.store.before_current_read()
+            if self.store.current_read_error is not None:
+                raise self.store.current_read_error
+            return self.store.current_run
+        assert entity is RunAdmissionPoolRow
+        self._observed("pool")
+        return self.store.current_pool
+
+    async def execute(self, statement):
+        if statement.column_descriptions[0].get("entity") is RunInputAuthorizationRow:
+            self._observed("authorization")
+            return SimpleNamespace(
+                one_or_none=lambda: (self.store.current_link, self.store.current_turn)
+            )
+        self._observed("clock")
+        return SimpleNamespace(scalar_one=lambda: datetime.now(UTC))
+
+
+def _install_current_fence(store, context):
+    """Actual ORM facts plus a read-only session spy, shared by new unit regressions."""
+    evidence = context.evidence
+    store.current_reads = []
+    store.before_current_read = None
+    store.current_read_error = None
+    store.current_run = RunRow(
+        id=context.run_id,
+        tenant_id=context.tenant_id,
+        actor_id=evidence.actor_id,
+        actor_role=evidence.actor_role.value,
+        request=evidence.message,
+        status="running",
+        mode="direct",
+        blocked_by_run_id=None,
+        worker_id=context.lease.worker_id,
+        worker_lease_token=context.lease.token,
+        worker_lease_expires_at=context._pool.original_deadline,
+        routing_decision={
+            "runtime_token_absolute_tokens": 40000,
+            "runtime_plan_token_budget": 40000,
+            "runtime_timeout_absolute_seconds": 50,
+        },
+    )
+    store.current_pool = RunAdmissionPoolRow(
+        tenant_id=context.tenant_id,
+        run_id=context.run_id,
+        authorization_turn_id=evidence.turn_id,
+        actor_id=evidence.actor_id,
+        actor_role=evidence.actor_role.value,
+        message_sha256=evidence.message_sha256,
+        scope_sha256=evidence.scope_sha256,
+        config_sha256=review_config_sha256(context.config),
+        original_token_grant=context._pool.original_token_grant,
+        original_deadline=context._pool.original_deadline,
+        closed=False,
+    )
+    store.current_link = RunInputAuthorizationRow(
+        run_id=context.run_id, tenant_id=context.tenant_id, turn_id=evidence.turn_id
+    )
+    store.current_turn = RunAuthenticatedInputRow(
+        run_id=context.run_id,
+        tenant_id=context.tenant_id,
+        turn_id=evidence.turn_id,
+        actor_id=evidence.actor_id,
+        actor_role=evidence.actor_role.value,
+        message=evidence.message,
+        message_sha256=evidence.message_sha256,
+        input_scope=evidence.input_scope,
+        scope_sha256=evidence.scope_sha256,
+    )
+    store._session_factory = lambda: _CurrentFenceSession(store)
+
+
+def current_binding(context):
+    return {
+        "tenant_id": context.tenant_id,
+        "run_id": context.run_id,
+        "authorization_turn_id": context.evidence.turn_id,
+        "lease": context.lease,
+        "config_sha256": review_config_sha256(context.config),
+    }
+
+
+def invalidate_current(store, kind):
+    if kind == "lease_expired":
+        store.current_run.worker_lease_expires_at = datetime.now(UTC) - timedelta(seconds=1)
+    elif kind == "lease_replaced":
+        store.current_run.worker_lease_token = uuid4()
+    elif kind == "run_cancelled":
+        store.current_run.status = "cancelled"
+    elif kind == "turn_replaced":
+        store.current_link.turn_id = store.current_turn.turn_id = uuid4()
+    elif kind == "deadline":
+        store.current_pool.original_deadline = datetime.now(UTC) - timedelta(seconds=1)
+    elif kind == "closed":
+        store.current_pool.closed = True
+    elif kind == "config":
+        store.current_pool.config_sha256 = "0" * 64
+    elif kind == "missing_pool":
+        store.current_pool = None
+    else:
+        raise AssertionError("unknown test state")
+
+
 def configured(store=None, *, bounds=True, config=None, acting=None):
     b = budget_module()
     config = config or ApprovalReviewConfig(
@@ -168,6 +305,7 @@ def configured(store=None, *, bounds=True, config=None, acting=None):
         else (),
         acting_model=acting,
     )
+    _install_current_fence(store, context)
     return context, store, selected, reviewer
 
 
@@ -518,3 +656,64 @@ async def test_root_scope_exit_while_dao_awaits_revokes_child_before_delegate():
     with pytest.raises(_PhysicalAdmissionStopped):
         await child
     assert wires == [] and store.charged == 10000
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "current",
+        "lease_expired",
+        "lease_replaced",
+        "run_cancelled",
+        "turn_replaced",
+        "deadline",
+        "closed",
+        "config",
+        "missing_pool",
+    ],
+)
+async def test_require_current_uses_real_fence_without_writes_or_new_grant(kind):
+    from agent_hub.models.run_admission_repository import AdmissionConflict
+
+    context, store, _, _ = configured()
+    require = getattr(store, "require_current", None)
+    assert callable(require), "current durable fence query is missing"
+    if kind != "current":
+        invalidate_current(store, kind)
+        with pytest.raises(AdmissionConflict, match="^admission state conflict$"):
+            await require(**current_binding(context))
+    else:
+        assert await require(**current_binding(context)) is None
+        assert [kind for kind, _ in store.current_reads] == [
+            "run",
+            "pool",
+            "authorization",
+            "clock",
+        ]
+    assert store.calls == [] and store.charged == 0 and store.attempts == {}
+
+
+@pytest.mark.parametrize(
+    "change", [{"tenant_id": "bad"}, {"lease": None}, {"config_sha256": "bad"}]
+)
+async def test_require_current_rejects_invalid_original_binding_before_storage(change):
+    context, store, _, _ = configured()
+    require = getattr(store, "require_current", None)
+    assert callable(require), "current durable fence query is missing"
+    with pytest.raises(ValueError, match="^invalid admission binding$"):
+        await require(**{**current_binding(context), **change})
+    assert store.current_reads == []
+
+
+async def test_require_current_keeps_original_lease_across_lock_await():
+    context, store, _, _ = configured()
+    binding = current_binding(context)
+    original = binding["lease"].token
+
+    async def mutate_caller_lease():
+        object.__setattr__(binding["lease"], "token", uuid4())
+
+    store.before_current_read = mutate_caller_lease
+    assert await store.require_current(**binding) is None
+    assert binding["lease"].token != original and context.lease.token == original
+    assert store.calls == [] and store.charged == 0
