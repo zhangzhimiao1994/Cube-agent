@@ -250,13 +250,33 @@ def test_ambiguous_duplicate_owned_tasks_fail_closed_without_rewriting_either() 
 
 
 async def test_user_instructions_alone_too_large_are_not_sliced_or_paid() -> None:
-    context = task(hybrid=False).model_copy(update={"request": "不可删改的用户指令" * 20_000, "artifacts": ()})
-    model = BoundedModel()
+    instructions = "不可删改的用户指令" * 1000
+    context = TaskContext(run_id=uuid4(), tenant_id=uuid4(), actor_id=uuid4(), actor_role=Role.OPERATOR,
+        mode=TaskMode.DISCUSS, request=instructions, artifacts=(), token_budget=500_000,
+        timeout_seconds=30, routing_decision={})
+    assert len(context.request.encode("utf-8")) <= 65_536
+
+    class SmallWindowModel(BoundedModel):
+        def __init__(self) -> None:
+            super().__init__()
+            self.admissions: list[ModelRequest] = []
+
+        def context_window_tokens(self, request: ModelRequest) -> int:
+            self.admissions.append(request)
+            return 4096
+
+    model = SmallWindowModel()
+    assert model.estimate_input_tokens(ModelRequest(
+        logical_model="selector", messages=(ModelMessage("user", context.request),),
+    )) > 4096
     runtime = AutoGenDiscussionRuntime(cast(Any, model), plan())
     events = [event async for event in runtime.run(context)]
     assert events[-1].kind is EventKind.RUNTIME_FAILED
     assert "context window" in (events[-1].reason or "")
-    assert not model.requests and context.request == "不可删改的用户指令" * 20_000
+    assert model.admissions and all(request.logical_model == "selector" for request in model.admissions)
+    assert all(any(isinstance(message.content, str) and instructions in message.content
+                   for message in request.messages) for request in model.admissions)
+    assert not model.requests and context.request == instructions
 
 
 async def test_joint_artifact_and_history_fitted_slot_restores_known_or_unknown_exactly() -> None:
