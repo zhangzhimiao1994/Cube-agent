@@ -411,8 +411,12 @@ async def test_post_issue_stale_fence_refuses_new_allow_after_known_accounting(
                 receipt = json.loads(intent.private_receipt)
                 assert receipt["accounting_receipt_sha256"] == attempt.receipt_sha256
                 assert receipt["evidence"]["usage"] == attempt.receipt["usage"]
-                assert attempt.receipt["usage"]["total_tokens"] == 5
-                assert attempt.receipt["usage"]["cost_usd"] == "0.000008"
+                assert attempt.receipt["usage"] == {
+                    "prompt_tokens": 2,
+                    "completion_tokens": 3,
+                    "total_tokens": 5,
+                    "cost_usd": {"decimal": "0.000008"},
+                }
                 original_receipts = (intent.receipt_sha256, attempt.receipt_sha256)
 
             repeated = await ModelApprovalReviewService(gw, ReviewRepository(c.factory)).review(
