@@ -30,7 +30,7 @@ from agent_hub.models.capacity import CapacityPool
 from agent_hub.models.litellm_client import LiteLLMClient
 from agent_hub.models.physical_budget import _run_budget
 from agent_hub.runs.authorization import _capture_authenticated_input, _persist_authenticated_input
-from agent_hub.runs.repository import RunRepository
+from agent_hub.runs.repository import RunRepository, _database_uuid
 from agent_hub.runs.workspace import workspace_selection
 from agent_hub.runtime.artifacts import InMemoryArtifactRepository
 from agent_hub.runtime.contracts import TaskContext
@@ -100,6 +100,32 @@ def submitted_input_scope(body):
             "execution_backend": body.execution_backend,
         },
     }
+
+
+def capture_submission_input(row, body):
+    """Capture the fixture's original input at its persisted-principal boundary."""
+    return _capture_authenticated_input(
+        AuthenticatedPrincipal(
+            _database_uuid(row.actor_id), _database_uuid(row.tenant_id), Role(row.actor_role)
+        ),
+        body.message,
+        submitted_input_scope(body),
+    )
+
+
+def build_task_context(record, binding, body, route):
+    return TaskContext(
+        run_id=record.id,
+        tenant_id=record.tenant_id,
+        actor_id=record.actor_id,
+        actor_role=record.actor_role,
+        execution_token=binding["lease"].token,
+        mode=body.mode,
+        request=body.message,
+        routing_decision=route,
+        timeout_seconds=150,
+        token_budget=1000000,
+    )
 
 
 def schema_value(schema, root=None):
@@ -414,25 +440,10 @@ async def build_case(storage, tmp_path, mode, redis_client, *, pending=False):
     async with factory() as session, session.begin():
         row = await session.get(RunRow, binding["run_id"])
         row.request, row.mode, row.routing_decision = message, mode.value, route
-        evidence = _capture_authenticated_input(
-            AuthenticatedPrincipal(row.actor_id, row.tenant_id, Role.OPERATOR),
-            message,
-            submitted_input_scope(body),
-        )
+        evidence = capture_submission_input(row, body)
         await _persist_authenticated_input(session, row, evidence)
     record = await repository.get(binding["tenant_id"], binding["run_id"])
-    context = TaskContext(
-        run_id=record.id,
-        tenant_id=record.tenant_id,
-        actor_id=record.actor_id,
-        actor_role=record.actor_role,
-        execution_token=binding["lease"].token,
-        mode=mode,
-        request=message,
-        routing_decision=route,
-        timeout_seconds=150,
-        token_budget=1000000,
-    )
+    context = build_task_context(record, binding, body, route)
     artifacts = InMemoryArtifactRepository()
     stack = assemble_review_capability_stack(
         broker,

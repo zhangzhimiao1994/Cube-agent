@@ -13,17 +13,30 @@ import json
 import os
 import shutil
 import tempfile
+from datetime import UTC, datetime
 from pathlib import Path
+from uuid import UUID, uuid4
 
 import pytest
 import pytest_asyncio
+from asyncpg.pgproto.pgproto import UUID as DriverUUID
 from redis.asyncio import Redis
 from sqlalchemy import select
 
+from agent_hub.auth.models import Role
 from agent_hub.capabilities.types import CapabilityRequest
-from agent_hub.db.models import RunAdmissionAttemptRow, RunReviewIntentRow
+from agent_hub.db.models import (
+    RunAdmissionAttemptRow,
+    RunAuthenticatedInputRow,
+    RunInputAuthorizationRow,
+    RunReviewIntentRow,
+    RunRow,
+)
 from agent_hub.domain.runs import TaskMode
-from agent_hub.models.run_admission_repository import RunAdmissionRepository
+from agent_hub.models.run_admission_repository import RunAdmissionRepository, _WorkerLease
+from agent_hub.runs.authorization import _persist_authenticated_input, _validate_authenticated_input
+from agent_hub.runs.repository import RunRepository
+from agent_hub.runs.workspace import workspace_selection
 from agent_hub.runtime.autogen.adapter import AutoGenDiscussionRuntime
 from agent_hub.runtime.contracts import EventKind
 from agent_hub.runtime.crew.adapter import CrewAIObjectFactory, CrewDispatchRuntime
@@ -41,6 +54,8 @@ from tests.integration.runtime.test_model_review_modes_helper import (
     FINAL_TEXT,
     FixedWire,
     build_case,
+    build_task_context,
+    capture_submission_input,
     schema_value,
     submission_request,
     submitted_input_scope,
@@ -187,6 +202,76 @@ async def test_protocol_responder_preserves_exact_reviewer_digest():
     scope = submitted_input_scope(pending)
     assert scope["conversation_id"] == pending.conversation_id
     assert "message" not in scope["selection"]
+
+
+async def test_protocol_fixture_capture_accepts_driver_uuid_without_changing_authority():
+    """No PG: exercise actual asyncpg UUID, ORM row and strict sealed capture."""
+    actor, tenant = uuid4(), uuid4()
+    row = RunRow(
+        id=DriverUUID(str(uuid4())),
+        tenant_id=DriverUUID(str(tenant)),
+        actor_id=DriverUUID(str(actor)),
+        actor_role=Role.OPERATOR.value,
+        status="running",
+        version=1,
+        created_at=datetime.now(UTC),
+    )
+    lease = _WorkerLease("fixture-driver", uuid4())
+    row.worker_id, row.worker_lease_token = lease.worker_id, DriverUUID(str(lease.token))
+
+    class RecordingSession:
+        """Persistence protocol only, no SQL or native PG claim."""
+
+        def __init__(self):
+            self.rows = []
+
+        def add(self, item):
+            self.rows.append(item)
+
+        async def flush(self):
+            pass
+
+        async def get(self, model, key):
+            assert model is RunInputAuthorizationRow and key == row.id
+
+    assert isinstance(row.actor_id, UUID) and type(row.actor_id) is not UUID
+    for mode, pending in [*((mode, False) for mode in FACTORIES), (TaskMode.DIRECT, True)]:
+        body = submission_request(mode, pending=pending)
+        row.request, row.mode = body.message, body.mode.value
+        selection = workspace_selection(
+            project_id=body.project_id,
+            session_id=body.workspace_session_id,
+            sandbox_profile=body.sandbox_profile,
+            requested_permissions=body.requested_permissions,
+            permission_mode=body.permission_mode,
+        )
+        row.routing_decision = {
+            **selection.routing_payload(),
+            "conversation_id": body.conversation_id,
+        }
+        evidence = capture_submission_input(row, body)
+        _validate_authenticated_input(evidence, tenant, actor, Role.OPERATOR, body.message)
+        assert type(evidence.actor_id) is UUID and type(evidence.tenant_id) is UUID
+        assert evidence.actor_id == row.actor_id and evidence.tenant_id == row.tenant_id
+        assert evidence.actor_role is Role.OPERATOR
+        assert evidence.message == body.message
+        assert json.loads(evidence.input_scope) == submitted_input_scope(body)
+        assert body.conversation_id and body.project_id and body.workspace_session_id
+        session = RecordingSession()
+        await _persist_authenticated_input(session, row, evidence)
+        saved, link = session.rows
+        assert type(saved) is RunAuthenticatedInputRow and type(link) is RunInputAuthorizationRow
+        assert saved.turn_id == link.turn_id == evidence.turn_id
+        assert saved.message == body.message and saved.input_scope == evidence.input_scope
+        record = RunRepository._record(row)
+        context = build_task_context(record, {"lease": lease}, body, row.routing_decision)
+        assert context.execution_token is lease.token  # Use the driver, not the DB token.
+        assert context.mode is mode and context.request == body.message
+        assert context.actor_id == actor and context.actor_role is Role.OPERATOR
+        assert type(context.run_id) is UUID and type(context.tenant_id) is UUID
+    row.actor_role = Role.VIEWER.value
+    evidence = capture_submission_input(row, submission_request())
+    assert evidence.actor_role is Role.VIEWER  # No role upgrade hidden in normalization.
 
 
 @pytest.mark.parametrize(
