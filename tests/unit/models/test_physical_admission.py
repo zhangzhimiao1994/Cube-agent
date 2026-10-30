@@ -180,3 +180,50 @@ async def test_inconsistent_usage_totals_are_invalid_not_missing_or_zero() -> No
     await call.finish("invalid")
     assert admission.receipts[0][1].usage_status == "invalid"
     assert admission.receipts[0][1].usage is None
+
+
+@pytest.mark.parametrize("later", [None, TokenUsage(2, 3, 5), TokenUsage(10, 50, 60)])
+async def test_usage_invalidity_is_sticky_but_preserves_prior_evidence(later: TokenUsage | None) -> None:
+    admission = Admission()
+    scope = admission_scope(admission, purpose="primary", max_attempts=2)
+    call = physical_call(scope)
+    await _GuardedTransport(httpx.MockTransport(lambda r: httpx.Response(200)), call).handle_async_request(
+        httpx.Request("POST", "https://mock.example"))
+    call.observe_usage(TokenUsage(20, 30, 50))
+    call.observe_usage(later, invalid=later is None)
+    assert scope.stopped is not None
+    call.observe_usage(TokenUsage(30, 40, 70))
+    call.observe_usage(None)
+    await call.finish("invalid")
+    assert admission.receipts[0][1].usage == TokenUsage(20, 30, 50)
+    assert admission.receipts[0][1].usage_status == "invalid"
+
+
+async def test_direct_receipt_failure_clears_exception_context_and_retains_permit() -> None:
+    admission = Admission()
+    admission.receipt_failure = True
+    scope = admission_scope(admission)
+    call = physical_call(scope)
+    await _GuardedTransport(httpx.MockTransport(lambda r: httpx.Response(200)), call).handle_async_request(
+        httpx.Request("POST", "https://mock.example"))
+    call.observe_usage(TokenUsage(2, 3, 5))
+    with pytest.raises(_PhysicalAdmissionStopped) as caught:
+        await call.finish("completed")
+    assert caught.value.__context__ is None and caught.value.__cause__ is None
+    assert scope.attempts[0].permit.attempt_id.int == 1
+    assert scope.attempts[0].receipt.usage == TokenUsage(2, 3, 5)
+    assert not scope.attempts[0].delivered
+
+
+async def test_monotonic_usage_and_duplicates_remain_known_across_empty_observations() -> None:
+    admission = Admission()
+    scope = admission_scope(admission)
+    call = physical_call(scope)
+    await _GuardedTransport(httpx.MockTransport(lambda r: httpx.Response(200)), call).handle_async_request(
+        httpx.Request("POST", "https://mock.example"))
+    for usage in [TokenUsage(2, 3, 5), None, TokenUsage(2, 3, 5), TokenUsage(4, 6, 10), None]:
+        call.observe_usage(usage)
+    assert scope.stopped is None
+    await call.finish("completed")
+    assert admission.receipts[0][1].usage == TokenUsage(4, 6, 10)
+    assert admission.receipts[0][1].usage_status == "known"

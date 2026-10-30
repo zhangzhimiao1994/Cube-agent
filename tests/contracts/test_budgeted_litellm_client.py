@@ -1,6 +1,7 @@
 """Real SDK/HTTP boundary proofs; every network delegate is local MockTransport."""
 import asyncio
 import json
+import traceback
 from collections.abc import AsyncIterator
 from dataclasses import replace
 from decimal import Decimal
@@ -331,8 +332,9 @@ async def test_issued_network_unknown_keeps_identity_and_primary_error() -> None
         raise httpx.ReadError("private transport failure")
 
     client = LiteLLMClient(_network_delegate_factory=lambda: httpx.MockTransport(handle))
-    with _bind_physical_admission(scope), pytest.raises(ModelTransportError):
-        await client.complete(deployment("chat_completions"), request("chat_completions"), "mock-key")
+    with _bind_physical_admission(scope):
+        with pytest.raises(ModelTransportError):
+            await client.complete(deployment("chat_completions"), request("chat_completions"), "mock-key")
         with pytest.raises(_PhysicalAdmissionStopped):
             await client.complete(deployment("chat_completions"), request("chat_completions"), "mock-key")
     assert len(wire) == 1
@@ -543,3 +545,131 @@ async def test_pending_cancel_before_stream_advance_delivers_receipt_and_closes(
     assert closed.is_set()
     assert admission.receipts[0][1].outcome == "cancelled"
     assert admission.receipts[0][1].usage == TokenUsage(2, 3, 5)
+
+
+@pytest.mark.parametrize("later", ["negative", "regression", "conflict"])
+async def test_stream_usage_invalidity_preserves_evidence_and_blocks_resend(later: str) -> None:
+    admission = Admission()
+    scope = admission_scope(admission, purpose="primary", max_attempts=2)
+    wire: list[httpx.Request] = []
+    counts = {
+        "negative": (-1, 3, 2), "regression": (2, 3, 5), "conflict": (10, 50, 60),
+    }[later]
+
+    def handle(req: httpx.Request) -> httpx.Response:
+        wire.append(req)
+        chunks = [{"id": "chunk", "object": "chat.completion.chunk", "created": 1,
+                   "model": "test-model", "choices": [], "usage": {
+                       "prompt_tokens": a, "completion_tokens": b, "total_tokens": c,
+                   }} for a, b, c in [(20, 30, 50), counts]]
+        return httpx.Response(200, headers={"content-type": "text/event-stream"},
+                              content="".join("data: " + json.dumps(c) + "\n\n" for c in chunks)
+                              + "data: [DONE]\n\n")
+
+    client = LiteLLMClient(_network_delegate_factory=lambda: httpx.MockTransport(handle))
+    with _bind_physical_admission(scope):
+        with pytest.raises(ModelResponseError if later == "negative" else _PhysicalAdmissionStopped):
+            _ = [c async for c in client.stream_openai_compatible_chunks(
+                deployment("chat_completions"), request("chat_completions"), "mock-key")]
+        assert admission.receipts[0][1].usage_status == "invalid"
+        assert admission.receipts[0][1].usage == TokenUsage(20, 30, 50)
+        with pytest.raises(_PhysicalAdmissionStopped):
+            await client.complete(deployment("chat_completions"), request("chat_completions"), "mock-key")
+    assert len(wire) == 1
+
+
+_RECEIPT_PRIVATE_SENTINEL = "private-db-url-and-secret-receipt-sentinel"
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_after_receipt_failure_has_no_reachable_private_exception(streaming: bool) -> None:
+    class PrivateFailure(Admission):
+        async def after_receipt(self, permit, receipt, *, deadline) -> None:
+            raise RuntimeError(_RECEIPT_PRIVATE_SENTINEL)
+
+    scope = admission_scope(PrivateFailure())
+
+    def handle(req: httpx.Request) -> httpx.Response:
+        if not streaming:
+            return httpx.Response(200, json=provider_response("chat_completions"))
+        chunk = {"id": "chunk", "object": "chat.completion.chunk", "created": 1,
+                 "model": "test-model", "choices": [],
+                 "usage": {"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5}}
+        return httpx.Response(200, headers={"content-type": "text/event-stream"},
+                              content="data: " + json.dumps(chunk) + "\n\ndata: [DONE]\n\n")
+
+    client = LiteLLMClient(_network_delegate_factory=lambda: httpx.MockTransport(handle))
+    with _bind_physical_admission(scope), pytest.raises(_PhysicalAdmissionStopped) as caught:
+        if streaming:
+            _ = [c async for c in client.stream_openai_compatible_chunks(
+                deployment("chat_completions"), request("chat_completions"), "mock-key")]
+        else:
+            await client.complete(deployment("chat_completions"), request("chat_completions"), "mock-key")
+    assert caught.value.__context__ is None and caught.value.__cause__ is None
+    rendered = "".join(traceback.TracebackException.from_exception(
+        caught.value, capture_locals=True).format())
+    assert _RECEIPT_PRIVATE_SENTINEL not in rendered
+    assert len(scope.attempts) == 1
+    assert scope.attempts[0].receipt.usage == TokenUsage(2, 3, 5)
+    assert not scope.attempts[0].delivered
+
+
+@pytest.mark.parametrize("stop", ["revoke", "pending_cancel"])
+@pytest.mark.parametrize("cleanup", ["normal", "error", "blocked"])
+async def test_paused_stream_stop_closes_response_body_before_return(stop: str, cleanup: str) -> None:
+    admission = Admission()
+    scope = admission_scope(admission)
+    body_events: list[str] = []
+    transport_closes: list[bool] = []
+
+    class Body(httpx.AsyncByteStream):
+        async def __aiter__(self) -> AsyncIterator[bytes]:
+            chunk = {"id": "chunk", "object": "chat.completion.chunk", "created": 1,
+                     "model": "test-model", "choices": [],
+                     "usage": {"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5}}
+            yield ("data: " + json.dumps(chunk) + "\n\n").encode()
+            await asyncio.Future()
+
+        async def aclose(self) -> None:
+            assert admission.receipts[0][1].usage == TokenUsage(2, 3, 5)
+            body_events.append("started")
+            if cleanup == "error":
+                body_events.append("error")
+                raise RuntimeError("private body cleanup error")
+            if cleanup == "blocked":
+                try:
+                    # Exceeds the production cleanup budget, but also bounds
+                    # teardown on the intentionally failing RED implementation.
+                    await asyncio.sleep(0.6)
+                except asyncio.CancelledError:
+                    body_events.append("cancelled")
+                    raise
+            body_events.append("finished")
+
+    class Delegate(httpx.MockTransport):
+        async def aclose(self) -> None:
+            transport_closes.append(True)
+
+    client = LiteLLMClient(_network_delegate_factory=lambda: Delegate(
+        lambda r: httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=Body())))
+    with _bind_physical_admission(scope):
+        chunks = client.stream_openai_compatible_chunks(deployment("chat_completions"),
+                  request("chat_completions", timeout_seconds=0.5), "mock-key")
+        await anext(chunks)
+
+        async def advance() -> None:
+            if stop == "revoke":
+                scope.revoke()
+            else:
+                task = asyncio.current_task()
+                assert task is not None
+                task.cancel()
+            await anext(chunks)
+
+        async with asyncio.timeout(2):
+            with pytest.raises(_PhysicalAdmissionStopped if stop == "revoke" else asyncio.CancelledError):
+                await asyncio.create_task(advance())
+        assert body_events == ["started", {"normal": "finished", "error": "error", "blocked": "cancelled"}[cleanup]]
+        assert transport_closes == [True]
+        await chunks.aclose()
+        assert len(body_events) == 2  # explicit close is idempotent after the stop

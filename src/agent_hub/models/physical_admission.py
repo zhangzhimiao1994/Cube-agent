@@ -261,12 +261,25 @@ class _PhysicalCall:
         if not self.attempts:
             return
         attempt = self.attempts[-1]
-        if _valid_usage(usage):
-            # Never erase a known EOF receipt during cancellation/cleanup.
+        if attempt.usage_status == "invalid":
+            return  # Later observations cannot repair contradictory billing evidence.
+        if invalid or (usage is not None and not _valid_usage(usage)):
+            attempt.usage_status = "invalid"
+            self.scope.stop()
+        elif usage is not None:
+            previous = attempt.usage
+            if previous is not None and any(new < old for new, old in zip(
+                (usage.prompt_tokens, usage.completion_tokens, usage.total_tokens),
+                (previous.prompt_tokens, previous.completion_tokens, previous.total_tokens),
+                strict=True,
+            )):
+                attempt.usage_status = "invalid"
+                self.scope.stop()
+                return
+            # Keep cumulative observations monotonic; None chunks and cleanup
+            # do not erase evidence. Invalidity preserves the last trusted values.
             attempt.usage = usage
             attempt.usage_status = "known"
-        elif (invalid or usage is not None) and attempt.usage is None:
-            attempt.usage_status = "invalid"
 
     async def finish(self, outcome: _PhysicalOutcome) -> None:
         for attempt in self.attempts:
@@ -292,7 +305,11 @@ class _PhysicalCall:
                 self.scope.stop()
                 raise
             except Exception:  # noqa: BLE001 - retain permit and immutable pending receipt
-                raise self.scope.stop() from None
+                self.scope.stop()
+            if not attempt.delivered:
+                # Raise after leaving the callback's exception context. `from
+                # None` alone would still expose its private __context__/locals.
+                raise self.scope.stop()
 
 
 class _GuardedTransport(httpx.AsyncBaseTransport):

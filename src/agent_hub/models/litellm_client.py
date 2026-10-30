@@ -265,14 +265,14 @@ async def _try_record_physical_outcome(
     outcome: object,
 ) -> _PhysicalAdmissionStopped | _CancelledOutcome | None:
     """Keep cleanup reachable, with the received primary error taking priority."""
+    receipt_failed = False
     try:
         await _record_physical_outcome(outcome)
-    except _PhysicalAdmissionStopped as error:
-        if isinstance(outcome, ModelResponse):
-            return error
+    except _PhysicalAdmissionStopped:
+        receipt_failed = isinstance(outcome, ModelResponse)
     except asyncio.CancelledError:
         return _cancelled_outcome(outcome)
-    return None
+    return _PhysicalAdmissionStopped() if receipt_failed else None
 
 
 def _cancelled_outcome(outcome: object) -> _CancelledOutcome:
@@ -834,16 +834,18 @@ class _OpenAICompatibleChunkStream:
                 call.scope.stop()
                 with suppress(_PhysicalAdmissionStopped, asyncio.CancelledError):
                     await call.finish("error")
-                await self._close_client_ignoring_failure()
-                raise call.scope.stop() from None
+                await self._close_stream_ignoring_failure()
             except asyncio.CancelledError:
                 # Cancellation may already be pending at entry, before _next
                 # has a chance to run its read/start cancellation handler.
                 call.scope.stop()
                 with suppress(_PhysicalAdmissionStopped, asyncio.CancelledError):
                     await call.finish("cancelled")
-                await self._close_client_ignoring_failure()
+                await self._close_stream_ignoring_failure()
                 raise
+            # The original exception (including private callback context) is
+            # out of scope before the final public terminal control is raised.
+            raise call.scope.stop()
 
     async def _next(self) -> object:
         if self._closed:
@@ -960,6 +962,12 @@ class _OpenAICompatibleChunkStream:
                                            - asyncio.get_running_loop().time()))
         # Leave time to deliver buffered tool events and settle the gateway lease.
         return min(2.0, remaining / 2)
+
+    async def _close_stream_ignoring_failure(self) -> None:
+        """Retain the primary stop/cancel while closing the full paused stream."""
+        with suppress(ModelTransportError, ModelClientError,
+                      _PhysicalAdmissionStopped, asyncio.CancelledError):
+            await self.aclose()
 
     async def _close_client_ignoring_failure(self) -> bool:
         try:
