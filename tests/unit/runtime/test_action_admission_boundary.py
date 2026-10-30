@@ -16,9 +16,14 @@ from agent_hub.runtime.engineering_admission import (
     with_engineering_admission,
 )
 from tests.unit.runs.test_repository_approval_upserts import ApprovalProjectionSession
-from tests.unit.runtime.test_discuss_repository_wiring import OfflineCapacity, OfflineTransport
+from tests.unit.runtime.test_action_admission_helper import (
+    NoExecutionBackend,
+    OfflineCapacity,
+    OfflineTransport,
+    factory,
+    task,
+)
 from tests.unit.runtime.test_engineering_admission import Authorizer, Child, context
-from tests.unit.runtime.test_submission_admission_factory import NoExecutionBackend, factory, task
 
 
 def selected(mode: TaskMode = TaskMode.DISCUSS, **route: Any) -> Any:

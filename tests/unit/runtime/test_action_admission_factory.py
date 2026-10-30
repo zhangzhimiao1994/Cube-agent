@@ -29,14 +29,16 @@ from agent_hub.runtime.project_scale_artifact import (
     project_scale_artifact_zip_arguments,
 )
 from tests.unit.runs.test_repository_approval_upserts import ApprovalProjectionSession
-from tests.unit.runtime.test_configured_runtime import FakeConfigService, FakeSecretService
-from tests.unit.runtime.test_discuss_repository_wiring import (
+from tests.unit.runtime.test_action_admission_helper import (
+    NoExecutionBackend,
     OfflineCapacity,
     OfflineTransport,
     configured_document,
+    factory,
     response,
+    task,
 )
-from tests.unit.runtime.test_submission_admission_factory import NoExecutionBackend, factory, task
+from tests.unit.runtime.test_configured_runtime import FakeConfigService, FakeSecretService
 
 
 @pytest.mark.parametrize('mode', [TaskMode.DISPATCH, TaskMode.DISCUSS, TaskMode.HYBRID])

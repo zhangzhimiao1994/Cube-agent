@@ -434,7 +434,7 @@ async def test_direct_diagnostic_read_approval_cold_resume_does_not_replay_old_e
     from agent_hub.runtime.contracts import Artifact, RunEvent, RuntimeCheckpoint
     from agent_hub.runtime.worker_execution import worker_runtime_events
     from tests.unit.capabilities.test_verification_cold_recovery import Fixture
-    from tests.unit.runtime.test_action_direct_cold_verification import Policy as ApprovalPolicy
+    from tests.unit.runtime.test_action_admission_helper import Policy as ApprovalPolicy
 
     fixture = Fixture(tmp_path, failed=True)
     fixture.db.row.routing_decision.update({"project_scale": "small", "project_delivery": "workspace",
