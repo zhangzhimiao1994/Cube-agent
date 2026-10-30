@@ -15,13 +15,16 @@ import math
 import re
 from collections.abc import AsyncGenerator, AsyncIterator, Coroutine, Mapping
 from contextlib import aclosing
+from dataclasses import replace
 from typing import Any, cast
 from uuid import UUID, uuid4
 
 from agent_hub.auth.models import Role
 from agent_hub.capabilities.action_preparation import CONTRACT_ROUTE_KEYS as _CONTRACT_ROUTE_KEYS
 from agent_hub.capabilities.generated_project_service import validate_generated_preparation
+from agent_hub.harness.events import gateway_completion_events
 from agent_hub.harness.types import HarnessToolCallRequest, HarnessToolCallResult
+from agent_hub.models.types import ModelMessage
 from agent_hub.runtime.action_approval_capture import capture_action_approval
 from agent_hub.runtime.action_checkpoint import (
     action_checkpoint_valid as action_checkpoint_valid,  # noqa: PLC0414
@@ -32,6 +35,7 @@ from agent_hub.runtime.continuation_artifacts import _encode, save_continuation
 from agent_hub.runtime.contracts import (
     Artifact,
     EventKind,
+    GatewayProvenance,
     JsonValue,
     RunEvent,
     RuntimeCheckpoint,
@@ -47,6 +51,7 @@ from agent_hub.runtime.direct import (
     DirectRuntime,
     Gateway,
     RuntimeExecutionError,
+    _workspace_batch_from_model_text,
 )
 from agent_hub.runtime.direct_completion_journal import DirectCompletionJournal
 from agent_hub.runtime.engineering_admission import _fingerprint
@@ -300,7 +305,9 @@ class _ToolGateway:
 class ActionApprovedDirectRuntime(DirectRuntime):
     def __init__(self, gateway: Gateway, *, artifact_repository: ArtifactRepository,
                  capability_gateway: CapabilityGateway, harness_tool_gateway: HarnessToolInvoker,
+                 plain_file: bool = False,
                  **kwargs: Any) -> None:
+        self._plain_file = plain_file
         self._repository = artifact_repository
         self._action_gateway, self._action_backend = harness_tool_gateway, capability_gateway
         self._action_context: TaskContext | None = None
@@ -450,6 +457,113 @@ class ActionApprovedDirectRuntime(DirectRuntime):
             return dict(_freeze_object(frame, name='action preparation snapshot'))
         return await self._data_io(read(), deadline=deadline)
 
+    async def _run_plain_file(self, context: TaskContext) -> AsyncGenerator[RunEvent, None]:
+        """One textual file proposal through the existing exact-action journal/gate."""
+        from agent_hub.capabilities.execution_authority import _trusted_review_context
+        from agent_hub.models.physical_budget import _run_budget, _RunBudgetContext
+
+        def current_budget() -> _RunBudgetContext:
+            budget = _run_budget.get()
+            try:
+                if type(budget) is not _RunBudgetContext:
+                    raise ValueError
+                assert context.actor_id is not None and context.actor_role is not None
+                bound, worker = _trusted_review_context(tenant_id=context.tenant_id, run_id=context.run_id,
+                    user_id=context.actor_id, role=context.actor_role)
+                budget.check()
+                if ((budget.tenant_id, budget.run_id, budget.lease.worker_id, budget.lease.token,
+                     budget.evidence.actor_id, budget.evidence.actor_role, budget.evidence.message)
+                    != (context.tenant_id, context.run_id, worker, context.execution_token,
+                        context.actor_id, context.actor_role, context.request)
+                    or bound.execution_token != context.execution_token or bound.mode is not context.mode):
+                    raise ValueError
+                return budget
+            except Exception:  # noqa: BLE001 - no unbudgeted fallback after selection.
+                raise RuntimeExecutionError('plain file original worker budget unavailable') from None
+
+        budget = current_budget()
+        outcome = self._build_request(context)
+        if outcome.request is None:
+            raise RuntimeExecutionError(outcome.error_code or 'plain file model request unavailable')
+        request = replace(outcome.request, messages=(*outcome.request.messages, ModelMessage(role='system', content=(
+            'PLAIN_FILE_ACTION: Propose exactly one plain .txt file requested by the user. '
+            'Use the existing strict textual workspace_batch protocol: '
+            '{"workspace_batch":{"files":{"relative.txt":"complete UTF-8 content"},'
+            '"complete":true,"continuation":""},"summary":"brief summary"}. '
+            'This is only a proposal; current policy may require human approval. '
+            'Do not propose project verification, bundles, commands, or any other tools.'
+        ))))
+        yield RunEvent(kind=EventKind.MODEL_STARTED, sequence=1, run_id=context.run_id,
+                       actor='main_agent', payload={'logical_model': self._logical_model})
+        await budget.require_current()
+        if current_budget() is not budget:
+            raise RuntimeExecutionError('plain file original worker budget changed')
+        task = asyncio.create_task(self._complete_with_scope(request))
+        self._active_task = task
+        try:
+            async with asyncio.timeout_at(self._action_deadline):
+                completion = await task
+        finally:
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            self._active_task = None
+        validated = self._strict_completion(completion)
+        if (validated is None or validated.response.tool_calls
+                or not isinstance(validated.response.text, str)):
+            raise RuntimeExecutionError('plain file proposal is invalid')
+        completion = validated
+        text = validated.response.text
+        try:
+            proposal = json.loads(text)
+        except ValueError:
+            raise RuntimeExecutionError('plain file proposal is invalid') from None
+        batch = _workspace_batch_from_model_text(text)
+        if (not isinstance(proposal, dict) or set(proposal) != {'workspace_batch', 'summary'}
+                or not isinstance(proposal['workspace_batch'], dict)
+                or set(proposal['workspace_batch']) != {'files', 'complete', 'continuation'}
+                or proposal['workspace_batch']['complete'] is not True
+                or proposal['workspace_batch']['continuation'] != ''
+                or batch is None or len(batch.files) != 1
+                or not next(iter(batch.files)).endswith('.txt')):
+            raise RuntimeExecutionError('plain file proposal is invalid')
+        usage = self._verified_budget_usage(completion.response.usage,
+            prompt_estimate=outcome.prompt_estimate, response_text=text,
+            request_max_output_tokens=request.max_output_tokens, context_token_budget=context.token_budget)
+        if usage.usage is None or usage.completion_exceeded_request:
+            raise RuntimeExecutionError(usage.error_code or 'plain file response budget is invalid')
+        sequence = 2
+        for event in gateway_completion_events(completion, run_id=context.run_id, start_sequence=sequence):
+            yield event
+            sequence += 1
+        if completion.cost_usd is not None:
+            yield RunEvent(kind=EventKind.COST_RECORDED, sequence=sequence, run_id=context.run_id,
+                actor='main_agent', provider_id=completion.provider_id, cost_usd=completion.cost_usd, currency='USD',
+                payload={'usage_known': not usage.estimated, 'input_tokens': usage.usage.prompt_tokens,
+                         'output_tokens': usage.usage.completion_tokens, 'total_tokens': usage.usage.total_tokens})
+            sequence += 1
+        await self._write_workspace_batch(context, batch, known_files={}, deadline=self._action_deadline)
+        path = next(iter(batch.files))
+        payload = self._actions[-1]['result']['payload']
+        artifact = Artifact(id=uuid4(), type='text', producer='main', content={
+            'text': f'Saved {path}.', 'workspace_files': payload.get('workspace_files', ()),
+        }, provenance=GatewayProvenance(logical_model=completion.logical_model,
+            deployment_id=completion.deployment_id, provider_id=completion.provider_id,
+            provider_model=completion.provider_model))
+        yield RunEvent(kind=EventKind.ARTIFACT_CREATED, sequence=sequence, run_id=context.run_id,
+                       artifact=artifact, payload={'artifact_id': str(artifact.id)})
+        sequence += 1
+        checkpoint = RuntimeCheckpoint(id=uuid4(), runtime_type='direct', runtime_version='1',
+            run_id=context.run_id, tenant_id=context.tenant_id, mode=self.mode,
+            state={'completed': True, 'artifact_id': str(artifact.id),
+                   'artifact_sha256': artifact.content_sha256, 'next_sequence': sequence + 1})
+        self._last_checkpoint = checkpoint
+        yield RunEvent(kind=EventKind.CHECKPOINT_SAVED, sequence=sequence, run_id=context.run_id,
+                       checkpoint=checkpoint)
+        yield RunEvent(kind=EventKind.RUNTIME_COMPLETED, sequence=sequence + 1, run_id=context.run_id,
+                       actor='main_agent', message=f'Saved {path}.', inputs=(artifact,),
+                       payload={'artifact_id': str(artifact.id), 'summary': f'Saved {path}.'})
+
     async def _run_actions(self, context: TaskContext, token: object, done: asyncio.Event) -> AsyncGenerator[RunEvent, None]:
         _check_guidance(context)
         original = _tighten_budgets(context, context)
@@ -522,10 +636,13 @@ class ActionApprovedDirectRuntime(DirectRuntime):
                                                run_id=context.run_id, references=refs)
         self._action_cursor = 0
         try:
-            async for event in super()._run(context, token, done):
-                emitted += 1
-                if emitted > skip:
-                    yield event
+            stream = (self._run_plain_file(context) if self._plain_file and self._restored_checkpoint is None
+                      else cast(AsyncGenerator[RunEvent, None], super()._run(context, token, done)))
+            async with aclosing(stream) as events:
+                async for event in events:
+                    emitted += 1
+                    if emitted > skip:
+                        yield event
         except _PendingAction as pending:
             captured = self._pending_preparation
             preparation = (await self._preparation_snapshot(context, deadline=deadline)

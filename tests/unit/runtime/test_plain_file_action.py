@@ -1,0 +1,270 @@
+"""Fresh original worker/pool selection with real policy/backend and fixed wire."""
+
+import json
+from contextlib import ExitStack
+from dataclasses import replace
+from types import SimpleNamespace
+from uuid import uuid4
+
+import httpx
+import pytest
+
+from agent_hub.auth.models import AuthenticatedPrincipal, Role
+from agent_hub.capabilities.execution_authority import bind_execution_authority
+from agent_hub.capabilities.review_repository import ReviewRepository
+from agent_hub.db.models import RunReviewIntentRow
+from agent_hub.files.workspace import ProjectWorkspaceStore
+from agent_hub.models.admission_bounds import TrustedContextBound
+from agent_hub.models.litellm_client import LiteLLMClient
+from agent_hub.models.physical_budget import _bind_run_budget
+from agent_hub.models.run_admission_repository import RunAdmissionRepository
+from agent_hub.runs.authorization import _capture_authenticated_input
+from agent_hub.runtime.action_direct import ActionApprovedDirectRuntime
+from agent_hub.runtime.artifacts import InMemoryArtifactRepository
+from agent_hub.runtime.contracts import EventKind
+from agent_hub.runtime.defaults import ConfigBackedDirectRuntime, _deployments
+from agent_hub.runtime.direct import DirectRuntime
+from agent_hub.runtime.streams import closing_runtime_events
+from tests.integration.runtime.test_model_review_modes_helper import (
+    FixtureSecrets,
+    fixture_platform,
+    submitted_input_scope,
+)
+from tests.unit.capabilities.test_concrete_model_review import FixedLedgerReview, FocusedDB
+from tests.unit.capabilities.test_model_review_reachability import full_scope
+from tests.unit.runtime.test_plain_file_action_helper import (
+    LocalCapacityBoundary,
+    plain_note_submission,
+)
+
+
+def note_case(tmp_path, *, mode="auto_review", preauth=False, profile="workspace_write"):
+    s = full_scope(tmp_path, mode=mode, preauthorized=preauth, profile=profile)
+    body, path, content = plain_note_submission()
+    body = body.model_copy(
+        update={
+            "permission_mode": mode,
+            "project_id": "demo",
+            "workspace_session_id": "session",
+            "conversation_id": s.body.conversation_id,
+            "sandbox_profile": s.body.sandbox_profile,
+            "requested_permissions": s.body.requested_permissions,
+        }
+    )
+    evidence = _capture_authenticated_input(
+        AuthenticatedPrincipal(
+            user_id=s.task.actor_id, tenant_id=s.task.tenant_id, role=s.task.actor_role
+        ),
+        body.message,
+        submitted_input_scope(body),
+    )
+    s.task = s.task.model_copy(update={"request": body.message})
+    s.runs.record = replace(s.runs.record, request=body.message)
+    old = s.budget
+    platform = fixture_platform()
+    for model in platform.models.values():
+        for deployment in model.deployments:
+            deployment.context_window_tokens = 10000
+            deployment.max_output_tokens = 1000
+    s.budget = type(old)(
+        repository=old.repository,
+        pool=replace(old._pool, authorization_turn_id=evidence.turn_id),
+        evidence=evidence,
+        lease=old.lease,
+        config=old.config,
+        deadline=old.deadline,
+        trusted_contexts=tuple(
+            TrustedContextBound(d.id, d.logical_model, d.provider_model, 10000)
+            for d in _deployments(platform)
+        ),
+    )
+    s.runs.evidence = evidence
+    s.db = FocusedDB(s)
+    s.budget.repository = RunAdmissionRepository(s.db)
+    s.ledger = ReviewRepository(s.db)
+    s.fixed = FixedLedgerReview(s.ledger)
+    s.gate.repository, s.gate.service = s.ledger, s.fixed
+    s.body, s.path, s.content = body, path, content
+    s.wire = []
+
+    class Configs:
+        async def get_current(self, tenant):
+            return SimpleNamespace(version=1, document=platform.model_dump(mode="json"))
+
+    async def capacity(tenant, deployments):
+        return LocalCapacityBoundary()
+
+    async def wire(request):
+        payload = json.loads(request.content)
+        s.wire.append(payload)
+        text = json.dumps(
+            {
+                "workspace_batch": {"files": {path: content}, "complete": True, "continuation": ""},
+                "summary": f"Saved {path}.",
+            }
+        )
+        return httpx.Response(
+            200,
+            json={
+                "id": "note",
+                "object": "chat.completion",
+                "created": 1,
+                "model": payload["model"],
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": text},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5},
+            },
+        )
+
+    s.runtime = ConfigBackedDirectRuntime(
+        config_service=Configs(),
+        secret_service=FixtureSecrets(),
+        capacity_factory=capacity,
+        transport=LiteLLMClient(_network_delegate_factory=lambda: httpx.MockTransport(wire)),
+        artifact_repository=InMemoryArtifactRepository(),
+        capability_gateway=s.backend,
+        harness_tool_gateway=s.harness,
+        action_capability_gateway=s.backend,
+        action_harness_tool_gateway=s.harness,
+    )
+    return s
+
+
+@pytest.mark.parametrize("mode", ["default", "auto_review"])
+async def test_actual_bound_pending_note_selects_existing_action_runtime(tmp_path, mode):
+    s = note_case(tmp_path, mode=mode)
+    with (
+        bind_execution_authority(s.task, worker_id=s.budget.lease.worker_id),
+        _bind_run_budget(s.budget),
+    ):
+        runtime = await s.runtime._runtime_for(s.task)
+    assert type(runtime) is ActionApprovedDirectRuntime
+    assert s.fixed.calls == 0 and s.wire == [] and s.calls == []
+
+
+async def test_validated_frozen_context_selects_pending_note_runtime(tmp_path):
+    s = note_case(tmp_path)
+    context = s.task.validated_internal_clone()
+    assert isinstance(context.routing_decision["requested_permissions"], tuple)
+    with (
+        bind_execution_authority(context, worker_id=s.budget.lease.worker_id),
+        _bind_run_budget(s.budget),
+    ):
+        assert type(await s.runtime._runtime_for(context)) is ActionApprovedDirectRuntime
+
+
+@pytest.mark.parametrize(
+    "barrier",
+    [
+        "worker",
+        "budget",
+        "role",
+        "token",
+        "profile",
+        "chat",
+        "preauth",
+        "read_only",
+        "restricted",
+        "none",
+        "pool",
+        "auth",
+    ],
+)
+async def test_incomplete_or_ordinary_scope_keeps_direct_runtime(tmp_path, barrier):
+    s = note_case(
+        tmp_path,
+        preauth=barrier == "preauth",
+        profile=barrier if barrier in {"read_only", "restricted", "none"} else "workspace_write",
+    )
+    context = s.task
+    if barrier == "role":
+        context = context.model_copy(update={"actor_role": Role.ADMIN})
+    elif barrier == "token":
+        context = context.model_copy(update={"execution_token": uuid4()})
+    elif barrier == "profile":
+        route = dict(context.routing_decision)
+        route.pop("approval_review_profile")
+        context = context.model_copy(update={"routing_decision": route})
+    elif barrier == "chat":
+        context = context.model_copy(update={"request": "Compare two bounded observations."})
+    elif barrier == "pool":
+        s.db.pool.closed = True
+    elif barrier == "auth":
+        s.runs.evidence = replace(s.runs.evidence, turn_id=uuid4())
+    with ExitStack() as stack:
+        if barrier != "worker":
+            stack.enter_context(
+                bind_execution_authority(s.task, worker_id=s.budget.lease.worker_id)
+            )
+        if barrier != "budget":
+            stack.enter_context(_bind_run_budget(s.budget))
+        assert type(await s.runtime._runtime_for(context)) is DirectRuntime
+    assert s.fixed.calls == 0 and not s.wire and not s.calls
+
+
+async def test_pending_auto_actual_runtime_writes_note_and_finishes(tmp_path):
+    s = note_case(tmp_path)
+    events = []
+    with (
+        bind_execution_authority(s.task, worker_id=s.budget.lease.worker_id),
+        _bind_run_budget(s.budget),
+    ):
+        async with closing_runtime_events(s.runtime.run(s.task)) as stream:
+            async for event in stream:
+                events.append(event)
+    root = ProjectWorkspaceStore(tmp_path).session_root(s.task.tenant_id, "demo", "session")
+    assert (root / s.path).read_bytes() == s.content.encode()
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert any(
+        event.artifact is not None
+        and event.artifact.type == "text"
+        and s.path in event.artifact.content["text"]
+        for event in events
+    )
+    assert len(s.wire) == s.fixed.calls == len(s.calls) == 1
+    assert [row.consumed for row in s.db.rows if type(row) is RunReviewIntentRow] == [True]
+    assert all(call["name"] == "workspace.write_text" for call in s.calls)
+
+
+async def test_default_pending_note_waits_and_resumes_only_with_exact_human(tmp_path):
+    s = note_case(tmp_path, mode="default")
+    with (
+        bind_execution_authority(s.task, worker_id=s.budget.lease.worker_id),
+        _bind_run_budget(s.budget),
+    ):
+        async with closing_runtime_events(s.runtime.run(s.task)) as stream:
+            pending = [event async for event in stream]
+        assert pending[-1].kind is EventKind.CHECKPOINT_SAVED
+        checkpoint = pending[-1].checkpoint
+        assert checkpoint.runtime_type == "direct_action"
+        assert checkpoint.state["tool_name"] == "workspace.write_text"
+        assert len(s.runs.waits) == 1 and not s.calls and s.fixed.calls == 0
+        s.runs.exact = True
+        await s.runtime.restore_checkpoint(checkpoint)
+        current = s.task.model_copy(update={"checkpoint": checkpoint})
+        async with closing_runtime_events(s.runtime.run(current)) as stream:
+            resumed = [event async for event in stream]
+    assert resumed[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert len(s.calls) == len(s.wire) == 1 and s.fixed.calls == 0
+    root = ProjectWorkspaceStore(tmp_path).session_root(s.task.tenant_id, "demo", "session")
+    assert (root / s.path).read_bytes() == s.content.encode()
+
+
+async def test_selected_plain_runtime_cannot_run_after_worker_scope_exit(tmp_path):
+    from agent_hub.runtime.direct import RuntimeExecutionError
+
+    s = note_case(tmp_path)
+    with (
+        bind_execution_authority(s.task, worker_id=s.budget.lease.worker_id),
+        _bind_run_budget(s.budget),
+    ):
+        selected = await s.runtime._runtime_for(s.task)
+    with pytest.raises(RuntimeExecutionError):
+        async with closing_runtime_events(selected.run(s.task)) as stream:
+            _ = [event async for event in stream]
+    assert not s.wire and not s.calls and s.fixed.calls == 0

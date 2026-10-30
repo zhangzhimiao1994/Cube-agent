@@ -929,6 +929,92 @@ class ConfigBackedDirectRuntime:
     async def cancel_run_owned(self, run_id: UUID, execution_token: UUID) -> None:
         await _cancel_owned_active_run(self._active, run_id, execution_token)
 
+    async def _pending_plain_file(self, context: TaskContext) -> bool:
+        """Select a proposal protocol only; Harness still owns concrete consent."""
+        import json
+        from datetime import UTC, datetime
+
+        from agent_hub.capabilities.execution_authority import _trusted_review_context
+        from agent_hub.capabilities.review_context import (
+            ConcreteModelReviewGate,
+            ReviewRunRepository,
+        )
+        from agent_hub.capabilities.review_repository import (
+            authorization_binding_sha256,
+            review_config_sha256,
+        )
+        from agent_hub.capabilities.runtime import RuntimeCapabilityGateway
+        from agent_hub.harness.tool_gateway import HarnessToolGateway
+        from agent_hub.models.physical_budget import _run_budget, _RunBudgetContext
+        from agent_hub.runtime.contracts import _canonical_json_bytes
+        from agent_hub.runtime.review_assembly import _execution
+
+        route, text = context.routing_decision, context.request.casefold()
+        intent = ((re.search(r"\b(?:save|write)\b", text) is not None
+                   and re.search(r"\b(?:note|text)\b", text) is not None)
+                  or "保存" in text and any(word in text for word in ("文本", "笔记", "note")))
+        if (context.mode is not TaskMode.DIRECT or not intent or ".txt" not in text
+            or route.get("sandbox_profile") != "workspace_write"
+            or route.get("permission_mode") not in {"default", "auto_review"}
+            or not isinstance(route.get("requested_permissions"), (tuple, list))
+            or not all(type(permission) is str for permission in cast(Sequence[object], route["requested_permissions"]))
+            or set(cast(Sequence[str], route["requested_permissions"])) != {"workspace.read", "command.run"}
+            or any(key in route for key in ("project_delivery", "project_input", "project_input_contract_version",
+                "generated_project_contract_version", "source_run_id")) or route.get("source") == "self_repair"
+            or context.checkpoint is not None and context.checkpoint.runtime_type != "direct_action"):
+            return False
+        backend, harness = self._action_capability_gateway, self._action_harness_tool_gateway
+        budget, execution, profile = _run_budget.get(), _execution.get(), route.get("approval_review_profile")
+        if (not isinstance(backend, RuntimeCapabilityGateway) or not isinstance(harness, HarnessToolGateway)
+            or harness._backend is not backend or type(budget) is not _RunBudgetContext
+            or execution is not None and execution.budget is not budget
+            or not isinstance(getattr(getattr(harness, "_fresh", harness), "_review_gate", None), ConcreteModelReviewGate)
+            or not isinstance(profile, Mapping) or type(profile.get("version")) is not int
+            or profile["version"] != 1 or profile.get("config_sha256") != review_config_sha256(budget.config)
+            or budget.config.engine != "rules_then_model"):
+            return False
+        try:
+            assert context.actor_id is not None and context.actor_role is not None
+            bound, worker = _trusted_review_context(tenant_id=context.tenant_id, run_id=context.run_id,
+                user_id=context.actor_id, role=context.actor_role)
+            if (bound.request != context.request or bound.mode is not context.mode
+                or bound.execution_token != context.execution_token
+                or _canonical_json_bytes(bound.routing_decision) != _canonical_json_bytes(route)
+                or (budget.tenant_id, budget.run_id, budget.lease.worker_id, budget.lease.token) != (
+                    context.tenant_id, context.run_id, worker, context.execution_token)):
+                return False
+            await budget.require_current()
+            repository = cast(ReviewRunRepository, backend._run_repository)
+            record = await repository.get(context.tenant_id, context.run_id)
+            _trusted_review_context(tenant_id=context.tenant_id, run_id=context.run_id,
+                user_id=context.actor_id, role=context.actor_role, current_record=record)
+            evidence = await repository.load_authenticated_input(context.tenant_id, context.run_id)
+            if (evidence is None or authorization_binding_sha256(evidence) != authorization_binding_sha256(budget.evidence)
+                or evidence.message != context.request or record.worker_id != worker
+                or record.worker_lease_token != context.execution_token
+                or record.worker_lease_expires_at is None
+                or record.worker_lease_expires_at <= datetime.now(UTC)):
+                return False
+            scope = json.loads(evidence.input_scope)
+            if (scope.get("evidence_kind") != "submitted_selection_not_grant"
+                or scope.get("conversation_id") != route.get("conversation_id")):
+                return False
+            expected = {key: route.get(key) for key in ("sandbox_profile", "permission_mode", "requested_permissions")}
+            resolved = {key: scope.get("resolved_selection", {}).get(key) for key in expected}
+            if _canonical_json_bytes(resolved) != _canonical_json_bytes(expected):
+                return False
+            if any(scope.get("selection", {}).get(key) != route.get(key)
+                for key in ("project_id", "workspace_session_id", "conversation_id")):
+                return False
+            if scope.get("selection", {}).get("mode") != context.mode.value:
+                return False
+            budget.check()
+            _trusted_review_context(tenant_id=context.tenant_id, run_id=context.run_id,
+                user_id=context.actor_id, role=context.actor_role)
+            return True
+        except Exception:  # noqa: BLE001 - missing original authority keeps the legacy protocol.
+            return False
+
     async def _runtime_for(self, context: TaskContext) -> ExecutionRuntime:
         pending = self._pending_checkpoints.get(context.run_id)
         checkpoint = context.checkpoint or pending
@@ -964,7 +1050,8 @@ class ConfigBackedDirectRuntime:
             config, logical_model, fallback_policy=fallback_policy,
             routing_decision=context.routing_decision,
         )
-        if action_ready and (action_checkpoint or new_workspace):
+        plain_file = action_ready and await self._pending_plain_file(context)
+        if action_ready and (action_checkpoint or new_workspace or plain_file):
             from agent_hub.runtime.action_direct import ActionApprovedDirectRuntime
 
             assert self._artifact_repository is not None
@@ -976,6 +1063,7 @@ class ConfigBackedDirectRuntime:
                 capability_gateway=self._action_capability_gateway,
                 harness_tool_gateway=self._action_harness_tool_gateway,
                 available_model_attempts=available_model_attempts,
+                plain_file=plain_file,
             )
         return DirectRuntime(
             gateway,
