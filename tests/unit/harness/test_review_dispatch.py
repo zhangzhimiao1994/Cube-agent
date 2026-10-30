@@ -1,6 +1,7 @@
 """Concrete worker/Harness integration; fixed review seam, no provider/PG claims."""
 
 import asyncio
+import os
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -615,6 +616,218 @@ async def test_final_authorization_await_cannot_dispatch_stale_source(
         "baseline.txt"
     ]
     assert not ProjectWorkspaceStore(changed_root).list_files(s.task.tenant_id, "demo", "session")
+
+
+def _point_directory_alias(alias, target):
+    """Real OS alias, not a patched resolver or scanner."""
+    if alias.is_symlink():
+        alias.unlink()
+    elif alias.is_junction():
+        alias.rmdir()  # Remove only the junction, never recursively remove its target.
+    if os.name == "nt":
+        import _winapi
+
+        _winapi.CreateJunction(str(target), str(alias))
+        assert alias.is_junction()
+    else:
+        alias.symlink_to(target, target_is_directory=True)
+        assert alias.is_symlink()
+    assert alias.resolve(strict=True) == target.resolve(strict=True)
+
+
+def _alias_workspace(tmp_path):
+    s = setup(tmp_path)
+    store = ProjectWorkspaceStore(tmp_path)
+    for directory in ("public", "other", "credentials", "node_modules"):
+        store.write_bytes(
+            tenant_id=s.task.tenant_id,
+            project_id="demo",
+            session_id="session",
+            relative_path=f"{directory}/target.txt",
+            data=f"{directory} before".encode(),
+            mime_type="text/plain",
+        )
+    root = store.session_root(s.task.tenant_id, "demo", "session")
+    alias = root / "alias"
+    _point_directory_alias(alias, root / "public")
+    s.request = replace(
+        s.request, arguments={"path": "alias/target.txt", "content": "original content"}
+    )
+    return s, store, root, alias
+
+
+def _workspace_manifest(s, store):
+    return tuple(
+        (f.path, f.sha256, f.size_bytes)
+        for f in store.list_files(s.task.tenant_id, "demo", "session")
+    )
+
+
+@pytest.mark.parametrize("authorization", ["model", "exact"])
+@pytest.mark.parametrize("target", ["other", "credentials", "node_modules"])
+async def test_final_await_alias_target_change_cannot_dispatch(tmp_path, authorization, target):
+    s, store, root, alias = _alias_workspace(tmp_path)
+    before = _workspace_manifest(s, store)
+    assert [row[0] for row in before] == ["other/target.txt", "public/target.txt"]
+    contents = {
+        directory: (root / directory / "target.txt").read_bytes()
+        for directory in ("public", "other", "credentials", "node_modules")
+    }
+    original_policy = s.policy._current_review_policy
+    policy_reads = exact_reads = mutations = 0
+
+    def retarget():
+        nonlocal mutations
+        _point_directory_alias(alias, root / target)
+        mutations += 1
+        assert _workspace_manifest(s, store) == before
+
+    async def policy_reader(*args):
+        nonlocal policy_reads
+        policy_reads += 1
+        result = await original_policy(*args)
+        if authorization == "model" and policy_reads == 5:
+            await asyncio.sleep(0)
+            retarget()
+        return result
+
+    async def exact_reader(_request):
+        nonlocal exact_reads
+        exact_reads += 1
+        if exact_reads == 2:
+            await asyncio.sleep(0)
+            retarget()
+        return True
+
+    s.policy._current_review_policy = policy_reader
+    if authorization == "exact":
+        s.runs.exact = True
+        s.policy._exact_human_approval_getter = exact_reader
+    result = await invoke(s)
+    assert mutations == 1
+    assert (policy_reads if authorization == "model" else exact_reads) == (
+        5 if authorization == "model" else 2
+    )
+    assert len(s.reviewer.calls) == len(s.permits.consumes) == (authorization == "model")
+    if authorization == "model":
+        action = s.reviewer.calls[0][0]
+        assert action.request().arguments["path"] == "alias/target.txt"
+        assert action.to_payload()["normalized_effect"]["target"] == "public/target.txt"
+    assert s.runs.waits == []
+    assert s.calls == [], result
+    assert result.status == "failed"
+    assert _workspace_manifest(s, store) == before
+    assert {
+        directory: (root / directory / "target.txt").read_bytes() for directory in contents
+    } == contents
+
+
+@pytest.mark.parametrize("authorization", ["model", "exact"])
+async def test_unchanged_alias_target_uses_owned_path(tmp_path, authorization):
+    s, _store, root, _alias = _alias_workspace(tmp_path)
+
+    def mutate_original():
+        object.__setattr__(
+            s.request, "arguments", {"path": "credentials/target.txt", "content": "changed"}
+        )
+
+    if authorization == "model":
+
+        async def reviewed(_snapshot=None):
+            mutate_original()
+
+        s.reviewer.hook = reviewed
+    else:
+        s.runs.exact = True
+        reads = 0
+
+        async def exact_reader(_request):
+            nonlocal reads
+            reads += 1
+            if reads == 2:
+                mutate_original()
+            return True
+
+        s.policy._exact_human_approval_getter = exact_reader
+    result = await invoke(s)
+    assert result.status == "succeeded", result
+    assert len(s.calls) == 1
+    assert dict(s.calls[0]["arguments"]) == {
+        "path": "alias/target.txt",
+        "content": "original content",
+    }
+    assert (root / "public" / "target.txt").read_bytes() == b"original content"
+    assert (root / "credentials" / "target.txt").read_bytes() == b"credentials before"
+    assert len(s.reviewer.calls) == len(s.permits.consumes) == (authorization == "model")
+
+
+async def test_exact_explicit_private_target_is_not_model_authority(tmp_path):
+    s, _store, root, _alias = _alias_workspace(tmp_path)
+    s.request = replace(
+        s.request, arguments={"path": "credentials/target.txt", "content": "manual content"}
+    )
+    s.runs.exact = True
+    result = await invoke(s)
+    assert result.status == "succeeded", result
+    assert len(s.calls) == 1
+    assert (root / "credentials" / "target.txt").read_bytes() == b"manual content"
+    assert s.reviewer.calls == s.permits.consumes == s.runs.waits == []
+
+
+@pytest.mark.parametrize("target", ["credentials", "node_modules"])
+async def test_initial_private_alias_still_requires_human(tmp_path, target):
+    s, _store, root, alias = _alias_workspace(tmp_path)
+    _point_directory_alias(alias, root / target)
+    result = await invoke(s)
+    assert result.status == "failed"
+    assert len(s.runs.waits) == 1
+    assert s.calls == s.reviewer.calls == s.permits.consumes == []
+
+
+@pytest.mark.parametrize("authorization", ["model", "exact"])
+@pytest.mark.parametrize("callback_result", ["none", "allow", "deny", "retarget"])
+async def test_dispatch_check_await_precedes_final_target_guard(
+    tmp_path, authorization, callback_result
+):
+    s, store, root, alias = _alias_workspace(tmp_path)
+    before = _workspace_manifest(s, store)
+    callback_calls = 0
+
+    async def dispatch_check():
+        nonlocal callback_calls
+        callback_calls += 1
+        # This hook is AFTER authorization/one-use consumption; it cannot mint
+        # another review or execution grant, and failures leave the permit spent.
+        assert len(s.reviewer.calls) == len(s.permits.consumes) == (authorization == "model")
+        assert s.calls == []
+        await asyncio.sleep(0)
+        if callback_result == "deny":
+            raise RuntimeError("private callback details")
+        if callback_result == "retarget":
+            _point_directory_alias(alias, root / "credentials")
+            assert _workspace_manifest(s, store) == before
+
+    s.harness._review_gate = type(s.gate)(
+        s.loader,
+        s.reviewer,
+        s.permits,
+        dispatch_check=None if callback_result == "none" else dispatch_check,
+    )
+    s.runs.exact = authorization == "exact"
+    result = await invoke(s)
+    allowed = callback_result in {"none", "allow"}
+    assert callback_calls == (callback_result != "none")
+    assert result.status == ("succeeded" if allowed else "failed"), result
+    assert len(s.calls) == allowed
+    assert len(s.reviewer.calls) == len(s.permits.consumes) == (authorization == "model")
+    assert s.runs.waits == []
+    assert (root / "credentials" / "target.txt").read_bytes() == b"credentials before"
+    assert (root / "public" / "target.txt").read_bytes() == (
+        b"original content" if allowed else b"public before"
+    )
+    if not allowed:
+        assert _workspace_manifest(s, store) == before
+    assert "private callback details" not in str(result.to_payload())
 
 
 @pytest.mark.parametrize("tool,sandbox", [("unknown.command", "systemd"), ("vendor.echo", "mcp")])

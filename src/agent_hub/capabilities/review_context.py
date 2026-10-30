@@ -92,6 +92,15 @@ def _check_cancelled() -> None:
         raise asyncio.CancelledError
 
 
+def _require_reviewable_target(path: str, target: str) -> None:
+    if any(
+        project_private_entry(part) or part.casefold() in _EXCLUDED_WORKSPACE_DIRECTORIES
+        for part in (*_path_parts(path), *_path_parts(target))
+    ):
+        # The manifest deliberately excludes these paths; never infer model authority.
+        raise ValueError("review action requires human")
+
+
 @dataclass(frozen=True, slots=True)
 class _Fence:
     data: bytes = field(repr=False)
@@ -327,13 +336,7 @@ class TrustedReviewContextLoader:
         if source["contracts"] or path == "DELIVERY_MANIFEST.json":
             raise ValueError("review action requires human")
         target = self._effect_target(fence, path)
-        if any(
-            project_private_entry(part) or part.casefold() in _EXCLUDED_WORKSPACE_DIRECTORIES
-            for part in (*_path_parts(path), *_path_parts(target))
-        ):
-            # The existing source manifest intentionally excludes these trees.
-            # Do not assert completeness or send private targets to the reviewer.
-            raise ValueError("review action requires human")
+        _require_reviewable_target(path, target)
         effect = {
             "operation": "workspace.write_text",
             "scope": {
@@ -380,8 +383,11 @@ class ConcreteModelReviewGate:
         loader: TrustedReviewContextLoader,
         service: ConcreteReviewService,
         repository: ConcreteReviewRepository,
+        *,
+        dispatch_check: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         self.loader, self.service, self.repository = loader, service, repository
+        self.dispatch_check = dispatch_check
 
     def invocation(
         self, *, tool_name: str, backend: object, backend_getter: Callable[[], object]
@@ -453,6 +459,14 @@ class _ConcreteReviewCall:
             # is rechecked against the live worker/config/policy at dispatch.
             try:
                 self._require_same_backend()
+                path: str | None = None
+                target: str | None = None
+                if self.tool_name == "workspace.write_text" and request.tool_origin == "builtin":
+                    owned_path = request.arguments.get("path")
+                    if not isinstance(owned_path, str):
+                        raise TypeError("review target unavailable")
+                    path = owned_path
+                    target = self.gate.loader._effect_target(fence, path)
                 source = await self.gate.loader.source(fence)
             except Exception:  # noqa: BLE001 - exact authorization still needs live Root continuity.
                 return await human_wait()
@@ -468,7 +482,7 @@ class _ConcreteReviewCall:
                 )
 
             self._check = exact_check
-            self._set_source_check(fence, source)
+            self._set_source_check(fence, source, path=path, target=target)
             return CapabilityResult(CapabilityStatus.ALLOWED, request.run_id)
         if route == "human_only":
             return await human_wait()
@@ -477,6 +491,14 @@ class _ConcreteReviewCall:
             snapshot, live, captured = await self.gate.loader.load(
                 request, role, policy, tool_name=self.tool_name
             )
+            # Keep the original path AND resolved effect from the owned Task1
+            # bytes. Never re-establish the expected target after a later await.
+            reviewed_path = snapshot.request().arguments.get("path")
+            reviewed_target = _freeze_object(
+                snapshot.to_payload()["normalized_effect"], name="reviewed effect"
+            ).get("target")
+            if not isinstance(reviewed_path, str) or not isinstance(reviewed_target, str):
+                raise TypeError("review target unavailable")
         except Exception:  # noqa: BLE001 - unsupported/missing materials require precise human consent.
             return await human_wait()
         try:
@@ -532,6 +554,9 @@ class _ConcreteReviewCall:
                 _freeze_object(
                     snapshot.to_payload()["source_binding"], name="reviewed dispatch source"
                 ),
+                path=reviewed_path,
+                target=reviewed_target,
+                model_review=True,
             )
             self._budget = live.budget
             return CapabilityResult(CapabilityStatus.ALLOWED, request.run_id)
@@ -551,10 +576,24 @@ class _ConcreteReviewCall:
         ):
             raise ValueError("review Root backend mismatch")
 
-    def _set_source_check(self, fence: _Fence, source: Mapping[str, JsonValue]) -> None:
+    def _set_source_check(
+        self,
+        fence: _Fence,
+        source: Mapping[str, JsonValue],
+        *,
+        path: str | None = None,
+        target: str | None = None,
+        model_review: bool = False,
+    ) -> None:
         def check() -> None:
             self._require_same_backend()
             self.gate.loader._require_source_current(fence, source)
+            if path is not None:
+                current_target = self.gate.loader._effect_target(fence, path)
+                if model_review:
+                    _require_reviewable_target(path, current_target)
+                if current_target != target:
+                    raise ValueError("review target changed")
 
         self._source_check = check
 
@@ -567,6 +606,8 @@ class _ConcreteReviewCall:
             valid = await self._check()
             if not valid:
                 return False
+            if self.gate.dispatch_check is not None:
+                await self.gate.dispatch_check()
             if self._source_check is not None:
                 self._source_check()
             # Nothing asynchronous may follow these revocation checks before
