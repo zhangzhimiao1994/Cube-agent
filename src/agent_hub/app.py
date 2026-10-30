@@ -49,6 +49,7 @@ from agent_hub.auth.service import AuthService
 from agent_hub.auth.tokens import AccessTokenService
 from agent_hub.auth.user_admin import PersistentUserAdminService
 from agent_hub.capabilities.defaults import build_runtime_capability_stack
+from agent_hub.capabilities.review_contracts import ApprovalReviewConfig
 from agent_hub.capabilities.tools.registry import CompositeCapabilityManifestSource
 from agent_hub.capability_installer.environment import CapabilityEnvironmentManager
 from agent_hub.capability_installer.scoped_probe import build_scoped_cli_probe
@@ -162,6 +163,11 @@ from agent_hub.runtime.invalidation import (
     StrictReloadRuntimeAdapter,
 )
 from agent_hub.runtime.registry import RuntimeRegistry
+from agent_hub.runtime.review_assembly import (
+    ReviewAssemblyBroker,
+    assemble_review_capability_stack,
+    build_review_broker,
+)
 from agent_hub.scheduler.service import (
     SCHEDULER_ADVISORY_LOCK_KEY,
     SCHEDULER_CLAIM_RECORD_TYPE,
@@ -1243,6 +1249,7 @@ def create_app(
         active_redis = redis_client
         active_sessions = session_factory
         active_mode_router = mode_router
+        review_broker: ReviewAssemblyBroker | None = None
         cleanup_callbacks: list[CleanupCallback] = []
         token_service = (
             AccessTokenService(configured.jwt_signing_key_value()) if auth_service is None else None
@@ -1581,8 +1588,19 @@ def create_app(
                             ),
                         )
                     )
+                    async def review_config(tenant_id: UUID) -> ApprovalReviewConfig:
+                        return (await _admin_settings_getter_for_tenant(
+                            admin_service_for_capabilities, tenant_id,
+                        )()).approval_review
+
+                    review_broker = build_review_broker(
+                        config_service=ConfigService(active_sessions), config_getter=review_config,
+                        run_repository=capability_run_repository, session_factory=active_sessions,
+                        secret_service=active_secret_service, redis_client=active_redis,
+                    )
+                    application.state.review_assembly_broker = review_broker
                     capability_stack_builder = partial(
-                        build_runtime_capability_stack,
+                        assemble_review_capability_stack, review_broker, build_runtime_capability_stack,
                         tenant_id=configured.bootstrap_tenant_id,
                         run_repository=capability_run_repository,
                         skill_store_dir=configured.skill_store_dir,
@@ -1686,6 +1704,7 @@ def create_app(
 
                 application.state.run_service = RunService(
                     RunRepository(active_sessions),
+                    review_broker=review_broker,
                     conversation_artifact_repository=artifact_repository,
                     project_input_preparer=getattr(application.state, 'project_input_preparer', None),
                     terminal_run_hooks=tuple(hook for hook in (

@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from agent_hub.api.routers import admin
 from agent_hub.capabilities.defaults import build_runtime_capability_stack
 from agent_hub.capabilities.python_project_lifecycle import PythonProjectTerminalHook
+from agent_hub.capabilities.review_contracts import ApprovalReviewConfig
 from agent_hub.capabilities.tools.registry import CompositeCapabilityManifestSource
 from agent_hub.config.service import ConfigService
 from agent_hub.db.session import Database, build_database
@@ -42,6 +43,7 @@ from agent_hub.runtime.invalidation import (
     RuntimeConfigInvalidationBus,
     StrictReloadRuntimeAdapter,
 )
+from agent_hub.runtime.review_assembly import assemble_review_capability_stack, build_review_broker
 from agent_hub.security.secrets import SecretCipher, SecretService
 from agent_hub.settings import Settings, get_settings
 
@@ -333,8 +335,16 @@ def build_worker_service(
             dependency_policy=plugin_dependency_policy,
         ),
     )
+    async def review_config(tenant_id: UUID) -> ApprovalReviewConfig:
+        return (await _admin_settings_getter_for_tenant(admin_service, tenant_id)()).approval_review
+
+    review_broker = build_review_broker(
+        config_service=config_service, config_getter=review_config,
+        run_repository=run_repository, session_factory=database.session_factory,
+        secret_service=secret_service, redis_client=redis_client,
+    )
     capability_stack_builder = partial(
-        build_runtime_capability_stack,
+        assemble_review_capability_stack, review_broker, build_runtime_capability_stack,
         tenant_id=settings.bootstrap_tenant_id,
         run_repository=run_repository,
         skill_store_dir=settings.skill_store_dir,
@@ -370,6 +380,7 @@ def build_worker_service(
     ) if hook is not None)
     service = RunService(
         run_repository,
+        review_broker=review_broker,
         conversation_artifact_repository=artifact_repository,
         project_input_preparer=runtime_capability_stack.project_input_preparer,
         instruction_context_loader=InstructionContextLoader(

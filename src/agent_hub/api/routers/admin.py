@@ -2306,6 +2306,7 @@ class SystemSettingsRequest(BaseModel):
 
 
 class SystemSettingsResponse(SystemSettingsRequest):
+    _runtime_review_readiness: ApprovalReviewReadiness | None = PrivateAttr(default=None)
     supported_permission_modes: tuple[Literal["default", "auto_review", "read_only"], ...] = (
         "default", "auto_review", "read_only",
     )
@@ -2313,6 +2314,8 @@ class SystemSettingsResponse(SystemSettingsRequest):
     @computed_field
     def approval_review_readiness(self) -> ApprovalReviewReadiness:
         # Stored configuration is never evidence of an assembled review runtime.
+        if self._runtime_review_readiness is not None:
+            return self._runtime_review_readiness
         return ApprovalReviewReadiness(
             reason_code=(
                 "rules_only" if self.approval_review.engine == "rules" else "runtime_not_ready"
@@ -2379,6 +2382,19 @@ def _settings_with_runtime_status(
     return settings.model_copy(
         update={"plugin_package_subprocess_registration_status": status}
     )
+
+
+async def _settings_with_review_runtime_status(
+    settings: SystemSettingsResponse, request: Request, tenant_id: UUID,
+) -> SystemSettingsResponse:
+    from agent_hub.runtime.review_assembly import ReviewAssemblyBroker
+
+    response = _settings_with_runtime_status(settings, request)
+    broker = getattr(request.app.state, "review_assembly_broker", None)
+    # A settings payload or arbitrary app.state dictionary cannot assert ready.
+    if type(broker) is ReviewAssemblyBroker:
+        response._runtime_review_readiness = await broker.readiness(tenant_id, expected_config=settings.approval_review)
+    return response
 
 
 def _persisted_system_settings_payload(
@@ -18705,7 +18721,7 @@ async def get_settings(
     service: Annotated[AdminResourceService, Depends(_service)],
 ) -> SystemSettingsResponse:
     _require(principal, "config:read")
-    return _settings_with_runtime_status(await service.get_settings(), request)
+    return await _settings_with_review_runtime_status(await service.get_settings(), request, principal.tenant_id)
 
 
 @router.get(
@@ -18746,7 +18762,7 @@ async def update_settings(
                 "execution backend is unavailable",
                 details={"backend": body.default_execution_backend, "reason": reason or "unknown"},
             )
-    return _settings_with_runtime_status(await service.update_settings(body), request)
+    return await _settings_with_review_runtime_status(await service.update_settings(body), request, principal.tenant_id)
 
 
 @router.post(

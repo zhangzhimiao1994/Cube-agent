@@ -10,6 +10,7 @@ from typing import Annotated, Literal
 from pydantic import (
     BaseModel,
     ConfigDict,
+    Field,
     GetJsonSchemaHandler,
     PlainSerializer,
     PlainValidator,
@@ -51,10 +52,31 @@ ApprovalReviewSettings = Annotated[
 ]
 
 
+ApprovalReviewReadinessReason = Literal[
+    "ready",
+    "rules_only",
+    "runtime_not_ready",
+    "model_alias_missing",
+    "metadata_missing",
+    "pricing_missing",
+    "capability_missing",
+    "provider_contract_missing",
+    "current_mode_fence_unverified",
+    "transport_unsupported",
+    "secret_unavailable",
+    "evidence_invalid",
+    "configuration_changed",
+    "review_budget_insufficient",
+]
+
+
 class ApprovalReviewReadiness(BaseModel):
     """Fail-closed projection until Task6B supplies trusted assembled runtime state."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    status: Literal["not_ready"] = "not_ready"
-    reason_code: Literal["rules_only", "runtime_not_ready"]
+    status: Literal["ready", "not_ready"] = "not_ready"
+    reason_code: ApprovalReviewReadinessReason
+    supported_scope: tuple[Literal["fresh_original_run", "workspace.write_text"], ...] = Field(
+        default=(), exclude_if=lambda value: not value,
+    )

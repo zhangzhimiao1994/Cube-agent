@@ -97,6 +97,7 @@ from agent_hub.subprocess_cleanup import ProcessCleanupIncomplete
 
 if TYPE_CHECKING:
     from agent_hub.runs.conversation_inputs import ConversationInputs
+    from agent_hub.runtime.review_assembly import ReviewAssemblyBroker
 
 _LOGGER = logging.getLogger(__name__)
 _AUTO_RESOLVE_MAX_SINGLE_COST_USD = Decimal("0.50")
@@ -558,6 +559,7 @@ class RunService:
         conversation_queue_repository: ConversationQueueRepository | None = None,
         conversation_preview_stopper: Callable[[UUID, str], Awaitable[None]] | None = None,
         project_input_preparer: Callable[[TaskContext], Awaitable[TaskContext]] | None = None,
+        review_broker: ReviewAssemblyBroker | None = None,
     ) -> None:
         self._repository = repository
         self._instruction_context_loader = instruction_context_loader
@@ -566,6 +568,7 @@ class RunService:
         self._conversation_queue_repository = conversation_queue_repository
         self._conversation_preview_stopper = conversation_preview_stopper
         self._project_input_preparer = project_input_preparer
+        self._review_broker = review_broker
         self._runtime_registry = runtime_registry
         self._router = router
         self._queue = task_queue
@@ -788,6 +791,18 @@ class RunService:
             operator_selection["runtime_timeout_seconds"] = cleaned_runtime_timeout
             operator_selection["runtime_timeout_absolute_seconds"] = cleaned_runtime_timeout
             operator_selection["runtime_timeout_source"] = "operator"
+        if self._review_broker is not None and authenticated_input is not None:
+            operator_selection.update(await self._review_broker.submission_profile(
+                tenant_id, timeout_seconds=(
+                    _explicit_runtime_timeout_seconds(operator_selection.get("runtime_timeout_absolute_seconds"))
+                    or _routing_runtime_timeout_seconds(operator_selection, progress_units=0)
+                    or self._runtime_timeout_seconds
+                ),
+            ))
+            if "approval_review_profile" in operator_selection:
+                operator_selection = _with_runtime_token_budget_policy(
+                    operator_selection, configured_tokens=self._runtime_token_budget, mode=mode,
+                )
         if channel_context:
             operator_selection.update(_safe_channel_context(channel_context))
         evolution_proposal = None
@@ -2524,6 +2539,7 @@ class RunService:
                     runtime,
                     context,
                     worker_id=self._worker_id,
+                    review_broker=self._review_broker,
                     configured_tokens=self._runtime_token_budget,
                     routing_decision=runtime_routing_decision,
                     initial_progress_units=checkpoint_progress_units,
@@ -6566,6 +6582,7 @@ async def _adaptive_runtime_events(
     initial_artifact_progress_keys: Mapping[str, str | None] | None = None,
     meaningful_progress: bool = True,
     worker_id: str | None = None,
+    review_broker: ReviewAssemblyBroker | None = None,
 ) -> AsyncGenerator[RunEvent, None]:
     progress_units = max(0, initial_progress_units)
     seen_tool_calls: set[str] = set()
@@ -6573,7 +6590,7 @@ async def _adaptive_runtime_events(
     seen_artifacts: set[str] = set(artifact_keys)
     seen_progress_keys = {key for key in artifact_keys.values() if key is not None}
     metadata_artifact_ids = set(non_progress_artifact_ids)
-    async with worker_runtime_events(runtime, context, worker_id=worker_id) as stream:
+    async with worker_runtime_events(runtime, context, worker_id=worker_id, review_broker=review_broker) as stream:
         async for event in stream:
             new_artifact_key = None
             if event.artifact is not None:

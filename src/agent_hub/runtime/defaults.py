@@ -946,13 +946,9 @@ class ConfigBackedDirectRuntime:
                          and engineering_scope(context)
                          and context.routing_decision.get('execution_backend', 'systemd') == 'systemd'
                          and context.routing_decision.get('permission_mode', 'default') in ('default', 'auto_review'))
-        current = await self._config_service.get_current(context.tenant_id)
-        if current is None:
+        config = await _current_platform_config(self._config_service, context.tenant_id, context.routing_decision)
+        if config is None:
             return UnavailableRuntime(TaskMode.DIRECT)
-        config = PlatformConfig.model_validate(current.document)
-        if not config.models:
-            return UnavailableRuntime(TaskMode.DIRECT)
-        config = _scope_runtime_model_config(config, context.routing_decision)
         try:
             gateway, logical_model, fallback_policy = await _gateway_for_config(
                 config,
@@ -1780,6 +1776,11 @@ async def _current_platform_config(
     tenant_id: UUID,
     routing_decision: Mapping[str, JsonValue] | None = None,
 ) -> PlatformConfig | None:
+    from agent_hub.runtime.review_assembly import current_review_platform
+
+    pinned = current_review_platform(tenant_id)
+    if pinned is not None:
+        return _scope_runtime_model_config(pinned, routing_decision)
     current = await config_service.get_current(tenant_id)
     if current is None:
         return None
@@ -1848,8 +1849,10 @@ async def _gateway_for_config(
     transport: ModelTransport,
     routing_decision: object | None = None,
 ) -> tuple[ModelGateway, str, FallbackExecutionPolicy]:
+    from agent_hub.runtime.review_assembly import review_deployments
+
     logical_model = _direct_logical_model(config, routing_decision)
-    deployments = _deployments(config)
+    deployments = review_deployments(_deployments(config))
     try:
         fallback_policy = fallback_execution_policy_from_decision(routing_decision)
         selection_policy = model_selection_policy_from_decision(routing_decision)
