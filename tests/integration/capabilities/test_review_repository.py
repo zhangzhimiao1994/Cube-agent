@@ -637,10 +637,14 @@ async def test_populated_downgrade_refuses_and_model_migration_parity(ctx):
                 "agent_hub_review_events",
             ):
                 actual = {
-                    c["name"]: (str(c["type"]), c["nullable"]) for c in inspector.get_columns(name)
+                    c["name"]: _column_parity_signature(
+                        c["type"], c["nullable"], dialect=sync.dialect
+                    )
+                    for c in inspector.get_columns(name)
                 }
                 expected = {
-                    c.name: (str(c.type), c.nullable) for c in Base.metadata.tables[name].columns
+                    c.name: _column_parity_signature(c.type, c.nullable, dialect=sync.dialect)
+                    for c in Base.metadata.tables[name].columns
                 }
                 assert actual == expected
 
@@ -651,6 +655,13 @@ async def test_populated_downgrade_refuses_and_model_migration_parity(ctx):
             )
         await s.rollback()
     assert await counts(ctx) == [1, 1, 1, 1, 0]
+
+
+def _column_parity_signature(sql_type, nullable, *, dialect):
+    # Compare actual PostgreSQL DDL, not generic display aliases (DATETIME vs
+    # reflected TIMESTAMP). Preserve length/precision/scale and explicitly
+    # retain timezone and nullability; complete column dictionaries stay exact.
+    return sql_type.compile(dialect=dialect), getattr(sql_type, "timezone", None), nullable
 
 
 def _downgrade(mod, operations):
