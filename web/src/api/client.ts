@@ -257,6 +257,14 @@ const ReviewCostSchema = z.string().refine((value) => {
   const scale = (mantissa.split(".")[1]?.length ?? 0) - Number(exponent);
   return scale <= 6 && Number.isFinite(Number(value)) && Number(value) >= 0 && Number(value) <= 1_000_000;
 }, "审查预算须为 0 至 1000000 的十进制字符串，最多六位小数。");
+const REVIEW_INT64_FIELDS = new Set([
+  "max_reviews_per_run", "denial_breaker_consecutive", "denial_breaker_denials", "denial_breaker_window",
+]);
+// UI-entered numbers stay safe integers; only exact response tokens become bigint.
+const StoredReviewCountSchema = z.union([
+  z.number().int().min(1).max(Number.MAX_SAFE_INTEGER),
+  z.bigint().min(1n).max(9223372036854775807n),
+], { error: "审查计数须为安全范围内的正整数；服务器已有的精确 int64 值可原样保留。" });
 const ApprovalReviewConfigSchema = z.object({
   schema_version: z.literal(1).default(1),
   engine: z.enum(["rules", "rules_then_model"]).default("rules"),
@@ -265,12 +273,12 @@ const ApprovalReviewConfigSchema = z.object({
   timeout_seconds: z.number({ error: "审查超时须为有效数字。" }).min(1, "审查超时须在 1 至 60 秒之间。").max(60, "审查超时须在 1 至 60 秒之间。").default(15),
   max_input_tokens: z.number({ error: "输入 token 上限须为有效数字。" }).int("输入 token 上限须为整数。").min(1, "输入 token 上限至少为 1。").max(1_000_000, "输入 token 上限不能超过 1000000。").default(4096),
   max_output_tokens: z.number({ error: "输出 token 上限须为有效数字。" }).int("输出 token 上限须为整数。").min(1, "输出 token 上限至少为 1。").max(1_000_000, "输出 token 上限不能超过 1000000。").default(512),
-  max_reviews_per_run: z.number({ error: "审查次数须为有效数字。" }).int("审查次数须为整数。").min(1, "审查次数至少为 1。").max(Number.MAX_SAFE_INTEGER, "审查次数不能超过安全整数范围。").default(8),
+  max_reviews_per_run: StoredReviewCountSchema.default(8),
   max_transport_attempts_per_review: z.literal(1).default(1),
   max_cost_usd_per_run: ReviewCostSchema.default("0.00"),
-  denial_breaker_consecutive: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER).default(3),
-  denial_breaker_denials: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER).default(10),
-  denial_breaker_window: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER).default(50),
+  denial_breaker_consecutive: StoredReviewCountSchema.default(3),
+  denial_breaker_denials: StoredReviewCountSchema.default(10),
+  denial_breaker_window: StoredReviewCountSchema.default(50),
 }).strict().superRefine((value, context) => {
   if (value.engine === "rules_then_model" && !value.reviewer_logical_model) context.addIssue({ code: "custom", message: "请选择已有审查模型 alias。" });
   if (value.engine === "rules_then_model" && Number(value.max_cost_usd_per_run) <= 0) context.addIssue({ code: "custom", message: "独立模型审查预算必须大于 0。" });
@@ -331,6 +339,26 @@ export type SystemSettings = Omit<z.infer<typeof SystemSettingsSchema>, "approva
 const SystemSettingsWriteSchema = SystemSettingsSchema.omit({
   supported_permission_modes: true, approval_review_readiness: true, plugin_package_subprocess_registration_status: true,
 });
+
+async function readSettingsResponse(response: Response): Promise<unknown> {
+  return JSON.parse(await response.text(), (key: string, value: unknown, context?: { source: string }) => {
+    if (!REVIEW_INT64_FIELDS.has(key) || typeof value !== "number" || Number.isSafeInteger(value)) return value;
+    // Never reconstruct an integer from the already-rounded JS number.
+    if (!context?.source || !/^-?\d+$/.test(context.source)) {
+      throw new ApiError("当前浏览器无法无损读取审查计数，请更新浏览器后重试。", response.status, "invalid_response");
+    }
+    return BigInt(context.source);
+  });
+}
+
+function serializeSettingsBody({ approval_review, ...settings }: { approval_review: ApprovalReviewConfig } & Record<string, unknown>): string {
+  // The validated review contract is flat. Emit its exact int64 values as JSON
+  // numbers without a global bigint hook, string sentinel, or JSON.rawJSON dependency.
+  const fields = Object.entries(approval_review).map(([key, value]) =>
+    `${JSON.stringify(key)}:${typeof value === "bigint" ? value.toString() : JSON.stringify(value)}`,
+  );
+  return `${JSON.stringify(settings).slice(0, -1)},"approval_review":{${fields.join(",")}}}`;
+}
 
 const ExecutionBackendSchema = z.object({
   id: z.enum(["systemd", "docker", "ssh", "modal", "daytona", "vercel"]),
@@ -2211,6 +2239,7 @@ async function request<T>(
   path: string,
   init: RequestInit,
   schema: z.ZodType<T>,
+  decodeResponse?: (response: Response) => Promise<unknown>,
 ): Promise<T> {
   let response: Response;
   const token = currentAccessToken();
@@ -2233,7 +2262,7 @@ async function request<T>(
   }
   let payload: unknown;
   try {
-    payload = await response.json();
+    payload = decodeResponse ? await decodeResponse(response) : await response.json();
   } catch (error) {
     if (error instanceof TypeError || (error instanceof DOMException && error.name === "AbortError")) {
       throw new ApiError("network response interrupted", 0, "network_error");
@@ -2652,7 +2681,7 @@ export const api = {
     );
   },
   settings(): Promise<SystemSettings> {
-    return request("/api/v1/admin/settings", { method: "GET" }, SystemSettingsSchema);
+    return request("/api/v1/admin/settings", { method: "GET" }, SystemSettingsSchema, readSettingsResponse);
   },
   executionBackends(): Promise<ExecutionBackend[]> {
     return request(
@@ -2669,8 +2698,9 @@ export const api = {
       : legacy;
     return request(
       "/api/v1/admin/settings",
-      { method: "PUT", body: JSON.stringify(body) },
+      { method: "PUT", body: serializeSettingsBody(body) },
       SystemSettingsSchema,
+      readSettingsResponse,
     );
   },
   createOpenClawOperationFromRun(runId: string): Promise<OpenClawOperation> {

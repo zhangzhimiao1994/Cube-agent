@@ -13,6 +13,45 @@ function serve(extra: Record<string, unknown> = {}) {
 }
 afterEach(() => vi.unstubAllGlobals());
 describe("approval review settings transport", () => {
+  it.each([
+    ["max_reviews_per_run", "9007199254740992"],
+    ["denial_breaker_window", "9007199254740992"],
+    ["max_reviews_per_run", "9007199254740993"],
+    ["denial_breaker_consecutive", "9007199254740993"],
+    ["denial_breaker_denials", "9007199254740993"],
+    ["denial_breaker_window", "9223372036854775807"],
+  ])("preserves raw int64 %s=%s while changing other settings", async (field, rawInteger) => {
+    const fields = field === "denial_breaker_consecutive"
+      ? [field, "denial_breaker_denials", "denial_breaker_window"]
+      : field === "denial_breaker_denials" ? [field, "denial_breaker_window"] : [field];
+    let raw = JSON.stringify({ ...legacy, approval_review: expectedReview });
+    for (const key of fields) raw = raw.replace(new RegExp(`"${key}":\\d+`), `"${key}":${rawInteger}`);
+    const fetcher = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) => new Response(raw, { headers: { "Content-Type": "application/json" } }));
+    vi.stubGlobal("fetch", fetcher);
+    const settings = await api.settings();
+    expect(settings.approval_review?.[field as "max_reviews_per_run"]).toBe(BigInt(rawInteger));
+    await api.updateSettings({ ...settings, log_level: "error" });
+    const body = String(fetcher.mock.calls.at(-1)?.[1]?.body);
+    for (const key of fields) expect(body).toMatch(new RegExp(`"${key}":${rawInteger}(?=[,}])`));
+    expect(body).toContain('"log_level":"error"');
+    expect(body).not.toContain('"approval_review_readiness"');
+  });
+  it("still rejects unsafe new numeric input and out-of-range raw int64", async () => {
+    const review = { ...defaultApprovalReview(), max_reviews_per_run: 9007199254740992 };
+    expect(() => validateApprovalReview(review)).toThrow();
+    const raw = JSON.stringify({ ...legacy, approval_review: expectedReview }).replace('"max_reviews_per_run":8', '"max_reviews_per_run":9223372036854775808');
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(raw)));
+    await expect(api.settings()).rejects.toThrow();
+  });
+  it("does not pretend a rounded number is exact when raw source context is unavailable", async () => {
+    const raw = JSON.stringify({ ...legacy, approval_review: expectedReview }).replace('"max_reviews_per_run":8', '"max_reviews_per_run":9007199254740993');
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(raw)));
+    const parse = JSON.parse;
+    const spy = vi.spyOn(JSON, "parse").mockImplementation((text, reviver) => parse(text, reviver
+      ? function (key, value) { return reviver.call(this, key, value); } : undefined));
+    try { await expect(api.settings()).rejects.toThrow(/无法无损读取审查计数/); }
+    finally { spy.mockRestore(); }
+  });
   it("parses legacy missing fields into rules without inventing ready", async () => {
     serve(); const settings = await api.settings();
     expect(settings.approval_review).toEqual(expectedReview);

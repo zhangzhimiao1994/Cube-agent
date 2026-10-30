@@ -30,7 +30,8 @@ export function approvalReviewPresentation(settings?: {
     current_mode_fence_unverified: "当前权限边界尚未验证，请联系管理员完成服务配置。",
     transport_unsupported: "服务尚不支持该模型的调用方式，请选择受支持的模型。",
   };
-  const reason = reasons[settings.approval_review_readiness?.reason_code ?? ""] ?? "服务器尚未确认模型审查可用，请检查服务配置。";
+  const code = settings.approval_review_readiness?.reason_code ?? "";
+  const reason = Object.hasOwn(reasons, code) ? reasons[code] : "服务器尚未确认模型审查可用，请检查服务配置。";
   return { summary: "模型未就绪", status: `独立模型审查未就绪：${reason}`,
     description: `模型未就绪：${reason}规则审查仍可选择，需审批的动作由人工确认。` };
 }

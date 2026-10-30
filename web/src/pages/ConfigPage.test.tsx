@@ -7,7 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
 
 import { TestApp } from "../app/router";
-import { api } from "../api/client";
+import { api, defaultApprovalReview } from "../api/client";
 import { AuthProvider, useAuth } from "../auth/AuthProvider";
 import { ConfigPage } from "./ConfigPage";
 
@@ -388,6 +388,32 @@ describe("ConfigPage", () => {
     expect(await screen.findByText("设置服务暂不可用")).toBeTruthy();
     expect(screen.queryByText(/系统设置已保存，并会/)).toBeNull();
     expect(screen.getByLabelText("独立模型审查状态").textContent).toContain("仅规则审查");
+  });
+
+  it.each(["max_reviews_per_run", "denial_breaker_window"])("loads raw int64 %s and saves another setting without rounding", async (field) => {
+    const fixtureFetch = globalThis.fetch;
+    let raw = JSON.stringify({ ...settings, approval_review: defaultApprovalReview() })
+      .replace(new RegExp(`"${field}":\\d+`), `"${field}":9007199254740993`);
+    let savedBody = "";
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (new URL(String(input), "https://agent-hub.test").pathname !== "/api/v1/admin/settings") return fixtureFetch(input, init);
+      if (init?.method === "PUT") {
+        savedBody = String(init.body);
+        raw = savedBody.slice(0, -1) + ',"supported_permission_modes":["default","auto_review","read_only"]}';
+      }
+      return new Response(raw, { headers: { "Content-Type": "application/json" } });
+    }));
+    const user = userEvent.setup(); render(<TestApp initialPath="/config" />);
+    await screen.findByLabelText("审查引擎");
+    if (field === "max_reviews_per_run") {
+      expect((screen.getByLabelText("每次运行最多审查次数") as HTMLInputElement).value).toBe("9007199254740993");
+    }
+    await user.click(screen.getByLabelText("启用 Hermes 学习，但不绕过审批"));
+    await user.click(screen.getByRole("button", { name: "保存系统设置" }));
+    await screen.findByText(/系统设置已保存，并会/);
+    expect(savedBody).toContain(`"${field}":9007199254740993`);
+    expect(savedBody).toContain('"hermes_enabled":false');
+    expect(screen.queryByText(/系统设置加载失败/)).toBeNull();
   });
 
   it("does not read or expose settings until the authenticated identity is loaded", async () => {

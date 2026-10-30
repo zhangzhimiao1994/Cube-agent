@@ -55,3 +55,10 @@ it("describes the server's bounded ready scope without promising model review fo
   expect(result.description).toContain("新建原始运行");
   expect(result.description).toContain("文本写入");
 });
+
+it.each(["constructor", "__proto__", "toString"])("uses the safe fallback for prototype reason %s", (reason_code) => {
+  const result = approvalReviewPresentation({ approval_review: { engine: "rules_then_model" },
+    approval_review_readiness: { status: "not_ready", reason_code } });
+  expect(result.status).toContain("服务器尚未确认模型审查可用，请检查服务配置。");
+  expect(result.description).not.toMatch(/native code|object Object|function/);
+});

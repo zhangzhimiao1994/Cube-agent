@@ -520,9 +520,13 @@ function IdentityConfigPage() {
                 <input id="review-output" type="number" min={1} max={1000000} step={1} value={Number.isNaN(review.max_output_tokens) ? "" : review.max_output_tokens} onChange={(event) => updateReview({ max_output_tokens: event.target.valueAsNumber })} />
               </label>
               <label htmlFor="review-count">每次运行最多审查次数
-                <input id="review-count" type="number" min={1} max={Number.MAX_SAFE_INTEGER} step={1} value={Number.isNaN(review.max_reviews_per_run) ? "" : review.max_reviews_per_run} onChange={(event) => updateReview({ max_reviews_per_run: event.target.valueAsNumber })} />
+                <input id="review-count" type={typeof review.max_reviews_per_run === "bigint" ? "text" : "number"}
+                  readOnly={typeof review.max_reviews_per_run === "bigint"} min={1} max={Number.MAX_SAFE_INTEGER} step={1}
+                  value={typeof review.max_reviews_per_run === "bigint" ? review.max_reviews_per_run.toString() : Number.isNaN(review.max_reviews_per_run) ? "" : review.max_reviews_per_run}
+                  onChange={(event) => updateReview({ max_reviews_per_run: event.target.valueAsNumber })} />
               </label>
             </div>
+            {typeof review.max_reviews_per_run === "bigint" ? <p className="field-help">已有审查次数超出此处新输入的安全整数范围，将精确显示并原样保留；其他设置仍可保存。</p> : null}
             <label className="inline-check">
               <input type="checkbox" checked={review.require_distinct_model} onChange={(event) => updateReview({ require_distinct_model: event.target.checked })} />
               审查模型必须与执行模型不同
