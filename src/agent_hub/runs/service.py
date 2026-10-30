@@ -2548,6 +2548,7 @@ class RunService:
                     context,
                     worker_id=self._worker_id,
                     review_broker=self._review_broker,
+                    run_repository=self._repository,
                     configured_tokens=self._runtime_token_budget,
                     routing_decision=runtime_routing_decision,
                     initial_progress_units=checkpoint_progress_units,
@@ -6591,6 +6592,7 @@ async def _adaptive_runtime_events(
     meaningful_progress: bool = True,
     worker_id: str | None = None,
     review_broker: ReviewAssemblyBroker | None = None,
+    run_repository: RunRepository | None = None,
 ) -> AsyncGenerator[RunEvent, None]:
     progress_units = max(0, initial_progress_units)
     seen_tool_calls: set[str] = set()
@@ -6598,7 +6600,13 @@ async def _adaptive_runtime_events(
     seen_artifacts: set[str] = set(artifact_keys)
     seen_progress_keys = {key for key in artifact_keys.values() if key is not None}
     metadata_artifact_ids = set(non_progress_artifact_ids)
-    async with worker_runtime_events(runtime, context, worker_id=worker_id, review_broker=review_broker) as stream:
+    async with worker_runtime_events(
+        runtime,
+        context,
+        worker_id=worker_id,
+        review_broker=review_broker,
+        run_repository=run_repository,
+    ) as stream:
         async for event in stream:
             new_artifact_key = None
             if event.artifact is not None:

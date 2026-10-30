@@ -17,6 +17,7 @@ from agent_hub.runtime.streams import (
 )
 
 if TYPE_CHECKING:
+    from agent_hub.runs.repository import RunRepository
     from agent_hub.runtime.review_assembly import ReviewAssemblyBroker
 
 
@@ -26,6 +27,8 @@ async def _scoped_events(
     scope: Context,
     *,
     cancel: Callable[[], Awaitable[None]] | None = None,
+    before_advance: Callable[[], Awaitable[None]] | None = None,
+    on_event: Callable[[RunEvent], None] | None = None,
 ) -> AsyncIterator[AsyncIterator[RunEvent]]:
     # One demand produces one advancement. Actual adapter streams bind their
     # consumer Task as well as Context; neither may change between yields.
@@ -46,7 +49,11 @@ async def _scoped_events(
                     continue
                 try:
                     advancing = True
+                    if before_advance is not None:
+                        await before_advance()
                     event = await anext(stream)
+                    if on_event is not None:
+                        on_event(event)
                 except BaseException as error:  # noqa: BLE001 - transfer iterator/cancellation outcome unchanged.
                     if not reply.done():
                         reply.set_result((None, error))
@@ -142,11 +149,17 @@ async def worker_runtime_events(
     *,
     worker_id: str | None = None,
     review_broker: ReviewAssemblyBroker | None = None,
+    run_repository: RunRepository | None = None,
 ) -> AsyncIterator[AsyncIterator[RunEvent]]:
     """Use only the driver's context; legacy streams acquire no verification identity."""
     # runs.__init__ imports RunService; defer this dependency until package initialization ends.
     from agent_hub.capabilities.execution_authority import bind_execution_authority
     from agent_hub.models.physical_budget import _bind_run_budget
+    from agent_hub.runtime.repair_projection import (
+        _bind_projection,
+        _prepare_projection,
+        _projection_events,
+    )
     from agent_hub.runtime.review_assembly import ReviewAssemblyUnavailable, _execution
 
     # Private DB locators/leases are not model context or continuation payloads.
@@ -198,6 +211,13 @@ async def worker_runtime_events(
         execution = await review_broker.prepare(context, worker_id=worker_id)
     elif "approval_review_profile" in context.routing_decision:
         raise ReviewAssemblyUnavailable("review_broker_missing")
+    projection = await _prepare_projection(
+        run_repository
+        if run_repository is not None
+        else (None if review_broker is None else review_broker._runs),
+        context,
+        worker_id,
+    )
     if execution is not None:
         # Enter the actual owner bind once in an isolated Context, restore that
         # context for construction, every lazy advancement and finalization.
@@ -206,6 +226,7 @@ async def worker_runtime_events(
 
         def enter() -> AsyncIterator[RunEvent]:
             stack.enter_context(binding)
+            stack.enter_context(_bind_projection(projection))
             if owns_budget:
                 stack.enter_context(_bind_run_budget(execution.budget))
             _execution.set(execution)
@@ -226,12 +247,17 @@ async def worker_runtime_events(
                 stream,
                 scope,
                 cancel=stop_runtime if callable(owned_cancel) or callable(cancel) else None,
+                before_advance=None if projection is None else projection.refresh,
+                on_event=None if projection is None else projection.observe,
             ) as events:
                 yield events
         finally:
             scope.run(stack.close)
         return
-    with binding:
+    with binding, _bind_projection(projection):
         # Stream finalizers and their awaited children retain identity until close returns.
-        async with closing_runtime_events(runtime.run(context)) as stream:
+        runtime_events = runtime.run(context)
+        if projection is not None:
+            runtime_events = _projection_events(runtime_events, projection)
+        async with closing_runtime_events(runtime_events) as stream:
             yield stream

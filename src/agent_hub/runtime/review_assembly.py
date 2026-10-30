@@ -101,6 +101,8 @@ def runtime_source_fingerprint() -> str:
         "runtime/action_direct.py",
         "runtime/crew/adapter.py",
         "runtime/autogen/adapter.py",
+        "runtime/autogen/project_repair_phase.py",
+        "runtime/repair_projection.py",
         "runtime/hybrid.py",
         "runs/service.py",
         "runs/authorization.py",

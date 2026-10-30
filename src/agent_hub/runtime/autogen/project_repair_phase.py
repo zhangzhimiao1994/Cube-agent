@@ -95,6 +95,17 @@ def selected(context: TaskContext) -> bool:
         and route.get('source') == 'self_repair' and route.get('self_repair_accepted') is True)
 
 
+def _matches_authority(context: TaskContext, expected: JsonValue) -> bool:
+    from agent_hub.runtime.repair_projection import _matches_projection
+
+    route = context.routing_decision
+    if authority_digest(route) == expected:
+        return True
+    # A projected route is data from the trusted current worker, not a second
+    # public-route candidate or a grant. No token-only fallback after revocation.
+    return _matches_projection(context, expected)
+
+
 def _proposal(context: TaskContext) -> Mapping[str, JsonValue]:
     route = context.routing_decision
     proposal = route.get('repair_proposal')
@@ -112,7 +123,7 @@ def _proposal(context: TaskContext) -> Mapping[str, JsonValue]:
         and route.get('self_repair_source_run_id') == str(context.run_id)
         and type(route.get('self_repair_max_attempts')) is int
         and route.get('self_repair_max_attempts') == proposal.get('max_attempts'))
-    _need(proposal['automatic_scope_sha256'] == authority_digest(route))
+    _need(_matches_authority(context, proposal['automatic_scope_sha256']))
     return proposal
 
 
