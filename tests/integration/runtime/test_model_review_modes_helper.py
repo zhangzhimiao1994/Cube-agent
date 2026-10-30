@@ -418,7 +418,7 @@ def assert_wire_receipts(attempts, wire_attempts, pool):
     assert total == pool.token_charged == len(wire_attempts) * 5
 
 
-async def build_case(storage, tmp_path, mode, redis_client, *, pending=False):
+async def build_case(storage, tmp_path, mode, redis_client, *, pending=False, body=None):
     """Seed authenticated PG facts; use the real worker's original driver lease."""
     factory = storage[0]
     _, binding, _ = await prepare(storage, open_now=False)
@@ -485,7 +485,9 @@ async def build_case(storage, tmp_path, mode, redis_client, *, pending=False):
     )
     profile = await broker.submission_profile(binding["tenant_id"], timeout_seconds=180)
     assert "approval_review_profile" in profile, "protocol fixture failed to enroll fresh profile"
-    body = submission_request(mode, pending=pending)
+    body = submission_request(mode, pending=pending) if body is None else body
+    if not isinstance(body, CreateRunRequest) or body.mode is not mode:
+        raise ValueError("native body must match the requested runtime mode")
     selection = workspace_selection(
         project_id=body.project_id,
         session_id=body.workspace_session_id,
