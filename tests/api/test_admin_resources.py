@@ -4,6 +4,7 @@ import hashlib
 import io
 import json
 import shutil
+import socket
 import sys
 import tarfile
 import tempfile
@@ -378,7 +379,7 @@ def test_settings_update_rejects_unavailable_default_execution_backend(
     )
     api = client()
     payload = api.get("/api/v1/admin/settings", headers=headers()).json()
-    payload.pop("supported_permission_modes", None)
+    payload = _settings_request_payload(payload)
     payload["default_execution_backend"] = "docker"
 
     response = api.put("/api/v1/admin/settings", headers=headers(), json=payload)
@@ -417,7 +418,7 @@ def test_settings_update_accepts_projected_plugin_package_subprocess_registratio
         "launcher_not_found"
     )
     payload = api.get("/api/v1/admin/settings", headers=headers()).json()
-    payload.pop("supported_permission_modes", None)
+    payload = _settings_request_payload(payload)
 
     response = api.put("/api/v1/admin/settings", headers=headers(), json=payload)
 
@@ -431,7 +432,7 @@ def test_settings_update_accepts_projected_plugin_package_subprocess_registratio
 def test_settings_update_rejects_unknown_plugin_package_subprocess_registration_status() -> None:
     api = client()
     payload = api.get("/api/v1/admin/settings", headers=headers()).json()
-    payload.pop("supported_permission_modes", None)
+    payload = _settings_request_payload(payload)
     payload["plugin_package_subprocess_registration_status"] = "unexpected_raw_status"
 
     response = api.put("/api/v1/admin/settings", headers=headers(), json=payload)
@@ -538,7 +539,7 @@ def test_openclaw_adapters_expose_multisystem_execution_boundary() -> None:
 def test_openclaw_adapters_require_nonempty_command_allowlist() -> None:
     api = client()
     payload = api.get("/api/v1/admin/settings", headers=headers()).json()
-    payload.pop("supported_permission_modes", None)
+    payload = _settings_request_payload(payload)
     payload["openclaw_enabled"] = True
     payload["openclaw_allowed_commands"] = []
     assert api.put("/api/v1/admin/settings", headers=headers(), json=payload).status_code == 200
@@ -574,7 +575,7 @@ def test_openclaw_remote_adapter_requires_successful_health_and_capability_probe
         json={"label": "openclaw-windows-adapter", "value": "sk-live"},
     )
     payload = api.get("/api/v1/admin/settings", headers=headers()).json()
-    payload.pop("supported_permission_modes", None)
+    payload = _settings_request_payload(payload)
     payload["openclaw_enabled"] = True
     payload["openclaw_allowed_commands"] = [["whoami"]]
     payload["openclaw_remote_adapters"] = [
@@ -614,7 +615,7 @@ def test_openclaw_remote_adapter_health_probe_failure_is_unavailable(
         json={"label": "openclaw-windows-adapter", "value": "sk-live"},
     )
     payload = api.get("/api/v1/admin/settings", headers=headers()).json()
-    payload.pop("supported_permission_modes", None)
+    payload = _settings_request_payload(payload)
     payload["openclaw_enabled"] = True
     payload["openclaw_allowed_commands"] = [["whoami"]]
     payload["openclaw_remote_adapters"] = [
@@ -644,7 +645,7 @@ def test_openclaw_operation_can_be_created_from_chat_proposal() -> None:
     service = cast(InMemoryAdminResourceService, cast(Any, api.app).state.admin_resource_service)
     settings_response = api.get("/api/v1/admin/settings", headers=headers())
     payload = settings_response.json()
-    payload.pop("supported_permission_modes", None)
+    payload = _settings_request_payload(payload)
     payload["openclaw_enabled"] = True
     payload["openclaw_mode"] = "ask"
     assert api.put("/api/v1/admin/settings", headers=headers(), json=payload).status_code == 200
@@ -1501,7 +1502,7 @@ def test_openclaw_operation_from_run_rejects_non_openclaw_proposal() -> None:
     service = cast(InMemoryAdminResourceService, cast(Any, api.app).state.admin_resource_service)
     settings_response = api.get("/api/v1/admin/settings", headers=headers())
     payload = settings_response.json()
-    payload.pop("supported_permission_modes", None)
+    payload = _settings_request_payload(payload)
     payload["openclaw_enabled"] = True
     assert api.put("/api/v1/admin/settings", headers=headers(), json=payload).status_code == 200
     run_id = uuid4()
@@ -1534,7 +1535,7 @@ def test_openclaw_operation_creates_approval_request_when_enabled() -> None:
     api = client()
     settings_response = api.get("/api/v1/admin/settings", headers=headers())
     payload = settings_response.json()
-    payload.pop("supported_permission_modes", None)
+    payload = _settings_request_payload(payload)
     payload["openclaw_enabled"] = True
     payload["openclaw_mode"] = "ask"
     assert api.put("/api/v1/admin/settings", headers=headers(), json=payload).status_code == 200
@@ -1589,7 +1590,7 @@ def test_openclaw_read_only_mode_rejects_write_operations() -> None:
     api = client()
     settings_response = api.get("/api/v1/admin/settings", headers=headers())
     payload = settings_response.json()
-    payload.pop("supported_permission_modes", None)
+    payload = _settings_request_payload(payload)
     payload["openclaw_enabled"] = True
     payload["openclaw_mode"] = "read_only"
     assert api.put("/api/v1/admin/settings", headers=headers(), json=payload).status_code == 200
@@ -1614,7 +1615,7 @@ def test_openclaw_read_only_mode_rejects_write_operations() -> None:
 def test_openclaw_execute_requires_approved_operation() -> None:
     api = client()
     payload = api.get("/api/v1/admin/settings", headers=headers()).json()
-    payload.pop("supported_permission_modes", None)
+    payload = _settings_request_payload(payload)
     payload["openclaw_enabled"] = True
     payload["openclaw_mode"] = "ask"
     assert api.put("/api/v1/admin/settings", headers=headers(), json=payload).status_code == 200
@@ -1646,7 +1647,7 @@ def test_openclaw_auto_review_approves_allowlisted_low_risk_linux_command() -> N
     api = client()
     command = [sys.executable, "-c", "print('openclaw-auto-review-ok')"]
     payload = api.get("/api/v1/admin/settings", headers=headers()).json()
-    payload.pop("supported_permission_modes", None)
+    payload = _settings_request_payload(payload)
     payload["openclaw_enabled"] = True
     payload["openclaw_mode"] = "auto_review"
     payload["openclaw_allowed_commands"] = [command]
@@ -1681,7 +1682,7 @@ def test_openclaw_auto_review_keeps_unlisted_command_waiting_for_user_approval()
     api = client()
     command = [sys.executable, "-c", "print('openclaw-auto-review-denied')"]
     payload = api.get("/api/v1/admin/settings", headers=headers()).json()
-    payload.pop("supported_permission_modes", None)
+    payload = _settings_request_payload(payload)
     payload["openclaw_enabled"] = True
     payload["openclaw_mode"] = "auto_review"
     payload["openclaw_allowed_commands"] = []
@@ -1715,7 +1716,7 @@ def test_openclaw_auto_review_keeps_unlisted_command_waiting_for_user_approval()
 def test_openclaw_execute_denies_approved_unlisted_command() -> None:
     api = client()
     payload = api.get("/api/v1/admin/settings", headers=headers()).json()
-    payload.pop("supported_permission_modes", None)
+    payload = _settings_request_payload(payload)
     payload["openclaw_enabled"] = True
     payload["openclaw_mode"] = "ask"
     payload["openclaw_allowed_commands"] = []
@@ -1755,7 +1756,7 @@ def test_openclaw_execute_runs_allowlisted_linux_command() -> None:
     api = client()
     command = [sys.executable, "-c", "print('openclaw-api-exec-ok')"]
     payload = api.get("/api/v1/admin/settings", headers=headers()).json()
-    payload.pop("supported_permission_modes", None)
+    payload = _settings_request_payload(payload)
     payload["openclaw_enabled"] = True
     payload["openclaw_mode"] = "ask"
     payload["openclaw_allowed_commands"] = [command]
@@ -1804,7 +1805,7 @@ def test_openclaw_execute_denies_shell_even_when_allowlisted() -> None:
     api = client()
     command = ["bash", "-c", "echo unsafe"]
     payload = api.get("/api/v1/admin/settings", headers=headers()).json()
-    payload.pop("supported_permission_modes", None)
+    payload = _settings_request_payload(payload)
     payload["openclaw_enabled"] = True
     payload["openclaw_mode"] = "ask"
     payload["openclaw_allowed_commands"] = [command]
@@ -1843,7 +1844,7 @@ def test_openclaw_execute_denies_shell_even_when_allowlisted() -> None:
 def test_openclaw_execute_returns_adapter_unavailable_for_windows_command() -> None:
     api = client()
     payload = api.get("/api/v1/admin/settings", headers=headers()).json()
-    payload.pop("supported_permission_modes", None)
+    payload = _settings_request_payload(payload)
     payload["openclaw_enabled"] = True
     payload["openclaw_mode"] = "ask"
     payload["openclaw_allowed_commands"] = [["cmd", "/c", "echo", "ok"]]
@@ -1940,7 +1941,7 @@ def test_openclaw_execute_uses_configured_remote_windows_adapter() -> None:
         )
         assert secret.status_code == 200
         payload = api.get("/api/v1/admin/settings", headers=headers()).json()
-        payload.pop("supported_permission_modes", None)
+        payload = _settings_request_payload(payload)
         payload["openclaw_enabled"] = True
         payload["openclaw_mode"] = "ask"
         payload["openclaw_allowed_commands"] = [["whoami"]]
@@ -2026,12 +2027,17 @@ def test_openclaw_execute_uses_configured_remote_windows_adapter() -> None:
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
+        assert not thread.is_alive()
+        assert server.fileno() == -1
+        with socket.socket() as probe:
+            probe.settimeout(1)
+            assert probe.connect_ex(("127.0.0.1", server.server_port)) != 0
 
 
 def test_openclaw_operation_can_bind_to_active_session() -> None:
     api = client()
     payload = api.get("/api/v1/admin/settings", headers=headers()).json()
-    payload.pop("supported_permission_modes", None)
+    payload = _settings_request_payload(payload)
     payload["openclaw_enabled"] = True
     payload["openclaw_mode"] = "ask"
     assert api.put("/api/v1/admin/settings", headers=headers(), json=payload).status_code == 200
@@ -2076,7 +2082,7 @@ def test_openclaw_operation_can_bind_to_active_session() -> None:
 def test_openclaw_operation_rejects_inactive_session_binding() -> None:
     api = client()
     payload = api.get("/api/v1/admin/settings", headers=headers()).json()
-    payload.pop("supported_permission_modes", None)
+    payload = _settings_request_payload(payload)
     payload["openclaw_enabled"] = True
     payload["openclaw_mode"] = "ask"
     assert api.put("/api/v1/admin/settings", headers=headers(), json=payload).status_code == 200
@@ -2123,7 +2129,7 @@ def test_openclaw_execute_rechecks_bound_session_is_active() -> None:
     api = client()
     command = [sys.executable, "-c", "print('openclaw-paused-session-should-not-run')"]
     payload = api.get("/api/v1/admin/settings", headers=headers()).json()
-    payload.pop("supported_permission_modes", None)
+    payload = _settings_request_payload(payload)
     payload["openclaw_enabled"] = True
     payload["openclaw_mode"] = "ask"
     payload["openclaw_allowed_commands"] = [command]
@@ -2201,7 +2207,7 @@ def test_openclaw_session_requires_feature_switch() -> None:
 def test_openclaw_session_lifecycle_tracks_pause_resume_and_stop() -> None:
     api = client()
     payload = api.get("/api/v1/admin/settings", headers=headers()).json()
-    payload.pop("supported_permission_modes", None)
+    payload = _settings_request_payload(payload)
     payload["openclaw_enabled"] = True
     payload["openclaw_mode"] = "ask"
     assert api.put("/api/v1/admin/settings", headers=headers(), json=payload).status_code == 200
@@ -2265,7 +2271,7 @@ def test_openclaw_session_lifecycle_tracks_pause_resume_and_stop() -> None:
 def test_openclaw_windows_session_is_managed_but_adapter_unavailable() -> None:
     api = client()
     payload = api.get("/api/v1/admin/settings", headers=headers()).json()
-    payload.pop("supported_permission_modes", None)
+    payload = _settings_request_payload(payload)
     payload["openclaw_enabled"] = True
     payload["openclaw_mode"] = "ask"
     assert api.put("/api/v1/admin/settings", headers=headers(), json=payload).status_code == 200
@@ -3985,12 +3991,24 @@ class StubAuthService:
             raise InvalidCredentials("bad token")
         return AuthenticatedPrincipal(USER_ID, TENANT_ID, Role.SUPER_ADMIN)
 
+    async def validate_principal(self, principal: AuthenticatedPrincipal) -> AuthenticatedPrincipal:
+        configured = self.authenticate_token("valid-token")
+        if principal != configured:
+            raise InvalidCredentials("principal does not match configured identity")
+        return configured
+
 
 class OtherTenantAuthService:
     def authenticate_token(self, token: str) -> AuthenticatedPrincipal:
         if token != "valid-token":
             raise InvalidCredentials("bad token")
         return AuthenticatedPrincipal(USER_ID, OTHER_TENANT_ID, Role.SUPER_ADMIN)
+
+    async def validate_principal(self, principal: AuthenticatedPrincipal) -> AuthenticatedPrincipal:
+        configured = self.authenticate_token("valid-token")
+        if principal != configured:
+            raise InvalidCredentials("principal does not match configured identity")
+        return configured
 
 
 async def accept_plugin_activation(plugin: PluginResourceResponse) -> None:
@@ -4048,6 +4066,15 @@ def client_with_settings(settings: Settings) -> TestClient:
 
 def headers() -> dict[str, str]:
     return {"Authorization": "Bearer valid-token"}
+
+
+def _settings_request_payload(payload: Mapping[str, object]) -> dict[str, object]:
+    """Project GET/response data onto writable fields, including projected plugin status."""
+    return {
+        name: payload[name]
+        for name in admin_router.SystemSettingsRequest.model_fields
+        if name in payload
+    }
 
 
 def _audit_event(
@@ -4678,7 +4705,9 @@ def test_admin_settings_memory_logs_and_hermes_scope_to_principal_tenant_and_act
     cast(Any, api).state.admin_resource_service = service
     test_client = TestClient(api)
 
-    settings_payload = SystemSettingsResponse(default_mode="hybrid").model_dump(mode="json", exclude={"supported_permission_modes"})
+    settings_payload = _settings_request_payload(
+        SystemSettingsResponse(default_mode="hybrid").model_dump(mode="json")
+    )
     updated_settings = test_client.put(
         "/api/v1/admin/settings",
         headers=headers(),
@@ -14063,7 +14092,7 @@ def test_multimedia_video_generation_requires_video_capable_model() -> None:
     api = client()
     settings_response = api.get("/api/v1/admin/settings", headers=headers())
     payload = settings_response.json()
-    payload.pop("supported_permission_modes", None)
+    payload = _settings_request_payload(payload)
     payload["multimedia_generation_enabled"] = True
     assert api.put("/api/v1/admin/settings", headers=headers(), json=payload).status_code == 200
     gateway = FakeGenerationGateway(
@@ -14094,7 +14123,7 @@ def test_multimedia_generation_daily_limit_returns_429() -> None:
     api = client()
     settings_response = api.get("/api/v1/admin/settings", headers=headers())
     payload = settings_response.json()
-    payload.pop("supported_permission_modes", None)
+    payload = _settings_request_payload(payload)
     payload["multimedia_generation_enabled"] = True
     assert api.put("/api/v1/admin/settings", headers=headers(), json=payload).status_code == 200
     gateway = FakeGenerationGateway(
@@ -14120,7 +14149,7 @@ def test_multimedia_generation_provider_failure_returns_502() -> None:
     api = client()
     settings_response = api.get("/api/v1/admin/settings", headers=headers())
     payload = settings_response.json()
-    payload.pop("supported_permission_modes", None)
+    payload = _settings_request_payload(payload)
     payload["multimedia_generation_enabled"] = True
     assert api.put("/api/v1/admin/settings", headers=headers(), json=payload).status_code == 200
     gateway = FakeGenerationGateway(
@@ -14204,7 +14233,7 @@ def test_multimedia_generation_job_can_be_run_by_executor_agent_and_read_by_main
     api = client()
     settings_response = api.get("/api/v1/admin/settings", headers=headers())
     payload = settings_response.json()
-    payload.pop("supported_permission_modes", None)
+    payload = _settings_request_payload(payload)
     payload["multimedia_generation_enabled"] = True
     assert api.put("/api/v1/admin/settings", headers=headers(), json=payload).status_code == 200
     cast(Any, api.app).state.multimedia_generation_executor = MultimediaGenerationExecutor(

@@ -11,6 +11,7 @@ from typing import Any
 from uuid import UUID
 
 import pytest
+from jsonschema import Draft202012Validator
 from pydantic import ValidationError
 from starlette.requests import Request
 
@@ -169,13 +170,34 @@ def test_request_cannot_forge_response_only_readiness(readiness: object) -> None
 def test_schema_exposes_nested_contract_without_provider_fields(mode: Any) -> None:
     schema = admin.SystemSettingsRequest.model_json_schema(mode=mode)
     review = schema["properties"]["approval_review"]
+    if mode == "validation":
+        assert len(review["anyOf"]) == 2
+        assert {"type": "null"} in review["anyOf"]
+        review = next(branch for branch in review["anyOf"] if branch != {"type": "null"})
+    else:
+        assert "anyOf" not in review
     if "$ref" in review:
         review = schema["$defs"][review["$ref"].rsplit("/", 1)[-1]]
     assert set(review["properties"]) == set(RULES)
     assert review["additionalProperties"] is False
+    engine = review["properties"]["engine"]
+    if "$ref" in engine:
+        engine = schema["$defs"][engine["$ref"].rsplit("/", 1)[-1]]
+    assert engine["enum"] == ["rules", "rules_then_model"]
     assert "approval_review_readiness" not in schema["properties"]
     response = admin.SystemSettingsResponse.model_json_schema(mode="serialization")
     assert response["properties"]["approval_review_readiness"]["readOnly"] is True
+
+
+@pytest.mark.parametrize("model", [admin.SystemSettingsRequest, admin.SystemSettingsResponse])
+def test_nullable_schema_matches_codec_and_serializes_canonical_object(model: Any) -> None:
+    incoming = {"approval_review": None}
+    Draft202012Validator(model.model_json_schema(mode="validation")).validate(incoming)
+    outgoing = model.model_validate(incoming).model_dump(mode="json")
+    assert outgoing["approval_review"] == RULES
+    output_validator = Draft202012Validator(model.model_json_schema(mode="serialization"))
+    output_validator.validate(outgoing)
+    assert not output_validator.is_valid({**outgoing, "approval_review": None})
 
 
 def test_legacy_migration_strips_projection_and_adds_rules_without_mutating_input() -> None:

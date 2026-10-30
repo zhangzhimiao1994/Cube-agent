@@ -36,6 +36,8 @@ class _ReviewConfigJsonSchema:
         # Let the enclosing generator register the dataclass/engine references.
         result = handler(TypeAdapter(ApprovalReviewConfig).core_schema)
         handler.resolve_ref_schema(result)["additionalProperties"] = False
+        if handler.mode == "validation":
+            return {"anyOf": [result, {"type": "null"}]}
         return result
 
 
