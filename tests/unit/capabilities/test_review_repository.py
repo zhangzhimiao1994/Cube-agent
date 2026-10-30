@@ -317,3 +317,242 @@ def test_private_begin_arguments_are_isolated_before_first_database_await():
     assert r.request_sha256 == "e" * 64
     assert r.deployment.model_id == "model"
     assert r.lease.token != reservation.lease.token
+
+
+@pytest.mark.parametrize(
+    "initial, expected_status, charged, closed",
+    [
+        ((2, 3, 5, Decimal("0.01")), "allow", 5, False),
+        ((2, None, None, None), "unknown", 30, False),
+        ((20, 20, 40, Decimal("0.01")), "unknown", 30, True),
+        ((2, 3, 5, Decimal("NaN")), "unknown", 30, False),
+    ],
+)
+def test_finish_usage_mutation_between_review_and_budget_receipts_is_inert(
+    initial,
+    expected_status,
+    charged,
+    closed,
+):
+    """DB boundary double; BOTH production repositories perform real settlement."""
+    from agent_hub.db.models import (
+        RunAdmissionAttemptRow,
+        RunAdmissionPoolRow,
+        RunReviewEffectRow,
+        RunReviewIntentRow,
+        RunRow,
+    )
+    from agent_hub.models.run_admission_repository import UsageObservation
+
+    m = module()
+    a = action()
+    p, req = a.to_payload(), a.request()
+    review, physical = uuid4(), uuid4()
+    attempt_id = m._attempt_id(review)
+    lease = _WorkerLease("worker", uuid4())
+    deployment = DeploymentIdentity("synthetic", "review", "model")
+    usage = UsageObservation(*initial)
+    verdict = ModelReviewVerdict(
+        1, "allow", "low", "authorized_action", "Private reasoning.", a.action_digest
+    )
+    row = RunReviewIntentRow(
+        review_id=review,
+        tenant_id=req.tenant_id,
+        run_id=req.run_id,
+        authorization_turn_id=UUID(p["authorization_turn_id"]),
+        attempt_id=attempt_id,
+        action_digest=a.action_digest,
+        effect_digest=a.effect_digest,
+        authorization_sha256=p["authorization_sha256"],
+        config_sha256=p["config_sha256"],
+        policy_sha256=p["policy_sha256"],
+        source_sha256=hashlib.sha256(
+            json.dumps(p["source_binding"], sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest(),
+        request_sha256="e" * 64,
+        private_action=a._payload_bytes.decode(),
+        private_config=config().to_payload(),
+        status="issued",
+        physical_identity=physical,
+        consumed=False,
+    )
+    attempt = RunAdmissionAttemptRow(
+        attempt_id=attempt_id,
+        tenant_id=req.tenant_id,
+        run_id=req.run_id,
+        purpose="review",
+        state="issued",
+        request_sha256="e" * 64,
+        deployment={"provider_id": "synthetic", "deployment_id": "review", "model_id": "model"},
+        worker_id=lease.worker_id,
+        worker_lease_token=lease.token,
+        token_hold=30,
+        review_cost_hold=Decimal("0.2"),
+        physical_transport_id=physical,
+    )
+    pool = RunAdmissionPoolRow(
+        run_id=req.run_id,
+        tenant_id=req.tenant_id,
+        token_charged=30,
+        review_token_charged=30,
+        review_count_charged=1,
+        review_cost_charged=Decimal("0.2"),
+        closed=False,
+    )
+    effect = RunReviewEffectRow(
+        tenant_id=req.tenant_id,
+        run_id=req.run_id,
+        review_id=review,
+        authorization_turn_id=row.authorization_turn_id,
+        effect_digest=a.effect_digest,
+    )
+
+    class Pause:
+        def __await__(self):
+            yield "budget-settlement-await"
+
+    class SessionBoundary:
+        def __init__(self):
+            self.run_reads = 0
+            self.events = []
+
+        def in_transaction(self):
+            return True
+
+        async def scalar(self, statement):
+            entity = statement.column_descriptions[0]["entity"]
+            if entity is RunRow:
+                self.run_reads += 1
+                if self.run_reads == 2:
+                    await Pause()
+                return RunRow(id=req.run_id, tenant_id=req.tenant_id)
+            return {
+                RunAdmissionPoolRow: pool,
+                RunReviewEffectRow: effect,
+                RunReviewIntentRow: row,
+                RunAdmissionAttemptRow: attempt,
+            }[entity]
+
+        def add(self, event):
+            self.events.append(event)
+
+        async def flush(self):
+            pass
+
+    session = SessionBoundary()
+    repo = m.ReviewRepository(None)
+    operation = repo._finish_in_session(
+        session,
+        tenant_id=req.tenant_id,
+        run_id=req.run_id,
+        review_id=review,
+        attempt_id=attempt_id,
+        request_sha256="e" * 64,
+        physical_identity=physical,
+        lease=lease,
+        actual_model_identity=deployment,
+        outcome="allow",
+        usage=usage,
+        verdict=verdict,
+    )
+    try:
+        assert operation.send(None) == "budget-settlement-await"
+        object.__setattr__(usage, "prompt_tokens", 2)
+        object.__setattr__(usage, "completion_tokens", 4)
+        object.__setattr__(usage, "total_tokens", 6)
+        object.__setattr__(usage, "cost_usd", Decimal("0.01"))
+        with pytest.raises(StopIteration) as completed:
+            operation.send(None)
+        assert completed.value.value.status == expected_status
+        review_receipt = json.loads(row.private_receipt)
+        assert attempt.receipt["usage"] == review_receipt["evidence"]["usage"]
+        assert pool.token_charged == charged
+        assert pool.closed is closed
+        assert attempt.receipt["usage"]["total_tokens"] == initial[2]
+        repo._terminal_proof(row, attempt)
+    finally:
+        operation.close()
+
+
+@pytest.mark.parametrize(
+    "usage_values",
+    [
+        (True, 3, 4, Decimal("0.01")),
+        ("bad", None, None, Decimal("NaN")),
+        (2, 3, None, None),
+        (2, 3, 5, Decimal("Infinity")),
+        ([], {}, object(), None),
+    ],
+)
+def test_finish_freezes_malformed_usage_without_zero_or_lost_observation(usage_values):
+    from agent_hub.models.run_admission_repository import UsageObservation, _observation
+
+    m = module()
+    usage = UsageObservation(*usage_values)
+    expected = _observation(usage)
+    frozen, _, _, _ = m._freeze_finish_arguments(
+        usage,
+        _WorkerLease("worker", uuid4()),
+        DeploymentIdentity("synthetic", "review", "model"),
+        None,
+    )
+    object.__setattr__(usage, "prompt_tokens", 0)
+    object.__setattr__(usage, "completion_tokens", 0)
+    object.__setattr__(usage, "total_tokens", 0)
+    object.__setattr__(usage, "cost_usd", Decimal(0))
+    assert _observation(frozen) == expected
+    assert frozen is not usage
+
+
+def test_finish_freezes_model_lease_and_verdict_without_retaining_aliases():
+    from agent_hub.models.run_admission_repository import UsageObservation
+
+    m = module()
+    lease = _WorkerLease("worker", uuid4())
+    token = lease.token
+    identity = DeploymentIdentity("synthetic", "review", "model")
+    verdict = ModelReviewVerdict(
+        1, "allow", "low", "authorized_action", "Private reasoning.", "a" * 64
+    )
+    u, owned_lease, owned_model, owned_verdict = m._freeze_finish_arguments(
+        UsageObservation(2, 3, 5, Decimal("0.01")), lease, identity, verdict
+    )
+    object.__setattr__(lease, "token", uuid4())
+    object.__setattr__(identity, "model_id", "changed")
+    object.__setattr__(verdict, "risk", "high")
+    assert owned_lease.token == token
+    assert owned_model.model_id == "model"
+    assert owned_verdict.risk == "low"
+    assert (u.prompt_tokens, u.completion_tokens, u.total_tokens) == (2, 3, 5)
+
+
+def test_finish_freezes_opaque_invalid_type_without_retaining_caller_object():
+    from agent_hub.models.run_admission_repository import UsageObservation, _observation
+
+    m = module()
+
+    class BadUsage:
+        pass
+
+    class OtherUsage:
+        pass
+
+    field = BadUsage()
+    original = UsageObservation(field, None, None, None)
+    frozen, _, _, _ = m._freeze_finish_arguments(
+        original,
+        _WorkerLease("worker", uuid4()),
+        DeploymentIdentity("synthetic", "review", "model"),
+        None,
+    )
+    field.__class__ = OtherUsage
+    assert _observation(frozen)["prompt_tokens"] == {"invalid_type": "BadUsage"}
+    invalid = BadUsage()
+    frozen, _, _, _ = m._freeze_finish_arguments(
+        invalid,
+        _WorkerLease("worker", uuid4()),
+        DeploymentIdentity("synthetic", "review", "model"),
+        None,
+    )
+    invalid.__class__ = OtherUsage
+    assert _observation(frozen) == {"invalid_type": "BadUsage"}

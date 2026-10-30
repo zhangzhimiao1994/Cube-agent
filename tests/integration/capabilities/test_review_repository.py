@@ -716,3 +716,84 @@ async def test_begin_freezes_configuration_and_reservation_before_lock_wait(ctx)
         if pending is not None and not pending.done():
             pending.cancel()
             await asyncio.gather(pending, return_exceptions=True)
+
+
+@pytest.mark.parametrize(
+    "target, checkpoint",
+    [
+        ("usage", 2),
+        ("usage", 1),
+        ("lease", 2),
+        ("model", 1),
+        ("verdict", 1),
+    ],
+)
+async def test_finish_freezes_external_inputs_across_real_settlement_await(
+    ctx,
+    monkeypatch,
+    target,
+    checkpoint,
+):
+    intent = await ctx.issued()
+    repo = ctx.repo()
+    receipt = ctx.receipt(intent)
+    # This owned loader binding survives deliberate mutation of the external lease.
+    original_lease = ctx.reservation.lease
+    binding = _CurrentReviewBinding(
+        ctx.snapshot(), ctx.config, _WorkerLease(original_lease.worker_id, original_lease.token)
+    )
+    reached, release = asyncio.Event(), asyncio.Event()
+    locked = repo._budget._locked
+    reads = 0
+
+    async def pausing_locked(*args, **kwargs):
+        nonlocal reads
+        rows = await locked(*args, **kwargs)
+        reads += 1
+        if reads == checkpoint:
+            reached.set()
+            await release.wait()
+        return rows
+
+    monkeypatch.setattr(repo._budget, "_locked", pausing_locked)
+    pending = asyncio.create_task(repo.finish(**receipt))
+    try:
+        await asyncio.wait_for(reached.wait(), timeout=5)
+        if target == "usage":
+            object.__setattr__(receipt["usage"], "completion_tokens", 4)
+            object.__setattr__(receipt["usage"], "total_tokens", 6)
+        if target == "lease":
+            object.__setattr__(receipt["lease"], "token", uuid4())
+        if target == "model":
+            object.__setattr__(receipt["actual_model_identity"], "model_id", "changed")
+        if target == "verdict":
+            object.__setattr__(receipt["verdict"], "risk", "high")
+        release.set()
+        result = await asyncio.wait_for(pending, timeout=5)
+        assert result.status == "allow"
+        assert (await repo.get(ctx.tenant, ctx.run, intent.review_id)).status == "allow"
+        async with ctx.factory() as s:
+            row = await s.get(RunReviewIntentRow, intent.review_id)
+            attempt = await s.get(RunAdmissionAttemptRow, intent.attempt_id)
+            observed = json.loads(row.private_receipt)["evidence"]["usage"]
+            assert attempt.receipt["usage"] == observed
+            assert observed["total_tokens"] == 5
+        pool = await RunAdmissionRepository(ctx.factory).get_pool(ctx.tenant, ctx.run)
+        assert (pool.token_charged, pool.review_cost_charged) == (5, Decimal("0.01"))
+        assert await repo.consume_permit(
+            tenant_id=ctx.tenant,
+            run_id=ctx.run,
+            review_id=intent.review_id,
+            current_binding=binding,
+        )
+        assert not await repo.consume_permit(
+            tenant_id=ctx.tenant,
+            run_id=ctx.run,
+            review_id=intent.review_id,
+            current_binding=binding,
+        )
+    finally:
+        release.set()
+        if not pending.done():
+            pending.cancel()
+        await asyncio.gather(pending, return_exceptions=True)

@@ -244,6 +244,48 @@ def _freeze_begin_arguments(
     )
 
 
+def _freeze_observed_value(value: object) -> object:
+    if value is None or type(value) in (bool, int, float, str, Decimal):
+        return value
+    # 2B observes opaque invalid objects ONLY by their bounded type name. Keep
+    # that diagnostic using an inert private marker, never caller references or
+    # untrusted deepcopy hooks. A 64-character prefix preserves its unicode-
+    # escaped/truncated 64-byte diagnostic. No malformed value becomes zero.
+    return type(type(value).__name__[:64], (), {"__slots__": ()})()
+
+
+def _freeze_finish_arguments(
+    usage: UsageObservation | None,
+    lease: _WorkerLease,
+    model: DeploymentIdentity,
+    verdict: ModelReviewVerdict | None,
+) -> tuple[UsageObservation | None, _WorkerLease, DeploymentIdentity, ModelReviewVerdict | None]:
+    """Own settlement/receipt inputs synchronously before the first DB await."""
+    try:
+        if type(lease) is not _WorkerLease:
+            raise ValueError
+        lease.__post_init__()
+        _deployment(model)
+        lease_copy = _WorkerLease(lease.worker_id, lease.token)
+        model_copy = DeploymentIdentity(model.provider_id, model.deployment_id, model.model_id)
+        verdict_copy = (
+            None if verdict is None else _validated_verdict(verdict, verdict.action_digest)
+        )
+        usage_copy: UsageObservation | None
+        if type(usage) is UsageObservation:
+            usage_copy = UsageObservation(
+                cast(int | None, _freeze_observed_value(usage.prompt_tokens)),
+                cast(int | None, _freeze_observed_value(usage.completion_tokens)),
+                cast(int | None, _freeze_observed_value(usage.total_tokens)),
+                cast(Decimal | None, _freeze_observed_value(usage.cost_usd)),
+            )
+        else:
+            usage_copy = cast(UsageObservation | None, _freeze_observed_value(usage))
+        return usage_copy, lease_copy, model_copy, verdict_copy
+    except (ValueError, TypeError, AttributeError):
+        raise ValueError(_INVALID) from None
+
+
 @dataclass(frozen=True, slots=True)
 class _CurrentReviewBinding:
     """Trusted loader input, never exposed user input or live OS attestation."""
@@ -759,6 +801,9 @@ class ReviewRepository:
         usage: UsageObservation | None = None,
         verdict: ModelReviewVerdict | None = None,
     ) -> ReviewIntent:
+        usage, lease, actual_model_identity, verdict = _freeze_finish_arguments(
+            usage, lease, actual_model_identity, verdict
+        )
         async with self._transaction() as session:
             return await self._finish_in_session(
                 session,
@@ -792,6 +837,10 @@ class ReviewRepository:
         usage: UsageObservation | None = None,
         verdict: ModelReviewVerdict | None = None,
     ) -> ReviewIntent:
+        _require_transaction(session)
+        usage, lease, actual_model_identity, verdict = _freeze_finish_arguments(
+            usage, lease, actual_model_identity, verdict
+        )
         _, pool, row = await self._locked(session, tenant_id, run_id, review_id)
         attempt = await self._budget._attempt(session, pool, UUID(str(row.attempt_id)))
         _check_attempt(row, attempt)
