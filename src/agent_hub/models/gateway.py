@@ -7,7 +7,8 @@ import json
 import logging
 import math
 import time
-from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping, Sequence
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Coroutine, Mapping, Sequence
+from contextlib import nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -20,6 +21,7 @@ from uuid import uuid4
 if TYPE_CHECKING:
     from agent_hub.harness.provider import NormalizedProviderEvent
     from agent_hub.harness.streaming import OpenAICompatibleChunkTransport
+    from agent_hub.models.physical_budget import _BudgetCall
 from agent_hub.models.capacity import (
     CapacityBackendDiagnostic,
     CapacityBackendError,
@@ -54,6 +56,10 @@ from agent_hub.models.litellm_client import (
 )
 from agent_hub.models.litellm_client import (
     is_model_negotiation_exhausted as _is_transport_negotiation_exhausted,
+)
+from agent_hub.models.physical_admission import (
+    _bind_physical_selection,
+    _PhysicalAdmissionStopped,
 )
 from agent_hub.models.provider_diagnostics import ProviderDiagnostic, get_provider_diagnostic
 from agent_hub.models.registry import ModelRegistry, NoCapableDeployment
@@ -342,7 +348,7 @@ class GatewayCompletion:
 
 @dataclass(frozen=True, slots=True)
 class _SafeTransportFailure:
-    error: ModelTransportError | ModelGatewayError | ModelResponseCancelled
+    error: ModelTransportError | ModelGatewayError | ModelResponseCancelled | _PhysicalAdmissionStopped
 
 
 @dataclass(slots=True)
@@ -740,8 +746,16 @@ class ModelGateway:
                 seen.add(current)
                 current = fallbacks[current]
 
-    async def complete(self, request: ModelRequest) -> ModelResponse:
-        return (await self.complete_with_context(request)).response
+    def complete(self, request: ModelRequest) -> Coroutine[Any, Any, ModelResponse]:
+        from agent_hub.models.physical_budget import _capture_budget_call
+
+        call = _capture_budget_call(request, self._transport)
+        owned = request if call is None else call.request
+
+        async def received() -> ModelResponse:
+            return (await self._run_budgeted_completion(owned, call)).response
+
+        return received()
 
     async def _record_capacity_outcome(
         self,
@@ -766,7 +780,27 @@ class ModelGateway:
             timeout=min(self._capacity_wait_timeout, remaining_seconds),
         )
 
-    async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+    def complete_with_context(self, request: ModelRequest) -> Coroutine[Any, Any, GatewayCompletion]:
+        from agent_hub.models.physical_budget import _capture_budget_call
+
+        # Capture before creating tasks or returning a coroutine to the caller.
+        call = _capture_budget_call(request, self._transport)
+        owned = request if call is None else call.request
+        return self._run_budgeted_completion(owned, call)
+
+    async def _run_budgeted_completion(
+        self, request: ModelRequest, call: _BudgetCall | None,
+    ) -> GatewayCompletion:
+        from agent_hub.models.physical_budget import _resume_budget_call
+
+        try:
+            with _resume_budget_call(call):
+                return await self._complete_context_captured(request)
+        finally:
+            if call is not None:
+                call.scope.revoke()
+
+    async def _complete_context_captured(self, request: ModelRequest) -> GatewayCompletion:
         failure_history = _GatewayFailureHistory()
         # Consume the call-local observer before spawning transport/cleanup tasks.
         observer = _gateway_scope_observer.get()
@@ -813,7 +847,9 @@ class ModelGateway:
     async def _complete_with_failure_history(
         self, request: ModelRequest, failure_history: _GatewayFailureHistory,
     ) -> GatewayCompletion:
-        request_deadline = asyncio.get_running_loop().time() + request.timeout_seconds
+        from agent_hub.models.physical_budget import _budget_deadline
+
+        request_deadline = _budget_deadline(asyncio.get_running_loop().time() + request.timeout_seconds)
         (
             candidate_groups,
             attempted_logical_models,
@@ -969,9 +1005,40 @@ class ModelGateway:
             raise last_admission_error from None
         raise CapacityUnavailable("model capacity unavailable") from None
 
-    async def stream_openai_compatible_events(
+    def stream_openai_compatible_events(
         self, request: ModelRequest
-    ) -> AsyncIterator[NormalizedProviderEvent]:
+    ) -> AsyncGenerator[NormalizedProviderEvent, None]:
+        from agent_hub.models.physical_budget import _capture_budget_call
+
+        call = _capture_budget_call(request, self._transport)
+        owned = request if call is None else call.request
+        return self._run_budgeted_stream(owned, call)
+
+    async def _run_budgeted_stream(
+        self, request: ModelRequest, call: _BudgetCall | None,
+    ) -> AsyncGenerator[NormalizedProviderEvent, None]:
+        from agent_hub.models.physical_budget import _resume_budget_call
+
+        events = self._stream_context_captured(request)
+        try:
+            while True:
+                try:
+                    with _resume_budget_call(call):
+                        event = await anext(events)
+                except StopAsyncIteration:
+                    return
+                yield event
+        finally:
+            try:
+                with _resume_budget_call(call, check=False):
+                    await events.aclose()
+            finally:
+                if call is not None:
+                    call.scope.revoke()
+
+    async def _stream_context_captured(
+        self, request: ModelRequest
+    ) -> AsyncGenerator[NormalizedProviderEvent, None]:
         history = _GatewayFailureHistory()
         events = self._stream_with_failure_history(request, history)
         try:
@@ -987,7 +1054,9 @@ class ModelGateway:
     async def _stream_with_failure_history(
         self, request: ModelRequest, history: _GatewayFailureHistory,
     ) -> AsyncGenerator[NormalizedProviderEvent, None]:
-        request_deadline = asyncio.get_running_loop().time() + request.timeout_seconds
+        from agent_hub.models.physical_budget import _budget_deadline
+
+        request_deadline = _budget_deadline(asyncio.get_running_loop().time() + request.timeout_seconds)
         streaming_transport = self._streaming_transport()
         last_retryable_error: BaseException | None = None
         last_admission_error: CapacityWaitTimeout | CapacityQueueFull | None = None
@@ -1581,6 +1650,8 @@ class ModelGateway:
                 except (CapacityBackendError, CapacityConfigurationError) as error:
                     stream_primary_error = error
                     primary_error = error
+                except _PhysicalAdmissionStopped:
+                    primary_error = _PhysicalAdmissionStopped()
                 except Exception as error:  # noqa: BLE001 - redact arbitrary stream failures
                     safe_error = safe_model_client_error(deployment.id, error, (api_key,))
                     if isinstance(safe_error, ModelTransportError) and not isinstance(
@@ -1667,14 +1738,16 @@ class ModelGateway:
         deadline: float,
     ) -> AsyncIterator[NormalizedProviderEvent]:
         from agent_hub.harness.streaming import transport_openai_compatible_stream_events
+        from agent_hub.models.physical_budget import _selected_budget_request, _selection_stream
 
-        events = transport_openai_compatible_stream_events(
+        deployment, request, selection = _selected_budget_request(deployment, request, self._pricing)
+        events = _selection_stream(transport_openai_compatible_stream_events(
             transport,
             deployment,
             request,
             api_key,
             provider=deployment.provider_model.split("/", 1)[0],
-        )
+        ), selection)
         heartbeat_task = asyncio.create_task(self._heartbeat(capacity, lease))
         primary_error: BaseException | None = None
         next_event: asyncio.Task[NormalizedProviderEvent] | None = None
@@ -2022,11 +2095,17 @@ class ModelGateway:
         *,
         failure_tracking: _GatewayFailureTracking | None = None,
     ) -> ModelResponse | _SafeTransportFailure:
+        from agent_hub.models.physical_budget import _selected_budget_request
+
         outcome: ModelResponse | _SafeTransportFailure
         try:
             if failure_tracking is not None:
                 failure_tracking.enter()
-            outcome = await self._transport.complete(deployment, request, api_key)
+            deployment, request, selection = _selected_budget_request(deployment, request, self._pricing)
+            with nullcontext() if selection is None else _bind_physical_selection(selection):
+                outcome = await self._transport.complete(deployment, request, api_key)
+        except _PhysicalAdmissionStopped:
+            outcome = _SafeTransportFailure(_PhysicalAdmissionStopped())
         except ModelNegotiatedCancellation as error:
             if failure_tracking is not None:
                 failure_tracking.negotiation_exhausted = True
