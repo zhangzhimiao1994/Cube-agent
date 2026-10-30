@@ -10,8 +10,19 @@ from uuid import UUID, uuid4
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from agent_hub.db.models import ConversationQueueItemRow, RunOutboxRow, RunRow
+from agent_hub.auth.models import Role
+from agent_hub.db.models import (
+    ConversationQueueItemRow,
+    RunInputAuthorizationRow,
+    RunOutboxRow,
+    RunRow,
+)
 from agent_hub.domain.runs import ConversationQueueStatus, RunStatus
+from agent_hub.runs.authorization import (
+    _AuthenticatedInput,
+    _persist_authenticated_input,
+    _validate_authenticated_input,
+)
 
 
 def _has_worker_execution(row: RunRow) -> bool:
@@ -207,6 +218,7 @@ class ConversationQueueRepository:
         *,
         expected_version: int,
         message: str,
+        authenticated_input: _AuthenticatedInput | None = None,
     ) -> ConversationQueueItem:
         normalized_message = message.strip()
         if not normalized_message:
@@ -224,10 +236,25 @@ class ConversationQueueRepository:
             successor = await self._tenant_run(session, tenant_id, row.successor_run_id)
             if successor.blocked_by_run_id is None:
                 raise ConversationQueueConflict("queue item is already being released")
+            if authenticated_input is not None:
+                try:
+                    _validate_authenticated_input(
+                        authenticated_input, tenant_id, successor.actor_id,
+                        None if successor.actor_role is None else Role(successor.actor_role), message)
+                except ValueError:
+                    raise ConversationQueueConflict('authenticated input binding is invalid') from None
             row.message = normalized_message
             row.version += 1
             successor.request = normalized_message
             successor.version += 1
+            if authenticated_input is not None:
+                await _persist_authenticated_input(
+                    session, successor, authenticated_input, submitted_message=message)
+            else:
+                # A changed internal request must never retain stale review input.
+                await session.execute(delete(RunInputAuthorizationRow).where(
+                    RunInputAuthorizationRow.run_id == successor.id,
+                    RunInputAuthorizationRow.tenant_id == tenant_id))
             await session.flush()
             await session.refresh(row)
             return self._item(row)

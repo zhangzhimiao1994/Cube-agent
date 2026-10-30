@@ -25,8 +25,10 @@ from agent_hub.db.models import (
     ConversationRow,
     RunApprovalRow,
     RunArtifactRow,
+    RunAuthenticatedInputRow,
     RunCheckpointRow,
     RunEventRow,
+    RunInputAuthorizationRow,
     RunOutboxRow,
     RunRow,
     RunStepRow,
@@ -37,6 +39,12 @@ from agent_hub.db.models import (
 )
 from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.runs.approval_checkpoint import checkpoint_waits_for_approval
+from agent_hub.runs.authorization import (
+    _AuthenticatedInput,
+    _persist_authenticated_input,
+    _validate_authenticated_input,
+    _validated_persisted_input,
+)
 from agent_hub.runs.context_evidence import CONTEXT_EVENT_KINDS, context_event_projection
 from agent_hub.runs.self_repair import (
     project_repair_checkpoint_is_safe,
@@ -611,7 +619,10 @@ class RunRepository:
         routing_decision: dict[str, object] | None = None,
         blocked_by_run_id: UUID | None = None,
         enqueue: bool,
+        authenticated_input: _AuthenticatedInput | None = None,
     ) -> RunRecord:
+        if authenticated_input is not None:
+            _validate_authenticated_input(authenticated_input, tenant_id, actor_id, actor_role, request)
         if blocked_by_run_id is None and routing_decision is not None:
             raw_blocked_by_run_id = routing_decision.get("blocked_by_run_id")
             if isinstance(raw_blocked_by_run_id, str):
@@ -624,6 +635,11 @@ class RunRepository:
         outbox_key = f"{tenant_id}:{idempotency_key or run_id}"
         async with self._session_factory() as session, session.begin():
             if idempotency_key is not None:
+                # Serialize duplicate API submissions before checking for an existing run.
+                lock_key = int.from_bytes(hashlib.sha256(
+                    f'authenticated-submit:{tenant_id}:{idempotency_key}'.encode()
+                ).digest()[:8], 'big', signed=True)
+                await session.execute(select(func.pg_advisory_xact_lock(lock_key)))
                 existing = await session.scalar(
                     select(RunRow).where(
                         RunRow.tenant_id == tenant_id,
@@ -647,6 +663,8 @@ class RunRepository:
             )
             session.add(row)
             await session.flush()
+            if authenticated_input is not None:
+                await _persist_authenticated_input(session, row, authenticated_input)
             if enqueue and blocked_by_run_id is None:
                 session.add(
                     RunOutboxRow(
@@ -660,6 +678,22 @@ class RunRepository:
                 )
             await session.flush()
             return self._record(row)
+
+    async def load_authenticated_input(
+        self, tenant_id: UUID, run_id: UUID,
+    ) -> _AuthenticatedInput | None:
+        """Read a current, genuine private turn; never infer authority from run.request."""
+        async with self._session_factory() as session:
+            result = (await session.execute(
+                select(RunRow, RunInputAuthorizationRow, RunAuthenticatedInputRow)
+                .outerjoin(RunInputAuthorizationRow, RunInputAuthorizationRow.run_id == RunRow.id)
+                .outerjoin(RunAuthenticatedInputRow,
+                           RunAuthenticatedInputRow.turn_id == RunInputAuthorizationRow.turn_id)
+                .where(RunRow.tenant_id == tenant_id, RunRow.id == run_id)
+            )).one_or_none()
+            if result is None:
+                return None
+            return _validated_persisted_input(*result)
 
     async def get(
         self, tenant_id: UUID, run_id: UUID, *, actor_id: UUID | None = None,

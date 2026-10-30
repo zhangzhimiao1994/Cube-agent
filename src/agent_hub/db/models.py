@@ -7,6 +7,7 @@ from sqlalchemy import (
     CheckConstraint,
     DateTime,
     ForeignKey,
+    ForeignKeyConstraint,
     Index,
     Integer,
     String,
@@ -254,6 +255,49 @@ class RunRow(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
+
+
+class RunAuthenticatedInputRow(Base):
+    """Append-only private originals; never included in public run projections."""
+
+    __tablename__ = "agent_hub_authenticated_inputs"
+    __table_args__ = (
+        UniqueConstraint("turn_id", "tenant_id", "run_id", name="uq_authenticated_input_binding"),
+        CheckConstraint("actor_role IN ('super_admin', 'admin', 'operator', 'viewer')",
+                        name="ck_authenticated_input_role"),
+        CheckConstraint("message_sha256 ~ '^[0-9a-f]{64}$'", name="ck_authenticated_input_message_hash"),
+        CheckConstraint("scope_sha256 ~ '^[0-9a-f]{64}$'", name="ck_authenticated_input_scope_hash"),
+        Index("ix_authenticated_inputs_run", "tenant_id", "run_id"),
+    )
+
+    turn_id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), primary_key=True)
+    tenant_id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), nullable=False)
+    run_id: Mapped[UUID] = mapped_column(
+        ForeignKey("agent_hub_runs.id", ondelete="CASCADE"), nullable=False)
+    actor_id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), nullable=False)
+    actor_role: Mapped[str] = mapped_column(String(32), nullable=False)
+    message: Mapped[str] = mapped_column(Text, nullable=False)
+    message_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    input_scope: Mapped[str] = mapped_column(Text, nullable=False)
+    scope_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class RunInputAuthorizationRow(Base):
+    __tablename__ = "agent_hub_run_input_authorizations"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["turn_id", "tenant_id", "run_id"],
+            ["agent_hub_authenticated_inputs.turn_id", "agent_hub_authenticated_inputs.tenant_id",
+             "agent_hub_authenticated_inputs.run_id"],
+            name="fk_run_input_authorization_binding", ondelete="CASCADE"),
+        UniqueConstraint("turn_id", name="uq_run_input_authorization_turn"),
+    )
+
+    run_id: Mapped[UUID] = mapped_column(
+        ForeignKey("agent_hub_runs.id", ondelete="CASCADE"), primary_key=True)
+    tenant_id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), nullable=False)
+    turn_id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), nullable=False)
 
 
 class ConversationQueueItemRow(Base):

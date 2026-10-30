@@ -29,6 +29,7 @@ from agent_hub.auth.models import AuthenticatedPrincipal, Role
 from agent_hub.capabilities.project_contracts import EDITABLE_PATHS_MAX_COUNT, ManagedProjectInput
 from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.execution_backends import execution_backend_unavailable_reason
+from agent_hub.runs.authorization import _AuthenticatedInput, _capture_authenticated_input
 from agent_hub.runs.conversation_queue import (
     ConversationQueueConflict,
     ConversationQueueItem,
@@ -116,6 +117,7 @@ class RunServiceProtocol(Protocol):
         runtime_timeout_seconds: float | None = None,
         permission_mode: PermissionMode | None = None,
         idempotency_key: str | None = None,
+        authenticated_input: _AuthenticatedInput | None = None,
     ) -> SubmittedRun: ...
 
     async def choose_mode(
@@ -234,11 +236,17 @@ class RunServiceProtocol(Protocol):
         attachment_ids: tuple[str, ...] = (),
         reference_conversation_id: str | None = None,
         idempotency_key: str,
+        authenticated_input: _AuthenticatedInput | None = None,
         **submit_options: object,
     ) -> ConversationQueueItem: ...
 
+    async def queued_authenticated_input(
+        self, tenant_id: UUID, item_id: UUID,
+    ) -> _AuthenticatedInput | None: ...
+
     async def edit_queued_message(
-        self, tenant_id: UUID, item_id: UUID, *, version: int, message: str
+        self, tenant_id: UUID, item_id: UUID, *, version: int, message: str,
+        authenticated_input: _AuthenticatedInput | None = None,
     ) -> ConversationQueueItem: ...
 
     async def conversation_queue(
@@ -1302,6 +1310,7 @@ async def create_run(
             "Vibe Coding is disabled in system settings",
         )
     await _stop_conversation_preview(request, principal.tenant_id, body.conversation_id)
+    submitted_selection = body.model_dump(mode='json', exclude={'message'})
     try:
         body = await _resolve_permission_selection(request, principal, body)
         execution_backend = body.execution_backend or await _default_execution_backend(request)
@@ -1321,10 +1330,21 @@ async def create_run(
                         "reason": unavailable_reason,
                     },
                 )
+        authenticated_input = _capture_authenticated_input(principal, body.message, {
+            'schema_version': 1, 'evidence_kind': 'submitted_selection_not_grant',
+            'operation': 'create_run', 'conversation_id': body.conversation_id,
+            'selection': submitted_selection,
+            'resolved_selection': {
+                'sandbox_profile': body.sandbox_profile, 'permission_mode': body.permission_mode,
+                'requested_permissions': list(body.requested_permissions),
+                'execution_backend': execution_backend,
+            },
+        })
         submitted = await service.submit(
             tenant_id=principal.tenant_id,
             actor_id=principal.user_id,
             actor_role=principal.role,
+            authenticated_input=authenticated_input,
             message=body.message,
             mode=body.mode,
             agent_ids=body.agent_ids,
@@ -1403,13 +1423,25 @@ async def queue_conversation_message(
     if body.conversation_id not in {None, conversation_id}:
         raise PublicAPIError(422, "request_validation", "conversation_id does not match path")
     await _stop_conversation_preview(request, principal.tenant_id, conversation_id)
+    submitted_selection = body.model_dump(mode='json', exclude={'message'})
     try:
         body = await _resolve_permission_selection(request, principal, body)
         execution_backend = body.execution_backend or await _default_execution_backend(request)
+        authenticated_input = _capture_authenticated_input(principal, body.message, {
+            'schema_version': 1, 'evidence_kind': 'submitted_selection_not_grant',
+            'operation': 'queue', 'conversation_id': conversation_id,
+            'selection': submitted_selection,
+            'resolved_selection': {
+                'sandbox_profile': body.sandbox_profile, 'permission_mode': body.permission_mode,
+                'requested_permissions': list(body.requested_permissions),
+                'execution_backend': execution_backend,
+            },
+        })
         item = await service.queue_message(
             tenant_id=principal.tenant_id,
             actor_id=principal.user_id,
             actor_role=principal.role,
+            authenticated_input=authenticated_input,
             conversation_id=conversation_id,
             message=body.message,
             mode=body.mode,
@@ -1475,11 +1507,29 @@ async def edit_conversation_queue_item(
     principal: Annotated[AuthenticatedPrincipal, Depends(require_permission("run:create"))],
 ) -> ConversationQueueItemResponse:
     try:
+        original = await service.queued_authenticated_input(principal.tenant_id, queue_item_id)
+        input_scope: dict[str, object] = {
+            'schema_version': 1, 'evidence_kind': 'submitted_selection_not_grant',
+            'operation': 'queue_edit', 'scope_kind': 'message_edit_only',
+            'queue_item_id': str(queue_item_id), 'expected_version': body.version,
+        }
+        if original is not None and (
+            original.tenant_id, original.actor_id, original.actor_role
+        ) == (principal.tenant_id, principal.user_id, principal.role):
+            # A message-only edit keeps the same run's submitted selection, never route metadata.
+            prior_scope = json.loads(original.input_scope)
+            if 'selection' in prior_scope:
+                for key in ('selection', 'resolved_selection', 'conversation_id'):
+                    if key in prior_scope:
+                        input_scope[key] = prior_scope[key]
+                input_scope['unchanged_selection_from_turn'] = str(original.turn_id)
+                input_scope['scope_kind'] = 'message_edit_with_persisted_selection'
         item = await service.edit_queued_message(
             principal.tenant_id,
             queue_item_id,
             version=body.version,
             message=body.message,
+            authenticated_input=_capture_authenticated_input(principal, body.message, input_scope),
         )
     except (ConversationQueueConflict, ConversationQueueNotFound) as error:
         raise _queue_error(error) from error

@@ -38,6 +38,11 @@ from agent_hub.recovery_metadata import (
 )
 from agent_hub.routing.types import EXECUTABLE_MODES, RiskLevel, RouteAssessment, RouteDecision
 from agent_hub.runs.approval_checkpoint import checkpoint_waits_for_approval
+from agent_hub.runs.authorization import (
+    _authenticated_input_options,
+    _AuthenticatedInput,
+    _validate_authenticated_input,
+)
 from agent_hub.runs.conversation_queue import (
     ConversationQueueConflict,
     ConversationQueueItem,
@@ -614,7 +619,10 @@ class RunService:
         channel_context: dict[str, str] | None = None,
         idempotency_key: str | None = None,
         blocked_by_run_id: UUID | None = None,
+        authenticated_input: _AuthenticatedInput | None = None,
     ) -> SubmittedRun:
+        if authenticated_input is not None:
+            _validate_authenticated_input(authenticated_input, tenant_id, actor_id, actor_role, message)
         if (
             not isinstance(allowed_models, tuple)
             or len(allowed_models) > 64
@@ -794,6 +802,7 @@ class RunService:
                 tenant_id=tenant_id,
                 actor_id=actor_id,
                 actor_role=actor_role,
+                **_authenticated_input_options(authenticated_input),
                 message=message,
                 mode=evolution_proposal.mode,
                 proposal=evolution_proposal,
@@ -810,6 +819,7 @@ class RunService:
                 tenant_id=tenant_id,
                 actor_id=actor_id,
                 actor_role=actor_role,
+                **_authenticated_input_options(authenticated_input),
                 message=message,
                 mode=schedule_proposal.mode,
                 proposal=schedule_proposal,
@@ -826,6 +836,7 @@ class RunService:
                 tenant_id=tenant_id,
                 actor_id=actor_id,
                 actor_role=actor_role,
+                **_authenticated_input_options(authenticated_input),
                 message=message,
                 mode=TaskMode.DISPATCH if mode is TaskMode.AUTO else mode,
                 proposal=openclaw_proposal,
@@ -843,6 +854,7 @@ class RunService:
                 tenant_id=tenant_id,
                 actor_id=actor_id,
                 actor_role=actor_role,
+                **_authenticated_input_options(authenticated_input),
                 message=message,
                 mode=project_preflight_proposal.mode,
                 proposal=project_preflight_proposal,
@@ -867,6 +879,7 @@ class RunService:
                     tenant_id=tenant_id,
                     actor_id=actor_id,
                     actor_role=actor_role,
+                    **_authenticated_input_options(authenticated_input),
                     request=message,
                     mode=explicit_mode,
                     status=RunStatus.QUEUED,
@@ -910,6 +923,7 @@ class RunService:
                     tenant_id=tenant_id,
                     actor_id=actor_id,
                     actor_role=actor_role,
+                    **_authenticated_input_options(authenticated_input),
                     request=message,
                     mode=continuation_mode,
                     status=RunStatus.QUEUED,
@@ -963,6 +977,7 @@ class RunService:
                         tenant_id=tenant_id,
                         actor_id=actor_id,
                         actor_role=actor_role,
+                        **_authenticated_input_options(authenticated_input),
                         message=message,
                         mode=selected_mode,
                         proposal=proposal,
@@ -973,6 +988,7 @@ class RunService:
                     tenant_id=tenant_id,
                     actor_id=actor_id,
                     actor_role=actor_role,
+                    **_authenticated_input_options(authenticated_input),
                     request=message,
                     mode=selected_mode,
                     status=RunStatus.QUEUED,
@@ -1015,6 +1031,7 @@ class RunService:
                             tenant_id=tenant_id,
                             actor_id=actor_id,
                             actor_role=actor_role,
+                            **_authenticated_input_options(authenticated_input),
                             message=message,
                             mode=local_mode,
                             proposal=proposal,
@@ -1025,6 +1042,7 @@ class RunService:
                         tenant_id=tenant_id,
                         actor_id=actor_id,
                         actor_role=actor_role,
+                        **_authenticated_input_options(authenticated_input),
                         request=message,
                         mode=local_mode,
                         status=RunStatus.QUEUED,
@@ -1076,6 +1094,7 @@ class RunService:
                         tenant_id=tenant_id,
                         actor_id=actor_id,
                         actor_role=actor_role,
+                        **_authenticated_input_options(authenticated_input),
                         message=message,
                         mode=selected_mode,
                         proposal=proposal,
@@ -1086,6 +1105,7 @@ class RunService:
                     tenant_id=tenant_id,
                     actor_id=actor_id,
                     actor_role=actor_role,
+                    **_authenticated_input_options(authenticated_input),
                     request=message,
                     mode=selected_mode,
                     status=RunStatus.QUEUED,
@@ -1131,6 +1151,7 @@ class RunService:
                             tenant_id=tenant_id,
                             actor_id=actor_id,
                             actor_role=actor_role,
+                            **_authenticated_input_options(authenticated_input),
                             message=message,
                             mode=local_mode,
                             proposal=proposal,
@@ -1141,6 +1162,7 @@ class RunService:
                         tenant_id=tenant_id,
                         actor_id=actor_id,
                         actor_role=actor_role,
+                        **_authenticated_input_options(authenticated_input),
                         request=message,
                         mode=local_mode,
                         status=RunStatus.QUEUED,
@@ -1194,6 +1216,7 @@ class RunService:
                         tenant_id=tenant_id,
                         actor_id=actor_id,
                         actor_role=actor_role,
+                        **_authenticated_input_options(authenticated_input),
                         message=message,
                         mode=selected_mode,
                         proposal=proposal,
@@ -1204,6 +1227,7 @@ class RunService:
                     tenant_id=tenant_id,
                     actor_id=actor_id,
                     actor_role=actor_role,
+                    **_authenticated_input_options(authenticated_input),
                     request=message,
                     mode=selected_mode,
                     status=RunStatus.QUEUED,
@@ -1241,6 +1265,7 @@ class RunService:
                         tenant_id=tenant_id,
                         actor_id=actor_id,
                         actor_role=actor_role,
+                        **_authenticated_input_options(authenticated_input),
                         request=message,
                         mode=local_mode,
                         status=RunStatus.QUEUED,
@@ -1260,6 +1285,7 @@ class RunService:
                     tenant_id=tenant_id,
                     actor_id=actor_id,
                     actor_role=actor_role,
+                    **_authenticated_input_options(authenticated_input),
                     request=message,
                     mode=None,
                     status=RunStatus.WAITING_USER_MODE,
@@ -1294,6 +1320,7 @@ class RunService:
                 tenant_id=tenant_id,
                 actor_id=actor_id,
                 actor_role=actor_role,
+                **_authenticated_input_options(authenticated_input),
                 request=message,
                 mode=None,
                 status=RunStatus.WAITING_USER_MODE,
@@ -1328,6 +1355,7 @@ class RunService:
                 tenant_id=tenant_id,
                 actor_id=actor_id,
                 actor_role=actor_role,
+                **_authenticated_input_options(authenticated_input),
                 message=message,
                 mode=mode,
                 proposal=proposal,
@@ -1339,6 +1367,7 @@ class RunService:
             tenant_id=tenant_id,
             actor_id=actor_id,
             actor_role=actor_role,
+            **_authenticated_input_options(authenticated_input),
             request=message,
             mode=mode,
             status=RunStatus.QUEUED,
@@ -1755,6 +1784,7 @@ class RunService:
         attachment_ids: tuple[str, ...] = (),
         reference_conversation_id: str | None = None,
         idempotency_key: str,
+        authenticated_input: _AuthenticatedInput | None = None,
         **submit_options: object,
     ) -> ConversationQueueItem:
         if self._conversation_queue_repository is None:
@@ -1771,6 +1801,7 @@ class RunService:
             tenant_id=tenant_id,
             actor_id=actor_id,
             actor_role=actor_role,
+            **_authenticated_input_options(authenticated_input),
             message=message,
             mode=mode,
             conversation_id=conversation_id,
@@ -1829,6 +1860,13 @@ class RunService:
             raise ConversationQueueNotFound("conversation queue is unavailable")
         return await self._conversation_queue_repository.get(tenant_id, item_id)
 
+    async def queued_authenticated_input(
+        self, tenant_id: UUID, item_id: UUID,
+    ) -> _AuthenticatedInput | None:
+        """Read only this successor's genuine persisted original selection for a message edit."""
+        item = await self.conversation_queue_item(tenant_id, item_id)
+        return await self._repository.load_authenticated_input(tenant_id, item.successor_run_id)
+
     async def edit_queued_message(
         self,
         tenant_id: UUID,
@@ -1836,11 +1874,13 @@ class RunService:
         *,
         version: int,
         message: str,
+        authenticated_input: _AuthenticatedInput | None = None,
     ) -> ConversationQueueItem:
         if self._conversation_queue_repository is None:
             raise ConversationQueueConflict("conversation queue is unavailable")
         return await self._conversation_queue_repository.edit(
-            tenant_id, item_id, expected_version=version, message=message
+            tenant_id, item_id, expected_version=version, message=message,
+            **_authenticated_input_options(authenticated_input),
         )
 
     async def cancel_queued_message(
@@ -3788,6 +3828,7 @@ class RunService:
         proposal: TemporaryAgentProposal,
         idempotency_key: str | None,
         operator_selection: dict[str, object],
+        authenticated_input: _AuthenticatedInput | None = None,
     ) -> SubmittedRun:
         token = _decision_token()
         proposal_payload = proposal.to_payload()
@@ -3795,6 +3836,7 @@ class RunService:
             tenant_id=tenant_id,
             actor_id=actor_id,
             actor_role=actor_role,
+            **_authenticated_input_options(authenticated_input),
             request=message,
             mode=mode,
             status=RunStatus.WAITING_APPROVAL,
@@ -3821,6 +3863,7 @@ class RunService:
         proposal: EvolutionProposal,
         idempotency_key: str | None,
         operator_selection: dict[str, object],
+        authenticated_input: _AuthenticatedInput | None = None,
     ) -> SubmittedRun:
         token = _decision_token()
         proposal_payload = proposal.to_payload()
@@ -3828,6 +3871,7 @@ class RunService:
             tenant_id=tenant_id,
             actor_id=actor_id,
             actor_role=actor_role,
+            **_authenticated_input_options(authenticated_input),
             request=message,
             mode=mode,
             status=RunStatus.WAITING_APPROVAL,
@@ -3854,6 +3898,7 @@ class RunService:
         proposal: ScheduleProposal,
         idempotency_key: str | None,
         operator_selection: dict[str, object],
+        authenticated_input: _AuthenticatedInput | None = None,
     ) -> SubmittedRun:
         token = _decision_token()
         proposal_payload = proposal.to_payload()
@@ -3861,6 +3906,7 @@ class RunService:
             tenant_id=tenant_id,
             actor_id=actor_id,
             actor_role=actor_role,
+            **_authenticated_input_options(authenticated_input),
             request=message,
             mode=mode,
             status=RunStatus.WAITING_APPROVAL,
@@ -3887,6 +3933,7 @@ class RunService:
         proposal: OpenClawProposal,
         idempotency_key: str | None,
         operator_selection: dict[str, object],
+        authenticated_input: _AuthenticatedInput | None = None,
     ) -> SubmittedRun:
         token = _decision_token()
         proposal_payload = proposal.to_payload()
@@ -3894,6 +3941,7 @@ class RunService:
             tenant_id=tenant_id,
             actor_id=actor_id,
             actor_role=actor_role,
+            **_authenticated_input_options(authenticated_input),
             request=message,
             mode=mode,
             status=RunStatus.WAITING_APPROVAL,
@@ -3920,6 +3968,7 @@ class RunService:
         proposal: ProjectPreflightProposal,
         idempotency_key: str | None,
         operator_selection: dict[str, object],
+        authenticated_input: _AuthenticatedInput | None = None,
     ) -> SubmittedRun:
         token = _decision_token()
         proposal_payload = proposal.to_payload()
@@ -3927,6 +3976,7 @@ class RunService:
             tenant_id=tenant_id,
             actor_id=actor_id,
             actor_role=actor_role,
+            **_authenticated_input_options(authenticated_input),
             request=message,
             mode=mode,
             status=RunStatus.WAITING_APPROVAL,

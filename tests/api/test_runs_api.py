@@ -34,6 +34,10 @@ class StubAuthService:
             raise InvalidCredentials("bad token")
         return self.principal
 
+    async def validate_principal(self, principal: AuthenticatedPrincipal) -> AuthenticatedPrincipal:
+        assert principal == self.principal
+        return self.principal
+
 
 @dataclass(slots=True)
 class StubPreviewManager:
@@ -178,6 +182,7 @@ class StubRunService:
         requested_permissions: tuple[str, ...] = (),
         runtime_timeout_seconds: float | None = None,
         idempotency_key: str | None = None,
+        authenticated_input: object | None = None,
     ) -> SubmittedRun:
         del idempotency_key
         del allow_scale_mode_upgrade
@@ -645,8 +650,12 @@ class StubRunService:
             if item.tenant_id == tenant_id and item.id == item_id
         )
 
+    async def queued_authenticated_input(self, tenant_id: UUID, item_id: UUID) -> None:
+        return None
+
     async def edit_queued_message(
-        self, tenant_id: UUID, item_id: UUID, *, version: int, message: str
+        self, tenant_id: UUID, item_id: UUID, *, version: int, message: str,
+        authenticated_input: object | None = None,
     ) -> ConversationQueueItem:
         item = self._queue_item(tenant_id, item_id, version)
         updated = self._replace_queue_item(item, message=message, version=item.version + 1)
