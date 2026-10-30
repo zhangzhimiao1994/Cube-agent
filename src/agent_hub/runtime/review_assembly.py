@@ -635,12 +635,17 @@ class ReviewAssemblyBroker:
         route = context.routing_decision
         profile = route.get(_PROFILE)
         if profile is None:
-            if route.get("source") == "self_repair" or route.get("source_run_id") is not None:
+            current = await self._runs.get(context.tenant_id, context.run_id)
+            persisted = current.routing_decision or {}
+            if (
+                route.get("source") == "self_repair"
+                or route.get("source_run_id") is not None
+                or persisted.get("source") == "self_repair"
+                or persisted.get("source_run_id") is not None
+            ):
                 # Internal run creation does not carry private resource scope.
                 # Inspect only persisted provenance; never adopt a parent lease
                 # or mint a new pool when the parent's profile was dropped.
-                current = await self._runs.get(context.tenant_id, context.run_id)
-                persisted = current.routing_decision or {}
                 ancestors: set[UUID] = {context.run_id}
                 for _ in range(32):
                     if (
@@ -706,10 +711,23 @@ class ReviewAssemblyBroker:
             or record.routing_decision.get(_PROFILE) != dict(profile)
         ):
             raise ReviewAssemblyUnavailable("original_authenticated_context_missing")
-        # Cross-run repair has no trusted parent-pool continuity in the current DAO.
-        # True in-run repair has no new run/source link and reuses the existing pool.
-        if route.get("source") == "self_repair" or route.get("source_run_id") is not None:
+        # A genuine accepted repair requeues the SAME RunRow. Children still have
+        # no trusted parent-pool continuity and cannot borrow their parent's frame.
+        repair = None
+        if (
+            route.get("source_run_id") is not None
+            or record.routing_decision.get("source_run_id") is not None
+        ):
             raise ReviewAssemblyUnavailable("derived_run_pool_continuity_unsupported")
+        if (
+            route.get("source") == "self_repair"
+            or record.routing_decision.get("source") == "self_repair"
+        ):
+            repair = await self._runs.load_same_run_repair_continuity(
+                context.tenant_id, context.run_id
+            )
+            if repair is None or not repair.matches(context):
+                raise ReviewAssemblyUnavailable("derived_run_pool_continuity_unsupported")
 
         async def check() -> None:
             from agent_hub.capabilities.execution_authority import _trusted_review_context
@@ -728,6 +746,12 @@ class ReviewAssemblyBroker:
                     )
 
             local_worker_scope()
+            if repair is not None:
+                # Pin the proved resume boundary, not the latest in-flight
+                # checkpoint. New work has its own journal/UNKNOWN fences.
+                current_run = await self._runs.get(context.tenant_id, context.run_id)
+                if not repair.matches_routing(current_run.routing_decision or {}):
+                    raise ReviewAssemblyUnavailable("derived_run_pool_continuity_unsupported")
             current, current_reason = await self._compile(context.tenant_id)
             local_worker_scope()
             if (
@@ -746,7 +770,7 @@ class ReviewAssemblyBroker:
         lease = _WorkerLease(worker_id, context.execution_token)
         pool = await repository.get_pool(context.tenant_id, context.run_id)
         if pool is None:
-            if context.checkpoint is not None:
+            if repair is not None or context.checkpoint is not None:
                 raise ReviewAssemblyUnavailable("recovery_original_pool_missing")
             absolute, plan = (
                 route.get("runtime_token_absolute_tokens"),

@@ -58,6 +58,7 @@ from agent_hub.runtime.contracts import (
     RunEvent,
     RuntimeCheckpoint,
     TaskContext,
+    _mutable_json,
 )
 from agent_hub.runtime.failure_reason import (
     RECOVERY_BLOCKED_FAILURE_REASON,
@@ -83,6 +84,80 @@ def _database_uuid(value: UUID) -> UUID:
 
 def _optional_database_uuid(value: UUID | None) -> UUID | None:
     return None if value is None else _database_uuid(value)
+
+
+_REPAIR_WORKER_PRIVATE_ROUTE_KEYS = frozenset(
+    {
+        "project_verification_receipt",
+        "approval_checkpoint_worker_token",
+    }
+)
+
+
+@dataclass(frozen=True)
+class _SameRunRepairContinuity:
+    """Persisted continuity only; never a grant, new pool or transferable lease."""
+
+    routing_sha256: str
+    checkpoint_id: UUID
+    checkpoint_sha256: str
+    runtime_routing_sha256: str
+    runtime_windowless_routing_sha256: str | None
+
+    def matches(self, context: TaskContext) -> bool:
+        checkpoint = context.checkpoint
+        return (
+            checkpoint is not None
+            and checkpoint.run_id == context.run_id
+            and checkpoint.tenant_id == context.tenant_id
+            and checkpoint.mode is context.mode
+            and checkpoint.runtime_type == "autogen"
+            and checkpoint.runtime_version == "2"
+            and checkpoint.id == self.checkpoint_id
+            and checkpoint.state_sha256 == self.checkpoint_sha256
+            and checkpoint.recompute_state_sha256() == self.checkpoint_sha256
+            and self._matches_runtime_routing(context.routing_decision)
+        )
+
+    def matches_routing(self, route: Mapping[str, object]) -> bool:
+        # Live persisted drift always uses the COMPLETE original route.
+        return _repair_routing_sha256(cast(Mapping[str, JsonValue], route)) == self.routing_sha256
+
+    def _matches_runtime_routing(self, route: Mapping[str, JsonValue]) -> bool:
+        digest = _repair_routing_sha256(route)
+        if digest == self.routing_sha256:
+            return True
+        # worker_runtime_events removes exactly these two private locators.
+        # Values supplied in an unprojected context must still match exactly.
+        if _REPAIR_WORKER_PRIVATE_ROUTE_KEYS.intersection(route):
+            return False
+        if digest == self.runtime_routing_sha256:
+            return True
+        window = route.get("main_agent_context_window_tokens")
+        if (
+            self.runtime_windowless_routing_sha256 is None
+            or type(window) is not int
+            or not 0 < window <= 10_000_000
+        ):
+            return False
+        # Only service._with_main_agent_context_window may add/replace this
+        # derived window when BOTH persisted window fields lack a valid value.
+        # No other key (including context_window_tokens) is dropped or normalized.
+        without_window = {
+            key: value for key, value in route.items() if key != "main_agent_context_window_tokens"
+        }
+        return _repair_routing_sha256(without_window) == self.runtime_windowless_routing_sha256
+
+
+def _repair_routing_sha256(route: Mapping[str, JsonValue]) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            _mutable_json(route),
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode()
+    ).hexdigest()
 
 
 class _PythonApprovalOptions(TypedDict, total=False):
@@ -706,6 +781,195 @@ class RunRepository:
             if actor_id is not None and row.actor_id != actor_id:
                 raise RunNotFound("run was not found")
             return self._record(row)
+
+    async def load_same_run_repair_continuity(
+        self,
+        tenant_id: UUID,
+        run_id: UUID,
+    ) -> _SameRunRepairContinuity | None:
+        """Read an accepted automatic episode; source flags alone establish nothing.
+
+        The caller must still fence the original authenticated pool and the current
+        worker. This reader cannot open a pool or turn a child run into its parent.
+        """
+        from agent_hub.runs.artifacts import PostgresArtifactRepository
+        from agent_hub.runtime.artifacts import ArtifactRepositoryError
+        from agent_hub.runtime.autogen import project_repair_phase as phase
+
+        async with self._session_factory() as session:
+            row = await session.scalar(
+                self._run_select(tenant_id, run_id).execution_options(populate_existing=True)
+            )
+            if (
+                row is None
+                or row.status != RunStatus.RUNNING.value
+                or row.mode != TaskMode.DISCUSS.value
+                or row.blocked_by_run_id is not None
+                or row.actor_id is None
+                or row.actor_role is None
+            ):
+                return None
+            route = dict(row.routing_decision or {})
+            baseline = route.get("self_repair_recovery_baseline_sequence")
+            token_hash = route.get("self_repair_decision_token_hash")
+            if (
+                route.get("source") != "self_repair"
+                or route.get("source_run_id") is not None
+                or route.get("self_repair_accepted") is not True
+                or route.get("self_repair_source_run_id") != str(run_id)
+                or type(baseline) is not int
+                or baseline < 0
+                or not isinstance(token_hash, str)
+                or re.fullmatch(r"[a-f0-9]{64}", token_hash) is None
+            ):
+                return None
+            try:
+                proposal = route.get("repair_proposal")
+                if not isinstance(proposal, dict):
+                    return None
+                attempt, maximum = (
+                    route.get("self_repair_attempt"),
+                    route.get("self_repair_max_attempts"),
+                )
+                if (
+                    type(attempt) is not int
+                    or type(maximum) is not int
+                    or not 0 < attempt <= maximum
+                    or route.get("self_repair_fingerprint") != proposal.get("fingerprint")
+                ):
+                    return None
+                source_row = await session.scalar(
+                    select(RunCheckpointRow)
+                    .where(
+                        RunCheckpointRow.tenant_id == tenant_id,
+                        RunCheckpointRow.run_id == run_id,
+                        RunCheckpointRow.state_sha256
+                        == proposal.get("automatic_checkpoint_sha256"),
+                    )
+                    .order_by(RunCheckpointRow.sequence.desc())
+                    .limit(1)
+                )
+                source = (
+                    None
+                    if source_row is None
+                    else RuntimeCheckpoint.from_payload(dict(source_row.payload))
+                )
+                checkpoint = await self.latest_checkpoint(
+                    session, tenant_id=tenant_id, run_id=run_id
+                )
+                # The original source must still be a persisted, stopped safe boundary.
+                original_route = {
+                    k: v for k, v in route.items() if k not in {"source", "self_repair_accepted"}
+                }
+                if (
+                    source is None
+                    or checkpoint is None
+                    or not project_repair_checkpoint_is_safe(
+                        source,
+                        routing_decision=original_route,
+                        run_id=run_id,
+                        tenant_id=tenant_id,
+                        mode=TaskMode.DISCUSS,
+                    )
+                    or not project_repair_checkpoint_is_safe(
+                        checkpoint,
+                        routing_decision=original_route,
+                        run_id=run_id,
+                        tenant_id=tenant_id,
+                        mode=TaskMode.DISCUSS,
+                    )
+                ):
+                    return None
+                context = TaskContext(
+                    run_id=run_id,
+                    tenant_id=tenant_id,
+                    actor_id=row.actor_id,
+                    actor_role=Role(row.actor_role),
+                    mode=TaskMode.DISCUSS,
+                    request=row.request,
+                    routing_decision=cast(Mapping[str, JsonValue], route),
+                )
+                models = cast(tuple[Mapping[str, JsonValue], ...], source.state["model_ledger"])
+                tools = cast(tuple[Mapping[str, JsonValue], ...], source.state["tool_ledger"])
+                phase.prepare(context, source, models, tools)
+                if checkpoint.id != source.id:
+                    models = cast(
+                        tuple[Mapping[str, JsonValue], ...], checkpoint.state["model_ledger"]
+                    )
+                    tools = cast(
+                        tuple[Mapping[str, JsonValue], ...], checkpoint.state["tool_ledger"]
+                    )
+                    ids = [
+                        UUID(cast(str, entry["artifact_id"]))
+                        for entry in (*models, *tools)
+                        if entry.get("status") in {"succeeded", "failed"}
+                    ]
+                    written = (
+                        select(RuntimeArtifactWriteRow.write_id)
+                        .where(
+                            RuntimeArtifactWriteRow.tenant_id == RuntimeArtifactRow.tenant_id,
+                            RuntimeArtifactWriteRow.run_id == RuntimeArtifactRow.run_id,
+                            RuntimeArtifactWriteRow.artifact_id == RuntimeArtifactRow.id,
+                            RuntimeArtifactWriteRow.content_sha256
+                            == RuntimeArtifactRow.content_sha256,
+                            RuntimeArtifactWriteRow.status == "written",
+                        )
+                        .exists()
+                    )
+                    stored = (
+                        await session.scalars(
+                            select(RuntimeArtifactRow).where(
+                                RuntimeArtifactRow.tenant_id == tenant_id,
+                                RuntimeArtifactRow.run_id == run_id,
+                                RuntimeArtifactRow.id.in_(ids),
+                                or_(RuntimeArtifactRow.permanent.is_(True), written),
+                            )
+                        )
+                    ).all()
+                    phase.validate(
+                        checkpoint.state.get(phase.PHASE_KEY),
+                        context=context,
+                        models=models,
+                        tools=tools,
+                        tool_prefix=cast(int, checkpoint.state.get("engineering_tool_prefix", 0)),
+                        state=checkpoint.state,
+                        artifacts=tuple(
+                            PostgresArtifactRepository._hydrate(item) for item in stored
+                        ),
+                    )
+                runtime_route = {
+                    key: value
+                    for key, value in context.routing_decision.items()
+                    if key not in _REPAIR_WORKER_PRIVATE_ROUTE_KEYS
+                }
+                windowless_sha256 = None
+                if not any(
+                    type(runtime_route.get(key)) is int and cast(int, runtime_route[key]) > 0
+                    for key in ("main_agent_context_window_tokens", "context_window_tokens")
+                ):
+                    windowless_sha256 = _repair_routing_sha256(
+                        {
+                            key: value
+                            for key, value in runtime_route.items()
+                            if key != "main_agent_context_window_tokens"
+                        }
+                    )
+                return _SameRunRepairContinuity(
+                    _repair_routing_sha256(context.routing_decision),
+                    checkpoint.id,
+                    checkpoint.state_sha256,
+                    _repair_routing_sha256(runtime_route),
+                    windowless_sha256,
+                )
+            except (
+                ArithmeticError,
+                AttributeError,
+                KeyError,
+                TypeError,
+                ValueError,
+                ArtifactRepositoryError,
+            ):
+                return None
 
     async def model_reviews(
         self, tenant_id: UUID, run_id: UUID, *, actor_id: UUID,
