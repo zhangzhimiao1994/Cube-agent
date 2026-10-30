@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from typing import Protocol
 from uuid import UUID
 
-from agent_hub.runtime.contracts import Artifact
+from agent_hub.runtime.contracts import Artifact, _safe_identifier
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _DEFAULT_MAX_ARTIFACTS_PER_RUN = 16_384
@@ -21,6 +21,30 @@ _DEFAULT_MAX_WRITE_RESERVATIONS_PER_RUN = 65_536
 
 class ArtifactRepositoryError(RuntimeError):
     """Stable repository failure that never exposes artifact content."""
+
+
+def _validate_reference_query(
+    artifact_type: str,
+    producer: str,
+    limit: int,
+    after: UUID | None,
+    *,
+    max_batch_size: int,
+) -> None:
+    if (
+        type(artifact_type) is not str
+        or type(producer) is not str
+        or type(limit) is not int
+        or not 1 <= limit <= max_batch_size
+        or after is not None
+        and type(after) is not UUID
+    ):
+        raise ArtifactRepositoryError("artifact reference query is invalid")
+    try:
+        _safe_identifier(artifact_type, name="artifact type")
+        _safe_identifier(producer, name="artifact producer")
+    except ValueError:
+        raise ArtifactRepositoryError("artifact reference query is invalid") from None
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,6 +61,23 @@ class ArtifactReference:
 
 
 class ArtifactRepository(Protocol):
+    async def find_references(
+        self,
+        tenant_id: UUID,
+        run_id: UUID,
+        *,
+        type: str,
+        producer: str,
+        limit: int = 128,
+        after: UUID | None = None,
+    ) -> tuple[ArtifactReference, ...]:
+        """Read scoped references in ascending UUID order, strictly after cursor.
+
+        A full page may have successors. Callers must authorize the current
+        principal first, then use get_many for body/hash validation.
+        """
+        ...
+
     async def reserve_write(
         self,
         tenant_id: UUID,
@@ -185,6 +226,35 @@ class InMemoryArtifactRepository:
         if size > self._max_artifact_bytes:
             raise ArtifactRepositoryError("artifact repository capacity exceeded")
         return size
+
+    async def find_references(
+        self,
+        tenant_id: UUID,
+        run_id: UUID,
+        *,
+        type: str,
+        producer: str,
+        limit: int = 128,
+        after: UUID | None = None,
+    ) -> tuple[ArtifactReference, ...]:
+        scope = self._scope(tenant_id, run_id)
+        _validate_reference_query(type, producer, limit, after, max_batch_size=self._max_batch_size)
+        async with self._lock:
+            matches = sorted(
+                (
+                    artifact
+                    for key, artifact in self._artifacts.items()
+                    if key[:2] == scope
+                    and artifact.type == type
+                    and artifact.producer == producer
+                    and (after is None or artifact.id > after)
+                ),
+                key=lambda artifact: artifact.id,
+            )
+            return tuple(
+                ArtifactReference(id=artifact.id, sha256=artifact.content_sha256)
+                for artifact in matches[:limit]
+            )
 
     async def put(
         self,

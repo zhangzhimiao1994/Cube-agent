@@ -12,7 +12,11 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from agent_hub.db.models import RunRow, RuntimeArtifactRow, RuntimeArtifactWriteRow
-from agent_hub.runtime.artifacts import ArtifactReference, ArtifactRepositoryError
+from agent_hub.runtime.artifacts import (
+    ArtifactReference,
+    ArtifactRepositoryError,
+    _validate_reference_query,
+)
 from agent_hub.runtime.contracts import Artifact
 
 
@@ -235,6 +239,66 @@ class PostgresArtifactRepository:
                 if total > self._max_total_bytes_per_run:
                     raise ArtifactRepositoryError("artifact repository capacity exceeded")
             return tuple(resolved)
+
+    async def find_references(
+        self,
+        tenant_id: UUID,
+        run_id: UUID,
+        *,
+        type: str,
+        producer: str,
+        limit: int = 128,
+        after: UUID | None = None,
+    ) -> tuple[ArtifactReference, ...]:
+        tenant_id, run_id = self._scope(tenant_id, run_id)
+        _validate_reference_query(type, producer, limit, after, max_batch_size=self._max_batch_size)
+        # The canonical Text body may legally contain escaped NUL. Do not run
+        # PostgreSQL JSON conversions over it, even just to extract labels.
+        query = select(RuntimeArtifactRow).where(
+            RuntimeArtifactRow.tenant_id == tenant_id,
+            RuntimeArtifactRow.run_id == run_id,
+        )
+        failed = False
+        references: list[ArtifactReference] = []
+        scan_after = after
+        scan_size = min(128, self._max_batch_size)
+        total = 0
+        try:
+            async with self._transaction(tenant_id, run_id) as session:
+                while len(references) < limit:
+                    page = (
+                        query
+                        if scan_after is None
+                        else query.where(RuntimeArtifactRow.id > scan_after)
+                    )
+                    rows = (
+                        await session.scalars(
+                            page.order_by(RuntimeArtifactRow.id.asc()).limit(scan_size)
+                        )
+                    ).all()
+                    for row in rows:
+                        artifact = self._hydrate(
+                            row
+                        )  # Validate canonical bytes before filtering; never skip corruption.
+                        total += row.byte_size
+                        if total > self._max_total_bytes_per_run:
+                            raise ArtifactRepositoryError("artifact repository capacity exceeded")
+                        scan_after = artifact.id
+                        if artifact.type == type and artifact.producer == producer:
+                            references.append(
+                                ArtifactReference(id=artifact.id, sha256=artifact.content_sha256)
+                            )
+                            if len(references) == limit:
+                                break
+                    if len(rows) < scan_size:
+                        break
+        except ArtifactRepositoryError:
+            failed = True
+        # contextlib may attach the original SQL exception while unwinding yield.
+        # Raise after that scope exits, retaining neither parameters nor context.
+        if failed:
+            raise ArtifactRepositoryError("artifact is unavailable")
+        return tuple(references)
 
     async def abort_write(
         self, tenant_id: UUID, run_id: UUID, reference: ArtifactReference, *, write_id: UUID,
