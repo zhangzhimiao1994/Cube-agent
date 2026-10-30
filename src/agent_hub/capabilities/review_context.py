@@ -11,7 +11,9 @@ import asyncio
 import hashlib
 import json
 import os
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Iterator, Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Protocol
@@ -21,6 +23,7 @@ from agent_hub.auth.models import Role
 from agent_hub.capabilities.execution_authority import _trusted_review_context
 from agent_hub.capabilities.gateway import CapabilityResult, CapabilityStatus
 from agent_hub.capabilities.model_review import ModelReviewOutcome, _LiveReviewContext
+from agent_hub.capabilities.permission_modes import _concrete_write_policy
 from agent_hub.capabilities.policy import CapabilityPolicy
 from agent_hub.capabilities.review_contracts import (
     _CREDENTIAL,
@@ -42,6 +45,7 @@ from agent_hub.files.workspace import (
     _safe_workspace_path,
     project_private_entry,
 )
+from agent_hub.harness.types import HarnessToolCallRequest
 from agent_hub.models.physical_budget import _run_budget, _RunBudgetContext
 from agent_hub.models.run_admission_repository import _WorkerLease
 from agent_hub.runs.authorization import _AuthenticatedInput
@@ -309,6 +313,7 @@ class TrustedReviewContextLoader:
             != authorization_binding_sha256(fence.evidence)
             or review_config_sha256(budget.config) != review_config_sha256(fence.config)
             or fence.config.engine != "rules_then_model"
+            or fence.context.routing_decision.get("permission_mode") != "auto_review"
         ):
             raise ValueError("review context unavailable")
         source = await self.source(fence)
@@ -399,6 +404,108 @@ class ConcreteModelReviewGate:
         return tool_name == "workspace.write_text"
 
 
+@dataclass(slots=True)
+class _WriteDispatch:
+    """Revocable one-entry authority; never serialized or inherited by child tasks."""
+
+    call: _ConcreteReviewCall
+    envelope: HarnessToolCallRequest
+    owner: asyncio.Task[object] | None
+    store: object
+    active: bool = True
+    claimed: bool = False
+    started: bool = False
+
+    def require_bound(self, backend: object) -> None:
+        if (
+            not self.active
+            or self.call._write_dispatch is not self
+            or self.owner is not asyncio.current_task()
+            or backend is not self.call._backend
+            or getattr(backend, "_project_workspace_store", None) is not self.store
+            or _run_budget.get() is not self.call._budget
+        ):
+            raise ValueError("concrete write authority unavailable")
+        self.call._require_same_backend()
+        if (
+            self.call._identity_check is None
+            or self.call._source_check is None
+            or self.call._budget is None
+        ):
+            raise ValueError("concrete write authority unavailable")
+        self.call._budget.check()
+        self.call._identity_check()
+        self.call._source_check()
+
+    async def require_current(self, backend: object) -> None:
+        self.require_bound(backend)
+        if not self.claimed or not self.started:
+            raise ValueError("concrete write authority unavailable")
+        assert self.call._budget is not None
+        await self.call._budget.require_current()
+        if not await self.call._live_dispatch_check():
+            raise ValueError("concrete write authority changed")
+        # No await after the final source/target/identity/owner checks.
+        self.require_bound(backend)
+
+    def begin_write(
+        self,
+        backend: object,
+        tenant_id: UUID,
+        run_id: UUID,
+        arguments: Mapping[str, JsonValue],
+    ) -> None:
+        self.require_bound(backend)
+        request = self.call._write_request
+        if (
+            not self.claimed
+            or self.started
+            or request is None
+            or (tenant_id, run_id) != (request.tenant_id, request.run_id)
+            or _canonical_json_bytes(_freeze_object(arguments, name="write arguments"))
+            != _canonical_json_bytes(_freeze_object(request.arguments, name="owned arguments"))
+        ):
+            raise ValueError("concrete write authority mismatch")
+        self.started = True
+
+
+_WRITE_DISPATCH: ContextVar[_WriteDispatch | None] = ContextVar(
+    "concrete_write_dispatch", default=None
+)
+
+
+def _claim_write_dispatch(
+    backend: object,
+    *,
+    tenant_id: UUID,
+    run_id: UUID,
+    actor: str,
+    name: str,
+    arguments: Mapping[str, JsonValue],
+    idempotency_key: str,
+) -> _WriteDispatch | None:
+    binding = _WRITE_DISPATCH.get()
+    if binding is None:
+        return None
+    if type(binding) is not _WriteDispatch:
+        raise ValueError("concrete write authority unavailable")
+    binding.require_bound(backend)
+    request = binding.call._write_request
+    envelope = binding.envelope
+    if (
+        binding.claimed
+        or request is None
+        or name != "workspace.write_text"
+        or (tenant_id, run_id, actor, idempotency_key)
+        != (request.tenant_id, request.run_id, envelope.actor, envelope.idempotency_key)
+        or _canonical_json_bytes(_freeze_object(arguments, name="dispatch arguments"))
+        != _canonical_json_bytes(_freeze_object(request.arguments, name="owned arguments"))
+    ):
+        raise ValueError("concrete write authority mismatch")
+    binding.claimed = True
+    return binding
+
+
 class _ConcreteReviewCall:
     """Private per-actual-invocation state, never serialized or reused by discovery."""
 
@@ -419,6 +526,70 @@ class _ConcreteReviewCall:
         self._dispatched = False
         self._identity_check: Callable[[], object] | None = None
         self._budget: _RunBudgetContext | None = None
+        self._write_request: CapabilityRequest | None = None
+        self._write_dispatch: _WriteDispatch | None = None
+        self._dispatch_ready = False
+
+    @contextmanager
+    def permission_scope(self, request: CapabilityRequest, role: Role) -> Iterator[None]:
+        if self.tool_name == "workspace.write_text":
+            with _concrete_write_policy(request, role):
+                yield
+        else:
+            yield
+
+    def _prepare_write_dispatch(self, request: CapabilityRequest, fence: _Fence) -> None:
+        permissions = fence.context.routing_decision.get("requested_permissions", ())
+        if not isinstance(permissions, (list, tuple)):
+            raise TypeError("concrete write authority unavailable")
+        if "workspace.write" in permissions:
+            return
+        budget = _run_budget.get()
+        if type(budget) is not _RunBudgetContext or self.tool_name != "workspace.write_text":
+            raise ValueError("concrete write authority unavailable")
+        self._budget = budget
+        self._write_request = CapabilityRequest.model_validate_json(request.model_dump_json())
+
+    @contextmanager
+    def dispatch_scope(self, envelope: HarnessToolCallRequest) -> Iterator[None]:
+        if self._write_request is None:
+            yield
+            return
+        request = self._write_request
+        if (
+            not self._dispatch_ready
+            or self._write_dispatch is not None
+            or (
+                envelope.run_id,
+                envelope.actor,
+                envelope.tool_name,
+                envelope.idempotency_key,
+                envelope.sandbox,
+            )
+            != (
+                request.run_id,
+                request.agent_id,
+                self.tool_name,
+                request.idempotency_key,
+                "workspace_write",
+            )
+            or dict(envelope.arguments) != request.arguments
+        ):
+            raise ValueError("concrete write authority mismatch")
+        binding = _WriteDispatch(
+            self,
+            envelope,
+            asyncio.current_task(),
+            getattr(self._backend, "_project_workspace_store", None),
+        )
+        self._write_dispatch = binding
+        token = _WRITE_DISPATCH.set(binding)
+        try:
+            binding.require_bound(self._backend)
+            yield
+        finally:
+            binding.active = False
+            _WRITE_DISPATCH.reset(token)
 
     async def authorize(
         self,
@@ -483,6 +654,7 @@ class _ConcreteReviewCall:
 
             self._check = exact_check
             self._set_source_check(fence, source, path=path, target=target)
+            self._prepare_write_dispatch(request, fence)
             return CapabilityResult(CapabilityStatus.ALLOWED, request.run_id)
         if route == "human_only":
             return await human_wait()
@@ -559,6 +731,7 @@ class _ConcreteReviewCall:
                 model_review=True,
             )
             self._budget = live.budget
+            self._prepare_write_dispatch(request, captured)
             return CapabilityResult(CapabilityStatus.ALLOWED, request.run_id)
         except Exception:  # noqa: BLE001 - stale/unknown/consume failures never downgrade to legacy grants.
             return denied
@@ -601,8 +774,14 @@ class _ConcreteReviewCall:
         if self._dispatched or self._check is None:
             return False
         self._dispatched = True
+        self._dispatch_ready = await self._live_dispatch_check()
+        return self._dispatch_ready
+
+    async def _live_dispatch_check(self) -> bool:
         try:
             _check_cancelled()
+            if self._check is None:
+                return False
             valid = await self._check()
             if not valid:
                 return False

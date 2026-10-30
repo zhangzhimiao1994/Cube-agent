@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, cast
@@ -26,6 +26,7 @@ from agent_hub.capabilities.gateway import (
     _is_toolchain_supply_request,
 )
 from agent_hub.capabilities.permission_modes import (
+    _concrete_write_policy,
     read_only_capability_allowed,
     run_permission_mode,
     run_permission_policy,
@@ -101,21 +102,41 @@ class DefaultRuntimeCapabilityPolicyGateway:
         return await self._invoke(request, role=role)
 
     async def invoke_concrete(
-        self, request: CapabilityRequest, *, role: Role, review: _ConcreteReviewCall,
+        self,
+        request: CapabilityRequest,
+        *,
+        role: Role,
+        review: _ConcreteReviewCall,
     ) -> CapabilityResult:
         """Only the owned actual Harness invocation supplies this private call."""
         if _is_toolchain_supply_request(request) or _is_go_recipe_request(request):
-            return CapabilityResult(CapabilityStatus.DENIED, request.run_id, reason="capability denied")
-        review.policy_reader = lambda: self._current_review_policy(request, role)
-        review.exact_reader = (lambda: _has_exact_human_approval(self._run_repository, request)
-            ) if self._exact_human_approval_getter is None else lambda: self._read_exact_human(request)
+            return CapabilityResult(
+                CapabilityStatus.DENIED, request.run_id, reason="capability denied"
+            )
+
+        async def current_policy() -> tuple[CapabilityPolicy, bool]:
+            with review.permission_scope(request, role):
+                return await self._current_review_policy(request, role)
+
+        review.policy_reader = current_policy
+        review.exact_reader = (
+            (lambda: _has_exact_human_approval(self._run_repository, request))
+            if self._exact_human_approval_getter is None
+            else lambda: self._read_exact_human(request)
+        )
         try:
-            policy, inbound = await self._current_review_policy(request, role)
+            policy, inbound = await current_policy()
         except Exception:  # noqa: BLE001 - unavailable current scope never grants execution.
-            return CapabilityResult(CapabilityStatus.DENIED, request.run_id, reason="capability denied")
-        return await CapabilityGateway(policy, self._approvals, self._run_repository,
-            plugin_policy_source=self._plugin_policy_rules).invoke(request, role=role,
-                concrete_review=review, submission_authorized=inbound)
+            return CapabilityResult(
+                CapabilityStatus.DENIED, request.run_id, reason="capability denied"
+            )
+        with review.permission_scope(request, role):
+            return await CapabilityGateway(
+                policy,
+                self._approvals,
+                self._run_repository,
+                plugin_policy_source=self._plugin_policy_rules,
+            ).invoke(request, role=role, concrete_review=review, submission_authorized=inbound)
 
     async def _read_exact_human(self, request: CapabilityRequest) -> bool:
         getter = self._exact_human_approval_getter
@@ -131,6 +152,10 @@ class DefaultRuntimeCapabilityPolicyGateway:
             raise ValueError("capability denied")
         required = mode is not None or await self._tool_approval_required(request.tenant_id)
         rules = self._extra_policy_rules(request)
+        if mode == "default":
+            # The user's manual choice is a ceiling over even explicitly eligible ASK rules.
+            rules = tuple(replace(rule, review_disposition="human_only")
+                if rule.effect is PolicyEffect.REQUIRE_APPROVAL else rule for rule in rules)
         effect = await _project_metadata_preparation_effect(self._run_repository, request, role=role)
         if effect is None:
             effect = await _project_input_supply_effect(self._run_repository, request, role=role)
@@ -145,17 +170,21 @@ class DefaultRuntimeCapabilityPolicyGateway:
         # action. Explicit current ASK/DENY rules still aggregate above ALLOW.
         policy = default_capability_policy(request.tenant_id,
             require_approval_for_tools=required and not inbound,
-            extra_rules=rules, concrete_model_review=True)
+            extra_rules=rules, concrete_model_review=mode == "auto_review")
         return policy, inbound
 
     async def authorize_static(self, request: CapabilityRequest, *, role: Role) -> CapabilityResult:
         try:
-            policy, _ = await self._current_review_policy(request, role)
+            with _concrete_write_policy(request, role):
+                policy, _ = await self._current_review_policy(request, role)
             allowed = policy.evaluate(request, role).route != "deny"
         except Exception:  # noqa: BLE001 - discovery cannot establish execution authority.
             allowed = False
-        return CapabilityResult(CapabilityStatus.ALLOWED if allowed else CapabilityStatus.DENIED,
-                                request.run_id, reason=None if allowed else "capability denied")
+        return CapabilityResult(
+            CapabilityStatus.ALLOWED if allowed else CapabilityStatus.DENIED,
+            request.run_id,
+            reason=None if allowed else "capability denied",
+        )
 
     async def authorize_project_toolchain(
         self, request: CapabilityRequest, *, role: Role,

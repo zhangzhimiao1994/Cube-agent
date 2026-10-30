@@ -19,6 +19,7 @@ from uuid import UUID, uuid4
 if TYPE_CHECKING:
     from agent_hub.capabilities.project_inspection import PythonCatalogQuery
     from agent_hub.capabilities.python_project_reports import PythonProjectFailure
+    from agent_hub.capabilities.review_context import _WriteDispatch
     from agent_hub.harness.tool_gateway import HarnessToolGateway
     from agent_hub.runs.project_inputs import OriginalProjectPreparer
     from agent_hub.runs.project_verification_receipts import ProjectVerificationReceiptRepository
@@ -436,7 +437,23 @@ class RuntimeCapabilityGateway:
                 raise RuntimeCapabilityError('original project contract requires scoped workspace operations')
             return self._execute_generate_project_zip(tenant_id, run_id, arguments)
         if normalized_name == _WORKSPACE_WRITE_TOOL:
-            return await self._execute_workspace_write_text(tenant_id, run_id, arguments)
+            from agent_hub.capabilities.review_context import _claim_write_dispatch
+
+            try:
+                dispatch = _claim_write_dispatch(
+                    self,
+                    tenant_id=tenant_id,
+                    run_id=run_id,
+                    actor=actor,
+                    name=normalized_name,
+                    arguments=arguments,
+                    idempotency_key=idempotency_key,
+                )
+            except ValueError:
+                raise RuntimeCapabilityError("concrete write authority unavailable") from None
+            return await self._execute_workspace_write_text(
+                tenant_id, run_id, arguments, _dispatch=dispatch
+            )
         if normalized_name == _WORKSPACE_PRUNE_TOOL:
             return await self._execute_workspace_prune(tenant_id, run_id, arguments)
         if normalized_name == _WORKSPACE_LIST_TOOL:
@@ -818,27 +835,50 @@ class RuntimeCapabilityGateway:
         tenant_id: UUID,
         run_id: UUID,
         arguments: Mapping[str, JsonValue],
+        *,
+        _dispatch: _WriteDispatch | None = None,
     ) -> Mapping[str, JsonValue]:
         store = self._require_project_workspace_store()
-        project_id, session_id = await self._project_workspace_scope(tenant_id, run_id)
+        if _dispatch is not None:
+            from agent_hub.capabilities.review_context import _WriteDispatch
+
+            if type(_dispatch) is not _WriteDispatch or not _dispatch.claimed:
+                raise RuntimeCapabilityError("concrete write authority unavailable")
+            try:
+                _dispatch.begin_write(self, tenant_id, run_id, arguments)
+            except ValueError:
+                raise RuntimeCapabilityError("concrete write authority unavailable") from None
+        project_id, session_id = await self._project_workspace_scope(
+            tenant_id,
+            run_id,
+            write_required=_dispatch is None,
+        )
         path = _required_string(arguments, "path")
         referenced = "content_reference" in arguments
         if referenced:
             # References transport reviewed file data only; they grant no write authority.
             reference = arguments["content_reference"]
             if set(arguments) != {"path", "content_reference"}:
-                raise RuntimeCapabilityError("workspace content sources must be exclusive with no extra arguments")
+                raise RuntimeCapabilityError(
+                    "workspace content sources must be exclusive with no extra arguments"
+                )
             if self._artifact_repository is None or not isinstance(reference, Mapping):
                 raise RuntimeCapabilityError("workspace content reference is unavailable")
             try:
                 loaded = await load_continuation(
-                    self._artifact_repository, tenant_id=tenant_id, run_id=run_id,
+                    self._artifact_repository,
+                    tenant_id=tenant_id,
+                    run_id=run_id,
                     reference=reference,
                 )
             except ArtifactRepositoryError:
-                raise RuntimeCapabilityError("workspace content reference is invalid or unavailable") from None
+                raise RuntimeCapabilityError(
+                    "workspace content reference is invalid or unavailable"
+                ) from None
             if type(loaded) is not str or not loaded.strip():
-                raise RuntimeCapabilityError("workspace referenced content must be a nonempty string")
+                raise RuntimeCapabilityError(
+                    "workspace referenced content must be a nonempty string"
+                )
             content = loaded
             # Hydration may await remote storage; do not write using a stale workspace grant.
             if await self._project_workspace_scope(tenant_id, run_id) != (project_id, session_id):
@@ -846,8 +886,17 @@ class RuntimeCapabilityGateway:
         else:
             content = _required_string(arguments, "content")
         contract = await self._original_project_contract(tenant_id, run_id)
-        if contract is not None and path != 'DELIVERY_MANIFEST.json' and not contract.is_editable(path):
-            raise RuntimeCapabilityError('original project checks are protected from modification')
+        if (
+            contract is not None
+            and path != "DELIVERY_MANIFEST.json"
+            and not contract.is_editable(path)
+        ):
+            raise RuntimeCapabilityError("original project checks are protected from modification")
+        if _dispatch is not None:
+            try:
+                await _dispatch.require_current(self)
+            except ValueError:
+                raise RuntimeCapabilityError("concrete write authority unavailable") from None
         task = asyncio.current_task()
         if referenced and task is not None and task.cancelling():
             raise asyncio.CancelledError

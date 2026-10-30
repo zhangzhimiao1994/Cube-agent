@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Mapping
+import asyncio
+from collections.abc import Awaitable, Iterator, Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, cast
 
 from agent_hub.auth.models import Role
@@ -12,6 +16,114 @@ from agent_hub.domain.runs import RunStatus, TaskMode
 
 if TYPE_CHECKING:
     from agent_hub.runs.workspace import PermissionMode
+
+
+@dataclass(slots=True)
+class _ConcreteWritePolicyScope:
+    request: CapabilityRequest
+    role: Role
+    owner: asyncio.Task[object] | None
+    active: bool = True
+
+
+_WRITE_POLICY: ContextVar[_ConcreteWritePolicyScope | None] = ContextVar(
+    "concrete_write_policy_candidate",
+    default=None,
+)
+
+
+@contextmanager
+def _concrete_write_policy(request: CapabilityRequest, role: Role) -> Iterator[None]:
+    """Discovery/evaluation only; this scope never grants backend access."""
+    scope = _ConcreteWritePolicyScope(
+        CapabilityRequest.model_validate_json(request.model_dump_json()),
+        role,
+        asyncio.current_task(),
+    )
+    token = _WRITE_POLICY.set(scope)
+    try:
+        yield
+    finally:
+        scope.active = False
+        _WRITE_POLICY.reset(token)
+
+
+def _pending_concrete_write(record: object, request: CapabilityRequest, role: Role) -> bool:
+    """Defer only a fresh owned builtin text write to concrete consent, never ALLOW."""
+    from agent_hub.capabilities.execution_authority import _trusted_review_context
+    from agent_hub.capabilities.review_repository import review_config_sha256
+    from agent_hub.models.physical_budget import _run_budget, _RunBudgetContext
+    from agent_hub.runs.repository import RunRecord
+
+    scope = _WRITE_POLICY.get()
+    if (
+        type(scope) is not _ConcreteWritePolicyScope
+        or not scope.active
+        or scope.owner is not asyncio.current_task()
+        or scope.request != request
+        or scope.role is not role
+        or not isinstance(record, RunRecord)
+        or request.tool_origin != "builtin"
+        or (request.capability, request.operation, request.resource)
+        != ("file", "write", "workspace/current")
+        or set(request.arguments) != {"path", "content"}
+        or not all(type(request.arguments[key]) is str for key in ("path", "content"))
+    ):
+        return False
+    route = getattr(record, "routing_decision", None)
+    if (
+        not isinstance(route, Mapping)
+        or route.get("sandbox_profile") != "workspace_write"
+        or route.get("permission_mode") not in {"default", "auto_review"}
+        or "workspace.read" not in route.get("requested_permissions", ())
+        or "workspace.write" in route.get("requested_permissions", ())
+        or not all(
+            isinstance(route.get(key), str) and route[key]
+            for key in ("conversation_id", "project_id", "workspace_session_id")
+        )
+        or any(
+            key in route
+            for key in (
+                "project_input",
+                "project_input_contract_version",
+                "generated_project_contract_version",
+                "generated_project_preparation",
+            )
+        )
+    ):
+        return False
+    profile = route.get("approval_review_profile")
+    budget = _run_budget.get()
+    if (
+        type(budget) is not _RunBudgetContext
+        or not isinstance(profile, Mapping)
+        or type(profile.get("version")) is not int
+        or profile["version"] != 1
+        or profile.get("config_sha256") != review_config_sha256(budget.config)
+        or type(profile.get("catalog_version")) is not int
+        or profile["catalog_version"] < 1
+        or not isinstance(profile.get("catalog_sha256"), str)
+        or len(profile["catalog_sha256"]) != 64
+        or budget.config.engine != "rules_then_model"
+    ):
+        return False
+    try:
+        budget.check()
+        context, worker = _trusted_review_context(
+            tenant_id=request.tenant_id,
+            run_id=request.run_id,
+            user_id=request.user_id,
+            role=role,
+            current_record=record,
+        )
+        return (budget.tenant_id, budget.run_id, budget.lease.worker_id, budget.lease.token) == (
+            request.tenant_id,
+            request.run_id,
+            worker,
+            context.execution_token,
+        )
+    except Exception:  # noqa: BLE001 - absent original authority cannot open pending scope.
+        return False
 
 
 async def run_permission_mode(
@@ -71,7 +183,10 @@ async def run_permission_policy(
                 required.add("workspace.write")
             if request.capability == "command" and request.operation == "run":
                 required.add("command.run")
-        if not required.issubset(permissions):
+        if not required.issubset(permissions) and not (
+            required.difference(permissions) == {"workspace.write"}
+            and _pending_concrete_write(record, request, role)
+        ):
             raise ValueError("run permission policy is unavailable")
     return cast(PermissionMode, mode), concrete
 

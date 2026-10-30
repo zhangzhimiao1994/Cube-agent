@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import re
 from collections.abc import Mapping
+from contextlib import nullcontext
 from typing import TYPE_CHECKING, Literal, Protocol, cast
 from uuid import UUID
 
@@ -398,14 +399,15 @@ class HarnessToolGateway:
             else:
                 if not self._backend.is_available(tenant_id, request.tool_name):
                     return self._failure(request, "tool unavailable")
-                payload = await self._backend.execute(
-                    tenant_id=tenant_id,
-                    run_id=request.run_id,
-                    actor=request.actor,
-                    name=request.tool_name,
-                    arguments=request.arguments,
-                    idempotency_key=request.idempotency_key,
-                )
+                with review_call.dispatch_scope(request) if review_call is not None else nullcontext():
+                    payload = await self._backend.execute(
+                        tenant_id=tenant_id,
+                        run_id=request.run_id,
+                        actor=request.actor,
+                        name=request.tool_name,
+                        arguments=request.arguments,
+                        idempotency_key=request.idempotency_key,
+                    )
         except GeneratedProjectDraftRejected as error:
             draft = (_generated_draft_payload(error, tenant_id=tenant_id, user_id=user_id, request=request)
                      if type(user_id) is UUID and isinstance(role, Role) else None)
