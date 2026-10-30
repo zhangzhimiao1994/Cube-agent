@@ -144,7 +144,7 @@ async def _admit_unit(broker: ProjectExecutionBroker, job: _Execution, *, no_job
         2.0,
     )
     properties = dict(line.split('=', 1) for line in result.stdout.splitlines() if '=' in line)
-    if not broker._unit_quiet(job, result) or (no_job and properties.get('Job') != '0'):
+    if not broker._unit_quiet(job, result) or (no_job and properties.get('Job') not in ('', '0')):
         raise ValueError("python_project_execution_unavailable")
 
 

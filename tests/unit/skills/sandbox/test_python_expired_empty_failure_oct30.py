@@ -135,28 +135,56 @@ async def test_same_archive_identity_with_changed_snapshot_metadata_is_conflict_
         await repository.put(value.scope.tenant_id, value.scope.run_id, changed)
 
 
-@pytest.mark.parametrize('job', ['7', None])
-async def test_new_unit_admission_requires_explicit_zero_job(job: str | None) -> None:
+@pytest.mark.parametrize(('job', 'change', 'populated', 'no_job', 'allowed'), [
+    ('', {}, False, True, True),
+    ('0', {}, False, True, True),
+    (None, {}, False, True, False),
+    ('7', {}, False, True, False),
+    ('', {'MainPID': '123'}, False, True, False),
+    ('0', {'ControlPID': '123'}, False, True, False),
+    ('', {'TasksCurrent': '1'}, False, True, False),
+    ('', {}, True, True, False),
+    ('0', {}, True, True, False),
+    (None, {}, False, False, True),
+])
+async def test_unit_admission_keeps_quiet_and_explicit_no_job(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, job: str | None,
+    change: dict[str, str], populated: bool, no_job: bool, allowed: bool,
+) -> None:
+    from agent_hub.skills.sandbox import project
     from agent_hub.skills.sandbox.base import SkillResult
     from agent_hub.skills.sandbox.project import _Execution
     from agent_hub.skills.sandbox.python_project_broker import _admit_unit
     seen: list[str] = []
+    execution = _Execution(invocation(), None)
+    properties = {'LoadState': 'not-found', 'ActiveState': 'inactive', 'SubState': 'dead',
+        'MainPID': '0', 'ControlPID': '0', 'ControlGroup': '', 'TasksCurrent': '[not set]'}
+    if job is not None:
+        properties['Job'] = job
+    if populated:
+        properties.update(LoadState='loaded', ControlGroup=f'/system.slice/{execution.unit}')
+        group = tmp_path / 'system.slice' / execution.unit
+        group.mkdir(parents=True)
+        (group / 'cgroup.events').write_text('populated 1\nfrozen 0\n')
+    properties.update(change)
+    monkeypatch.setattr(project, '_CGROUP_ROOT', tmp_path)
 
     class Broker:
         policy = SimpleNamespace(systemctl='/usr/bin/systemctl')
+        # Keep the production quiet predicate; this is not a native Linux proof.
+        _unit_quiet = staticmethod(project.ProjectExecutionBroker._unit_quiet)
 
         async def _helper(self, command: Any, timeout: float) -> Any:
             seen.extend(command)
-            return SkillResult(exit_code=0, stdout='' if job is None else 'Job=' + job,
+            return SkillResult(exit_code=0, stdout='\n'.join(f'{k}={v}' for k, v in properties.items()),
                                stderr='', timed_out=False)
 
-        def _unit_quiet(self, *args: Any) -> bool:
-            # Unit-only boundary test, not a claim of native quiescence.
-            return True
-
-    with pytest.raises(ValueError):
-        await _admit_unit(Broker(), _Execution(invocation(), None), no_job=True)
-    assert any('Job' in item for item in seen)
+    if allowed:
+        await _admit_unit(Broker(), execution, no_job=no_job)
+    else:
+        with pytest.raises(ValueError, match='python_project_execution_unavailable'):
+            await _admit_unit(Broker(), execution, no_job=no_job)
+    assert any('Job' in item for item in seen) is no_job
 
 
 @pytest.fixture
