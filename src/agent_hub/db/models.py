@@ -748,3 +748,104 @@ class AdminResourceRow(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
+
+
+class RunReviewIntentRow(Base):
+    """Private immutable snapshot and append-only-event state materialization."""
+
+    __tablename__ = 'agent_hub_review_intents'
+    __table_args__ = (
+        UniqueConstraint('review_id', 'run_id', 'tenant_id', name='uq_review_intent_owner'),
+        UniqueConstraint('attempt_id', name='uq_review_intent_attempt'),
+        ForeignKeyConstraint(['attempt_id', 'run_id', 'tenant_id'],
+            ['agent_hub_run_admission_attempts.attempt_id', 'agent_hub_run_admission_attempts.run_id',
+             'agent_hub_run_admission_attempts.tenant_id'], name='fk_review_intent_attempt',
+            ondelete='CASCADE'),
+        ForeignKeyConstraint(['authorization_turn_id', 'tenant_id', 'run_id'],
+            ['agent_hub_authenticated_inputs.turn_id', 'agent_hub_authenticated_inputs.tenant_id',
+             'agent_hub_authenticated_inputs.run_id'], name='fk_review_intent_original'),
+        CheckConstraint("status IN ('prepared','issued','allow','deny','needs_human','timeout',"
+                        "'unavailable','invalid_response','unknown','cancelled')",
+                        name='ck_review_intent_status'),
+        CheckConstraint("NOT consumed OR status = 'allow'", name='ck_review_intent_consumed'),
+        CheckConstraint('octet_length(private_action) BETWEEN 1 AND 65536 AND '
+                        '(private_receipt IS NULL OR octet_length(private_receipt) <= 16384)',
+                        name='ck_review_intent_bounds'),
+        CheckConstraint("action_digest ~ '^[0-9a-f]{64}$' AND effect_digest ~ '^[0-9a-f]{64}$' AND "
+                        "authorization_sha256 ~ '^[0-9a-f]{64}$' AND config_sha256 ~ '^[0-9a-f]{64}$' "
+                        "AND policy_sha256 ~ '^[0-9a-f]{64}$' AND source_sha256 ~ '^[0-9a-f]{64}$' "
+                        "AND request_sha256 ~ '^[0-9a-f]{64}$' AND "
+                        "(receipt_sha256 IS NULL OR receipt_sha256 ~ '^[0-9a-f]{64}$')",
+                        name='ck_review_intent_digests'),
+        Index('ix_review_intent_original', 'tenant_id', 'authorization_turn_id'),
+    )
+
+    review_id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), primary_key=True)
+    tenant_id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True))
+    run_id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True))
+    authorization_turn_id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True))
+    attempt_id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True))
+    action_digest: Mapped[str] = mapped_column(String(64))
+    effect_digest: Mapped[str] = mapped_column(String(64))
+    authorization_sha256: Mapped[str] = mapped_column(String(64))
+    config_sha256: Mapped[str] = mapped_column(String(64))
+    policy_sha256: Mapped[str] = mapped_column(String(64))
+    source_sha256: Mapped[str] = mapped_column(String(64))
+    request_sha256: Mapped[str] = mapped_column(String(64))
+    private_action: Mapped[str] = mapped_column(Text)
+    private_config: Mapped[dict[str, object]] = mapped_column(JSONB)
+    status: Mapped[str] = mapped_column(String(24))
+    physical_identity: Mapped[UUID | None] = mapped_column(PostgreSQLUUID(as_uuid=True), nullable=True)
+    receipt_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    private_receipt: Mapped[str | None] = mapped_column(Text, nullable=True)
+    risk: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    reason_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    consumed: Mapped[bool] = mapped_column(Boolean)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class RunReviewEffectRow(Base):
+    """Permanent original-authorization/effect claim, shared across keys/agents."""
+
+    __tablename__ = 'agent_hub_review_effects'
+    __table_args__ = (
+        UniqueConstraint('review_id', name='uq_review_effect_intent'),
+        ForeignKeyConstraint(['review_id', 'run_id', 'tenant_id'],
+            ['agent_hub_review_intents.review_id', 'agent_hub_review_intents.run_id',
+             'agent_hub_review_intents.tenant_id'], name='fk_review_effect_intent', ondelete='CASCADE'),
+        ForeignKeyConstraint(['authorization_turn_id', 'tenant_id', 'run_id'],
+            ['agent_hub_authenticated_inputs.turn_id', 'agent_hub_authenticated_inputs.tenant_id',
+             'agent_hub_authenticated_inputs.run_id'], name='fk_review_effect_original'),
+        CheckConstraint("effect_digest ~ '^[0-9a-f]{64}$'", name='ck_review_effect_digest'),
+    )
+
+    tenant_id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), primary_key=True)
+    authorization_turn_id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), primary_key=True)
+    effect_digest: Mapped[str] = mapped_column(String(64), primary_key=True)
+    run_id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True))
+    review_id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class RunReviewEventRow(Base):
+    """Only INSERT transitions; sequence orders serialized original-run evidence."""
+
+    __tablename__ = 'agent_hub_review_events'
+    __table_args__ = (
+        ForeignKeyConstraint(['review_id', 'run_id', 'tenant_id'],
+            ['agent_hub_review_intents.review_id', 'agent_hub_review_intents.run_id',
+             'agent_hub_review_intents.tenant_id'], name='fk_review_event_intent', ondelete='CASCADE'),
+        UniqueConstraint('review_id', 'kind', name='uq_review_event_transition'),
+        CheckConstraint("kind IN ('prepared','issued','terminal','consumed')",
+                        name='ck_review_event_kind'),
+        Index('ix_review_event_original', 'tenant_id', 'authorization_turn_id', 'sequence'),
+    )
+
+    sequence: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    tenant_id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True))
+    run_id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True))
+    authorization_turn_id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True))
+    review_id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True))
+    kind: Mapped[str] = mapped_column(String(16))
+    evidence: Mapped[dict[str, object]] = mapped_column(JSONB)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
