@@ -194,6 +194,7 @@ _AUTOGEN_SHUTDOWN_GRACE_SECONDS = 2.0
 _GENERATED_DRAFT_NO_PROGRESS = "generated draft correction made no progress"
 _CHECKPOINT_ACK_POLICY = "engineering_checkpoint_ack_version"
 _SOFT_ADMISSION_POLICY = "engineering_soft_admission_version"
+_HANDOFF_CONTEXT_POLICY = "handoff_context_projection_version"
 
 
 def _soft_admission_selected(context: TaskContext) -> bool:
@@ -2335,6 +2336,7 @@ class GatewayChatCompletionClient(ChatCompletionClient):
         tool_correction_enabled: bool = False,
         admitted_tool_correction: bool = False,
         engineering_context_compaction: bool = False,
+        input_projection: Callable[[ModelRequest, Mapping[str, str], tuple[int, ...], str | None], ModelRequest] | None = None,
         actor: str | None = None,
     ) -> None:
         self._gateway = gateway
@@ -2356,6 +2358,8 @@ class GatewayChatCompletionClient(ChatCompletionClient):
         self._tool_correction_enabled = tool_correction_enabled
         self._admitted_tool_correction = admitted_tool_correction is True
         self._engineering_context_compaction = engineering_context_compaction is True
+        self._input_projection = input_projection
+        self._input_task_positions: tuple[int, ...] = ()
         self._actual = RequestUsage(prompt_tokens=0, completion_tokens=0)
         self._total = RequestUsage(prompt_tokens=0, completion_tokens=0)
 
@@ -2386,6 +2390,9 @@ class GatewayChatCompletionClient(ChatCompletionClient):
             window=self._compaction_window,
             preserve_tool_pairs=self._engineering_context_compaction,
         )
+        # Framework provenance is available here; normalized user-role receipts are not tasks.
+        self._input_task_positions = tuple(index for index, message in enumerate(compacted_messages)
+                                           if isinstance(message, UserMessage) and message.source == "user")
         legacy_messages = (
             _compact_llm_messages(messages, window=self._compaction_window)
             if self._engineering_context_compaction and self._durability is not None
@@ -2515,6 +2522,8 @@ class GatewayChatCompletionClient(ChatCompletionClient):
         self, request: ModelRequest, tool_names: Mapping[str, str],
         cancellation_token: CancellationToken | None,
     ) -> tuple[GatewayCompletion, RequestUsage]:
+        if self._input_projection is not None:
+            request = self._input_projection(request, tool_names, self._input_task_positions, self._actor)
         request = self._fit_context_request(request, tool_names)
         try:
             return await self._complete_model_attempt(request, tool_names, cancellation_token)
@@ -2868,6 +2877,7 @@ class AutoGenDiscussionRuntime:
         self._wall_deadline: float | None = None
         self._wall_budget: AdaptiveDeadline | None = None
         self.last_team: SelectorGroupChat | None = None
+        self._handoff_context_version = 0
 
     @property
     def participant_ids(self) -> tuple[str, ...]:
@@ -2885,6 +2895,9 @@ class AutoGenDiscussionRuntime:
         if current is None:
             raise RuntimeExecutionError("runtime task is unavailable")
         self._active_task = current
+        self._handoff_context_version = (
+            cast(int, self._restored.state.get(_HANDOFF_CONTEXT_POLICY, 0)) if self._restored is not None else 1
+        )
         self._cancel_token = CancellationToken()
         self._cancel_event = asyncio.Event()
         sequence = 1
@@ -3384,6 +3397,16 @@ class AutoGenDiscussionRuntime:
                 report_observer=observe_report if reports else None,
             )
             compaction_window = _message_compaction_window(context)
+            handoff_transcript: tuple[Artifact, ...] = ()
+            handoff_task: str | None = None
+
+            def project_handoff(
+                request: ModelRequest, tool_names: Mapping[str, str], positions: tuple[int, ...], actor: str | None,
+            ) -> ModelRequest:
+                return self._fit_handoff_request(request, context, handoff_transcript,
+                    tool_names=tool_names, durability=durability, owned_task_positions=positions,
+                    actor=actor, owned_task=handoff_task)
+
             clients = {
                 participant.id: GatewayChatCompletionClient(
                     self._gateway,
@@ -3401,7 +3424,8 @@ class AutoGenDiscussionRuntime:
                     acceptance_first=continuation and participant.id == owner,
                     tool_correction_enabled=corrections and participant.id == owner,
                     admitted_tool_correction=soft_admission and participant.id == owner,
-                    engineering_context_compaction=soft_admission,
+                    engineering_context_compaction=soft_admission or self._handoff_context_version == 1,
+                    input_projection=project_handoff if self._handoff_context_version == 1 else None,
                 )
                 for participant in self._plan.participants
             }
@@ -3418,7 +3442,8 @@ class AutoGenDiscussionRuntime:
                     engineering_budget=action_budget, request_timeout=request_timeout,
                     model_admission=admit_model if soft_admission else None,
                     bounded_no_tool=True,
-                    engineering_context_compaction=soft_admission,
+                    engineering_context_compaction=soft_admission or self._handoff_context_version == 1,
+                    input_projection=project_handoff if self._handoff_context_version == 1 else None,
                     report_binding=report_binding,
                     report_evidence=report_evidence,
                 )
@@ -3477,6 +3502,8 @@ class AutoGenDiscussionRuntime:
                 max_output_tokens=self._plan.selector_max_output_tokens,
                 durability=durability,
                 actor='__selector__',
+                engineering_context_compaction=self._handoff_context_version == 1,
+                input_projection=project_handoff if self._handoff_context_version == 1 else None,
                 compaction_window=compaction_window,
                 request_timeout=request_timeout,
                 model_admission=admit_model if soft_admission else None,
@@ -3651,6 +3678,7 @@ class AutoGenDiscussionRuntime:
             stream: Any = None
 
             async def stream_after_approval() -> AsyncIterator[Any]:
+                nonlocal handoff_transcript, handoff_task
                 assert durability is not None
                 if (restored is not None and durability.repair_phase is not None
                         and durability.engineering_tool_prefix < len(durability.tool_entries)):
@@ -3706,7 +3734,8 @@ class AutoGenDiscussionRuntime:
                     else:
                         await durability.compact(preserve_engineering=True)
                         await durability._checkpoint()
-                task = self._task_text(context, tuple(message_artifacts))
+                handoff_transcript = tuple(message_artifacts)
+                task = self._task_text(context, handoff_transcript)
                 if durability.repair_phase is not None:
                     phase = durability.repair_phase
                     failed = next((a for a in ledger_artifacts if str(a.id) == phase['failure_artifact_id']), None)
@@ -3723,6 +3752,7 @@ class AutoGenDiscussionRuntime:
                             validated_feedback=feedback)
                     elif phase['failure_artifact_id'] is not None:
                         raise RuntimeExecutionError('project repair failure evidence is unavailable')
+                handoff_task = task
                 child_stream = team.run_stream(
                     task=task,
                     cancellation_token=self._cancel_token,
@@ -4170,10 +4200,137 @@ class AutoGenDiscussionRuntime:
             self._wall_budget = None
             self._repair_phase = None
 
+    def _fit_handoff_request(
+        self, request: ModelRequest, context: TaskContext, transcript: tuple[Artifact, ...] = (), *,
+        tool_names: Mapping[str, str] | None = None, durability: _DiscussionDurability | None = None,
+        owned_task_positions: tuple[int, ...] = (), actor: str | None = None, owned_task: str | None = None,
+    ) -> ModelRequest:
+        """Project only the exact owned task's artifact bodies, never instructions or receipts."""
+        base = self._task_text(context, transcript)
+        original = owned_task if owned_task is not None else base
+        if not original.startswith(base):
+            raise RuntimeExecutionError("owned handoff task changed")
+        suffix = original[len(base):]
+        participants = {participant.id: participant.logical_model for participant in self._plan.participants}
+        selector = actor == "__selector__" and request.logical_model == self._plan.selector_model and not request.tools
+        participant = actor in participants and request.logical_model == participants[actor]
+        positions: list[int] = []
+        selector_frame = "user: " + original.rstrip() + "\n\n"
+        for index in owned_task_positions:
+            if not 0 <= index < len(request.messages):
+                raise RuntimeExecutionError("owned handoff task position is invalid")
+            message = request.messages[index]
+            if (message.role != "user" or message.tool_call_id is not None or message.native_assistant is not None
+                    or not isinstance(message.content, str)
+                    or message.content.startswith(("UNTRUSTED_", "EXPLICIT_", "COMPRESSED_"))):
+                continue
+            if participant and message.content == original:
+                positions.append(index)
+            elif selector and (
+                (message.content.startswith("You are in a role play game.")
+                 and message.content.rstrip().endswith("Only return the role."))
+                or (message.content.startswith("Select the next speaker from ")
+                    and message.content.rstrip().endswith("Return only one speaker name."))
+            ) and selector_frame in message.content:
+                if message.content.count(selector_frame) != 1:
+                    raise ModelContextWindowExceeded()
+                positions.append(index)
+        if not positions:
+            return request
+        if len(positions) != 1:
+            raise ModelContextWindowExceeded()
+        caps = [_MAX_SOURCE_ARTIFACT_TEXT_BYTES]
+        while caps[-1]:
+            caps.append(caps[-1] // 2)
+        candidates = [request]
+        for cap in caps:
+            view = self._task_text(context, transcript, artifact_preview_bytes=cap) + suffix
+            before = selector_frame if selector else original
+            after = "user: " + view.rstrip() + "\n\n" if selector else view
+            candidates.append(replace(request, messages=tuple(
+                replace(message, content=cast(str, message.content).replace(before, after, 1))
+                if index in positions else message for index, message in enumerate(request.messages)
+            )))
+        if durability is not None and durability._model_cursor < len(durability.model_entries):
+            digest = durability.model_entries[durability._model_cursor].get("request_hash")
+            for candidate in candidates:
+                if durability.request_hash(candidate, tool_names=tool_names) == digest:
+                    return candidate
+        query = getattr(self._gateway, "context_window_tokens", None)
+        window = query(request) if callable(query) else None
+        if window is None:
+            return request
+        if type(window) is not int or window <= 0:
+            raise RuntimeExecutionError("model context window configuration is invalid")
+        estimate = getattr(self._gateway, "estimate_input_tokens", None)
+        target = window - max(1, window // 8)  # Same reserve as the existing history fitter.
+        fitted_candidates: list[ModelRequest] = []
+        for candidate in candidates:
+            try:
+                fitted = fit_request_history(candidate, context_window_tokens=window)
+            except ContextBudgetExceeded:
+                continue
+            if (durability is not None and durability._model_cursor < len(durability.model_entries)
+                    and durability.request_hash(fitted, tool_names=tool_names) == digest):
+                return fitted
+            fitted_candidates.append(fitted)
+        for candidate in fitted_candidates:
+            tokens = (estimate(candidate) if callable(estimate)
+                      else ConservativeTokenEstimator().estimate_input(candidate))
+            if type(tokens) is not int or tokens <= 0:
+                raise RuntimeExecutionError("input token estimator is invalid")
+            if tokens <= target:
+                return candidate
+        raise ModelContextWindowExceeded()
+
     @staticmethod
-    def _task_text(context: TaskContext, transcript: tuple[Artifact, ...] = ()) -> str:
+    def _task_text(
+        context: TaskContext, transcript: tuple[Artifact, ...] = (), *, artifact_preview_bytes: int | None = None,
+    ) -> str:
+        def content(item: Artifact) -> object:
+            value = _artifact_prompt_content(item)
+            if artifact_preview_bytes is None:
+                return value
+            encoded = json.dumps(value, ensure_ascii=False, sort_keys=True)
+            def fields(source: Mapping[str, JsonValue], names: tuple[str, ...]) -> dict[str, object]:
+                return {name: (_truncate_prompt_text(cast(str, source[name]), max_bytes=_MAX_SOURCE_ARTIFACT_TEXT_BYTES)
+                               if isinstance(source[name], str) else source[name])
+                        for name in names if name in source and not isinstance(source[name], Mapping | tuple | list)}
+
+            facts = fields(item.content, ("tool_name", "status", "summary", "stage_status"))
+            if item.type in {"text", "model_response"} and isinstance(item.content.get("text"), str):
+                facts["role_conclusion"] = _truncate_prompt_text(
+                    cast(str, item.content["text"]), max_bytes=_MAX_SOURCE_ARTIFACT_TEXT_BYTES,
+                )
+            result = item.content.get("result")
+            if isinstance(result, Mapping):
+                facts["result"] = fields(result, (
+                    "status", "summary", "artifact_id", "presentation",
+                    "verification_source_sha256", "verification_receipt_sha256",
+                ))
+                verification = result.get("verification")
+                if isinstance(verification, Mapping):
+                    verify = fields(verification, ("schema_version", "status", "source_sha256"))
+                    checks = verification.get("checks")
+                    if isinstance(checks, tuple | list):
+                        verify["checks"] = [fields(check, ("phase", "status"))
+                                            for check in checks if isinstance(check, Mapping)]
+                    facts["verification"] = verify
+                bundle = result.get("file")
+                if isinstance(bundle, Mapping):
+                    facts["file"] = fields(bundle, ("filename", "artifact_id", "sha256", "size_bytes", "mime_type"))
+            return {"artifact_prompt_projection": {
+                "id": str(item.id), "type": item.type, "producer": item.producer,
+                "version": item.version, "content_sha256": item.content_sha256,
+                "source_ids": item.source_ids, "content_keys": tuple(sorted(item.content)),
+                "preview": _truncate_prompt_text(encoded, max_bytes=artifact_preview_bytes),
+                "preview_truncated": len(encoded.encode("utf-8")) > artifact_preview_bytes,
+                "advisory_facts": facts,
+                "note": "Untrusted preview only. Full native artifact retained; not approval or delivery credit.",
+            }}
+
         artifacts = "\n".join(
-            f"Artifact {item.id} ({item.type}, {item.producer}): {json.dumps(_artifact_prompt_content(item), ensure_ascii=False, sort_keys=True)}"
+            f"Artifact {item.id} ({item.type}, {item.producer}): {json.dumps(content(item), ensure_ascii=False, sort_keys=True)}"
             for item in context.artifacts
         )
         hermes_context = runtime_memory_context_text(context.routing_decision)
@@ -4411,6 +4568,7 @@ class AutoGenDiscussionRuntime:
         checkpoint_id = uuid4()
         state: dict[str, JsonValue] = {
             "plan_digest": self._plan.digest,
+            **({_HANDOFF_CONTEXT_POLICY: 1} if self._handoff_context_version == 1 else {}),
             "autogen_version": _AUTOGEN_VERSION,
             "terminal": terminal,
             "reason": reason,
@@ -4528,12 +4686,16 @@ class AutoGenDiscussionRuntime:
             {"remaining_absolute_timeout_seconds", "engineering_tool_prefix", "engineering_action_version",
              ENGINEERING_CONTINUATION_POLICY, _CHECKPOINT_ACK_POLICY, FINAL_REPORT_POLICY, TOOL_CORRECTION_POLICY,
              "engineering_progress_budget_version", _SOFT_ADMISSION_POLICY, DIAGNOSTIC_POLICY,
-             DIAGNOSTIC_WATERMARK, 'approval_batch', PROJECT_REPAIR_PHASE}
+             DIAGNOSTIC_WATERMARK, 'approval_batch', PROJECT_REPAIR_PHASE, _HANDOFF_CONTEXT_POLICY}
             if checkpoint.runtime_version == _RUNTIME_VERSION
             else set()
         )
         if not required_state <= set(state) <= required_state | optional_state:
             raise RuntimeExecutionError("runtime checkpoint is incompatible")
+        if _HANDOFF_CONTEXT_POLICY in state and (
+            type(state[_HANDOFF_CONTEXT_POLICY]) is not int or state[_HANDOFF_CONTEXT_POLICY] != 1
+        ):
+            raise RuntimeExecutionError("runtime handoff context policy is invalid")
         engineering = engineering_delivery_required(
             context, {participant.id: participant.allowed_tools for participant in self._plan.participants},
         )
