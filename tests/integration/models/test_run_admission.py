@@ -565,3 +565,64 @@ async def test_valid_partial_bound_break_closes_pool_despite_other_missing_field
     assert json.loads(result.receipt_bytes)['usage']['total_tokens'] == usage.total_tokens
     with pytest.raises(AdmissionConflict):
         await reserve(repo, binding, tokens=1)
+
+
+@pytest.mark.parametrize('cost,broken', [
+    (Decimal('0.6000000'), True), (Decimal(1_000_001), True),
+    (Decimal('0.1000000'), False),
+])
+async def test_actual_cost_outside_hold_storage_limits_preserves_receipt_and_pool_fence(
+    storage, cost, broken,
+):
+    repo, binding, _ = await prepare(storage)
+    attempt = await reserve(repo, binding, purpose='review')
+    await issue(repo, binding, attempt)
+    result = await finish(repo, binding, attempt, usage=UsageObservation(1, 1, 2, cost))
+    assert result.state == ('invalid' if broken else 'unknown')
+    assert json.loads(result.receipt_bytes)['usage']['cost_usd'] == {'decimal': str(cost)}
+    snapshot = await pool(repo, binding)
+    assert snapshot.closed is broken
+    assert (snapshot.token_charged, snapshot.review_token_charged,
+        snapshot.review_count_charged, snapshot.review_cost_charged) == (60, 60, 1, Decimal('.5'))
+    if broken:
+        with pytest.raises(AdmissionConflict):
+            await reserve(repo, binding, tokens=1)
+    else:
+        await reserve(repo, binding, tokens=40, request_sha256='b' * 64)
+        assert (await pool(repo, binding)).token_charged == 100
+        assert await repo.get_attempt(binding['tenant_id'], binding['run_id'], attempt.attempt_id) == result
+
+
+async def test_in_session_duplicate_physical_is_private_conflict_and_caller_rolls_back(storage):
+    repo, binding, _ = await prepare(storage)
+    first = await reserve(repo, binding, tokens=10)
+    second = await reserve(repo, binding, tokens=10)
+    physical = uuid4()
+    await issue(repo, binding, first, physical)
+    additional_id = uuid4()
+    async with storage[0]() as session:
+        with pytest.raises(AdmissionConflict, match='^admission state conflict$'):
+            async with session.begin():
+                await repo._reserve_in_session(session, **binding, attempt_id=additional_id,
+                    purpose='primary', request_sha256='c' * 64, deployment=DEPLOYMENT,
+                    token_hold=10, review_cost_hold=None)
+                await session.execute(update(RunRow).where(RunRow.id == binding['run_id'])
+                    .values(version=RunRow.version + 1))
+                try:
+                    await repo._mark_issued_in_session(session, **binding,
+                        attempt_id=second.attempt_id, physical_transport_id=physical)
+                except AdmissionConflict as error:
+                    assert str(binding['lease'].token) not in str(error)
+                    # Repository translates the failure but never ends the caller's
+                    # transaction; its context manager must perform the full rollback.
+                    assert session.in_transaction() and not session.is_active
+                    raise
+    assert (await pool(repo, binding)).token_charged == 20
+    assert await repo.get_attempt(binding['tenant_id'], binding['run_id'], additional_id) is None
+    current = await repo.get_attempt(binding['tenant_id'], binding['run_id'], second.attempt_id)
+    assert current.state == 'prepared' and current.physical_transport_id is None
+    assert (await repo.get_attempt(binding['tenant_id'], binding['run_id'], first.attempt_id)).state == 'issued'
+    async with storage[0]() as session:
+        assert (await session.get(RunRow, binding['run_id'])).version == 1
+        assert await session.scalar(select(func.count()).select_from(RunAdmissionEventRow)
+            .where(RunAdmissionEventRow.run_id == binding['run_id'])) == 4

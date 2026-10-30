@@ -175,11 +175,12 @@ def _over_bound_usage(
         return False
     if _known_token_usage(usage) and cast(int, usage.total_tokens) > token_hold:
         return True
-    if review_cost_hold is not None:
-        try:
-            return _cost(usage.cost_usd) > review_cost_hold
-        except ValueError:
-            pass
+    actual_cost = usage.cost_usd
+    # Actual evidence is not a new grant: storage precision/maximum must never
+    # discard finite nonnegative proof that the conservative cost hold broke.
+    if (review_cost_hold is not None and type(actual_cost) is Decimal
+            and actual_cost.is_finite() and actual_cost >= 0):
+        return actual_cost > review_cost_hold
     return False
 
 
@@ -531,27 +532,33 @@ class RunAdmissionRepository:
     async def _mark_issued_in_session(
         self, session: AsyncSession, **a: Unpack[_IssueArguments],
     ) -> bool:
-        _binding(a['tenant_id'], a['run_id'], a['authorization_turn_id'], a['lease'],
-                 a['config_sha256'])
-        _uuid(a['attempt_id'])
-        _uuid(a['physical_transport_id'])
-        run, pool = await self._locked(session, a['tenant_id'], a['run_id'])
-        if pool is None:
-            raise AdmissionConflict(_CONFLICT)
-        row = await self._attempt(session, pool, a['attempt_id'])
-        await self._fence(session, run, pool, a['authorization_turn_id'], a['lease'], a['config_sha256'])
-        if (row.worker_id, row.worker_lease_token) != (a['lease'].worker_id, a['lease'].token):
-            raise AdmissionConflict(_CONFLICT)
-        if row.physical_transport_id is not None:
-            if row.physical_transport_id != a['physical_transport_id']:
+        try:
+            _binding(a['tenant_id'], a['run_id'], a['authorization_turn_id'], a['lease'],
+                     a['config_sha256'])
+            _uuid(a['attempt_id'])
+            _uuid(a['physical_transport_id'])
+            run, pool = await self._locked(session, a['tenant_id'], a['run_id'])
+            if pool is None:
                 raise AdmissionConflict(_CONFLICT)
-            return False
-        if pool.closed or row.state != 'prepared':
-            raise AdmissionConflict(_CONFLICT)
-        row.state, row.physical_transport_id = 'issued', a['physical_transport_id']
-        await self._event(session, pool, 'issued', row,
-                          {'physical_transport_id': str(a['physical_transport_id'])})
-        return True
+            row = await self._attempt(session, pool, a['attempt_id'])
+            await self._fence(session, run, pool, a['authorization_turn_id'],
+                              a['lease'], a['config_sha256'])
+            if (row.worker_id, row.worker_lease_token) != (a['lease'].worker_id, a['lease'].token):
+                raise AdmissionConflict(_CONFLICT)
+            if row.physical_transport_id is not None:
+                if row.physical_transport_id != a['physical_transport_id']:
+                    raise AdmissionConflict(_CONFLICT)
+                return False
+            if pool.closed or row.state != 'prepared':
+                raise AdmissionConflict(_CONFLICT)
+            row.state, row.physical_transport_id = 'issued', a['physical_transport_id']
+            await self._event(session, pool, 'issued', row,
+                              {'physical_transport_id': str(a['physical_transport_id'])})
+            return True
+        except SQLAlchemyError:
+            # Translate only. The caller still owns its entire transaction and
+            # must roll it back; do not begin/commit/rollback or retry here.
+            raise AdmissionConflict(_CONFLICT) from None
 
     async def finish(self, **arguments: Unpack[_FinishArguments]) -> AttemptSnapshot:
         async with self._transaction() as session:

@@ -144,3 +144,17 @@ def test_valid_partial_observation_can_prove_bound_broken(usage, broken):
     c = contracts()
     assert hasattr(c, '_over_bound_usage'), 'independent bound evidence validation is missing'
     assert c._over_bound_usage(c.UsageObservation(*usage), 60, Decimal('.5')) is broken
+
+
+@pytest.mark.parametrize('cost,broken', [
+    (Decimal('0.6000000'), True), (Decimal(1_000_001), True),
+    (Decimal('0.1000000'), False), (Decimal('NaN'), False),
+    (Decimal('Infinity'), False), (Decimal('-0.6'), False),
+])
+def test_actual_cost_bound_comparison_is_independent_of_hold_storage_limits(cost, broken):
+    c = contracts()
+    usage = c.UsageObservation(1, 1, 2, cost)
+    assert c._over_bound_usage(usage, 60, Decimal('.5')) is broken
+    # Storage limits still reject these as new grants/holds, including finer precision.
+    with pytest.raises(ValueError, match='invalid admission binding'):
+        c._cost(cost)
