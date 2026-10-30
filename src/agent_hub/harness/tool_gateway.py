@@ -18,6 +18,7 @@ from agent_hub.harness.types import HarnessToolCallRequest, HarnessToolCallResul
 if TYPE_CHECKING:
     from agent_hub.capabilities.go_project_inputs import GoProjectInputs
     from agent_hub.capabilities.project_baselines import ProjectBaselineReference
+    from agent_hub.capabilities.review_context import ConcreteModelReviewGate, _ConcreteReviewCall
     from agent_hub.runs.toolchain_supply import ToolchainSupplyAuthority
     from agent_hub.skills.sandbox.python_input_supply_protocol import PythonInputSupplyPlan
     from agent_hub.skills.sandbox.toolchain_catalog import ToolchainSupplyPlan
@@ -81,6 +82,15 @@ class HarnessCapabilityPolicyGateway(Protocol):
     async def invoke(self, request: CapabilityRequest, *, role: Role) -> CapabilityResult: ...
 
 
+class _ConcretePolicyGateway(Protocol):
+    async def invoke_concrete(self, request: CapabilityRequest, *, role: Role,
+                              review: _ConcreteReviewCall) -> CapabilityResult: ...
+
+
+class _StaticPolicyGateway(Protocol):
+    async def authorize_static(self, request: CapabilityRequest, *, role: Role) -> CapabilityResult: ...
+
+
 class HarnessToolchainPolicyGateway(Protocol):
     async def authorize_project_toolchain(
         self, request: CapabilityRequest, *, role: Role, authority: ToolchainSupplyAuthority,
@@ -105,6 +115,7 @@ class HarnessToolGateway:
         plugin_backend: PluginToolBackend | None = None,
         require_actor_identity: bool = False,
         raise_backend_errors: bool = False,
+        review_gate: ConcreteModelReviewGate | None = None,
     ) -> None:
         self._backend = backend
         self._policy_gateway = policy_gateway
@@ -112,6 +123,7 @@ class HarnessToolGateway:
         self._plugin_backend = plugin_backend
         self._require_actor_identity = require_actor_identity
         self._raise_backend_errors = raise_backend_errors
+        self._review_gate = review_gate
 
     async def authorize(
         self,
@@ -276,6 +288,15 @@ class HarnessToolGateway:
     ) -> HarnessToolCallResult:
         if not isinstance(request, HarnessToolCallRequest):
             raise TypeError("request must be HarnessToolCallRequest")
+        review_call = None
+        if self._review_gate is not None:
+            # Own ALL dispatch fields before the first await. The dataclass's
+            # frozen flag alone is not isolation from object.__setattr__.
+            request = HarnessToolCallRequest(run_id=UUID(str(request.run_id)), actor=request.actor,
+                tool_name=request.tool_name, arguments=request.arguments,
+                approval_required=request.approval_required, sandbox=request.sandbox,
+                idempotency_key=request.idempotency_key, call_id=request.call_id)
+            review_call = self._review_gate.invocation(tool_name=request.tool_name, backend=self._backend)
         if request.tool_name in {'project.prepare_inputs', 'project.prepare_toolchain', 'project.prepare_go_recipe'}:
             return self._failure(request, 'tool permission mapping unavailable')
         policy_mapping_failure = _builtin_policy_mapping_failure(request)
@@ -335,6 +356,7 @@ class HarnessToolGateway:
                 plugin_backend=plugin_backend,
             ),
             tool_origin="mcp" if mcp_backend is not None else "plugin" if plugin_backend is not None else "builtin",
+            review_call=review_call,
         )
         if authorization_failure is not None:
             return authorization_failure
@@ -346,6 +368,8 @@ class HarnessToolGateway:
             PythonGeneratedRecipeApprovalRequired,
         )
         try:
+            if review_call is not None and not await review_call.before_dispatch():
+                return self._failure(request, "capability authorization unavailable")
             if mcp_backend is not None:
                 if type(user_id) is not UUID:
                     return self._failure(request, "capability identity unavailable")
@@ -445,6 +469,7 @@ class HarnessToolGateway:
         capability_parts: tuple[str, str, str] | None = None,
         static_only: bool = False,
         tool_origin: Literal["builtin", "mcp", "plugin"] = "builtin",
+        review_call: _ConcreteReviewCall | None = None,
     ) -> HarnessToolCallResult | None:
         if type(user_id) is not UUID or not isinstance(role, Role):
             if self._policy_gateway is not None or self._require_actor_identity:
@@ -477,7 +502,17 @@ class HarnessToolGateway:
                     error.__context__ = None
                     error.__cause__ = None
                     return self._failure(request, reason)
-        decision = await self._policy_gateway.invoke(admission, role=role)
+        if static_only:
+            if not callable(getattr(self._policy_gateway, "authorize_static", None)):
+                return None  # unresolved concrete consent is deferred, never awaited here.
+            decision = await cast(_StaticPolicyGateway, self._policy_gateway).authorize_static(admission, role=role)
+        elif review_call is not None:
+            if not callable(getattr(self._policy_gateway, "invoke_concrete", None)):
+                return self._failure(request, "capability authorization unavailable")
+            decision = await cast(_ConcretePolicyGateway, self._policy_gateway).invoke_concrete(
+                admission, role=role, review=review_call)
+        else:
+            decision = await self._policy_gateway.invoke(admission, role=role)
         if decision.status is CapabilityStatus.ALLOWED:
             return None
         payload: Mapping[str, JsonValue] = {}

@@ -12,6 +12,7 @@ from agent_hub.capabilities.approvals import (
     ApprovalRecord,
     ApprovalService,
     capability_approval_scope,
+    exact_capability_approval,
     fingerprint_capability_request,
     plugin_approval_identity,
 )
@@ -27,6 +28,7 @@ from agent_hub.runtime.action_approval_capture import (
 )
 
 if TYPE_CHECKING:
+    from agent_hub.capabilities.review_context import _ConcreteReviewCall
     from agent_hub.runs.toolchain_supply import ToolchainSupplyAuthority
 
 
@@ -105,7 +107,11 @@ class CapabilityGateway:
         self._go_recipe_authority = go_recipe_authority
         approvals.bind_run_repository(run_repository)  # type: ignore[arg-type]
 
-    async def invoke(self, request: CapabilityRequest, *, role: Role) -> CapabilityResult:
+    async def invoke(
+        self, request: CapabilityRequest, *, role: Role,
+        concrete_review: _ConcreteReviewCall | None = None,
+        submission_authorized: bool = False,
+    ) -> CapabilityResult:
         try:
             permission_mode = await run_permission_mode(self._run_repository, request, role=role)
         except Exception:  # noqa: BLE001 - a missing trusted policy never grants execution.
@@ -143,6 +149,17 @@ class CapabilityGateway:
                 request.run_id,
                 reason="capability denied",
             )
+        if concrete_review is not None:
+            async def human_wait() -> CapabilityResult:
+                # This instance has no legacy reviewer in the fresh path. A model
+                # allow never enters the ordinary approved-grant audit/upsert.
+                gateway = CapabilityGateway(self._policy, self._approvals, self._run_repository,
+                    plugin_policy_source=self._plugin_policy_source)
+                with exact_capability_approval(request):
+                    return await gateway.invoke(request, role=role)
+
+            return await concrete_review.authorize(request, role, self._policy,
+                inbound=submission_authorized, human_wait=human_wait)
         if go_recipe:
             try:
                 await self._run_repository.require_go_project_recipe_approval(  # type: ignore[attr-defined]

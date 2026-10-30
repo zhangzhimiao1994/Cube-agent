@@ -48,11 +48,13 @@ from agent_hub.runtime.artifacts import ArtifactRepository
 from agent_hub.runtime.contracts import TaskContext
 
 if TYPE_CHECKING:
+    from agent_hub.capabilities.review_context import ConcreteModelReviewGate, _ConcreteReviewCall
     from agent_hub.runs.project_verification_receipts import ProjectVerificationReceiptRepository
     from agent_hub.runs.toolchain_supply import ToolchainSupplyAuthority
 
 ToolApprovalPolicyGetter = Callable[[UUID], Awaitable[bool]]
 ToolApprovalModeGetter = Callable[[UUID], Awaitable[str]]
+ExactHumanApprovalGetter = Callable[[CapabilityRequest], Awaitable[bool]]
 
 
 class PluginPolicyRuleSource(Protocol):
@@ -78,6 +80,7 @@ class DefaultRuntimeCapabilityPolicyGateway:
         tool_approval_mode: ToolApprovalModeGetter | None = None,
         approval_reviewer: ApprovalReviewer | None = None,
         plugin_policy_rules: PluginPolicyRuleSource | None = None,
+        exact_human_approval_getter: ExactHumanApprovalGetter | None = None,
     ) -> None:
         self._approvals = approvals
         self._run_repository = run_repository
@@ -85,6 +88,7 @@ class DefaultRuntimeCapabilityPolicyGateway:
         self._tool_approval_mode = tool_approval_mode
         self._approval_reviewer = approval_reviewer
         self._plugin_policy_rules = plugin_policy_rules
+        self._exact_human_approval_getter = exact_human_approval_getter
 
     async def invoke(
         self,
@@ -95,6 +99,63 @@ class DefaultRuntimeCapabilityPolicyGateway:
         if _is_toolchain_supply_request(request) or _is_go_recipe_request(request):
             return CapabilityResult(CapabilityStatus.DENIED, request.run_id, reason='capability denied')
         return await self._invoke(request, role=role)
+
+    async def invoke_concrete(
+        self, request: CapabilityRequest, *, role: Role, review: _ConcreteReviewCall,
+    ) -> CapabilityResult:
+        """Only the owned actual Harness invocation supplies this private call."""
+        if _is_toolchain_supply_request(request) or _is_go_recipe_request(request):
+            return CapabilityResult(CapabilityStatus.DENIED, request.run_id, reason="capability denied")
+        review.policy_reader = lambda: self._current_review_policy(request, role)
+        review.exact_reader = (lambda: _has_exact_human_approval(self._run_repository, request)
+            ) if self._exact_human_approval_getter is None else lambda: self._read_exact_human(request)
+        try:
+            policy, inbound = await self._current_review_policy(request, role)
+        except Exception:  # noqa: BLE001 - unavailable current scope never grants execution.
+            return CapabilityResult(CapabilityStatus.DENIED, request.run_id, reason="capability denied")
+        return await CapabilityGateway(policy, self._approvals, self._run_repository,
+            plugin_policy_source=self._plugin_policy_rules).invoke(request, role=role,
+                concrete_review=review, submission_authorized=inbound)
+
+    async def _read_exact_human(self, request: CapabilityRequest) -> bool:
+        getter = self._exact_human_approval_getter
+        return getter is not None and await getter(request) is True
+
+    async def _current_review_policy(
+        self, request: CapabilityRequest, role: Role,
+    ) -> tuple[CapabilityPolicy, bool]:
+        mode, _ = await run_permission_policy(self._run_repository, request, role=role)
+        if mode == "read_only" and not read_only_capability_allowed(request):
+            raise ValueError("capability denied")
+        if not await _run_scope_belongs_to_request_actor(self._run_repository, request):
+            raise ValueError("capability denied")
+        required = mode is not None or await self._tool_approval_required(request.tenant_id)
+        rules = self._extra_policy_rules(request)
+        effect = await _project_metadata_preparation_effect(self._run_repository, request, role=role)
+        if effect is None:
+            effect = await _project_input_supply_effect(self._run_repository, request, role=role)
+        if effect is None:
+            effect = await _project_verification_effect(self._run_repository, request, role=role)
+        if effect in {PolicyEffect.DENY, PolicyEffect.REQUIRE_APPROVAL}:
+            rules = (*rules, CapabilityRule(request.tenant_id, role, request.agent_id,
+                request.capability, request.operation, request.resource, effect))
+        inbound = (effect in {None, PolicyEffect.ALLOW}
+            and await submission_capability_allowed(self._run_repository, request, role=role))
+        # Suppress only the default blanket ASK for an actually authorized inbound
+        # action. Explicit current ASK/DENY rules still aggregate above ALLOW.
+        policy = default_capability_policy(request.tenant_id,
+            require_approval_for_tools=required and not inbound,
+            extra_rules=rules, concrete_model_review=True)
+        return policy, inbound
+
+    async def authorize_static(self, request: CapabilityRequest, *, role: Role) -> CapabilityResult:
+        try:
+            policy, _ = await self._current_review_policy(request, role)
+            allowed = policy.evaluate(request, role).route != "deny"
+        except Exception:  # noqa: BLE001 - discovery cannot establish execution authority.
+            allowed = False
+        return CapabilityResult(CapabilityStatus.ALLOWED if allowed else CapabilityStatus.DENIED,
+                                request.run_id, reason=None if allowed else "capability denied")
 
     async def authorize_project_toolchain(
         self, request: CapabilityRequest, *, role: Role,
@@ -339,6 +400,32 @@ async def _has_approved_capability_request(repository: object, request: Capabili
     )
 
 
+async def _has_exact_human_approval(repository: object, request: CapabilityRequest) -> bool:
+    """Read existing manual rows only; old model upserts are not human overrides.
+
+    The old boolean getter intentionally includes auto_review records, so it is
+    unsuitable for the fresh path. This narrow read uses the same approval table.
+    Alternate repositories must explicitly inject their trusted manual reader.
+    """
+    from sqlalchemy import select
+
+    from agent_hub.db.models import RunApprovalRow
+    from agent_hub.runs.repository import RunRepository
+
+    if not isinstance(repository, RunRepository):
+        return False
+    async with repository._session_factory() as session:
+        rows = (await session.scalars(select(RunApprovalRow).where(
+            RunApprovalRow.tenant_id == request.tenant_id, RunApprovalRow.run_id == request.run_id,
+            RunApprovalRow.action == "capability_tool", RunApprovalRow.status == "approved",
+        ))).all()
+        fingerprint = fingerprint_capability_request(request)
+        return any(row.payload.get("approval_fingerprint") == fingerprint
+            and row.payload.get("decision_scope") != "conversation"
+            and row.payload.get("approval_origin", request.tool_origin) == request.tool_origin
+            for row in rows)
+
+
 async def _has_approved_capability_scope(repository: object, request: CapabilityRequest) -> bool:
     approval_scope = capability_approval_scope(request)
     if approval_scope is None:
@@ -388,6 +475,7 @@ def default_capability_policy(
     *,
     require_approval_for_tools: bool = False,
     extra_rules: tuple[CapabilityRule, ...] = (),
+    concrete_model_review: bool = False,
 ) -> CapabilityPolicy:
     allowed_roles = (Role.SUPER_ADMIN, Role.ADMIN, Role.OPERATOR)
     generated_effect = (
@@ -409,6 +497,10 @@ def default_capability_policy(
             operation=operation,
             resource_prefix=resource_prefix,
             effect=effect,
+            review_disposition=("model_eligible" if concrete_model_review
+                and effect is PolicyEffect.REQUIRE_APPROVAL
+                and (capability, operation, resource_prefix) == ("file", "write", "workspace/current")
+                else None),
         )
         for role in allowed_roles
         for capability, operation, resource_prefix, effect in (
@@ -652,7 +744,12 @@ def build_runtime_capability_stack(
     plugin_backend: PluginToolBackend | None = None,
     artifact_repository: ArtifactRepository | None = None,
     receipt_repository: ProjectVerificationReceiptRepository | None = None,
+    review_gate: ConcreteModelReviewGate | None = None,
+    review_gate_factory: Callable[[RuntimeCapabilityGateway], ConcreteModelReviewGate] | None = None,
+    exact_human_approval_getter: ExactHumanApprovalGetter | None = None,
 ) -> RuntimeCapabilityStack:
+    if review_gate is not None and review_gate_factory is not None:
+        raise ValueError("configure one concrete review gate")
     runtime_gateway = RuntimeCapabilityGateway(
         skill_store_dir=skill_store_dir,
         tenant_id=tenant_id,
@@ -676,6 +773,7 @@ def build_runtime_capability_stack(
         tool_approval_mode=tool_approval_mode,
         approval_reviewer=default_reviewer,
         plugin_policy_rules=_plugin_policy_rule_source(plugin_backend),
+        exact_human_approval_getter=exact_human_approval_getter,
     )
     harness_tool_gateway = HarnessToolGateway(
         runtime_gateway,
@@ -683,6 +781,7 @@ def build_runtime_capability_stack(
         mcp_backend=mcp_backend,
         plugin_backend=plugin_backend,
         raise_backend_errors=True,
+        review_gate=review_gate_factory(runtime_gateway) if review_gate_factory is not None else review_gate,
     )
     cleanup_hook = build_python_project_terminal_hook(
         run_repository, getattr(runtime_gateway, "_project_verification", None),

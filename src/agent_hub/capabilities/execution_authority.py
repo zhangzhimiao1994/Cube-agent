@@ -126,3 +126,38 @@ def get_verification_authority(
         )
     except (ValueError, TypeError, RuntimeError, AttributeError, KeyError):
         raise ExecutionAuthorityError(_ERROR) from None
+
+
+def _trusted_review_context(
+    *, tenant_id: UUID, run_id: UUID, user_id: UUID, role: Role,
+    current_record: RunRecord | None = None,
+) -> tuple[TaskContext, str]:
+    """Independent worker snapshot; never adopt a lease from a current row.
+
+    Reuse the verification binding's identity/route validation and revocation.
+    This accessor conveys continuity only, never approval or budget authority.
+    """
+    binding = _BINDING.get()
+    if binding is None or not binding.active:
+        raise ExecutionAuthorityError(_ERROR)
+    try:
+        context = binding.context.validated_internal_clone()
+        if (not all(type(value) is UUID for value in (tenant_id, run_id, user_id))
+                or type(role) is not Role or role is not context.actor_role
+                or (tenant_id, run_id, user_id) != (context.tenant_id, context.run_id, context.actor_id)):
+            raise ValueError(_ERROR)
+        if current_record is not None:
+            if (type(current_record) is not RunRecord
+                    or (current_record.tenant_id, current_record.id, current_record.actor_id,
+                        current_record.actor_role, current_record.mode, current_record.request,
+                        current_record.status) != (tenant_id, run_id, user_id, role, context.mode,
+                                                  context.request, RunStatus.RUNNING)
+                    or type(current_record.actor_role) is not Role
+                    or type(current_record.mode) is not TaskMode
+                    or _stable_route(current_record.routing_decision or {}) != _stable_route(context.routing_decision)):
+                raise ValueError(_ERROR)
+            context = context.model_copy(update={"routing_decision": _freeze_object(
+                current_record.routing_decision, name="current review routing")})
+        return context.validated_internal_clone(), binding.worker_id
+    except (ValueError, TypeError, RuntimeError, AttributeError, KeyError):
+        raise ExecutionAuthorityError(_ERROR) from None
