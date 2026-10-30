@@ -79,7 +79,7 @@ from agent_hub.project_preflight import (
 )
 from agent_hub.runtime.artifacts import ArtifactRepository, ArtifactRepositoryError
 from agent_hub.runtime.continuation_artifacts import load_continuation
-from agent_hub.runtime.contracts import JsonValue, TaskContext
+from agent_hub.runtime.contracts import JsonValue, TaskContext, _freeze_object
 from agent_hub.skills.package import InvalidSkillPackage, SkillPackageInspector
 from agent_hub.skills.sandbox.base import (
     SANDBOX_PROFILES,
@@ -845,6 +845,8 @@ class RuntimeCapabilityGateway:
             if type(_dispatch) is not _WriteDispatch or not _dispatch.claimed:
                 raise RuntimeCapabilityError("concrete write authority unavailable")
             try:
+                # Match and execute this owned copy across all backend awaits.
+                arguments = _freeze_object(arguments, name="owned concrete write arguments")
                 _dispatch.begin_write(self, tenant_id, run_id, arguments)
             except ValueError:
                 raise RuntimeCapabilityError("concrete write authority unavailable") from None

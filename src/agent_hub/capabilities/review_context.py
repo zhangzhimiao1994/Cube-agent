@@ -539,13 +539,15 @@ class _ConcreteReviewCall:
             yield
 
     def _prepare_write_dispatch(self, request: CapabilityRequest, fence: _Fence) -> None:
+        if self.tool_name != "workspace.write_text" or request.tool_origin != "builtin":
+            return
         permissions = fence.context.routing_decision.get("requested_permissions", ())
         if not isinstance(permissions, (list, tuple)):
             raise TypeError("concrete write authority unavailable")
         if "workspace.write" in permissions:
             return
         budget = _run_budget.get()
-        if type(budget) is not _RunBudgetContext or self.tool_name != "workspace.write_text":
+        if type(budget) is not _RunBudgetContext:
             raise ValueError("concrete write authority unavailable")
         self._budget = budget
         self._write_request = CapabilityRequest.model_validate_json(request.model_dump_json())

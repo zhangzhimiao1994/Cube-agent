@@ -666,3 +666,104 @@ async def test_loader_cannot_review_manual_choice_even_with_eligible_policy(tmp_
     ):
         await s.loader.load(action(s), s.task.actor_role, policy, tool_name="workspace.write_text")
     assert s.fixed.calls == 0 and not s.calls
+
+
+@pytest.mark.parametrize("field", ["path", "content"])
+async def test_private_write_scope_await_cannot_change_owned_execution_bytes(tmp_path, field):
+    s = full_scope(tmp_path)
+    entry = s.backend._execute_workspace_write_text
+    scope = s.backend._project_workspace_scope
+    held = []
+
+    async def mutable_entry(tenant, run, arguments, *, _dispatch=None):
+        mutable = dict(arguments)
+        held.append((mutable, _dispatch))
+        return await entry(tenant, run, mutable, _dispatch=_dispatch)
+
+    async def mutate_during_scope(*args, **kwargs):
+        result = await scope(*args, **kwargs)
+        await asyncio.sleep(0)
+        held[0][0][field] = "second.txt" if field == "path" else "not reviewed"
+        return result
+
+    s.backend._execute_workspace_write_text = mutable_entry
+    s.backend._project_workspace_scope = mutate_during_scope
+    result = await invoke(s)
+    assert result.status == "succeeded", result
+    assert s.fixed.calls == len(s.calls) == len(held) == 1
+    consumed(s)
+    mutable, dispatch = held[0]
+    assert mutable[field] == ("second.txt" if field == "path" else "not reviewed")
+    assert dispatch.claimed and dispatch.started and not dispatch.active
+    root = ProjectWorkspaceStore(tmp_path).session_root(s.task.tenant_id, "demo", "session")
+    assert (root / "hello.txt").read_bytes() == b"original content"
+    assert not (root / "second.txt").exists()
+    assert not s.runs.waits
+    assert s.runs.record.routing_decision["requested_permissions"] == [
+        "workspace.read",
+        "command.run",
+    ]
+
+
+async def test_default_exact_human_calculator_uses_no_write_authority(tmp_path):
+    s = full_scope(tmp_path, mode="default")
+    s.request = replace(
+        s.request, tool_name="calculator.evaluate", arguments={"expression": "1+1"}, sandbox="none"
+    )
+    s.runs.exact = True
+    s.policy._plugin_policy_rules = SimpleNamespace(
+        capability_policy_rules=lambda _: (
+            CapabilityRule(
+                s.task.tenant_id,
+                Role.OPERATOR,
+                None,
+                "calculator",
+                "evaluate",
+                "calculator",
+                PolicyEffect.REQUIRE_APPROVAL,
+            ),
+        )
+    )
+    execute = s.backend.execute
+    seen = []
+
+    async def inspect_authority(**kwargs):
+        seen.append(review_module._WRITE_DISPATCH.get())
+        return await execute(**kwargs)
+
+    s.backend.execute = inspect_authority
+    result = await invoke(s)
+    assert result.status == "succeeded", result
+    assert result.payload["value"] == "2"
+    assert s.fixed.calls == 0 and len(s.calls) == 1 and seen == [None]
+    assert review_module._WRITE_DISPATCH.get() is None and not s.runs.waits
+    assert not [row for row in s.db.rows if type(row) is RunReviewIntentRow]
+    no_owned_write(s, tmp_path)
+
+
+@pytest.mark.parametrize("barrier", ["deny", "no_exact"])
+async def test_calculator_exact_path_still_requires_current_consent_and_policy(tmp_path, barrier):
+    s = full_scope(tmp_path, mode="default")
+    s.request = replace(
+        s.request, tool_name="calculator.evaluate", arguments={"expression": "1+1"}, sandbox="none"
+    )
+    s.runs.exact = barrier != "no_exact"
+    effect = PolicyEffect.DENY if barrier == "deny" else PolicyEffect.REQUIRE_APPROVAL
+    s.policy._plugin_policy_rules = SimpleNamespace(
+        capability_policy_rules=lambda _: (
+            CapabilityRule(
+                s.task.tenant_id,
+                Role.OPERATOR,
+                None,
+                "calculator",
+                "evaluate",
+                "calculator",
+                effect,
+            ),
+        )
+    )
+    result = await invoke(s)
+    assert result.status == "failed", result
+    assert s.fixed.calls == 0 and not s.calls
+    assert len(s.runs.waits) == (1 if barrier == "no_exact" else 0)
+    assert review_module._WRITE_DISPATCH.get() is None
