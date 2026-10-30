@@ -10,9 +10,11 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import hashlib
 import json
 import re
 from dataclasses import dataclass, field
+from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
@@ -28,6 +30,7 @@ from agent_hub.db.models import RunRow
 from agent_hub.domain.runs import TaskMode
 from agent_hub.models.capacity import CapacityPool
 from agent_hub.models.litellm_client import LiteLLMClient
+from agent_hub.models.physical_admission import _call as physical_call
 from agent_hub.models.physical_budget import _run_budget
 from agent_hub.runs.authorization import _capture_authenticated_input, _persist_authenticated_input
 from agent_hub.runs.repository import RunRepository, _database_uuid
@@ -183,6 +186,7 @@ class FixedWire:
     bodies: list = field(default_factory=list)
     budgets: list = field(default_factory=list)
     classes: set = field(default_factory=set)
+    attempts: dict = field(default_factory=dict)
     selector_calls: int = 0
     participant_calls: int = 0
     reviewer_calls: int = 0
@@ -253,6 +257,31 @@ class FixedWire:
         self.budgets.append(_run_budget.get())
         assert self.budgets[-1] is not None, "native primary escaped original pool"
         self.native_objects()
+        call = physical_call.get()
+        assert call is not None and call.attempts
+        attempt = call.attempts[-1]
+        meta = attempt.metadata
+        assert payload["model"] == meta.provider_model.rsplit("/", 1)[-1]
+        self.attempts[attempt.permit.attempt_id] = {
+            "request_sha256": meta.request_sha256,
+            "purpose": meta.purpose,
+            "physical_transport_id": (
+                str(call.scope._admission._attempts[attempt.permit.attempt_id].physical_id)
+                if meta.purpose == "primary"
+                else None
+            ),
+            "deployment": {
+                "provider_id": meta.provider_model.split("/", 1)[0],
+                "deployment_id": meta.deployment_id,
+                "model_id": meta.provider_model,
+            },
+            "usage": {
+                "prompt_tokens": 2,
+                "completion_tokens": 3,
+                "total_tokens": 5,
+                "cost_usd": {"decimal": "0.000008"},
+            },
+        }
         self.entered.set()
         if self.block_primary:
             await self.release.wait()
@@ -308,22 +337,11 @@ class FixedWire:
         )
 
 
-async def build_case(storage, tmp_path, mode, redis_client, *, pending=False):
-    """Seed authenticated PG facts; use the real worker's original driver lease."""
-    factory = storage[0]
-    _, binding, _ = await prepare(storage, open_now=False)
-    repository = RunRepository(factory)
-    config = ApprovalReviewConfig(
-        engine="rules_then_model",
-        reviewer_logical_model="reviewer",
-        max_input_tokens=1000000,
-        max_output_tokens=512,
-        max_cost_usd_per_run="100.00",
-    )
+def fixture_platform():
     definition = {
         "provider": "openai",
         "model": "fixture-primary",
-        "credential_ref": "fixture-secret",
+        "credential_ref": "fixture-primary-secret",
         "quota_scope_id": "fixture-primary",
         "context_window_tokens": 131072,
         "max_output_tokens": 8192,
@@ -331,7 +349,7 @@ async def build_case(storage, tmp_path, mode, redis_client, *, pending=False):
         "output_per_million_usd": "2",
         "capabilities": ["text", "structured_output", "tool_calling"],
     }
-    platform = PlatformConfig.model_validate(
+    return PlatformConfig.model_validate(
         {
             "models": {
                 "primary": {"deployments": [definition]},
@@ -340,6 +358,7 @@ async def build_case(storage, tmp_path, mode, redis_client, *, pending=False):
                         {
                             **definition,
                             "model": "fixture-reviewer",
+                            "credential_ref": "fixture-reviewer-secret",
                             "quota_scope_id": "fixture-reviewer",
                         }
                     ]
@@ -358,24 +377,72 @@ async def build_case(storage, tmp_path, mode, redis_client, *, pending=False):
         }
     )
 
+
+class FixtureSecrets:
+    async def fingerprint(self, tenant_id, reference):
+        value = await self.resolve(tenant_id, reference)
+        return hashlib.sha256(f"{tenant_id}:{value}".encode()).hexdigest()
+
+    async def resolve(self, tenant_id, reference):
+        return {
+            "fixture-primary-secret": "synthetic-primary-credential",
+            "fixture-reviewer-secret": "synthetic-reviewer-credential",
+        }[reference]
+
+
+def assert_wire_receipts(attempts, wire_attempts, pool):
+    """Compare each durable receipt to its actual guarded transport admission."""
+    assert {row.attempt_id for row in attempts} == set(wire_attempts)
+    total = 0
+    for row in attempts:
+        sent = wire_attempts[row.attempt_id]
+        assert row.purpose == sent["purpose"] == "primary"
+        assert row.request_sha256 == sent["request_sha256"]
+        assert row.deployment == sent["deployment"]
+        assert row.state == "completed" and row.physical_transport_id is not None
+        assert str(row.physical_transport_id) == sent["physical_transport_id"]
+        expected = {
+            "outcome": "completed",
+            "deployment": sent["deployment"],
+            "attempt_id": str(row.attempt_id),
+            "physical_transport_id": str(row.physical_transport_id),
+            "usage": sent["usage"],
+        }
+        assert row.receipt == expected
+        encoded = json.dumps(
+            expected, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False
+        ).encode()
+        assert row.receipt_sha256 == hashlib.sha256(encoded).hexdigest()
+        assert Decimal(expected["usage"]["cost_usd"]["decimal"]) == Decimal("0.000008")
+        total += expected["usage"]["total_tokens"]
+    assert total == pool.token_charged == len(wire_attempts) * 5
+
+
+async def build_case(storage, tmp_path, mode, redis_client, *, pending=False):
+    """Seed authenticated PG facts; use the real worker's original driver lease."""
+    factory = storage[0]
+    _, binding, _ = await prepare(storage, open_now=False)
+    repository = RunRepository(factory)
+    config = ApprovalReviewConfig(
+        engine="rules_then_model",
+        reviewer_logical_model="reviewer",
+        max_input_tokens=1000000,
+        max_output_tokens=512,
+        max_cost_usd_per_run="100.00",
+    )
+    platform = fixture_platform()
+
     class Configs:
         async def get_current(self, tenant_id):
             assert tenant_id == binding["tenant_id"]
             return SimpleNamespace(version=1, document=platform.model_dump(mode="json"))
-
-    class Secrets:
-        async def fingerprint(self, tenant_id, reference):
-            return "fixture-fingerprint"
-
-        async def resolve(self, tenant_id, reference):
-            return "fixture-secret"
 
     capacities = []
     namespace = "task7a:" + uuid4().hex + ":"
 
     async def capacity(tenant_id, deployments):
         async def fingerprint(reference):
-            return await Secrets().fingerprint(tenant_id, reference)
+            return await FixtureSecrets().fingerprint(tenant_id, reference)
 
         controller = CapacityPool(
             redis_client,
@@ -396,7 +463,7 @@ async def build_case(storage, tmp_path, mode, redis_client, *, pending=False):
         config_getter=current_config,
         run_repository=repository,
         session_factory=factory,
-        secret_service=Secrets(),
+        secret_service=FixtureSecrets(),
         capacity_factory=capacity,
         transport=transport,
         # Protocol fixtures ONLY: not an ops-installed file or a production record.
@@ -458,7 +525,7 @@ async def build_case(storage, tmp_path, mode, redis_client, *, pending=False):
     )
     runtime = FACTORIES[mode](
         config_service=Configs(),
-        secret_service=Secrets(),
+        secret_service=FixtureSecrets(),
         capacity_factory=capacity,
         transport=transport,
         capability_gateway=stack.runtime_gateway,

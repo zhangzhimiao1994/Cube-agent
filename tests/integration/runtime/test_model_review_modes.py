@@ -8,13 +8,16 @@ unreachable model-required/Root-await/UNKNOWN-review acceptance is complete.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import json
 import os
 import shutil
 import tempfile
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import pytest
@@ -33,13 +36,20 @@ from agent_hub.db.models import (
     RunRow,
 )
 from agent_hub.domain.runs import TaskMode
+from agent_hub.models.capacity import (
+    CapacityBackendError,
+    CapacityConfigurationError,
+    CapacityPool,
+    CredentialDescriptor,
+)
 from agent_hub.models.run_admission_repository import RunAdmissionRepository, _WorkerLease
 from agent_hub.runs.authorization import _persist_authenticated_input, _validate_authenticated_input
 from agent_hub.runs.repository import RunRepository
 from agent_hub.runs.workspace import workspace_selection
 from agent_hub.runtime.autogen.adapter import AutoGenDiscussionRuntime
-from agent_hub.runtime.contracts import EventKind
+from agent_hub.runtime.contracts import EventKind, RunEvent
 from agent_hub.runtime.crew.adapter import CrewAIObjectFactory, CrewDispatchRuntime
+from agent_hub.runtime.defaults import TenantSecretResolver, _deployments
 from agent_hub.runtime.direct import DirectRuntime
 from agent_hub.runtime.hybrid import HybridRuntime
 from agent_hub.runtime.worker_execution import worker_runtime_events
@@ -53,9 +63,12 @@ from tests.integration.runtime.test_model_review_modes_helper import (
     FACTORIES,
     FINAL_TEXT,
     FixedWire,
+    FixtureSecrets,
+    assert_wire_receipts,
     build_case,
     build_task_context,
     capture_submission_input,
+    fixture_platform,
     schema_value,
     submission_request,
     submitted_input_scope,
@@ -274,6 +287,101 @@ async def test_protocol_fixture_capture_accepts_driver_uuid_without_changing_aut
     assert evidence.actor_role is Role.VIEWER  # No role upgrade hidden in normalization.
 
 
+async def test_protocol_fixture_credentials_match_actual_capacity_contract():
+    """Exercise the real capacity credential registry before any Redis/PG setup."""
+    tenant = uuid4()
+    secrets = FixtureSecrets()
+    deployments = _deployments(fixture_platform())
+
+    async def fingerprint(reference):
+        return await secrets.fingerprint(tenant, reference)
+
+    class RedisBoundary:
+        calls = 0
+
+        async def eval(self, *args):
+            self.calls += 1
+            raise OSError("protocol test stops at the Redis boundary")
+
+    boundary = RedisBoundary()
+    capacity = CapacityPool(boundary, deployments=deployments, fingerprint_resolver=fingerprint)
+    registry = await capacity._resolved_credentials(deployments)
+    identities = {}
+    for deployment in deployments:
+        value = registry.fingerprint_for(deployment.secret_ref)
+        CredentialDescriptor(deployment.secret_ref, value)
+        assert value == await secrets.fingerprint(tenant, deployment.secret_ref)
+        previous = identities.setdefault(value, deployment.quota_scope_id)
+        assert previous == deployment.quota_scope_id, "one credential cannot claim two quota scopes"
+        assert await TenantSecretResolver(secrets, tenant).resolve(deployment.secret_ref)
+        secret = await secrets.resolve(tenant, deployment.secret_ref)
+        assert value == hashlib.sha256(f"{tenant}:{secret}".encode()).hexdigest()
+    assert len(identities) == 2
+    with pytest.raises(CapacityBackendError):
+        await capacity._register_metadata(
+            catalog_by_id={d.id: d for d in deployments},
+            scope_policies=capacity._scope_policies,
+            prior_registration_current=False,
+        )
+    assert boundary.calls > 0  # The actual pre-register checks reached the no-Redis boundary.
+    boundary.calls = 0
+    conflicting = (deployments[0], replace(deployments[1], secret_ref=deployments[0].secret_ref))
+    with pytest.raises(CapacityConfigurationError, match="fingerprint quota scope conflicts"):
+        await capacity._register_metadata(
+            catalog_by_id={d.id: d for d in conflicting},
+            scope_policies=capacity._scope_policies,
+            prior_registration_current=False,
+        )
+    assert boundary.calls == 0
+
+
+async def test_protocol_receipt_rejects_usage_drift_even_with_valid_digest():
+    attempt_id, physical = uuid4(), uuid4()
+    sent = {
+        "request_sha256": "a" * 64,
+        "purpose": "primary",
+        "physical_transport_id": str(physical),
+        "deployment": {
+            "provider_id": "openai",
+            "deployment_id": "primary_1",
+            "model_id": "openai/fixture-primary",
+        },
+        "usage": {
+            "prompt_tokens": 2,
+            "completion_tokens": 3,
+            "total_tokens": 5,
+            "cost_usd": {"decimal": "0.000008"},
+        },
+    }
+    receipt = {
+        "outcome": "completed",
+        "deployment": sent["deployment"],
+        "attempt_id": str(attempt_id),
+        "physical_transport_id": str(physical),
+        "usage": sent["usage"],
+    }
+    row = SimpleNamespace(
+        attempt_id=attempt_id,
+        physical_transport_id=physical,
+        state="completed",
+        purpose="primary",
+        request_sha256=sent["request_sha256"],
+        deployment=sent["deployment"],
+        receipt=receipt,
+        receipt_sha256=hashlib.sha256(
+            json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest(),
+    )
+    pool = SimpleNamespace(token_charged=5)
+    assert_wire_receipts([row], {attempt_id: sent}, pool)
+    row.receipt = {**receipt, "usage": {**sent["usage"], "total_tokens": 999}}
+    row.receipt_sha256 = hashlib.sha256(
+        json.dumps(row.receipt, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    with pytest.raises(AssertionError):
+        assert_wire_receipts([row], {attempt_id: sent}, pool)
+
+
 @pytest.mark.parametrize(
     "mode", [TaskMode.DIRECT, TaskMode.DISPATCH, TaskMode.DISCUSS, TaskMode.HYBRID]
 )
@@ -343,6 +451,7 @@ async def test_actual_native_modes_share_original_pool_and_deliver_chat(
             )
         assert len(attempts) == len(case.wire.calls)
         assert all(attempt.state == "completed" and attempt.receipt_sha256 for attempt in attempts)
+        assert_wire_receipts(attempts, case.wire.attempts, pool)
         assert all(
             attempt.worker_lease_token == case.context.execution_token
             and attempt.worker_id == case.binding["lease"].worker_id
@@ -414,3 +523,45 @@ async def test_actual_direct_cancel_retains_unknown_hold_and_releases_capacity(
             task.cancel()
         await asyncio.gather(task, return_exceptions=True)
         await case.runtime.cancel_run_owned(case.context.run_id, case.context.execution_token)
+
+
+async def test_protocol_actual_guarded_sdk_wire_observer_matches_persisted_receipt(tmp_path):
+    """Real SDK/guard/DAO code, fixed HTTP and unit DB/capacity seams; no native claim."""
+    import httpx
+
+    from agent_hub.db.models import RunAdmissionAttemptRow
+    from agent_hub.models.litellm_client import LiteLLMClient
+    from agent_hub.runtime.defaults import _gateway_for_config
+    from tests.integration.runtime.test_model_review_modes_helper import (
+        FixedWire,
+        assert_wire_receipts,
+    )
+    from tests.unit.models.test_physical_budget import logical_request
+    from tests.unit.runtime.test_review_assembly import fixture
+
+    f = await fixture(tmp_path)
+    wire = FixedWire()
+    transport = LiteLLMClient(_network_delegate_factory=lambda: httpx.MockTransport(wire))
+
+    class Runtime:
+        async def run(self, context):
+            gateway, _, _ = await _gateway_for_config(
+                f.state.platform,
+                tenant_id=context.tenant_id,
+                secret_service=f.secrets,
+                capacity_factory=f.capacity,
+                transport=transport,
+            )
+            await gateway.complete(logical_request())
+            yield RunEvent(
+                kind="runtime.wire", sequence=1, run_id=context.run_id, payload={"ok": True}
+            )
+
+    async with worker_runtime_events(
+        Runtime(), f.s.task, worker_id=f.s.budget.lease.worker_id, review_broker=f.broker
+    ) as events:
+        await anext(events)
+    attempts = [row for row in f.db.rows if type(row) is RunAdmissionAttemptRow]
+    pool = await RunAdmissionRepository(f.db).get_pool(f.s.task.tenant_id, f.s.task.run_id)
+    assert_wire_receipts(attempts, wire.attempts, pool)
+    assert len(wire.calls) == 1 and all(body.closed for body in wire.bodies)
