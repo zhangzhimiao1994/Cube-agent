@@ -1,0 +1,8 @@
+.model-review-history-controls { display: flex; flex-wrap: wrap; gap: 8px; }
+.model-review-history-controls button {
+  background: #fff; border: 1px solid #dce2ea; border-radius: 4px; box-shadow: none;
+  color: #5b6573; font-size: 12px; font-weight: 500; min-height: 32px; padding: 5px 10px;
+}
+.model-review-history-controls button:hover { background: #f6f8fb; transform: none; }
+.model-review-history-controls button:disabled { opacity: 0.6; }
+.model-review-history-notice { color: #646b78; font-size: 12px; margin: 0; }

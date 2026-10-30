@@ -1049,6 +1049,22 @@ const CapabilityApprovalsSchema = z.object({
   conversation_approval_version: z.number().int().positive().nullable().optional(),
 });
 export type CapabilityApprovalEvent = z.infer<typeof CapabilityApprovalEventSchema>;
+
+const ModelReviewUuidSchema = z.string().regex(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
+const PublicModelReviewSchema = z.object({
+  id: z.string().regex(/^model-review:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i),
+  created_at: z.string().datetime({ offset: true }),
+  status: z.enum(["pending", "allow", "deny", "needs_human", "unknown"]),
+  risk: z.enum(["low", "medium", "high", "unknown"]).nullable(),
+  reason_code: z.enum(["authorized_action", "outside_authorized_scope", "protected_resource", "untrusted_content",
+    "unclear_impact", "missing_context", "policy_requires_human", "accounting_unknown", "review_timeout",
+    "review_unavailable", "review_invalid_response", "review_unknown", "review_cancelled"]).nullable(),
+  reviewer: z.literal("independent_model"),
+  tool_name: z.literal("workspace.write_text"),
+});
+const ModelReviewPageSchema = z.object({ items: z.array(PublicModelReviewSchema), next_cursor: ModelReviewUuidSchema.nullable() });
+export type PublicModelReview = z.infer<typeof PublicModelReviewSchema>;
+export type ModelReviewPage = z.infer<typeof ModelReviewPageSchema>;
 export type RunDeleteResult = z.infer<typeof RunDeleteSchema>;
 export type BulkFailure = z.infer<typeof BulkFailureSchema>;
 export type RunBulkDeleteResult = z.infer<typeof RunBulkDeleteSchema>;
@@ -3052,6 +3068,11 @@ export const api = {
       throw new ApiError("approval history scope mismatch", 200, "invalid_response");
     }
     return history;
+  },
+  modelReviews(id: string, { cursor, signal }: { cursor?: string; signal?: AbortSignal } = {}): Promise<ModelReviewPage> {
+    if (cursor !== undefined && !ModelReviewUuidSchema.safeParse(cursor).success) throw new Error("模型审查分页 cursor 必须是 UUID。");
+    const query = new URLSearchParams({ limit: "50", ...(cursor ? { cursor } : {}) });
+    return request(`/api/v1/runs/${encodeURIComponent(id)}/model-reviews?${query}`, { method: "GET", signal }, ModelReviewPageSchema);
   },
   rejectCapability(
     id: string,

@@ -4,6 +4,7 @@ import { useRef } from "react";
 import { ApiError, type CapabilityApprovalEvent, type RunDetail } from "../api/client";
 import { useAuth } from "../auth/AuthProvider";
 import { useRunCapabilityApprovals } from "./useRunCapabilityApprovals";
+import { RunModelReviewHistory } from "./RunModelReviewHistory";
 import "../components/CapabilityApprovalCard.css";
 
 type ApprovalRecord = {
@@ -66,6 +67,7 @@ export function RunApprovalHistory({ run }: { run: RunDetail }) {
     legacyActor.current === actorScope && history.data !== undefined ? run : { ...run, events: [] }, history.data?.items ?? [],
   );
   return <>
+    <RunModelReviewHistory run={run} />
     {records.map((record) => (
       <article key={record.id} className="run-approval-result" aria-label="权限审批结果" data-decision={record.decision}>
         {record.decision === "approved" ? <ShieldCheck size={16} aria-hidden="true" /> : <ShieldX size={16} aria-hidden="true" />}
