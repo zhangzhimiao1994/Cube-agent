@@ -10,7 +10,11 @@ from typing import TYPE_CHECKING
 
 from agent_hub.auth.models import Role
 from agent_hub.runtime.contracts import ExecutionRuntime, RunEvent, TaskContext, _freeze_object
-from agent_hub.runtime.streams import _protect_runtime_stream_owner, closing_runtime_events
+from agent_hub.runtime.streams import (
+    _protect_runtime_stream_owner,
+    _register_runtime_stream_owner,
+    closing_runtime_events,
+)
 
 if TYPE_CHECKING:
     from agent_hub.runtime.review_assembly import ReviewAssemblyBroker
@@ -62,7 +66,13 @@ async def _scoped_events(
                 if pending is not None and not pending.done():
                     pending.set_result((None, StopAsyncIteration()))
 
-    owner = asyncio.create_task(consume(), context=scope, name="worker-runtime-owner")
+    async def run_owner() -> None:
+        # Register inside the owner before its first await, and remove only after
+        # consume's awaited aclose (including error cleanup) has really finished.
+        with _register_runtime_stream_owner():
+            await consume()
+
+    owner = asyncio.create_task(run_owner(), context=scope, name="worker-runtime-owner")
 
     async def events() -> AsyncIterator[RunEvent]:
         nonlocal pending
