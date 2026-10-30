@@ -42,7 +42,7 @@ _REASONS = frozenset(
 )
 _CREDENTIAL = re.compile(
     r"(?i)(?:\b(?:api[_ -]?key|access[_ -]?token|refresh[_ -]?token|"
-    r"token|(?:client[_ -]?)?secret|password|passwd|authorization)\s*[:=]|\bbearer\s+\S+|"
+    r"token|(?:client[_ -]?)?secret|password|passwd|authorization)[\"']?\s*[:=]|\bbearer\s+\S+|"
     r"\bsk-[a-z0-9_-]+|\bAKIA[0-9A-Z]{16}\b|-----BEGIN[^-]*PRIVATE KEY|"
     r"\b(?:github_pat_|gh[pousr]_|xox[baprs]-)[a-z0-9_-]+|"
     r"\beyJ[a-z0-9_-]+\.[a-z0-9_-]+\.[a-z0-9_-]+|"

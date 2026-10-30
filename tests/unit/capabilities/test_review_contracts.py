@@ -436,6 +436,37 @@ def test_verdict_rejects_invalid_and_secret_fields_without_echoing(changes):
     assert "private-value-never-echo" not in repr(error.value)
 
 
+@pytest.mark.parametrize("key", ["api_key", "password", "client_secret"])
+@pytest.mark.parametrize("quote", ['"', "'"])
+def test_verdict_rejects_quoted_credential_keys_without_echoing(key, quote):
+    secret = "synthetic-review-secret"
+    rationale = "{" + quote + key + quote + ": " + quote + secret + quote + "}"
+    with pytest.raises(ValueError) as error:
+        contracts().parse_model_review(
+            json.dumps(verdict_payload(rationale=rationale)), expected_action_digest=DIGEST
+        )
+    assert secret not in str(error.value)
+    assert secret not in repr(error.value)
+
+
+@pytest.mark.parametrize(
+    "rationale",
+    [
+        'The "api_key" field is omitted.',
+        'The "password" field is outside the requested scope.',
+        'The "client_secret" name is documented without a value.',
+        "The 'api_key' field is omitted.",
+        '{"api_key_present": false}',
+        '{"summary": "credential fields omitted"}',
+    ],
+)
+def test_verdict_accepts_credential_field_mentions_without_assignment(rationale):
+    verdict = contracts().parse_model_review(
+        json.dumps(verdict_payload(rationale=rationale)), expected_action_digest=DIGEST
+    )
+    assert verdict.rationale == rationale
+
+
 @pytest.mark.parametrize("field", list(verdict_payload()))
 def test_verdict_rejects_missing_and_duplicate_fields(field):
     module = contracts()
