@@ -30,6 +30,9 @@ from agent_hub.skills.sandbox.project import (
 )
 from agent_hub.skills.sandbox.python_project_protocol import (
     PythonEnvironmentReference,
+    PythonFailedMaintenanceInvocation,
+    PythonFailedMaintenanceRequest,
+    PythonFailedReservationSnapshot,
     PythonProductDescriptor,
     PythonProjectBrokerRequest,
     PythonProjectBrokerResponse,
@@ -46,7 +49,7 @@ from agent_hub.subprocess_cleanup import ProcessCleanupIncomplete
 type _PythonRequest = (
     PythonProjectBrokerRequest | PythonProjectProbeRequest | PythonProjectInspectEnvironmentRequest
     | PythonProjectReleaseEnvironmentRequest
-    | PythonProjectReleaseExpiredEnvironmentRequest
+    | PythonProjectReleaseExpiredEnvironmentRequest | PythonFailedMaintenanceRequest
 )
 _REQUEST_GRACE_SECONDS = 10.0
 _CLEANUP_SECONDS = 10.0
@@ -60,6 +63,7 @@ def _validated_request(request: _PythonRequest) -> _PythonRequest:
             PythonProjectInspectEnvironmentRequest,
             PythonProjectReleaseEnvironmentRequest,
             PythonProjectReleaseExpiredEnvironmentRequest,
+    PythonFailedMaintenanceRequest,
         }:
             raise ValueError("invalid request type")
         # Frozen models can still be constructed/copied without validation. Reparse
@@ -197,6 +201,19 @@ class PythonProjectSystemdSandbox:
         response = await self._exchange(PythonProjectReleaseExpiredEnvironmentRequest(invocation=invocation))
         assert response.expired_environment_released is not None
         return response.expired_environment_released
+
+    async def inspect_failed(self, invocation: PythonFailedMaintenanceInvocation) -> PythonFailedReservationSnapshot | None:
+        response = await self._exchange(PythonFailedMaintenanceRequest(invocation=invocation, phase='inspect'))
+        return response.failure_snapshot
+
+    async def commit_failed(
+        self, invocation: PythonFailedMaintenanceInvocation, snapshot: PythonFailedReservationSnapshot,
+    ) -> bool:
+        archive = snapshot.archive()
+        response = await self._exchange(PythonFailedMaintenanceRequest(invocation=invocation, phase='commit',
+            snapshot=snapshot, archive_id=archive.id, archive_sha256=archive.content_sha256))
+        assert response.failure_removed is not None
+        return response.failure_removed
 
     async def _exchange(self, request: _PythonRequest) -> PythonProjectBrokerResponse:
         if not _systemd_supported():

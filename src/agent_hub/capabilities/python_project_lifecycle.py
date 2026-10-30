@@ -40,10 +40,13 @@ from agent_hub.db.models import (
 from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.runs.artifacts import PostgresArtifactRepository
 from agent_hub.runs.repository import RunRepository, _database_uuid
+from agent_hub.runtime.artifacts import ArtifactReference, ArtifactRepository
 from agent_hub.runtime.contracts import Artifact, RuntimeCheckpoint
 from agent_hub.skills.sandbox.python_project_client import PythonProjectSystemdSandbox
 from agent_hub.skills.sandbox.python_project_protocol import (
     PythonEnvironmentReference,
+    PythonFailedMaintenanceInvocation,
+    PythonFailedReservationSnapshot,
     PythonProjectInvocation,
     PythonProjectReleaseEnvironmentRequest,
     _reference_matches,
@@ -156,6 +159,12 @@ class _GeneratedContextReader(Protocol):
 
 class _Releaser(Protocol):
     async def release_expired(self, invocation: PythonProjectInvocation) -> bool: ...
+
+    async def inspect_failed(self, invocation: PythonFailedMaintenanceInvocation) -> PythonFailedReservationSnapshot | None: ...
+
+    async def commit_failed(
+        self, invocation: PythonFailedMaintenanceInvocation, snapshot: PythonFailedReservationSnapshot,
+    ) -> bool: ...
 
     async def release_completed(
         self,
@@ -500,7 +509,139 @@ class PythonProjectTerminalHook:
         self.generated_reader = generated_reader
         self._retry_cursor: UUID | None = None
         self._capacity_cursor: UUID | None = None
+        self._failed_empty_cursor: UUID | None = None
         self._capacity_lock = asyncio.Lock()
+        self._failure_archive_repository: ArtifactRepository | None = (
+            PostgresArtifactRepository(repository._session_factory) if isinstance(repository, RunRepository) else None
+        )
+
+    async def _failed_empty_owner(
+        self, session: AsyncSession, tenant: UUID, run: UUID, cutoff: datetime,
+    ) -> tuple[int, str, str] | None:
+        row = await session.scalar(select(RunRow).where(
+            RunRow.tenant_id == tenant, RunRow.id == run).with_for_update())
+        if (row is None or (row.tenant_id, row.id, row.status) != (tenant, run, 'failed')
+                or type(row.version) is not int or not isinstance(row.updated_at, datetime)
+                or row.updated_at.tzinfo is None or row.updated_at > cutoff
+                or any(value is not None for value in (row.worker_id, row.worker_lease_token,
+                    row.worker_lease_expires_at, row.worker_heartbeat_at))
+                or type(row.routing_decision) is not dict or _uncertain(row.routing_decision)):
+            return None
+        if row.routing_decision.get('approval_kind') is not None or row.routing_decision.get('decision_token') is not None:
+            return None
+        generated = row.routing_decision.get('generated_project_preparation')
+        original = row.routing_decision.get('project_input_preparation')
+        generated_python = (
+            type(row.routing_decision.get('generated_project_contract_version')) is int
+            and row.routing_decision['generated_project_contract_version'] == 1
+            and isinstance(generated, dict) and type(generated.get('schema_version')) is int
+            and generated['schema_version'] == 1 and generated.get('phase') == 'python_ready'
+            and generated.get('stack') == 'python')
+        original_python = (
+            isinstance(original, dict) and type(original.get('schema_version')) is int
+            and original['schema_version'] == 2 and isinstance(original.get('python_recipe'), dict)
+            and type(original['python_recipe'].get('schema_version')) is int
+            and original['python_recipe']['schema_version'] == 1)
+        if not generated_python and not original_python:
+            return None
+        # Historical self_repair/provider bytes do not enqueue a consumer. Actual
+        # acceptance changes this locked row's status/version and creates outbox.
+        for query in (
+            select(RunApprovalRow.id).where(RunApprovalRow.tenant_id == tenant, RunApprovalRow.run_id == run,
+                RunApprovalRow.status.not_in(('approved', 'rejected', 'expired'))),
+            select(RunOutboxRow.id).where(RunOutboxRow.tenant_id == tenant, RunOutboxRow.run_id == run,
+                RunOutboxRow.delivered.is_(False)),
+        ):
+            if await session.scalar(query.limit(1)) is not None:
+                return None
+        latest = await session.scalar(select(RunCheckpointRow).where(RunCheckpointRow.tenant_id == tenant,
+            RunCheckpointRow.run_id == run).order_by(RunCheckpointRow.sequence.desc()).limit(1))
+        if latest is not None:
+            checkpoint = _bound_checkpoint(latest.payload, tenant, run)
+            if (latest.state_sha256 != checkpoint.state_sha256 or latest.state != checkpoint.to_payload()['state']
+                    or (latest.id, latest.runtime_type, latest.runtime_version, latest.mode) != (
+                        checkpoint.id, checkpoint.runtime_type, checkpoint.runtime_version, checkpoint.mode.value)):
+                return None
+            body_path: tuple[str, ...] = ()
+            if (checkpoint.runtime_type, checkpoint.runtime_version, checkpoint.mode) == ('hybrid', '3', TaskMode.HYBRID):
+                native = _bound_checkpoint(latest.state.get('child_checkpoint'), tenant, run)
+                body_path = ('child_checkpoint', 'state')
+            else:
+                native = checkpoint
+            if (native.runtime_type, native.runtime_version, native.mode) != ('crew', '11', TaskMode.DISPATCH):
+                return None
+            body = native.to_payload()['state']
+            assert isinstance(body, dict)
+            for name in ('models', 'tools'):
+                ledger = body.get(name)
+                if (type(ledger) is not dict or (name == 'models' and not ledger)
+                        or any(type(entry) is not dict or type(entry.get('status')) is not str
+                               or entry['status'] not in {'succeeded', 'failed', 'rejected'}
+                               for entry in ledger.values())):
+                    return None
+            pending: list[tuple[object, tuple[str, ...], int]] = [(latest.state, (), 0)]
+            for _ in range(100_000):
+                if not pending:
+                    break
+                value, path, depth = pending.pop()
+                if depth > 64:
+                    return None
+                if isinstance(value, dict):
+                    for key, item in value.items():
+                        # Only this bound native CP body has a historical runtime
+                        # phase. A provider object cannot acquire the exemption.
+                        if key == 'phase' and item == 'running' and path == body_path:
+                            continue
+                        pending.append((item, (*path, key), depth + 1))
+                elif isinstance(value, (list, tuple)):
+                    pending.extend((item, (*path, str(index)), depth + 1) for index, item in enumerate(value))
+                elif _uncertain(value):
+                    return None
+            if pending:
+                return None
+        project, workspace = authorized_workspace_scope(row, tenant_id=tenant, run_id=run)
+        return row.version, project, workspace
+
+    async def _release_expired_empty_failure(self, tenant: UUID, run: UUID, cutoff: datetime) -> bool:
+        archive_repository = self._failure_archive_repository
+        if archive_repository is None:
+            return False
+        async with asyncio.timeout(_CAPACITY_TIMEOUT_SECONDS):
+            async with await self.repository.run_transaction() as session, session.begin():
+                owner = await self._failed_empty_owner(session, tenant, run, cutoff)
+                if owner is None:
+                    return False
+                version, project, workspace = owner
+                invocation = PythonFailedMaintenanceInvocation(execution_id='python_release_expired_' + uuid4().hex,
+                    tenant_id=tenant, run_id=run, project_id=project, session_id=workspace)
+                snapshot = await self.executor.inspect_failed(invocation)
+                if snapshot is None:
+                    return False
+                snapshot = PythonFailedReservationSnapshot.model_validate_json(snapshot.model_dump_json(), strict=True)
+                if any(getattr(snapshot.scope, key) != getattr(invocation, key)
+                       for key in ('tenant_id', 'run_id', 'project_id', 'session_id')):
+                    return False
+            # ArtifactRepo owns a separate RunRow-locked transaction. Never call
+            # put/get_many inside the owner transaction above or below.
+            archive = snapshot.archive()
+            reference = ArtifactReference(id=archive.id, sha256=archive.content_sha256)
+            await archive_repository.put(tenant, run, archive)
+            readback = await archive_repository.get_many(tenant, run, (reference,))
+            if len(readback) != 1 or readback[0].to_payload() != archive.to_payload():
+                return False
+            async with await self.repository.run_transaction() as session, session.begin():
+                if await self._failed_empty_owner(session, tenant, run, cutoff) != (version, project, workspace):
+                    return False
+                stored = await session.scalar(select(RuntimeArtifactRow).where(RuntimeArtifactRow.tenant_id == tenant,
+                    RuntimeArtifactRow.run_id == run, RuntimeArtifactRow.id == archive.id))
+                if (stored is None or stored.permanent is not True or (stored.tenant_id, stored.run_id) != (tenant, run)
+                        or PostgresArtifactRepository._hydrate(stored).to_payload() != archive.to_payload()):
+                    return False
+                commit = invocation.model_copy(update={'execution_id': 'python_release_expired_' + uuid4().hex})
+                result = await self.executor.commit_failed(commit, snapshot)
+                if type(result) is not bool:
+                    raise ValueError('invalid failed reservation maintenance result')
+                return result
 
     async def _release_expired_pre_model(
         self, tenant: UUID, run: UUID, cutoff: datetime,
@@ -629,7 +770,32 @@ class PythonProjectTerminalHook:
                 except Exception:  # noqa: BLE001 - UNKNOWN is not false/absent and never grants deletion.
                     _LOGGER.warning('python_expired_environment_maintenance_blocked run_id=%s', run)
                 self._capacity_cursor = run
-            return released
+            return released + await self._maintain_empty_failures(cutoff)
+
+    async def _maintain_empty_failures(self, cutoff: datetime) -> int:
+        if self._failure_archive_repository is None:
+            return 0
+        query = select(RunRow).where(RunRow.status == 'failed', RunRow.updated_at <= cutoff,
+            or_(RunRow.routing_decision.contains({'generated_project_contract_version': 1,
+                'generated_project_preparation': {'schema_version': 1, 'phase': 'python_ready', 'stack': 'python'}}),
+                RunRow.routing_decision.contains({'project_input_preparation': {
+                    'schema_version': 2, 'python_recipe': {'schema_version': 1}}})),
+        ).order_by(RunRow.id).limit(8)
+        if self._failed_empty_cursor is not None:
+            query = query.where(RunRow.id > self._failed_empty_cursor)
+        async with await self.repository.run_transaction() as session:
+            rows = (await session.scalars(query)).all()
+            candidates = tuple((_database_uuid(row.tenant_id), _database_uuid(row.id)) for row in rows)
+        if not candidates:
+            self._failed_empty_cursor = None
+        released = 0
+        for tenant, run in candidates:
+            try:
+                released += int(await self._release_expired_empty_failure(tenant, run, cutoff))
+            except Exception:  # noqa: BLE001 - one blocked owner never grants cleanup or stalls the bounded cursor.
+                _LOGGER.warning('python_failed_empty_maintenance_blocked run_id=%s', run)
+            self._failed_empty_cursor = run
+        return released
 
     async def __call__(
         self,

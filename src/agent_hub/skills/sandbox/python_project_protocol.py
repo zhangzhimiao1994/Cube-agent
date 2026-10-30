@@ -6,8 +6,10 @@ authorize that recipe and the broker must independently observe its inputs.
 
 from __future__ import annotations
 
-from typing import BinaryIO, Literal, Self, cast
-from uuid import UUID
+import hashlib
+import json
+from typing import TYPE_CHECKING, BinaryIO, Literal, Self, cast
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator, model_validator
 
@@ -25,6 +27,9 @@ from agent_hub.skills.sandbox.project import (
 )
 
 PYTHON_PROJECT_NATIVE_UNCERTAIN_EXIT_CODE = 3
+
+if TYPE_CHECKING:
+    from agent_hub.runtime.contracts import Artifact
 
 
 class PythonProjectInvocation(ContractProjectInvocation):
@@ -173,6 +178,104 @@ class PythonProjectReleaseExpiredEnvironmentRequest(_PythonRequest):
         return self
 
 
+class PythonFailedMaintenanceInvocation(ProjectInvocation):
+    """Owner identity only; cannot stage a source or authorize an installation."""
+    install_allowed: Literal[False] = False
+    sandbox_profile: Literal['restricted'] = 'restricted'
+    timeout_seconds: int = Field(default=30, ge=1, le=30)
+    execution_id: str = Field(pattern=r'^python_release_expired_[a-f0-9]{32}$')
+
+    @field_validator('install_allowed', mode='before')
+    @classmethod
+    def no_install(cls, value: object) -> object:
+        if value is not False:
+            raise ValueError('maintenance cannot install')
+        return value
+
+
+class PythonFailedReservationSnapshot(BaseModel):
+    model_config = ConfigDict(extra='forbid', strict=True, frozen=True)
+    schema_version: Literal[1] = 1
+    cache_key: str = Field(pattern=r'^[a-f0-9]{64}$')
+    scope: PythonProjectScope
+    reservation: str = Field(min_length=1, max_length=16384, repr=False)
+    outcome: str = Field(min_length=1, max_length=16384, repr=False)
+    reservation_sha256: str = Field(pattern=r'^[a-f0-9]{64}$')
+    outcome_sha256: str = Field(pattern=r'^[a-f0-9]{64}$')
+    identities: tuple[tuple[int, ...], ...]
+
+    @field_validator('schema_version', mode='before')
+    @classmethod
+    def strict_schema(cls, value: object) -> object:
+        if type(value) is not int or value != 1:
+            raise ValueError('invalid failure snapshot schema')
+        return value
+
+    @model_validator(mode='after')
+    def valid_snapshot(self) -> Self:
+        from agent_hub.skills.sandbox.project_contract_broker import _encoded
+        from agent_hub.skills.sandbox.python_project_cache import (
+            _validate_failed_outcome,
+            _validate_reservation,
+        )
+
+        if (type(self.schema_version) is not int or len(self.identities) != 3
+                or any(len(row) != 9 or any(type(value) is not int for value in row) for row in self.identities)):
+            raise ValueError('invalid failure snapshot identity')
+        values = []
+        for raw, digest in ((self.reservation, self.reservation_sha256), (self.outcome, self.outcome_sha256)):
+            encoded = raw.encode('ascii')
+            parsed = json.loads(raw)
+            if (len(encoded) > 16384 or type(parsed) is not dict or _encoded(parsed) != encoded
+                    or hashlib.sha256(encoded).hexdigest() != digest):
+                raise ValueError('invalid failure snapshot bytes')
+            values.append(parsed)
+        reservation, outcome = values
+        _validate_reservation(reservation, self.cache_key, 2**63 - 1)
+        _validate_failed_outcome(outcome, reservation)
+        if reservation['scope'] != self.scope.model_dump(mode='json'):
+            raise ValueError('invalid failure snapshot scope')
+        return self
+
+    @property
+    def origin_execution_id(self) -> str:
+        return cast(str, json.loads(self.reservation)['origin_execution_id'])
+
+    def archive(self) -> Artifact:
+        from agent_hub.runtime.contracts import Artifact
+
+        identity = ':'.join((str(self.scope.tenant_id), str(self.scope.run_id), self.cache_key,
+                             self.origin_execution_id, self.reservation_sha256, self.outcome_sha256))
+        return Artifact(id=uuid5(NAMESPACE_URL, 'agent-hub:failed-python-cache:' + identity),
+            type='python_failed_cache_archive', producer='python_terminal_maintenance',
+            content={'schema_version': 1, 'snapshot': self.model_dump(mode='json')})
+
+
+class PythonFailedMaintenanceRequest(_PythonRequest):
+    action: Literal['maintain_expired_python_failure'] = 'maintain_expired_python_failure'
+    invocation: PythonFailedMaintenanceInvocation
+    phase: Literal['inspect', 'commit']
+    snapshot: PythonFailedReservationSnapshot | None = None
+    archive_id: UUID | None = None
+    archive_sha256: str | None = Field(default=None, pattern=r'^[a-f0-9]{64}$')
+
+    @model_validator(mode='after')
+    def valid_phase(self) -> Self:
+        if self.phase == 'inspect':
+            if any(value is not None for value in (self.snapshot, self.archive_id, self.archive_sha256)):
+                raise ValueError('unexpected failure inspect material')
+        else:
+            if self.snapshot is None:
+                raise ValueError('missing failure commit snapshot')
+            archive = self.snapshot.archive()
+            if ((archive.id, archive.content_sha256) != (self.archive_id, self.archive_sha256)
+                    or any(getattr(self.invocation, field) != getattr(self.snapshot.scope, field)
+                           for field in ('tenant_id', 'run_id', 'project_id', 'session_id'))
+                    or self.invocation.execution_id == self.snapshot.origin_execution_id):
+                raise ValueError('invalid failure commit binding')
+        return self
+
+
 class PythonProjectInputsObservation(BaseModel):
     """Measured inputs from the root probe; not an installed environment."""
 
@@ -251,6 +354,7 @@ class PythonProjectBrokerResponse(_PythonRequest):
         "probe_python_project", "run_python_project", "inspect_python_project_environment",
         "release_python_project_environment",
         'release_expired_python_project_environment',
+        'maintain_expired_python_failure',
     ]
     execution_id: str = Field(pattern=r"^[a-z0-9][a-z0-9_-]{0,127}$")
     ok: bool
@@ -260,12 +364,26 @@ class PythonProjectBrokerResponse(_PythonRequest):
     released_environment: PythonEnvironmentReference | None = None
     release_outcome: Literal["released", "absent"] | None = None
     expired_environment_released: bool | None = None
+    failure_phase: Literal['inspect', 'commit'] | None = None
+    failure_snapshot: PythonFailedReservationSnapshot | None = None
+    failure_removed: bool | None = None
     error: PythonProjectBrokerError | None = None
     product: PythonProductDescriptor | None = None
     _product_stream: BinaryIO | None = PrivateAttr(default=None)
 
     @model_validator(mode="after")
     def exclusive_outcome(self) -> Self:
+        if self.ok and self.action == 'maintain_expired_python_failure':
+            if (self.error is not None or self.failure_phase is None or any(value is not None for value in (
+                    self.result, self.observation, self.environment_reference, self.released_environment,
+                    self.release_outcome, self.expired_environment_released, self.product))
+                    or (self.failure_phase == 'inspect' and self.failure_removed is not None)
+                    or (self.failure_phase == 'commit' and (
+                        type(self.failure_removed) is not bool or self.failure_snapshot is not None))):
+                raise ValueError('invalid failure maintenance outcome')
+            return self
+        if any(value is not None for value in (self.failure_phase, self.failure_snapshot, self.failure_removed)):
+            raise ValueError('unexpected failure maintenance fields')
         if self.product is not None and (not self.ok or self.action != "run_python_project"):
             raise ValueError("unexpected Python product")
         if not self.ok:
@@ -322,7 +440,8 @@ class PythonProjectBrokerResponse(_PythonRequest):
         | PythonProjectProbeRequest
         | PythonProjectInspectEnvironmentRequest
         | PythonProjectReleaseEnvironmentRequest
-        | PythonProjectReleaseExpiredEnvironmentRequest,
+        | PythonProjectReleaseExpiredEnvironmentRequest
+        | PythonFailedMaintenanceRequest,
     ) -> None:
         """Bind the authenticated root reply to the actual invocation, not report fields."""
         if type(request) not in {
@@ -331,6 +450,7 @@ class PythonProjectBrokerResponse(_PythonRequest):
             PythonProjectInspectEnvironmentRequest,
             PythonProjectReleaseEnvironmentRequest,
             PythonProjectReleaseExpiredEnvironmentRequest,
+            PythonFailedMaintenanceRequest,
         }:
             raise ValueError("invalid Python broker request type")
         invocation = request.invocation
@@ -340,6 +460,13 @@ class PythonProjectBrokerResponse(_PythonRequest):
             self.product.require_for(request.invocation)
         if (self.action, self.execution_id) != (request.action, invocation.execution_id):
             raise ValueError("Python broker response context mismatch")
+        if isinstance(request, PythonFailedMaintenanceRequest):
+            if self.ok and (self.failure_phase != request.phase or (
+                self.failure_snapshot is not None and any(
+                    getattr(invocation, field) != getattr(self.failure_snapshot.scope, field)
+                    for field in ('tenant_id', 'run_id', 'project_id', 'session_id')))):
+                raise ValueError('failure maintenance response binding mismatch')
+            return
         if (
             isinstance(request, PythonProjectReleaseEnvironmentRequest) and self.ok
             and self.released_environment != request.expected_environment
@@ -352,7 +479,9 @@ class PythonProjectBrokerResponse(_PythonRequest):
             if self.observation is not None
             else None
         )
-        if scope is not None and scope.model_dump() != _scope_payload(invocation):
+        if scope is not None and scope.model_dump() != _scope_payload(
+            cast(PythonProjectInvocation | PythonProjectProbeInvocation, invocation)
+        ):
             raise ValueError("Python broker response scope mismatch")
         if self.environment_reference is not None and (
             type(invocation) is not PythonProjectInvocation
@@ -370,9 +499,9 @@ class PythonProjectBrokerResponse(_PythonRequest):
 
 
 def base_python_invocation(
-    invocation: PythonProjectInvocation | PythonProjectProbeInvocation,
+    invocation: PythonProjectInvocation | PythonProjectProbeInvocation | PythonFailedMaintenanceInvocation,
 ) -> ProjectInvocation:
-    if type(invocation) not in {PythonProjectInvocation, PythonProjectProbeInvocation}:
+    if type(invocation) not in {PythonProjectInvocation, PythonProjectProbeInvocation, PythonFailedMaintenanceInvocation}:
         raise ValueError("invalid Python project invocation")
     validated = type(invocation).model_validate(invocation.model_dump(), strict=True)
     return ProjectInvocation.model_validate(

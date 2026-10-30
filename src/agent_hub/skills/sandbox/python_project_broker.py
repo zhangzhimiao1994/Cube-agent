@@ -29,6 +29,7 @@ from agent_hub.skills.sandbox.python_project_command import _escaped
 from agent_hub.skills.sandbox.python_project_process import python_root_response_limit
 from agent_hub.skills.sandbox.python_project_protocol import (
     PYTHON_PROJECT_NATIVE_UNCERTAIN_EXIT_CODE,
+    PythonFailedMaintenanceRequest,
     PythonProductDescriptor,
     PythonProjectBrokerError,
     PythonProjectBrokerRequest,
@@ -49,7 +50,7 @@ if TYPE_CHECKING:
 type _Request = (
     PythonProjectBrokerRequest | PythonProjectProbeRequest | PythonProjectInspectEnvironmentRequest
     | PythonProjectReleaseEnvironmentRequest
-    | PythonProjectReleaseExpiredEnvironmentRequest
+    | PythonProjectReleaseExpiredEnvironmentRequest | PythonFailedMaintenanceRequest
 )
 type ProductSink = Callable[[Path, PythonProjectBrokerResponse, PythonProjectInvocation],
                            Awaitable[PythonProductDescriptor | None]]
@@ -130,18 +131,20 @@ def _configuration() -> RootConfig:
     return read_root_configuration()
 
 
-async def _admit_unit(broker: ProjectExecutionBroker, job: _Execution) -> None:
+async def _admit_unit(broker: ProjectExecutionBroker, job: _Execution, *, no_job: bool = False) -> None:
     result = await broker._helper(
         (
             broker.policy.systemctl,
             "show",
             job.unit,
             "--no-pager",
-            "--property=LoadState,ActiveState,SubState,MainPID,ControlPID,ControlGroup,TasksCurrent",
+            "--property=LoadState,ActiveState,SubState,MainPID,ControlPID,ControlGroup,TasksCurrent"
+            + (",Job" if no_job else ""),
         ),
         2.0,
     )
-    if not broker._unit_quiet(job, result):
+    properties = dict(line.split('=', 1) for line in result.stdout.splitlines() if '=' in line)
+    if not broker._unit_quiet(job, result) or (no_job and properties.get('Job') != '0'):
         raise ValueError("python_project_execution_unavailable")
 
 
@@ -194,6 +197,7 @@ async def handle_python_project(
             PythonProjectInspectEnvironmentRequest,
             PythonProjectReleaseEnvironmentRequest,
             PythonProjectReleaseExpiredEnvironmentRequest,
+    PythonFailedMaintenanceRequest,
         }:
             raise ValueError("python_project_request_invalid")
         request = type(request).model_validate_json(request.model_dump_json(), strict=True)
@@ -265,8 +269,12 @@ async def handle_python_project(
             async with asyncio.timeout_at(deadline):
                 await broker.slots.acquire()
                 job.slot_acquired = True
-                await _admit_unit(broker, helper)
-                await _admit_unit(broker, job)
+                if isinstance(request, PythonFailedMaintenanceRequest):
+                    await _admit_unit(broker, helper, no_job=True)
+                    await _admit_unit(broker, job, no_job=True)
+                else:
+                    await _admit_unit(broker, helper)
+                    await _admit_unit(broker, job)
                 _private_project_runtime(configuration.stage_root)
                 job.stage = Path(tempfile.mkdtemp(prefix=key + "-", dir=configuration.stage_root))
                 job.stage.chmod(0o700)

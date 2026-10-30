@@ -53,6 +53,7 @@ if TYPE_CHECKING:
         PythonProjectProfileResponse,
     )
     from agent_hub.skills.sandbox.python_project_protocol import (
+        PythonFailedMaintenanceRequest,
         PythonProjectBrokerRequest,
         PythonProjectBrokerResponse,
         PythonProjectInspectEnvironmentRequest,
@@ -358,7 +359,7 @@ class SkillBroker:
         return await self._project_broker.handle(request, peer_uid=peer_uid)
 
     async def handle_python_project(
-        self, request: PythonProjectBrokerRequest | PythonProjectProbeRequest | PythonProjectInspectEnvironmentRequest | PythonProjectReleaseEnvironmentRequest | PythonProjectReleaseExpiredEnvironmentRequest,
+        self, request: PythonProjectBrokerRequest | PythonProjectProbeRequest | PythonProjectInspectEnvironmentRequest | PythonProjectReleaseEnvironmentRequest | PythonProjectReleaseExpiredEnvironmentRequest | PythonFailedMaintenanceRequest,
         *, peer_uid: int, product_sink: ProductSink | None = None,
     ) -> PythonProjectBrokerResponse:
         from agent_hub.skills.sandbox.python_project_broker import handle_python_project
@@ -600,7 +601,7 @@ async def _serve_client(
     is_toolchain = False
     toolchain_request: ToolchainRequest | None = None
     supply_request: PythonInputSupplyRequest | None = None
-    python_request: PythonProjectBrokerRequest | PythonProjectProbeRequest | PythonProjectInspectEnvironmentRequest | PythonProjectReleaseEnvironmentRequest | PythonProjectReleaseExpiredEnvironmentRequest | None = None
+    python_request: PythonProjectBrokerRequest | PythonProjectProbeRequest | PythonProjectInspectEnvironmentRequest | PythonProjectReleaseEnvironmentRequest | PythonProjectReleaseExpiredEnvironmentRequest | PythonFailedMaintenanceRequest | None = None
     response: BrokerResponse | PythonProjectBrokerResponse | PythonInputSupplyResponse | PythonProjectProfileResponse | ToolchainResponse | PythonDependencyClosureResponse | PythonMetadataPlanningResponse | PythonMetadataPreparationResponse
     try:
         peer_uid = _peer_uid(writer)
@@ -713,6 +714,7 @@ async def _serve_client(
         elif isinstance(envelope, dict) and type(envelope.get("version")) is int and envelope["version"] == 4:
             is_project = True
             from agent_hub.skills.sandbox.python_project_protocol import (
+                PythonFailedMaintenanceRequest,
                 PythonProjectBrokerRequest,
                 PythonProjectBrokerResponse,
                 PythonProjectInspectEnvironmentRequest,
@@ -735,6 +737,8 @@ async def _serve_client(
                     python_request = PythonProjectReleaseExpiredEnvironmentRequest.model_validate_json(payload, strict=True)
                 except (ValueError, TypeError):
                     raise BrokerRequestError('invalid Python expired release request') from None
+            elif action == 'maintain_expired_python_failure':
+                python_request = PythonFailedMaintenanceRequest.model_validate_json(payload, strict=True)
             else:
                 raise BrokerRequestError("invalid Python broker action")
             if (isinstance(python_request, PythonProjectBrokerRequest)

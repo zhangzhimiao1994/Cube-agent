@@ -55,6 +55,8 @@ from agent_hub.skills.sandbox.python_project_environment import PythonProjectEnv
 from agent_hub.skills.sandbox.python_project_process import PythonPhaseProcessResult
 from agent_hub.skills.sandbox.python_project_protocol import (
     PythonEnvironmentReference,
+    PythonFailedMaintenanceInvocation,
+    PythonFailedReservationSnapshot,
     PythonProjectInvocation,
     PythonProjectScope,
     base_python_invocation,
@@ -78,6 +80,39 @@ _READY = frozenset({"reservation.json", "reference.json", "environment"})
 _MAX_FAILURES = 16
 _MAX_MEMBERS = 4 + 2 * _MAX_FAILURES
 _ARCHIVE = re.compile(r"failed-([a-z0-9][a-z0-9_-]{0,127})\.(reservation|outcome)\.json")
+_RETIREMENT = re.compile(r"retired-[a-f0-9]{64}\.json")
+_MAX_RETIREMENTS = 1024
+
+
+def _owner(invocation: object) -> dict[str, str]:
+    return {field: str(getattr(invocation, field))
+            for field in ('tenant_id', 'run_id', 'project_id', 'session_id')}
+
+
+def _retirement_name(owner: dict[str, str]) -> str:
+    return 'retired-' + hashlib.sha256(_encoded(owner)).hexdigest() + '.json'
+
+
+def _validate_retirement(name: str, value: object) -> None:
+    from agent_hub.skills.sandbox.project import ProjectInvocation
+
+    _need(type(value) is dict)
+    assert isinstance(value, dict)
+    _need(set(value) == {'schema_version', 'kind', 'owner', 'cache_key', 'origin_execution_id',
+                        'reservation_sha256', 'outcome_sha256', 'archive_id', 'archive_sha256'})
+    owner = value['owner']
+    _need(type(owner) is dict and set(owner) == {'tenant_id', 'run_id', 'project_id', 'session_id'})
+    _need(all(type(owner[key]) is str and str(UUID(owner[key])) == owner[key] for key in ('tenant_id', 'run_id')))
+    ProjectInvocation.model_validate_json(_encoded(owner | {
+        'execution_id': 'retirement_validation', 'sandbox_profile': 'restricted', 'timeout_seconds': 1}), strict=True)
+    _need(type(value['schema_version']) is int and value['schema_version'] == 1
+          and value['kind'] == 'python_failed_owner_retired' and _retirement_name(owner) == name
+          and len(_encoded(value)) <= 4096)
+    _need(all(type(value[key]) is str and _SHA.fullmatch(value[key]) for key in (
+        'cache_key', 'reservation_sha256', 'outcome_sha256', 'archive_sha256')))
+    _need(type(value['origin_execution_id']) is str
+          and re.fullmatch(r'[a-z0-9][a-z0-9_-]{0,127}', value['origin_execution_id']) is not None
+          and type(value['archive_id']) is str and str(UUID(value['archive_id'])) == value['archive_id'])
 
 
 class PythonProjectCacheError(ValueError):
@@ -297,12 +332,20 @@ def _usage(parent: int, *, maximum: int, deadline: float) -> int:
                 if not parts:
                     _need(
                         member.name == "cache.lock"
+                        or (_RETIREMENT.fullmatch(member.name) is not None
+                            and stat.S_ISREG(info.st_mode) and info.st_nlink == 1
+                            and stat.S_IMODE(info.st_mode) == 0o600)
                         or (
                             _SHA.fullmatch(member.name) is not None
                             and stat.S_ISDIR(info.st_mode)
                             and stat.S_IMODE(info.st_mode) == 0o700
                         )
                     )
+                    if _RETIREMENT.fullmatch(member.name):
+                        pins: list[_Observed] = []
+                        _validate_retirement(member.name, _read(fd, member.name, pins))
+                        for pin in pins:
+                            pin.check()
                 elif len(parts) == 1:
                     _need(
                         member.name in _READY | {"failed.json", "unpublished.json"}
@@ -875,19 +918,40 @@ class PythonProjectEnvironmentCache:
                 pin.check()
 
     def _catalog(self, parent: int, deadline: float) -> set[str]:
-        names = _names(parent, self.policy.max_entries + 1, deadline)
+        names = _names(parent, self.policy.max_entries + 1 + _MAX_RETIREMENTS, deadline)
+        retirements = {name for name in names if _RETIREMENT.fullmatch(name)}
+        _need(len(retirements) <= _MAX_RETIREMENTS)
+        pins: list[_Observed] = []
+        for name in sorted(retirements):
+            _validate_retirement(name, _read(parent, name, pins))
+        for pin in pins:
+            pin.check()
+        active = names - retirements - {'cache.lock'}
         _need(
             "cache.lock" in names
-            and all(name == "cache.lock" or _SHA.fullmatch(name) for name in names)
+            and len(active) <= self.policy.max_entries
+            and all(_SHA.fullmatch(name) for name in active)
         )
-        return names - {"cache.lock"}
+        return active
+
+    def _retired_scope(self, parent: int, owner: dict[str, str], deadline: float) -> bool:
+        name = _retirement_name(owner)
+        if name not in _names(parent, self.policy.max_entries + 1 + _MAX_RETIREMENTS, deadline):
+            return False
+        pins: list[_Observed] = []
+        value = _read(parent, name, pins)
+        _validate_retirement(name, value)
+        _need(value['owner'] == owner)
+        for pin in pins:
+            pin.check()
+        return True
 
     def _capacity(self, parent: int, deadline: float, *, additional: int = 0) -> tuple[int, int]:
         if sys.platform != "linux":
             raise PythonProjectCacheError("cache_unsupported")
         used = _usage(
             parent,
-            maximum=self.policy.max_entries * (100_010 + 2 * _MAX_FAILURES) + 1,
+            maximum=self.policy.max_entries * (100_010 + 2 * _MAX_FAILURES) + 1 + _MAX_RETIREMENTS,
             deadline=deadline,
         )
         disk = os.fstatvfs(parent)
@@ -899,6 +963,86 @@ class PythonProjectEnvironmentCache:
         )
         _check(deadline)
         return used, free
+
+    def maintain_failed(
+        self, invocation: PythonFailedMaintenanceInvocation, *, deadline: float,
+        quiescence_check: Callable[[str], None], expected: PythonFailedReservationSnapshot | None = None,
+    ) -> PythonFailedReservationSnapshot | bool | None:
+        """Caller holds native admission; Root selects and remeasures, never trusts a deletion key."""
+        invocation = PythonFailedMaintenanceInvocation.model_validate(invocation.model_dump(), strict=True)
+        mutating = False
+        try:
+            with self._locked(deadline, create=False) as locked:
+                if locked is None:
+                    return None if expected is None else False
+                parent, stack, root_pins = locked
+                selected: tuple[str, int, PythonFailedReservationSnapshot, list[_Observed]] | None = None
+                for key in sorted(self._catalog(parent, deadline)):
+                    _check(deadline)
+                    pins: list[_Observed] = []
+                    entry = _open_directory(parent, key, 0, stack, pins, mode=0o700, full=True)
+                    reservation = _reservation(entry, key, self.policy, pins)
+                    if {field: reservation['scope'][field] for field in _owner(invocation)} != _owner(invocation):
+                        continue
+                    if _names(entry, _MAX_MEMBERS, deadline) != {'reservation.json', 'failed.json'}:
+                        continue
+                    _need(selected is None, 'cache_changed')
+                    outcome = _read(entry, 'failed.json', pins)
+                    _validate_failed_outcome(outcome, reservation)
+                    if time.time() < reservation['expires_at']:
+                        continue
+                    raw, failed = _encoded(reservation), _encoded(outcome)
+                    snapshot = PythonFailedReservationSnapshot(
+                        cache_key=key, scope=PythonProjectScope.model_validate_json(_encoded(reservation['scope']), strict=True),
+                        reservation=raw.decode('ascii'), outcome=failed.decode('ascii'),
+                        reservation_sha256=hashlib.sha256(raw).hexdigest(), outcome_sha256=hashlib.sha256(failed).hexdigest(),
+                        identities=(_stamp(os.fstat(entry), full=True),
+                            _stamp(os.stat('reservation.json', dir_fd=entry, follow_symlinks=False), full=True),
+                            _stamp(os.stat('failed.json', dir_fd=entry, follow_symlinks=False), full=True)))
+                    selected = key, entry, snapshot, pins
+                if selected is None:
+                    return None if expected is None else False
+                key, entry, snapshot, pins = selected
+                if expected is not None:
+                    expected = PythonFailedReservationSnapshot.model_validate_json(expected.model_dump_json(), strict=True)
+                    _need(expected == snapshot, 'cache_changed')
+                quiescence_check(snapshot.origin_execution_id)
+                for pin in (*root_pins, *pins):
+                    pin.check()
+                if expected is None:
+                    return snapshot
+                owner = _owner(invocation)
+                archive = snapshot.archive()
+                marker = {'schema_version': 1, 'kind': 'python_failed_owner_retired', 'owner': owner,
+                    'cache_key': key, 'origin_execution_id': snapshot.origin_execution_id,
+                    'reservation_sha256': snapshot.reservation_sha256, 'outcome_sha256': snapshot.outcome_sha256,
+                    'archive_id': str(archive.id), 'archive_sha256': archive.content_sha256}
+                name = _retirement_name(owner)
+                names = _names(parent, self.policy.max_entries + 1 + _MAX_RETIREMENTS, deadline)
+                if name in names:
+                    _need(_read(parent, name, root_pins) == marker, 'cache_changed')
+                else:
+                    _need(sum(bool(_RETIREMENT.fullmatch(item)) for item in names) < _MAX_RETIREMENTS, 'cache_quota')
+                    self._capacity(parent, deadline, additional=len(_encoded(marker)))
+                    mutating = True
+                    _write(parent, name, marker)
+                _need(_read(parent, name, root_pins) == marker, 'cache_changed')
+                for pin in (*root_pins, *pins):
+                    pin.check()
+                _check(deadline)
+                mutating = True
+                os.unlink('failed.json', dir_fd=entry)
+                os.unlink('reservation.json', dir_fd=entry)
+                os.fsync(entry)
+                _need(not _names(entry, 1, deadline), 'cache_changed')
+                _same(parent, key, os.fstat(entry), entry)
+                os.rmdir(key, dir_fd=parent)
+                os.fsync(parent)
+                return True
+        except BaseException:
+            if mutating:
+                raise ProcessCleanupIncomplete('python_project_cleanup_incomplete') from None
+            raise
 
     @contextmanager
     def reserve(
@@ -915,6 +1059,7 @@ class PythonProjectEnvironmentCache:
                 assert locked is not None
                 parent, stack, pins = locked
                 names = self._catalog(parent, deadline)
+                _need(not self._retired_scope(parent, _owner(invocation), deadline), 'cache_incomplete')
                 used, free = self._capacity(parent, deadline)
                 def new_budget() -> int:
                     # Called only under the global cache lock, before any mutation.

@@ -85,6 +85,7 @@ from agent_hub.skills.sandbox.python_project_product_export import (
 from agent_hub.skills.sandbox.python_project_protocol import (
     PYTHON_PROJECT_NATIVE_UNCERTAIN_EXIT_CODE,
     PythonEnvironmentReference,
+    PythonFailedMaintenanceRequest,
     PythonProjectBrokerError,
     PythonProjectBrokerRequest,
     PythonProjectBrokerResponse,
@@ -124,7 +125,7 @@ _Request = (
     | PythonProjectProbeRequest
     | PythonProjectInspectEnvironmentRequest
     | PythonProjectReleaseEnvironmentRequest
-    | PythonProjectReleaseExpiredEnvironmentRequest
+    | PythonProjectReleaseExpiredEnvironmentRequest | PythonFailedMaintenanceRequest
 )
 _CONFIG_PATH = Path("/etc/agent-hub/python-project.json")
 _MAX_CONTROL = 16 * 1024
@@ -1001,6 +1002,8 @@ def _quiesce(policy: BrokerPolicy, job: _Execution) -> None:
 
 
 def _scope(request: _Request) -> PythonProjectScope:
+    if isinstance(request, PythonFailedMaintenanceRequest):
+        raise TypeError('maintenance does not carry an environment reference')
     item = request.invocation
     return PythonProjectScope(
         tenant_id=item.tenant_id,
@@ -1116,7 +1119,8 @@ def _release_stage_invocation(value: object, name: str) -> ProjectInvocation:
 
 
 def _release_scope_guard(
-    request: PythonProjectReleaseEnvironmentRequest, stage_root: Path, stage: Path, deadline: float,
+    request: PythonProjectReleaseEnvironmentRequest | PythonFailedMaintenanceRequest,
+    stage_root: Path, stage: Path, deadline: float,
 ) -> None:
     """Under admission: another execution's stage fences its entire tenant/run.
 
@@ -1259,6 +1263,42 @@ def _release_expired(
     _need(type(removed) is bool, 'python_project_environment_changed')
     return PythonProjectBrokerResponse(action=request.action,
         execution_id=request.invocation.execution_id, ok=True, expired_environment_released=removed)
+
+
+def _maintain_failed(
+    request: PythonFailedMaintenanceRequest, policy: BrokerPolicy, config: RootConfig,
+    deadline: float, *, stage: Path,
+) -> PythonProjectBrokerResponse:
+    from agent_hub.skills.sandbox.python_project_broker import PythonRootExecution, _admit_unit
+    from agent_hub.skills.sandbox.python_project_protocol import PythonFailedReservationSnapshot
+
+    def quiescence(origin_id: str) -> None:
+        _need(origin_id != request.invocation.execution_id, 'python_project_request_invalid')
+        origin = base_python_invocation(request.invocation).model_copy(update={'execution_id': origin_id})
+
+        async def check_units() -> None:
+            broker = ProjectExecutionBroker(policy, retained_runtime_roots=(config.stage_root,))
+            if broker._retained(origin_id):
+                raise ProcessCleanupIncomplete('python_project_cleanup_incomplete')
+            await _admit_unit(broker, PythonRootExecution(origin, None), no_job=True)
+            await _admit_unit(broker, _Execution(origin, None), no_job=True)
+
+        try:
+            asyncio.run(check_units())
+            _release_scope_guard(request, config.stage_root, stage, deadline)
+            _check(deadline)
+        except (OSError, ValueError, RuntimeError, TimeoutError, TypeError, KeyError, AttributeError):
+            raise ProcessCleanupIncomplete('python_project_cleanup_incomplete') from None
+
+    value = PythonProjectEnvironmentCache(config.environment_root, config.cache_policy).maintain_failed(
+        request.invocation, deadline=deadline, quiescence_check=quiescence, expected=request.snapshot)
+    if request.phase == 'inspect':
+        _need(value is None or type(value) is PythonFailedReservationSnapshot)
+        return PythonProjectBrokerResponse(action=request.action, execution_id=request.invocation.execution_id,
+            ok=True, failure_phase='inspect', failure_snapshot=cast(PythonFailedReservationSnapshot | None, value))
+    _need(type(value) is bool)
+    return PythonProjectBrokerResponse(action=request.action, execution_id=request.invocation.execution_id,
+        ok=True, failure_phase='commit', failure_removed=cast(bool, value))
 
 
 def _run(
@@ -1439,6 +1479,7 @@ def execute_python_project_request(
             PythonProjectInspectEnvironmentRequest,
             PythonProjectReleaseEnvironmentRequest,
             PythonProjectReleaseExpiredEnvironmentRequest,
+    PythonFailedMaintenanceRequest,
         },
         "python_project_request_invalid",
     )
@@ -1457,6 +1498,10 @@ def execute_python_project_request(
             ) as roots,
             _admission(roots.stage_root_fd, deadline),
         ):
+            if isinstance(request, PythonFailedMaintenanceRequest):
+                response = _maintain_failed(request, policy, configuration, deadline, stage=stage)
+                response.require_for(request)
+                return response
             if isinstance(request, PythonProjectReleaseExpiredEnvironmentRequest):
                 response = _release_expired(request, policy, configuration, deadline, stage=stage)
                 response.require_for(request)
@@ -1535,6 +1580,7 @@ def _request(raw: bytes) -> _Request:
             "inspect_python_project_environment": PythonProjectInspectEnvironmentRequest,
             "release_python_project_environment": PythonProjectReleaseEnvironmentRequest,
             'release_expired_python_project_environment': PythonProjectReleaseExpiredEnvironmentRequest,
+            'maintain_expired_python_failure': PythonFailedMaintenanceRequest,
         }
         action = payload.get("action")
         _need(type(action) is str and action in classes, "python_project_request_invalid")
