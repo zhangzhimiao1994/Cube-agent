@@ -12,7 +12,8 @@ import pytest_asyncio
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
 from sqlalchemy import delete, func, select, text, update
-from sqlalchemy.exc import DBAPIError
+from sqlalchemy.engine import make_url
+from sqlalchemy.exc import ArgumentError, DBAPIError
 
 from agent_hub.auth.models import AuthenticatedPrincipal, Role
 from agent_hub.db.models import (
@@ -41,16 +42,39 @@ CONFIG = 'c' * 64
 DEPLOYMENT = DeploymentIdentity('synthetic', 'deployment', 'model')
 
 
+def _require_test_database_url(database_url: str) -> None:
+    message = 'dedicated test database URL required'
+    try:
+        url = make_url(database_url)
+    except (ArgumentError, ValueError):
+        raise AssertionError(message) from None
+    assert (url.drivername == 'postgresql+asyncpg' and url.username == 'agent_hub_test'
+            and url.database == 'agent_hub_test' and set(url.query) <= {'host'}), message
+    if url.port is not None:
+        assert 1 <= url.port <= 65535, message
+    socket = url.query.get('host')
+    if socket is None:
+        assert url.host in {'127.0.0.1', 'localhost', '::1'} and url.port is not None, message
+    else:
+        assert (url.host is None and type(socket) is str and socket.startswith('/')
+                and not socket.startswith('//') and '..' not in socket.split('/')
+                and '\x00' not in socket), message
+
+
 @pytest_asyncio.fixture(scope='module', loop_scope='module')
 async def storage(database_url):
-    assert database_url == 'postgresql+asyncpg://agent_hub_test@127.0.0.1:55483/agent_hub_test'
+    _require_test_database_url(database_url)
     database = build_database(database_url)
     ids = []
     try:
+        async with database.session_factory() as session:
+            identity = (await session.execute(select(func.current_database(), func.current_user()))).one()
+            assert tuple(identity) == ('agent_hub_test', 'agent_hub_test'), 'dedicated test DB identity required'
         yield database.session_factory, ids
     finally:
-        async with database.session_factory() as session, session.begin():
-            await session.execute(delete(RunRow).where(RunRow.id.in_(ids)))
+        if ids:
+            async with database.session_factory() as session, session.begin():
+                await session.execute(delete(RunRow).where(RunRow.id.in_(ids)))
         await database.dispose()
 
 
