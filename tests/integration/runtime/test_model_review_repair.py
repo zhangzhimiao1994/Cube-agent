@@ -11,9 +11,11 @@ import importlib.util
 import json
 import shutil
 import sys
+from collections.abc import Mapping
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
@@ -28,7 +30,7 @@ from agent_hub.db.models import (
 )
 from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.files.workspace import ProjectWorkspaceStore
-from agent_hub.models.run_admission_repository import RunAdmissionRepository
+from agent_hub.models.run_admission_repository import RunAdmissionRepository, _WorkerLease
 from agent_hub.runs.artifacts import PostgresArtifactRepository
 from agent_hub.runs.self_repair import project_repair_checkpoint_is_safe
 from agent_hub.runtime import review_assembly
@@ -82,8 +84,484 @@ async def rows(factory, model, run):
         return list((await session.scalars(select(model).where(model.run_id == run))).all())
 
 
+def _metadata_hash(value):
+    return hashlib.sha256(
+        json.dumps(
+            _mutable_json(value), sort_keys=True, separators=(",", ":"), allow_nan=False
+        ).encode()
+    ).hexdigest()
+
+
+def _recovery_restore_metadata(saved, loaded, phase, scope):
+    assert saved is not None and loaded is not None and isinstance(phase, Mapping)
+    assert (saved.id, saved.run_id, saved.tenant_id, saved.mode) == (
+        loaded.id,
+        loaded.run_id,
+        loaded.tenant_id,
+        loaded.mode,
+    )
+    assert saved.state_sha256 == saved.recompute_state_sha256()
+    assert loaded.state_sha256 == loaded.recompute_state_sha256() == saved.state_sha256
+    assert phase["source_checkpoint_id"] == str(loaded.id)
+    assert phase["source_checkpoint_sha256"] == loaded.state_sha256
+    assert phase["source_scope_sha256"] == scope
+    return {
+        "saved_checkpoint_sha256": saved.state_sha256,
+        "loaded_checkpoint_sha256": loaded.state_sha256,
+        "prepared_phase_sha256": _metadata_hash(phase),
+        "phase_source_checkpoint_sha256": phase["source_checkpoint_sha256"],
+        "source_scope_sha256": phase["source_scope_sha256"],
+    }
+
+
+def _recovery_pool_metadata(pool, lease):
+    return {
+        "token_grant": pool.original_token_grant,
+        "deadline_sha256": _metadata_hash(pool.original_deadline.astimezone(UTC).isoformat()),
+        "lease_sha256": _metadata_hash({"worker_id": lease.worker_id, "token": str(lease.token)}),
+    }
+
+
+async def _record_recovery_metadata(
+    f, repair, request, record_property, *, retry_calls=(None, None)
+):
+    """Record actual asserted objects only; native PASS/cleanup belongs to collector."""
+    contexts = f.wire.contexts
+    assert len(contexts) == 2 and all(context.run_id == f.record.id for context in contexts)
+    assert contexts[0].execution_token != contexts[1].execution_token
+    after = await RunAdmissionRepository(f.factory).get_pool(f.user.tenant_id, f.record.id)
+    assert (
+        (after.tenant_id, after.run_id, after.authorization_turn_id)
+        == (f.before.tenant_id, f.before.run_id, f.before.authorization_turn_id)
+        == (f.user.tenant_id, f.record.id, f.evidence.turn_id)
+    )
+    assert (after.original_token_grant, after.original_deadline) == (
+        f.before.original_token_grant,
+        f.before.original_deadline,
+    )
+    attempts = await rows(f.factory, RunAdmissionAttemptRow, f.record.id)
+    unknown = next(item for item in attempts if item.attempt_id == f.unknown[0])
+    assert (unknown.state, unknown.token_hold, unknown.receipt_sha256) == (
+        f.unknown_state_before,
+        *f.unknown[1:],
+    )
+    assert {item.attempt_id for item in attempts} == set(f.wire.sent)
+    leases = []
+    for context in contexts:
+        sent = [
+            value
+            for value in f.wire.sent.values()
+            if value["lease"].token == context.execution_token
+        ]
+        assert sent and all(value["lease"] == sent[0]["lease"] for value in sent)
+        lease = sent[0]["lease"]
+        for item in attempts:
+            observed = f.wire.sent[item.attempt_id]
+            assert (item.worker_id, item.worker_lease_token) == (
+                observed["lease"].worker_id,
+                observed["lease"].token,
+            )
+            assert item.request_sha256 == observed["request_sha256"]
+            assert item.physical_transport_id == observed["physical_id"]
+        leases.append(lease)
+    assert after.token_charged == sum(
+        item.token_hold if item.state == "unknown" else item.receipt["usage"]["total_tokens"]
+        for item in attempts
+    )
+    intents = await rows(f.factory, RunReviewIntentRow, f.record.id)
+    assert len(intents) == 1 and len(f.wire.reviews) == 1
+    intent = intents[0]
+    reviews = [item for item in attempts if item.purpose == "review"]
+    assert len(reviews) == 1 and reviews[0].deployment["deployment_id"] == "reviewer_1"
+    assert all(
+        item.deployment != reviews[0].deployment for item in attempts if item.purpose == "primary"
+    )
+    before_sha = f.root_before_sha
+    after_sha = hashlib.sha256((f.root / TARGET).read_bytes()).hexdigest()
+    if intent.status == "allow":
+        assert intent.consumed and len(repair.root_effects) == 1 and before_sha != after_sha
+        assert retry_calls == (None, None)
+    else:
+        assert intent.status == "unknown" and not intent.consumed and not repair.root_effects
+        assert before_sha == after_sha
+        assert retry_calls[0] is not None and retry_calls[0] == retry_calls[1]
+    checkpoint = repair.runtime.phase_checkpoint
+    assert checkpoint is not None
+    # Canonical SOURCE scope, not the current waiting-approval DTO with its new
+    # approval ID/fingerprint/locator. The phase was prepared inside the real
+    # worker proof and its exact checkpoint must have been committed below.
+    scope_after = checkpoint.state[project_repair_phase.PHASE_KEY]["source_scope_sha256"]
+    assert scope_after == f.scope_before
+    async with f.factory() as session:
+        durable = await f.repository.latest_checkpoint(
+            session, tenant_id=f.user.tenant_id, run_id=f.record.id
+        )
+    assert durable is not None and durable.state_sha256 == checkpoint.state_sha256
+    restore = _recovery_restore_metadata(
+        f.saved_checkpoint,
+        repair.runtime.loaded_checkpoint,
+        checkpoint.state[project_repair_phase.PHASE_KEY],
+        f.scope_before,
+    )
+    assert review_assembly.runtime_source_fingerprint() == f.source_sha
+    snapshots = [
+        _recovery_pool_metadata(pool, lease)
+        for pool, lease in zip((f.before, after), leases, strict=True)
+    ]
+    record_property(
+        "review_recovery_observed",
+        json.dumps(
+            {
+                "phase": "actual_runtime_restore"
+                if intent.status == "allow"
+                else "unknown_review_no_replay",
+                "mode": contexts[1].mode.value,
+                "selector": request.node.nodeid,
+                "runtime_source_sha256": f.source_sha,
+                "run_id": str(f.record.id),
+                "pool_id": str(after.run_id),
+                "authorization_turn_id": str(after.authorization_turn_id),
+                "scope_sha256_before": f.scope_before,
+                "scope_sha256_after": scope_after,
+                "original": snapshots[0],
+                "restored": snapshots[1],
+                "restore": restore,
+                "unknown_hold": {
+                    "attempt_id": str(unknown.attempt_id),
+                    "state_before": f.unknown_state_before,
+                    "state_after": unknown.state,
+                    "token_hold_before": f.unknown[1],
+                    "token_hold_after": unknown.token_hold,
+                    "receipt_sha256_before": f.unknown[2],
+                    "receipt_sha256_after": unknown.receipt_sha256,
+                },
+                "review": {
+                    "attempts": len(reviews),
+                    "calls": len(f.wire.reviews),
+                    "intent_status": intent.status,
+                    "consumed_intents": sum(int(item.consumed) for item in intents),
+                    "action_digest": intent.action_digest,
+                    "receipt_sha256": intent.receipt_sha256,
+                },
+                "root": {
+                    "before_sha256": before_sha,
+                    "after_sha256": after_sha,
+                    "effects": len(repair.root_effects),
+                },
+                "retry": {"calls_before": retry_calls[0], "calls_after": retry_calls[1]},
+            },
+            sort_keys=True,
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "defect", [None, "checkpoint", "checkpoint_identity", "phase_source", "scope", "missing_phase"]
+)
+async def test_recovery_metadata_restore_binds_actual_checkpoint_and_prepared_phase_without_pg(
+    tmp_path, defect
+):
+    f = await repair_fixture(tmp_path)
+    context = await claim(f)
+    prepared = project_repair_phase.prepare(
+        context, f.cp, f.cp.state["model_ledger"], f.cp.state["tool_ledger"]
+    )
+    loaded = f.cp
+    if defect == "checkpoint":
+        loaded = f.cp.model_copy(update={"state_sha256": "f" * 64})
+    elif defect == "checkpoint_identity":
+        loaded = f.cp.model_copy(update={"run_id": uuid4()})
+    elif defect == "phase_source":
+        prepared["source_checkpoint_sha256"] = "f" * 64
+    elif defect == "scope":
+        prepared["source_scope_sha256"] = "f" * 64
+    elif defect == "missing_phase":
+        prepared = None
+    scope = context.routing_decision["repair_proposal"]["automatic_scope_sha256"]
+    if defect is not None:
+        with pytest.raises(AssertionError):
+            _recovery_restore_metadata(f.cp, loaded, prepared, scope)
+    else:
+        facts = _recovery_restore_metadata(f.cp, loaded, prepared, scope)
+        assert facts == {
+            "saved_checkpoint_sha256": f.cp.state_sha256,
+            "loaded_checkpoint_sha256": f.cp.state_sha256,
+            "prepared_phase_sha256": hashlib.sha256(
+                json.dumps(
+                    _mutable_json(prepared), sort_keys=True, separators=(",", ":"), allow_nan=False
+                ).encode()
+            ).hexdigest(),
+            "phase_source_checkpoint_sha256": f.cp.state_sha256,
+            "source_scope_sha256": scope,
+        }
+
+
+@pytest.mark.parametrize("change", ["token", "owner", "deadline"])
+async def test_recovery_metadata_hashes_bind_lease_deadline_without_exposing_them(change):
+    pool = SimpleNamespace(
+        original_token_grant=1000, original_deadline=datetime(2026, 1, 1, tzinfo=UTC)
+    )
+    lease = _WorkerLease("local-protocol-owner", uuid4())
+    before = _recovery_pool_metadata(pool, lease)
+    if change == "deadline":
+        pool.original_deadline += timedelta(seconds=1)
+    else:
+        lease = _WorkerLease(
+            "other-owner" if change == "owner" else lease.worker_id,
+            uuid4() if change == "token" else lease.token,
+        )
+    after = _recovery_pool_metadata(pool, lease)
+    field = "deadline_sha256" if change == "deadline" else "lease_sha256"
+    assert before[field] != after[field]
+    encoded = json.dumps(after)
+    assert str(lease.token) not in encoded and lease.worker_id not in encoded
+    assert pool.original_deadline.isoformat() not in encoded
+
+
+@pytest.mark.parametrize(
+    "delay_after_begin", [False, True], ids=["ordinary", "committed-before-return"]
+)
+async def test_actual_service_repair_manual_approval_drains_real_checkpoint_without_pg(
+    tmp_path, monkeypatch, delay_after_begin
+):
+    """Actual accept/worker/adapter/Root pause and service drain; local SQL seam only."""
+    from sqlalchemy.sql.dml import Insert
+
+    from agent_hub.db import models
+    from agent_hub.runs.approval_checkpoint import checkpoint_waits_for_approval
+    from agent_hub.runs.self_repair import project_repair_scope_sha256
+    from agent_hub.runs.service import RunService
+    from agent_hub.runtime.registry import RuntimeRegistry
+    from agent_hub.runtime.repair_projection import _Projection
+    from tests.unit.runs.test_project_auto_repair import decision
+
+    f = await repair_fixture(
+        tmp_path,
+        accept=False,
+        route_extras={
+            "runtime_timeout_absolute_seconds": 60,
+            "runtime_token_soft_base_tokens": 40000,
+            "runtime_plan_timeout_seconds": 60,
+            "engineering_final_report_version": 1,
+            "permission_mode": "default",
+        },
+    )
+    original_pool = await RunAdmissionRepository(f.db).get_pool(f.cp.tenant_id, f.cp.run_id)
+    held = next(row for row in f.db.rows if type(row) is models.RunAdmissionAttemptRow)
+    original_hold = (held.attempt_id, held.state, held.token_hold, held.receipt_sha256)
+    scalar, execute = f.db.scalar, f.db.execute
+    tables = {
+        cls.__tablename__: cls
+        for cls in (
+            models.RunEventRow,
+            models.RunCheckpointRow,
+            models.RunArtifactRow,
+            models.RunUsageRow,
+            models.RunApprovalRow,
+        )
+    }
+
+    def inserted(statement):
+        cls = tables[statement.table.name]
+        params = statement.compile().params
+        keys = (
+            ("run_id", "sequence")
+            if cls in (models.RunEventRow, models.RunCheckpointRow)
+            else ("id",)
+        )
+        if any(
+            type(row) is cls and all(getattr(row, key) == params[key] for key in keys)
+            for row in f.db.rows
+        ):
+            return None
+        row = cls(**params)
+        f.db.add(row)
+        return row.id
+
+    async def local_scalar(statement):
+        if isinstance(statement, Insert):
+            return inserted(statement)
+        if getattr(statement.column_descriptions[0]["expr"], "name", None) == "count":
+            table = statement.get_final_froms()[0].name
+            return sum(type(row).__tablename__ == table for row in f.db.rows)
+        return await scalar(statement)
+
+    async def local_execute(statement):
+        if isinstance(statement, Insert):
+            identity = inserted(statement)
+            return SimpleNamespace(scalar_one_or_none=lambda: identity)
+        if getattr(statement.column_descriptions[0]["expr"], "name", None) == "count":
+            artifacts = [row for row in f.db.rows if type(row) is models.RuntimeArtifactRow]
+            return SimpleNamespace(
+                one=lambda: (len(artifacts), sum(row.byte_size for row in artifacts))
+            )
+        return await execute(statement)
+
+    async def local_get(cls, identity, **kwargs):
+        values = identity if isinstance(identity, tuple) else (identity,)
+        keys = [column.key for column in cls.__mapper__.primary_key]
+        return next(
+            (
+                row
+                for row in f.db.rows
+                if type(row) is cls
+                and all(getattr(row, key) == value for key, value in zip(keys, values, strict=True))
+            ),
+            None,
+        )
+
+    f.db.scalar, f.db.execute = local_scalar, local_execute
+    f.db.get = local_get
+    f.db.rows[:] = [
+        row for row in f.db.rows if type(row) not in (models.RunEventRow, models.RunCheckpointRow)
+    ]
+    f.db.run.routing_decision = dict(f.original_task.routing_decision)
+    f.db.run.status = "running"
+    f.db.run.worker_id = f.original.budget.lease.worker_id
+    f.db.run.worker_lease_token = f.original_task.execution_token
+    f.db.run.worker_lease_expires_at = datetime.now(UTC) + timedelta(seconds=90)
+    root = ProjectWorkspaceStore(tmp_path).session_root(f.cp.tenant_id, "demo", "session")
+    root.mkdir(parents=True, exist_ok=True)
+    (root / TARGET).write_text(ORIGINAL, encoding="utf-8")
+    f.f.broker._a2_tenant = f.cp.tenant_id
+    wire = RepairWire(unknown_review=True, authorization_message=f.original_task.request)
+    common = (
+        tmp_path,
+        f.runs,
+        PostgresArtifactRepository(f.db),
+        f.f.broker,
+        f.f.state.platform,
+        f.f.config_service,
+        f.f.secrets,
+        f.f.capacity,
+        wire,
+    )
+    initial = await components(*common)
+    initial.runtime.prime_unknown = False
+    async with worker_runtime_events(
+        initial.runtime, f.original_task, worker_id=f.db.run.worker_id, review_broker=f.f.broker
+    ) as stream:
+        async for event in stream:
+            sequence = await f.runs.next_event_sequence(f.db, f.cp.run_id)
+            await f.runs.persist_event(
+                f.db,
+                tenant_id=f.cp.tenant_id,
+                run_id=f.cp.run_id,
+                event=event.model_copy(update={"sequence": sequence}),
+            )
+    checkpoint = initial.runtime.last_checkpoint
+    assert checkpoint is not None, [
+        (row.kind, row.payload.get("reason"))
+        for row in f.db.rows
+        if type(row) is models.RunEventRow
+    ]
+    assert project_repair_checkpoint_is_safe(
+        checkpoint,
+        routing_decision=f.db.run.routing_decision,
+        run_id=f.cp.run_id,
+        tenant_id=f.cp.tenant_id,
+        mode=TaskMode.DISCUSS,
+    ), {
+        "terminal": checkpoint.state.get("terminal"),
+        "soft": checkpoint.state.get("remaining_timeout_seconds"),
+        "absolute": checkpoint.state.get("remaining_absolute_timeout_seconds"),
+        "ceiling": f.db.run.routing_decision.get("runtime_timeout_absolute_seconds"),
+        "tool_status": [row.get("status") for row in checkpoint.state.get("tool_ledger", ())],
+    }
+    proposal = replace(
+        decision(checkpoint),
+        requires_approval=False,
+        automatic_execution=True,
+        automatic_checkpoint_sha256=checkpoint.state_sha256,
+        automatic_scope_sha256=project_repair_scope_sha256(f.db.run.routing_decision),
+    )
+    f.db.run.routing_decision = {
+        **f.db.run.routing_decision,
+        "approval_kind": "self_repair",
+        "decision_token": "local-real-checkpoint",
+        "repair_proposal": proposal.to_proposal(run_id=f.cp.run_id),
+    }
+    f.db.run.status = "failed"
+    f.runs.clear_worker_lease(f.db.run)
+    await f.runs.accept_self_repair_and_enqueue(
+        tenant_id=f.cp.tenant_id,
+        run_id=f.cp.run_id,
+        version=f.db.run.version,
+        decision_token="local-real-checkpoint",
+        automatic_checkpoint_sha256=checkpoint.state_sha256,
+    )
+    repair = await components(*common)
+    begin_approval = f.runs.begin_capability_approval
+    waiting_call_counts = []
+
+    async def observed_begin(*args, **kwargs):
+        record = await begin_approval(*args, **kwargs)
+        waiting_call_counts.append(len(wire.calls))
+        if delay_after_begin:
+            await asyncio.sleep(
+                0.05
+            )  # SQL transaction committed, actual response not returned yet.
+        return record
+
+    monkeypatch.setattr(f.runs, "begin_capability_approval", observed_begin)
+    refreshed_statuses = []
+    refresh = _Projection.refresh
+
+    async def observe_refresh(self):
+        refreshed_statuses.append(f.db.run.status)
+        await refresh(self)
+
+    monkeypatch.setattr(_Projection, "refresh", observe_refresh)
+
+    async def trusted_window():
+        return 131072
+
+    service = RunService(
+        f.runs,
+        runtime_registry=RuntimeRegistry((repair.runtime,)),
+        router=None,
+        task_queue=SimpleNamespace(),
+        worker_id="local-repair-drain",
+        runtime_timeout_seconds=60,
+        runtime_token_budget=40000,
+        review_broker=f.f.broker,
+        main_agent_context_window_getter=trusted_window,
+    )
+    result = await asyncio.wait_for(service.execute(f.cp.run_id), timeout=15)
+    approval_id = f.db.run.routing_decision.get("approval_id")
+    assert approval_id, {
+        "events": [
+            (row.kind, row.payload.get("tool_name"), row.payload.get("reason"))
+            for row in f.db.rows
+            if type(row) is models.RunEventRow
+        ][-8:],
+        "tools": [(phase, name) for phase, name, _ in wire.tool_calls],
+        "reviews": len(wire.reviews),
+    }
+    assert result.status is RunStatus.WAITING_APPROVAL
+    saved = await f.runs.latest_checkpoint(f.db, tenant_id=f.cp.tenant_id, run_id=f.cp.run_id)
+    assert checkpoint_waits_for_approval(saved, approval_id)
+    assert set(refreshed_statuses) == {"running"}
+    assert waiting_call_counts == [len(wire.calls)], "waiting may not start any new model calls"
+    assert repair.root_entries == repair.root_effects == []
+    assert (root / TARGET).read_text(encoding="utf-8") == ORIGINAL
+    after_pool = await RunAdmissionRepository(f.db).get_pool(f.cp.tenant_id, f.cp.run_id)
+    assert (
+        after_pool.authorization_turn_id,
+        after_pool.original_token_grant,
+        after_pool.original_deadline,
+    ) == (
+        original_pool.authorization_turn_id,
+        original_pool.original_token_grant,
+        original_pool.original_deadline,
+    )
+    assert (held.attempt_id, held.state, held.token_hold, held.receipt_sha256) == original_hold
+
+
 async def accepted_case(storage, tmp_path, redis_client, *, unknown_review=False):
     f = await pg_case(storage, tmp_path, redis_client, unknown_review=unknown_review)
+    f.source_sha = review_assembly.runtime_source_fingerprint()
+    f.root_before_sha = hashlib.sha256((f.root / TARGET).read_bytes()).hexdigest()
     initial = await f.service("a2-original-worker")
     result = await asyncio.wait_for(initial.service.execute(f.record.id), timeout=75)
     assert result.status is RunStatus.QUEUED, (
@@ -101,12 +579,24 @@ async def accepted_case(storage, tmp_path, redis_client, *, unknown_review=False
     assert unknown.state == "unknown" and unknown.token_hold > 0
     f.before = await RunAdmissionRepository(f.factory).get_pool(f.user.tenant_id, f.record.id)
     f.unknown = (unknown.attempt_id, unknown.token_hold, unknown.receipt_sha256)
+    f.unknown_state_before = unknown.state
+    f.scope_before = project_repair_phase.authority_digest(accepted.routing_decision)
+    assert f.scope_before == accepted.routing_decision["repair_proposal"]["automatic_scope_sha256"]
+    async with f.factory() as session:
+        f.saved_checkpoint = await f.repository.latest_checkpoint(
+            session, tenant_id=f.user.tenant_id, run_id=f.record.id
+        )
+    assert f.saved_checkpoint is not None
+    assert (
+        f.saved_checkpoint.state_sha256
+        == accepted.routing_decision["repair_proposal"]["automatic_checkpoint_sha256"]
+    )
     f.initial = initial
     return f
 
 
 async def test_discuss_service_repair_new_diagnosis_review_and_single_root_effect(
-    storage, own_redis, tmp_path
+    storage, own_redis, tmp_path, request, record_property
 ):
     f = await accepted_case(storage, tmp_path, own_redis)
     assert (f.root / TARGET).read_text(encoding="utf-8") == ORIGINAL
@@ -158,10 +648,11 @@ async def test_discuss_service_repair_new_diagnosis_review_and_single_root_effec
     )
     assert f.wire.bodies and all(body.closed for body in f.wire.bodies)
     await capacity_clean(f)
+    await _record_recovery_metadata(f, repair, request, record_property)
 
 
 async def test_discuss_repair_unknown_review_never_executes_or_replays(
-    storage, own_redis, tmp_path
+    storage, own_redis, tmp_path, request, record_property
 ):
     f = await accepted_case(storage, tmp_path, own_redis, unknown_review=True)
     repair = await f.service("a2-repair-worker")
@@ -182,6 +673,9 @@ async def test_discuss_repair_unknown_review_never_executes_or_replays(
     assert len([item for item in attempts if item.state == "unknown"]) == 2
     assert retry.root_entries == retry.root_effects == []
     await capacity_clean(f)
+    await _record_recovery_metadata(
+        f, repair, request, record_property, retry_calls=(before, len(f.wire.calls))
+    )
 
 
 async def test_discuss_sdk_stopped_checkpoint_protocol_without_pg(tmp_path):

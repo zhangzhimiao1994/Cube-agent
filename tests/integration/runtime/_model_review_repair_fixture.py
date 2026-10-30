@@ -70,8 +70,9 @@ MESSAGE = (
 class RepairWire:
     """OpenAI SDK HTTP seam; identity is taken from the real physical permit."""
 
-    def __init__(self, *, unknown_review=False):
+    def __init__(self, *, unknown_review=False, authorization_message=MESSAGE):
         self.unknown_review = unknown_review
+        self.authorization_message = authorization_message
         self.phase = "initial"
         self.calls, self.bodies, self.sent, self.reviews = [], [], {}, []
         self.contexts, self.tool_calls = [], []
@@ -103,7 +104,7 @@ class RepairWire:
         if "action_digest" in schema.get("properties", {}):
             assert not payload.get("tools") and metadata.purpose == "review"
             material = json.loads(payload["messages"][-1]["content"])
-            assert material["authenticated_authorization"]["message"] == MESSAGE
+            assert material["authenticated_authorization"]["message"] == self.authorization_message
             assert material["exact_action"]["request"]["arguments"] == {
                 "path": TARGET,
                 "content": PATCHED,
@@ -203,6 +204,7 @@ class AckBoundary:
         self.gateway, self.stack, self.artifacts, self.wire = gateway, stack, artifacts, wire
         self.prime_unknown = prime_unknown
         self.pending = self.adapter = self.last_checkpoint = None
+        self.loaded_checkpoint = self.phase_checkpoint = None
 
     async def restore_checkpoint(self, checkpoint):
         self.pending = checkpoint
@@ -267,6 +269,7 @@ class AckBoundary:
         )
         if self.pending is not None:
             await self.adapter.restore_checkpoint(self.pending)
+            self.loaded_checkpoint = self.adapter._restored
         boundary = asyncio.Event()
         fail, succeed = _DiscussionDurability.fail_tool, _DiscussionDurability.succeed_tool
 
@@ -302,7 +305,13 @@ class AckBoundary:
                             await asyncio.gather(item, return_exceptions=True)
                             break
                         try:
-                            yield item.result()
+                            event = item.result()
+                            if (
+                                event.checkpoint is not None
+                                and "project_repair_phase" in event.checkpoint.state
+                            ):
+                                self.phase_checkpoint = event.checkpoint
+                            yield event
                         except StopAsyncIteration:
                             return
                 finally:
@@ -425,13 +434,17 @@ async def pg_case(storage, tmp_path, redis_client, *, unknown_review=False):
             for name in ("primary_1", "reviewer_1")
         ),
         verification=WorkerReviewVerification(
-            frozenset({TaskMode.DISCUSS}),
+            # Compiler protocol fixture, as in the existing native mode helper;
+            # these two selectors only exercise actual DISCUSS repair.
+            frozenset({TaskMode.DIRECT, TaskMode.DISPATCH, TaskMode.DISCUSS, TaskMode.HYBRID}),
             "fixture://A2-DISCUSS-only",
             source_sha256=runtime_source_fingerprint(),
             checks=REQUIRED_VERIFICATION_CHECKS,
         ),
     )
     broker._a2_tenant = user.tenant_id
+    profile = await broker.submission_profile(user.tenant_id, timeout_seconds=120)
+    assert "approval_review_profile" in profile, "repair protocol fixture failed to enroll profile"
     selection = workspace_selection(
         project_id=PROJECT,
         session_id=SESSION,
@@ -449,7 +462,7 @@ async def pg_case(storage, tmp_path, redis_client, *, unknown_review=False):
         "runtime_token_absolute_tokens": 1000000,
         "runtime_plan_token_budget": 1000000,
         "runtime_timeout_seconds": 120,
-        **await broker.submission_profile(user.tenant_id, timeout_seconds=120),
+        **profile,
     }
     evidence = _capture_authenticated_input(
         user, MESSAGE, {"mode": "discuss", "project": PROJECT, "session": SESSION}

@@ -11,6 +11,9 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
+import re
+import sys
 from datetime import UTC, datetime
 from decimal import Decimal
 from types import SimpleNamespace
@@ -33,9 +36,10 @@ from agent_hub.runs.repository import RunRecord
 from agent_hub.runs.service import _project_delivery_assessment
 from agent_hub.runs.workspace import workspace_selection
 from agent_hub.runtime.artifacts import InMemoryArtifactRepository
-from agent_hub.runtime.contracts import EventKind, TaskContext
+from agent_hub.runtime.contracts import Artifact, EventKind, TaskContext
 from agent_hub.runtime.defaults import ConfigBackedDirectRuntime
 from agent_hub.runtime.direct import DirectRuntime, RuntimeExecutionError
+from agent_hub.runtime.review_assembly import runtime_source_fingerprint
 from agent_hub.runtime.streams import closing_runtime_events
 from tests.integration.capabilities.test_review_repository import (
     database_url as database_url,  # noqa: PLC0414
@@ -428,13 +432,103 @@ async def test_plain_note_actual_review_wire_and_storage_without_pg(tmp_path):
     assert all(response.closed for response in wire.bodies)
 
 
+def _direct_delivery_metadata(artifact, path):
+    text = artifact.content.get("text")
+    assert artifact.type == "text" and artifact.producer == "main"
+    assert isinstance(text, str) and text.strip() and not text.lstrip().startswith("{")
+    assert re.search(
+        r"(?<![\w/.-])" + re.escape(path) + r"(?=$|[\s\x60\"'，。,:;!?)]|\.(?:$|\s))", text
+    ), "final delivery must name the exact saved filename"
+    assert re.search(r"[A-Za-z\u4e00-\u9fff]{2,}", text.replace(path, ""))
+    return {
+        "artifact_id": str(artifact.id),
+        "artifact_sha256": artifact.content_sha256,
+        "text_sha256": hashlib.sha256(text.encode()).hexdigest(),
+        "text_bytes": len(text.encode()),
+        "filename_sha256": hashlib.sha256(path.encode()).hexdigest(),
+    }
+
+
+class _DirectWriteAudit:
+    """Observe real writable opens of the exact target, without replacing IO."""
+
+    def __init__(self, target):
+        self.target = os.path.normcase(str(target.resolve()))
+        self.count, self.active = 0, True
+
+    def __call__(self, event, args):
+        if (
+            self.active
+            and event == "open"
+            and isinstance(args[0], (str, bytes))
+            and os.path.normcase(os.path.abspath(os.fsdecode(args[0]))) == self.target
+            and type(args[2]) is int
+            and args[2] & (os.O_WRONLY | os.O_RDWR)
+        ):
+            self.count += 1
+
+
+@pytest.mark.parametrize("text", ["{}", "Saved other.txt.", "Saved other-note.txt.", "note.txt"])
+async def test_direct_delivery_metadata_rejects_unreadable_or_wrong_filename(text):
+    artifact = Artifact(id=uuid4(), type="text", producer="main", content={"text": text})
+    with pytest.raises(AssertionError):
+        _direct_delivery_metadata(artifact, "note.txt")
+
+
+async def test_direct_delivery_metadata_contains_only_actual_artifact_hashes():
+    artifact = Artifact(
+        id=uuid4(), type="text", producer="main", content={"text": "Saved note.txt."}
+    )
+    facts = _direct_delivery_metadata(artifact, "note.txt")
+    assert facts == {
+        "artifact_id": str(artifact.id),
+        "artifact_sha256": artifact.content_sha256,
+        "text_sha256": hashlib.sha256(b"Saved note.txt.").hexdigest(),
+        "text_bytes": 15,
+        "filename_sha256": hashlib.sha256(b"note.txt").hexdigest(),
+    }
+    assert "Saved" not in json.dumps(facts) and "note.txt" not in json.dumps(facts)
+
+
+async def test_direct_write_audit_metadata_counts_only_target_writes(tmp_path):
+    target = tmp_path / "note.txt"
+    audit = _DirectWriteAudit(target)
+    sys.addaudithook(audit)
+    try:
+        target.write_bytes(b"first")
+        assert audit.count == 1
+        assert target.read_bytes() == b"first"
+        (tmp_path / "other.txt").write_bytes(b"other")
+        assert audit.count == 1
+    finally:
+        audit.active = False
+    target.write_bytes(b"after")
+    assert audit.count == 1
+
+
 async def test_native_direct_plain_note_review_consumes_once_and_writes(
-    storage, own_redis, tmp_path
+    storage, own_redis, tmp_path, request, record_property
 ):
     """One actual PG/Redis/worker/broker/factory/Harness action, fixed wire only."""
     body, path, content = plain_note_submission()
     case = await build_case(storage, tmp_path, TaskMode.DIRECT, own_redis, body=body)
     proposals = _install_note_wire(case, body, path, content)
+    source_sha = runtime_source_fingerprint()
+    root = ProjectWorkspaceStore(tmp_path).session_root(
+        case.context.tenant_id, body.project_id, body.workspace_session_id
+    )
+    audit = _DirectWriteAudit(root / path)
+    sys.addaudithook(audit)
+    invoked = []
+    original_invoke = case.stack.harness_tool_gateway.invoke
+
+    async def observe(tenant_id, call, **kwargs):
+        result = await original_invoke(tenant_id, call, **kwargs)
+        if call.tool_name == "workspace.write_text":
+            invoked.append((call, result))
+        return result
+
+    case.stack.harness_tool_gateway.invoke = observe
     try:
         evidence = await case.repository.load_authenticated_input(
             case.context.tenant_id, case.context.run_id
@@ -469,6 +563,14 @@ async def test_native_direct_plain_note_review_consumes_once_and_writes(
         ]
         assert len(text_artifacts) == 1 and path in text_artifacts[0].content["text"]
         assert text_artifacts[0].content["workspace_files"][0]["sha256"] == digest
+        final_delivery = _direct_delivery_metadata(text_artifacts[0], path)
+        assert events[-1].inputs == (text_artifacts[0],)
+        assert audit.count == len(invoked) == 1
+        call, result = invoked[0]
+        assert result.status == "succeeded" and result.failure_reason is None
+        assert call.run_id == case.context.run_id
+        assert dict(call.arguments) == {"path": path, "content": content}
+        assert result.payload["file"]["sha256"] == digest
         async with case.factory() as session:
             attempts = list(
                 await session.scalars(
@@ -534,6 +636,57 @@ async def test_native_direct_plain_note_review_consumes_once_and_writes(
         assert record.routing_decision["requested_permissions"] == ["workspace.read", "command.run"]
         assert all(response.closed for response in case.wire.bodies)
         await capacity_is_clean(case)
+        assert runtime_source_fingerprint() == source_sha
+        assert pool.run_id == case.context.run_id
+        primary = [row for row in attempts if row.purpose == "primary"]
+        assert primary and all(row.deployment != review_attempt.deployment for row in primary)
+        adapter_names = case.wire.classes & {"DirectRuntime", "ActionApprovedDirectRuntime"}
+        assert len(adapter_names) == 1
+        record_property(
+            "review_action_composition_observed",
+            json.dumps(
+                {
+                    "mode": case.context.mode.value,
+                    "phase": "review_action_composition",
+                    "selector": request.node.nodeid,
+                    "runtime_source_sha256": source_sha,
+                    "factory": type(case.runtime).__name__,
+                    "adapter": next(iter(adapter_names)),
+                    "tool": call.tool_name,
+                    "review_calls": case.wire.reviewer_calls,
+                    "reviewed_backend_effects": audit.count,
+                    "consumed_intents": sum(int(item.consumed) for item in reviews),
+                    "primary_attempts": len(primary),
+                    "review_attempts": len([row for row in attempts if row.purpose == "review"]),
+                    "action_digest": review.action_digest,
+                    "backend_write_sha256": files[0].sha256,
+                    "review_receipt_sha256": review.receipt_sha256,
+                    "pool_id": str(pool.run_id),
+                    "run_id": str(case.context.run_id),
+                },
+                sort_keys=True,
+            ),
+        )
+        record_property(
+            "review_action_assertions",
+            json.dumps(
+                {
+                    "same_original_pool": pool.run_id == case.context.run_id,
+                    "same_lease": all(
+                        row.worker_id == case.binding["lease"].worker_id
+                        and row.worker_lease_token == case.context.execution_token
+                        for row in attempts
+                    ),
+                    "root_bytes_match": (root / path).read_bytes() == content.encode(),
+                    "result_status": result.status,
+                    "final_status": events[-1].kind.value,
+                    "write_count": audit.count,
+                    "final_delivery": final_delivery,
+                },
+                sort_keys=True,
+            ),
+        )
     finally:
+        audit.active = False
         case.wire.release.set()
         await case.runtime.cancel_run_owned(case.context.run_id, case.context.execution_token)
