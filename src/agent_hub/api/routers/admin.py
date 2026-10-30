@@ -50,6 +50,7 @@ from pydantic import (
     SecretStr,
     ValidationError,
     ValidationInfo,
+    computed_field,
     field_validator,
     model_serializer,
     model_validator,
@@ -61,6 +62,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from agent_hub.api.dependencies import current_principal
 from agent_hub.api.errors import BASE_ERROR_RESPONSES, PublicAPIError, error_responses
 from agent_hub.auth.models import AuthenticatedPrincipal, Authorizer, PermissionDenied, Role
+from agent_hub.capabilities.review_contracts import ApprovalReviewConfig
+from agent_hub.capabilities.review_settings import ApprovalReviewReadiness, ApprovalReviewSettings
 from agent_hub.capabilities.tools.registry import PluginConfigCapabilityManifestSource
 from agent_hub.config.schema import PlatformConfig
 from agent_hub.config.service import ConfigService, ConfigValidationError
@@ -2260,6 +2263,9 @@ class SystemSettingsRequest(BaseModel):
     safe_tools_enabled: bool = True
     require_approval_for_tools: bool = True
     tool_approval_mode: str = Field(default="auto_review", pattern=r"^(ask|auto_review)$")
+    approval_review: ApprovalReviewSettings = Field(
+        default_factory=lambda: ApprovalReviewConfig.from_payload(None)
+    )
     allow_main_agent_override: bool = False
     allow_temporary_agents: bool = False
     vibe_coding_enabled: bool = False
@@ -2304,6 +2310,15 @@ class SystemSettingsResponse(SystemSettingsRequest):
         "default", "auto_review", "read_only",
     )
 
+    @computed_field
+    def approval_review_readiness(self) -> ApprovalReviewReadiness:
+        # Stored configuration is never evidence of an assembled review runtime.
+        return ApprovalReviewReadiness(
+            reason_code=(
+                "rules_only" if self.approval_review.engine == "rules" else "runtime_not_ready"
+            )
+        )
+
 
 class ExecutionBackendResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -2341,6 +2356,10 @@ _PLUGIN_PACKAGE_SUBPROCESS_REGISTRATION_STATUSES = frozenset(
 def _migrate_system_settings_payload(payload: Mapping[str, object]) -> dict[str, object]:
     migrated = dict(payload)
     migrated.pop("supported_permission_modes", None)
+    migrated.pop("approval_review_readiness", None)
+    migrated["approval_review"] = ApprovalReviewConfig.from_payload(
+        migrated.get("approval_review")
+    ).to_payload()
     if migrated.get("tool_approval_mode") not in {"ask", "auto_review"}:
         migrated["tool_approval_mode"] = "ask"
     return migrated
@@ -2366,7 +2385,11 @@ def _persisted_system_settings_payload(
     settings: SystemSettingsRequest | SystemSettingsResponse,
 ) -> dict[str, Any]:
     return settings.model_dump(
-        exclude={"plugin_package_subprocess_registration_status", "supported_permission_modes"}
+        exclude={
+            "plugin_package_subprocess_registration_status",
+            "supported_permission_modes",
+            "approval_review_readiness",
+        }
     )
 
 
@@ -7210,12 +7233,12 @@ class InMemoryAdminResourceService:
         del self.workflows[workflow_id]
 
     async def get_settings(self) -> SystemSettingsResponse:
-        return self.settings
+        return self.settings.model_copy(deep=True)
 
     async def update_settings(self, request: SystemSettingsRequest) -> SystemSettingsResponse:
         response = SystemSettingsResponse(**_persisted_system_settings_payload(request))
         self.settings = response
-        return response
+        return response.model_copy(deep=True)
 
     async def list_runs(self) -> tuple[RunListItem, ...]:
         return tuple(
