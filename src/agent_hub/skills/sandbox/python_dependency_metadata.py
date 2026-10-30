@@ -11,6 +11,7 @@ import hashlib
 import io
 import json
 import re
+import time
 import zipfile
 from dataclasses import dataclass, replace
 from email.parser import BytesParser
@@ -57,21 +58,45 @@ def _field(value: object) -> str:
     return text
 
 
-def extract_python_wheel_metadata(entry: WheelDownload, raw: bytes) -> PythonWheelMetadata:
+def _check_deadline(deadline: float | None) -> None:
+    if deadline is not None and time.monotonic() >= deadline:
+        raise PythonDependencyMetadataError("python_dependency_metadata_timeout")
+
+
+def extract_python_wheel_metadata(
+    entry: WheelDownload, raw: bytes, *, deadline: float | None = None,
+) -> PythonWheelMetadata:
     """Validate the whole archive first, then read its sole matching METADATA."""
-    validate_wheel_bytes(entry, raw)
+    if deadline is None:
+        validate_wheel_bytes(entry, raw)
+    else:
+        validate_wheel_bytes(entry, raw, deadline=deadline)
     try:
+        _check_deadline(deadline)
         primary = "-".join(entry.filename.split("-")[:2]) + ".dist-info/METADATA"
         with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+            _check_deadline(deadline)
             matches = [item for item in archive.infolist() if item.filename == primary]
             _need(len(matches) == 1 and 0 < matches[0].file_size <= _MAX_METADATA_BYTES)
             with archive.open(matches[0]) as stream:
-                metadata_bytes = stream.read(_MAX_METADATA_BYTES + 1)
+                metadata = bytearray()
+                while True:
+                    _check_deadline(deadline)
+                    chunk = stream.read(min(65536, _MAX_METADATA_BYTES + 1 - len(metadata)))
+                    _check_deadline(deadline)
+                    if not chunk:
+                        break
+                    metadata.extend(chunk)
+                    _need(len(metadata) <= _MAX_METADATA_BYTES)
+                metadata_bytes = bytes(metadata)
             _need(len(metadata_bytes) == matches[0].file_size
                   and len(metadata_bytes) <= _MAX_METADATA_BYTES)
+        _check_deadline(deadline)
         document = BytesParser(policy=compat32).parsebytes(metadata_bytes)
+        _check_deadline(deadline)
         _need(not document.defects)
         for key, expected in (("Name", entry.name), ("Version", entry.version)):
+            _check_deadline(deadline)
             values = document.get_all(key, [])
             _need(len(values) == 1)
             actual = _field(values[0])
@@ -87,8 +112,10 @@ def extract_python_wheel_metadata(entry: WheelDownload, raw: bytes) -> PythonWhe
         _need(len(dependencies) <= _MAX_REQUIRES_DIST)
         requires_dist = tuple(_field(value) for value in dependencies)
         for requirement in requires_dist:
+            _check_deadline(deadline)
             _need(requirement.count("(") <= 32)
             Requirement(requirement)
+        _check_deadline(deadline)
         return PythonWheelMetadata(
             wheel=PythonWheelBinding(entry.filename, entry.name, entry.version, entry.sha256),
             requires_python=requires_python, requires_dist=requires_dist,

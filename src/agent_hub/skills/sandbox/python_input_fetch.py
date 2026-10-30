@@ -207,7 +207,11 @@ class _WheelTransport(PinnedHttpTransport):
         return HttpResponse(200, headers, body)
 
 
-def _central_directory(data: bytes) -> None:
+def _check_deadline(deadline: float) -> None:
+    _need(time.monotonic() < deadline, "fetch_timeout")
+
+
+def _central_directory(data: bytes, deadline: float = math.inf) -> None:
     # Bound actual central records before ZipFile creates objects. Count fields
     # alone are attacker-controlled. ZIP64/multidisk are outside this small recipe.
     end = data.rfind(b"PK\x05\x06", max(0, len(data) - 65557))
@@ -218,6 +222,7 @@ def _central_directory(data: bytes) -> None:
     _need(end + 22 + comment == len(data) and offset + size == end, "fetch_wheel_invalid")
     position, actual = offset, 0
     while position < end:
+        _check_deadline(deadline)
         _need(position + 46 <= end and data[position:position + 4] == b"PK\x01\x02", "fetch_wheel_invalid")
         name, extra, note = struct.unpack_from("<3H", data, position + 28)
         position += 46 + name + extra + note
@@ -227,10 +232,17 @@ def _central_directory(data: bytes) -> None:
 
 
 def _validate(entry: WheelDownload, data: bytes, deadline: float) -> None:
+    _check_deadline(deadline)
     entry = _entry(entry)
     _need(type(data) is bytes and len(data) == entry.size_bytes, "fetch_size")
-    _need(hashlib.sha256(data).hexdigest() == entry.sha256, "fetch_sha")
-    _central_directory(data)
+    actual_sha = hashlib.sha256()
+    view = memoryview(data)
+    for offset in range(0, len(data), 65536):
+        _check_deadline(deadline)
+        actual_sha.update(view[offset:offset + 65536])
+    _need(actual_sha.hexdigest() == entry.sha256, "fetch_sha")
+    _check_deadline(deadline)
+    _central_directory(data, deadline)
     primary = "-".join(entry.filename.split("-")[:2]) + ".dist-info"
     required = {primary + "/METADATA", primary + "/WHEEL"}
     with zipfile.ZipFile(io.BytesIO(data)) as archive:
@@ -239,6 +251,7 @@ def _validate(entry: WheelDownload, data: bytes, deadline: float) -> None:
         seen: dict[str, bool] = {}
         expanded = 0
         for member in members:
+            _check_deadline(deadline)
             name = member.filename
             path = name.rstrip("/")
             parts = path.split("/")
@@ -260,16 +273,19 @@ def _validate(entry: WheelDownload, data: bytes, deadline: float) -> None:
                   and (name not in required or member.file_size <= _MAX_METADATA), "fetch_wheel_limit")
         _need(required <= seen.keys() and not any(seen[p] for p in required), "fetch_wheel_invalid")
         for path in seen:
+            _check_deadline(deadline)
             _need(all(seen.get("/".join(path.split("/")[:n]), True)
                       for n in range(1, len(path.split("/")))), "fetch_wheel_invalid")
         metadata: dict[str, bytes] = {}
         total = 0
         for member in members:
+            _check_deadline(deadline)
             body = bytearray()
             with archive.open(member) as stream:
                 while True:
-                    _need(time.monotonic() < deadline, "fetch_timeout")
+                    _check_deadline(deadline)
                     chunk = stream.read(65536)
+                    _check_deadline(deadline)
                     if not chunk:
                         break
                     total += len(chunk)
@@ -279,22 +295,31 @@ def _validate(entry: WheelDownload, data: bytes, deadline: float) -> None:
                         body.extend(chunk)
             if member.filename in required:
                 metadata[member.filename] = bytes(body)
+        _check_deadline(deadline)
         package = BytesParser(policy=compat32).parsebytes(metadata[primary + "/METADATA"])
+        _check_deadline(deadline)
         wheel = BytesParser(policy=compat32).parsebytes(metadata[primary + "/WHEEL"])
+        _check_deadline(deadline)
         _need(not package.defects and not wheel.defects, "fetch_wheel_invalid")
         for document, key, expected in ((package, "Name", entry.name), (package, "Version", entry.version),
                 (wheel, "Wheel-Version", "1.0"), (wheel, "Root-Is-Purelib", "true"),
                 (wheel, "Tag", "py3-none-any")):
+            _check_deadline(deadline)
             values = document.get_all(key, [])
             _need(len(values) == 1 and type(values[0]) is str, "fetch_wheel_invalid")
             actual = re.sub(r"[-_.]+", "-", values[0]).lower() if key == "Name" else values[0]
             _need(actual == expected, "fetch_wheel_invalid")
 
 
-def validate_wheel_bytes(entry: WheelDownload, data: bytes) -> None:
+def validate_wheel_bytes(
+    entry: WheelDownload, data: bytes, *, deadline: float | None = None,
+) -> None:
     """Independently hash and inspect actual bytes; no extraction/import/authority."""
     try:
-        _validate(entry, data, math.inf)
+        _need(deadline is None or (
+            type(deadline) in {int, float} and math.isfinite(deadline) and deadline > 0
+        ), "fetch_entry_invalid")
+        _validate(entry, data, math.inf if deadline is None else deadline)
     except PythonInputFetchError:
         raise
     except Exception:  # noqa: BLE001 - malformed archive exceptions must remain path-free.
