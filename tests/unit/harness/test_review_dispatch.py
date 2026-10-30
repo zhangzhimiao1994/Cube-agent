@@ -110,7 +110,7 @@ def setup(tmp_path):
         "project_id": "demo",
         "workspace_session_id": "session",
         "sandbox_profile": "workspace_write",
-        "permission_mode": "default",
+        "permission_mode": "auto_review",
         "requested_permissions": ["workspace.read", "workspace.write", "command.run"],
         "execution_backend": "systemd",
         "runtime_timeout_seconds": 60,
