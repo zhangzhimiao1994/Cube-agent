@@ -47,8 +47,6 @@ def resolution_action(
         "root_sha256": claim.planning.expected_root_config_sha256,
         "catalog_sha256": claim.planning.expected_catalog_sha256,
         "permissions_sha256": scope.permissions_sha256,
-        "worker_id": claim.worker_id,
-        "lease_sha256": hashlib.sha256(str(claim.lease_token).encode("ascii")).hexdigest(),
         "original_deadline": claim.original_deadline.isoformat(),
         "registry": "https://pypi.org",
         "artifact_host": "files.pythonhosted.org",
@@ -58,7 +56,7 @@ def resolution_action(
         "max_wheel_bytes": 64 * 1024**2,
     }
     if plan is not None:
-        need(plan.claim.effect_payload() == claim.effect_payload(), "resolution_scope_changed")
+        need(plan.claim.approval_payload() == claim.approval_payload(), "resolution_scope_changed")
         binding["plan_sha256"] = plan.sha256
         binding["artifacts"] = [list(a) for a in plan.artifacts]
     return CapabilityRequest(
@@ -170,7 +168,12 @@ class PythonResolutionPreparation:
         if self._original is None:
             self._original = result
         else:
-            result.require_continuity(self._original)
+            if (result.worker_id, result.lease_token) == (self._original.worker_id, self._original.lease_token):
+                result.require_continuity(self._original)
+            else:
+                # Both authority accessors above verified the fresh private binding.
+                result.require_data_origin(self._original)
+                self._original = result
         return result
 
     async def _send(
@@ -186,7 +189,12 @@ class PythonResolutionPreparation:
         environment: dict[str, str],
         planning: PythonMetadataPlanningRequest,
         plan: ResolutionPlan | None = None,
+        expected_plan_sha256: str | None = None,
     ) -> ResolutionStatus:
+        if expected_plan_sha256 is not None:
+            from agent_hub.skills.sandbox.python_registry_protocol import require_sha
+            require_sha(expected_plan_sha256)
+            need(action == "inspect_python_resolution" and (plan is None or plan.sha256 == expected_plan_sha256),"resolution_request_invalid")
         claim = await self._claim(planning)
         action_request = resolution_action(claim, needs, environment, plan=plan)
         if action in {"resolve_python_inputs", "publish_python_resolution"} and (
@@ -217,7 +225,7 @@ class PythonResolutionPreparation:
             claim=current.model_copy(update={"planning": transport_planning}),
             requirements=tuple((n.requirement, n.evidence_sha256) for n in needs),
             environment=environment,
-            expected_plan_sha256=plan.sha256 if plan else None,
+            expected_plan_sha256=plan.sha256 if plan else expected_plan_sha256,
         )
         transport: Callable[[ResolutionRequest], Awaitable[ResolutionStatus]]
         if self.transport is None:
@@ -284,7 +292,9 @@ class PythonResolutionPreparation:
         needs: tuple[DependencyNeed, ...],
         environment: dict[str, str],
         planning: PythonMetadataPlanningRequest,
+        plan: ResolutionPlan | None = None,
+        expected_plan_sha256: str | None = None,
     ) -> ResolutionStatus:
         return await self._send(
-            "inspect_python_resolution", needs=needs, environment=environment, planning=planning
+            "inspect_python_resolution", needs=needs, environment=environment, planning=planning, plan=plan, expected_plan_sha256=expected_plan_sha256
         )

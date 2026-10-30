@@ -137,12 +137,7 @@ async def execute_resolution(
     status = store.inspect(request.key, request.claim)
     if request.action == "inspect_python_resolution":
         if request.expected_plan_sha256 is not None:
-            plan = store.require_plan(request.key, request.claim, request.expected_plan_sha256)
-            status = ResolutionStatus(
-                state=store.publication_status(request.key, request.claim, plan),
-                key=request.key,
-                plan=plan,
-            )
+            return store.inspect_publication(request.key,request.claim,request.expected_plan_sha256)
         return status
     if request.action == "resolve_python_inputs":
         need(status.state == "absent", "resolution_consumed")
@@ -155,6 +150,10 @@ async def execute_resolution(
             "resolution_quota",
         )
         limits = ResolutionLimits(**(request.limits | {"max_wheel_bytes": maximum}))
+        from agent_hub.skills.sandbox.python_resolution_overlay import record_attempt
+
+        record_attempt(supply,request.invocation,source_sha256=request.claim.planning.draft.source_sha256,
+            resolution_key=request.key,deadline=deadline)
         store.begin(request.key, request.claim)
 
         # A durable intent exists before even the first registry read. Every error
@@ -183,12 +182,16 @@ async def execute_resolution(
     if request.action == "freeze_python_resolution":
         # Only data is rebound. The original receipt remains unchanged.
         plan = store.freeze(request.key, request.claim)
+        from agent_hub.skills.sandbox.python_resolution_overlay import record_frozen_plan
+
+        record_frozen_plan(supply,plan,deadline=min(deadline,plan.claim.monotonic_deadline))
         await _context(request, policy, root, supply, deadline)
         return ResolutionStatus(
             state="frozen", key=request.key, descriptor=descriptor.to_payload(), plan=plan
         )
     assert request.expected_plan_sha256 is not None
     plan = store.require_plan(request.key, request.claim, request.expected_plan_sha256)
+    deadline = min(deadline,plan.claim.monotonic_deadline)
     effective = overlay_supply(supply, descriptor)
     need(
         effective.digest == plan.overlay_sha256 and plan.descriptor_sha256 == descriptor.sha256,

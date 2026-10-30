@@ -308,11 +308,16 @@ def execute(
         _roots,
         read_root_configuration,
     )
+    from agent_hub.skills.sandbox.python_resolution_overlay import effective_supply, has_overlay
 
     validate_configuration(policy, configuration, supply)
+    base_supply = supply
     deadline = time.monotonic() + request.invocation.timeout_seconds
     with _roots(policy, configuration, stage, False) as roots:
-        if request.action == "inspect_python_project_input_supply":
+        if request.action == "inspect_python_project_input_supply" and not has_overlay(
+            base_supply, base_python_invocation(request.invocation),
+            source_sha256=request.invocation.original_reference.input_source_sha256, deadline=deadline,
+        ):
             response = _status(request, supply)
             response.require_for(request)
             return response
@@ -321,6 +326,12 @@ def execute(
                 base_python_invocation(request.invocation),
                 ProjectBaselineReference.from_payload(request.invocation.original_reference.model_dump()),
                 stage, policy.allowed_uid)
+            supply = effective_supply(base_supply, base_python_invocation(request.invocation),
+                source_sha256=original.reference.input_source_sha256, deadline=deadline)
+            if request.action == "inspect_python_project_input_supply":
+                response = _status(request, supply)
+                response.require_for(request)
+                return response
             prepared = plan_inputs(original, request.invocation, configuration, supply, deadline=deadline)
             if request.action == "plan_python_project_inputs":
                 return PythonInputSupplyResponse(action=request.action, execution_id=request.invocation.execution_id,
@@ -347,8 +358,12 @@ def execute(
                     pin.check()
         downloaded = asyncio.run(_fetch_inputs(prepared.downloads, request, policy, configuration, supply, deadline))
         with _admission(roots.stage_root_fd, deadline):
+            current_base = read_supply_configuration()
+            current_supply = effective_supply(current_base, base_python_invocation(request.invocation),
+                source_sha256=original.reference.input_source_sha256, deadline=deadline)
             if (read_root_configuration().to_payload() != configuration.to_payload()
-                    or read_supply_configuration().digest != supply.digest):
+                    or current_base.digest != base_supply.digest
+                    or current_supply.digest != supply.digest):
                 raise InputSupplyError("input_supply_plan_changed")
             current = plan_inputs(original, request.invocation, configuration, supply, deadline=deadline)
             if current.plan != prepared.plan:

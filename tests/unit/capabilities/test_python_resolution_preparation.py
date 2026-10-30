@@ -191,9 +191,5 @@ def test_public_approval_arguments_never_expose_private_worker_lease():
     public = request.model_dump_json()
     assert str(original.lease_token) not in public
     assert "lease_token" not in request.arguments
-    import hashlib
-
-    assert (
-        request.arguments["lease_sha256"]
-        == hashlib.sha256(str(original.lease_token).encode("ascii")).hexdigest()
-    )
+    assert "worker_id" not in request.arguments
+    assert "lease_sha256" not in request.arguments

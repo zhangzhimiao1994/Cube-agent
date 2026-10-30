@@ -188,6 +188,24 @@ class ResolutionClaim(_Strict):
         need(current.monotonic_deadline <= previous.monotonic_deadline, "resolution_deadline")
         _ = current.deadline
 
+    def data_identity(self) -> dict[str, object]:
+        return {"scope": self.planning.scope.model_dump(mode="json"),
+            "root": self.planning.expected_root_config_sha256,
+            "catalog": self.planning.expected_catalog_sha256}
+
+    def require_data_origin(self, original: ResolutionClaim) -> None:
+        """Immutable bytes may cross a fresh bound worker; its grant never does."""
+        current = ResolutionClaim.model_validate(self, strict=True)
+        previous = ResolutionClaim.model_validate(original, strict=True)
+        need(current.data_identity() == previous.data_identity(), "resolution_scope_changed")
+        need(current.original_deadline <= previous.original_deadline, "resolution_deadline")
+        _ = current.deadline
+
+    def approval_payload(self) -> dict[str, object]:
+        value = self.effect_payload()
+        value["anchor"] = {**self.data_identity(), "original_deadline": self.original_deadline.isoformat()}
+        return value
+
     def effect_payload(self) -> dict[str, object]:
         invocation = self.planning.invocation.model_dump(mode="json")
         invocation.pop("execution_id")
@@ -238,7 +256,7 @@ class ResolutionPlan(_Strict):
 
     @property
     def sha256(self) -> str:
-        return digest({**self.model_dump(mode="json"), "claim": self.claim.effect_payload()})
+        return digest({**self.model_dump(mode="json"), "claim": self.claim.approval_payload()})
 
 
 class ResolutionStatus(_Strict):

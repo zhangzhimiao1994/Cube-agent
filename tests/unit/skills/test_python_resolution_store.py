@@ -274,6 +274,17 @@ def root_store(monkeypatch):
     _, s = api()
     fs = FileSystem()
     fs.O_WRONLY = 1
+    import posixpath
+    from contextlib import contextmanager
+
+    @contextmanager
+    def scandir(parent):
+        directory = fs.fds[parent][1]
+        fs.events.append(("scandir", directory))
+        yield (SimpleNamespace(name=posixpath.basename(path))
+               for path in tuple(fs.nodes) if posixpath.dirname(path) == directory)
+
+    fs.scandir = scandir
     for module in (s, indexes, catalog, supply_worker, contracts):
         monkeypatch.setattr(module, "os", fs)
     monkeypatch.setattr(indexes, "sys", SimpleNamespace(platform="linux"))
