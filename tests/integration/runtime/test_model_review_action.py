@@ -294,6 +294,80 @@ def _install_note_wire(case, body, path, content):
     return proposals
 
 
+def _assert_accounting_receipt(row, sent):
+    """Compare durable accounting against the guarded wire for either purpose."""
+    expected = {
+        "outcome": "completed",
+        "deployment": sent["deployment"],
+        "attempt_id": str(row.attempt_id),
+        "physical_transport_id": sent["physical_transport_id"],
+        "usage": sent["usage"],
+    }
+    assert row.receipt == expected
+    assert (
+        row.receipt_sha256
+        == hashlib.sha256(
+            json.dumps(
+                expected, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False
+            ).encode()
+        ).hexdigest()
+    )
+
+
+@pytest.mark.parametrize("purpose", ["primary", "review"])
+async def test_plain_note_accounting_receipt_rejects_rehashed_identity_drift(purpose):
+    """Pure assertion check: a valid hash must not hide incorrect receipt identity."""
+    attempt_id, physical_id = uuid4(), uuid4()
+    sent = {
+        "purpose": purpose,
+        "physical_transport_id": str(physical_id),
+        "deployment": {
+            "provider_id": "fixture",
+            "deployment_id": f"fixture-{purpose}",
+            "model_id": f"fixture/{purpose}",
+        },
+        "usage": {
+            "prompt_tokens": 2,
+            "completion_tokens": 3,
+            "total_tokens": 5,
+            "cost_usd": {"decimal": "0.000008"},
+        },
+    }
+    receipt = {
+        "outcome": "completed",
+        "deployment": sent["deployment"],
+        "attempt_id": str(attempt_id),
+        "physical_transport_id": str(physical_id),
+        "usage": sent["usage"],
+    }
+
+    def row_with(value):
+        return SimpleNamespace(
+            attempt_id=attempt_id,
+            purpose=purpose,
+            deployment=sent["deployment"],
+            physical_transport_id=physical_id,
+            receipt=value,
+            receipt_sha256=hashlib.sha256(
+                json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
+            ).hexdigest(),
+        )
+
+    _assert_accounting_receipt(row_with(receipt), sent)
+    wrong_hash = row_with(receipt)
+    wrong_hash.receipt_sha256 = "0" * 64
+    with pytest.raises(AssertionError):
+        _assert_accounting_receipt(wrong_hash, sent)
+    for key, wrong in {
+        "outcome": "cancelled",
+        "attempt_id": str(uuid4()),
+        "physical_transport_id": str(uuid4()),
+        "deployment": {**sent["deployment"], "deployment_id": "not-the-wire-deployment"},
+    }.items():
+        with pytest.raises(AssertionError):
+            _assert_accounting_receipt(row_with({**receipt, key: wrong}), sent)
+
+
 async def test_plain_note_actual_review_wire_and_storage_without_pg(tmp_path):
     """Actual service/SDK plus focused DB; not PG/Redis/worker acceptance."""
     from agent_hub.capabilities.execution_authority import bind_execution_authority
@@ -342,15 +416,7 @@ async def test_plain_note_actual_review_wire_and_storage_without_pg(tmp_path):
         sent = wire.attempts[row.attempt_id]
         assert row.request_sha256 == sent["request_sha256"] and row.deployment == sent["deployment"]
         assert str(row.physical_transport_id) == sent["physical_transport_id"]
-        assert row.receipt["usage"] == sent["usage"]
-        assert (
-            hashlib.sha256(
-                json.dumps(
-                    row.receipt, sort_keys=True, separators=(",", ":"), ensure_ascii=True
-                ).encode()
-            ).hexdigest()
-            == row.receipt_sha256
-        )
+        _assert_accounting_receipt(row, sent)
     (review_attempt,) = [row for row in attempts if row.purpose == "review"]
     receipt = json.loads(intents[0].private_receipt)
     assert receipt["accounting_receipt_sha256"] == review_attempt.receipt_sha256
@@ -436,15 +502,7 @@ async def test_native_direct_plain_note_review_consumes_once_and_writes(
             assert str(row.physical_transport_id) == sent["physical_transport_id"]
             assert row.worker_id == case.binding["lease"].worker_id
             assert row.worker_lease_token == case.context.execution_token
-            assert row.receipt["usage"] == sent["usage"]
-            assert (
-                row.receipt_sha256
-                == hashlib.sha256(
-                    json.dumps(
-                        row.receipt, sort_keys=True, separators=(",", ":"), ensure_ascii=True
-                    ).encode()
-                ).hexdigest()
-            )
+            _assert_accounting_receipt(row, sent)
         (review,) = reviews
         (review_attempt,) = [row for row in attempts if row.purpose == "review"]
         assert review.attempt_id == review_attempt.attempt_id
