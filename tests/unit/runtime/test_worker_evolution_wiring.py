@@ -12,9 +12,11 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from agent_hub.api.routers import admin as admin_router
 from agent_hub.api.routers.admin import SystemSettingsResponse
+from agent_hub.capabilities.defaults import RuntimeCapabilityStack
 from agent_hub.config.service import ConfigService
 from agent_hub.evolution_hooks import EvolutionExecutionIngestHook
 from agent_hub.plugins import handover_reviews
+from agent_hub.runs.artifacts import PostgresArtifactRepository
 from agent_hub.runs.repository import RunRepository
 from agent_hub.runtime import worker
 from agent_hub.security.secrets import SecretService
@@ -24,10 +26,13 @@ TENANT_ID = UUID("00000000-0000-4000-8000-000000000001")
 OTHER_TENANT_ID = UUID("00000000-0000-4000-8000-000000000002")
 
 
+@pytest.mark.parametrize("shared_artifacts", [False, True], ids=["existing-wiring", "shared-artifact-repository"])
 def test_worker_runtime_stack_uses_configured_artifacts_and_sql_approval_validator(
-    monkeypatch: MonkeyPatch, tmp_path: Path
+    monkeypatch: MonkeyPatch, tmp_path: Path, shared_artifacts: bool,
 ) -> None:
     captured: dict[str, object] = {}
+    stack_calls: list[dict[str, object]] = []
+    stacks: list[RuntimeCapabilityStack] = []
 
     class FakeDatabase:
         session_factory = object()
@@ -97,9 +102,21 @@ def test_worker_runtime_stack_uses_configured_artifacts_and_sql_approval_validat
         def capability_manifest_source(self) -> object:
             return Source("calendar.create_event", "plugin")
 
-    def fake_build_runtime_capability_stack(**kwargs: object) -> FakeRuntimeStack:
+    def fake_build_runtime_capability_stack(**kwargs: object) -> RuntimeCapabilityStack:
         captured["runtime_stack"] = kwargs
-        return FakeRuntimeStack()
+        # The registry consumer receives the exact gateway built from these args.
+        gateway = SimpleNamespace(
+            artifact_repository=kwargs.get("artifact_repository"),
+            original_project_preparer=lambda harness: FakeRuntimeStack.project_input_preparer,
+        )
+        stack = RuntimeCapabilityStack(
+            runtime_gateway=cast(Any, gateway), policy_gateway=cast(Any, object()),
+            harness_tool_gateway=cast(Any, object()),
+            project_input_preparer=cast(Any, FakeRuntimeStack.project_input_preparer),
+        )
+        stack_calls.append(kwargs)
+        stacks.append(stack)
+        return stack
 
     def fake_configured_runtime_registry(**kwargs: object) -> object:
         captured["runtime_registry"] = kwargs
@@ -121,7 +138,8 @@ def test_worker_runtime_stack_uses_configured_artifacts_and_sql_approval_validat
     monkeypatch.setattr(worker, "SecretService", lambda session_factory, cipher: object())
     monkeypatch.setattr(worker, "PersistentHermesRunAdvisor", lambda session_factory: object())
     monkeypatch.setattr(worker, "_evolution_terminal_hooks", lambda **kwargs: ())
-    monkeypatch.setattr(worker, "PostgresArtifactRepository", FakePostgresArtifactRepository, raising=False)
+    if not shared_artifacts:
+        monkeypatch.setattr(worker, "PostgresArtifactRepository", FakePostgresArtifactRepository, raising=False)
     monkeypatch.setattr(worker, "configured_runtime_registry", fake_configured_runtime_registry)
     def fake_run_service(*args: object, **kwargs: object) -> object:
         captured['run_service'] = kwargs
@@ -175,8 +193,23 @@ def test_worker_runtime_stack_uses_configured_artifacts_and_sql_approval_validat
     assert runtime_stack["mcp_backend"] is resources.runtime_mcp_service
     assert runtime_stack["plugin_backend"] is resources.runtime_plugin_service
     runtime_registry = cast(dict[str, object], captured["runtime_registry"])
-    assert captured["artifact_session_factory"] is FakeDatabase.session_factory
-    assert isinstance(runtime_registry["artifact_repository"], FakePostgresArtifactRepository)
+    repository = runtime_registry["artifact_repository"]
+    if not shared_artifacts:
+        assert captured["artifact_session_factory"] is FakeDatabase.session_factory
+        assert isinstance(repository, FakePostgresArtifactRepository)
+    else:
+        assert isinstance(repository, PostgresArtifactRepository)
+        assert repository._session_factory is FakeDatabase.session_factory
+        assert len(stack_calls) == len(stacks) == 2
+        action_call, main_call = stack_calls
+        assert action_call["artifact_repository"] is repository
+        assert main_call.get("artifact_repository") is repository
+        assert "receipt_repository" in action_call and "receipt_repository" not in main_call
+        assert runtime_registry["capability_gateway"] is stacks[1].runtime_gateway
+        assert runtime_registry["action_capability_gateway"] is stacks[0].runtime_gateway
+        assert cast(Any, runtime_registry["capability_gateway"]).artifact_repository is repository
+        assert cast(Any, runtime_registry["action_capability_gateway"]).artifact_repository is repository
+        assert cast(dict[str, object], captured["run_service"])["conversation_artifact_repository"] is repository
 
 
 def test_worker_runtime_stack_reads_tool_approval_settings_for_target_tenant(

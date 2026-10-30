@@ -371,7 +371,7 @@ def build_worker_service(
         artifact_repository=artifact_repository,
         receipt_repository=ProjectVerificationReceiptRepository(database.session_factory),
     )
-    runtime_capability_stack = capability_stack_builder()
+    runtime_capability_stack = capability_stack_builder(artifact_repository=artifact_repository)
     if isinstance(runtime_capability_stack.project_input_preparer, OriginalProjectPreparer):
         runtime_capability_stack.project_input_preparer.bind_artifact_repository(artifact_repository)
     cache_cleanup_hooks = tuple(hook for hook in (
