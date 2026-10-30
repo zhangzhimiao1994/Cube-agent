@@ -77,6 +77,12 @@ from tests.integration.runtime.test_model_review_modes_helper import (
 pytestmark = [pytest.mark.integration, pytest.mark.asyncio(loop_scope="module")]
 
 
+@pytest.fixture(autouse=True)
+def owned_crewai_storage(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Own native CrewAI state for this test, restoring the environment on exit."""
+    monkeypatch.setenv("AGENT_HUB_CREWAI_STORAGE_DIR", str(tmp_path / "crewai"))
+
+
 @pytest_asyncio.fixture(scope="module", loop_scope="module")
 async def own_redis():
     """No TCP, production Redis, Docker, persistent data or external broker."""

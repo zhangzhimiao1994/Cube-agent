@@ -2,6 +2,7 @@
 import asyncio
 import importlib.util
 import json
+from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -14,6 +15,7 @@ from alembic.operations import Operations
 from sqlalchemy import delete, func, select, text, update
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import ArgumentError, DBAPIError
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from agent_hub.auth.models import AuthenticatedPrincipal, Role
 from agent_hub.db.models import (
@@ -22,6 +24,9 @@ from agent_hub.db.models import (
     RunAdmissionPoolRow,
     RunAuthenticatedInputRow,
     RunInputAuthorizationRow,
+    RunReviewEffectRow,
+    RunReviewEventRow,
+    RunReviewIntentRow,
     RunRow,
 )
 from agent_hub.db.session import build_database
@@ -74,8 +79,16 @@ async def storage(database_url):
     finally:
         if ids:
             async with database.session_factory() as session, session.begin():
-                await session.execute(delete(RunRow).where(RunRow.id.in_(ids)))
+                await _cleanup_owned_runs(session, ids)
         await database.dispose()
+
+
+async def _cleanup_owned_runs(session: AsyncSession, ids: Sequence[UUID]) -> None:
+    """Remove only this fixture's run IDs; callers own the cleanup transaction."""
+    if ids:
+        for row in (RunReviewEventRow, RunReviewEffectRow, RunReviewIntentRow):
+            await session.execute(delete(row).where(row.run_id.in_(ids)))
+        await session.execute(delete(RunRow).where(RunRow.id.in_(ids)))
 
 
 async def prepare(storage, *, open_now=True, route=None, **limits):
