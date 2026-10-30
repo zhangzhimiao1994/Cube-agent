@@ -38,6 +38,7 @@ from agent_hub.capabilities.scoped_read import _path_parts
 from agent_hub.capabilities.types import CapabilityRequest
 from agent_hub.files.workspace import (
     _EXCLUDED_WORKSPACE_DIRECTORIES,
+    ProjectWorkspaceStore,
     _safe_workspace_path,
     project_private_entry,
 )
@@ -151,6 +152,41 @@ class TrustedReviewContextLoader:
         ):
             raise ValueError("review source unavailable")
         return _freeze_object({**source, "root_identity": identity}, name="review Root source")
+
+    def _require_source_current(self, fence: _Fence, source: Mapping[str, JsonValue]) -> None:
+        """Synchronous dispatch continuity, never an OS-atomic snapshot or grant.
+
+        Match capture_action_preparation's exact workspace manifest encoding.
+        Run only after the last policy/approval await; no later await may precede
+        backend entry. Inbound actions without a reviewed Root do not call this.
+        """
+        from agent_hub.capabilities.runtime import RuntimeCapabilityGateway
+
+        identity = self._root_identity()
+        if source["root_identity"] != identity:
+            raise ValueError("review Root changed")
+        backend = getattr(self._preparation_reader, "__self__", None)
+        if (
+            not isinstance(backend, RuntimeCapabilityGateway)
+            or backend._project_verification is None
+        ):
+            raise ValueError("review Root unavailable")
+        project = fence.context.routing_decision.get("project_id")
+        session = fence.context.routing_decision.get("workspace_session_id")
+        if not isinstance(project, str) or not isinstance(session, str):
+            raise TypeError("review scope unavailable")
+        files = ProjectWorkspaceStore(backend._project_verification.root).list_files(
+            fence.context.tenant_id, project, session
+        )
+        digest = hashlib.sha256(
+            json.dumps(
+                [(item.path, item.sha256, item.size_bytes) for item in files],
+                ensure_ascii=True,
+                separators=(",", ":"),
+            ).encode("ascii")
+        ).hexdigest()
+        if digest != source["workspace_sha256"] or self._root_identity() != identity:
+            raise ValueError("review source changed")
 
     def _effect_target(self, fence: _Fence, path: str) -> str:
         from agent_hub.capabilities.runtime import RuntimeCapabilityGateway
@@ -347,8 +383,10 @@ class ConcreteModelReviewGate:
     ) -> None:
         self.loader, self.service, self.repository = loader, service, repository
 
-    def invocation(self, *, tool_name: str, backend: object) -> _ConcreteReviewCall:
-        return _ConcreteReviewCall(self, tool_name, backend)
+    def invocation(
+        self, *, tool_name: str, backend: object, backend_getter: Callable[[], object]
+    ) -> _ConcreteReviewCall:
+        return _ConcreteReviewCall(self, tool_name, backend, backend_getter)
 
     def supports_model_review(self, tool_name: str) -> bool:
         """Semantic support only; live context/budget/config are checked per call."""
@@ -358,12 +396,20 @@ class ConcreteModelReviewGate:
 class _ConcreteReviewCall:
     """Private per-actual-invocation state, never serialized or reused by discovery."""
 
-    def __init__(self, gate: ConcreteModelReviewGate, tool_name: str, backend: object) -> None:
+    def __init__(
+        self,
+        gate: ConcreteModelReviewGate,
+        tool_name: str,
+        backend: object,
+        backend_getter: Callable[[], object],
+    ) -> None:
         self.gate, self.tool_name = gate, tool_name
         self._backend = backend
+        self._backend_getter = backend_getter
         self.policy_reader: ReviewPolicyReader | None = None
         self.exact_reader: Callable[[], Awaitable[bool]] | None = None
         self._check: Callable[[], Awaitable[bool]] | None = None
+        self._source_check: Callable[[], None] | None = None
         self._dispatched = False
         self._identity_check: Callable[[], object] | None = None
         self._budget: _RunBudgetContext | None = None
@@ -422,6 +468,7 @@ class _ConcreteReviewCall:
                 )
 
             self._check = exact_check
+            self._set_source_check(fence, source)
             return CapabilityResult(CapabilityStatus.ALLOWED, request.run_id)
         if route == "human_only":
             return await human_wait()
@@ -480,6 +527,12 @@ class _ConcreteReviewCall:
             ):
                 return denied
             self._check = model_check
+            self._set_source_check(
+                captured,
+                _freeze_object(
+                    snapshot.to_payload()["source_binding"], name="reviewed dispatch source"
+                ),
+            )
             self._budget = live.budget
             return CapabilityResult(CapabilityStatus.ALLOWED, request.run_id)
         except Exception:  # noqa: BLE001 - stale/unknown/consume failures never downgrade to legacy grants.
@@ -492,8 +545,18 @@ class _ConcreteReviewCall:
         return current.policy_sha256() == policy.policy_sha256()
 
     def _require_same_backend(self) -> None:
-        if getattr(self.gate.loader._preparation_reader, "__self__", None) is not self._backend:
+        if (
+            self._backend_getter() is not self._backend
+            or getattr(self.gate.loader._preparation_reader, "__self__", None) is not self._backend
+        ):
             raise ValueError("review Root backend mismatch")
+
+    def _set_source_check(self, fence: _Fence, source: Mapping[str, JsonValue]) -> None:
+        def check() -> None:
+            self._require_same_backend()
+            self.gate.loader._require_source_current(fence, source)
+
+        self._source_check = check
 
     async def before_dispatch(self) -> bool:
         if self._dispatched or self._check is None:
@@ -502,6 +565,10 @@ class _ConcreteReviewCall:
         try:
             _check_cancelled()
             valid = await self._check()
+            if not valid:
+                return False
+            if self._source_check is not None:
+                self._source_check()
             # Nothing asynchronous may follow these revocation checks before
             # entering the actual backend. Children share the original frame.
             _check_cancelled()

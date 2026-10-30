@@ -522,6 +522,101 @@ async def test_revocation_in_final_policy_await_cannot_execute(tmp_path):
     assert s.calls == []
 
 
+@pytest.mark.parametrize("authorization", ["model", "exact"])
+@pytest.mark.parametrize("change", ["root", "store", "source", "backend"])
+async def test_final_authorization_await_cannot_dispatch_stale_source(
+    tmp_path, authorization, change
+):
+    """Use actual Root/files/backend at the last query, after async source validation."""
+    s = setup(tmp_path)
+    store = ProjectWorkspaceStore(tmp_path)
+    store.write_bytes(
+        tenant_id=s.task.tenant_id,
+        project_id="demo",
+        session_id="session",
+        relative_path="baseline.txt",
+        data=b"before",
+        mime_type="text/plain",
+    )
+    changed_root = tmp_path / "changed-root"
+    changed_root.mkdir()
+    policy_reads = exact_reads = mutations = 0
+    original_policy = s.policy._current_review_policy
+    other = RuntimeCapabilityGateway(
+        skill_store_dir=tmp_path / "other-skills",
+        tenant_id=s.task.tenant_id,
+        project_workspace_dir=changed_root,
+        run_repository=s.runs,
+    )
+    other_execute = other.execute
+
+    async def record_other_entry(**kwargs):
+        s.calls.append(kwargs)
+        return await other_execute(**kwargs)
+
+    other.execute = record_other_entry
+
+    def mutate():
+        nonlocal mutations
+        mutations += 1
+        if change == "root":
+            # Change all real backend Root owners together; this is a genuinely
+            # different target, not just a loader-seam digest or mismatched config.
+            s.backend._project_verification.root = changed_root
+            s.backend._project_workspace_dir = changed_root
+            s.backend._project_workspace_store = ProjectWorkspaceStore(changed_root)
+        elif change == "store":
+            s.backend._project_workspace_store = ProjectWorkspaceStore(changed_root)
+        elif change == "backend":
+            s.harness._backend = other
+        else:
+            # Same name/size, different bytes: metadata-only checks are insufficient.
+            store.write_bytes(
+                tenant_id=s.task.tenant_id,
+                project_id="demo",
+                session_id="session",
+                relative_path="baseline.txt",
+                data=b"after!",
+                mime_type="text/plain",
+            )
+
+    async def policy_reader(*args):
+        nonlocal policy_reads
+        policy_reads += 1
+        result = await original_policy(*args)
+        if authorization == "model" and policy_reads == 5:
+            await asyncio.sleep(0)
+            mutate()
+        return result
+
+    async def exact_reader(_request):
+        nonlocal exact_reads
+        exact_reads += 1
+        if exact_reads == 2:
+            await asyncio.sleep(0)
+            mutate()
+        return True
+
+    s.policy._current_review_policy = policy_reader
+    if authorization == "exact":
+        s.runs.exact = True
+        s.policy._exact_human_approval_getter = exact_reader
+    result = await invoke(s)
+    assert mutations == 1
+    assert len(s.reviewer.calls) == len(s.permits.consumes) == (authorization == "model")
+    assert s.runs.waits == []  # failure must not request another grant/review.
+    if authorization == "model":
+        assert policy_reads == 5
+    else:
+        assert exact_reads == 2
+    assert s.calls == [], result  # count actual backend ENTRY, not only its final result.
+    assert result.status == "failed"
+    assert [item.path for item in store.list_files(s.task.tenant_id, "demo", "session")] == [
+        "baseline.txt"
+    ]
+    assert not ProjectWorkspaceStore(changed_root).list_files(s.task.tenant_id, "demo", "session")
+
+
 @pytest.mark.parametrize("tool,sandbox", [("unknown.command", "systemd"), ("vendor.echo", "mcp")])
 async def test_unknown_external_effect_is_human_only_even_with_broad(tmp_path, tool, sandbox):
     s = setup(tmp_path)

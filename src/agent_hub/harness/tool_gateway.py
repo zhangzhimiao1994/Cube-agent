@@ -296,7 +296,8 @@ class HarnessToolGateway:
                 tool_name=request.tool_name, arguments=request.arguments,
                 approval_required=request.approval_required, sandbox=request.sandbox,
                 idempotency_key=request.idempotency_key, call_id=request.call_id)
-            review_call = self._review_gate.invocation(tool_name=request.tool_name, backend=self._backend)
+            review_call = self._review_gate.invocation(tool_name=request.tool_name,
+                backend=self._backend, backend_getter=lambda: self._backend)
         if request.tool_name in {'project.prepare_inputs', 'project.prepare_toolchain', 'project.prepare_go_recipe'}:
             return self._failure(request, 'tool permission mapping unavailable')
         policy_mapping_failure = _builtin_policy_mapping_failure(request)
