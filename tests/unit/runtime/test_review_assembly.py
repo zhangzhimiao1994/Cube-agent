@@ -360,6 +360,163 @@ async def test_runtime_local_context_token_survives_yields_without_leaking(tmp_p
     assert local.get() == "outside"
 
 
+@pytest.mark.parametrize("mode", [TaskMode.DIRECT, TaskMode.DISPATCH])
+@pytest.mark.parametrize("advances", [0, 2])
+async def test_actual_adapter_stream_retains_one_consumer_task(tmp_path, mode, advances):
+    from agent_hub.runtime.crew.adapter import CrewDispatchRuntime, CrewRunStream
+    from agent_hub.runtime.crew.plan import AgentSpec, DispatchPlan, DispatchStep
+    from agent_hub.runtime.defaults import _gateway_for_config
+    from agent_hub.runtime.direct import DirectRunStream, DirectRuntime
+
+    f = await fixture(tmp_path, mode=mode)
+    context = f.s.task.model_copy(update={"token_budget": 20000})
+    gateway, _, _ = await _gateway_for_config(
+        f.state.platform,
+        tenant_id=f.s.task.tenant_id,
+        secret_service=f.secrets,
+        capacity_factory=f.capacity,
+        transport=f.broker._transport,
+    )
+    runtime = (
+        DirectRuntime(gateway, logical_model="primary")
+        if mode is TaskMode.DIRECT
+        else CrewDispatchRuntime(
+            gateway,
+            DispatchPlan(
+                agents=(
+                    AgentSpec(id="writer", role="Writer", goal="Reply", logical_model="primary"),
+                ),
+                steps=(
+                    DispatchStep(
+                        id="reply", agent="writer", task="Reply briefly", final_synthesizer=True
+                    ),
+                ),
+                total_token_budget=20000,
+                total_timeout_seconds=60,
+            ),
+        )
+    )
+    before = asyncio.all_tasks()
+    async with worker_runtime_events(
+        runtime, context, worker_id=f.s.budget.lease.worker_id, review_broker=f.broker
+    ) as events:
+        actual = runtime._active_stream
+        assert isinstance(actual, DirectRunStream if mode is TaskMode.DIRECT else CrewRunStream)
+        owner = None
+        for _ in range(advances):
+            await anext(events)
+            owner = owner or actual._owner
+            assert actual._owner is owner and not owner.done()
+            assert owner is not asyncio.current_task()
+        assert _run_budget.get() is None
+    assert owner is None or owner.done()
+    assert actual._closed and runtime._active_stream is None
+    assert not (asyncio.all_tasks() - before)
+
+
+async def test_worker_owner_cancellation_drains_same_task_finalizer_without_prefetch(tmp_path):
+    f = await fixture(tmp_path)
+    entered, finalizing, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    observed, counts = [], []
+    local = ContextVar("owner_local", default="outside")
+    before = asyncio.all_tasks()
+
+    class Runtime:
+        async def run(self, context):
+            token = local.set("inside")
+            owner, budget = asyncio.current_task(), _run_budget.get()
+            observed.append((owner, budget))
+            try:
+                counts.append(1)
+                yield RunEvent(
+                    kind="runtime.first",
+                    sequence=1,
+                    run_id=context.run_id,
+                    payload={"phase": "first"},
+                )
+                counts.append(2)
+                entered.set()
+                await asyncio.Event().wait()
+            finally:
+                assert asyncio.current_task() is owner and local.get() == "inside"
+                finalizing.set()
+                await release.wait()
+                assert _run_budget.get() is budget and budget._active
+                local.reset(token)
+
+    async def driver():
+        async with worker_runtime_events(
+            Runtime(), f.s.task, worker_id=f.s.budget.lease.worker_id, review_broker=f.broker
+        ) as events:
+            await anext(events)
+            await asyncio.sleep(0)
+            assert counts == [1] and local.get() == "outside" and _run_budget.get() is None
+            await anext(events)
+
+    task = asyncio.create_task(driver())
+    try:
+        try:
+            await asyncio.wait_for(entered.wait(), 3)
+        except TimeoutError:
+            if task.done():
+                await task
+            raise
+        task.cancel()
+        await asyncio.wait_for(finalizing.wait(), 3)
+        task.cancel()  # Must not re-cancel/abandon the owner's awaited finalizer.
+        await asyncio.sleep(0)
+        assert not task.done()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        owner, budget = observed[0]
+        assert owner.done() and not budget._active and local.get() == "outside"
+        assert not (asyncio.all_tasks() - before)
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.parametrize("phase", ["construct", "advance", "finalize"])
+async def test_worker_scope_failure_closes_and_revokes_without_background_task(tmp_path, phase):
+    f = await fixture(tmp_path)
+    seen = []
+    before = asyncio.all_tasks()
+
+    class Runtime:
+        def run(self, context):
+            seen.append(_run_budget.get())
+            if phase == "construct":
+                raise ValueError("construct")
+
+            async def events():
+                try:
+                    if phase == "advance":
+                        raise ValueError("advance")
+                    yield RunEvent(
+                        kind="runtime.first",
+                        sequence=1,
+                        run_id=context.run_id,
+                        payload={"phase": "first"},
+                    )
+                finally:
+                    assert _run_budget.get() is seen[0] and seen[0]._active
+                    if phase == "finalize":
+                        raise ValueError("finalize")
+
+            return events()
+
+    with pytest.raises(ValueError, match=phase):
+        async with worker_runtime_events(
+            Runtime(), f.s.task, worker_id=f.s.budget.lease.worker_id, review_broker=f.broker
+        ) as events:
+            await anext(events)
+    assert not seen[0]._active and _run_budget.get() is None
+    assert not (asyncio.all_tasks() - before)
+
+
 def evidence_document(f):
     a = assembly()
     return {

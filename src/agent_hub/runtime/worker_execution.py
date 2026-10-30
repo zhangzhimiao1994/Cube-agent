@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Awaitable
+from collections.abc import AsyncIterator
 from contextlib import ExitStack, asynccontextmanager, nullcontext
 from contextvars import Context, copy_context
 from typing import TYPE_CHECKING
@@ -15,31 +15,100 @@ from agent_hub.runtime.streams import closing_runtime_events
 if TYPE_CHECKING:
     from agent_hub.runtime.review_assembly import ReviewAssemblyBroker
 
-async def _in_context[T](context: Context, awaitable: Awaitable[T]) -> T:
-    async def receive() -> T:
-        return await awaitable
-    # Sequential advancements reuse the EXACT Context: runtime-owned tokens
-    # spanning yields must be reset in their creation Context at finalization.
-    return await asyncio.create_task(receive(), context=context)
 
+@asynccontextmanager
+async def _scoped_events(
+    stream: AsyncIterator[RunEvent],
+    scope: Context,
+) -> AsyncIterator[AsyncIterator[RunEvent]]:
+    # One demand produces one advancement. Actual adapter streams bind their
+    # consumer Task as well as Context; neither may change between yields.
+    type Reply = tuple[RunEvent | None, BaseException | None]
+    requests: asyncio.Queue[asyncio.Future[Reply] | None] = asyncio.Queue(maxsize=1)
+    pending: asyncio.Future[Reply] | None = None
+    advancing = False
 
-async def _scoped_events(stream: AsyncIterator[RunEvent], scope: Context) -> AsyncIterator[RunEvent]:
-    try:
-        while True:
+    async def consume() -> None:
+        nonlocal advancing
+        try:
+            while True:
+                reply = await requests.get()
+                if reply is None:
+                    return
+                if reply.cancelled():
+                    continue
+                try:
+                    advancing = True
+                    event = await anext(stream)
+                except BaseException as error:  # noqa: BLE001 - transfer iterator/cancellation outcome unchanged.
+                    if not reply.done():
+                        reply.set_result((None, error))
+                    return
+                finally:
+                    advancing = False
+                if not reply.done():
+                    reply.set_result((event, None))
+        finally:
             try:
-                event = await _in_context(scope, anext(stream))
-            except StopAsyncIteration:
+                close = getattr(stream, "aclose", None)
+                if callable(close):
+                    await close()
+            finally:
+                if pending is not None and not pending.done():
+                    pending.set_result((None, StopAsyncIteration()))
+
+    owner = asyncio.create_task(consume(), context=scope, name="worker-runtime-owner")
+
+    async def events() -> AsyncIterator[RunEvent]:
+        nonlocal pending
+        while True:
+            if owner.done():
+                owner.result()
                 return
+            pending = asyncio.get_running_loop().create_future()
+            requests.put_nowait(pending)
+            event, error = await pending
+            if isinstance(error, StopAsyncIteration):
+                return
+            if error is not None:
+                raise error
+            assert event is not None
             yield event
+
+    try:
+        async with closing_runtime_events(events()) as forwarding:
+            yield forwarding
     finally:
-        close = getattr(stream, "aclose", None)
-        if callable(close):
-            await _in_context(scope, close())
+        # Cancel the owner at most once, then drain its same-Task finalizer.
+        # Repeated caller cancellation must not abandon privileged cleanup.
+        caller = asyncio.current_task()
+        cancellations = 0 if caller is None else caller.cancelling()
+        if not owner.done():
+            if advancing:
+                owner.cancel()
+            else:
+                # Even an unstarted owner must close an eagerly created stream.
+                # Dropping an unprocessed demand never advances/prefetches it.
+                if not requests.empty():
+                    requests.get_nowait()
+                requests.put_nowait(None)
+        while not owner.done():
+            try:
+                await asyncio.shield(owner)
+            except asyncio.CancelledError:
+                pass
+        if not owner.cancelled():
+            owner.result()
+        if caller is not None and caller.cancelling() > cancellations:
+            raise asyncio.CancelledError
 
 
 @asynccontextmanager
 async def worker_runtime_events(
-    runtime: ExecutionRuntime, context: TaskContext, *, worker_id: str | None = None,
+    runtime: ExecutionRuntime,
+    context: TaskContext,
+    *,
+    worker_id: str | None = None,
     review_broker: ReviewAssemblyBroker | None = None,
 ) -> AsyncIterator[AsyncIterator[RunEvent]]:
     """Use only the driver's context; legacy streams acquire no verification identity."""
@@ -49,16 +118,26 @@ async def worker_runtime_events(
     from agent_hub.runtime.review_assembly import ReviewAssemblyUnavailable, _execution
 
     # Private DB locators/leases are not model context or continuation payloads.
-    private = {'project_verification_receipt', 'approval_checkpoint_worker_token'}
+    private = {"project_verification_receipt", "approval_checkpoint_worker_token"}
     if private.intersection(context.routing_decision):
-        context = context.model_copy(update={'routing_decision': _freeze_object(
-            {key: value for key, value in context.routing_decision.items() if key not in private},
-            name='runtime-visible routing',
-        )})
+        context = context.model_copy(
+            update={
+                "routing_decision": _freeze_object(
+                    {
+                        key: value
+                        for key, value in context.routing_decision.items()
+                        if key not in private
+                    },
+                    name="runtime-visible routing",
+                )
+            }
+        )
     binding = (
         bind_execution_authority(context, worker_id=worker_id)
-        if worker_id is not None and context.execution_token is not None
-        and context.actor_id is not None and context.actor_role is not None
+        if worker_id is not None
+        and context.execution_token is not None
+        and context.actor_id is not None
+        and context.actor_role is not None
         and context.actor_role is not Role.VIEWER
         else nullcontext()
     )
@@ -66,10 +145,21 @@ async def worker_runtime_events(
     owns_budget = execution is None
     if execution is not None:
         original = execution.budget
-        if ((context.tenant_id, context.run_id, context.execution_token, worker_id,
-             context.actor_id, context.actor_role) !=
-                (original.tenant_id, original.run_id, original.lease.token, original.lease.worker_id,
-                 original.evidence.actor_id, original.evidence.actor_role)):
+        if (
+            context.tenant_id,
+            context.run_id,
+            context.execution_token,
+            worker_id,
+            context.actor_id,
+            context.actor_role,
+        ) != (
+            original.tenant_id,
+            original.run_id,
+            original.lease.token,
+            original.lease.worker_id,
+            original.evidence.actor_id,
+            original.evidence.actor_role,
+        ):
             raise ReviewAssemblyUnavailable("derived_run_pool_continuity_unsupported")
         original.check()
     elif review_broker is not None and worker_id is not None:
@@ -91,7 +181,7 @@ async def worker_runtime_events(
 
         try:
             stream = scope.run(enter)
-            async with closing_runtime_events(_scoped_events(stream, scope)) as events:
+            async with _scoped_events(stream, scope) as events:
                 yield events
         finally:
             scope.run(stack.close)
