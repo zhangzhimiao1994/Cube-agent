@@ -3,7 +3,8 @@ import json
 import logging
 import re
 import socket
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Mapping, Sequence
+from contextlib import suppress
 from typing import Any, Protocol, cast
 from urllib.parse import urlsplit, urlunsplit
 
@@ -20,6 +21,14 @@ from openai import (
 from agent_hub.models import provider_diagnostics
 from agent_hub.models.failure_receipt import _valid_usage
 from agent_hub.models.native_messages import NativeAssistantMessage, NativeToolCall
+from agent_hub.models.physical_admission import (
+    _bind_physical_call,
+    _capture_physical_call,
+    _current_physical_call,
+    _GuardedTransport,
+    _PhysicalAdmissionStopped,
+    _PhysicalCall,
+)
 from agent_hub.models.provider_diagnostics import (
     ProviderDiagnostic,
     RequestShape,
@@ -230,6 +239,42 @@ class _NegotiatedOutcome:
         self.outcome = outcome
 
 
+async def _record_physical_outcome(outcome: object) -> None:
+    call = _current_physical_call()
+    if call is None:
+        return
+    received = outcome.outcome if isinstance(outcome, _NegotiatedOutcome) else outcome
+    if isinstance(received, _CancelledOutcome):
+        receipt = received.receipt
+        if isinstance(receipt, ModelResponse | RejectedOutputEvidence):
+            call.observe_usage(receipt.usage)
+        await call.finish("cancelled")
+    elif isinstance(received, ModelResponse):
+        call.observe_usage(received.usage)
+        await call.finish("completed")
+    elif isinstance(received, ModelResponseError):
+        if received.evidence is not None:
+            call.observe_usage(received.evidence.usage,
+                               invalid=received.evidence.usage_status == "invalid")
+        await call.finish("invalid" if received.evidence is None else "rejected")
+    else:
+        await call.finish("error")
+
+
+async def _try_record_physical_outcome(
+    outcome: object,
+) -> _PhysicalAdmissionStopped | _CancelledOutcome | None:
+    """Keep cleanup reachable, with the received primary error taking priority."""
+    try:
+        await _record_physical_outcome(outcome)
+    except _PhysicalAdmissionStopped as error:
+        if isinstance(outcome, ModelResponse):
+            return error
+    except asyncio.CancelledError:
+        return _cancelled_outcome(outcome)
+    return None
+
+
 def _cancelled_outcome(outcome: object) -> _CancelledOutcome:
     if isinstance(outcome, ModelResponse):
         return _CancelledOutcome(outcome)
@@ -243,6 +288,9 @@ def _cancelled_outcome(outcome: object) -> _CancelledOutcome:
 async def _close_received_client(
     close: Callable[[], Awaitable[None]], timeout: float,
 ) -> BaseException | None:
+    call = _current_physical_call()
+    if call is not None:
+        timeout = min(timeout, max(0.0, call.scope.deadline - asyncio.get_running_loop().time()))
     async def bounded_close() -> None:
         async with asyncio.timeout(min(2.0, timeout)):
             await close()
@@ -644,8 +692,16 @@ def safe_model_client_error(
     error: Exception,
     sensitive_values: Sequence[str],
     *, request_shape: RequestShape | None = None, prior_diagnostic: ProviderDiagnostic | None = None,
-) -> ModelTransportError | ModelClientError:
+) -> ModelTransportError | ModelClientError | _PhysicalAdmissionStopped:
     """Classify provider failures without retaining raw exception text or context."""
+    cause: BaseException | None = error
+    seen: set[int] = set()
+    while cause is not None and id(cause) not in seen:
+        if isinstance(cause, _PhysicalAdmissionStopped):
+            # Preserve the trusted control class, not the SDK traceback/body.
+            return _PhysicalAdmissionStopped()
+        seen.add(id(cause))
+        cause = cause.__cause__
     diagnostic = _capture_provider_diagnostic(error, request_shape, prior_diagnostic)
     if type(error) is ModelNegotiatedClientError:
         return ModelNegotiatedClientError("model client internal failure")
@@ -688,6 +744,14 @@ def safe_model_client_error(
 async def _close_ignoring_failures(client: _OpenAIClient | None) -> bool:
     if client is None:
         return False
+    call = _current_physical_call()
+    if call is not None:
+        task = asyncio.current_task()
+        await _try_record_physical_outcome(
+            _CANCELLED if task is not None and task.cancelling() else ModelClientError("model failed"),
+        )
+        close_error = await _close_received_client(client.close, 2.0)
+        return isinstance(close_error, asyncio.CancelledError)
     try:
         await client.close()
     except asyncio.CancelledError:
@@ -739,12 +803,14 @@ class _OpenAICompatibleChunkStream:
         sensitive_values: Sequence[str],
         timeout: float,
         request_shape: list[RequestShape | None] | None = None,
+        physical_call: _PhysicalCall | None = None,
     ) -> None:
         self._start: Callable[[], Awaitable[tuple[_OpenAIClient, object]]] | None = start
         self._deployment_id = deployment_id
         self._sensitive_values = tuple(sensitive_values)
         self._timeout = timeout
         self._request_shape = request_shape
+        self._physical_call = physical_call
         self._deadline: float | None = None
         self._client: _OpenAIClient | None = None
         self._iterator: AsyncIterator[object] | None = None
@@ -756,6 +822,30 @@ class _OpenAICompatibleChunkStream:
         return self
 
     async def __anext__(self) -> object:
+        call = self._physical_call
+        with _bind_physical_call(call):
+            if call is None:
+                return await self._next()
+            try:
+                call.scope.check()
+                async with asyncio.timeout_at(call.scope.deadline):
+                    return await self._next()
+            except (_PhysicalAdmissionStopped, TimeoutError):
+                call.scope.stop()
+                with suppress(_PhysicalAdmissionStopped, asyncio.CancelledError):
+                    await call.finish("error")
+                await self._close_client_ignoring_failure()
+                raise call.scope.stop() from None
+            except asyncio.CancelledError:
+                # Cancellation may already be pending at entry, before _next
+                # has a chance to run its read/start cancellation handler.
+                call.scope.stop()
+                with suppress(_PhysicalAdmissionStopped, asyncio.CancelledError):
+                    await call.finish("cancelled")
+                await self._close_client_ignoring_failure()
+                raise
+
+    async def _next(self) -> object:
         if self._closed:
             raise StopAsyncIteration
         if self._deadline is None:
@@ -777,10 +867,23 @@ class _OpenAICompatibleChunkStream:
                 self._iterator = _async_chunks(stream).__aiter__()
             if self._response_body is not None:
                 self._response_body.automatic_cleanup = True
-            return await self._iterator.__anext__()
+            chunk = await self._iterator.__anext__()
+            if self._physical_call is not None:
+                raw_usage = _attribute(chunk, "usage")
+                try:
+                    usage = _parse_usage(raw_usage, self._deployment_id)
+                except ModelResponseError:
+                    self._physical_call.observe_usage(None, invalid=True)
+                    raise
+                self._physical_call.observe_usage(usage)
+            return chunk
         except StopAsyncIteration:
             exhausted = True
         except asyncio.CancelledError:
+            if self._physical_call is not None:
+                self._physical_call.scope.stop()
+                with suppress(_PhysicalAdmissionStopped, asyncio.CancelledError):
+                    await self._physical_call.finish("cancelled")
             if await self._close_client_ignoring_failure():
                 raise
             raise
@@ -795,11 +898,19 @@ class _OpenAICompatibleChunkStream:
             if self._response_body is not None:
                 self._response_body.automatic_cleanup = False
         if exhausted:
+            if self._physical_call is not None:
+                await self._physical_call.finish("completed")
             try:
                 await self.aclose()
             except Exception as error:  # noqa: BLE001 - EOF cleanup preserves received chunks
                 _LOGGER.warning("litellm_stream_eof_cleanup_failed error_type=%s", type(error).__name__)
             raise StopAsyncIteration
+        if self._physical_call is not None:
+            try:
+                await self._physical_call.finish("invalid" if isinstance(safe_error, ModelResponseError)
+                                                  else "error")
+            except _PhysicalAdmissionStopped:
+                pass
         if await self._close_client_ignoring_failure():
             raise asyncio.CancelledError
         raise safe_error from None
@@ -807,8 +918,13 @@ class _OpenAICompatibleChunkStream:
     async def aclose(self) -> None:
         if self._closed:
             return
-        close_failure: ModelTransportError | ModelClientError | asyncio.CancelledError | None = None
+        close_failure: ModelTransportError | ModelClientError | _PhysicalAdmissionStopped | asyncio.CancelledError | None = None
         try:
+            if self._physical_call is not None:
+                try:
+                    await self._physical_call.finish("cancelled")
+                except (_PhysicalAdmissionStopped, asyncio.CancelledError) as error:
+                    close_failure = error
             closers: list[Callable[[], Awaitable[None]]] = []
             if self._iterator is not None:
                 closers.append(cast(Any, self._iterator).aclose)
@@ -839,6 +955,9 @@ class _OpenAICompatibleChunkStream:
         remaining = self._timeout if self._deadline is None else max(
             0.0, self._deadline - asyncio.get_running_loop().time(),
         )
+        if self._physical_call is not None:
+            remaining = min(remaining, max(0.0, self._physical_call.scope.deadline
+                                           - asyncio.get_running_loop().time()))
         # Leave time to deliver buffered tool events and settle the gateway lease.
         return min(2.0, remaining / 2)
 
@@ -881,14 +1000,90 @@ class LiteLLMClient:
         self,
         client_factory: OpenAIClientFactory | None = None,
         http_client_factory: HTTPClientFactory | None = None,
+        *,
+        _network_delegate_factory: Callable[[], httpx.AsyncBaseTransport] | None = None,
     ) -> None:
+        self._custom_client_factory = client_factory is not None
+        self._custom_http_factory = http_client_factory is not None
+        self._network_delegate_factory = _network_delegate_factory
         self._client_factory = client_factory or cast(OpenAIClientFactory, AsyncOpenAI)
         self._http_client_factory = http_client_factory or cast(
             HTTPClientFactory,
             httpx.AsyncClient,
         )
 
-    async def complete(
+    def _new_http_client(self, *, timeout: float) -> _HTTPClient:
+        call = _current_physical_call()
+        if call is not None and self._custom_http_factory:
+            raise call.scope.stop()
+        if call is None and self._network_delegate_factory is None:
+            return self._http_client_factory(timeout=timeout)
+        delegate = (httpx.AsyncHTTPTransport(retries=0) if self._network_delegate_factory is None
+                    else self._network_delegate_factory())
+        return cast(_HTTPClient, httpx.AsyncClient(
+            timeout=timeout, follow_redirects=False, trust_env=False,
+            transport=delegate if call is None else _GuardedTransport(delegate, call),
+        ))
+
+    def _new_openai_client(
+        self, *, api_key: str, base_url: str, max_retries: int,
+    ) -> _OpenAIClient:
+        call = _current_physical_call()
+        if call is not None and self._custom_client_factory:
+            raise call.scope.stop()
+        if call is None and self._network_delegate_factory is None:
+            return self._client_factory(api_key=api_key, base_url=base_url, max_retries=max_retries)
+        delegate = (httpx.AsyncHTTPTransport(retries=0) if self._network_delegate_factory is None
+                    else self._network_delegate_factory())
+        http_client = httpx.AsyncClient(
+            follow_redirects=False, trust_env=False,
+            transport=delegate if call is None else _GuardedTransport(delegate, call),
+        )
+        return cast(_OpenAIClient, AsyncOpenAI(
+            api_key=api_key, base_url=base_url, max_retries=0, http_client=http_client,
+        ))
+
+    def complete(
+        self, deployment: Deployment, request: ModelRequest, api_key: str,
+    ) -> Coroutine[Any, Any, ModelResponse]:
+        # Capture now, even if the returned coroutine is awaited outside the scope.
+        call = _capture_physical_call(
+            deployment=deployment,
+            protocol="messages" if _is_messages_endpoint(deployment.api_base) else (
+                "responses" if request.response_schema is not None
+                and deployment.structured_output_api == "responses" else "chat_completions"
+            ), stream=False,
+        )
+        return self._complete_captured(deployment, request, api_key, call)
+
+    async def _complete_captured(
+        self, deployment: Deployment, request: ModelRequest, api_key: str,
+        call: _PhysicalCall | None,
+    ) -> ModelResponse:
+        with _bind_physical_call(call):
+            try:
+                if call is None:
+                    return await self._complete(deployment, request, api_key)
+                call.scope.check()
+                async with asyncio.timeout_at(call.scope.deadline):
+                    return await self._complete(deployment, request, api_key)
+            except (Exception, asyncio.CancelledError) as error:
+                if call is not None:
+                    if isinstance(error, asyncio.CancelledError | TimeoutError):
+                        call.scope.stop()
+                    with suppress(_PhysicalAdmissionStopped, asyncio.CancelledError):
+                        await _record_physical_outcome(
+                            _CANCELLED if isinstance(error, asyncio.CancelledError) else error,
+                        )
+                if call is not None and isinstance(error, TimeoutError):
+                    raise call.scope.stop() from None
+                raise
+            finally:
+                # This wrapper adds a traceback frame around the original safe
+                # boundary; it must obey the same secret/request erasure rule.
+                del deployment, request, api_key
+
+    async def _complete(
         self,
         deployment: Deployment,
         request: ModelRequest,
@@ -945,12 +1140,17 @@ class LiteLLMClient:
             raise ValueError("structured Responses streaming is not supported")
         sensitive_values = _sensitive_values(request, api_key)
         shape: list[RequestShape | None] = [None]
+        call = _capture_physical_call(
+            deployment=deployment,
+            protocol="chat_completions", stream=True,
+        )
         return _OpenAICompatibleChunkStream(
             lambda: self._start_stream(deployment, request, api_key, sensitive_values, shape),
             deployment_id=deployment.id,
             sensitive_values=sensitive_values,
             timeout=request.timeout_seconds,
             request_shape=shape,
+            physical_call=call,
         )
 
     async def _complete_outcome(
@@ -973,11 +1173,11 @@ class LiteLLMClient:
         parsed: ModelResponse | None = None
         create_kwargs: dict[str, object] | None = None
         response: object | None = None
-        safe_failure: ModelTransportError | ModelClientError | None = None
+        safe_failure: ModelTransportError | ModelClientError | _PhysicalAdmissionStopped | None = None
         negotiated = False
         shape: RequestShape | None = None
         try:
-            client = self._client_factory(
+            client = self._new_openai_client(
                 api_key=api_key,
                 base_url=deployment.api_base,
                 max_retries=0,
@@ -1053,7 +1253,7 @@ class LiteLLMClient:
             ):
                 if await _close_ignoring_failures(client):
                     return _CANCELLED
-                client = self._client_factory(
+                client = self._new_openai_client(
                     api_key=api_key,
                     base_url=cast(str, _api_base_with_v1(deployment.api_base)),
                     max_retries=0,
@@ -1080,21 +1280,25 @@ class LiteLLMClient:
                 safe_failure = safe_model_client_error(deployment.id, error, sensitive_values, request_shape=shape)
 
         if safe_failure is not None:
+            receipt_failure = await _try_record_physical_outcome(safe_failure)
             if client is not None:
                 close_error = await _close_received_client(client.close, request.timeout_seconds)
                 if isinstance(close_error, asyncio.CancelledError):
                     cancelled_failure = _cancelled_outcome(safe_failure)
                     return _NegotiatedOutcome(cancelled_failure) if negotiated else cancelled_failure
-            return _NegotiatedOutcome(safe_failure) if negotiated else safe_failure
+            failure = receipt_failure or safe_failure
+            return _NegotiatedOutcome(failure) if negotiated else failure
         if client is None or parsed is None:  # pragma: no cover - defensive invariant
             return ModelClientError("model client internal failure")
 
+        receipt_failure = await _try_record_physical_outcome(parsed)
         close_error = await _close_received_client(client.close, request.timeout_seconds)
         if isinstance(close_error, asyncio.CancelledError):
             cancelled_response = _cancelled_outcome(parsed)
             return _NegotiatedOutcome(cancelled_response) if negotiated else cancelled_response
         # Cleanup failure cannot discard an already received response or its usage.
-        return _NegotiatedOutcome(parsed) if negotiated else parsed
+        received = receipt_failure or parsed
+        return _NegotiatedOutcome(received) if negotiated else received
 
     async def _responses_outcome(
         self,
@@ -1112,7 +1316,7 @@ class LiteLLMClient:
         outcome: ModelResponse | Exception | _CancelledOutcome
         try:
             async with asyncio.timeout(request.timeout_seconds):
-                client = self._client_factory(
+                client = self._new_openai_client(
                     api_key=api_key,
                     base_url=deployment.api_base,
                     max_retries=0,
@@ -1125,6 +1329,7 @@ class LiteLLMClient:
             outcome = ModelResponseError("model response rejected", evidence=error.evidence)
         except Exception as error:  # noqa: BLE001 - preserve the safe transport boundary
             outcome = safe_model_client_error(deployment.id, error, sensitive_values, request_shape=shape)
+        outcome = await _try_record_physical_outcome(outcome) or outcome
         if client is not None:
             close_error = await _close_received_client(client.close, request.timeout_seconds)
             if isinstance(close_error, asyncio.CancelledError):
@@ -1139,7 +1344,7 @@ class LiteLLMClient:
         sensitive_values: Sequence[str],
         shape_sink: list[RequestShape | None] | None = None,
     ) -> tuple[_OpenAIClient, object]:
-        client = self._client_factory(
+        client = self._new_openai_client(
             api_key=api_key,
             base_url=deployment.api_base,
             max_retries=0,
@@ -1180,7 +1385,7 @@ class LiteLLMClient:
             if _should_retry_root_base_with_v1(error, deployment.api_base):
                 if await _close_ignoring_failures(client):
                     raise asyncio.CancelledError
-                client = self._client_factory(
+                client = self._new_openai_client(
                     api_key=api_key,
                     base_url=cast(str, _api_base_with_v1(deployment.api_base)),
                     max_retries=0,
@@ -1216,7 +1421,7 @@ class LiteLLMClient:
         api_key: str,
     ) -> ModelResponse | Exception | _CancelledOutcome:
         sensitive_values = _sensitive_values(request, api_key)
-        client = self._http_client_factory(timeout=request.timeout_seconds)
+        client = self._new_http_client(timeout=request.timeout_seconds)
         outcome: ModelResponse | Exception | _CancelledOutcome
         wire_payload = _messages_endpoint_payload(deployment, request)
         shape = _request_shape(wire_payload, "messages", 1, request)
@@ -1255,6 +1460,7 @@ class LiteLLMClient:
             outcome = _safe_response_error(error)
         except Exception as error:  # noqa: BLE001 - redact direct HTTP/provider failures
             outcome = safe_model_client_error(deployment.id, error, sensitive_values, request_shape=shape)
+        outcome = await _try_record_physical_outcome(outcome) or outcome
         close_error = await _close_received_client(client.aclose, request.timeout_seconds)
         if isinstance(close_error, asyncio.CancelledError):
             return _cancelled_outcome(outcome)
@@ -1329,7 +1535,15 @@ def _parse_messages_endpoint_response(
 ) -> ModelResponse:
     if not isinstance(payload, Mapping):
         raise ModelResponseError(f"malformed messages response for deployment {deployment_id!r}")
-    usage = _messages_endpoint_usage(payload.get("usage"))
+    call = _current_physical_call()
+    try:
+        usage = _messages_endpoint_usage(payload.get("usage"))
+    except ModelResponseError:
+        if call is not None:
+            call.observe_usage(None, invalid=True)
+        raise
+    if call is not None:
+        call.observe_usage(usage, invalid=usage is None and payload.get("usage") is not None)
     stop_reason = payload.get("stop_reason")
     if stop_reason in ("refusal", "max_tokens", "model_context_window_exceeded"):
         raise ModelResponseError(
