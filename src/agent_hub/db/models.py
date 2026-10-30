@@ -1,4 +1,5 @@
 from datetime import datetime
+from decimal import Decimal
 from uuid import UUID, uuid4
 
 from sqlalchemy import (
@@ -10,6 +11,7 @@ from sqlalchemy import (
     ForeignKeyConstraint,
     Index,
     Integer,
+    Numeric,
     String,
     Text,
     UniqueConstraint,
@@ -298,6 +300,119 @@ class RunInputAuthorizationRow(Base):
         ForeignKey("agent_hub_runs.id", ondelete="CASCADE"), primary_key=True)
     tenant_id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), nullable=False)
     turn_id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), nullable=False)
+
+
+class RunAdmissionPoolRow(Base):
+    """Immutable original limits plus transactional spent/held materializations."""
+
+    __tablename__ = "agent_hub_run_admission_pools"
+    __table_args__ = (
+        UniqueConstraint("run_id", "tenant_id", name="uq_admission_pool_owner"),
+        ForeignKeyConstraint(
+            ["authorization_turn_id", "tenant_id", "run_id"],
+            ["agent_hub_authenticated_inputs.turn_id", "agent_hub_authenticated_inputs.tenant_id",
+             "agent_hub_authenticated_inputs.run_id"], name="fk_admission_pool_original"),
+        CheckConstraint("original_token_grant BETWEEN 1 AND 10000000 AND "
+                        "review_token_limit BETWEEN 1 AND original_token_grant AND "
+                        "review_count_limit > 0", name="ck_admission_pool_limits"),
+        CheckConstraint("token_charged BETWEEN 0 AND original_token_grant AND "
+                        "review_token_charged BETWEEN 0 AND review_token_limit AND "
+                        "review_token_charged <= token_charged AND "
+                        "review_count_charged BETWEEN 0 AND review_count_limit AND "
+                        "review_cost_limit BETWEEN 0 AND 1000000 AND "
+                        "review_cost_charged BETWEEN 0 AND review_cost_limit",
+                        name="ck_admission_pool_charges"),
+        CheckConstraint("config_sha256 ~ '^[0-9a-f]{64}$' AND "
+                        "message_sha256 ~ '^[0-9a-f]{64}$' AND "
+                        "scope_sha256 ~ '^[0-9a-f]{64}$'", name="ck_admission_pool_digests"),
+    )
+
+    run_id: Mapped[UUID] = mapped_column(ForeignKey("agent_hub_runs.id", ondelete="CASCADE"),
+                                       primary_key=True)
+    tenant_id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True))
+    authorization_turn_id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True))
+    actor_id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True))
+    actor_role: Mapped[str] = mapped_column(String(32))
+    message_sha256: Mapped[str] = mapped_column(String(64))
+    scope_sha256: Mapped[str] = mapped_column(String(64))
+    config_sha256: Mapped[str] = mapped_column(String(64))
+    original_token_grant: Mapped[int] = mapped_column(BigInteger)
+    original_deadline: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    review_token_limit: Mapped[int] = mapped_column(BigInteger)
+    review_count_limit: Mapped[int] = mapped_column(BigInteger)
+    review_cost_limit: Mapped[Decimal] = mapped_column(Numeric(13, 6))
+    token_charged: Mapped[int] = mapped_column(BigInteger)
+    review_token_charged: Mapped[int] = mapped_column(BigInteger)
+    review_count_charged: Mapped[int] = mapped_column(BigInteger)
+    review_cost_charged: Mapped[Decimal] = mapped_column(Numeric(13, 6))
+    closed: Mapped[bool] = mapped_column(Boolean)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class RunAdmissionAttemptRow(Base):
+    __tablename__ = "agent_hub_run_admission_attempts"
+    __table_args__ = (
+        ForeignKeyConstraint(["run_id", "tenant_id"],
+            ["agent_hub_run_admission_pools.run_id", "agent_hub_run_admission_pools.tenant_id"],
+            name="fk_admission_attempt_pool", ondelete="CASCADE"),
+        UniqueConstraint("attempt_id", "run_id", "tenant_id", name="uq_admission_attempt_owner"),
+        UniqueConstraint("physical_transport_id", name="uq_admission_physical_transport"),
+        CheckConstraint("purpose IN ('primary', 'review')", name="ck_admission_attempt_purpose"),
+        CheckConstraint("state IN ('prepared', 'issued', 'completed', 'cancelled', 'unknown', "
+                        "'invalid')", name="ck_admission_attempt_state"),
+        CheckConstraint("token_hold BETWEEN 1 AND 10000000 AND "
+                        "((purpose = 'primary' AND review_cost_hold IS NULL) OR "
+                        "(purpose = 'review' AND review_cost_hold BETWEEN 0 AND 1000000))",
+                        name="ck_admission_attempt_hold"),
+        CheckConstraint("request_sha256 ~ '^[0-9a-f]{64}$' AND "
+                        "(receipt_sha256 IS NULL OR receipt_sha256 ~ '^[0-9a-f]{64}$')",
+                        name="ck_admission_attempt_digests"),
+        Index("ix_admission_attempt_run", "tenant_id", "run_id"),
+    )
+
+    attempt_id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), primary_key=True)
+    run_id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True))
+    tenant_id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True))
+    purpose: Mapped[str] = mapped_column(String(16))
+    state: Mapped[str] = mapped_column(String(16))
+    request_sha256: Mapped[str] = mapped_column(String(64))
+    deployment: Mapped[dict[str, object]] = mapped_column(JSONB)
+    worker_id: Mapped[str] = mapped_column(String(128))
+    worker_lease_token: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True))
+    token_hold: Mapped[int] = mapped_column(BigInteger)
+    review_cost_hold: Mapped[Decimal | None] = mapped_column(Numeric(13, 6), nullable=True)
+    physical_transport_id: Mapped[UUID | None] = mapped_column(PostgreSQLUUID(as_uuid=True),
+                                                             nullable=True)
+    receipt_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    receipt: Mapped[dict[str, object] | None] = mapped_column(JSONB, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class RunAdmissionEventRow(Base):
+    """Repository only INSERTs these private audit events; no terminal replacement."""
+
+    __tablename__ = "agent_hub_run_admission_events"
+    __table_args__ = (
+        ForeignKeyConstraint(["run_id", "tenant_id"],
+            ["agent_hub_run_admission_pools.run_id", "agent_hub_run_admission_pools.tenant_id"],
+            name="fk_admission_event_pool", ondelete="CASCADE"),
+        ForeignKeyConstraint(["attempt_id", "run_id", "tenant_id"],
+            ["agent_hub_run_admission_attempts.attempt_id", "agent_hub_run_admission_attempts.run_id",
+             "agent_hub_run_admission_attempts.tenant_id"], name="fk_admission_event_attempt",
+             ondelete="CASCADE"),
+        UniqueConstraint("run_id", "attempt_id", "kind", name="uq_admission_event_transition"),
+        CheckConstraint("kind IN ('opened', 'prepared', 'issued', 'completed', 'cancelled', "
+                        "'unknown', 'invalid')", name="ck_admission_event_kind"),
+        Index("ix_admission_event_run", "tenant_id", "run_id"),
+    )
+
+    id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), primary_key=True, default=uuid4)
+    run_id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True))
+    tenant_id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True))
+    attempt_id: Mapped[UUID | None] = mapped_column(PostgreSQLUUID(as_uuid=True), nullable=True)
+    kind: Mapped[str] = mapped_column(String(16))
+    evidence: Mapped[dict[str, object]] = mapped_column(JSONB)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 class ConversationQueueItemRow(Base):

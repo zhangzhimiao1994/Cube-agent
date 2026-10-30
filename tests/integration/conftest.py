@@ -15,6 +15,9 @@ from agent_hub.db.models import (
     ConversationQueueItemRow,
     ConversationRow,
     ProjectWorkspaceRow,
+    RunAdmissionAttemptRow,
+    RunAdmissionEventRow,
+    RunAdmissionPoolRow,
     RunApprovalRow,
     RunArtifactRow,
     RunAuthenticatedInputRow,
@@ -155,6 +158,9 @@ async def _clean_database(
 
 async def _delete_run_rows(session: AsyncSession) -> None:
     for table in (
+        RunAdmissionEventRow,
+        RunAdmissionAttemptRow,
+        RunAdmissionPoolRow,
         RunInputAuthorizationRow,
         RunAuthenticatedInputRow,
         RunOutboxRow,
