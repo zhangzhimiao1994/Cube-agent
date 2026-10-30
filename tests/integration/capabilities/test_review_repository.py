@@ -670,3 +670,49 @@ async def test_error_usage_observation_never_refunds_unproven_issue(ctx, outcome
     assert result.status == outcome
     pool = await RunAdmissionRepository(ctx.factory).get_pool(ctx.tenant, ctx.run)
     assert (pool.token_charged, pool.review_cost_charged) == (30, Decimal("0.2"))
+
+
+async def test_begin_freezes_configuration_and_reservation_before_lock_wait(ctx):
+    from sqlalchemy import text
+
+    c = replace(ctx.config)
+    r = _ReviewReservation(
+        "e" * 64,
+        DeploymentIdentity("synthetic", "dedicated-review", "review-model"),
+        30,
+        Decimal("0.2"),
+        _WorkerLease("synthetic-worker", ctx.reservation.lease.token),
+    )
+    original_config_sha = review_config_sha256(c)
+    pending = None
+    try:
+        async with ctx.factory() as blocker:
+            async with blocker.begin():
+                await blocker.scalar(select(RunRow).where(RunRow.id == ctx.run).with_for_update())
+                pid = await blocker.scalar(select(func.pg_backend_pid()))
+                pending = asyncio.create_task(ctx.begin(config=c, reservation=r))
+                for _ in range(300):
+                    async with ctx.factory() as probe:
+                        waiting = await probe.scalar(
+                            text(
+                                "SELECT EXISTS (SELECT 1 FROM pg_stat_activity "
+                                "WHERE :pid = ANY(pg_blocking_pids(pid)))"
+                            ),
+                            {"pid": pid},
+                        )
+                    if waiting:
+                        break
+                    await asyncio.sleep(0.01)
+                assert waiting, "repository did not reach the RunRow lock wait"
+                object.__setattr__(c, "max_reviews_per_run", 1)
+                object.__setattr__(r, "request_sha256", "f" * 64)
+                object.__setattr__(r.deployment, "model_id", "changed")
+                object.__setattr__(r.lease, "token", uuid4())
+            result = await asyncio.wait_for(pending, timeout=5)
+        assert result.config_sha256 == original_config_sha
+        assert result.request_sha256 == "e" * 64
+        assert result.model_identity.model_id == "review-model"
+    finally:
+        if pending is not None and not pending.done():
+            pending.cancel()
+            await asyncio.gather(pending, return_exceptions=True)

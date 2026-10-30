@@ -224,6 +224,26 @@ class _ReviewReservation:
             raise ValueError(_INVALID) from None
 
 
+def _freeze_begin_arguments(
+    config: ApprovalReviewConfig,
+    reservation: _ReviewReservation,
+) -> tuple[ApprovalReviewConfig, _ReviewReservation]:
+    """Own validated copies before any DB await; caller object mutation is inert."""
+    review_config_sha256(config)
+    if type(reservation) is not _ReviewReservation:
+        raise ValueError(_INVALID)
+    reservation.__post_init__()
+    config_copy = ApprovalReviewConfig.from_payload(config.to_payload())
+    identity = reservation.deployment
+    return config_copy, _ReviewReservation(
+        reservation.request_sha256,
+        DeploymentIdentity(identity.provider_id, identity.deployment_id, identity.model_id),
+        reservation.token_hold,
+        reservation.cost_hold,
+        _WorkerLease(reservation.lease.worker_id, reservation.lease.token),
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class _CurrentReviewBinding:
     """Trusted loader input, never exposed user input or live OS attestation."""
@@ -564,6 +584,7 @@ class ReviewRepository:
     ) -> ReviewIntent:
         _require_transaction(session)
         a = _validated_action(snapshot)
+        config, reservation = _freeze_begin_arguments(config, reservation)
         config_sha = review_config_sha256(config)
         if type(reservation) is not _ReviewReservation or config.engine != "rules_then_model":
             raise ValueError(_INVALID)

@@ -296,3 +296,24 @@ def test_accounting_mapping_never_refunds_unproven_unknown(outcome):
         if outcome in ("allow", "deny", "needs_human")
         else "unknown"
     )
+
+
+def test_private_begin_arguments_are_isolated_before_first_database_await():
+    m = module()
+    original = config()
+    reservation = m._ReviewReservation(
+        "e" * 64,
+        DeploymentIdentity("synthetic", "review", "model"),
+        20,
+        Decimal("0.1"),
+        _WorkerLease("worker", uuid4()),
+    )
+    c, r = m._freeze_begin_arguments(original, reservation)
+    object.__setattr__(original, "denial_breaker_consecutive", 999)
+    object.__setattr__(reservation, "request_sha256", "f" * 64)
+    object.__setattr__(reservation.deployment, "model_id", "changed")
+    object.__setattr__(reservation.lease, "token", uuid4())
+    assert c.denial_breaker_consecutive == 3
+    assert r.request_sha256 == "e" * 64
+    assert r.deployment.model_id == "model"
+    assert r.lease.token != reservation.lease.token
