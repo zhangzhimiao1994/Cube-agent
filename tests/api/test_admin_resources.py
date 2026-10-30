@@ -5264,12 +5264,6 @@ def test_capability_installer_requires_confirmed_plan_id() -> None:
 
 
 def test_capability_manifest_endpoint_reads_mcp_config_for_principal_tenant() -> None:
-    class OtherTenantAuthService:
-        def authenticate_token(self, token: str) -> AuthenticatedPrincipal:
-            if token != "valid-token":
-                raise InvalidCredentials("bad token")
-            return AuthenticatedPrincipal(USER_ID, OTHER_TENANT_ID, Role.SUPER_ADMIN)
-
     class RecordingMcpService:
         def __init__(self) -> None:
             self.tenant_ids: list[UUID | None] = []
@@ -5306,13 +5300,32 @@ def test_capability_manifest_endpoint_reads_mcp_config_for_principal_tenant() ->
     assert gateway.tenant_ids == [OTHER_TENANT_ID]
 
 
-def test_plugin_admin_endpoints_read_plugin_config_for_principal_tenant() -> None:
-    class OtherTenantAuthService:
-        def authenticate_token(self, token: str) -> AuthenticatedPrincipal:
-            if token != "valid-token":
-                raise InvalidCredentials("bad token")
-            return AuthenticatedPrincipal(USER_ID, OTHER_TENANT_ID, Role.SUPER_ADMIN)
+@pytest.mark.parametrize("changed_field", ["user_id", "tenant_id", "role"])
+def test_capability_manifest_rejects_live_identity_drift(changed_field: str) -> None:
+    class ChangedIdentityAuthService(OtherTenantAuthService):
+        async def validate_principal(
+            self, principal: AuthenticatedPrincipal,
+        ) -> AuthenticatedPrincipal:
+            assert principal == AuthenticatedPrincipal(
+                USER_ID, OTHER_TENANT_ID, Role.SUPER_ADMIN,
+            )
+            return AuthenticatedPrincipal(
+                uuid4() if changed_field == "user_id" else USER_ID,
+                TENANT_ID if changed_field == "tenant_id" else OTHER_TENANT_ID,
+                Role.OPERATOR if changed_field == "role" else Role.SUPER_ADMIN,
+            )
 
+    app = create_app(auth_service=ChangedIdentityAuthService(), rate_limiter=object())
+    app.state.admin_resource_service = InMemoryAdminResourceService()
+    app.state.runtime_capability_gateway = FakeRuntimeCapabilityGateway()
+
+    response = TestClient(app).get("/api/v1/admin/capabilities/manifest", headers=headers())
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "service_unavailable"
+
+
+def test_plugin_admin_endpoints_read_plugin_config_for_principal_tenant() -> None:
     class TenantScopedPluginService:
         def __init__(self) -> None:
             self.tenant_ids: list[UUID | None] = []
@@ -5419,12 +5432,6 @@ def test_plugin_admin_endpoints_read_plugin_config_for_principal_tenant() -> Non
 def test_plugin_admin_write_endpoints_scope_writes_to_principal_tenant_and_actor(
     tmp_path: Path,
 ) -> None:
-    class OtherTenantAuthService:
-        def authenticate_token(self, token: str) -> AuthenticatedPrincipal:
-            if token != "valid-token":
-                raise InvalidCredentials("bad token")
-            return AuthenticatedPrincipal(USER_ID, OTHER_TENANT_ID, Role.SUPER_ADMIN)
-
     class RecordingPluginWriteService(InMemoryAdminResourceService):
         def __init__(self) -> None:
             super().__init__()
@@ -10519,6 +10526,14 @@ def test_plugin_package_approval_mutations_forbid_non_approver() -> None:
             if token != "valid-token":
                 raise InvalidCredentials("bad token")
             return AuthenticatedPrincipal(USER_ID, TENANT_ID, Role.OPERATOR)
+
+        async def validate_principal(
+            self, principal: AuthenticatedPrincipal,
+        ) -> AuthenticatedPrincipal:
+            configured = self.authenticate_token("valid-token")
+            if principal != configured:
+                raise InvalidCredentials("principal does not match configured identity")
+            return configured
 
     app = create_app(auth_service=OperatorAuthService(), rate_limiter=object())
     app.state.admin_resource_service = InMemoryAdminResourceService()
@@ -18640,6 +18655,14 @@ def test_skill_strategy_upload_and_activation_require_approval_permission() -> N
             if token != "operator-token":
                 raise InvalidCredentials("bad token")
             return AuthenticatedPrincipal(USER_ID, TENANT_ID, Role.OPERATOR)
+
+        async def validate_principal(
+            self, principal: AuthenticatedPrincipal,
+        ) -> AuthenticatedPrincipal:
+            configured = self.authenticate_token("operator-token")
+            if principal != configured:
+                raise InvalidCredentials("principal does not match configured identity")
+            return configured
 
     resource_service = InMemoryAdminResourceService()
     admin_app = create_app(auth_service=StubAuthService(), rate_limiter=object())

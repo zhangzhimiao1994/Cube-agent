@@ -22,6 +22,7 @@ from agent_hub.auth.models import AuthenticatedPrincipal, InvalidCredentials, Ro
 from agent_hub.domain.runs import ConversationQueueStatus, RunStatus, TaskMode
 from agent_hub.runs.conversation_queue import ConversationQueueConflict, ConversationQueueItem
 from agent_hub.runs.conversations import ConversationArchived
+from agent_hub.runs.repository import CapabilityApprovalSnapshot, RunNotFound
 from agent_hub.runs.service import RunSummary, SubmittedRun, VibeCodingUnavailable
 
 
@@ -751,34 +752,59 @@ def bearer() -> dict[str, str]:
 def test_capability_approval_readiness_is_actor_scoped(
     monkeypatch: pytest.MonkeyPatch, ready: bool,
 ) -> None:
-    client, _service, principal = _client()
+    client, service, principal = _client()
     run_id = uuid4()
-    calls: list[str] = []
+    calls: list[tuple[UUID, UUID, UUID]] = []
 
-    async def events(
+    async def snapshot(
         self: StubRunService, tenant_id: UUID, requested_run: UUID, *, actor_id: UUID,
-    ) -> tuple[dict[str, object], ...]:
+    ) -> CapabilityApprovalSnapshot:
+        assert self is service
         assert (tenant_id, requested_run, actor_id) == (
             principal.tenant_id, run_id, principal.user_id,
         )
-        calls.append("events")
-        return ()
-
-    async def readiness(
-        self: StubRunService, tenant_id: UUID, requested_run: UUID, *, actor_id: UUID,
-    ) -> bool:
-        assert (tenant_id, requested_run, actor_id) == (
-            principal.tenant_id, run_id, principal.user_id,
+        calls.append((tenant_id, requested_run, actor_id))
+        return CapabilityApprovalSnapshot(
+            items=(), ready=ready, conversation_approval_available=ready,
+            conversation_approval_id="current-approval" if ready else None,
+            conversation_approval_version=7 if ready else None,
         )
-        calls.append("ready")
-        return ready
 
-    monkeypatch.setattr(StubRunService, "capability_approval_events", events, raising=False)
-    monkeypatch.setattr(StubRunService, "capability_approval_ready", readiness, raising=False)
+    monkeypatch.setattr(StubRunService, "capability_approval_snapshot", snapshot, raising=False)
     response = client.get(f"/api/v1/runs/{run_id}/capability-approvals", headers=bearer())
     assert response.status_code == 200
-    assert response.json() == {"items": [], "ready": ready}
-    assert calls == ["events", "ready"]
+    assert response.json() == {
+        "items": [], "ready": ready, "conversation_approval_available": ready,
+        "conversation_approval_id": "current-approval" if ready else None,
+        "conversation_approval_version": 7 if ready else None,
+    }
+    assert calls == [(principal.tenant_id, run_id, principal.user_id)]
+
+
+def test_capability_approval_snapshot_not_found_does_not_expose_receipt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, service, principal = _client()
+    run_id = uuid4()
+    calls: list[tuple[UUID, UUID, UUID]] = []
+
+    async def snapshot(
+        self: StubRunService, tenant_id: UUID, requested_run: UUID, *, actor_id: UUID,
+    ) -> CapabilityApprovalSnapshot:
+        assert self is service
+        assert (tenant_id, requested_run, actor_id) == (
+            principal.tenant_id, run_id, principal.user_id,
+        )
+        calls.append((tenant_id, requested_run, actor_id))
+        raise RunNotFound("run was not found")
+
+    monkeypatch.setattr(StubRunService, "capability_approval_snapshot", snapshot, raising=False)
+    response = client.get(f"/api/v1/runs/{run_id}/capability-approvals", headers=bearer())
+
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "run_not_found"
+    assert "conversation_approval_id" not in response.json()
+    assert calls == [(principal.tenant_id, run_id, principal.user_id)]
 
 
 def test_conversation_queue_supports_list_edit_redirect_and_cancel() -> None:
