@@ -36,6 +36,7 @@ from agent_hub.capabilities.review_contracts import ApprovalReviewConfig, Frozen
 from agent_hub.capabilities.review_repository import (
     ReviewIntent,
     ReviewRepository,
+    _CurrentReviewBinding,
     _ReviewReservation,
     review_config_sha256,
 )
@@ -92,6 +93,7 @@ def runtime_source_fingerprint() -> str:
         "config/schema.py",
         "runtime/review_assembly.py",
         "runtime/worker_execution.py",
+        "runtime/streams.py",
         "runtime/worker.py",
         "runtime/defaults.py",
         "runtime/contracts.py",
@@ -107,6 +109,7 @@ def runtime_source_fingerprint() -> str:
         "capabilities/gateway.py",
         "capabilities/policy.py",
         "capabilities/runtime.py",
+        "capabilities/action_preparation.py",
         "capabilities/execution_authority.py",
         "capabilities/review_context.py",
         "capabilities/model_review.py",
@@ -119,6 +122,7 @@ def runtime_source_fingerprint() -> str:
         "models/physical_admission.py",
         "models/run_admission_repository.py",
         "models/admission_bounds.py",
+        "files/workspace.py",
     )
     digest = hashlib.sha256()
     for name in sorted(files):
@@ -330,6 +334,14 @@ class _CurrentAdmission(RunAdmissionRepository):
 class _AssembledReviewRepository(ReviewRepository):
     """Run unchanged ledger transactions behind the same worker resource fence."""
 
+    def __init__(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        current_check: Callable[[], Awaitable[None]],
+    ) -> None:
+        super().__init__(session_factory)
+        self._current_check = current_check
+
     async def _current(self, tenant_id: UUID, run_id: UUID) -> None:
         execution = _execution.get()
         if execution is None or (execution.budget.tenant_id, execution.budget.run_id) != (
@@ -337,7 +349,7 @@ class _AssembledReviewRepository(ReviewRepository):
             run_id,
         ):
             raise ReviewAssemblyUnavailable("original_budget_binding_missing")
-        await execution.budget.require_current()
+        await self._current_check()
 
     async def begin_intent(
         self,
@@ -375,6 +387,23 @@ class _AssembledReviewRepository(ReviewRepository):
         await self._current(tenant_id, run_id)
         return result
 
+    async def consume_permit(
+        self,
+        *,
+        tenant_id: UUID,
+        run_id: UUID,
+        review_id: UUID,
+        current_binding: _CurrentReviewBinding,
+    ) -> bool:
+        await self._current(tenant_id, run_id)
+        consumed = await super().consume_permit(
+            tenant_id=tenant_id, run_id=run_id, review_id=review_id, current_binding=current_binding
+        )
+        # A consumed permit stays consumed if activation changes during the DAO
+        # await. Never refund/reissue the settled review or dispatch its allow.
+        await self._current(tenant_id, run_id)
+        return consumed
+
 
 class ReviewAssemblyBroker:
     """One versioned getter/compiler for API, worker, reviewer and readiness."""
@@ -402,10 +431,58 @@ class ReviewAssemblyBroker:
         self._transport = transport or LiteLLMClient()
         self._contracts, self._verification = tuple(billing_contracts), verification
         self._evidence_loader = evidence_loader
-        self.review_repository = _AssembledReviewRepository(session_factory)
+        self.review_repository = _AssembledReviewRepository(session_factory, self._dispatch_check)
 
     async def current_config(self, tenant_id: UUID) -> ApprovalReviewConfig:
         return ApprovalReviewConfig.from_payload((await self._get_config(tenant_id)).to_payload())
+
+    def _require_activation_current(self, snapshot: _Snapshot) -> None:
+        """Final synchronous evidence fence after all awaited control-plane IO."""
+        try:
+            records, verification = self._contracts, self._verification
+            if self._evidence_loader is not None:
+                installed = self._evidence_loader()
+                records, verification = ((), None) if installed is None else installed
+            if (
+                type(verification) is not WorkerReviewVerification
+                or verification.profile_version != 1
+                or verification.modes != _MODES
+                or not verification.evidence_reference.strip()
+                or verification.checks != REQUIRED_VERIFICATION_CHECKS
+                or verification.source_sha256 != runtime_source_fingerprint()
+            ):
+                raise ValueError
+            available = {
+                record.deployment_id
+                for record in records
+                if type(record) is ProviderBillingContract
+                and record.tenant_id == snapshot.tenant_id
+                and record.catalog_sha256 == snapshot.catalog_sha256
+            }
+            if not {bound.deployment_id for bound in snapshot.contracts}.issubset(available):
+                raise ValueError
+        except (OSError, ValueError, TypeError):
+            raise ReviewAssemblyUnavailable("review_activation_changed") from None
+
+    async def _dispatch_check(self) -> None:
+        """Use the original binding at consumption and the last async gate seam."""
+        execution = _execution.get()
+        if execution is None or execution.budget is not _run_budget.get():
+            raise ReviewAssemblyUnavailable("original_budget_binding_missing")
+        await execution.budget.require_current()
+        # Read catalog last: secret/DAO awaits in require_current must not hide
+        # a newly published catalog with otherwise identical review settings.
+        current = await self._configs.get_current(execution.budget.tenant_id)
+        if (
+            current is None
+            or current.version != execution.snapshot.catalog_version
+            or catalog_fingerprint(PlatformConfig.model_validate(current.document))
+            != execution.snapshot.catalog_sha256
+        ):
+            raise ReviewAssemblyUnavailable("review_configuration_changed")
+        # No await may follow this file hash/expiry/source check in this callback.
+        self._require_activation_current(execution.snapshot)
+        execution.budget.check()
 
     async def _compile(
         self, tenant_id: UUID
@@ -658,10 +735,12 @@ class ReviewAssemblyBroker:
                 or current.catalog_version != snapshot.catalog_version
                 or current.catalog_sha256 != snapshot.catalog_sha256
                 or current.config != snapshot.config
+                or current.contracts != snapshot.contracts
             ):
                 raise ReviewAssemblyUnavailable(
                     current_reason if current is None else "review_configuration_changed"
                 )
+            self._require_activation_current(snapshot)
 
         repository = _CurrentAdmission(self._sessions, check)
         lease = _WorkerLease(worker_id, context.execution_token)
@@ -738,6 +817,7 @@ class ReviewAssemblyBroker:
             # Awaitable. Both await the same real repository; no method replaced.
             self,
             cast(ConcreteReviewRepository, self.review_repository),
+            dispatch_check=self._dispatch_check,
         )
 
     async def review(

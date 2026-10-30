@@ -882,3 +882,237 @@ async def test_readiness_requires_review_budget_for_actual_conservative_hold(tmp
     readiness = await f.broker.readiness(f.s.task.tenant_id)
     assert readiness.status == "not_ready"
     assert readiness.reason_code == "review_budget_insufficient"
+
+
+@pytest.mark.parametrize(
+    ("phase", "revocation"),
+    [
+        (phase, revocation)
+        for phase in ("before_consume", "inside_consume", "before_dispatch")
+        for revocation in ("removed", "expired", "catalog")
+    ]
+    + [
+        ("before_dispatch", "unchanged"),
+        ("during_dispatch", "removed"),
+        ("during_dispatch", "expired"),
+    ],
+)
+async def test_assembled_allow_revocation_fences_consume_and_dispatch(
+    tmp_path, monkeypatch, phase, revocation
+):
+    """Actual worker/gate/SDK/ledger; only the awaited race is controlled."""
+    from agent_hub.capabilities.defaults import build_runtime_capability_stack
+    from agent_hub.capabilities.review_context import _ConcreteReviewCall
+    from agent_hub.capabilities.review_repository import ReviewRepository
+    from agent_hub.db.models import (
+        RunAdmissionAttemptRow,
+        RunAdmissionPoolRow,
+        RunReviewEventRow,
+        RunReviewIntentRow,
+    )
+    from agent_hub.files.workspace import ProjectWorkspaceStore
+
+    a = assembly()
+    f = await fixture(tmp_path)
+    f.state.review = True
+    document = evidence_document(f)
+    path = tmp_path / "activation.json"
+    body = json.dumps(document).encode()
+    path.write_bytes(body)
+    digest = hashlib.sha256(body).hexdigest()
+    f.broker._evidence_loader = lambda: a.load_server_review_evidence(path, expected_sha256=digest)
+    stack = a.assemble_review_capability_stack(
+        f.broker,
+        build_runtime_capability_stack,
+        tenant_id=f.s.task.tenant_id,
+        run_repository=f.s.runs,
+        skill_store_dir=tmp_path / "skills",
+        workspace_root=tmp_path,
+        generated_artifact_dir=tmp_path / "generated",
+        project_workspace_dir=tmp_path,
+    )
+    assert f.s.gate.dispatch_check is None  # unchanged default for old/non-assembled gates
+    gate = stack.harness_tool_gateway._fresh._review_gate
+    assert gate.dispatch_check.__self__ is f.broker
+    executions = []
+    execute = stack.runtime_gateway.execute
+
+    async def actual_execute(**kwargs):
+        executions.append(kwargs)
+        return await execute(**kwargs)
+
+    monkeypatch.setattr(stack.runtime_gateway, "execute", actual_execute)
+    paused, resume = asyncio.Event(), asyncio.Event()
+    original_receipt = []
+    outcomes = []
+
+    async def pause():
+        row = next(row for row in f.db.rows if type(row) is RunReviewIntentRow)
+        assert row.status == "allow" and row.private_receipt is not None
+        attempt = next(row for row in f.db.rows if type(row) is RunAdmissionAttemptRow)
+        assert attempt.state == "completed" and attempt.receipt_sha256
+        pool = next(row for row in f.db.rows if type(row) is RunAdmissionPoolRow)
+        original_receipt.append(
+            (row.private_receipt, attempt.receipt_sha256, pool.original_deadline)
+        )
+        paused.set()
+        await resume.wait()
+
+    if phase == "before_consume":
+        consume = f.broker.review_repository.consume_permit
+
+        async def before(**kwargs):
+            await pause()
+            return await consume(**kwargs)
+
+        monkeypatch.setattr(f.broker.review_repository, "consume_permit", before)
+    elif phase == "inside_consume":
+        consume = ReviewRepository.consume_permit
+
+        async def inside(self, **kwargs):
+            result = await consume(self, **kwargs)
+            assert result is True
+            await pause()
+            return result
+
+        monkeypatch.setattr(ReviewRepository, "consume_permit", inside)
+    elif phase == "during_dispatch":
+        callback = gate.dispatch_check
+
+        async def during_dispatch():
+            # All original budget/compile/DAO checks pass. Revoke while awaiting
+            # the callback's LAST catalog read; its sync evidence check must see it.
+            budget = a._execution.get().budget
+            require = budget.require_current
+            get_current = f.broker._configs.get_current
+            armed = False
+
+            async def checked():
+                nonlocal armed
+                await require()
+                armed = True
+
+            async def current(tenant):
+                value = await get_current(tenant)
+                if armed:
+                    await pause()
+                return value
+
+            monkeypatch.setattr(budget, "require_current", checked)
+            monkeypatch.setattr(f.broker._configs, "get_current", current)
+            try:
+                await callback()
+            finally:
+                monkeypatch.setattr(budget, "require_current", require)
+                monkeypatch.setattr(f.broker._configs, "get_current", get_current)
+
+        monkeypatch.setattr(gate, "dispatch_check", during_dispatch)
+    else:
+        dispatch = _ConcreteReviewCall.before_dispatch
+
+        async def before_dispatch(self):
+            await pause()
+            return await dispatch(self)
+
+        monkeypatch.setattr(_ConcreteReviewCall, "before_dispatch", before_dispatch)
+
+    class Runtime:
+        async def run(self, context):
+            for request in (
+                f.s.request,
+                replace(f.s.request, actor="repair_agent", idempotency_key="repeat"),
+            ):
+                outcomes.append(
+                    await stack.harness_tool_gateway.invoke(
+                        context.tenant_id,
+                        request,
+                        user_id=context.actor_id,
+                        role=context.actor_role,
+                    )
+                )
+            yield RunEvent(
+                kind="runtime.checked", sequence=1, run_id=context.run_id, payload={"checked": True}
+            )
+
+    async def drive():
+        async with worker_runtime_events(
+            Runtime(), f.s.task, worker_id=f.s.budget.lease.worker_id, review_broker=f.broker
+        ) as events:
+            return [event async for event in events]
+
+    task = asyncio.create_task(drive())
+    try:
+        await asyncio.wait_for(paused.wait(), timeout=10)
+        assert len(f.state.calls) == 1
+        if revocation == "removed":
+            path.unlink()
+        elif revocation == "expired":
+            expiry = datetime.fromisoformat(document["valid_until"])
+
+            class Expired(datetime):
+                @classmethod
+                def now(cls, tz=None):
+                    return expiry + timedelta(seconds=1)
+
+            monkeypatch.setattr(a, "datetime", Expired)
+        elif revocation == "catalog":
+            f.state.version += 1  # approval config deliberately unchanged
+        resume.set()
+        await asyncio.wait_for(task, timeout=10)
+    finally:
+        resume.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    assert len(outcomes) == 2
+    files = ProjectWorkspaceStore(tmp_path).list_files(f.s.task.tenant_id, "demo", "session")
+    if revocation == "unchanged":
+        assert [result.status for result in outcomes] == ["succeeded", "failed"]
+        assert [file.path for file in files] == ["hello.txt"]
+        assert len(executions) == 1
+    else:
+        assert all(result.status == "failed" for result in outcomes) and not files
+        assert not executions
+    assert len(f.state.calls) == 1  # no second reviewer, fallback or repair RPC
+    row = next(row for row in f.db.rows if type(row) is RunReviewIntentRow)
+    attempt = next(row for row in f.db.rows if type(row) is RunAdmissionAttemptRow)
+    pool = next(row for row in f.db.rows if type(row) is RunAdmissionPoolRow)
+    assert (
+        row.private_receipt,
+        attempt.receipt_sha256,
+        pool.original_deadline,
+    ) == original_receipt[0]
+    assert attempt.state == "completed" and pool.token_charged == 5
+    assert pool.review_count_charged == 1 and pool.original_token_grant == 40000
+    consumed = sum(type(row) is RunReviewEventRow and row.kind == "consumed" for row in f.db.rows)
+    assert consumed == (0 if phase == "before_consume" else 1)
+
+
+@pytest.mark.parametrize(
+    "relative", ["capabilities/action_preparation.py", "files/workspace.py", "runtime/streams.py"]
+)
+async def test_actual_proof_dependency_change_invalidates_installed_evidence(
+    tmp_path, monkeypatch, relative
+):
+    from pathlib import Path
+
+    a = assembly()
+    f = await fixture(tmp_path)
+    original = a.runtime_source_fingerprint()
+    document = evidence_document(f)
+    path = tmp_path / "activation.json"
+    body = json.dumps(document).encode()
+    path.write_bytes(body)
+    digest = hashlib.sha256(body).hexdigest()
+    a.load_server_review_evidence(path, expected_sha256=digest)
+    target = Path(a.__file__).resolve().parents[1] / relative
+    read = Path.read_bytes
+
+    def changed(self):
+        data = read(self)
+        return data + b"\n# virtual dependency change\n" if self.resolve() == target else data
+
+    monkeypatch.setattr(Path, "read_bytes", changed)
+    assert a.runtime_source_fingerprint() != original
+    with pytest.raises(ValueError, match="invalid server review evidence"):
+        a.load_server_review_evidence(path, expected_sha256=digest)
