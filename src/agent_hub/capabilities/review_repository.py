@@ -14,12 +14,13 @@ import json
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from datetime import datetime
 from decimal import Decimal
 from functools import wraps
-from typing import Literal, cast
+from typing import Literal, cast, get_args
 from uuid import UUID, uuid5
 
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -488,10 +489,164 @@ def _snapshot(
     )
 
 
+type ModelReviewStatus = Literal["pending", "allow", "deny", "needs_human", "unknown"]
+type ModelReviewRisk = Literal["low", "medium", "high", "unknown"]
+type ModelReviewReasonCode = Literal[
+    "authorized_action",
+    "outside_authorized_scope",
+    "protected_resource",
+    "untrusted_content",
+    "unclear_impact",
+    "missing_context",
+    "policy_requires_human",
+    "accounting_unknown",
+    "review_timeout",
+    "review_unavailable",
+    "review_invalid_response",
+    "review_unknown",
+    "review_cancelled",
+]
+
+
+@dataclass(frozen=True, slots=True)
+class ModelReviewItem:
+    """Read-only public history. An allow is never a tool execution receipt."""
+
+    id: str
+    created_at: datetime
+    status: ModelReviewStatus
+    risk: ModelReviewRisk | None
+    reason_code: ModelReviewReasonCode | None
+    reviewer: Literal["independent_model"] = "independent_model"
+    tool_name: Literal["workspace.write_text"] = "workspace.write_text"
+
+
+@dataclass(frozen=True, slots=True)
+class ModelReviewPage:
+    items: tuple[ModelReviewItem, ...]
+    next_cursor: UUID | None
+
+
+class ModelReviewHistoryNotFound(RuntimeError):
+    """The current principal does not own the requested run."""
+
+
+def _model_review_item(
+    review_id: UUID, created_at: datetime, state: str, risk: object, reason: object
+) -> ModelReviewItem:
+    public_state: ModelReviewStatus = (
+        "pending"
+        if state in ("prepared", "issued")
+        else cast(ModelReviewStatus, state)
+        if state in ("allow", "deny", "needs_human")
+        else "unknown"
+    )
+    safe_risk = (
+        cast(ModelReviewRisk, risk)
+        if type(risk) is str and risk in get_args(ModelReviewRisk.__value__)
+        else None
+    )
+    safe_reason = (
+        cast(ModelReviewReasonCode, reason)
+        if type(reason) is str and reason in get_args(ModelReviewReasonCode.__value__)
+        else None
+    )
+    return ModelReviewItem(
+        "model-review:" + str(review_id), created_at, public_state, safe_risk, safe_reason
+    )
+
+
 class ReviewRepository:
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
         self._session_factory = session_factory
         self._budget = RunAdmissionRepository(session_factory)
+
+    async def list_for_run(
+        self,
+        tenant_id: UUID,
+        run_id: UUID,
+        *,
+        actor_id: UUID,
+        cursor: UUID | None = None,
+        limit: int = 50,
+    ) -> ModelReviewPage:
+        """SELECT-only history: no private snapshots, admission fence or grant writes.
+
+        Ascending (created_at, review_id) keyset. UUID cursor must belong to this
+        exact current owner/run; every ledger query repeats the ownership join.
+        limit bounds a page only, never the complete history.
+        """
+        for value in (tenant_id, run_id, actor_id):
+            _uuid(value)
+        if type(limit) is not int or not 1 <= limit <= 200:
+            raise ValueError("model review page limit must be between 1 and 200")
+        if cursor is not None:
+            _uuid(cursor)
+        try:
+            async with self._session_factory() as session:
+                with session.no_autoflush:
+                    owned = await session.scalar(
+                        select(RunRow.id).where(
+                            RunRow.tenant_id == tenant_id,
+                            RunRow.id == run_id,
+                            RunRow.actor_id == actor_id,
+                        )
+                    )
+                    if owned is None:
+                        raise ModelReviewHistoryNotFound("run was not found")
+                    scope = (
+                        RunReviewIntentRow.tenant_id == tenant_id,
+                        RunReviewIntentRow.run_id == run_id,
+                        RunRow.tenant_id == tenant_id,
+                        RunRow.id == run_id,
+                        RunRow.actor_id == actor_id,
+                    )
+                    query = (
+                        select(
+                            RunReviewIntentRow.review_id,
+                            RunReviewIntentRow.created_at,
+                            RunReviewIntentRow.status,
+                            RunReviewIntentRow.risk,
+                            RunReviewIntentRow.reason_code,
+                        )
+                        .join(RunRow, RunRow.id == RunReviewIntentRow.run_id)
+                        .where(*scope)
+                    )
+                    if cursor is not None:
+                        pivot = (
+                            await session.execute(
+                                select(RunReviewIntentRow.created_at)
+                                .join(RunRow, RunRow.id == RunReviewIntentRow.run_id)
+                                .where(*scope, RunReviewIntentRow.review_id == cursor)
+                            )
+                        ).one_or_none()
+                        if pivot is None:
+                            raise ValueError("invalid model review cursor")
+                        query = query.where(
+                            or_(
+                                RunReviewIntentRow.created_at > pivot[0],
+                                and_(
+                                    RunReviewIntentRow.created_at == pivot[0],
+                                    RunReviewIntentRow.review_id > cursor,
+                                ),
+                            )
+                        )
+                    rows = (
+                        await session.execute(
+                            query.order_by(
+                                RunReviewIntentRow.created_at.asc(),
+                                RunReviewIntentRow.review_id.asc(),
+                            ).limit(limit + 1)
+                        )
+                    ).all()
+                    items = tuple(
+                        _model_review_item(UUID(str(identity)), created, state, risk, reason)
+                        for identity, created, state, risk, reason in rows[:limit]
+                    )
+                    next_cursor = UUID(str(rows[limit - 1][0])) if len(rows) > limit else None
+                    return ModelReviewPage(items, next_cursor)
+        except SQLAlchemyError:
+            raise ReviewConflict(_CONFLICT) from None
 
     @asynccontextmanager
     async def _transaction(self) -> AsyncIterator[AsyncSession]:

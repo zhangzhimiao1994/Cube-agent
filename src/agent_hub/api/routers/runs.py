@@ -18,15 +18,22 @@ from typing import Annotated, Literal, Protocol, TypedDict, cast
 from urllib.parse import unquote
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, Header, Request, status
+from fastapi import APIRouter, Depends, Header, Query, Request, status
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_validator, model_validator
 from sqlalchemy.exc import SQLAlchemyError
 
 from agent_hub.api.dependencies import require_permission
 from agent_hub.api.errors import PublicAPIError, error_responses
 from agent_hub.auth.models import AuthenticatedPrincipal, Role
 from agent_hub.capabilities.project_contracts import EDITABLE_PATHS_MAX_COUNT, ManagedProjectInput
+from agent_hub.capabilities.review_repository import (
+    ModelReviewItem,
+    ModelReviewPage,
+    ModelReviewReasonCode,
+    ModelReviewRisk,
+    ModelReviewStatus,
+)
 from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.execution_backends import execution_backend_unavailable_reason
 from agent_hub.runs.authorization import _AuthenticatedInput, _capture_authenticated_input
@@ -205,6 +212,11 @@ class RunServiceProtocol(Protocol):
     async def events(
         self, tenant_id: UUID, run_id: UUID, *, actor_id: UUID | None = None,
     ) -> tuple[dict[str, object], ...]: ...
+
+    async def model_reviews(
+        self, tenant_id: UUID, run_id: UUID, *, actor_id: UUID,
+        cursor: UUID | None = None, limit: int = 50,
+    ) -> ModelReviewPage: ...
 
     async def capability_approval_events(
         self, tenant_id: UUID, run_id: UUID, *, actor_id: UUID,
@@ -629,6 +641,30 @@ class RunSummaryResponse(BaseModel):
 
 class RunEventsResponse(BaseModel):
     items: tuple[dict[str, object], ...]
+
+
+class RunModelReviewItemResponse(BaseModel):
+    model_config = ConfigDict(extra='forbid', frozen=True)
+
+    id: str = Field(pattern=r'^model-review:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')
+    created_at: AwareDatetime
+    status: ModelReviewStatus
+    risk: ModelReviewRisk | None
+    reason_code: ModelReviewReasonCode | None
+    reviewer: Literal['independent_model']
+    tool_name: Literal['workspace.write_text']
+
+    @classmethod
+    def from_record(cls, item: ModelReviewItem) -> RunModelReviewItemResponse:
+        return cls(id=item.id, created_at=item.created_at, status=item.status, risk=item.risk,
+            reason_code=item.reason_code, reviewer=item.reviewer, tool_name=item.tool_name)
+
+
+class RunModelReviewsResponse(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+
+    items: tuple[RunModelReviewItemResponse, ...]
+    next_cursor: UUID | None
 
 
 class RunCapabilityApprovalsResponse(RunEventsResponse):
@@ -1886,6 +1922,29 @@ async def run_events(
     except RunNotFound as error:
         raise _run_not_found() from error
     return RunEventsResponse(items=events)
+
+
+@router.get('/{run_id}/model-reviews', response_model=RunModelReviewsResponse)
+async def run_model_reviews(
+    run_id: UUID,
+    service: Annotated[RunServiceProtocol, Depends(_run_service)],
+    principal: Annotated[AuthenticatedPrincipal, Depends(require_permission('run:read'))],
+    cursor: UUID | None = None,
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+) -> RunModelReviewsResponse:
+    """Independent model verdict history only; allow does not prove execution."""
+    try:
+        page = await service.model_reviews(principal.tenant_id, run_id,
+            actor_id=principal.user_id, cursor=cursor, limit=limit)
+    except RunNotFound as error:
+        raise _run_not_found() from error
+    except ValueError:
+        raise PublicAPIError(422, 'invalid_cursor', 'model review cursor is invalid') from None
+    except RunConflict as error:
+        raise _run_conflict(error) from error
+    return RunModelReviewsResponse(
+        items=tuple(RunModelReviewItemResponse.from_record(item) for item in page.items),
+        next_cursor=page.next_cursor)
 
 
 @router.get("/{run_id}/capability-approvals", response_model=RunCapabilityApprovalsResponse)

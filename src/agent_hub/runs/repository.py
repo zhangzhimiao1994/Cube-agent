@@ -67,6 +67,7 @@ from agent_hub.runtime.failure_reason import (
 
 if TYPE_CHECKING:
     from agent_hub.capabilities.go_project_inputs import GoProjectInputs
+    from agent_hub.capabilities.review_repository import ModelReviewPage
     from agent_hub.capabilities.types import CapabilityRequest
     from agent_hub.runs.go_project_admission import GoExecutionReservation
     from agent_hub.runs.toolchain_supply import ToolchainSupplyAuthority
@@ -705,6 +706,25 @@ class RunRepository:
             if actor_id is not None and row.actor_id != actor_id:
                 raise RunNotFound("run was not found")
             return self._record(row)
+
+    async def model_reviews(
+        self, tenant_id: UUID, run_id: UUID, *, actor_id: UUID,
+        cursor: UUID | None = None, limit: int = 50,
+    ) -> ModelReviewPage:
+        # Keep the runs package initializer acyclic with 2B's authorization import.
+        from agent_hub.capabilities.review_repository import (
+            ModelReviewHistoryNotFound,
+            ReviewConflict,
+            ReviewRepository,
+        )
+
+        try:
+            return await ReviewRepository(self._session_factory).list_for_run(
+                tenant_id, run_id, actor_id=actor_id, cursor=cursor, limit=limit)
+        except ModelReviewHistoryNotFound:
+            raise RunNotFound('run was not found') from None
+        except ReviewConflict:
+            raise RunConflict('model review history unavailable') from None
 
     async def latest_waiting_choice_for_conversation(
         self,

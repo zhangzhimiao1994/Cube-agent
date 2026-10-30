@@ -96,6 +96,7 @@ from agent_hub.runtime.worker_execution import worker_runtime_events
 from agent_hub.subprocess_cleanup import ProcessCleanupIncomplete
 
 if TYPE_CHECKING:
+    from agent_hub.capabilities.review_repository import ModelReviewPage
     from agent_hub.runs.conversation_inputs import ConversationInputs
     from agent_hub.runtime.review_assembly import ReviewAssemblyBroker
 
@@ -1717,6 +1718,13 @@ class RunService:
         if actor_id is None:
             return await self._repository.events(tenant_id, run_id)
         return await self._repository.events(tenant_id, run_id, actor_id=actor_id)
+
+    async def model_reviews(
+        self, tenant_id: UUID, run_id: UUID, *, actor_id: UUID,
+        cursor: UUID | None = None, limit: int = 50,
+    ) -> ModelReviewPage:
+        return await self._repository.model_reviews(
+            tenant_id, run_id, actor_id=actor_id, cursor=cursor, limit=limit)
 
     async def capability_approval_events(
         self, tenant_id: UUID, run_id: UUID, *, actor_id: UUID,
