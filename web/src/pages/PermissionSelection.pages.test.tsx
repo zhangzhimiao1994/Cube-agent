@@ -4,7 +4,7 @@ import userEvent from "@testing-library/user-event";
 import { MemoryRouter, useNavigate } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { ApiError, api } from "../api/client";
+import { ApiError, api, type SystemSettings } from "../api/client";
 import { AuthProvider, useAuth } from "../auth/AuthProvider";
 import { RunsPage } from "./RunsPage";
 
@@ -18,7 +18,7 @@ const defaults = {
 
 afterEach(() => { cleanup(); clients.splice(0).forEach((client) => client.clear()); vi.restoreAllMocks(); });
 
-async function mount(settings = defaults, active = false, confirmed = true) {
+async function mount(settings: typeof defaults & Pick<Partial<SystemSettings>, "approval_review" | "approval_review_readiness"> = defaults, active = false, confirmed = true) {
   const user = userEvent.setup();
   const client = new QueryClient({ defaultOptions: {
     queries: { enabled: false, retry: false, staleTime: Infinity }, mutations: { retry: false },
@@ -58,6 +58,28 @@ async function mount(settings = defaults, active = false, confirmed = true) {
 }
 
 describe("independent composer sandbox permissions", () => {
+
+  it.each([false, true])("keeps rules available and updates the model summary from server settings for active=%s", async (active) => {
+    const { user, client } = await mount({ ...defaults, default_permission_mode: "auto_review",
+      approval_review: { engine: "rules_then_model" } as SystemSettings["approval_review"],
+      approval_review_readiness: { status: "not_ready", reason_code: "runtime_not_ready" },
+    }, active);
+    await user.click(screen.getByRole("button", { name: /沙箱权限/ }));
+    const auto = screen.getByRole("menuitemradio", { name: /自动审查/ });
+    expect(auto.getAttribute("aria-disabled")).toBe("false");
+    expect(auto.textContent).toContain("服务尚未");
+    await user.click(auto);
+    expect(screen.getByRole("button", { name: /沙箱权限/ }).textContent).toContain("模型未就绪");
+    await act(async () => { client.setQueryData(["settings", "tenant", "actor", "operator"], {
+      ...defaults, approval_review: { engine: "rules_then_model" },
+      approval_review_readiness: { status: "ready", reason_code: "ready" },
+    }); });
+    await waitFor(() => expect(screen.getByRole("button", { name: /沙箱权限/ }).textContent).toContain("模型审查"));
+    await user.click(screen.getByRole("button", { name: /沙箱权限/ }));
+    expect(screen.getByRole("menuitemradio", { name: /自动审查/ }).textContent).toContain("独立模型审查");
+    expect(screen.getByRole("menuitemradio", { name: /完整访问权限/ }).getAttribute("aria-disabled")).toBe("true");
+  });
+
   it("opens permissions without opening or occupying the run settings dialog", async () => {
     const { user } = await mount();
     const tools = screen.getByLabelText("消息工具");

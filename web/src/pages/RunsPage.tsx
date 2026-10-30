@@ -26,7 +26,7 @@ import { useAuth } from "../auth/AuthProvider";
 import { PermissionSelector, type PermissionMode } from "../components/PermissionSelector";
 import { ComposerModeMenu, ComposerMoreMenu } from "../components/ComposerMenus";
 import { ProcessPanelTabs } from "../components/ProcessPanelTabs";
-import { resolvePermissionSelection, sandboxPermissions, type SupportedPermissionMode } from "./permissionSelection";
+import { approvalReviewPresentation, resolvePermissionSelection, sandboxPermissions, type SupportedPermissionMode } from "./permissionSelection";
 
 const RUN_MODES = [
   { value: "auto", label: "自动", description: "主 Agent 判断应使用直连、派单、讨论或混合；不确定时向你确认。" },
@@ -6475,6 +6475,7 @@ function RunsPageForActor() {
   const permissionScopeKey = JSON.stringify([...permissionActorKey, conversationId]);
   const permissionDraft = permissionDrafts[permissionScopeKey];
   const supportedPermissionModes = settings.data?.supported_permission_modes ?? [];
+  const approvalReview = approvalReviewPresentation(settings.data);
   const configuredPermissionMode = settings.data?.default_permission_mode ?? "default";
   const permissionMode = permissionDraft?.mode ?? configuredPermissionMode;
   const sandboxProfile: SandboxProfile = permissionMode === "read_only" ? "read_only"
@@ -9718,6 +9719,8 @@ function RunsPageForActor() {
                 ) : null}
                 <PermissionSelector
                   value={permissionMode}
+                  reviewSummary={approvalReview.summary}
+                  reviewDescription={approvalReview.description}
                   onChange={selectPermissionMode}
                   autoReviewAvailable={supportedPermissionModes.includes("auto_review") && settings.data?.tool_approval_mode === "auto_review"}
                   readOnlyAvailable={supportedPermissionModes.includes("read_only")}

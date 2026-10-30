@@ -345,6 +345,51 @@ describe("ConfigPage", () => {
     vi.restoreAllMocks();
   });
 
+
+  it("saves a model draft while not ready, rereads trusted status and keeps rule auto-review selectable", async () => {
+    vi.spyOn(api, "models").mockResolvedValue([{ id: "deployment", provider: "test", api_base: "https://fixture.invalid", api_protocol: "openai_compatible", upstream_model: "fixture", logical_model: "reviewer", capabilities: [], credential_ref: "fixture", quota_scope: "fixture", max_concurrency: 1, target_utilization: 1, reserved_capacity: 0, rpm: null, tpm: null, queue_timeout_seconds: 10, fallback: null, weight: 1, effective_slots: 1, saturation_policy: "queue" }]);
+    const user = userEvent.setup();
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
+    const view = renderScopedConfig(client);
+    const engine = await screen.findByLabelText("审查引擎");
+    await user.selectOptions(engine, "rules_then_model");
+    await user.click(screen.getByRole("button", { name: "保存系统设置" }));
+    expect(await screen.findByText(/请选择已有审查模型/)).toBeTruthy();
+    expect(requests.filter((r) => r.method === "PUT")).toHaveLength(0);
+    await user.selectOptions(screen.getByLabelText("审查模型 alias"), "reviewer");
+    await user.click(screen.getByText("详细审查限制"));
+    fireEvent.change(screen.getByLabelText("每次运行审查预算（USD）"), { target: { value: "0.0000001" } });
+    await user.click(screen.getByRole("button", { name: "保存系统设置" }));
+    expect(await screen.findByText(/预算.*小数/)).toBeTruthy();
+    fireEvent.change(screen.getByLabelText("每次运行审查预算（USD）"), { target: { value: "0.010000" } });
+    await user.selectOptions(screen.getByLabelText("默认权限模式"), "auto_review");
+    await user.click(screen.getByRole("button", { name: "保存系统设置" }));
+    await screen.findByText(/系统设置已保存，并会/);
+    const saved = requests.find((r) => r.method === "PUT")!.body as Record<string, unknown>;
+    expect(saved.approval_review).toMatchObject({ engine: "rules_then_model", reviewer_logical_model: "reviewer", max_cost_usd_per_run: "0.010000" });
+    expect(saved).not.toHaveProperty("approval_review_readiness");
+    expect(screen.getByLabelText("独立模型审查状态").textContent).toContain("未就绪");
+    expect((within(screen.getByLabelText("默认权限模式")).getByRole("option", { name: /自动审查/ }) as HTMLOptionElement).disabled).toBe(false);
+    // Re-read the server response; a saved draft alone must never become ready.
+    currentSettings = { ...currentSettings, approval_review_readiness: { status: "ready", reason_code: "ready" } } as typeof currentSettings;
+    await act(async () => { await view.getClient().invalidateQueries({ queryKey: ["settings"] }); });
+    await waitFor(() => expect(screen.getByLabelText("独立模型审查状态").textContent).toContain("已就绪"));
+    currentSettings = { ...currentSettings, approval_review_readiness: { status: "not_ready", reason_code: "runtime_not_ready" } } as typeof currentSettings;
+    await act(async () => { await view.getClient().invalidateQueries({ queryKey: ["settings"] }); });
+    await waitFor(() => expect(screen.getByLabelText("独立模型审查状态").textContent).toContain("未就绪"));
+  });
+
+
+  it("reports a server save failure without claiming approval or changing saved readiness", async () => {
+    const user = userEvent.setup(); render(<TestApp initialPath="/config" />);
+    await screen.findByLabelText("审查引擎");
+    vi.spyOn(api, "updateSettings").mockRejectedValue(new Error("设置服务暂不可用"));
+    await user.click(screen.getByRole("button", { name: "保存系统设置" }));
+    expect(await screen.findByText("设置服务暂不可用")).toBeTruthy();
+    expect(screen.queryByText(/系统设置已保存，并会/)).toBeNull();
+    expect(screen.getByLabelText("独立模型审查状态").textContent).toContain("仅规则审查");
+  });
+
   it("does not read or expose settings until the authenticated identity is loaded", async () => {
     const identity = await api.me();
     let resolveIdentity!: (value: typeof identity) => void;
@@ -437,7 +482,7 @@ describe("ConfigPage", () => {
     expect(requests.find((request) => request.path === "/api/v1/admin/settings")).toMatchObject({
       method: "PUT",
       body: {
-        ...Object.fromEntries(Object.entries(settings).filter(([key]) => key !== "supported_permission_modes")),
+        ...Object.fromEntries(Object.entries(settings).filter(([key]) => !["supported_permission_modes", "plugin_package_subprocess_registration_status"].includes(key))),
         default_mode: "dispatch",
         default_workflow_id: "short-video-dispatch",
         default_agent_ids: ["director"],

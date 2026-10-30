@@ -13,6 +13,8 @@ export type PermissionSelectorProps = {
   autoReviewAvailable: boolean;
   readOnlyAvailable?: boolean;
   permissionSupportNotice?: string;
+  reviewSummary?: string;
+  reviewDescription?: string;
   disabled?: boolean;
 };
 
@@ -24,7 +26,7 @@ const OPTIONS = [
 ] as const;
 
 export function PermissionSelector({
-  value, onChange, autoReviewAvailable, readOnlyAvailable = true, permissionSupportNotice, disabled = false,
+  value, onChange, autoReviewAvailable, readOnlyAvailable = true, permissionSupportNotice, reviewSummary, reviewDescription, disabled = false,
 }: PermissionSelectorProps) {
   const [open, setOpen] = useState(false);
   const [position, setPosition] = useState({ left: 8, top: 8, width: 304, maxHeight: 400 });
@@ -88,7 +90,7 @@ export function PermissionSelector({
       window.visualViewport?.removeEventListener("resize", place);
       window.visualViewport?.removeEventListener("scroll", place);
     };
-  }, [visible, permissionSupportNotice, autoReviewAvailable, readOnlyAvailable]);
+  }, [visible, permissionSupportNotice, autoReviewAvailable, readOnlyAvailable, reviewDescription]);
 
   useEffect(() => {
     if (!visible) return;
@@ -126,8 +128,8 @@ export function PermissionSelector({
   return (
     <>
       <button ref={triggerRef} type="button" className="permission-selector-trigger" disabled={disabled}
-        aria-label={`沙箱权限：${selected.label}`} aria-haspopup="menu" aria-expanded={visible}
-        aria-controls={visible ? menuId : undefined} title={`沙箱权限：${selected.label}`}
+        aria-label={`沙箱权限：${selected.label}${value === "auto_review" && reviewSummary ? ` · ${reviewSummary}` : ""}`} aria-haspopup="menu" aria-expanded={visible}
+        aria-controls={visible ? menuId : undefined} title={`沙箱权限：${selected.label}${value === "auto_review" && reviewDescription ? `；${reviewDescription}` : ""}`}
         onClick={() => { initialFocus.current = "selected"; setOpen((current) => !current); }}
         onKeyDown={(event) => {
           if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
@@ -136,7 +138,7 @@ export function PermissionSelector({
           setOpen(true);
         }}>
         <selected.Icon size={16} aria-hidden="true" />
-        <span>{selected.label}</span>
+        <span>{value === "auto_review" && reviewSummary ? reviewSummary : selected.label}</span>
         <ChevronDown size={14} aria-hidden="true" />
       </button>
       {visible ? createPortal(
@@ -183,7 +185,7 @@ export function PermissionSelector({
               <Icon size={18} aria-hidden="true" />
               <span className="permission-selector-copy">
                 <strong>{label}</strong>
-                <span>{mode === "default" && permissionSupportNotice ? permissionSupportNotice : description}</span>
+                <span>{mode === "default" && permissionSupportNotice ? permissionSupportNotice : mode === "auto_review" && reviewDescription ? reviewDescription : description}</span>
                 {mode === "auto_review" && !autoReviewAvailable ? <small>服务器尚未启用自动审查。</small> : null}
                 {mode === "read_only" && !readOnlyAvailable ? <small>当前服务仅支持工作区只读，尚不保证所有工具只读。</small> : null}
               </span>

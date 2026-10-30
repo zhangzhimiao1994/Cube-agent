@@ -8,9 +8,12 @@ import {
   ApiError,
   api,
   formatApiError,
+  defaultApprovalReview,
+  validateApprovalReview,
   type ConfigRevision,
   type SystemSettings,
 } from "../api/client";
+import { approvalReviewPresentation } from "./permissionSelection";
 
 type EditableConfig = {
   models: Record<string, unknown>;
@@ -131,6 +134,10 @@ function IdentityConfigPage() {
     mutationFn: async () => {
       if (!user || !settings || !settingsQuery.isSuccess || settingsQuery.isError) throw new Error("当前身份的设置尚未加载完成，不能保存。");
       setSettingsLocalError(null);
+      const review = validateApprovalReview(settings.approval_review ?? defaultApprovalReview());
+      if (review.engine === "rules_then_model" && !(modelsQuery.data ?? []).some((model) => model.logical_model === review.reviewer_logical_model)) {
+        throw new Error("请选择模型目录中已有的审查模型 alias。");
+      }
       if (settings.supported_permission_modes.length === 0) return api.updateSettings(settings);
       if (!settings.supported_permission_modes.includes(settings.default_permission_mode)) {
         throw new Error("服务端不支持所选默认权限模式，请重新选择。");
@@ -199,9 +206,16 @@ function IdentityConfigPage() {
   const executionBackends = executionBackendsQuery.data ?? [];
   const modelCount = Object.keys(document?.models ?? {}).length || (modelsQuery.data ?? []).length;
   const agentCount = document?.agents.length || agents.length;
+  const review = settings.approval_review ?? defaultApprovalReview();
+  const reviewStatus = approvalReviewPresentation(settingsQuery.data);
+  const modelAliases = [...new Set((modelsQuery.data ?? []).map((model) => model.logical_model))];
 
   function updateSettings(patch: Partial<SystemSettings>) {
     setSettings((currentSettings) => (currentSettings ? { ...currentSettings, ...patch } : currentSettings));
+  }
+
+  function updateReview(patch: Partial<typeof review>) {
+    updateSettings({ approval_review: { ...review, ...patch } });
   }
 
   function submitSettings(event: FormEvent<HTMLFormElement>) {
@@ -392,7 +406,7 @@ function IdentityConfigPage() {
                   });
                 }}>
                 <option value="default" disabled={!settings.supported_permission_modes.includes("default")}>默认权限：边界内操作，需审批时人工确认</option>
-                <option value="auto_review" disabled={!settings.supported_permission_modes.includes("auto_review")}>自动审查：仅规则审查，非独立模型</option>
+                <option value="auto_review" disabled={!settings.supported_permission_modes.includes("auto_review")}>自动审查：{reviewStatus.summary === "规则审查" ? "仅规则审查，非独立模型" : reviewStatus.summary}</option>
                 <option value="read_only" disabled={!settings.supported_permission_modes.includes("read_only")}>只读</option>
               </select>
             </label>
@@ -448,7 +462,7 @@ function IdentityConfigPage() {
               onChange={(event) => updateSettings({ tool_approval_mode: event.target.value as SystemSettings["tool_approval_mode"] })}
               disabled={!settings.require_approval_for_tools}
             >
-              <option value="auto_review">规则自动审查：有限安全产物，非独立模型</option>
+              <option value="auto_review">自动审查：{reviewStatus.summary}</option>
               <option value="ask">人工审批：全部交给人工确认</option>
             </select>
           </label>
@@ -470,6 +484,50 @@ function IdentityConfigPage() {
             </p>
             <Link className="secondary-action" to="/openclaw">打开 OpenClaw 控制</Link>
           </div>
+        </fieldset>
+        <fieldset>
+          <legend>独立模型审查</legend>
+          <p className="field-help" aria-label="独立模型审查状态" aria-live="polite">服务器当前状态：{reviewStatus.status}</p>
+          <div className="form-grid">
+            <label htmlFor="review-engine">审查引擎
+              <select id="review-engine" value={review.engine} onChange={(event) => updateReview({ engine: event.target.value as typeof review.engine })}>
+                <option value="rules">规则审查</option>
+                <option value="rules_then_model">规则 + 独立模型审查</option>
+              </select>
+            </label>
+            <label htmlFor="review-model">审查模型 alias
+              <select id="review-model" value={review.reviewer_logical_model ?? ""} onChange={(event) => updateReview({ reviewer_logical_model: event.target.value || null })}>
+                <option value="">请选择已有模型</option>
+                {review.reviewer_logical_model && !modelAliases.includes(review.reviewer_logical_model) ? <option value={review.reviewer_logical_model} disabled>{review.reviewer_logical_model}（目录中已不可用）</option> : null}
+                {modelAliases.map((alias) => <option key={alias} value={alias}>{alias}</option>)}
+              </select>
+            </label>
+          </div>
+          <p className="field-help">使用已有模型目录。可先保存合法配置，再由服务器确认可用状态；配置保存不代表动作审批通过。</p>
+          <details className="inline-guide" style={{ maxHeight: "none", overflow: "visible" }}>
+            <summary>详细审查限制</summary>
+            <div className="form-grid">
+              <label htmlFor="review-cost">每次运行审查预算（USD）
+                <input id="review-cost" type="text" inputMode="decimal" value={review.max_cost_usd_per_run} onChange={(event) => updateReview({ max_cost_usd_per_run: event.target.value })} />
+              </label>
+              <label htmlFor="review-timeout">审查超时（秒）
+                <input id="review-timeout" type="number" min={1} max={60} step="any" value={Number.isNaN(review.timeout_seconds) ? "" : review.timeout_seconds} onChange={(event) => updateReview({ timeout_seconds: event.target.valueAsNumber })} />
+              </label>
+              <label htmlFor="review-input">输入 token 上限
+                <input id="review-input" type="number" min={1} max={1000000} step={1} value={Number.isNaN(review.max_input_tokens) ? "" : review.max_input_tokens} onChange={(event) => updateReview({ max_input_tokens: event.target.valueAsNumber })} />
+              </label>
+              <label htmlFor="review-output">输出 token 上限
+                <input id="review-output" type="number" min={1} max={1000000} step={1} value={Number.isNaN(review.max_output_tokens) ? "" : review.max_output_tokens} onChange={(event) => updateReview({ max_output_tokens: event.target.valueAsNumber })} />
+              </label>
+              <label htmlFor="review-count">每次运行最多审查次数
+                <input id="review-count" type="number" min={1} max={Number.MAX_SAFE_INTEGER} step={1} value={Number.isNaN(review.max_reviews_per_run) ? "" : review.max_reviews_per_run} onChange={(event) => updateReview({ max_reviews_per_run: event.target.valueAsNumber })} />
+              </label>
+            </div>
+            <label className="inline-check">
+              <input type="checkbox" checked={review.require_distinct_model} onChange={(event) => updateReview({ require_distinct_model: event.target.checked })} />
+              审查模型必须与执行模型不同
+            </label>
+          </details>
         </fieldset>
         <h3>主 Agent 全局临场策略</h3>
         <p className="field-help">

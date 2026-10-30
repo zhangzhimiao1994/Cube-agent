@@ -250,7 +250,46 @@ const PluginPackageSubprocessRegistrationStatusSchema = z.enum([
   "ready",
 ]);
 
+// Editable configuration and response-only readiness have separate contracts.
+const ReviewCostSchema = z.string().refine((value) => {
+  if (!/^-?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?$/.test(value)) return false;
+  const [mantissa, exponent = "0"] = value.toLowerCase().split("e");
+  const scale = (mantissa.split(".")[1]?.length ?? 0) - Number(exponent);
+  return scale <= 6 && Number.isFinite(Number(value)) && Number(value) >= 0 && Number(value) <= 1_000_000;
+}, "审查预算须为 0 至 1000000 的十进制字符串，最多六位小数。");
+const ApprovalReviewConfigSchema = z.object({
+  schema_version: z.literal(1).default(1),
+  engine: z.enum(["rules", "rules_then_model"]).default("rules"),
+  reviewer_logical_model: z.string().regex(/^[a-z0-9][a-z0-9_-]{0,127}$/, "审查模型 alias 格式无效。").nullable().default(null),
+  require_distinct_model: z.boolean().default(false),
+  timeout_seconds: z.number({ error: "审查超时须为有效数字。" }).min(1, "审查超时须在 1 至 60 秒之间。").max(60, "审查超时须在 1 至 60 秒之间。").default(15),
+  max_input_tokens: z.number({ error: "输入 token 上限须为有效数字。" }).int("输入 token 上限须为整数。").min(1, "输入 token 上限至少为 1。").max(1_000_000, "输入 token 上限不能超过 1000000。").default(4096),
+  max_output_tokens: z.number({ error: "输出 token 上限须为有效数字。" }).int("输出 token 上限须为整数。").min(1, "输出 token 上限至少为 1。").max(1_000_000, "输出 token 上限不能超过 1000000。").default(512),
+  max_reviews_per_run: z.number({ error: "审查次数须为有效数字。" }).int("审查次数须为整数。").min(1, "审查次数至少为 1。").max(Number.MAX_SAFE_INTEGER, "审查次数不能超过安全整数范围。").default(8),
+  max_transport_attempts_per_review: z.literal(1).default(1),
+  max_cost_usd_per_run: ReviewCostSchema.default("0.00"),
+  denial_breaker_consecutive: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER).default(3),
+  denial_breaker_denials: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER).default(10),
+  denial_breaker_window: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER).default(50),
+}).strict().superRefine((value, context) => {
+  if (value.engine === "rules_then_model" && !value.reviewer_logical_model) context.addIssue({ code: "custom", message: "请选择已有审查模型 alias。" });
+  if (value.engine === "rules_then_model" && Number(value.max_cost_usd_per_run) <= 0) context.addIssue({ code: "custom", message: "独立模型审查预算必须大于 0。" });
+  if (value.denial_breaker_consecutive > value.denial_breaker_denials || value.denial_breaker_denials > value.denial_breaker_window) context.addIssue({ code: "custom", message: "拒绝熔断限制须满足：连续次数 ≤ 拒绝次数 ≤ 窗口大小。" });
+});
+export type ApprovalReviewConfig = z.infer<typeof ApprovalReviewConfigSchema>;
+export function defaultApprovalReview(): ApprovalReviewConfig { return ApprovalReviewConfigSchema.parse({}); }
+export function validateApprovalReview(value: unknown): ApprovalReviewConfig {
+  const parsed = ApprovalReviewConfigSchema.safeParse(value);
+  if (!parsed.success) throw new Error(parsed.error.issues[0]?.message ?? "审查配置无效。");
+  return parsed.data;
+}
+const ApprovalReviewReadinessSchema = z.object({
+  status: z.enum(["ready", "not_ready"]), reason_code: z.string(), supported_scope: z.array(z.string()).optional(),
+});
+
 const SystemSettingsSchema = z.object({
+  approval_review: ApprovalReviewConfigSchema.nullish().transform((value) => value ?? defaultApprovalReview()),
+  approval_review_readiness: ApprovalReviewReadinessSchema.optional().catch(undefined),
   default_mode: z.enum(["auto", "direct", "dispatch", "discuss", "hybrid"]),
   default_workflow_id: z.string().nullable(),
   default_execution_backend: z
@@ -284,7 +323,14 @@ const SystemSettingsSchema = z.object({
     .catch(null),
 });
 
-export type SystemSettings = z.infer<typeof SystemSettingsSchema>;
+// Optional additions keep typed legacy fixtures/callers compatible. GETs normalize configuration.
+export type SystemSettings = Omit<z.infer<typeof SystemSettingsSchema>, "approval_review" | "approval_review_readiness"> & {
+  approval_review?: ApprovalReviewConfig;
+  approval_review_readiness?: z.infer<typeof ApprovalReviewReadinessSchema>;
+};
+const SystemSettingsWriteSchema = SystemSettingsSchema.omit({
+  supported_permission_modes: true, approval_review_readiness: true, plugin_package_subprocess_registration_status: true,
+});
 
 const ExecutionBackendSchema = z.object({
   id: z.enum(["systemd", "docker", "ssh", "modal", "daytona", "vercel"]),
@@ -2616,7 +2662,8 @@ export const api = {
     );
   },
   updateSettings(payload: SystemSettings): Promise<SystemSettings> {
-    const { supported_permission_modes, default_permission_mode, default_sandbox_profile, ...legacy } = payload;
+    const { default_permission_mode, default_sandbox_profile, ...legacy } = SystemSettingsWriteSchema.parse(payload);
+    const supported_permission_modes = payload.supported_permission_modes;
     const body = supported_permission_modes.length > 0
       ? { ...legacy, default_permission_mode, default_sandbox_profile }
       : legacy;
