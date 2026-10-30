@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import ExitStack, asynccontextmanager, nullcontext
 from contextvars import Context, copy_context
 from typing import TYPE_CHECKING
 
 from agent_hub.auth.models import Role
 from agent_hub.runtime.contracts import ExecutionRuntime, RunEvent, TaskContext, _freeze_object
-from agent_hub.runtime.streams import closing_runtime_events
+from agent_hub.runtime.streams import _protect_runtime_stream_owner, closing_runtime_events
 
 if TYPE_CHECKING:
     from agent_hub.runtime.review_assembly import ReviewAssemblyBroker
@@ -20,6 +20,8 @@ if TYPE_CHECKING:
 async def _scoped_events(
     stream: AsyncIterator[RunEvent],
     scope: Context,
+    *,
+    cancel: Callable[[], Awaitable[None]] | None = None,
 ) -> AsyncIterator[AsyncIterator[RunEvent]]:
     # One demand produces one advancement. Actual adapter streams bind their
     # consumer Task as well as Context; neither may change between yields.
@@ -27,6 +29,7 @@ async def _scoped_events(
     requests: asyncio.Queue[asyncio.Future[Reply] | None] = asyncio.Queue(maxsize=1)
     pending: asyncio.Future[Reply] | None = None
     advancing = False
+    closing = False
 
     async def consume() -> None:
         nonlocal advancing
@@ -48,6 +51,8 @@ async def _scoped_events(
                     advancing = False
                 if not reply.done():
                     reply.set_result((event, None))
+                if closing:
+                    return
         finally:
             try:
                 close = getattr(stream, "aclose", None)
@@ -79,26 +84,43 @@ async def _scoped_events(
         async with closing_runtime_events(events()) as forwarding:
             yield forwarding
     finally:
-        # Cancel the owner at most once, then drain its same-Task finalizer.
-        # Repeated caller cancellation must not abandon privileged cleanup.
+        # anext can already be inside an awaited natural/error finalizer. Never
+        # inject cancellation into its owner. The runtime's own cancellation
+        # protocol stops live work; the owner alone advances/closes its stream.
+        closing = True
         caller = asyncio.current_task()
         cancellations = 0 if caller is None else caller.cancelling()
+        stopping: asyncio.Task[None] | None = None
         if not owner.done():
             if advancing:
-                owner.cancel()
+                if cancel is not None:
+
+                    async def stop_work() -> None:
+                        # Advancement may finish before this callback starts.
+                        # In that case the owner closes itself via closing=True.
+                        if advancing and not owner.done():
+                            with _protect_runtime_stream_owner(owner):
+                                await cancel()
+
+                    stopping = asyncio.create_task(
+                        stop_work(), context=scope.copy(), name="worker-runtime-cancel"
+                    )
             else:
                 # Even an unstarted owner must close an eagerly created stream.
                 # Dropping an unprocessed demand never advances/prefetches it.
                 if not requests.empty():
                     requests.get_nowait()
                 requests.put_nowait(None)
-        while not owner.done():
+        tasks = (owner,) if stopping is None else (owner, stopping)
+        drained = asyncio.gather(*tasks, return_exceptions=True)
+        while not drained.done():
             try:
-                await asyncio.shield(owner)
+                await asyncio.shield(drained)
             except asyncio.CancelledError:
                 pass
-        if not owner.cancelled():
-            owner.result()
+        for task in tasks:
+            if not task.cancelled():
+                task.result()
         if caller is not None and caller.cancelling() > cancellations:
             raise asyncio.CancelledError
 
@@ -181,7 +203,20 @@ async def worker_runtime_events(
 
         try:
             stream = scope.run(enter)
-            async with _scoped_events(stream, scope) as events:
+            owned_cancel = getattr(runtime, "cancel_run_owned", None)
+            cancel = getattr(runtime, "cancel", None)
+
+            async def stop_runtime() -> None:
+                if callable(owned_cancel):
+                    await owned_cancel(context.run_id, context.execution_token)
+                elif callable(cancel):
+                    await cancel()
+
+            async with _scoped_events(
+                stream,
+                scope,
+                cancel=stop_runtime if callable(owned_cancel) or callable(cancel) else None,
+            ) as events:
                 yield events
         finally:
             scope.run(stack.close)

@@ -1,9 +1,29 @@
 """Deterministic closure for single-execution runtime event streams."""
 
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+import asyncio
+from collections.abc import AsyncIterator, Iterator
+from contextlib import asynccontextmanager, contextmanager
+from contextvars import ContextVar
 
 from agent_hub.runtime.contracts import RunEvent
+
+_protected_owner: ContextVar[asyncio.Task[None] | None] = ContextVar(
+    "runtime_cancel_protected_stream_owner", default=None
+)
+
+
+@contextmanager
+def _protect_runtime_stream_owner(owner: asyncio.Task[None]) -> Iterator[None]:
+    """A cancellation callback may stop work while its driver drains naturally."""
+    token = _protected_owner.set(owner)
+    try:
+        yield
+    finally:
+        _protected_owner.reset(token)
+
+
+def _is_protected_stream_owner(task: object) -> bool:
+    return task is not None and task is _protected_owner.get()
 
 
 @asynccontextmanager

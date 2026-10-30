@@ -417,11 +417,16 @@ async def test_actual_adapter_stream_retains_one_consumer_task(tmp_path, mode, a
 async def test_worker_owner_cancellation_drains_same_task_finalizer_without_prefetch(tmp_path):
     f = await fixture(tmp_path)
     entered, finalizing, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    cancel_work = asyncio.Event()
     observed, counts = [], []
     local = ContextVar("owner_local", default="outside")
     before = asyncio.all_tasks()
 
     class Runtime:
+        async def cancel(self):
+            # Match ExecutionRuntime's work-cancellation protocol, not owner.cancel().
+            cancel_work.set()
+
         async def run(self, context):
             token = local.set("inside")
             owner, budget = asyncio.current_task(), _run_budget.get()
@@ -436,7 +441,7 @@ async def test_worker_owner_cancellation_drains_same_task_finalizer_without_pref
                 )
                 counts.append(2)
                 entered.set()
-                await asyncio.Event().wait()
+                await cancel_work.wait()
             finally:
                 assert asyncio.current_task() is owner and local.get() == "inside"
                 finalizing.set()
@@ -515,6 +520,403 @@ async def test_worker_scope_failure_closes_and_revokes_without_background_task(t
             await anext(events)
     assert not seen[0]._active and _run_budget.get() is None
     assert not (asyncio.all_tasks() - before)
+
+
+@pytest.mark.parametrize("terminal", ["eof", "error"])
+async def test_natural_finalizer_survives_first_caller_cancel(tmp_path, terminal):
+    """Unmodified AsyncIterator contract: cancellation cannot infer its phase."""
+    f = await fixture(tmp_path)
+    started, release, completed = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    observed = []
+    before = asyncio.all_tasks()
+
+    class Runtime:
+        async def run(self, context):
+            owner, budget = asyncio.current_task(), _run_budget.get()
+            observed.append((owner, budget))
+            try:
+                yield RunEvent(
+                    kind="runtime.first", sequence=1, run_id=context.run_id, payload={"first": True}
+                )
+                if terminal == "error":
+                    raise ValueError("terminal")
+            finally:
+                started.set()
+                await release.wait()
+                assert asyncio.current_task() is owner and _run_budget.get() is budget
+                assert budget._active
+                completed.set()
+
+    async def driver():
+        async with worker_runtime_events(
+            Runtime(), f.s.task, worker_id=f.s.budget.lease.worker_id, review_broker=f.broker
+        ) as events:
+            await anext(events)
+            await anext(events)
+
+    task = asyncio.create_task(driver())
+    try:
+        await asyncio.wait_for(started.wait(), 3)
+        owner, budget = observed[0]
+        task.cancel()
+        for _ in range(4):
+            await asyncio.sleep(0)
+        assert not owner.done(), "first caller cancel truncated a finalizer already in progress"
+        assert not completed.is_set() and not task.done() and budget._active
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert completed.is_set() and owner.done() and not budget._active
+        assert _run_budget.get() is None and not (asyncio.all_tasks() - before)
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.parametrize("mode", [TaskMode.DIRECT, TaskMode.DISCUSS, TaskMode.HYBRID])
+async def test_actual_direct_cancel_stops_http_but_drains_network_cleanup(tmp_path, mode):
+    from agent_hub.db.models import RunAdmissionAttemptRow
+    from agent_hub.runtime.autogen.adapter import (
+        AutoGenDiscussionRuntime,
+        DiscussionParticipant,
+        DiscussionPlan,
+    )
+    from agent_hub.runtime.crew.adapter import CrewDispatchRuntime
+    from agent_hub.runtime.crew.plan import AgentSpec, DispatchPlan, DispatchStep
+    from agent_hub.runtime.defaults import _gateway_for_config
+    from agent_hub.runtime.direct import DirectRuntime
+    from agent_hub.runtime.hybrid import HybridRuntime
+
+    f = await fixture(tmp_path, mode=mode)
+    entered, cleanup, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    budgets, cancel_calls = [], []
+
+    async def handler(request):
+        budgets.append(_run_budget.get())
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cleanup.set()
+            await release.wait()
+            assert _run_budget.get() is budgets[0] and budgets[0]._active
+        raise AssertionError("cancelled HTTP must not return a response")
+
+    gateway, _, _ = await _gateway_for_config(
+        f.state.platform,
+        tenant_id=f.s.task.tenant_id,
+        secret_service=f.secrets,
+        capacity_factory=f.capacity,
+        transport=LiteLLMClient(_network_delegate_factory=lambda: httpx.MockTransport(handler)),
+    )
+    direct = DirectRuntime(gateway, logical_model="primary")
+    discussion = AutoGenDiscussionRuntime(
+        gateway,
+        DiscussionPlan(
+            participants=tuple(
+                DiscussionParticipant(name, name, "Reply", "primary")
+                for name in ("analyst", "critic")
+            ),
+            selector_model="primary",
+            token_budget=20000,
+            wall_time_seconds=10,
+        ),
+    )
+    dispatch = CrewDispatchRuntime(
+        gateway,
+        DispatchPlan(
+            agents=(AgentSpec(id="writer", role="Writer", goal="Reply", logical_model="primary"),),
+            steps=(
+                DispatchStep(
+                    id="reply",
+                    agent="writer",
+                    task="Reply",
+                    final_synthesizer=True,
+                    timeout_seconds=10,
+                ),
+            ),
+            total_token_budget=20000,
+            total_timeout_seconds=10,
+        ),
+    )
+    runtime = {
+        TaskMode.DIRECT: direct,
+        TaskMode.DISCUSS: discussion,
+        TaskMode.HYBRID: HybridRuntime(dispatch, discussion, direct),
+    }[mode]
+    original_cancel = runtime.cancel
+
+    async def cancel():
+        cancel_calls.append(_run_budget.get())
+        await original_cancel()
+
+    runtime.cancel = cancel  # Delegating spy; actual runtime/stream/cancel implementation remain.
+    context = f.s.task.model_copy(update={"token_budget": 20000, "timeout_seconds": 10.0})
+    before = asyncio.all_tasks()
+
+    async def driver():
+        async with worker_runtime_events(
+            runtime, context, worker_id=f.s.budget.lease.worker_id, review_broker=f.broker
+        ) as events:
+            async for _ in events:
+                pass
+
+    task = asyncio.create_task(driver())
+    try:
+        await asyncio.wait_for(entered.wait(), 3)
+        owner = next(
+            t for t in asyncio.all_tasks() - before if t.get_name() == "worker-runtime-owner"
+        )
+        task.cancel()
+        await asyncio.wait_for(cleanup.wait(), 3)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done() and not owner.done() and owner.cancelling() == 0
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        # Hybrid's coordinator can start HTTP while the owner is between event
+        # demands; that path closes in the owner without a cancel callback.
+        assert len(cancel_calls) <= 1 and all(b is budgets[0] for b in cancel_calls)
+        if mode is not TaskMode.HYBRID:
+            assert cancel_calls == [budgets[0]]
+        assert not budgets[0]._active
+        assert (
+            getattr(runtime, "_active_stream", None) is None
+            and getattr(runtime, "_active_task", None) is None
+            and owner.done()
+        )
+        attempts = [r for r in f.db.rows if type(r) is RunAdmissionAttemptRow]
+        assert len(attempts) == 1 and attempts[0].state == "unknown"
+        pool = await RunAdmissionRepository(f.db).get_pool(context.tenant_id, context.run_id)
+        assert pool.token_charged == 10000
+        assert pool.original_deadline == budgets[0]._pool.original_deadline
+        assert not (asyncio.all_tasks() - before)
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.parametrize("mode", ["discuss", "hybrid"])
+async def test_actual_cancel_protocol_does_not_cancel_finalizing_owner(tmp_path, mode):
+    """Actual cancel methods around a barrier probe, not a native adapter run."""
+    from autogen_core import CancellationToken
+
+    from agent_hub.runtime.autogen.adapter import (
+        AutoGenDiscussionRuntime,
+        DiscussionParticipant,
+        DiscussionPlan,
+    )
+    from agent_hub.runtime.crew.adapter import CrewDispatchRuntime
+    from agent_hub.runtime.crew.plan import AgentSpec, DispatchPlan, DispatchStep
+    from agent_hub.runtime.direct import DirectRuntime
+    from agent_hub.runtime.hybrid import HybridRuntime
+
+    f = await fixture(tmp_path)
+    discussion = AutoGenDiscussionRuntime(
+        object(),
+        DiscussionPlan(
+            participants=tuple(
+                DiscussionParticipant(name, name, "Reply", "primary")
+                for name in ("analyst", "critic")
+            ),
+            selector_model="primary",
+        ),
+    )
+    discussion._cancel_token, discussion._cancel_event = CancellationToken(), asyncio.Event()
+    direct = DirectRuntime(object(), logical_model="primary")
+    dispatch = CrewDispatchRuntime(
+        object(),
+        DispatchPlan(
+            agents=(AgentSpec(id="writer", role="Writer", goal="Reply", logical_model="primary"),),
+            steps=(DispatchStep(id="reply", agent="writer", task="Reply", final_synthesizer=True),),
+        ),
+    )
+    actual = discussion if mode == "discuss" else HybridRuntime(dispatch, discussion, direct)
+    started, release, completed = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    seen = []
+    before = asyncio.all_tasks()
+
+    class Probe:
+        async def cancel(self):
+            await actual.cancel()
+
+        async def run(self, context):
+            owner = asyncio.current_task()
+            actual._active_task = discussion._active_task = owner
+            if mode == "hybrid":
+                actual._active_child = discussion
+            seen.append(owner)
+            try:
+                yield RunEvent(
+                    kind="runtime.probe", sequence=1, run_id=context.run_id, payload={"probe": True}
+                )
+            finally:
+                started.set()
+                await release.wait()
+                assert asyncio.current_task() is owner
+                completed.set()
+
+    async def driver():
+        async with worker_runtime_events(
+            Probe(), f.s.task, worker_id=f.s.budget.lease.worker_id, review_broker=f.broker
+        ) as events:
+            await anext(events)
+            await anext(events)
+
+    task = asyncio.create_task(driver())
+    try:
+        await asyncio.wait_for(started.wait(), 3)
+        task.cancel()
+        await asyncio.wait_for(discussion._cancel_event.wait(), 3)
+        assert not task.done() and not seen[0].done() and seen[0].cancelling() == 0
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert completed.is_set() and seen[0].done()
+        assert not (asyncio.all_tasks() - before)
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_worker_cancel_targets_original_owned_run_only(tmp_path):
+    f = await fixture(tmp_path)
+    entered, stop = asyncio.Event(), asyncio.Event()
+    seen = []
+
+    class Runtime:
+        async def cancel(self):
+            raise AssertionError("shared factory cancel-all must not be called")
+
+        async def cancel_run_owned(self, run_id, execution_token):
+            seen.append((run_id, execution_token, _run_budget.get()))
+            stop.set()
+
+        async def run(self, context):
+            entered.set()
+            await stop.wait()
+            yield RunEvent(kind="runtime.cancelled", sequence=1, run_id=context.run_id)
+
+    async def driver():
+        async with worker_runtime_events(
+            Runtime(), f.s.task, worker_id=f.s.budget.lease.worker_id, review_broker=f.broker
+        ) as events:
+            await anext(events)
+
+    task = asyncio.create_task(driver())
+    await asyncio.wait_for(entered.wait(), 3)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert len(seen) == 1 and seen[0][:2] == (f.s.task.run_id, f.s.task.execution_token)
+    assert not seen[0][2]._active and _run_budget.get() is None
+
+
+@pytest.mark.parametrize("mode", ["discuss", "hybrid"])
+async def test_legacy_cancel_keeps_unguarded_task_cancellation(mode):
+    from agent_hub.runtime.autogen.adapter import (
+        AutoGenDiscussionRuntime,
+        DiscussionParticipant,
+        DiscussionPlan,
+    )
+    from agent_hub.runtime.crew.adapter import CrewDispatchRuntime
+    from agent_hub.runtime.crew.plan import AgentSpec, DispatchPlan, DispatchStep
+    from agent_hub.runtime.direct import DirectRuntime
+    from agent_hub.runtime.hybrid import HybridRuntime
+    from agent_hub.runtime.streams import _is_protected_stream_owner
+
+    discussion = AutoGenDiscussionRuntime(
+        object(),
+        DiscussionPlan(
+            participants=tuple(
+                DiscussionParticipant(name, name, "Reply", "primary")
+                for name in ("analyst", "critic")
+            ),
+            selector_model="primary",
+        ),
+    )
+    if mode == "hybrid":
+        dispatch = CrewDispatchRuntime(
+            object(),
+            DispatchPlan(
+                agents=(
+                    AgentSpec(id="writer", role="Writer", goal="Reply", logical_model="primary"),
+                ),
+                steps=(
+                    DispatchStep(id="reply", agent="writer", task="Reply", final_synthesizer=True),
+                ),
+            ),
+        )
+        actual = HybridRuntime(
+            dispatch, discussion, DirectRuntime(object(), logical_model="primary")
+        )
+    else:
+        actual = discussion
+    entered = asyncio.Event()
+
+    async def waiting():
+        entered.set()
+        await asyncio.Event().wait()
+
+    task = asyncio.create_task(waiting())
+    actual._active_task = task
+    try:
+        await entered.wait()
+        assert not _is_protected_stream_owner(task)
+        await actual.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    finally:
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_legacy_none_worker_path_does_not_install_cancel_owner_or_budget(tmp_path):
+    f = await fixture(tmp_path)
+    context = f.s.task.model_copy(
+        update={
+            "routing_decision": {
+                key: value
+                for key, value in f.s.task.routing_decision.items()
+                if key != "approval_review_profile"
+            }
+        }
+    )
+    observed = []
+    caller = asyncio.current_task()
+    before = asyncio.all_tasks()
+
+    class Runtime:
+        async def cancel(self):
+            raise AssertionError("legacy stream must keep its existing close path")
+
+        async def run(self, context):
+            try:
+                observed.append((asyncio.current_task(), _run_budget.get()))
+                yield RunEvent(
+                    kind="runtime.legacy",
+                    sequence=1,
+                    run_id=context.run_id,
+                    payload={"legacy": True},
+                )
+            finally:
+                observed.append((asyncio.current_task(), _run_budget.get()))
+
+    async with worker_runtime_events(
+        Runtime(), context, worker_id=f.s.budget.lease.worker_id, review_broker=f.broker
+    ) as events:
+        await anext(events)
+    assert observed == [(caller, None), (caller, None)]
+    assert not (asyncio.all_tasks() - before)
+    assert await RunAdmissionRepository(f.db).get_pool(context.tenant_id, context.run_id) is None
 
 
 def evidence_document(f):

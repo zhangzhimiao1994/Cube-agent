@@ -172,6 +172,7 @@ from agent_hub.runtime.self_repair_context import (
     self_repair_context_text,
 )
 from agent_hub.runtime.source_preview_projection import project_source_preview
+from agent_hub.runtime.streams import _is_protected_stream_owner
 from agent_hub.subprocess_cleanup import ProcessCleanupIncomplete
 
 _ID = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,127}$")
@@ -5003,7 +5004,10 @@ class AutoGenDiscussionRuntime:
         cancel_event = self._cancel_event
         if cancel_event is not None:
             cancel_event.set()
-        if task is not None and task is not asyncio.current_task():
+        if (
+            task is not None and task is not asyncio.current_task()
+            and not _is_protected_stream_owner(task)
+        ):
             task.cancel()
 
 

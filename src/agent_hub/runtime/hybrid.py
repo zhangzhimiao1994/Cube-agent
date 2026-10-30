@@ -50,7 +50,7 @@ from agent_hub.runtime.generated_file_recovery import (
     final_attachment_text_conflicts,
 )
 from agent_hub.runtime.model_scope import validate_model_scope_artifact, validate_model_scope_parts
-from agent_hub.runtime.streams import closing_runtime_events
+from agent_hub.runtime.streams import _is_protected_stream_owner, closing_runtime_events
 from agent_hub.runtime.token_budget import (
     TokenBudgetExhausted,
     TokenBudgetSource,
@@ -1225,7 +1225,10 @@ class HybridRuntime:
         if child is not None:
             await child.cancel()
         task = self._active_task
-        if task is not None and task is not asyncio.current_task():
+        if (
+            task is not None and task is not asyncio.current_task()
+            and not _is_protected_stream_owner(task)
+        ):
             task.cancel()
 
 
