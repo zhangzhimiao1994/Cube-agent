@@ -13,6 +13,7 @@ import json
 import os
 import re
 import sys
+from collections.abc import Mapping
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -42,7 +43,7 @@ from agent_hub.runs.repository import RunRepository
 from agent_hub.runs.workspace import workspace_selection
 from agent_hub.runtime.artifacts import InMemoryArtifactRepository
 from agent_hub.runtime.autogen.adapter import AutoGenDiscussionRuntime
-from agent_hub.runtime.contracts import Artifact, EventKind, RunEvent
+from agent_hub.runtime.contracts import Artifact, EventKind, RunEvent, RuntimeCheckpoint
 from agent_hub.runtime.crew.adapter import CrewAIObjectFactory, CrewDispatchRuntime
 from agent_hub.runtime.direct import DirectRuntime
 from agent_hub.runtime.hybrid import HybridRuntime
@@ -224,6 +225,51 @@ def _assert_delivery_text(text, path):
     assert re.search(r"[A-Za-z\u4e00-\u9fff]{2,}", text.replace(path, "")), "missing readable reply"
 
 
+def _hybrid_discussion_completion(events):
+    """Hybrid publishes child terminal checkpoints and stage advances, not discussion.completed."""
+    boundaries = [event for event in events if event.kind is EventKind.CHECKPOINT_SAVED
+        and event.checkpoint is not None and event.checkpoint.runtime_type == "hybrid"
+        and event.checkpoint.state.get("terminal") is False
+        and event.checkpoint.state.get("child_checkpoint") is None]
+    assert [event.checkpoint.state.get("next_stage") for event in boundaries] == [1, 2, 3]
+    dispatch_end, discussion_end, synthesis_end = boundaries
+    starts = [event for event in events if event.kind is EventKind.DISCUSSION_STARTED]
+    assert len(starts) == 1
+    start = starts[0]
+    terminals = [event for event in events if event.kind is EventKind.CHECKPOINT_SAVED
+        and event.checkpoint is not None and event.checkpoint.runtime_type == "hybrid"
+        and event.checkpoint.state.get("next_stage") == 1
+        and isinstance(event.checkpoint.state.get("child_checkpoint"), Mapping)
+        and event.checkpoint.state["child_checkpoint"].get("runtime_type") == "autogen"
+        and event.checkpoint.state["child_checkpoint"].get("state", {}).get("terminal") is True]
+    assert len(terminals) == 1, "missing actual terminal AutoGen child checkpoint"
+    terminal = terminals[0]
+    assert dispatch_end.sequence < start.sequence < terminal.sequence < discussion_end.sequence
+    assert discussion_end.sequence < synthesis_end.sequence
+    messages = [event for event in events if event.kind is EventKind.MESSAGE_CREATED
+        and start.sequence < event.sequence < terminal.sequence]
+    outputs = [event for event in events if event.kind is EventKind.ARTIFACT_CREATED
+        and event.artifact is not None and event.artifact.type == "text"
+        and event.artifact.producer in start.participants
+        and start.sequence < event.sequence < terminal.sequence]
+    assert messages and outputs, "missing executed discussion output"
+    message, output = messages[-1], outputs[-1]
+    assert message.actor == output.artifact.producer
+    assert message.message == output.artifact.content.get("text")
+    assert message.sequence < output.sequence < terminal.sequence
+    for checkpoint_event in (terminal, discussion_end):
+        registry = checkpoint_event.checkpoint.state.get("output_artifact_registry", {})
+        assert registry.get(str(output.artifact.id)) == output.artifact.content_sha256
+    syntheses = [event for event in events if event.kind is EventKind.ARTIFACT_CREATED
+        and event.artifact is not None and event.artifact.type == "text"
+        and event.artifact.producer == "main"
+        and discussion_end.sequence < event.sequence < synthesis_end.sequence]
+    assert len(syntheses) == 1, "missing executed synthesis output"
+    final = syntheses[0].artifact
+    assert synthesis_end.checkpoint.state["output_artifact_registry"].get(str(final.id)) == final.content_sha256
+    return discussion_end
+
+
 def _assert_final_delivery(events, mode, path):
     """Select actual adapter delivery, never tool/model evidence or generic done."""
     assert events and events[-1].kind is EventKind.RUNTIME_COMPLETED
@@ -238,6 +284,7 @@ def _assert_final_delivery(events, mode, path):
     assert deliveries, "missing public final artifact"
     final_event = deliveries[-1]
     final = final_event.artifact
+    _assert_delivery_text(final.content.get("text"), path)
     if mode is TaskMode.DISPATCH:
         assert len(events[-1].inputs) == 1, "missing terminal delivery reference"
         terminal = events[-1].inputs[0]
@@ -263,10 +310,8 @@ def _assert_final_delivery(events, mode, path):
         )
     else:
         assert mode is TaskMode.HYBRID and final.producer == "main", "missing synthesis final"
-        completions = [event for event in events if event.kind == "discussion.completed"]
-        assert len(completions) == 1 and completions[0].sequence < final_event.sequence
-    text = final.content.get("text")
-    _assert_delivery_text(text, path)
+        completion = _hybrid_discussion_completion(events)
+        assert completion.sequence < final_event.sequence
     return final
 
 
@@ -316,7 +361,8 @@ def _assert_execution_observed(events, wire, mode):
         for event in events
         if event.kind is EventKind.STEP_COMPLETED and event.step_id == "final_response_step"
     ]
-    discussions = [event for event in events if event.kind == "discussion.completed"]
+    discussions = ([_hybrid_discussion_completion(events)] if mode is TaskMode.HYBRID else
+        [event for event in events if event.kind == "discussion.completed"])
     syntheses = [
         event
         for event in events
@@ -978,23 +1024,39 @@ def _local_delivery_events(mode, *, defect=None):
         content={"text": text},
     )
     if defect != "missing":
-        if mode is TaskMode.DISCUSS:
-            emit(EventKind.MESSAGE_CREATED, actor=artifact.producer, message=text)
-        emit(EventKind.ARTIFACT_CREATED, artifact=artifact)
-        if mode is TaskMode.DISPATCH:
-            emit(
-                EventKind.STEP_COMPLETED,
-                step_id="final_response_step",
-                actor=artifact.producer,
-                inputs=(artifact,),
-            )
-        elif mode is TaskMode.DISCUSS:
-            emit("discussion.completed", payload={"summary": text})
+        if mode is TaskMode.HYBRID:
+            # Synthetic assertion inputs mirror the real public checkpoint schema.
+            discussion_artifact = Artifact(id=uuid4(), type="text", producer="critic",
+                content={"text": "Discussion finished."})
+            registry = {str(discussion_artifact.id): discussion_artifact.content_sha256}
+            def boundary(stage, child=None):
+                checkpoint = RuntimeCheckpoint(id=uuid4(), runtime_type="hybrid", runtime_version="3",
+                    run_id=run_id, tenant_id=run_id, mode=mode, state={"terminal": False,
+                        "next_stage": stage, "child_checkpoint": child,
+                        "output_artifact_registry": dict(registry)})
+                emit(EventKind.CHECKPOINT_SAVED, checkpoint=checkpoint)
+            emit(EventKind.STEP_COMPLETED, step_id="final_response_step", actor="final_synthesizer")
+            boundary(1)
+            emit(EventKind.DISCUSSION_STARTED, actor="analyst", session_id=str(run_id),
+                participants=("analyst", "critic"))
+            emit(EventKind.MESSAGE_CREATED, actor="critic", message="Discussion finished.")
+            emit(EventKind.ARTIFACT_CREATED, artifact=discussion_artifact)
+            child = RuntimeCheckpoint(id=uuid4(), runtime_type="autogen", runtime_version="1",
+                run_id=run_id, tenant_id=run_id, mode=TaskMode.DISCUSS, state={"terminal": True})
+            boundary(1, child.to_payload())
+            boundary(2)
+            emit(EventKind.ARTIFACT_CREATED, artifact=artifact)
+            registry[str(artifact.id)] = artifact.content_sha256
+            boundary(3)
         else:
-            # Earlier discussion text is never the Hybrid final synthesis.
-            discussion = events.pop()
-            emit("discussion.completed", payload={"summary": "Discussion finished."})
-            emit(EventKind.ARTIFACT_CREATED, artifact=discussion.artifact)
+            if mode is TaskMode.DISCUSS:
+                emit(EventKind.MESSAGE_CREATED, actor=artifact.producer, message=text)
+            emit(EventKind.ARTIFACT_CREATED, artifact=artifact)
+            if mode is TaskMode.DISPATCH:
+                emit(EventKind.STEP_COMPLETED, step_id="final_response_step",
+                    actor=artifact.producer, inputs=(artifact,))
+            else:
+                emit("discussion.completed", payload={"summary": text})
     emit(
         EventKind.RUNTIME_COMPLETED,
         inputs=(artifact,) if mode is TaskMode.DISPATCH and defect != "missing" else (),
@@ -1003,7 +1065,7 @@ def _local_delivery_events(mode, *, defect=None):
         events = [
             event
             for event in events
-            if event.kind not in (EventKind.STEP_COMPLETED, "discussion.completed")
+            if event.kind not in (EventKind.STEP_COMPLETED, EventKind.CHECKPOINT_SAVED, "discussion.completed")
         ]
     elif defect == "dropped_final_event":
         events = [event for event in events if event.kind is not EventKind.ARTIFACT_CREATED]
@@ -1014,7 +1076,7 @@ def _local_delivery_events(mode, *, defect=None):
 async def test_action_mode_final_delivery_accepts_actual_adapter_contract(mode):
     events = _local_delivery_events(mode)
     final = _assert_final_delivery(events, mode, "synthetic-note.txt")
-    assert final.id == next(event.artifact.id for event in events if event.artifact)
+    assert final.id == [event.artifact.id for event in events if event.artifact][-1]
 
 
 @pytest.mark.parametrize("text", ["", "   ", "synthetic-note.txt", "Saved synthetic-note.txt.bak"])
@@ -1106,26 +1168,7 @@ async def test_action_mode_wire_text_preserves_schema_and_filename(stream, struc
 @pytest.mark.parametrize("defect", ["missing_wire_stage", "missing_lifecycle", "wrong_wire_order"])
 async def test_action_mode_hybrid_execution_requires_wire_and_lifecycle(defect):
     # Synthetic assertion-input contract only, never substitute these for native events.
-    run = uuid4()
-    artifact = Artifact(
-        id=uuid4(), type="text", producer="main", content={"text": "Saved synthetic-note.txt."}
-    )
-    events = [
-        RunEvent(
-            kind=EventKind.STEP_COMPLETED,
-            sequence=1,
-            run_id=run,
-            step_id="final_response_step",
-            actor="final_synthesizer",
-        ),
-        RunEvent(
-            kind="discussion.completed",
-            sequence=2,
-            run_id=run,
-            payload={"summary": "Discussion finished."},
-        ),
-        RunEvent(kind=EventKind.ARTIFACT_CREATED, sequence=3, run_id=run, artifact=artifact),
-    ]
+    events = _local_delivery_events(TaskMode.HYBRID)
     attempts = {
         uuid4(): {"stage": stage, "purpose": "primary", "physical_transport_id": str(uuid4())}
         for stage in ("dispatch", "discuss", "synthesis")
@@ -1267,3 +1310,84 @@ async def test_action_mode_current_discussion_actor_binding_allows_only_scoped_r
 
 async def test_action_mode_fixture_enforces_distinct_model_policy():
     assert _action_review_config().require_distinct_model is True
+
+
+async def test_action_mode_real_hybrid_events_match_delivery_contract(tmp_path, record_property):
+    """Real factories/adapters/SDK wire; local lifecycle proof, no action/PG proof."""
+    from agent_hub.runtime.contracts import TaskContext
+    from tests.unit.runtime.test_configured_runtime import ImmediateCapacity
+
+    platform = fixture_platform()
+    context = TaskContext(run_id=uuid4(), tenant_id=uuid4(), mode=TaskMode.HYBRID,
+        request="Return a bounded note summary naming synthetic-note.txt.",
+        timeout_seconds=30, token_budget=1000000)
+    artifacts = InMemoryArtifactRepository()
+    text_wire = ActionWire(None, "synthetic-note.txt", "synthetic")
+    stages, actual_adapters, child_events = [], [], []
+
+    class Configs:
+        async def get_current(self, tenant):
+            assert tenant == context.tenant_id
+            return SimpleNamespace(version=1, document=platform.model_dump(mode="json"))
+
+    async def capacity(tenant, deployments):
+        assert tenant == context.tenant_id
+        return ImmediateCapacity(deployments)
+
+    async def wire(request):
+        stage, adapter = _executing_adapter(runtime)
+        stages.append(stage)
+        actual_adapters.append(type(adapter))
+        payload = json.loads(request.content)
+        raw, content_type = _wire_reply(payload, text=text_wire.primary_text_for(payload))
+        return httpx.Response(200, headers={"content-type": content_type}, content=raw)
+
+    # Observe original AutoGen output without replacing or manufacturing events.
+    original_run = AutoGenDiscussionRuntime.run
+    async def observe_discussion(adapter, child_context):
+        async for event in original_run(adapter, child_context):
+            child_events.append(event)
+            yield event
+
+    # Real production construction remains untouched.
+    runtime = FACTORIES[TaskMode.HYBRID](config_service=Configs(),
+        secret_service=FixtureSecrets(), capacity_factory=capacity,
+        transport=LiteLLMClient(_network_delegate_factory=lambda: httpx.MockTransport(wire)),
+        artifact_repository=artifacts, role_planner=DeclaredActionRoles())
+    # Capture the factory's real AutoGen stream at its public method boundary.
+    from unittest.mock import patch
+    with patch.object(AutoGenDiscussionRuntime, "run", observe_discussion):
+        events = [event async for event in runtime.run(context)]
+    assert set(actual_adapters) == {CrewDispatchRuntime, AutoGenDiscussionRuntime, DirectRuntime}
+    assert set(stages) == {"dispatch", "discuss", "synthesis"}
+    assert stages == sorted(stages, key=("dispatch", "discuss", "synthesis").index)
+    assert len([event for event in child_events if event.kind == "discussion.completed"]) == 1
+    assert child_events[-1].kind is EventKind.RUNTIME_COMPLETED
+    record_property("local_hybrid_event_contract", json.dumps({
+        "wire_stages": stages, "events": [
+            {"kind": str(event.kind), "sequence": event.sequence,
+             "next_stage": event.checkpoint.state.get("next_stage") if event.checkpoint else None}
+            for event in events]}, sort_keys=True))
+    final = _assert_final_delivery(events, TaskMode.HYBRID, "synthetic-note.txt")
+    # Corrupt only observed outputs after the real run; never feed fabricated events to runtime.
+    terminal_child = next(event for event in events if event.checkpoint is not None
+        and isinstance(event.checkpoint.state.get("child_checkpoint"), Mapping)
+        and event.checkpoint.state["child_checkpoint"].get("runtime_type") == "autogen"
+        and event.checkpoint.state["child_checkpoint"]["state"].get("terminal") is True)
+    discussion_end = _hybrid_discussion_completion(events)
+    for removed in (terminal_child, discussion_end):
+        with pytest.raises(AssertionError):
+            _assert_final_delivery([event for event in events if event is not removed],
+                TaskMode.HYBRID, "synthetic-note.txt")
+    final_event = next(event for event in events if event.artifact is final)
+    with pytest.raises(AssertionError):
+        _assert_final_delivery([event for event in events if event is not final_event],
+            TaskMode.HYBRID, "synthetic-note.txt")
+    with pytest.raises(ValueError, match="artifact text must be nonblank"):
+        Artifact(id=final.id, type="text", producer="main", content={"text": ""})
+    corrupted = Artifact(id=final.id, type="text", producer="main",
+        content={"text": "Saved different-note.txt."})
+    with pytest.raises(AssertionError, match="exact saved filename"):
+        _assert_final_delivery([event.model_copy(update={"artifact": corrupted})
+            if event is final_event else event for event in events],
+            TaskMode.HYBRID, "synthetic-note.txt")
