@@ -31,6 +31,29 @@ from tests.unit.runs.test_harness_decision import RecordingQueue
 MESSAGE = '我需要你开发一个 Python 命令行项目，读取本地 CSV 并汇总金额；请实际编写代码和测试。'
 
 
+def _configured_document() -> dict[str, Any]:
+    """Keep model setup independent of unrelated acceptance-script imports."""
+    return {
+        'models': {'main': {'deployments': [{
+            'provider': 'openai',
+            'model': 'offline-test',
+            'api_base': 'http://127.0.0.1:1/v1',
+            'credential_ref': 'secret://offline',
+            'quota_scope_id': 'offline',
+            'max_concurrency': 2,
+            'target_utilization': 0.8,
+            'reserved_slots': 0,
+            'capabilities': ['text', 'tool_calling', 'structured_output'],
+        }]}},
+        'agents': [
+            {'id': 'analyst', 'role': 'Analyst', 'prompt': 'Compare facts.',
+             'model': 'main', 'skills': ['calculator']},
+            {'id': 'critic', 'role': 'Critic', 'prompt': 'Check claims.',
+             'model': 'main', 'skills': []},
+        ],
+    }
+
+
 class SubmissionRepository(ConversationModeRepository):
     """In-memory persistence boundary; keep the real API's original input/actor."""
 
@@ -147,7 +170,6 @@ async def test_ordinary_delivery_reaches_real_factory_request_and_workspace_writ
     from agent_hub.runtime.defaults import ConfigBackedDirectRuntime
     from agent_hub.runtime.direct import RuntimeExecutionError
     from agent_hub.skills.sandbox import python_project_profile
-    from tests.unit.runtime.test_action_admission_helper import configured_document
     from tests.unit.runtime.test_configured_runtime import FakeSecretService
     from tests.unit.runtime.test_plain_file_action_helper import LocalCapacityBoundary
 
@@ -204,7 +226,7 @@ async def test_ordinary_delivery_reaches_real_factory_request_and_workspace_writ
         return result
 
     monkeypatch.setattr(stack.harness_tool_gateway, 'invoke', observed_invoke)
-    document = configured_document()
+    document = _configured_document()
     definition = document['models'].pop('main')
     definition['deployments'][0].update(provider='deepseek', model='deepseek-chat')
     document['models']['deepseek'] = definition
