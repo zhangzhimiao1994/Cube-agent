@@ -14,6 +14,7 @@ from pathlib import PurePosixPath
 from agent_hub.models.types import ToolCall
 from agent_hub.runtime.contracts import Artifact, JsonValue
 from agent_hub.runtime.crew.workspace_maintenance_delivery import maintenance_delivery_ready
+from agent_hub.runtime.progress import is_workspace_read_not_found
 
 
 def _path(value: object) -> str | None:
@@ -104,6 +105,13 @@ def productive_workspace_proposal(
     for _, name, result in sorted(prefix, key=lambda item: item[0]):
         if name in {"workspace.read", "workspace_read"}:
             path, text = _path(result.get("path")), result.get("text")
+            if is_workspace_read_not_found(result):
+                assert path is not None
+                known.pop(path, None)
+                present_paths.discard(path)
+                continue
+            if result.get("status") == "not_found" or result.get("error_code") == "workspace.file_not_found":
+                return False
             if path is not None:
                 if path not in present_paths:
                     complete_listing = False

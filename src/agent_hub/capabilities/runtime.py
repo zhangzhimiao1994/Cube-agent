@@ -44,6 +44,7 @@ from agent_hub.capabilities.project_verification import (
     ProjectVerificationService,
 )
 from agent_hub.capabilities.scoped_read import (
+    ScopedFileNotFound,
     ScopedReadError,
     authorized_workspace_scope,
     read_scoped_file,
@@ -764,6 +765,13 @@ class RuntimeCapabilityGateway:
                 project_root=self._project_workspace_dir, attachment_root=self._workspace_root,
                 path=path,
             )
+        except ScopedFileNotFound as error:
+            return {
+                "path": error.relative_path,
+                "status": "not_found",
+                "error_code": "workspace.file_not_found",
+                "truncated": False,
+            }
         except ScopedReadError as error:
             raise RuntimeCapabilityError(str(error)) from None
         return {

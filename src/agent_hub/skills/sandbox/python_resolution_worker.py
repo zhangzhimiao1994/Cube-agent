@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import shutil
+import sys
 import time
 from contextlib import ExitStack
 from dataclasses import replace
@@ -248,6 +249,8 @@ async def request_resolution(request: ResolutionRequest) -> ResolutionStatus:
     from agent_hub.skills.sandbox.project import _systemd_supported
     from agent_hub.skills.sandbox.python_metadata_preparation_client import _close, _root_peer
 
+    if sys.platform != "linux":
+        raise ValueError("resolution_unavailable")
     need(_systemd_supported(), "resolution_unavailable")
     request = ResolutionRequest.model_validate(request, strict=True)
     raw = request.model_dump_json(warnings="error").encode()

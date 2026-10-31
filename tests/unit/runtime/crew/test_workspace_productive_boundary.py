@@ -545,6 +545,57 @@ def test_later_truncated_read_marks_path_existing_not_proven_absent() -> None:
     assert not eligible(states, artifacts)
 
 
+@pytest.mark.parametrize("name", ("workspace.read", "workspace_read"))
+def test_complete_listing_then_not_found_still_allows_create(name: str) -> None:
+    states, artifacts = fact("workspace.list", {"workspace_files": ()})
+    missing: dict[str, JsonValue] = {"path": A, "status": "not_found",
+               "error_code": "workspace.file_not_found", "truncated": False}
+    later_states, later_artifacts = fact(name, missing, round_index=1)
+    states["later"], artifacts["later"] = later_states["key"], later_artifacts["key"]
+    assert eligible(states, artifacts)
+    # A negative read is neither a complete inventory nor a successful empty read.
+    assert not eligible(*fact(name, missing))
+
+
+async def test_listing_not_found_then_create_crosses_productive_boundary() -> None:
+    path = "src/new-production.ts"
+
+    class MissingFileWorkspace(ExistingWorkspace):
+        async def invoke(self, tenant_id: UUID, request: HarnessToolCallRequest, *,
+                         user_id: UUID | None = None, role: Role | None = None) -> HarnessToolCallResult:
+            if request.tool_name == "workspace.read" and request.arguments.get("path") == path:
+                assert user_id is not None and role is Role.OPERATOR
+                assert path not in self.files
+                self.calls.append(request)
+                return HarnessToolCallResult(call_id=request.call_id, tool_name=request.tool_name,
+                    status="succeeded", payload={"path": path, "status": "not_found",
+                        "error_code": "workspace.file_not_found", "truncated": False})
+            return await super().invoke(tenant_id, request, user_id=user_id, role=role)
+
+    result = await drive((observe("workspace.list"), observe("workspace.read", path),
+        _workspace_delivery_write_response(path, "export const added = true;", "create"), *TAIL[1:]),
+        tools=MissingFileWorkspace())
+    assert result.reason is None
+    assert result.events[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert result.tools.files[path] == "export const added = true;"
+    assert [call.tool_name for call in result.tools.calls] == [
+        "workspace.list", "workspace.read", "workspace.write_text", "workspace.bundle",
+    ]
+
+
+@pytest.mark.parametrize("change", (
+    {"text": ""}, {"truncated": 0}, {"truncated": True}, {"status": "denied"},
+    {"error_code": "workspace.read_denied"}, {"extra": True}, {"path": "../foreign"},
+))
+def test_malformed_not_found_cannot_prove_productive_write(change: dict[str, JsonValue]) -> None:
+    states, artifacts = fact("workspace.list", {"workspace_files": ()})
+    missing = {"path": A, "status": "not_found",
+               "error_code": "workspace.file_not_found", "truncated": False, **change}
+    later_states, later_artifacts = fact(result=missing, round_index=1)
+    states["later"], artifacts["later"] = later_states["key"], later_artifacts["key"]
+    assert not eligible(states, artifacts)
+
+
 async def test_create_from_complete_listing_and_partial_restore_are_causal(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

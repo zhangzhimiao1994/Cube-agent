@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Iterable, Mapping
+from pathlib import PurePosixPath, PureWindowsPath
 
 from agent_hub.runtime.contracts import Artifact
 
@@ -27,10 +28,40 @@ def _files(value: object) -> list[dict[str, object]]:
     return sorted(rows, key=lambda row: str(row["path"]))
 
 
+def has_workspace_read_not_found_marker(name: object, result: object) -> bool:
+    """Negative markers cannot earn credit, even when the reader payload is malformed."""
+    return (isinstance(name, str) and name in {"workspace.read", "workspace_read", "read_context"}
+            and isinstance(result, Mapping)
+            and (result.get("status") == "not_found"
+                 or result.get("error_code") == "workspace.file_not_found"))
+
+
+def is_workspace_read_negative_artifact(artifact: Artifact) -> bool:
+    return artifact.type == "tool_result" and has_workspace_read_not_found_marker(
+        artifact.content.get("tool_name"), artifact.content.get("result"),
+    )
+
+
+def is_workspace_read_not_found(result: object) -> bool:
+    """Recognize only the scoped reader's negative observation, never file contents."""
+    if (not isinstance(result, Mapping)
+            or set(result) != {"path", "status", "error_code", "truncated"}
+            or result.get("status") != "not_found"
+            or result.get("error_code") != "workspace.file_not_found"
+            or result.get("truncated") is not False):
+        return False
+    path = result.get("path")
+    return (type(path) is str and bool(path) and "\\" not in path and ":" not in path
+            and not PurePosixPath(path).is_absolute() and str(PurePosixPath(path)) == path
+            and all(part not in {"", ".", ".."} and not part.endswith((" ", "."))
+                    and not PureWindowsPath(part).is_reserved() for part in path.split("/"))
+            and not any(ord(char) < 32 or ord(char) == 127 for char in path))
+
+
 def workspace_progress_key(name: str, arguments_sha256: str, result: object) -> str | None:
     """Hash observed information, not execution IDs or tool-supplied credit flags."""
     del arguments_sha256  # Builtins return canonical paths; ignored arguments cannot earn credit.
-    if not isinstance(result, Mapping):
+    if not isinstance(result, Mapping) or has_workspace_read_not_found_marker(name, result):
         return None
     if name in {"workspace.read", "workspace_read"} or (
         name == "read_context" and "path" in result

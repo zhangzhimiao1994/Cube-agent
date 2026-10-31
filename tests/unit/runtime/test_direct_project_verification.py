@@ -225,9 +225,10 @@ def diagnostic_read_batch(*, path: str = "main.py", summary: str = "Inspect the 
 
 def capture_delivery_deadline(monkeypatch: pytest.MonkeyPatch) -> list[Any]:
     from agent_hub.runtime import direct
+    from agent_hub.runtime.adaptive_budget import deadline_from_routing
 
     deadlines: list[Any] = []
-    create = direct.deadline_from_routing
+    create = deadline_from_routing
 
     def capture(*args: Any, **kwargs: Any) -> Any:
         budget = create(*args, **kwargs)
@@ -285,7 +286,7 @@ async def test_direct_diagnostic_observations_preserve_budget_and_completed_batc
     deadlines = capture_delivery_deadline(monkeypatch)
     token_limit = direct._workspace_delivery_token_limit
     token_observations = []
-    read_observations = []
+    read_observations: list[tuple[Any, ...]] = []
 
     def record_token_limit(*args: Any, **kwargs: Any) -> int:
         limit = token_limit(*args, **kwargs)

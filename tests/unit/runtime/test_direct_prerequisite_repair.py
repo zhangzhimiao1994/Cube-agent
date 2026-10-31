@@ -79,7 +79,12 @@ async def test_direct_repairs_manifest_after_source_read_before_real_child_and_z
     assert len(backend.process_results) == 1 and backend.process_results[0].exit_code == 0
     assert len(model.requests) == 3
     for request in model.requests[1:]:
-        user = '\n'.join(message.content for message in request.messages if message.role == 'user')
+        user_parts: list[str] = []
+        for message in request.messages:
+            if message.role == 'user':
+                assert isinstance(message.content, str)
+                user_parts.append(message.content)
+        user = '\n'.join(user_parts)
         assert 'UNTRUSTED_PROJECT_PREREQUISITE_JSON' in user
         assert 'invalid_package_manifest' in user
         assert 'no installation or successful verification' in user
@@ -118,7 +123,8 @@ async def test_old_or_malformed_policy_keeps_original_blocked_outcome(
     manifest_backend(backend, ctx, monkeypatch)
     with pytest.raises(RuntimeExecutionError) as caught:
         _ = [event async for event in runtime.run(ctx)]
-    assert caught.value.project_prerequisite_payload['reason'] == 'invalid_package_manifest'
+    report = getattr(caught.value, 'project_prerequisite_payload', None)
+    assert isinstance(report, Mapping) and report['reason'] == 'invalid_package_manifest'
     assert len(model.requests) == 1 and backend.calls.count('project.verify') == 1
 
 
@@ -135,7 +141,7 @@ async def test_other_prerequisites_do_not_gain_generic_retry_or_install_authorit
     manifest_backend(backend, ctx, monkeypatch, reason=reason)
     with pytest.raises(RuntimeExecutionError) as caught:
         _ = [event async for event in runtime.run(ctx)]
-    report = caught.value.project_prerequisite_payload
+    report = getattr(caught.value, 'project_prerequisite_payload', None)
     assert isinstance(report, Mapping) and report['reason'] == reason
     assert len(model.requests) == 1 and 'workspace.bundle' not in backend.calls
 
@@ -161,7 +167,7 @@ def test_presence_of_any_frozen_contract_excludes_plain_manifest_repair(key: str
     assert not _manifest_prerequisite_repair(repair_context(**{key: None}))
 
 
-@pytest.mark.parametrize('fault', ['no_read', 'truncated', 'changed_read', 'other_file'])
+@pytest.mark.parametrize('fault', ['no_read', 'truncated', 'changed_read', 'other_file', 'not_found'])
 async def test_manifest_repair_needs_complete_current_read_and_cannot_change_other_files(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault: str,
 ) -> None:
@@ -179,6 +185,9 @@ async def test_manifest_repair_needs_complete_current_read_and_cannot_change_oth
 
     async def read(*, name: str, **kwargs: Any) -> Any:
         result = await execute(name=name, **kwargs)
+        if name == 'read_context' and fault == 'not_found':
+            return {'path': 'package.json', 'status': 'not_found',
+                    'error_code': 'workspace.file_not_found', 'truncated': False}
         if name == 'read_context' and fault in {'truncated', 'changed_read'}:
             return {**result, **({'truncated': True} if fault == 'truncated' else {'text': 'different'})}
         return result
@@ -202,7 +211,8 @@ async def test_second_manifest_rejection_stops_even_after_a_different_invalid_wr
     manifest_backend(backend, ctx, monkeypatch)
     with pytest.raises(RuntimeExecutionError) as caught:
         _ = [event async for event in runtime.run(ctx)]
-    assert caught.value.project_prerequisite_payload['reason'] == 'invalid_package_manifest'
+    report = getattr(caught.value, 'project_prerequisite_payload', None)
+    assert isinstance(report, Mapping) and report['reason'] == 'invalid_package_manifest'
     assert backend.calls.count('project.verify') == 2 and len(model.requests) == 3
     assert not backend.process_results and 'workspace.bundle' not in backend.calls
 

@@ -24,6 +24,18 @@ class ScopedReadError(RuntimeError):
     """A stored run does not authorize this file read."""
 
 
+class ScopedFileNotFound(ScopedReadError):
+    """A child is missing beneath an opened, authorized workspace session."""
+
+    def __init__(self, relative_path: str) -> None:
+        super().__init__("authorized workspace file not found")
+        self.relative_path = relative_path
+
+
+class _ScopedPathMissing(Exception):
+    """Only raised after the authorized scope's directory chain is held."""
+
+
 @dataclass(frozen=True, slots=True)
 class ScopedReadEvidence:
     relative_path: str
@@ -89,6 +101,14 @@ async def read_scoped_file(
         routing = getattr(record, "routing_decision", None)
         assert isinstance(routing, Mapping)
         parts = _path_parts(path)
+        missing_after: int | None = None
+        # Tenant-prefixed paths name attachments, never another workspace scope.
+        try:
+            path_tenant = UUID(parts[0])
+        except ValueError:
+            path_tenant = None
+        if path_tenant is not None and path_tenant != tenant_id:
+            raise ScopedReadError
         if parts[0] == str(tenant_id):
             attachments = routing.get("attachment_ids")
             if not isinstance(attachments, (list, tuple)) or len(parts) < 2:
@@ -109,25 +129,36 @@ async def read_scoped_file(
             scoped_parts = parts
         else:
             root = project_root
-            scoped_parts = (str(tenant_id), "projects", project, "sessions", session, *parts)
+            scope = (str(tenant_id), "projects", project, "sessions", session)
+            scoped_parts = (*scope, *parts)
+            missing_after = len(scope)
         if root is None:
             raise ScopedReadError
-        data = _read_no_links(root, scoped_parts, max_bytes=max_bytes)
-        if include_metadata:
-            return ScopedReadEvidence(
-                relative_path="/".join(parts),
-                text=data[:max_bytes].decode("utf-8", errors="replace"),
-                truncated=len(data) > max_bytes,
-                data=data, project_id=project, session_id=session,
+        try:
+            data = _read_no_links(
+                root, scoped_parts, max_bytes=max_bytes, missing_after=missing_after,
             )
-        return WorkspaceReadResult(
-            relative_path="/".join(parts),
-            text=data[:max_bytes].decode("utf-8", errors="replace"),
-            truncated=len(data) > max_bytes,
-        )
+        except _ScopedPathMissing:
+            data = None
     except Exception:  # noqa: BLE001 - fail closed with a redacted boundary error.
         # Repository, filesystem and parser errors must not disclose other scopes or host paths.
         raise ScopedReadError("workspace read denied or scoped file unavailable") from None
+    # Emit the public exception outside the redaction boundary. Repository errors,
+    # including similarly typed exceptions, cannot bypass persisted authorization.
+    if data is None:
+        raise ScopedFileNotFound("/".join(parts)) from None
+    if include_metadata:
+        return ScopedReadEvidence(
+            relative_path="/".join(parts),
+            text=data[:max_bytes].decode("utf-8", errors="replace"),
+            truncated=len(data) > max_bytes,
+            data=data, project_id=project, session_id=session,
+        )
+    return WorkspaceReadResult(
+        relative_path="/".join(parts),
+        text=data[:max_bytes].decode("utf-8", errors="replace"),
+        truncated=len(data) > max_bytes,
+    )
 
 
 def _path_parts(path: str) -> tuple[str, ...]:
@@ -155,7 +186,10 @@ def _regular_file(value: os.stat_result) -> None:
         raise ScopedReadError
 
 
-def _read_no_links(root: Path, parts: tuple[str, ...], *, max_bytes: int = _MAX_BYTES) -> bytes:
+def _read_no_links(
+    root: Path, parts: tuple[str, ...], *, max_bytes: int = _MAX_BYTES,
+    missing_after: int | None = None,
+) -> bytes:
     if os.name == "posix" and os.open in os.supports_dir_fd:
         # Hold directory descriptors so an ancestor rename/link swap cannot redirect the read.
         with ExitStack() as stack:
@@ -165,22 +199,32 @@ def _read_no_links(root: Path, parts: tuple[str, ...], *, max_bytes: int = _MAX_
             flags = os.O_RDONLY | directory_flag | nofollow
             directory = os.open(root, flags)
             stack.callback(os.close, directory)
-            for part in parts[:-1]:
-                directory = os.open(part, flags, dir_fd=directory)
-                stack.callback(os.close, directory)
-            fd = os.open(
-                parts[-1], os.O_RDONLY | nofollow | nonblock,
-                dir_fd=directory,
-            )
+            depth = 0
+            try:
+                for part in parts[:-1]:
+                    directory = os.open(part, flags, dir_fd=directory)
+                    stack.callback(os.close, directory)
+                    depth += 1
+                fd = os.open(
+                    parts[-1], os.O_RDONLY | nofollow | nonblock,
+                    dir_fd=directory,
+                )
+            except FileNotFoundError:
+                if missing_after is not None and depth >= missing_after:
+                    raise _ScopedPathMissing from None
+                raise
             with os.fdopen(fd, "rb") as handle:
                 _regular_file(os.fstat(handle.fileno()))
                 return handle.read(max_bytes + 1)
     if os.name != "nt":
         raise ScopedReadError
-    return _read_windows_locked(root, parts, max_bytes=max_bytes)
+    return _read_windows_locked(root, parts, max_bytes=max_bytes, missing_after=missing_after)
 
 
-def _read_windows_locked(root: Path, parts: tuple[str, ...], *, max_bytes: int = _MAX_BYTES) -> bytes:
+def _read_windows_locked(
+    root: Path, parts: tuple[str, ...], *, max_bytes: int = _MAX_BYTES,
+    missing_after: int | None = None,
+) -> bytes:
     if sys.platform != "win32":
         raise ScopedReadError
     import ctypes
@@ -255,10 +299,17 @@ def _read_windows_locked(root: Path, parts: tuple[str, ...], *, max_bytes: int =
         stack.callback(kernel.CloseHandle, open_locked(current, directory=True))
         current = absolute_root
         stack.callback(kernel.CloseHandle, open_locked(current, directory=True))
-        for part in parts[:-1]:
-            current = current / part
-            stack.callback(kernel.CloseHandle, open_locked(current, directory=True))
-        raw_file = open_locked(current / parts[-1], directory=False)
+        depth = 0
+        try:
+            for part in parts[:-1]:
+                current = current / part
+                stack.callback(kernel.CloseHandle, open_locked(current, directory=True))
+                depth += 1
+            raw_file = open_locked(current / parts[-1], directory=False)
+        except FileNotFoundError:
+            if missing_after is not None and depth >= missing_after:
+                raise _ScopedPathMissing from None
+            raise
         try:
             fd = msvcrt.open_osfhandle(raw_file, os.O_RDONLY | os.O_BINARY)
         except BaseException:

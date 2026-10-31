@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import sys
 import time
 from contextlib import ExitStack
 from dataclasses import replace
@@ -333,6 +334,8 @@ class ResolutionStore:
         require_sha(sha)
         need(type(raw) is bytes and 0 < len(raw) <= 64 * 1024**2)
         files._native()
+        if sys.platform != "linux":
+            raise ValueError("resolution_unavailable")
         with ExitStack() as stack:
             pins: list[tuple[int, str, int, tuple[int, ...]]] = []
             parent = files._state(self.supply, stack, pins, exclusive=True, deadline=deadline)

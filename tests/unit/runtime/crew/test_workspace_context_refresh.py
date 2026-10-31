@@ -129,7 +129,7 @@ async def test_visible_duplicate_is_not_a_context_refresh() -> None:
 
 
 @pytest.mark.parametrize("enabled", (False, True))
-async def test_read_alias_refresh_uses_fresh_authorized_result_only_for_new_policy(enabled: bool) -> None:
+async def test_read_alias_is_always_fresh_but_lost_context_refresh_requires_policy(enabled: bool) -> None:
     def alias(response: ModelResponse) -> ModelResponse:
         return replace(response, tool_calls=tuple(
             replace(call, name="workspace_read") if call.name == "workspace.read" else call
@@ -154,7 +154,7 @@ async def test_read_alias_refresh_uses_fresh_authorized_result_only_for_new_poli
             async for event in stream:
                 events.append(event)
         assert not any(event.kind is EventKind.RUNTIME_COMPLETED for event in events)
-        assert len([call for call in tools.calls if call.tool_name == "workspace_read"]) == 2
+        assert len([call for call in tools.calls if call.tool_name == "workspace_read"]) == 3
 
 
 async def test_alternating_hidden_reads_are_once_per_key_per_epoch_without_budget_credit(
@@ -236,6 +236,53 @@ def test_read_visibility_uses_only_complete_user_result_frames_not_progress_or_s
         ModelMessage(role="system", content=frame),
         ModelMessage(role="user", content="WORKSPACE_DELIVERY_PROGRESS_JSON=" + json.dumps(result)),
     )) == frozenset()
+
+
+@pytest.mark.parametrize("name", ("workspace.read", "workspace_read", "read_context"))
+def test_not_found_keeps_other_visible_reads_without_empty_file_or_progress(name: str) -> None:
+    found = {"path": A, "text": "dependency", "truncated": False}
+    missing = {"path": B, "status": "not_found",
+               "error_code": "workspace.file_not_found", "truncated": False}
+    frame = ModelMessage("user", "UNTRUSTED_CAPABILITY_RESULTS_JSON=" + json.dumps([
+        {"name": "workspace.read", "result": found}, {"name": name, "result": missing},
+    ]))
+    key = workspace_progress_key("workspace.read", "", found)
+    assert key is not None
+    assert CrewDispatchRuntime._visible_workspace_read_keys((frame,)) == frozenset({key})
+    assert workspace_progress_key(name, "", missing) is None
+    assert missing == {"path": B, "status": "not_found",
+                       "error_code": "workspace.file_not_found", "truncated": False}
+
+
+def test_compaction_preserves_complete_mixed_not_found_feedback() -> None:
+    results = [{"name": "workspace.read", "result": {
+        "path": A, "text": "dependency", "truncated": False}},
+        {"name": "read_context", "result": {"path": B, "status": "not_found",
+         "error_code": "workspace.file_not_found", "truncated": False}}]
+    frame = ModelMessage("user", "UNTRUSTED_CAPABILITY_RESULTS_JSON=" + json.dumps(results))
+    messages = (ModelMessage("system", "rules"), ModelMessage("user", "task"),
+                ModelMessage("assistant", "old history" * 1000), frame)
+    compacted = CrewDispatchRuntime._compact_interaction_messages(
+        messages, max_prompt_bytes=1500, message_limit=4, preserve_feedback=True,
+    )
+    assert frame in compacted and messages[2] not in compacted
+    key = workspace_progress_key("workspace.read", "", results[0]["result"])
+    assert key is not None
+    assert CrewDispatchRuntime._visible_workspace_read_keys(compacted) == frozenset({key})
+
+
+@pytest.mark.parametrize("change", (
+    {"text": ""}, {"truncated": 0}, {"truncated": True}, {"status": "denied"},
+    {"error_code": "workspace.read_denied"}, {"extra": True}, {"path": "../foreign"},
+))
+def test_invalid_not_found_does_not_hide_ambiguous_feedback(change: dict[str, JsonValue]) -> None:
+    missing = {"path": B, "status": "not_found",
+               "error_code": "workspace.file_not_found", "truncated": False, **change}
+    frame = ModelMessage("user", "UNTRUSTED_CAPABILITY_RESULTS_JSON=" + json.dumps([
+        {"name": "workspace.read", "result": missing},
+    ]))
+    assert CrewDispatchRuntime._visible_workspace_read_keys((frame,)) is None
+    assert workspace_progress_key("workspace.read", "", missing) is None
 
 
 @pytest.mark.parametrize("payload", ("broken", "{}", '[{"name":"workspace.read","result":{}}]',

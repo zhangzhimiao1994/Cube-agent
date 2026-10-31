@@ -138,6 +138,9 @@ from agent_hub.runtime.instruction_context import model_request_sha256
 from agent_hub.runtime.progress import (
     artifact_progress_key,
     count_artifact_progress,
+    has_workspace_read_not_found_marker,
+    is_workspace_read_negative_artifact,
+    is_workspace_read_not_found,
     workspace_progress_key,
 )
 from agent_hub.runtime.project_scale_artifact import (
@@ -689,6 +692,10 @@ def _tool_description(internal_name: str, *, builtin_contract: bool = True) -> s
 
 def _is_read_context_tool(name: str) -> bool:
     return name in {"read_context", "workspace_read", "workspace.read"}
+
+
+def _is_mutable_workspace_read(name: str, arguments: Mapping[str, JsonValue]) -> bool:
+    return name in {"workspace.read", "workspace_read"} or (name == "read_context" and "path" in arguments)
 
 
 def _is_optional_read_context_unavailable(name: str, reason: str) -> bool:
@@ -3702,7 +3709,9 @@ def _causal_semantic_tool_result(
     evidence: Sequence[Artifact], consumed_artifact_ids: set[str], trigger_model_artifact_id: str,
     workspace_continuation: bool = False, context_refresh: bool = False,
 ) -> Artifact | None:
-    if reusable_generated_file_result(call.name, evidence, arguments=call.arguments) is not None or (
+    if _is_mutable_workspace_read(call.name, call.arguments) or (
+        reusable_generated_file_result(call.name, evidence, arguments=call.arguments) is not None
+    ) or (
         workspace_continuation and (
             call.name in {"workspace.read", "workspace.list"}
             or (context_refresh and call.name == "workspace_read")
@@ -7996,6 +8005,10 @@ class CrewDispatchRuntime:
                         continue
                     if not isinstance(result, Mapping):
                         return None
+                    if has_workspace_read_not_found_marker(name, result):
+                        if is_workspace_read_not_found(result):
+                            continue
+                        return None
                     if name == "read_context" and "path" not in result:
                         continue
                     key = workspace_progress_key(name, "", result)
@@ -8736,6 +8749,8 @@ class CrewDispatchRuntime:
             ) -> None:
                 nonlocal round_progressed, step_deadline
                 nonlocal round_context_refreshed, context_refresh_epoch_open
+                if is_workspace_read_negative_artifact(artifact):
+                    return
                 if meaningful_progress:
                     progress_key = artifact_progress_key(artifact)
                     if progress_key is None:
@@ -8828,7 +8843,9 @@ class CrewDispatchRuntime:
                 # Mutable observations reuse only the exact causal tool slot below.
                 semantic_artifact = (
                     None
-                    if generated_file_result is not None or (
+                    if generated_file_result is not None or _is_mutable_workspace_read(
+                        tool_call.name, tool_call.arguments,
+                    ) or (
                         step.engineering_action_version == 1
                         and tool_call.name in {"project.inspect", "project.verify"}
                     ) or (
@@ -8993,10 +9010,10 @@ class CrewDispatchRuntime:
                     )
                     evidence.append(artifact)
                     if (
-                        workspace_continuation
-                        and artifact.source_ids == (str(trigger_model_artifact.id),)
+                        artifact.source_ids == (str(trigger_model_artifact.id),)
+                        and (workspace_continuation or is_workspace_read_negative_artifact(artifact))
                     ):
-                        # Exact replay must preserve the original continuation's tool mode.
+                        # Exact negative replay preserves tool mode, never progress credit.
                         record_round_progress(artifact, replayed=True)
                     else:
                         reused_semantic_results += 1
@@ -11018,8 +11035,19 @@ class CrewDispatchRuntime:
             self._current_artifact_registry if artifact_registry is None else artifact_registry
         )
         input_ids = {str(artifact.id) for artifact in context.artifacts}
+        # Model-boundary validation uses provisional reader artifacts with no result.
+        # Defer their credit until the real result can be checked for negative markers.
+        pending_read_ids = {
+            str(row["artifact_id"]) for row in tool_ledger.states.values()
+            if row.get("name") in {"read_context", "workspace.read", "workspace_read"}
+            and row.get("artifact_id") is not None
+            and (artifact := checkpoint_artifacts.get(str(row["artifact_id"]))) is not None
+            and artifact.type == "tool_result" and artifact.content.get("result") is None
+        }
         progress_units = len(completed) + sum(
-            artifact_id not in input_ids for artifact_id in checkpoint_artifacts
+            artifact_id not in input_ids and artifact_id not in pending_read_ids
+            and not is_workspace_read_negative_artifact(artifact)
+            for artifact_id, artifact in checkpoint_artifacts.items()
         )
         meaningful_progress = (
             run_state.workspace_meaningful_progress and run_state.workspace_delivery_continuation

@@ -1,5 +1,6 @@
 """Read-tool wire contracts must match the actual executor, without query/path coercion."""
 
+import json
 from collections.abc import Mapping
 from pathlib import Path
 from typing import cast
@@ -29,6 +30,7 @@ from tests.unit.runtime.crew.test_meaningful_workspace_progress import (
     TOOLS,
     Observations,
     observe,
+    offline_only,  # noqa: F401
     write,
 )
 
@@ -266,3 +268,99 @@ async def test_legacy_partial_checkpoint_rebuilds_original_read_request_hashes()
     retained = await runtime.save_checkpoint()
     for key, row in cast(Mapping[str, Mapping[str, JsonValue]], checkpoint.state["models"]).items():
         assert cast(Mapping[str, Mapping[str, JsonValue]], retained.state["models"])[key] == row
+
+
+class MutablePathHarness(Observations):
+    async def invoke(self, tenant_id: UUID, request: HarnessToolCallRequest, *,
+                     user_id: UUID | None = None, role: Role | None = None) -> HarnessToolCallResult:
+        if request.tool_name not in {"read_context", "workspace.read", "workspace_read"}:
+            return await super().invoke(tenant_id, request, user_id=user_id, role=role)
+        assert user_id is not None and role is Role.OPERATOR
+        self.calls.append(request)
+        path = request.arguments.get("path")
+        if not isinstance(path, str):
+            payload: Mapping[str, JsonValue] = {"matches": (), "truncated": False}
+        elif path in self.files:
+            payload = {"path": path, "text": self.files[path], "truncated": False}
+        else:
+            payload = {"path": path, "status": "not_found",
+                       "error_code": "workspace.file_not_found", "truncated": False}
+        return HarnessToolCallResult(call_id=request.call_id, tool_name=request.tool_name,
+                                     status="succeeded", payload=payload)
+
+
+def path_read(name: str) -> ModelResponse:
+    return ModelResponse(text=None, usage=TokenUsage(1, 1, 2), tool_calls=(
+        ToolCall(id="read-business", name=name, arguments={"path": "src/business.ts"}),
+    ))
+
+
+@pytest.mark.parametrize("name", ("workspace.read", "workspace_read", "read_context"))
+@pytest.mark.parametrize("missing", (False, True))
+@pytest.mark.parametrize("continuation", (False, True))
+async def test_new_path_read_after_write_observes_current_file(
+    name: str, missing: bool, continuation: bool,
+) -> None:
+    harness = MutablePathHarness()
+    if not missing:
+        harness.files["src/business.ts"] = "old"
+    gateway = WorkspaceDeliverySequenceGateway((path_read(name), write("updated"), path_read(name),
+                                               _workspace_delivery_bundle_response(), FINAL))
+    tools = (*tuple(tool for tool in TOOLS if tool != "workspace.read"), name)
+    runtime = _workspace_delivery_sequence_runtime(gateway, harness, tools=tools)
+    stream = runtime.run(_workspace_delivery_sequence_context())
+    assert isinstance(stream, adapter.CrewRunStream)
+    stream._state.workspace_delivery_continuation = continuation
+    stream._state.workspace_context_refresh = False
+    events = [event async for event in stream]
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    reads = [call for call in harness.calls if call.tool_name == name]
+    assert len(reads) == 2 and reads[0].idempotency_key != reads[1].idempotency_key
+    prefix = "UNTRUSTED_CAPABILITY_RESULTS_JSON="
+    feedback = next(json.loads(str(message.content)[len(prefix):])
+                    for message in reversed(gateway.requests[3].messages)
+                    if str(message.content).startswith(prefix))
+    assert feedback == [{"name": name, "result": {
+        "path": "src/business.ts", "text": "updated", "truncated": False}}]
+
+
+@pytest.mark.parametrize("name", ("workspace.read", "workspace_read", "read_context"))
+@pytest.mark.parametrize("missing", (False, True))
+async def test_same_path_read_checkpoint_reuses_exact_call_then_authorizes_new_read(
+    name: str, missing: bool,
+) -> None:
+    harness = MutablePathHarness()
+    if not missing:
+        harness.files["src/business.ts"] = "old"
+    tools = (*tuple(tool for tool in TOOLS if tool != "workspace.read"), name)
+    checkpoint, context, repository, _, _ = await _workspace_delivery_partial_checkpoint(
+        responses=(path_read(name),), expected_tools=1, harness=harness, tools=tools,
+    )
+    before = checkpoint.to_payload()
+    first_read = harness.calls[0]
+    gateway = WorkspaceDeliverySequenceGateway((write("updated"), path_read(name),
+                                               _workspace_delivery_bundle_response(), FINAL))
+    restored = _workspace_delivery_sequence_runtime(gateway, harness,
+        artifact_repository=repository, tools=tools)
+    await restored.restore_checkpoint(checkpoint)
+    events = [event async for event in restored.run(context.model_copy(update={"checkpoint": checkpoint}))]
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    reads = [call for call in harness.calls if call.tool_name == name]
+    assert len(reads) == 2 and reads[0] == first_read
+    assert reads[1].idempotency_key != first_read.idempotency_key
+    assert checkpoint.to_payload() == before
+    feedback = "\n".join(str(message.content) for message in gateway.requests[0].messages)
+    if missing:
+        assert '"status":"not_found"' in feedback and '"text":""' not in feedback
+
+
+async def test_query_context_keeps_existing_semantic_cache() -> None:
+    harness = MutablePathHarness()
+    query = ModelResponse(text=None, usage=TokenUsage(1, 1, 2), tool_calls=(
+        ToolCall(id="query", name="read_context", arguments={"query": "runtime artifacts"}),
+    ))
+    gateway = WorkspaceDeliverySequenceGateway((query, write(), _workspace_delivery_bundle_response(), query, FINAL))
+    runtime = _workspace_delivery_sequence_runtime(gateway, harness, tools=(*TOOLS, "read_context"))
+    events = [event async for event in runtime.run(_workspace_delivery_sequence_context())]
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert sum(call.tool_name == "read_context" for call in harness.calls) == 1
