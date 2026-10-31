@@ -271,8 +271,11 @@ def simulated(api: Any, monkeypatch: pytest.MonkeyPatch) -> Iterator[Any]:
     monkeypatch.setattr(catalog_module, "os", filesystem)
     monkeypatch.setattr(api, "sys", SimpleNamespace(platform="linux", argv=[],
         stdout=io.StringIO(), stderr=io.StringIO()))
-    monkeypatch.setattr(api, "time", SimpleNamespace(monotonic=lambda: filesystem.clock,
-                                                     sleep=filesystem.sleep))
+    clock = SimpleNamespace(monotonic=lambda: filesystem.clock, sleep=filesystem.sleep)
+    # An absolute deadline and every consumer must share the same simulated clock.
+    for module in (api, importlib.import_module("agent_hub.skills.sandbox.python_dependency_metadata"),
+                   importlib.import_module("agent_hub.skills.sandbox.python_input_fetch")):
+        monkeypatch.setattr(module, "time", clock)
     lock_module = ModuleType("fcntl")
     for name, constant_value in (("LOCK_SH", 1), ("LOCK_EX", 2), ("LOCK_NB", 4),
                         ("flock", filesystem.flock)):
@@ -501,22 +504,32 @@ def test_publish_uses_actual_wheel_metadata_then_durable_no_replace_link(
 
 @pytest.mark.parametrize("missing", [False, True])
 def test_publish_covers_whole_catalog_and_sorts_records_only_after_all_wheels_validate(
-    api: Any, simulated: Any, missing: bool,
+    api: Any, simulated: Any, monkeypatch: pytest.MonkeyPatch, missing: bool,
 ) -> None:
+    original_deadline = 150.0
+    deadlines = []
+
+    def extract(entry: Any, raw: bytes, *, deadline: float | None = None) -> Any:
+        deadlines.append(deadline)
+        return extract_python_wheel_metadata(entry, raw, deadline=deadline)
+
+    monkeypatch.setattr(api, "extract_python_wheel_metadata", extract)
     last, last_raw = wheel(name="zzz")
     first, first_raw = wheel(name="aaa", headers=b"Requires-Dist: zzz>=1\n")
     simulated.supply = replace(simulated.supply, catalog=(last, first))
     simulated.fs.add(WHEELS + "/" + last.filename, stat.S_IFREG | 0o444, last_raw)
     if missing:
         assert_code(api, "metadata_unavailable",
-                    lambda: api.publish_dependency_metadata_index(simulated.root, simulated.supply))
+                    lambda: api.publish_dependency_metadata_index(simulated.root, simulated.supply, deadline=original_deadline))
         assert not any(event in {"create", "link"} for event, _ in simulated.fs.events)
     else:
         simulated.fs.add(WHEELS + "/" + first.filename, stat.S_IFREG | 0o444, first_raw)
-        result = api.publish_dependency_metadata_index(simulated.root, simulated.supply)
+        result = api.publish_dependency_metadata_index(simulated.root, simulated.supply, deadline=original_deadline)
         assert tuple(item.wheel.name for item in result.records) == ("aaa", "zzz")
         assert result.records[0].requires_dist == ("zzz>=1",)
         assert result.require_catalog(simulated.supply.catalog, simulated.supply.digest) is None
+
+    assert deadlines == [original_deadline] * (1 if missing else 2)
 
 
 def test_existing_correct_index_is_reused_even_with_no_wheels(api: Any, simulated: Any) -> None:
@@ -577,15 +590,20 @@ def test_deadline_covers_the_actual_extractor_and_not_only_reads(
     api: Any, simulated: Any, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     install_wheel(simulated)
+    original_deadline = 150.0
+    deadlines = []
 
-    def slow_extract(entry: Any, raw: bytes) -> Any:
-        value = extract_python_wheel_metadata(entry, raw)
+    def slow_extract(entry: Any, raw: bytes, *, deadline: float | None = None) -> Any:
+        deadlines.append(deadline)
+        value = extract_python_wheel_metadata(entry, raw, deadline=deadline)
         simulated.fs.clock = 10000.0
         return value
 
     monkeypatch.setattr(api, "extract_python_wheel_metadata", slow_extract)
-    assert_code(api, "timeout", lambda: api.publish_dependency_metadata_index(simulated.root, simulated.supply))
+    assert_code(api, "timeout", lambda: api.publish_dependency_metadata_index(simulated.root, simulated.supply, deadline=original_deadline))
     assert not any(event == "create" for event, _ in simulated.fs.events)
+
+    assert deadlines == [original_deadline]
 
 
 @pytest.mark.parametrize("case", ["write", "link", "link_unknown", "postlink_fsync", "foreign_temp"])

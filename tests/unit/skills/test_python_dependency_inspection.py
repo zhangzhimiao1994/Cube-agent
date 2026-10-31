@@ -13,6 +13,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import socket
 import subprocess
 import threading
@@ -90,9 +91,12 @@ def configured(api: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any
     root.to_payload = lambda: {"interpreter": root.interpreter.to_payload(),
                                "wheel_root": str(root.wheel_root)}
     reads: list[tuple[str, int]] = []
+    resolution_reads: list[str] = []
+    resolution_records: dict[str, object] = {}
     state = SimpleNamespace(api=api, invocation=invocation, project=project, manifest=manifest,
         policy=BrokerPolicy(project_workspace_root=workspace), root=root, supply=supply,
-        index=index, entries=entries, cold=cold, reads=reads)
+        index=index, entries=entries, cold=cold, reads=reads,
+        resolution_reads=resolution_reads, resolution_records=resolution_records)
 
     def read_root() -> Any:
         reads.append(("root", threading.get_ident()))
@@ -104,10 +108,26 @@ def configured(api: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any
 
     def read_index(supply: Any, *, deadline: float) -> Any:
         reads.append(("index", threading.get_ident()))
-        assert supply is state.supply
+        assert supply == state.supply and supply.digest == state.supply.digest
         assert deadline > time.monotonic()
         return state.index
 
+    # Keep the actual effective_supply selection/validation. Only its Root OS
+    # identity and private-file read boundary are simulated, just like root/index
+    # configuration above. An absent file alone raises FileNotFoundError; a known
+    # pending record is returned intact and must be rejected by the real helper.
+    overlay = importlib.import_module("agent_hub.skills.sandbox.python_resolution_overlay")
+    def read_resolution(store: Any, name: str, deadline: float) -> object:
+        assert store.supply == state.supply
+        assert deadline > time.monotonic()
+        assert re.fullmatch(r"resolution-(?:binding|attempt)-[a-f0-9]{64}\.json", name)
+        resolution_reads.append(name)
+        if name not in resolution_records:
+            raise FileNotFoundError(name)
+        return resolution_records[name]
+
+    monkeypatch.setattr(overlay.indexes, "_native", lambda: None)
+    monkeypatch.setattr(overlay.ResolutionStore, "_read", read_resolution)
     monkeypatch.setattr(api, "_require_root", lambda: None)
     monkeypatch.setattr(api, "read_root_configuration", read_root)
     monkeypatch.setattr(api, "read_supply_configuration", read_supply)
@@ -578,3 +598,32 @@ async def test_concurrent_requests_queue_then_both_execute_with_one_worker(
         release.set()
         await asyncio.gather(*(task for task in (first, second) if task is not None),
                              return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase,expected", [
+    ("initial", "python_dependency_unavailable"),
+    ("final", "python_dependency_catalog_changed"),
+])
+async def test_known_pending_overlay_never_falls_back_to_base(
+    configured: Any, monkeypatch: pytest.MonkeyPatch, phase: str, expected: str,
+) -> None:
+    write_lock(configured, complete=True)
+    request = await request_for(configured)
+    overlay = importlib.import_module("agent_hub.skills.sandbox.python_resolution_overlay")
+    scope = overlay._scope(request.invocation, request.expected_source_sha256)
+    attempt_name = overlay._name(scope, "attempt")
+    attempt = {"schema_version": 1, "purpose": "python_resolution_attempt", "scope": scope,
+               "resolution_key": "a" * 64, "base_catalog_sha256": configured.supply.digest}
+    if phase == "initial":
+        configured.resolution_records[attempt_name] = attempt
+    else:
+        def become_pending(supply: Any, *, deadline: float) -> Any:
+            assert supply == configured.supply and deadline > time.monotonic()
+            configured.resolution_records[attempt_name] = attempt
+            return configured.index
+        monkeypatch.setattr(configured.api, "read_dependency_metadata_index", become_pending)
+    result = await inspect(configured, request)
+    assert not result.ok and result.error == expected and result.observation is None
+    assert attempt_name in configured.resolution_reads
+    assert configured.resolution_records[attempt_name] == attempt

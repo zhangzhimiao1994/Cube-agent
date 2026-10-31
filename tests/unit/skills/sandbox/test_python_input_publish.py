@@ -50,7 +50,13 @@ def api(monkeypatch: pytest.MonkeyPatch) -> Any:
     assert importlib.util.find_spec(name) is not None, "atomic root wheel publisher is missing"
     module = importlib.import_module(name)
     validator = ModuleType("agent_hub.skills.sandbox.python_input_fetch")
-    validator.validate_wheel_bytes = lambda entry, data: None  # type: ignore[attr-defined]
+    deadlines: list[float | None] = []
+
+    def validate(entry: Any, data: bytes, *, deadline: float | None = None) -> None:
+        deadlines.append(deadline)
+
+    validator.validate_wheel_bytes = validate  # type: ignore[attr-defined]
+    validator.validation_deadlines = deadlines  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, validator.__name__, validator)
     return module
 
@@ -391,8 +397,10 @@ def test_exdev_actual_copy_passes_static_validator_again(
     api: Any, exdev: FileSystem, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     checked = []
-    def validate(entry: Any, data: bytes) -> None:
+    deadlines = []
+    def validate(entry: Any, data: bytes, *, deadline: float | None = None) -> None:
         checked.append(data)
+        deadlines.append(deadline)
         if len(checked) == 2:
             raise ValueError("private metadata invalid on revalidation")
     monkeypatch.setattr(sys.modules["agent_hub.skills.sandbox.python_input_fetch"],
@@ -400,6 +408,7 @@ def test_exdev_actual_copy_passes_static_validator_again(
     with pytest.raises(api.PythonInputPublishError, match="invalid_wheel"):
         publish(api)
     assert checked == [RAW, RAW] and not any(kind == "link" for kind, _ in exdev.events)
+    assert deadlines == [200.0, 200.0]
 
 
 def test_exdev_successful_link_then_stage_cleanup_failure_is_uncertain(api: Any, exdev: FileSystem) -> None:
@@ -481,6 +490,7 @@ def test_publishes_readonly_bytes_outside_flat_cache_then_reuses(api: Any, fs: F
     assert not any(path.startswith(str(STAGING) + "/") for path in fs.nodes)
     assert ("fsync", str(CACHE)) in fs.events and ("fsync", str(STAGING)) in fs.events
     assert publish(api) == "reused"
+    assert sys.modules["agent_hub.skills.sandbox.python_input_fetch"].validation_deadlines == [200.0, 200.0]
     assert sum(kind == "rename" for kind, _ in fs.events) == 1
     assert not fs.fds
 
@@ -497,13 +507,16 @@ def test_invalid_input_never_allocates(api: Any, fs: FileSystem, mutation: str) 
 
 def test_static_validator_failure_is_finite_and_allocates_nothing(api: Any, fs: FileSystem,
                                                                 monkeypatch: pytest.MonkeyPatch) -> None:
-    def reject(*args: Any) -> None:
+    deadlines = []
+    def reject(entry: Any, data: bytes, *, deadline: float | None = None) -> None:
+        deadlines.append(deadline)
         raise ValueError("untrusted wheel private contents")
     monkeypatch.setattr(sys.modules["agent_hub.skills.sandbox.python_input_fetch"],
                         "validate_wheel_bytes", reject)
     with pytest.raises(api.PythonInputPublishError) as caught:
         publish(api)
     assert "private" not in str(caught.value) and not fs.events
+    assert deadlines == [200.0]
 
 
 @pytest.mark.parametrize("deadline", [99.0, float("nan"), float("inf"), True])
@@ -620,6 +633,7 @@ def test_postpublication_cancellation_is_uncertain(api: Any, fs: FileSystem) -> 
     with pytest.raises(ProcessCleanupIncomplete):
         publish(api)
     assert fs.nodes[str(CACHE) + "/" + FILENAME].data == RAW
+    assert sys.modules["agent_hub.skills.sandbox.python_input_fetch"].validation_deadlines == [200.0]
 
 
 def test_expiry_during_write_cleans_without_needing_fresh_deadline(
