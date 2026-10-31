@@ -17,6 +17,7 @@ from uuid import uuid4
 
 import httpx
 
+from agent_hub.api.routers.runs import CreateRunRequest
 from agent_hub.auth.models import AuthenticatedPrincipal, Role
 from agent_hub.capabilities.defaults import build_runtime_capability_stack
 from agent_hub.capabilities.review_contracts import ApprovalReviewConfig
@@ -55,6 +56,7 @@ from tests.integration.runtime.test_model_review_modes_helper import (
     ClosedBody,
     FixtureSecrets,
     fixture_platform,
+    submitted_input_scope,
 )
 
 PROJECT, SESSION = "a2-repair", "main"
@@ -124,7 +126,11 @@ class RepairWire:
                 }
             )
         elif payload.get("tools"):
-            if self.phase == "initial":
+            choice = payload.get("tool_choice")
+            required = choice.get("function", {}).get("name") if isinstance(choice, dict) else None
+            if required in {"project.inspect", "project_inspect"}:
+                name, arguments = "project.inspect", {}
+            elif self.phase == "initial":
                 name, arguments = "workspace.read", {"path": TARGET}
             elif not self.diagnosed:
                 assert "repair" in text.lower(), "actual repair feedback was not propagated"
@@ -249,7 +255,7 @@ class AckBoundary:
                         role="Engineer",
                         goal="Diagnose and correct",
                         logical_model="primary",
-                        allowed_tools=("workspace.read", "workspace.write_text"),
+                        allowed_tools=("workspace.read", "workspace.write_text", "project.inspect"),
                     ),
                     DiscussionParticipant(
                         id="observer",
@@ -374,6 +380,23 @@ async def components(
     )
 
 
+def initial_route(selection, profile, *, conversation_id):
+    """The native initial submission, before RunService claim adds worker flags."""
+    return {
+        **selection.routing_payload(),
+        "conversation_id": conversation_id,
+        "execution_backend": "systemd",
+        "engineering_auto_repair_version": 1,
+        "engineering_delivery_contract_version": 1,
+        "engineering_checkpoint_ack_version": 1,
+        "engineering_final_report_version": 1,
+        "runtime_token_absolute_tokens": 1000000,
+        "runtime_plan_token_budget": 1000000,
+        "runtime_timeout_seconds": 120,
+        **profile,
+    }
+
+
 async def pg_case(storage, tmp_path, redis_client, *, unknown_review=False):
     factory, ids = storage
     user = AuthenticatedPrincipal(uuid4(), uuid4(), Role.OPERATOR)
@@ -445,6 +468,18 @@ async def pg_case(storage, tmp_path, redis_client, *, unknown_review=False):
     broker._a2_tenant = user.tenant_id
     profile = await broker.submission_profile(user.tenant_id, timeout_seconds=120)
     assert "approval_review_profile" in profile, "repair protocol fixture failed to enroll profile"
+    body = CreateRunRequest(
+        message=MESSAGE,
+        mode=TaskMode.DISCUSS,
+        conversation_id="a2-" + uuid4().hex,
+        project_id=PROJECT,
+        workspace_session_id=SESSION,
+        sandbox_profile="workspace_write",
+        requested_permissions=("workspace.read", "command.run"),
+        permission_mode="auto_review",
+        execution_backend="systemd",
+        runtime_timeout_seconds=120,
+    )
     selection = workspace_selection(
         project_id=PROJECT,
         session_id=SESSION,
@@ -452,21 +487,8 @@ async def pg_case(storage, tmp_path, redis_client, *, unknown_review=False):
         requested_permissions=("workspace.read", "command.run"),
         permission_mode="auto_review",
     )
-    route = {
-        **selection.routing_payload(),
-        "execution_backend": "systemd",
-        "engineering_auto_repair_version": 1,
-        "engineering_delivery_contract_version": 1,
-        "engineering_checkpoint_ack_version": 1,
-        "engineering_final_report_version": 1,
-        "runtime_token_absolute_tokens": 1000000,
-        "runtime_plan_token_budget": 1000000,
-        "runtime_timeout_seconds": 120,
-        **profile,
-    }
-    evidence = _capture_authenticated_input(
-        user, MESSAGE, {"mode": "discuss", "project": PROJECT, "session": SESSION}
-    )
+    route = initial_route(selection, profile, conversation_id=body.conversation_id)
+    evidence = _capture_authenticated_input(user, body.message, submitted_input_scope(body))
     record = await repository.create_run(
         tenant_id=user.tenant_id,
         actor_id=user.user_id,
@@ -568,3 +590,116 @@ async def projected_worker(f, context, check):
         async for _ in stream:
             pass
     return values[0]
+
+
+def local_service_sql(db):
+    """Only SQL transport is local; service/DAO classification and accept stay real."""
+    from sqlalchemy.sql import operators
+    from sqlalchemy.sql.dml import Insert
+    from sqlalchemy.sql.elements import BooleanClauseList, Grouping
+    from sqlalchemy.sql.selectable import Exists
+
+    from agent_hub.db import models
+    from tests.unit.runtime.test_review_repair_continuity import matches
+
+    select_rows = db.select
+
+    def artifact_match(condition, artifact):
+        if isinstance(condition, Grouping):
+            return artifact_match(condition.element, artifact)
+        if isinstance(condition, BooleanClauseList):
+            values = (artifact_match(clause, artifact) for clause in condition.clauses)
+            return all(values) if condition.operator is operators.and_ else any(values)
+        if isinstance(condition, Exists):
+            # The continuation DAO's exact correlated written-artifact lookup.
+            # Compare actual stored write rows, never claim an unwritten row exists.
+            return any(
+                type(row) is models.RuntimeArtifactWriteRow
+                and row.status == "written"
+                and (row.tenant_id, row.run_id, row.artifact_id, row.content_sha256)
+                == (artifact.tenant_id, artifact.run_id, artifact.id, artifact.content_sha256)
+                for row in db.rows
+            )
+        return matches(condition, artifact)
+
+    def local_select(statement):
+        if statement.column_descriptions[0].get("entity") is models.RuntimeArtifactRow:
+            return [
+                row
+                for row in db.rows
+                if type(row) is models.RuntimeArtifactRow
+                and all(artifact_match(c, row) for c in statement._where_criteria)
+            ]
+        return select_rows(statement)
+
+    db.select = local_select
+    scalar, execute = db.scalar, db.execute
+    tables = {
+        cls.__tablename__: cls
+        for cls in (
+            models.RunEventRow,
+            models.RunCheckpointRow,
+            models.RunArtifactRow,
+            models.RunUsageRow,
+            models.RunApprovalRow,
+        )
+    }
+
+    def inserted(statement):
+        cls = tables[statement.table.name]
+        params = statement.compile().params
+        keys = (
+            ("run_id", "sequence")
+            if cls in (models.RunEventRow, models.RunCheckpointRow)
+            else ("id",)
+        )
+        if any(
+            type(row) is cls and all(getattr(row, key) == params[key] for key in keys)
+            for row in db.rows
+        ):
+            return None
+        row = cls(**params)
+        db.add(row)
+        return row.id
+
+    async def local_scalar(statement):
+        if isinstance(statement, Insert):
+            return inserted(statement)
+        if getattr(statement.column_descriptions[0]["expr"], "name", None) == "count":
+            table = statement.get_final_froms()[0].name
+            return sum(type(row).__tablename__ == table for row in db.rows)
+        expr = statement.column_descriptions[0]["expr"]
+        if (
+            statement.column_descriptions[0].get("entity") is models.RunRow
+            and getattr(expr, "key", None) == "created_at"
+        ):
+            selected = db.select(statement)
+            return selected[0].created_at if selected else None
+        return await scalar(statement)
+
+    async def local_execute(statement):
+        if isinstance(statement, Insert):
+            identity = inserted(statement)
+            return SimpleNamespace(scalar_one_or_none=lambda: identity)
+        if getattr(statement.column_descriptions[0]["expr"], "name", None) == "count":
+            artifacts = [row for row in db.rows if type(row) is models.RuntimeArtifactRow]
+            return SimpleNamespace(
+                one=lambda: (len(artifacts), sum(row.byte_size for row in artifacts))
+            )
+        return await execute(statement)
+
+    async def local_get(cls, identity, **kwargs):
+        values = identity if isinstance(identity, tuple) else (identity,)
+        keys = [column.key for column in cls.__mapper__.primary_key]
+        return next(
+            (
+                row
+                for row in db.rows
+                if type(row) is cls
+                and all(getattr(row, key) == value for key, value in zip(keys, values, strict=True))
+            ),
+            None,
+        )
+
+    db.scalar, db.execute = local_scalar, local_execute
+    db.get = local_get

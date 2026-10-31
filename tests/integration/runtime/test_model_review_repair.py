@@ -657,7 +657,8 @@ async def test_discuss_repair_unknown_review_never_executes_or_replays(
     f = await accepted_case(storage, tmp_path, own_redis, unknown_review=True)
     repair = await f.service("a2-repair-worker")
     result = await asyncio.wait_for(repair.service.execute(f.record.id), timeout=75)
-    assert result.status is RunStatus.WAITING_APPROVAL
+    # Concrete UNKNOWN is denied by the existing gate, not an ordinary human ASK.
+    assert result.status is RunStatus.FAILED
     assert f.wire.diagnosed and len(f.wire.reviews) == 1
     assert (f.root / TARGET).read_text(encoding="utf-8") == ORIGINAL
     assert repair.root_entries == repair.root_effects == []
@@ -1501,3 +1502,273 @@ async def test_private_projection_nested_worker_cannot_borrow_parent_without_pg(
             pass
     assert bool(child_seen) is legacy
     assert pool_values(f.db) == f.before
+
+
+@pytest.mark.parametrize(
+    "unknown_review,omission",
+    [(False, None), (True, None), (False, "inspect"), (False, "conversation")],
+    ids=["allow", "unknown", "missing-inspect", "missing-conversation"],
+)
+async def test_native_initial_service_classifies_and_accepts_actual_stopped_boundary_without_pg(
+    tmp_path, monkeypatch, unknown_review, omission
+):
+    """Catch a participant/route that cannot reach native claim's engineering ACK."""
+    from agent_hub.api.routers.runs import CreateRunRequest
+    from agent_hub.db import models
+    from agent_hub.runs.authorization import _persist_authenticated_input
+    from agent_hub.runs.repository import RunRepository
+    from agent_hub.runs.service import RunService
+    from agent_hub.runs.workspace import workspace_selection
+    from agent_hub.runtime.registry import RuntimeRegistry
+    from tests.integration.runtime._model_review_repair_fixture import (
+        initial_route,
+        local_service_sql,
+    )
+    from tests.integration.runtime.test_model_review_modes_helper import capture_submission_input
+    from tests.unit.runtime.test_review_repair_continuity import RepairDB
+
+    f = await offline_assembly(tmp_path, mode=TaskMode.DISCUSS)
+    db = RepairDB(f.s)
+    db.rows.remove(db.pool)  # a fresh run; only the real broker may open its original pool
+    db.run.created_at = datetime.now(UTC)
+    db.run.version = 1
+    db.run.status = "queued"
+    RunRepository.clear_worker_lease(db.run)
+    selection = workspace_selection(
+        project_id="demo",
+        session_id="session",
+        sandbox_profile="workspace_write",
+        requested_permissions=("workspace.read", "command.run"),
+        permission_mode="auto_review",
+    )
+    profile = await f.broker.submission_profile(db.run.tenant_id, timeout_seconds=120)
+    body = CreateRunRequest(
+        message=db.run.request,
+        mode=TaskMode.DISCUSS,
+        conversation_id="a2-local-" + uuid4().hex,
+        project_id="demo",
+        workspace_session_id="session",
+        sandbox_profile="workspace_write",
+        requested_permissions=("workspace.read", "command.run"),
+        permission_mode="auto_review",
+        execution_backend="systemd",
+        runtime_timeout_seconds=120,
+    )
+    route = initial_route(selection, profile, conversation_id=body.conversation_id)
+    if omission == "conversation":
+        route.pop("conversation_id")
+    db.run.routing_decision = route
+    db.rows[:] = [
+        row
+        for row in db.rows
+        if type(row)
+        not in (
+            models.RunAuthenticatedInputRow,
+            models.RunInputAuthorizationRow,
+        )
+    ]
+    local_service_sql(db)
+    await _persist_authenticated_input(db, db.run, capture_submission_input(db.run, body))
+    repository = RunRepository(db)
+    prior_broker = f.broker
+    f.broker = review_assembly.ReviewAssemblyBroker(
+        config_service=f.config_service,
+        config_getter=prior_broker.current_config,
+        run_repository=repository,
+        session_factory=db,
+        secret_service=f.secrets,
+        capacity_factory=f.capacity,
+        transport=prior_broker._transport,
+        billing_contracts=prior_broker._contracts,
+        verification=prior_broker._verification,
+    )
+    f.broker._a2_tenant = db.run.tenant_id
+    root = ProjectWorkspaceStore(tmp_path).session_root(db.run.tenant_id, "demo", "session")
+    root.mkdir(parents=True, exist_ok=True)
+    (root / TARGET).write_text(ORIGINAL, encoding="utf-8")
+    wire = RepairWire(authorization_message=db.run.request, unknown_review=unknown_review)
+    case = await components(
+        tmp_path,
+        repository,
+        PostgresArtifactRepository(db),
+        f.broker,
+        f.state.platform,
+        f.config_service,
+        f.secrets,
+        f.capacity,
+        wire,
+    )
+
+    if omission == "inspect":
+        import tests.integration.runtime._model_review_repair_fixture as fixture_module
+
+        participant = fixture_module.DiscussionParticipant
+
+        def without_inspect(**kwargs):
+            if kwargs["id"] == "implementer":
+                kwargs["allowed_tools"] = tuple(
+                    name for name in kwargs["allowed_tools"] if name != "project.inspect"
+                )
+            return participant(**kwargs)
+
+        monkeypatch.setattr(fixture_module, "DiscussionParticipant", without_inspect)
+
+    async def trusted_main_window():
+        return 10000  # actual fixed local primary catalog; native catalog is 131072
+
+    service = RunService(
+        repository,
+        runtime_registry=RuntimeRegistry((case.runtime,)),
+        router=None,
+        task_queue=SimpleNamespace(),
+        worker_id="a2-local-initial",
+        runtime_timeout_seconds=120,
+        runtime_token_budget=1000000,
+        review_broker=f.broker,
+        main_agent_context_window_getter=trusted_main_window,
+    )
+    result = await asyncio.wait_for(service.execute(db.run.id), timeout=30)
+    events = await repository.raw_events(db.run.tenant_id, db.run.id)
+    diagnostic = [
+        (str(event.kind), event.reason, dict(event.payload))
+        for event in events
+        if str(event.kind) in {"runtime.failed", "repair.classified", "repair.skipped"}
+    ]
+    if omission == "inspect":
+        assert result.status is RunStatus.FAILED
+        assert case.runtime.last_checkpoint is None and not wire.tool_calls and not wire.reviews
+        assert case.root_entries == case.root_effects == []
+        assert any(
+            str(event.kind) == "repair.skipped"
+            and event.payload.get("skip_reason") == "project_repair_checkpoint_not_resumable"
+            for event in events
+        )
+        return
+    assert result.status is RunStatus.QUEUED, diagnostic
+    assert case.runtime.last_checkpoint is not None
+    assert wire.tool_calls == [("initial", "project.inspect", {})]
+    assert len(wire.unknown_ids) == 1
+    assert case.root_entries == case.root_effects == []
+    assert (root / TARGET).read_text(encoding="utf-8") == ORIGINAL
+    assert db.run.routing_decision["source"] == "self_repair"
+    assert db.run.routing_decision["self_repair_source_run_id"] == str(db.run.id)
+    classified = [event for event in events if str(event.kind) == "repair.classified"]
+    assert len(classified) == 1 and classified[0].payload["failure_category"] == "runtime_failure"
+    assert classified[0].payload["automatic_execution"] is True
+    assert any(
+        type(row) is models.RunOutboxRow and ":self-repair:" in row.idempotency_key
+        for row in db.rows
+    )
+    pool = next(row for row in db.rows if type(row) is models.RunAdmissionPoolRow)
+    assert pool.original_token_grant == 1000000
+    unknown = next(
+        row
+        for row in db.rows
+        if type(row) is models.RunAdmissionAttemptRow and row.attempt_id in wire.unknown_ids
+    )
+    assert unknown.state == "unknown" and unknown.token_hold > 0
+    assert wire.bodies and all(body.closed for body in wire.bodies)
+
+    original_budget = (
+        pool.authorization_turn_id,
+        pool.original_token_grant,
+        pool.original_deadline,
+    )
+    original_unknown = (
+        unknown.attempt_id,
+        unknown.token_hold,
+        unknown.receipt_sha256,
+        unknown.state,
+    )
+    original_lease = wire.contexts[0].execution_token
+    original_scope = db.run.routing_decision["repair_proposal"]["automatic_scope_sha256"]
+    saved = await repository.latest_checkpoint(db, tenant_id=db.run.tenant_id, run_id=db.run.id)
+    assert saved is not None and saved.state_sha256 == case.runtime.last_checkpoint.state_sha256
+    repair = await components(
+        tmp_path,
+        repository,
+        PostgresArtifactRepository(db),
+        f.broker,
+        f.state.platform,
+        f.config_service,
+        f.secrets,
+        f.capacity,
+        wire,
+    )
+    resumed = RunService(
+        repository,
+        runtime_registry=RuntimeRegistry((repair.runtime,)),
+        router=None,
+        task_queue=SimpleNamespace(),
+        worker_id="a2-local-restored",
+        runtime_timeout_seconds=120,
+        runtime_token_budget=1000000,
+        review_broker=f.broker,
+        main_agent_context_window_getter=trusted_main_window,
+    )
+    result = await asyncio.wait_for(resumed.execute(db.run.id), timeout=30)
+    assert len(wire.contexts) == 2 and wire.contexts[1].execution_token != original_lease
+    assert wire.contexts[1].run_id == wire.contexts[0].run_id == db.run.id
+    assert repair.runtime.loaded_checkpoint.state_sha256 == saved.state_sha256
+    assert (
+        repair.runtime.phase_checkpoint.state[project_repair_phase.PHASE_KEY]["source_scope_sha256"]
+        == original_scope
+    )
+    if omission == "conversation":
+        assert result.status is RunStatus.FAILED
+        assert wire.diagnosed and not wire.reviews
+        assert repair.root_entries == repair.root_effects == []
+        assert (root / TARGET).read_text(encoding="utf-8") == ORIGINAL
+        assert (
+            unknown.attempt_id,
+            unknown.token_hold,
+            unknown.receipt_sha256,
+            unknown.state,
+        ) == original_unknown
+        return
+    assert wire.diagnosed and len(wire.reviews) == 1, {
+        "status": result.status,
+        "tools": wire.tool_calls,
+        "events": [
+            (str(e.kind), e.reason, dict(e.payload))
+            for e in await repository.raw_events(db.run.tenant_id, db.run.id)
+        ],
+    }
+    assert [name for phase, name, _ in wire.tool_calls if phase == "repair"] == [
+        "workspace.read",
+        "workspace.write_text",
+    ]
+    assert (
+        pool.authorization_turn_id,
+        pool.original_token_grant,
+        pool.original_deadline,
+    ) == original_budget
+    assert (
+        unknown.attempt_id,
+        unknown.token_hold,
+        unknown.receipt_sha256,
+        unknown.state,
+    ) == original_unknown
+    intents = [row for row in db.rows if type(row) is models.RunReviewIntentRow]
+    assert len(intents) == 1
+    attempts = [row for row in db.rows if type(row) is models.RunAdmissionAttemptRow]
+    reviews = [row for row in attempts if row.purpose == "review"]
+    assert len(reviews) == 1 and reviews[0].deployment["deployment_id"] == "reviewer_1"
+    assert all(
+        row.deployment != reviews[0].deployment for row in attempts if row.purpose == "primary"
+    )
+    assert {row.attempt_id for row in attempts} == set(wire.sent)
+    if unknown_review:
+        assert result.status is RunStatus.FAILED
+        assert intents[0].status == "unknown" and not intents[0].consumed
+        assert repair.root_entries == repair.root_effects == []
+        assert (root / TARGET).read_text(encoding="utf-8") == ORIGINAL
+        before_retry = len(wire.calls)
+        await resumed.execute(db.run.id)
+        assert len(wire.calls) == before_retry and len(wire.reviews) == 1
+    else:
+        assert intents[0].status == "allow" and intents[0].consumed
+        assert repair.root_entries == [(db.run.id, {"path": TARGET, "content": PATCHED})]
+        assert len(repair.root_effects) == 1
+        assert (root / TARGET).read_text(encoding="utf-8") == PATCHED
+    assert wire.bodies and all(body.closed for body in wire.bodies)
