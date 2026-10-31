@@ -8,7 +8,15 @@ from decimal import Decimal
 from typing import cast
 from uuid import UUID
 
-from agent_hub.models.gateway import GatewayCompletion
+from agent_hub.models.capacity import (
+    CapacityBackendError,
+    CapacityConfigurationError,
+    CapacityQueueFull,
+    CapacityRequestTooLarge,
+    CapacityUnavailable,
+    CapacityWaitTimeout,
+)
+from agent_hub.models.gateway import GatewayCompletion, preserve_gateway_scope_diagnostic
 from agent_hub.models.types import JsonScalar as ModelJsonScalar
 from agent_hub.models.types import JsonValue as ModelJsonValue
 from agent_hub.models.types import ModelRequest, ModelResponse, TokenUsage, ToolCall
@@ -17,6 +25,10 @@ from agent_hub.runtime.contracts import JsonValue
 from agent_hub.runtime.instruction_context import model_request_sha256
 
 _UNAVAILABLE = 'direct continuation is unavailable'
+_CAPACITY_FAILURES = (
+    CapacityRequestTooLarge, CapacityQueueFull, CapacityWaitTimeout,
+    CapacityUnavailable, CapacityBackendError, CapacityConfigurationError,
+)
 
 
 def _response_payload(completion: GatewayCompletion) -> dict[str, JsonValue]:
@@ -109,6 +121,7 @@ class DirectCompletionJournal:
         if self._incomplete or request.native_tool_continuation:
             raise DirectJournalError(_UNAVAILABLE)
         request_sha = model_request_sha256(replace(request, timeout_seconds=1.0))
+        capacity_failure: Exception | None = None
         try:
             if self._cursor < len(self._references):
                 value = await load_continuation(self._repository, tenant_id=self._tenant, run_id=self._run,
@@ -129,6 +142,13 @@ class DirectCompletionJournal:
         except asyncio.CancelledError:
             self._incomplete = True
             raise
-        except Exception:  # noqa: BLE001 - never echo model/source/repository details.
+        except Exception as error:  # noqa: BLE001 - never echo model/source/repository details.
             self._incomplete = True
+            if any(type(error) is native for native in _CAPACITY_FAILURES):
+                # Retain the issued failure class for diagnosis, never its private
+                # body or a permission to replay an incomplete model operation.
+                capacity_failure = type(error)('model capacity admission failed')
+                preserve_gateway_scope_diagnostic(capacity_failure, error)
+        if capacity_failure is not None:
+            raise capacity_failure from None
         raise DirectJournalError(_UNAVAILABLE) from None

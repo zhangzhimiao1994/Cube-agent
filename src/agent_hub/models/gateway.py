@@ -887,10 +887,10 @@ class ModelGateway:
                     fallback_from_logical_model = logical_model
                     fallback_reason = "context_window_exceeded"
                 continue
-            estimated_tokens = self._capacity_token_estimates(
-                request, compatible_candidates, input_tokens
-            )
             try:
+                compatible_candidates, prepared_requests, estimated_tokens = (
+                    self._prepare_capacity_requests(request, compatible_candidates, input_tokens)
+                )
                 lease = await self._acquire_capacity(
                     capacity, compatible_candidates, estimated_tokens,
                     deadline=request_deadline,
@@ -952,7 +952,7 @@ class ModelGateway:
                 if cleanup_error is not None:
                     raise CapacityBackendError("model capacity release failed") from None
                 break
-            selected_request = self._request_for_deployment(request, selected, input_tokens)
+            selected_request = prepared_requests[selected.id]
             try:
                 response = await self._complete_leased(
                     capacity, selected, lease, selected_request, deadline=request_deadline,
@@ -1093,9 +1093,6 @@ class ModelGateway:
                     fallback_from_logical_model = logical_model
                     fallback_reason = "context_window_exceeded"
                 continue
-            estimated_tokens = self._capacity_token_estimates(
-                request, compatible_candidates, input_tokens
-            )
             if (
                 fallback_from_logical_model is not None
                 and fallback_reason is not None
@@ -1112,6 +1109,9 @@ class ModelGateway:
                 only_token_limits = False
                 break
             try:
+                compatible_candidates, prepared_requests, estimated_tokens = (
+                    self._prepare_capacity_requests(request, compatible_candidates, input_tokens)
+                )
                 lease = await self._acquire_capacity(
                     capacity, compatible_candidates, estimated_tokens,
                     deadline=request_deadline,
@@ -1163,7 +1163,7 @@ class ModelGateway:
                 if cleanup_error is not None:
                     raise CapacityBackendError("model capacity release failed") from None
                 break
-            selected_request = self._request_for_deployment(request, selected, input_tokens)
+            selected_request = prepared_requests[selected.id]
             yielded = False
             events = self._stream_openai_compatible_leased(
                 capacity,
@@ -1341,22 +1341,48 @@ class ModelGateway:
             return request
         return replace(request, max_output_tokens=output_limit)
 
-    def _capacity_token_estimates(
+    def _prepare_capacity_requests(
         self,
         request: ModelRequest,
         candidates: Sequence[Deployment],
         input_tokens: int | None,
-    ) -> int | Mapping[str, int]:
-        estimates = {
-            deployment.id: self._estimate_tokens(
-                self._request_for_deployment(request, deployment, input_tokens)
-            )
-            for deployment in candidates
-        }
+    ) -> tuple[tuple[Deployment, ...], Mapping[str, ModelRequest], int | Mapping[str, int]]:
+        prepared: dict[str, ModelRequest] = {}
+        estimates: dict[str, int] = {}
+        for deployment in candidates:
+            selected = self._request_for_deployment(request, deployment, input_tokens)
+            estimate = self._estimate_tokens(selected)
+            limit = deployment.tpm
+            if limit and estimate > limit:
+                # Output is an upper bound, not a mandatory reservation. Evaluate
+                # full requests: custom estimators need not have unit output cost,
+                # and even the default counts the output-limit field's digits.
+                minimum = replace(selected, max_output_tokens=1)
+                minimum_estimate = self._estimate_tokens(minimum)
+                if minimum_estimate > limit:
+                    continue
+                low, high = 2, selected.max_output_tokens - 1
+                selected, estimate = minimum, minimum_estimate
+                while low <= high:
+                    output = (low + high) // 2
+                    probe = replace(selected, max_output_tokens=output)
+                    probe_estimate = self._estimate_tokens(probe)
+                    if probe_estimate <= limit:
+                        selected, estimate = probe, probe_estimate
+                        low = output + 1
+                    else:
+                        high = output - 1
+            prepared[deployment.id] = selected
+            estimates[deployment.id] = estimate
+        if not prepared:
+            raise CapacityRequestTooLarge()
+        # Reuse the exact fitted requests after leasing; recomputing there could
+        # diverge from admission or fail after a lease has already been acquired.
+        compatible = tuple(item for item in candidates if item.id in prepared)
         unique_estimates = set(estimates.values())
         if len(unique_estimates) == 1:
-            return next(iter(unique_estimates))
-        return MappingProxyType(estimates)
+            return compatible, prepared, next(iter(unique_estimates))
+        return compatible, prepared, MappingProxyType(estimates)
 
     def context_window_tokens(self, request: ModelRequest) -> int | None:
         """Read the conservative finite window across the authorized candidate chain.
