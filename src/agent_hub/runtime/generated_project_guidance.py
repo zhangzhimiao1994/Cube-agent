@@ -47,10 +47,15 @@ def generated_project_guidance(context: TaskContext) -> str:
             and route['python_dependency_preflight_version'] == 1):
         guidance += (
             ' Before capture, project.verify checks dependency_closure against trusted wheel metadata. '
-            'Correct missing or incompatible lock entries using the actual catalog pins and the returned '
-            'dependency constraints, then verify again. If the requested dependency is unsupported, '
-            'choose a supported alternative that still meets the user requirements, including standard '
-            'library implementation when appropriate; do not repeat an unchanged failed draft. '
+            'For required registry packages outside the base catalog, project.verify requests a specific '
+            'resolution action, then project.inspect exposes trusted dependency data through a real artifact_ref. '
+            'Use its structured machine data (identical to the registered artifact) and write actual exact pins and hashes to pyproject.toml and requirements.lock '
+            'before capture; never invent hashes, preinstall global packages or replace a dependency with a fake module. '
+            'Legal control edits require a fresh source freeze while reusing the original verified bytes/needs data. '
+            'Publication, input supply and offline recipe installation retain their own concrete approvals. '
+            'An UNKNOWN operation is inspect-only; do not retry a download or extend the original budget/deadline. '
+            'Keep Main replies readable: explain the next concrete action and cite the real artifact_ref, '
+            'not raw descriptor JSON, private Root plans or worker credentials. '
             'A dependency observation is not installation, build or test evidence, an approval, '
             'or an extension of the original task deadline.'
         )

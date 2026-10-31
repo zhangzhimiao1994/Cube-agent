@@ -12,6 +12,7 @@ import os
 from collections.abc import Awaitable, Mapping
 from contextlib import ExitStack
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from inspect import isawaitable
 from typing import TYPE_CHECKING, NoReturn, cast, get_args
 from uuid import UUID, uuid4
@@ -197,7 +198,8 @@ class PythonGeneratedProjectService:
             return context, await self._inputs(context)
         invocation = context.invocation.model_copy(update={
             'execution_id': 'generated_probe_' + uuid4().hex, 'install_allowed': False})
-        inputs = await self.owner._python.prepare(invocation, context.stored.reference)
+        async with asyncio.timeout_at(self._deadline(context)):
+            inputs = await self.owner._python.prepare(invocation, context.stored.reference)
         _need(type(inputs) is PythonProjectInputs, _ERROR)
         assert inputs is not None
         _need(inputs.contract == context.stored.contract
@@ -213,16 +215,55 @@ class PythonGeneratedProjectService:
                 'phase': 'python_ready', 'python_recipe': marker})
         return context, inputs
 
+    @staticmethod
+    def _catalog(context: GeneratedProjectContext) -> str | None:
+        proof = context.state.get('python_dependency_preflight')
+        if not isinstance(proof, Mapping):
+            return None
+        value = proof.get('catalog_sha256')
+        _need(type(value) is str, 'input_supply_plan_changed')
+        return cast(str, value)
+
+    @staticmethod
+    def _deadline(context: GeneratedProjectContext) -> float:
+        from agent_hub.models.physical_budget import _budget_deadline
+
+        now = asyncio.get_running_loop().time()
+        deadline = now + context.invocation.timeout_seconds
+        created = getattr(context.record, 'created_at', None)
+        if isinstance(created, datetime):
+            remaining = (created + timedelta(seconds=context.invocation.timeout_seconds) - datetime.now(UTC)).total_seconds()
+            deadline = min(deadline, now + remaining)
+        deadline = _budget_deadline(deadline)
+        _need(deadline > now, 'input_supply_timeout')
+        return deadline
+
+    async def _needs_dynamic_supply(self, context: GeneratedProjectContext, actor: str) -> bool:
+        if _SUPPLY in context.state or self._catalog(context) is None:
+            return False
+        from agent_hub.skills.sandbox.python_project_profile import PythonProjectProfileSandbox
+
+        invocation = context.invocation.model_copy(update={'execution_id': 'generated_base_profile_' + uuid4().hex,
+                                                          'sandbox_profile': 'restricted', 'install_allowed': False})
+        async with asyncio.timeout_at(self._deadline(context)):
+            profile = await PythonProjectProfileSandbox().inspect(invocation)
+        _need(profile.ok and profile.profile is not None, 'input_supply_unavailable')
+        assert profile.profile is not None
+        await self._current(context, actor, exact_state=True)
+        return profile.profile.catalog_sha256 != self._catalog(context)
+
     async def _plan(self, context: GeneratedProjectContext, actor: str) -> GeneratedProjectContext:
         _need(actor == context.envelope.proposer_actor, 'input_supply_scope_changed')
         probe = _probe(context, 'input_plan_')
-        response = await self.supply_client.plan(probe)
+        async with asyncio.timeout_at(self._deadline(context)):
+            response = await self.supply_client.plan(probe)
         _need(type(response) is PythonInputSupplyResponse, 'input_supply_request_invalid')
         response = PythonInputSupplyResponse.model_validate_json(response.model_dump_json(), strict=True)
         response.require_for(PythonInputSupplyRequest(action='plan_python_project_inputs', invocation=probe))
         _need(response.ok and response.plan is not None, response.error or 'input_supply_unavailable')
         assert response.plan is not None
-        validate_supply_declaration(response.plan, probe, context.stored)
+        validate_supply_declaration(response.plan, probe, context.stored,
+            expected_catalog_sha256=self._catalog(context))
         await self._current(context, actor, exact_state=True)
         if _SUPPLY in context.state:
             _need(supply_state_plan(context.state[_SUPPLY]) == response.plan, 'input_supply_plan_changed')
@@ -245,6 +286,8 @@ class PythonGeneratedProjectService:
                 agent_id=request.agent_id, idempotency_key=request.idempotency_key)
             _need(generic or request == projected)
             context = await self._current(context, request.agent_id)
+            if await self._needs_dynamic_supply(context, request.agent_id):
+                context = await self._plan(context, request.agent_id)
             if _SUPPLY in context.state and cast(Mapping[str, JsonValue], context.state[_SUPPLY])['phase'] != 'supplied':
                 _need(request.agent_id == context.envelope.proposer_actor, 'input_supply_scope_changed')
                 if cast(Mapping[str, JsonValue], context.state[_SUPPLY])['phase'] == 'planned':
@@ -303,7 +346,8 @@ class PythonGeneratedProjectService:
         await authorize(supply_state_plan(state), state)
         await supply_python_inputs(client=self.supply_client, invocation=_probe(context, 'input_base_'),
             stored=context.stored, state_io=state_io, authorize=authorize,
-            deadline=asyncio.get_running_loop().time() + context.invocation.timeout_seconds)
+            deadline=self._deadline(context),
+            expected_catalog_sha256=self._catalog(context))
         return current
 
     async def verify(self, context: GeneratedProjectContext, actor: str) -> Mapping[str, JsonValue]:
@@ -319,6 +363,8 @@ class PythonGeneratedProjectService:
         committed = False
         try:
             context = await self._current(context, actor)
+            if await self._needs_dynamic_supply(context, actor):
+                context = await self._plan(context, actor)
             if _SUPPLY in context.state and cast(Mapping[str, JsonValue], context.state[_SUPPLY])['phase'] != 'supplied':
                 context = await self._supply(context, actor)
             context, inputs = await self._prepare(context, actor, fresh=True)
@@ -337,7 +383,8 @@ class PythonGeneratedProjectService:
             await self._after(context, actor, approval, source)
             await self.owner._begin_verification(tenant_id=invocation.tenant_id, run_id=invocation.run_id,
                 actor=actor, execution_id=invocation.execution_id, source_sha256=source)
-            response = await self.executor.run(invocation)
+            async with asyncio.timeout_at(self._deadline(context)):
+                response = await self.executor.run(invocation)
             with consume_response(response, invocation, source) as (response, stream):
                 _need(response.ok and response.result is not None, response.error or _ERROR)
                 assert response.result is not None
@@ -369,7 +416,7 @@ class PythonGeneratedProjectService:
                     'generated_project_acceptance': binding,
                     'python_recipe': python_recipe_marker(inputs),
                     'python_environment_reference': report.environment_reference.model_dump(mode='json'),
-                    'summary': 'Generated acceptance preserved; Python build and named tests verified in isolation.'}
+                    'summary': '已保留生成项目的验收要求，通过离线依赖环境核验，并在隔离环境中完成构建和指定测试；可继续按交付流程读取实际产物。'}
             committed = True
             return result
         except (ProjectVerificationError, ProcessCleanupIncomplete):

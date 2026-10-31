@@ -138,7 +138,11 @@ async def _observe(
     root = read_root_configuration()
     root_sha256 = _digest(root.to_payload())
     _check(deadline)
-    supply = read_supply_configuration()
+    from agent_hub.skills.sandbox.python_resolution_overlay import effective_supply
+
+    base = read_supply_configuration()
+    observed_source = await _source(request, policy, deadline)
+    supply = effective_supply(base, request.invocation, source_sha256=observed_source, deadline=deadline)
     catalog_sha256 = supply.digest
     if catalog_sha256 != request.expected_catalog_sha256:
         raise _InspectionError("python_dependency_catalog_changed")
@@ -184,7 +188,9 @@ async def _observe(
     try:
         final_root_sha256 = _digest(read_root_configuration().to_payload())
         _check(deadline)
-        final_catalog_sha256 = read_supply_configuration().digest
+        current_base = read_supply_configuration()
+        final_catalog_sha256 = effective_supply(current_base, request.invocation,
+            source_sha256=source_sha256, deadline=deadline).digest
         if (root_sha256 != _digest(root.to_payload()) or final_root_sha256 != root_sha256
                 or supply.digest != catalog_sha256 or final_catalog_sha256 != catalog_sha256):
             raise _InspectionError("python_dependency_catalog_changed")

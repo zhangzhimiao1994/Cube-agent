@@ -607,9 +607,103 @@ async def _project_verification_effect(
         return PolicyEffect.DENY
 
 
+async def _project_resolution_preparation_effect(
+    repository: object, request: CapabilityRequest, *, role: Role,
+) -> PolicyEffect:
+    """Concrete fixed-registry/publication actions; never generic command admission."""
+    from datetime import timedelta
+
+    from agent_hub.capabilities.execution_authority import (
+        _trusted_review_context,
+        get_verification_authority,
+    )
+    from agent_hub.capabilities.generated_project_service import generated_authority
+    from agent_hub.capabilities.python_metadata_preparation import metadata_scope
+    from agent_hub.capabilities.python_resolution_preparation import PREFIX
+    from agent_hub.skills.sandbox.python_registry_protocol import (
+        digest,
+        require_sha,
+        requirement,
+        target_environment,
+    )
+
+    try:
+        checked = CapabilityRequest.model_validate(request.model_dump(warnings='error'), strict=True)
+        if (checked.tool_origin != 'builtin' or checked.capability != 'command' or checked.operation != 'run'
+                or checked.resource != normalize_resource(checked.resource)):
+            return PolicyEffect.DENY
+        getter = getattr(repository, 'get', None)
+        if not callable(getter):
+            return PolicyEffect.DENY
+        record = await getter(checked.tenant_id, checked.run_id)
+        scope = metadata_scope(record, actor=checked.agent_id, live=True)
+        authority = get_verification_authority(tenant_id=checked.tenant_id, run_id=checked.run_id,
+            user_id=checked.user_id, role=role, current_record=record)
+        context, worker = _trusted_review_context(tenant_id=checked.tenant_id, run_id=checked.run_id,
+            user_id=checked.user_id, role=role, current_record=record)
+        live = generated_authority(record, checked.tenant_id, checked.run_id)
+        permissions = record.routing_decision.get('requested_permissions', ())
+        if (authority.actor != checked.agent_id or record.actor_role is not role
+                or not {'workspace.read', 'workspace.write', 'command.run'} <= set(permissions)):
+            return PolicyEffect.DENY
+        args = checked.arguments
+        public = {'purpose', 'key', 'source_sha256', 'root_sha256', 'catalog_sha256', 'permissions_sha256',
+            'original_deadline', 'registry', 'artifact_host', 'install_allowed',
+            'requirements', 'environment', 'max_wheel_bytes'}
+        purpose = args.get('purpose')
+        if purpose == 'python_dependency_publication':
+            public |= {'plan_sha256', 'artifacts'}
+        elif purpose != 'python_dependency_resolution':
+            return PolicyEffect.DENY
+        if set(args) != public or checked.resource != PREFIX + digest(args):
+            return PolicyEffect.DENY
+        for name in ('key', 'source_sha256', 'root_sha256', 'catalog_sha256', 'permissions_sha256'):
+            require_sha(cast(str, args[name]))
+        if (args['permissions_sha256'] != scope.permissions_sha256 or record.worker_id != worker
+                or record.worker_lease_token != authority.execution_token
+                or args['registry'] != 'https://pypi.org' or args['artifact_host'] != 'files.pythonhosted.org'
+                or args['install_allowed'] is not False or type(args['max_wheel_bytes']) is not int
+                or args['max_wheel_bytes'] != 64 * 1024**2
+                or args['original_deadline'] != (record.created_at + timedelta(
+                    seconds=min(context.timeout_seconds, live.timeout_seconds))).isoformat()):
+            return PolicyEffect.DENY
+        requirements = args['requirements']
+        if type(requirements) is not list or not 0 < len(requirements) <= 128:
+            return PolicyEffect.DENY
+        for item in requirements:
+            requirement(item)
+        target_environment(cast(dict[str, str], args['environment']))
+        if purpose == 'python_dependency_publication':
+            require_sha(cast(str, args['plan_sha256']))
+            artifacts = args['artifacts']
+            if type(artifacts) is not list or not 0 < len(artifacts) <= 128:
+                return PolicyEffect.DENY
+            total = 0
+            for entry in artifacts:
+                if (type(entry) is not list or len(entry) != 3 or type(entry[0]) is not str
+                        or not entry[0].endswith('-py3-none-any.whl') or '/' in entry[0] or '\\' in entry[0]
+                        or type(entry[2]) is not int or entry[2] <= 0):
+                    return PolicyEffect.DENY
+                require_sha(entry[1])
+                total += entry[2]
+            if total > 64 * 1024**2:
+                return PolicyEffect.DENY
+        # Root revalidates private source/plan evidence before IO. Public data
+        # only identifies this exact human approval, never a new execution grant.
+        return PolicyEffect.REQUIRE_APPROVAL
+    except Exception:  # noqa: BLE001 - no malformed/private/stale request can widen authority.
+        return PolicyEffect.DENY
+
+
 async def _project_metadata_preparation_effect(
     repository: object, request: CapabilityRequest, *, role: Role,
 ) -> PolicyEffect | None:
+    resolution_prefix = "workspace/current/project-resolution"
+    lexical = "/".join(part for part in request.resource.replace("\\", "/").split("/") if part not in {"", "."})
+    resource = normalize_resource(request.resource)
+    if any(value is not None and (value == resolution_prefix or value.startswith(resolution_prefix + "/"))
+           for value in (resource, lexical)):
+        return await _project_resolution_preparation_effect(repository, request, role=role)
     prefix = "workspace/current/project-metadata"
     resource = normalize_resource(request.resource)
     # Keep the lexical namespace too: traversal out of metadata must not reach
@@ -790,6 +884,8 @@ def build_runtime_capability_stack(
         artifact_repository=artifact_repository,
         receipt_repository=receipt_repository,
     )
+    if artifact_repository is not None and runtime_gateway._project_verification is not None:
+        runtime_gateway._project_verification.generated.configure_resolution_artifacts(artifact_repository)
     default_reviewer = (
         CodexAutoApprovalReviewer()
         if approval_reviewer is None and tool_approval_mode is None

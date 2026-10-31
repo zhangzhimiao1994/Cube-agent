@@ -576,21 +576,91 @@ class RuntimeCapabilityGateway:
             return {'status': 'unavailable'}
         record = await getter(tenant_id, run_id)
         project, session = authorized_workspace_scope(record, tenant_id=tenant_id, run_id=run_id)
+        resolution: dict[str, JsonValue] = {}
+        data: Mapping[str, JsonValue] | None = None
+        if self._project_verification is not None:
+            generated = self._project_verification.generated
+            if generated._resolution_journal is None and self._artifact_repository is not None:
+                generated.configure_resolution_artifacts(self._artifact_repository)
+            # Cached bytes never bypass current record/checkpoint/Root/base scope.
+            data = await generated.recover_resolution_data(record)
+            if data is not None:
+                from uuid import NAMESPACE_URL, uuid5
+
+                from agent_hub.runtime.artifacts import ArtifactReference
+                from agent_hub.runtime.contracts import Artifact
+
+                if self._artifact_repository is None:
+                    raise ProjectInspectionError('python dependency artifact unavailable')
+                artifact = Artifact(id=uuid5(NAMESPACE_URL,
+                    f'python-resolution:{tenant_id}:{run_id}:{data["descriptor_sha256"]}'),
+                    type='python_dependency_resolution', producer='project.inspect', content=data)
+                await self._artifact_repository.put(tenant_id, run_id, artifact)
+                artifact_reference = ArtifactReference(artifact.id, artifact.content_sha256)
+                stored = await self._artifact_repository.get_many(tenant_id, run_id, (artifact_reference,))
+                if stored != (artifact,):
+                    raise ProjectInspectionError('python dependency artifact unavailable')
+                resolution['dependency_resolution'] = {
+                    'summary': '已找到可信的 Python 依赖数据；请查看结构化记录修正依赖声明和锁文件。供给及安装仍需各自的具体授权，尚未验证安装成功。',
+                    'artifact_ref': artifact_reference.to_payload(),
+                    'data': dict(data),  # Machine tool layer; Main cites the summary/reference.
+                }
+
+        async def recheck_resolution() -> None:
+            if not resolution:
+                return
+            if self._project_verification is None:
+                raise ProjectInspectionError('python dependency scope changed')
+            latest = await getter(tenant_id, run_id)
+            if authorized_workspace_scope(latest, tenant_id=tenant_id, run_id=run_id) != (project, session):
+                raise ProjectInspectionError('python dependency scope changed')
+            current = await self._project_verification.generated.recover_resolution_data(latest)
+            if current != data:
+                raise ProjectInspectionError('python dependency scope changed')
+
         invocation = ProjectInvocation(execution_id='python_profile_' + uuid4().hex, tenant_id=tenant_id,
             run_id=run_id, project_id=project, session_id=session, sandbox_profile='restricted',
             install_allowed=False, timeout_seconds=15)
         try:
-            result = await PythonProjectProfileSandbox().inspect(invocation)
-        except (ValueError, OSError, TimeoutError):
+            route = getattr(record, 'routing_decision', {})
+            source = None
+            if (type(route.get('generated_project_contract_version')) is int
+                    and route['generated_project_contract_version'] == 1
+                    and type(route.get('python_dependency_preflight_version')) is int
+                    and route['python_dependency_preflight_version'] == 1):
+                from agent_hub.capabilities.generated_project_service import (
+                    validate_generated_preparation,
+                )
+                from agent_hub.capabilities.project_baselines import ProjectBaselineReference
+                from agent_hub.skills.sandbox.project import project_source_fingerprint
+
+                state = route.get('generated_project_preparation')
+                if state is not None:
+                    state = validate_generated_preparation(state)
+                    reference = state.get('reference')
+                    if reference is None:
+                        raise ValueError('generated acceptance is unresolved')
+                    source = ProjectBaselineReference.from_payload(reference).input_source_sha256
+                else:
+                    if self._project_workspace_dir is None:
+                        raise ValueError('project source is unavailable')
+                    async with asyncio.timeout(invocation.timeout_seconds):
+                        source = await project_source_fingerprint(self._project_workspace_dir, invocation)
+            result = (await PythonProjectProfileSandbox().inspect(invocation) if source is None
+                      else await PythonProjectProfileSandbox().inspect(invocation, expected_source_sha256=source))
+        except (ValueError, OSError, RuntimeError, TimeoutError):
             if catalog_query is not None:
                 raise ProjectInspectionError('python catalog unavailable') from None
-            return {'status': 'unavailable', 'readiness': 'not_probed'}
+            await recheck_resolution()
+            return {'status': 'unavailable', 'readiness': 'not_probed', **resolution}
         if not result.ok or result.profile is None:
             if catalog_query is not None:
                 raise ProjectInspectionError('python catalog unavailable')
-            return {'status': 'unavailable', 'readiness': 'not_probed', 'reason': result.error}
+            await recheck_resolution()
+            return {'status': 'unavailable', 'readiness': 'not_probed', 'reason': result.error, **resolution}
+        await recheck_resolution()
         return {
-            **python_catalog_projection(result.profile, query=catalog_query),
+            **python_catalog_projection(result.profile, query=catalog_query), **resolution,
             'recipe': 'python_offline_wheel_v1', 'build_backend': 'setuptools.build_meta',
             'requires_python': '>=3.12,<3.13', 'build_requirement_names': ('setuptools', 'wheel'),
             'source_directory': 'src', 'test_directory': 'tests', 'test_runner': 'unittest',

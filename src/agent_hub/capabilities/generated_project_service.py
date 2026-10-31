@@ -44,8 +44,13 @@ from agent_hub.skills.sandbox.python_metadata_preparation_client import (
 )
 
 if TYPE_CHECKING:
+    from agent_hub.capabilities.python_input_preparation import (
+        DynamicPythonResolutionFlow,
+        DynamicResolutionJournal,
+    )
     from agent_hub.capabilities.python_metadata_preparation_flow import MetadataPreparationClient
     from agent_hub.capabilities.types import CapabilityRequest
+    from agent_hub.runtime.artifacts import ArtifactReference, ArtifactRepository
     from agent_hub.skills.sandbox.python_dependency_protocol import (
         PythonDependencyClosureObservation,
     )
@@ -121,8 +126,8 @@ async def _inspect_dependencies(
         profile_invocation = ProjectInvocation.model_validate({**invocation.model_dump(),
             'execution_id': 'dependency_profile_' + uuid4().hex,
             'timeout_seconds': min(10, invocation.timeout_seconds)}, strict=True)
-        profile = await PythonProjectProfileSandbox().inspect(profile_invocation)
-        profile.require_for(PythonProjectProfileRequest(invocation=profile_invocation))
+        profile = await PythonProjectProfileSandbox().inspect(profile_invocation, expected_source_sha256=source)
+        profile.require_for(PythonProjectProfileRequest(invocation=profile_invocation, expected_source_sha256=source))
         _need(profile.ok and profile.profile is not None, 'python_dependency_metadata_unavailable')
         assert profile.profile is not None
         remaining = invocation.timeout_seconds - (asyncio.get_running_loop().time() - started)
@@ -370,6 +375,9 @@ class GeneratedProjectService:
         self.root, self.repository = root, repository
         self._dependency_inspector = _inspect_dependencies if dependency_inspector is None else dependency_inspector
         self._metadata_client = metadata_client
+        self._resolution_flows: dict[tuple[UUID, UUID, str], DynamicPythonResolutionFlow] = {}
+        self._resolution_journal: DynamicResolutionJournal | None = None
+        self._resolution_refs: dict[tuple[UUID, UUID, str], ArtifactReference] = {}
 
     async def _record(self, tenant: UUID, run: UUID) -> Any:
         getter = getattr(self.repository, 'get', None)
@@ -459,6 +467,202 @@ class GeneratedProjectService:
             request_sha256=authority.request_sha256, proposer_actor=actor,
             observation_sha256=observation_sha, reason=reason, issues=issues,
             schema_version=2 if dependency is not None else 1, dependency_closure=dependency))
+
+    def configure_resolution_artifacts(self, artifacts: ArtifactRepository) -> None:
+        from agent_hub.capabilities.python_input_preparation import DynamicResolutionJournal
+
+        self._resolution_journal = DynamicResolutionJournal(artifacts)
+
+    async def recover_resolution_data(self, record: Any) -> Mapping[str, JsonValue] | None:
+        """Warm and cold projections share the same current-scope registered-data gate.
+
+        The stored actor selects data only. It never supplies a worker, grant or plan.
+        """
+        from datetime import timedelta
+
+        from agent_hub.capabilities.python_metadata_preparation import metadata_scope
+        from agent_hub.skills.sandbox.python_project_profile import PythonProjectProfileSandbox
+
+        journal = self._resolution_journal
+        route = getattr(record, 'routing_decision', {})
+        if journal is None or any(type(route.get(name)) is not int or route[name] != 1 for name in (
+                'generated_project_contract_version', 'python_dependency_preflight_version',
+                'python_dependency_preflight_submission_version')):
+            return None
+        authority = generated_authority(record, record.tenant_id, record.id, readonly=True)
+        checkpoints = await journal.read_artifacts(authority.tenant_id, authority.run_id,
+            artifact_type='python_resolution_checkpoint', producer='python_resolution')
+        if not checkpoints:
+            return None
+        stored = checkpoints[0].content['scope']
+        _need(isinstance(stored, Mapping), 'resolution_checkpoint_invalid')
+        assert isinstance(stored, Mapping)
+        actor = stored.get('actor')
+        _need(type(actor) is str, 'resolution_checkpoint_invalid')
+        scope = metadata_scope(record, actor=cast(str, actor)).model_dump(mode='json')
+        invocation = authority.invocation.model_copy(update={'sandbox_profile': 'restricted', 'install_allowed': False})
+        profile = await PythonProjectProfileSandbox().inspect(invocation)
+        _need(profile.ok and profile.profile is not None, 'resolution_data_unavailable')
+        assert profile.profile is not None
+        deadline = datetime.fromisoformat(cast(str, stored.get('original_deadline')))
+        _need(deadline.tzinfo is not None and record.created_at < deadline
+              <= record.created_at + timedelta(seconds=authority.timeout_seconds), 'resolution_checkpoint_scope_changed')
+        scope.update(root_sha256=profile.profile.root_config_sha256, catalog_sha256=profile.profile.catalog_sha256,
+                     original_deadline=deadline.isoformat())
+        result = await journal.public_data(scope)
+        latest = await self._record(authority.tenant_id, authority.run_id)
+        _need(generated_authority(latest, authority.tenant_id, authority.run_id, readonly=True) == authority
+              and metadata_scope(latest, actor=cast(str, actor)).model_dump(mode='json')
+              == metadata_scope(record, actor=cast(str, actor)).model_dump(mode='json'), 'resolution_checkpoint_scope_changed')
+        return result
+
+    async def _resolve_dependency_draft(
+        self, authority: GeneratedAuthority, actor: str,
+        observation: tuple[bytes | None, dict[str, str]], controls: tuple[bytes, bytes],
+        *, publish: bool = False, force: bool = False,
+    ) -> bool:
+        from datetime import timedelta
+
+        from packaging.utils import canonicalize_name
+        from packaging.version import Version
+
+        from agent_hub.capabilities.approvals import capability_approval_scope
+        from agent_hub.capabilities.execution_authority import _trusted_review_context
+        from agent_hub.capabilities.python_input_preparation import (
+            DynamicPythonResolutionFlow,
+            dynamic_python_needs,
+            validate_dynamic_python_controls,
+        )
+        from agent_hub.capabilities.python_metadata_preparation import metadata_scope
+        from agent_hub.capabilities.python_resolution_preparation import (
+            PythonResolutionPreparation,
+            ResolutionApprovalRequired,
+        )
+        from agent_hub.skills.sandbox.python_metadata_plan_protocol import (
+            PythonMetadataDraft,
+            PythonMetadataPlanningRequest,
+        )
+        from agent_hub.skills.sandbox.python_project_profile import PythonProjectProfileSandbox
+        from agent_hub.skills.sandbox.python_registry_protocol import requirement
+
+        latest = await self._record(authority.tenant_id, authority.run_id)
+        route = latest.routing_decision
+        if (type(route.get('python_dependency_preflight_submission_version')) is not int
+                or route['python_dependency_preflight_submission_version'] != 1):
+            return False
+        try:
+            needs = dynamic_python_needs(controls[0])
+        except ValueError:
+            return False  # Original exact recipe/declaration gate still rejects unsupported sources.
+        key = (authority.tenant_id, authority.run_id, actor)
+        flow = self._resolution_flows.get(key)
+        invocation = ProjectInvocation.model_validate({**authority.invocation.model_dump(),
+            'sandbox_profile': 'restricted', 'install_allowed': False}, strict=True)
+
+        async def guard() -> None:
+            await asyncio.to_thread(self._controls_absent, invocation)
+            _need(await self._draft_observation(invocation) == observation)
+            current = await self._record(authority.tenant_id, authority.run_id)
+            _need(generated_authority(current, authority.tenant_id, authority.run_id) == authority)
+            _draft_route(current)
+
+        await guard()
+        profiles = PythonProjectProfileSandbox()
+        try:
+            base = await profiles.inspect(invocation)
+        except (ValueError, OSError, TimeoutError):
+            _need(flow is None and self._resolution_journal is None, 'resolution_data_unavailable')
+            return False  # Compatibility: the existing Root preflight still must succeed.
+        await guard()
+        if not base.ok or base.profile is None:
+            _need(flow is None, 'resolution_data_unavailable')
+            return False
+        catalog = base.profile.catalog
+        root_config_sha256 = base.profile.root_config_sha256
+        _need(root_config_sha256 is not None, 'resolution_data_unavailable')
+        assert root_config_sha256 is not None
+        source = _fingerprint(observation[1])
+        scope = metadata_scope(latest, actor=actor, live=True)
+        context, _ = _trusted_review_context(tenant_id=authority.tenant_id, run_id=authority.run_id,
+            user_id=authority.user_id, role=authority.role, current_record=latest)
+        journal_scope = {**scope.model_dump(mode='json'), 'root_sha256': root_config_sha256,
+            'catalog_sha256': base.profile.catalog_sha256,
+            'original_deadline': (latest.created_at + timedelta(
+                seconds=min(context.timeout_seconds, authority.timeout_seconds))).isoformat()}
+        journal = self._resolution_journal
+        recovered = await journal.load(journal_scope) if flow is None and journal is not None else None
+        if flow is None and recovered is None and not force and all(any(
+            wheel.name == canonicalize_name(requirement(n.requirement).name)
+            and Version(wheel.version) in requirement(n.requirement).specifier
+            for wheel in catalog) for n in needs):
+            return False
+        _need(journal is not None, 'resolution_artifact_unavailable')
+        assert journal is not None
+        async def current() -> Any:
+            await guard()
+            return await self._record(authority.tenant_id, authority.run_id)
+
+        async def persist(key_sha256: str, pending_sha256: str | None) -> None:
+            assert flow is not None
+            await guard()
+            _need(flow.needs is not None and flow.environment is not None, 'resolution_data_unavailable')
+            assert flow.needs is not None and flow.environment is not None
+            reference = await journal.save(journal_scope, needs=flow.needs, environment=flow.environment,
+                resolution_key=key_sha256, pending_plan_sha256=pending_sha256)
+            self._resolution_refs[key] = reference
+            await guard()
+
+        async def approved(request: CapabilityRequest) -> bool:
+            await guard()
+            # Durable data is registered before an action can wait or enter Root IO.
+            await persist(cast(str, request.arguments['key']),
+                cast(str | None, request.arguments.get('plan_sha256')))
+            checker = getattr(self.repository, 'is_capability_approval_scope_approved', None)
+            _need(callable(checker), 'resolution_authority_unavailable')
+            assert callable(checker)
+            return await checker(authority.tenant_id, authority.run_id, capability_approval_scope(request)) is True
+
+        # Retain immutable data, but never retain a previous call's source/actor fences.
+        client = PythonResolutionPreparation(current=current, approved=approved)
+        if flow is None:
+            flow = DynamicPythonResolutionFlow(client, checkpoint=persist)
+            if recovered is not None:
+                flow.restore(recovered)
+            self._resolution_flows[key] = flow
+        else:
+            flow.client, flow.checkpoint = client, persist
+        if flow.environment is not None:
+            environment = dict(flow.environment)
+        else:
+            configured = await profiles.inspect(invocation, expected_source_sha256=source)
+            await guard()
+            _need(configured.ok and configured.profile is not None
+                  and configured.profile.target_environment is not None, 'resolution_data_unavailable')
+            assert configured.profile is not None and configured.profile.target_environment is not None
+            environment = dict(configured.profile.target_environment)
+        planning = PythonMetadataPlanningRequest(invocation=invocation, scope=scope,
+            draft=PythonMetadataDraft(source_sha256=source,
+                acceptance_sha256=hashlib.sha256(cast(bytes, observation[0])).hexdigest(),
+                manifest_sha256=hashlib.sha256(controls[0]).hexdigest(),
+                lock_sha256=hashlib.sha256(controls[1]).hexdigest()),
+            expected_root_config_sha256=root_config_sha256,
+            expected_catalog_sha256=base.profile.catalog_sha256)
+        try:
+            if publish:
+                # Pins/closure are actual current controls; hash equality alone is insufficient.
+                await flow.resolve_data(needs=needs, environment=environment, planning=planning)
+                validate_dynamic_python_controls(controls[0], controls[1], flow.descriptor)
+                await flow.prepare(needs=needs, environment=environment, planning=planning)
+            else:
+                await flow.resolve_data(needs=needs, environment=environment, planning=planning)
+        except ResolutionApprovalRequired as error:
+            # Reuse the existing concrete project.verify approval projection.
+            # The request retains the distinct resolution/publication namespace.
+            raise PythonMetadataPreparationApprovalRequired(error.request) from None
+        await guard()
+        await journal.store_public_data(authority.tenant_id, authority.run_id, flow.public_data())
+        await guard()
+        return True
 
     async def _prepare_dependency_metadata(
         self, authority: GeneratedAuthority, actor: str,
@@ -591,6 +795,13 @@ class GeneratedProjectService:
         _need(generated_authority(latest, authority.tenant_id, authority.run_id) == authority
               and _dependency_selected(latest.routing_decision))
         _draft_route(latest)
+        if observed.closure['status'] != 'complete' and await self._resolve_dependency_draft(
+            authority, actor, observation, controls, publish=True, force=True
+        ):
+            observed = await inspect()
+            _need(observed.source_sha256 == source
+                  and observed.manifest_sha256 == hashlib.sha256(controls[0]).hexdigest()
+                  and observed.lock_sha256 == hashlib.sha256(controls[1]).hexdigest())
         payload = cast(Mapping[str, JsonValue], observed.model_dump(mode='json'))
         if observed.closure['status'] != 'complete':
             await self._reject_draft(authority, actor, observation,
@@ -696,12 +907,17 @@ class GeneratedProjectService:
                     data = await asyncio.to_thread(_read_no_links, self.root, (*parts, name), max_bytes=256 * 1024)
                     _need(files[name] in {hashlib.sha256(tag + data).hexdigest() for tag in (b'f\0', b'x\0')})
                     controls.append(data)
+                if _dependency_selected(route):
+                    await self._resolve_dependency_draft(authority, actor, observation, (controls[0], controls[1]))
                 try:
                     parse_python_project_declaration(*controls, max_control_bytes=256 * 1024, max_requirements=128)
                 except (ValueError, TypeError):
                     await self._reject_draft(authority, actor, observation,
                         'generated_acceptance_python_declaration_invalid', ('python_declaration_invalid',))
                 if _dependency_selected(route):
+                    if (authority.tenant_id, authority.run_id, actor) in self._resolution_flows:
+                        await self._resolve_dependency_draft(authority, actor, observation,
+                            (controls[0], controls[1]), publish=True)
                     dependency = await self._dependency_draft_preflight(authority, actor, observation,
                         (controls[0], controls[1]))
             state_body: dict[str, JsonValue] = {'schema_version': 1, 'phase': 'capturing',

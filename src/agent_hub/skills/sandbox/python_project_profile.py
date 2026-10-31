@@ -12,6 +12,7 @@ import contextlib
 import json
 import socket
 import struct
+import time
 from pathlib import Path
 from typing import Annotated, Literal, Self
 from uuid import UUID
@@ -56,6 +57,7 @@ class _Envelope(_Strict):
 
 class PythonProjectProfileRequest(_Envelope):
     invocation: ProjectInvocation
+    expected_source_sha256: Digest | None = None
 
     @field_validator("invocation", mode="before")
     @classmethod
@@ -118,12 +120,20 @@ class PythonProjectProfile(_Strict):
     # RootSupplyConfig.digest binds the entire private policy, not just this public projection.
     catalog_sha256: Digest
     root_config_sha256: Digest | None = None
+    source_sha256: Digest | None = None
+    target_environment: dict[str, str] | None = None
 
     @model_validator(mode="after")
     def complete_sorted_catalog(self) -> Self:
         keys = tuple((entry.name, entry.version) for entry in self.catalog)
         if keys != tuple(sorted(set(keys))) or len({e.filename for e in self.catalog}) != len(keys):
             raise ValueError(_RESPONSE_INVALID)
+        if (self.source_sha256 is None) != (self.target_environment is None):
+            raise ValueError(_RESPONSE_INVALID)
+        if self.target_environment is not None:
+            from agent_hub.skills.sandbox.python_registry_protocol import target_environment
+
+            target_environment(self.target_environment)
         return self
 
 
@@ -142,6 +152,11 @@ class PythonProjectProfileResponse(_Envelope):
 
     def require_for(self, request: PythonProjectProfileRequest) -> None:
         if self.scope != PythonProjectProfileScope.for_invocation(request.invocation):
+            raise ValueError(_RESPONSE_INVALID)
+        if request.expected_source_sha256 is not None and self.ok and (
+            self.profile is None or self.profile.source_sha256 != request.expected_source_sha256
+            or self.profile.target_environment is None
+        ):
             raise ValueError(_RESPONSE_INVALID)
 
 
@@ -183,7 +198,9 @@ def _validated_request(request: PythonProjectProfileRequest) -> PythonProjectPro
         raise ValueError(_REQUEST_INVALID) from None
 
 
-def _read_profile() -> tuple[PythonProjectProfile | None, ProfileError | None]:
+def _read_profile(
+    *, invocation: ProjectInvocation | None = None, expected_source_sha256: str | None = None,
+) -> tuple[PythonProjectProfile | None, ProfileError | None]:
     from agent_hub.skills.sandbox.python_input_supply_catalog import (
         InputSupplyError,
         read_supply_configuration,
@@ -206,6 +223,16 @@ def _read_profile() -> tuple[PythonProjectProfile | None, ProfileError | None]:
         return None, codes.get(error.code, _UNAVAILABLE)
     from agent_hub.skills.sandbox.python_metadata_plan import _digest
 
+    environment = None
+    if expected_source_sha256 is not None:
+        if type(invocation) is not ProjectInvocation:
+            raise ValueError(_REQUEST_INVALID)
+        from agent_hub.skills.sandbox.python_dependency_inspection import _target_environment
+        from agent_hub.skills.sandbox.python_resolution_overlay import effective_supply
+
+        supply = effective_supply(supply, invocation, source_sha256=expected_source_sha256,
+                                  deadline=time.monotonic() + min(invocation.timeout_seconds, _REQUEST_SECONDS))
+        environment = _target_environment(root)
     return PythonProjectProfile(
         interpreter=PythonProjectProfileInterpreter.model_validate(root.interpreter.to_payload(), strict=True),
         catalog=tuple(sorted((PythonProjectProfileWheel(name=e.name, filename=e.filename,
@@ -213,6 +240,7 @@ def _read_profile() -> tuple[PythonProjectProfile | None, ProfileError | None]:
             key=lambda e: (e.name, e.version))),
         catalog_sha256=supply.digest,
         root_config_sha256=_digest(root.to_payload()),
+        source_sha256=expected_source_sha256, target_environment=environment,
     ), None
 
 
@@ -225,7 +253,8 @@ def dispatch_profile_request(payload: bytes) -> bytes:
     request = _parse_request(payload)
     scope = PythonProjectProfileScope.for_invocation(request.invocation)
     try:
-        profile, error = _read_profile()
+        profile, error = (_read_profile() if request.expected_source_sha256 is None else
+            _read_profile(invocation=request.invocation, expected_source_sha256=request.expected_source_sha256))
         response = PythonProjectProfileResponse(scope=scope, ok=profile is not None,
                                                 profile=profile, error=error)
         raw = response.model_dump_json().encode("utf-8")
@@ -309,9 +338,11 @@ class PythonProjectProfileSandbox:
     def __init__(self, *, socket_path: Path | None = None) -> None:
         self.socket_path = socket_path
 
-    async def inspect(self, invocation: ProjectInvocation) -> PythonProjectProfileResponse:
+    async def inspect(self, invocation: ProjectInvocation, *,
+                      expected_source_sha256: str | None = None) -> PythonProjectProfileResponse:
         try:
-            request = _validated_request(PythonProjectProfileRequest(invocation=invocation))
+            request = _validated_request(PythonProjectProfileRequest(
+                invocation=invocation, expected_source_sha256=expected_source_sha256))
         except (ValueError, TypeError):
             raise ValueError(_REQUEST_INVALID) from None
         if not _systemd_supported():
