@@ -416,6 +416,18 @@ def fingerprint_capability_request(request: CapabilityRequest) -> str:
 
 def capability_approval_scope(request: CapabilityRequest) -> str | None:
     normalized_resource = normalize_resource(request.resource)
+    if (normalized_resource is not None
+            and normalized_resource.startswith('workspace/current/project-resolution/')):
+        from agent_hub.capabilities.python_resolution_authorization import (
+            InvalidResolutionAuthorization,
+            validate_resolution_authorization,
+        )
+
+        try:
+            checked = validate_resolution_authorization(request)
+        except InvalidResolutionAuthorization:
+            return None
+        return _run_capability_scope(checked, checked.resource) + ':agent=' + checked.agent_id
     if (
         request.capability == "command" and request.operation == "run"
         and normalized_resource == "workspace/current/project-verification"

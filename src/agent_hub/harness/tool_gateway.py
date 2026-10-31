@@ -152,7 +152,15 @@ class HarnessToolGateway:
         if type(user_id) is not UUID or not isinstance(role, Role) or self._policy_gateway is None:
             return self._failure(request, "capability identity unavailable")
         try:
-            failure = await self._authorize(tenant_id, request, user_id=user_id, role=role, static_only=True)
+            from agent_hub.capabilities.python_resolution_authorization import (
+                resolution_policy_scope,
+            )
+
+            # Static projection owns a separate, short-lived scope. _authorize's
+            # static callback denies concrete resolution IO even if discovery is allowed.
+            with (resolution_policy_scope(_capability_request(tenant_id, user_id, request))
+                  if request.tool_name == 'project.verify' else nullcontext()):
+                failure = await self._authorize(tenant_id, request, user_id=user_id, role=role, static_only=True)
         except Exception as error:  # noqa: BLE001 - admission never exposes policy internals
             error.__traceback__ = None
             error.__context__ = None
@@ -280,6 +288,25 @@ class HarnessToolGateway:
         return self._failure(request, result.reason or _capability_failure_reason(result.status), payload=payload)
 
     async def invoke(
+        self,
+        tenant_id: UUID,
+        request: HarnessToolCallRequest,
+        *,
+        user_id: UUID | None = None,
+        role: Role | None = None,
+    ) -> HarnessToolCallResult:
+        if (isinstance(request, HarnessToolCallRequest) and request.tool_name == 'project.verify'
+                and type(user_id) is UUID and isinstance(role, Role) and not _uses_external_envelope(request)):
+            from agent_hub.capabilities.python_resolution_authorization import (
+                resolution_policy_scope,
+            )
+
+            expected = _capability_request(tenant_id, user_id, request)
+            with resolution_policy_scope(expected):
+                return await self._invoke(tenant_id, request, user_id=user_id, role=role)
+        return await self._invoke(tenant_id, request, user_id=user_id, role=role)
+
+    async def _invoke(
         self,
         tenant_id: UUID,
         request: HarnessToolCallRequest,
@@ -421,7 +448,13 @@ class HarnessToolGateway:
                 expected = _capability_request(tenant_id, user_id, request)
                 selected = error.approval_request.model_copy(update={'idempotency_key': expected.idempotency_key})
                 selected = _project_verification_authorization(selected, expected=expected)
-                decision = await self._policy_gateway.invoke(selected, role=role)
+                from agent_hub.capabilities.python_resolution_authorization import (
+                    resolution_policy_decision,
+                )
+
+                decision = resolution_policy_decision(selected)
+                if decision is None:
+                    decision = await self._policy_gateway.invoke(selected, role=role)
             except Exception:  # noqa: BLE001 - only a scope-bound independent approval can follow supply.
                 return self._failure(request, 'capability authorization unavailable')
             payload = ({'approval_id': decision.approval_id}
@@ -492,10 +525,46 @@ class HarnessToolGateway:
                 # Only trusted backend scope can specialize a grant. An explicit
                 # None preserves Node behavior; exceptions NEVER fall back.
                 try:
+                    from agent_hub.capabilities.python_resolution_authorization import (
+                        bind_resolution_policy_authorizer,
+                        note_resolution_policy_decision,
+                    )
+
+                    original_admission = admission
+
+                    async def authorize_resolution(action: CapabilityRequest) -> bool:
+                        # Root-internal idempotency remains unchanged. The policy
+                        # projection is bound to this original Harness invocation.
+                        projected = _project_verification_authorization(action.model_copy(
+                            update={'idempotency_key': original_admission.idempotency_key}), expected=original_admission)
+                        if static_only:
+                            current = CapabilityResult(CapabilityStatus.DENIED, request.run_id, reason='capability denied')
+                        elif review_call is not None:
+                            concrete = review_call.gate.invocation(tool_name=request.tool_name,
+                                backend=self._backend, backend_getter=lambda: self._backend)
+                            current = await cast(_ConcretePolicyGateway, self._policy_gateway).invoke_concrete(
+                                projected, role=role, review=concrete)
+                            if current.status is CapabilityStatus.ALLOWED and not await concrete.before_dispatch():
+                                current = CapabilityResult(CapabilityStatus.DENIED, request.run_id, reason='capability denied')
+                        else:
+                            assert self._policy_gateway is not None
+                            current = await self._policy_gateway.invoke(projected, role=role)
+                        note_resolution_policy_decision(projected, current)
+                        return current.status is CapabilityStatus.ALLOWED
+
+                    bind_resolution_policy_authorizer(original_admission, authorize_resolution)
                     selected = await resolver(admission)
                     if selected is not None:
                         admission = _project_verification_authorization(selected, expected=admission)
                 except Exception as error:  # noqa: BLE001 - no private recipe error or fallback grant.
+                    from agent_hub.capabilities.python_resolution_authorization import (
+                        InvalidResolutionAuthorization,
+                        ResolutionAuthorizationFailure,
+                    )
+
+                    if isinstance(error, InvalidResolutionAuthorization):
+                        return self._failure(request, 'project verification scope is not authorized',
+                            payload={'verification_authorization_failure': ResolutionAuthorizationFailure().to_payload()})
                     draft = None if static_only else _generated_draft_payload(
                         error, tenant_id=tenant_id, user_id=user_id, request=request)
                     if draft is not None:
@@ -505,7 +574,16 @@ class HarnessToolGateway:
                     error.__context__ = None
                     error.__cause__ = None
                     return self._failure(request, reason)
-        if static_only:
+        from agent_hub.capabilities.python_resolution_authorization import (
+            resolution_policy_decision,
+        )
+
+        deferred = resolution_policy_decision(admission)
+        if deferred is not None and deferred.status is not CapabilityStatus.ALLOWED:
+            # A pending receipt already released the lease. Preserve that exact
+            # result instead of invoking policy twice or creating a second ASK.
+            decision = deferred
+        elif static_only:
             if not callable(getattr(self._policy_gateway, "authorize_static", None)):
                 return None  # unresolved concrete consent is deferred, never awaited here.
             decision = await cast(_StaticPolicyGateway, self._policy_gateway).authorize_static(admission, role=role)
@@ -616,6 +694,12 @@ def _generated_draft_payload(
 
 
 def _project_authorization_failure_reason(error: Exception) -> str:
+    from agent_hub.capabilities.python_resolution_authorization import (
+        InvalidResolutionAuthorization,
+    )
+
+    if isinstance(error, InvalidResolutionAuthorization):
+        return 'project verification scope is not authorized'
     from typing import get_args
 
     from agent_hub.capabilities.generated_project_service import GeneratedProjectError
@@ -647,6 +731,12 @@ def _project_authorization_failure_reason(error: Exception) -> str:
 
 
 def _project_verification_authorization(selected: object, *, expected: CapabilityRequest) -> CapabilityRequest:
+    if type(selected) is CapabilityRequest and selected.resource.startswith('workspace/current/project-resolution/'):
+        from agent_hub.capabilities.python_resolution_authorization import (
+            validate_resolution_authorization,
+        )
+
+        return validate_resolution_authorization(selected, expected=expected)
     if type(selected) is CapabilityRequest and selected.resource.startswith('workspace/current/project-metadata/'):
         return _metadata_preparation_authorization(selected, expected=expected)
     if type(selected) is not CapabilityRequest or not selected.resource.startswith('workspace/current/project-inputs/'):

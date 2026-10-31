@@ -14,6 +14,7 @@ import {
   type SystemSettings,
 } from "../api/client";
 import { approvalReviewPresentation } from "./permissionSelection";
+import { executionBackendOptionLabel, isExecutionBackendPending, useExecutionBackends } from "./useExecutionBackends";
 
 type EditableConfig = {
   models: Record<string, unknown>;
@@ -106,10 +107,7 @@ function IdentityConfigPage() {
   const agentsQuery = useQuery({ queryKey: ["agents"], queryFn: () => api.agents() });
   const workflowsQuery = useQuery({ queryKey: ["workflows"], queryFn: () => api.workflows() });
   const modelsQuery = useQuery({ queryKey: ["models"], queryFn: () => api.models() });
-  const executionBackendsQuery = useQuery({
-    queryKey: ["execution-backends"],
-    queryFn: () => api.executionBackends(),
-  });
+  const executionBackendsQuery = useExecutionBackends();
   const document = useMemo(
     () => currentOrEmpty(current.data, current.error),
     [current.data, current.error],
@@ -339,7 +337,7 @@ function IdentityConfigPage() {
               ) : null}
               {executionBackends.map((backend) => (
                 <option key={backend.id} value={backend.id} disabled={!backend.available}>
-                  {backend.name}{backend.available ? "" : "（不可用）"}
+                  {executionBackendOptionLabel(backend)}
                 </option>
               ))}
             </select>
@@ -349,6 +347,8 @@ function IdentityConfigPage() {
               </span>
             ) : executionBackendsQuery.isLoading ? (
               <span className="field-help">正在探测执行环境，其他设置可正常使用。</span>
+            ) : executionBackends.some(isExecutionBackendPending) ? (
+              <span className="field-help">执行环境准备中，确认可用后可选择；其他设置可正常使用。</span>
             ) : (
               <span className="field-help">仅列出已真实接入的执行器；不可用环境不能作为新默认值。</span>
             )}

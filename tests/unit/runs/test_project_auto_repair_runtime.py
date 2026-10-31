@@ -6,51 +6,74 @@ import hashlib
 import io
 import json
 import zipfile
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator, Mapping
 from contextlib import aclosing
 from dataclasses import asdict, replace
 from datetime import UTC, datetime
 from decimal import Decimal
-from types import SimpleNamespace
-from typing import Any
+from typing import Never, overload
 from unittest.mock import patch
 from uuid import UUID, uuid4
 
 import pytest
 from autogen_core import CancellationToken
-from sqlalchemy.sql import operators, visitors
-from sqlalchemy.sql.elements import BinaryExpression, BindParameter
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from agent_hub.auth.models import Role
 from agent_hub.capabilities.runtime import _builtin_input_schema
 from agent_hub.db.models import RunOutboxRow, RunRow, RuntimeArtifactRow
 from agent_hub.domain.runs import RunStatus, TaskMode
-from agent_hub.harness.types import HarnessToolCallResult
+from agent_hub.harness.types import HarnessToolCallRequest, HarnessToolCallResult
 from agent_hub.models.gateway import GatewayCompletion
 from agent_hub.models.types import ModelRequest, ModelResponse, TokenUsage, ToolCall
 from agent_hub.runs.approval_checkpoint import checkpoint_waits_for_approval
-from agent_hub.runs.repository import RunConflict, RunRecord, RunRepository
-from agent_hub.runs.service import RunService
+from agent_hub.runs.repository import (
+    RunConflict,
+    RunRecord,
+    RunRepository,
+    _SameRunRepairContinuity,
+)
+from agent_hub.runs.service import RunService, SubmittedRun
 from agent_hub.runs.workspace import workspace_selection
 from agent_hub.runtime.artifacts import ArtifactReference, InMemoryArtifactRepository
 from agent_hub.runtime.autogen.adapter import (
     AutoGenDiscussionRuntime,
     DiscussionParticipant,
     DiscussionPlan,
+    GatewayCapabilityTool,
     RuntimeExecutionError,
     _DiscussionDurability,
     _pending_approval_call,
+    _ToolRecord,
 )
+from agent_hub.runtime.autogen.checkpoint_publication import PendingCheckpoint
 from agent_hub.runtime.contracts import (
     Artifact,
     EventKind,
+    JsonValue,
     RunEvent,
     RuntimeCheckpoint,
     TaskContext,
 )
 from agent_hub.runtime.registry import RuntimeRegistry
-from tests.unit.runs.test_terminal_hooks import ExecutableFakeRepository, FakeTransaction
-from tests.unit.runtime.autogen.test_capability_approval_resume import tool as approval_tool
+from tests.unit.runs.project_auto_repair_typed_fixture import (
+    RepairRepository,
+    UnexpectedTaskQueue,
+    closable,
+    integer,
+    json_map,
+    ledger,
+    mapping,
+    mutable,
+    mutable_json,
+    number,
+    present,
+    present_artifact,
+    present_checkpoint,
+    registry,
+    sequence,
+    string,
+)
 from tests.unit.runtime.autogen.test_soft_model_admission import Journey
 from tests.unit.runtime.test_generated_draft_autogen import EMPTY_HASH, rejection
 
@@ -61,7 +84,7 @@ class ProjectJourney(Journey):
         self.context = self.context.model_copy(update={
             'timeout_seconds': 10.0,
             'routing_decision': {
-                **self.context.routing_decision,
+                **present(self.context.routing_decision),
                 **workspace_selection(project_id='draft-project', session_id='draft-session',
                                       sandbox_profile='workspace_write').routing_payload(),
                 'runtime_timeout_soft_seconds': 10.0, 'runtime_timeout_seconds': 10.0,
@@ -69,7 +92,7 @@ class ProjectJourney(Journey):
                 'runtime_plan_token_budget': 500, 'runtime_token_absolute_tokens': 500,
             },
         })
-        fresh_route = dict(self.context.routing_decision)
+        fresh_route = dict(present(mapping(self.context.routing_decision)))
         fresh_route.pop('engineering_action_version', None)
         self.context = self.context.model_copy(update={'routing_decision': fresh_route})
         self.files: dict[str, str] = {}
@@ -80,7 +103,11 @@ class ProjectJourney(Journey):
         self.plans: list[str] = []
         self.bundle_bytes = b''
         self.filename = 'project-' + datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ') + '.zip'
-        self.verified = None
+        self.verified: dict[str, JsonValue] | None = None
+        self.model_freeze: asyncio.Event | None = None
+        self.tool_freeze: asyncio.Event | None = None
+        self.read_count = 0
+        self.read_acks: list[tuple[RuntimeCheckpoint, dict[str, object]]] = []
         self.repair_content = 'repaired draft'
         self.strict_soft = False
         self.report = 'Delivered the repaired fixture archive. The harness recovery path was checked; native business acceptance was not performed.'
@@ -111,7 +138,7 @@ class ProjectJourney(Journey):
                 assert 'generated_acceptance_manifest_invalid' in messages
                 assert 'protected_editable_paths' in messages
                 assert 'a' * 64 in messages
-            if stage == 4 and getattr(self, 'model_freeze', None) is not None:
+            if stage == 4 and self.model_freeze is not None:
                 self.model_freeze.set()
                 await asyncio.Event().wait()
             actions = ['project_inspect', 'workspace_list', 'workspace_write_text',
@@ -126,19 +153,25 @@ class ProjectJourney(Journey):
         return GatewayCompletion(response=response, deployment_id='fixture', logical_model=request.logical_model,
                                  provider_id='fixture', provider_model='fixture/model', cost_usd=Decimal('0.001'))
 
-    async def invoke(self, tenant_id, request, *, user_id=None, role=None):
+    async def execute(self, *, tenant_id: UUID, run_id: UUID, actor: str, name: str,
+                      arguments: Mapping[str, JsonValue], idempotency_key: str) -> Mapping[str, JsonValue]:
+        raise AssertionError('project repair fixture must enter the authenticated harness path')
+
+    async def invoke(self, tenant_id: UUID, request: HarnessToolCallRequest, *,
+                     user_id: UUID | None = None, role: Role | None = None) -> HarnessToolCallResult:
         if request.tool_name not in {'workspace.write_text', 'project.verify', 'workspace.bundle'}:
             return await super().invoke(tenant_id, request, user_id=user_id, role=role)
         self.calls.append(request)
         if request.tool_name == 'workspace.write_text':
             self.write_count += 1
-            path, content = request.arguments['path'], request.arguments['content']
+            path, content = mapping(request.arguments)['path'], mapping(request.arguments)['content']
+            assert isinstance(path, str) and isinstance(content, str)
             self.files[path] = content
-            if self.write_count == 2 and getattr(self, 'tool_freeze', None) is not None:
+            if self.write_count == 2 and self.tool_freeze is not None:
                 self.tool_freeze.set()
                 await asyncio.Event().wait()
-            result = {'workspace_files': ({'path': path, 'sha256': hashlib.sha256(content.encode()).hexdigest(),
-                                            'size_bytes': len(content.encode())},)}
+            result: dict[str, JsonValue] = {'workspace_files': ({'path': path, 'sha256': hashlib.sha256(string(content).encode()).hexdigest(),
+                                            'size_bytes': len(string(content).encode())},)}
         elif request.tool_name == 'project.verify':
             self.verify_count += 1
             if self.verify_count == 1:
@@ -149,44 +182,48 @@ class ProjectJourney(Journey):
                         'call_id': request.call_id, 'arguments_sha256': EMPTY_HASH,
                     },
                 )
-            assert self.files['ACCEPTANCE.json'] == 'repaired draft'
+            assert mapping(self.files)['ACCEPTANCE.json'] == 'repaired draft'
             result = self.passed_fixture_receipt()
             self.verified = result
         else:
-            assert self.verified is not None and self.files['ACCEPTANCE.json'] == 'repaired draft'
-            content = io.BytesIO()
-            with zipfile.ZipFile(content, 'w') as archive:
-                for path, text in sorted(self.files.items()):
+            assert self.verified is not None and mapping(self.files)['ACCEPTANCE.json'] == 'repaired draft'
+            archive_buffer = io.BytesIO()
+            with zipfile.ZipFile(archive_buffer, 'w') as archive:
+                for path, text in sorted(mapping(self.files).items()):
                     archive.writestr(path, text)
-            self.bundle_bytes = content.getvalue()
-            receipt = self.verified['verification']
+            self.bundle_bytes = archive_buffer.getvalue()
+            receipt = json_map(mapping(mapping(self.verified)['verification']))
             result = {
                 'artifact_id': str(uuid4()), 'presentation': 'final_attachment',
                 'file': {'filename': self.filename, 'sha256': hashlib.sha256(self.bundle_bytes).hexdigest(),
                          'size_bytes': len(self.bundle_bytes)},
-                'workspace_files': self.manifest(),
-                'verification_source_sha256': receipt['source_sha256'],
+                'workspace_files': tuple(self.manifest()),
+                'verification_source_sha256': string(mapping(receipt)['source_sha256']),
                 'verification_receipt_sha256': self.digest(receipt),
-                'generated_project_acceptance': self.verified['generated_project_acceptance'],
+                'generated_project_acceptance': mapping(self.verified)['generated_project_acceptance'],
             }
         return HarnessToolCallResult(call_id=request.call_id, tool_name=request.tool_name,
                                      status='succeeded', payload=result)
 
     @staticmethod
-    def digest(value):
-        return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':'),
-                                         ensure_ascii=True).encode()).hexdigest()
+    def digest(value: object) -> str:
+        return hashlib.sha256(string(json.dumps(mutable_json(value), sort_keys=True, separators=(',', ':'),
+                                         ensure_ascii=True)).encode()).hexdigest()
 
-    def manifest(self, tenant_id=None):
+    @overload
+    def manifest(self, tenant_id: UUID) -> tuple[Mapping[str, JsonValue], ...]: ...
+    @overload
+    def manifest(self, tenant_id: None = None) -> list[dict[str, JsonValue]]: ...
+    def manifest(self, tenant_id: UUID | None = None) -> tuple[Mapping[str, JsonValue], ...] | list[dict[str, JsonValue]]:
         if tenant_id is not None:
             return super().manifest(tenant_id)
-        return [{'path': path, 'sha256': hashlib.sha256(text.encode()).hexdigest(),
-                 'size_bytes': len(text.encode())} for path, text in sorted(self.files.items())]
+        return [{'path': path, 'sha256': hashlib.sha256(string(text).encode()).hexdigest(),
+                 'size_bytes': len(string(text).encode())} for path, text in sorted(mapping(self.files).items())]
 
-    def passed_fixture_receipt(self):
+    def passed_fixture_receipt(self) -> dict[str, JsonValue]:
         # Protocol fixtures, not native systemd execution or business acceptance evidence.
         source = self.digest(self.manifest())
-        acceptance = hashlib.sha256(self.files['ACCEPTANCE.json'].encode()).hexdigest()
+        acceptance = hashlib.sha256(string(mapping(self.files)['ACCEPTANCE.json']).encode()).hexdigest()
         empty = {'sanitized_bytes': 0, 'returned_bytes': 0, 'sha256': hashlib.sha256(b'').hexdigest(),
                  'truncated': False, 'redacted': False, 'redacted_lines': 0}
         diagnostic = {'schema_version': 1, 'backend': 'systemd', 'exit_code': 0, 'timed_out': False,
@@ -196,117 +233,102 @@ class ProjectJourney(Journey):
             'schema_version': 1, 'kind': 'generated_project_acceptance', 'capture_phase': 'post_model',
             'tenant_id': str(self.context.tenant_id), 'user_id': str(self.context.actor_id),
             'run_id': str(self.context.run_id), 'project_id': 'draft-project', 'session_id': 'draft-session',
-            'request_sha256': hashlib.sha256(self.context.request.encode()).hexdigest(),
+            'request_sha256': hashlib.sha256(string(self.context.request).encode()).hexdigest(),
             'acceptance_sha256': acceptance, 'manifest_sha256': source, 'manifest_raw_sha256': source,
             'source_sha256': source, 'stack': 'node', 'test_execution': {
                 'schema_version': 1, 'manifest_sha256': source, 'count': len(names), 'names': names,
                 'test_evidence_sha256': self.digest({'schema_version': 1, 'passed_tests': names}),
             },
         }
-        return {'verification': {
+        return dict(mapping(json_map({'verification': {
             'schema_version': 1, 'status': 'passed', 'source_sha256': source,
             'generated_acceptance_sha256': acceptance, 'runtime': {'node': 'fixture', 'npm': 'fixture'},
             'checks': [{'phase': phase, 'status': 'passed', 'execution_diagnostic': diagnostic}
                        for phase in ('install', 'build', 'test')],
-        }, 'generated_project_acceptance': binding}
+        }, 'generated_project_acceptance': binding})))
 
 
-class ContinuationRepository(ExecutableFakeRepository):
+class ContinuationRepository(RepairRepository):
     def __init__(self, journey: ProjectJourney) -> None:
-        super().__init__(routing_decision=dict(journey.context.routing_decision))
-        self.row = RunRow(**asdict(self.row), blocked_by_run_id=None)
+        super().__init__(routing_decision=dict(present(mapping(journey.context.routing_decision))))
         self.row.mode = TaskMode.DISCUSS.value
         self.row.actor_role = Role.OPERATOR.value
         self.row.request = journey.context.request
         journey.context = journey.context.model_copy(update={'run_id': self.row.id,
             'tenant_id': self.row.tenant_id, 'actor_id': self.row.actor_id, 'actor_role': Role.OPERATOR})
-        self.checkpoint = None
+        self._checkpoint: RuntimeCheckpoint | None = None
         self.accept_count = 0
-        self.outbox: list[Any] = []
         self.journey = journey
-        self.continuation_errors = []
+        self.continuation_errors: list[str] = []
 
-    async def persist_event(self, *args, **kwargs):
-        await super().persist_event(*args, **kwargs)
-        event = kwargs['event']
+    @property
+    def checkpoint(self) -> RuntimeCheckpoint:
+        return present(self._checkpoint)
+
+    @checkpoint.setter
+    def checkpoint(self, value: RuntimeCheckpoint) -> None:
+        self._checkpoint = value
+
+    async def persist_event(self, session: AsyncSession, *, tenant_id: UUID, run_id: UUID,
+                            event: RunEvent, routing_decision: Mapping[str, JsonValue] | None = None) -> None:
+        await super().persist_event(session, tenant_id=tenant_id, run_id=run_id, event=event,
+                                    routing_decision=routing_decision)
         if event.checkpoint is not None:
             self.checkpoint = event.checkpoint
 
-    async def claim_for_execution(self, *args, **kwargs):
-        result = await super().claim_for_execution(*args, **kwargs)
-        return result if isinstance(result, RunRecord) else (result[0], self.checkpoint)
+    async def claim_for_execution(self, session: AsyncSession, run_id: UUID, *,
+                                  allow_running_recovery: bool, worker_id: str | None = None,
+                                  worker_lease_token: UUID | None = None,
+                                  worker_lease_expires_at: datetime | None = None,
+                                  ) -> tuple[RunRow, RuntimeCheckpoint | None] | RunRecord:
+        result = await super().claim_for_execution(session, run_id,
+            allow_running_recovery=allow_running_recovery, worker_id=worker_id,
+            worker_lease_token=worker_lease_token, worker_lease_expires_at=worker_lease_expires_at)
+        return result if isinstance(result, RunRecord) else (result[0], self._checkpoint)
 
-    async def latest_checkpoint(self, *args, **kwargs):
-        return self.checkpoint
+    async def latest_checkpoint(self, session: AsyncSession, *, tenant_id: UUID,
+                                run_id: UUID) -> RuntimeCheckpoint | None:
+        return self._checkpoint
 
-    _run_select = staticmethod(RunRepository._run_select)
-    has_worker_execution = staticmethod(RunRepository.has_worker_execution)
-
-    def _record(self, row=None):
-        return RunRepository._record(self.row if row is None else row)
-
-    async def _recovery_blocked_after_checkpoint(self, *args, **kwargs):
+    async def _recovery_blocked_after_checkpoint(self, session: AsyncSession, *, run_id: UUID,
+            minimum_event_sequence: int = 0, pre_model_original_capture: bool = False) -> bool:
         # Real service persists the full ledger-bearing CHECKPOINT_SAVED event.
         last = max(e.sequence for e in self.event_log if e.checkpoint is not None)
         return any(e.sequence > last and e.kind not in {
             EventKind.RUNTIME_FAILED, EventKind.STEP_FAILED, 'repair.classified', 'observer.notice',
         } for e in self.event_log)
 
-    async def accept_self_repair_and_enqueue(self, **kwargs):
-        repository = self
-
-        class Transaction(FakeTransaction):
-            async def scalar(self, statement):
-                return repository.row
-
-            async def flush(self):
-                return None
-
-            def add(self, value):
-                repository.outbox.append(value)
-
-        self._session_factory = Transaction
-        result = await RunRepository.accept_self_repair_and_enqueue(self, **kwargs)
+    async def accept_self_repair_and_enqueue(self, *, tenant_id: UUID, run_id: UUID,
+            decision_token: str, version: int, automatic_checkpoint_sha256: str | None = None) -> RunRecord:
+        result = await super().accept_self_repair_and_enqueue(tenant_id=tenant_id, run_id=run_id,
+            decision_token=decision_token, version=version,
+            automatic_checkpoint_sha256=automatic_checkpoint_sha256)
         self.accept_count += 1
         return result
 
-    async def continue_project_repair_and_enqueue(self, **kwargs):
+    async def _refresh_private_rows(self) -> None:
         from agent_hub.runs.artifacts import PostgresArtifactRepository
-        repository = self
+        refs = tuple(ArtifactReference(id=UUID(string(k)), sha256=v)
+                     for k, v in mapping(registry(registry(mapping(self.checkpoint.state)['artifact_registry']))).items())
+        artifacts = await self.journey.artifacts.get_many(self.row.tenant_id, self.run_id, refs)
+        self.private_rows = []
+        for artifact in artifacts:
+            payload = PostgresArtifactRepository._encode_payload(artifact.to_payload())
+            self.private_rows.append(RuntimeArtifactRow(id=artifact.id, run_id=self.run_id,
+                tenant_id=self.row.tenant_id, content_sha256=artifact.content_sha256,
+                payload=payload, byte_size=len(string(payload).encode()), permanent=True))
 
-        class Transaction(FakeTransaction):
-            async def scalar(self, statement):
-                return repository.row
+    async def load_same_run_repair_continuity(self, tenant_id: UUID,
+            run_id: UUID) -> _SameRunRepairContinuity | None:
+        await self._refresh_private_rows()
+        return await super().load_same_run_repair_continuity(tenant_id, run_id)
 
-            async def scalars(self, statement):
-                id_filters = [clause for clause in visitors.iterate(statement.whereclause)
-                    if isinstance(clause, BinaryExpression) and clause.operator is operators.in_op
-                    and clause.left.shares_lineage(RuntimeArtifactRow.__table__.c.id)
-                    and isinstance(clause.right, BindParameter)]
-                assert len(id_filters) == 1, 'private artifact query must select explicit artifact ids'
-                requested_ids = set(id_filters[0].right.value)
-                refs = tuple(ArtifactReference(id=UUID(k), sha256=v)
-                    for k, v in repository.checkpoint.state['artifact_registry'].items()
-                    if UUID(k) in requested_ids)
-                artifacts = await repository.journey.artifacts.get_many(
-                    repository.row.tenant_id, repository.run_id, refs)
-                rows = []
-                for a in artifacts:
-                    payload = PostgresArtifactRepository._encode_payload(a.to_payload())
-                    rows.append(RuntimeArtifactRow(id=a.id, run_id=repository.run_id,
-                        tenant_id=repository.row.tenant_id, content_sha256=a.content_sha256,
-                        payload=payload, byte_size=len(payload.encode()), permanent=True))
-                return SimpleNamespace(all=lambda: rows)
-
-            async def flush(self):
-                pass
-
-            def add(self, value):
-                repository.outbox.append(value)
-
-        self._session_factory = Transaction
+    async def continue_project_repair_and_enqueue(self, *, tenant_id: UUID, run_id: UUID,
+            version: int, checkpoint_sha256: str) -> RunRecord:
         try:
-            return await RunRepository.continue_project_repair_and_enqueue(self, **kwargs)
+            await self._refresh_private_rows()
+            return await super().continue_project_repair_and_enqueue(tenant_id=tenant_id,
+                run_id=run_id, version=version, checkpoint_sha256=checkpoint_sha256)
         except Exception as error:
             self.continuation_errors.append(repr(error))
             raise
@@ -319,67 +341,75 @@ class BoundaryFailure:
         self.journey = journey
         self.runner = journey.runtime()
         self.initial = True
+        self.second_fault: str | None = None
+        self.read_stop_count = 2
+        self.ack_checkpoint: RuntimeCheckpoint
+        self.ack_artifact: Artifact
+        self.ack_counts: tuple[int, int]
 
     async def restore_checkpoint(self, checkpoint: RuntimeCheckpoint) -> None:
         self.runner = self.journey.runtime()
         self.initial = False
         await self.runner.restore_checkpoint(checkpoint)
 
-    async def save_checkpoint(self):
-        return await self.runner.save_checkpoint()
+    async def save_checkpoint(self) -> RuntimeCheckpoint:
+        return present(await self.runner.save_checkpoint())
 
-    async def cancel(self):
+    async def cancel(self) -> None:
         await self.runner.cancel()
 
-    async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
+    def validate_publication_checkpoint(self, checkpoint: RuntimeCheckpoint, context: TaskContext) -> None:
+        self.runner.validate_publication_checkpoint(checkpoint, context)
+
+    async def run(self, context: TaskContext) -> AsyncGenerator[RunEvent, None]:
         self.journey.context = context
         original_fail, original_success = _DiscussionDurability.fail_tool, _DiscussionDurability.succeed_tool
         boundary = asyncio.Event()
-        if not self.initial and getattr(self, 'second_fault', None) == 'unknown_model':
+        if not self.initial and self.second_fault == 'unknown_model':
             self.journey.model_freeze = boundary
-        if not self.initial and getattr(self, 'second_fault', None) == 'unknown_write':
+        if not self.initial and (self.second_fault or '') == 'unknown_write':
             self.journey.tool_freeze = boundary
 
-        async def freeze():
+        async def freeze() -> None:
             boundary.set()
             await asyncio.Event().wait()
 
-        async def fail(durable, artifact):
+        async def fail(durable: _DiscussionDurability, artifact: Artifact) -> None:
             await original_fail(durable, artifact)
             if self.initial:
                 if self.journey.strict_soft:
                     # Simulate elapsed soft runway, retaining the real absolute clock and ACK publication.
-                    self.runner._wall_budget.deadline = asyncio.get_running_loop().time() + 0.25
+                    present(self.runner._wall_budget).deadline = asyncio.get_running_loop().time() + 0.25
                     await durable._checkpoint()
                 # The driver ACK and artifact finalization must finish before fault injection.
                 await freeze()
 
-        async def succeed(durable, artifact):
+        async def succeed(durable: _DiscussionDurability, artifact: Artifact) -> None:
             await original_success(durable, artifact)
-            if artifact.content.get('tool_name') == 'workspace.read' and hasattr(self.journey, 'read_acks'):
-                self.journey.read_acks.append((await self.runner.save_checkpoint(), asdict(self.runner._wall_budget)))
-            ack_tool = {'ack_verify': 'project.verify', 'ack_bundle': 'workspace.bundle',
-                        'ack_read': 'workspace.read', 'ack_repeat_read': 'workspace.read'}.get(
-                getattr(self, 'second_fault', None))
-            if (not self.initial and ack_tool == artifact.content.get('tool_name')
-                    and (getattr(self, 'second_fault', None) != 'ack_repeat_read'
+            if mapping(artifact.content).get('tool_name') == 'workspace.read' and hasattr(self.journey, 'read_acks'):
+                self.journey.read_acks.append((present(await self.runner.save_checkpoint()), asdict(present(self.runner._wall_budget))))
+            ack_tool = mapping({'ack_verify': 'project.verify', 'ack_bundle': 'workspace.bundle',
+                        'ack_read': 'workspace.read', 'ack_repeat_read': 'workspace.read'}).get(
+                self.second_fault or '')
+            if (not self.initial and ack_tool == mapping(artifact.content).get('tool_name')
+                    and ((self.second_fault or '') != 'ack_repeat_read'
                          or self.journey.read_count == getattr(self, 'read_stop_count', 2))):
-                self.ack_checkpoint = await self.runner.save_checkpoint()
+                self.ack_checkpoint = present(await self.runner.save_checkpoint())
                 self.ack_artifact = artifact
                 self.ack_counts = (len(self.journey.calls), len(self.journey.requests))
                 await freeze()
-            if (not self.initial and getattr(self, 'second_fault', None) == 'after_write'
-                    and artifact.content.get('tool_name') == 'workspace.write_text'):
+            if (not self.initial and (self.second_fault or '') == 'after_write'
+                    and mapping(artifact.content).get('tool_name') == 'workspace.write_text'):
                 await freeze()
 
         with patch.object(_DiscussionDurability, 'fail_tool', fail), \
                 patch.object(_DiscussionDurability, 'succeed_tool', succeed):
-            async with aclosing(self.runner.run(context)) as stream:
+            async with aclosing(closable(self.runner.run(context))) as stream:
                 stop = asyncio.create_task(boundary.wait())
-                item = None
+                item: asyncio.Future[RunEvent] | None = None
                 try:
                     while True:
-                        item = asyncio.create_task(anext(stream))
+                        item = asyncio.ensure_future(anext(stream))
                         await asyncio.wait((item, stop), return_when=asyncio.FIRST_COMPLETED)
                         if stop.done():
                             await self.runner.cancel()
@@ -391,16 +421,16 @@ class BoundaryFailure:
                         except StopAsyncIteration:
                             return
                         yield event
-                        late_tool = {'after_verify': 'project.verify', 'after_bundle': 'workspace.bundle',
-                                     'after_bundle_list': 'workspace.list'}.get(
-                            getattr(self, 'second_fault', None))
+                        late_tool = mapping({'after_verify': 'project.verify', 'after_bundle': 'workspace.bundle',
+                                     'after_bundle_list': 'workspace.list'}).get(
+                            self.second_fault or '')
                         if not self.initial and late_tool is not None and event.checkpoint is not None:
                             state = event.checkpoint.state
-                            tools, models = state['tool_ledger'], state['model_ledger']
-                            phase = state.get('project_repair_phase', {})
-                            if (tools and tools[-1]['name'] == late_tool and tools[-1]['status'] == 'succeeded'
-                                    and state['engineering_tool_prefix'] == len(tools)
-                                    and phase.get('model_floor') == len(models)):
+                            tools, models = sequence(mapping(state)['tool_ledger']), sequence(mapping(state)['model_ledger'])
+                            phase = mapping(state).get('project_repair_phase', {})
+                            if (tools and mapping(tools[-1])['name'] == late_tool and mapping(tools[-1])['status'] == 'succeeded'
+                                    and integer(mapping(state)['engineering_tool_prefix']) == len(tools)
+                                    and mapping(phase).get('model_floor') == len(models)):
                                 # The service has persisted and ACKed a complete round, before the report starts.
                                 await self.runner.cancel()
                                 break
@@ -419,13 +449,13 @@ async def test_real_runtime_service_repository_continue_without_replaying_old_ef
     journey = ProjectJourney()
     repo = ContinuationRepository(journey)
     runtime = BoundaryFailure(journey)
-    service = RunService(repo, runtime_registry=RuntimeRegistry((runtime,)), router=None, task_queue=object())
+    service = RunService(repo, runtime_registry=RuntimeRegistry((runtime,)), router=None, task_queue=UnexpectedTaskQueue())
     first = await service.execute(repo.run_id)
-    assert repo.row.routing_decision.get('engineering_auto_repair_version') == 1
+    assert present(mapping(repo.row.routing_decision)).get('engineering_auto_repair_version') == 1
     assert first.status is RunStatus.QUEUED, (first.status, first.repair_proposal,
         [(e.kind, e.reason) for e in repo.event_log[-5:]],
         [c.tool_name for c in journey.calls],
-        [(e.kind, dict(e.payload)) for e in repo.event_log if e.kind in {EventKind.TOOL_FAILED, 'repair.skipped'}])
+        [(e.kind, dict(mapping(e.payload))) for e in repo.event_log if e.kind in {EventKind.TOOL_FAILED, 'repair.skipped'}])
     saved = repo.checkpoint
     assert saved is not None and repo.accept_count == 1
     before = saved.to_payload()
@@ -448,17 +478,17 @@ async def test_real_runtime_service_repository_continue_without_replaying_old_ef
     assert repo.accept_count == 1 and len(repo.outbox) == 1
     assert len(set(journey.plans)) == 1
     assert saved.to_payload() == before
-    assert repo.checkpoint.state['usage']['tokens'] >= saved.state['usage']['tokens']
-    assert Decimal(repo.checkpoint.state['usage']['cost_usd']) >= Decimal(saved.state['usage']['cost_usd']) > 0
-    assert repo.checkpoint.state['remaining_absolute_timeout_seconds'] <= saved.state['remaining_absolute_timeout_seconds']
-    assert repo.row.routing_decision['runtime_token_absolute_tokens'] == 500
-    assert repo.row.routing_decision['runtime_timeout_absolute_seconds'] == 20.0
-    assert repo.checkpoint.state['project_repair_phase']['source_checkpoint_sha256'] == saved.state_sha256
-    assert repo.checkpoint.state['tool_ledger'][:len(saved.state['tool_ledger'])] == saved.state['tool_ledger']
-    assert repo.checkpoint.state['model_ledger'][:len(saved.state['model_ledger'])] == saved.state['model_ledger']
+    assert integer(mapping(mapping(repo.checkpoint.state)['usage'])['tokens']) >= integer(mapping(mapping(saved.state)['usage'])['tokens'])
+    assert Decimal(string(mapping(mapping(repo.checkpoint.state)['usage'])['cost_usd'])) >= Decimal(string(mapping(mapping(saved.state)['usage'])['cost_usd'])) > 0
+    assert number(mapping(repo.checkpoint.state)['remaining_absolute_timeout_seconds']) <= number(mapping(saved.state)['remaining_absolute_timeout_seconds'])
+    assert integer(present(mapping(repo.row.routing_decision))['runtime_token_absolute_tokens']) == 500
+    assert number(present(mapping(repo.row.routing_decision))['runtime_timeout_absolute_seconds']) == 20.0
+    assert mapping(mapping(repo.checkpoint.state)['project_repair_phase'])['source_checkpoint_sha256'] == saved.state_sha256
+    assert sequence(mapping(repo.checkpoint.state)['tool_ledger'])[:len(sequence(mapping(saved.state)['tool_ledger']))] == sequence(mapping(saved.state)['tool_ledger'])
+    assert sequence(mapping(repo.checkpoint.state)['model_ledger'])[:len(sequence(mapping(saved.state)['model_ledger']))] == sequence(mapping(saved.state)['model_ledger'])
     final = [e.artifact for e in repo.event_log if e.artifact is not None
-             and e.artifact.content.get('presentation') == 'final_answer']
-    assert len(final) == 1 and final[0].content['text'] == journey.report
+             and mapping(e.artifact.content).get('presentation') == 'final_answer']
+    assert len(final) == 1 and mapping(final[0].content)['text'] == journey.report
     assert final[0].producer == 'delivery_main_agent'
     with zipfile.ZipFile(io.BytesIO(journey.bundle_bytes)) as archive:
         assert archive.read('ACCEPTANCE.json') == b'repaired draft'
@@ -476,7 +506,7 @@ async def test_second_fault_preserves_phase_and_cold_restore_never_replays_unkno
     journey = ProjectJourney()
     repo = ContinuationRepository(journey)
     runtime = BoundaryFailure(journey)
-    service = RunService(repo, runtime_registry=RuntimeRegistry((runtime,)), router=None, task_queue=object())
+    service = RunService(repo, runtime_registry=RuntimeRegistry((runtime,)), router=None, task_queue=UnexpectedTaskQueue())
     first = await service.execute(repo.run_id)
     assert first.status is RunStatus.QUEUED
     source = repo.checkpoint
@@ -484,12 +514,12 @@ async def test_second_fault_preserves_phase_and_cold_restore_never_replays_unkno
     second = await service.execute(repo.run_id)
     assert second.status is (RunStatus.QUEUED if fault == 'after_write' else RunStatus.FAILED)
     failed = repo.checkpoint
-    phase = failed.state['project_repair_phase']
-    assert phase['source_checkpoint_sha256'] == source.state_sha256
-    assert failed.state['model_ledger'][:len(source.state['model_ledger'])] == source.state['model_ledger']
-    assert failed.state['tool_ledger'][:len(source.state['tool_ledger'])] == source.state['tool_ledger']
-    assert failed.state['usage']['tokens'] >= source.state['usage']['tokens'] > 0
-    assert Decimal(failed.state['usage']['cost_usd']) >= Decimal(source.state['usage']['cost_usd']) > 0
+    phase = mapping(mapping(failed.state)['project_repair_phase'])
+    assert mapping(phase)['source_checkpoint_sha256'] == source.state_sha256
+    assert sequence(mapping(failed.state)['model_ledger'])[:len(sequence(mapping(source.state)['model_ledger']))] == sequence(mapping(source.state)['model_ledger'])
+    assert sequence(mapping(failed.state)['tool_ledger'])[:len(sequence(mapping(source.state)['tool_ledger']))] == sequence(mapping(source.state)['tool_ledger'])
+    assert integer(mapping(mapping(failed.state)['usage'])['tokens']) >= integer(mapping(mapping(source.state)['usage'])['tokens']) > 0
+    assert Decimal(string(mapping(mapping(failed.state)['usage'])['cost_usd'])) >= Decimal(string(mapping(mapping(source.state)['usage'])['cost_usd'])) > 0
     before = failed.to_payload()
     old_count = len(journey.calls)
     old_model_count = len(journey.requests)
@@ -498,18 +528,18 @@ async def test_second_fault_preserves_phase_and_cold_restore_never_replays_unkno
         third = await service.execute(repo.run_id)
         assert third.status is RunStatus.COMPLETED
         assert repo.accept_count == 1 and len(repo.outbox) == 2
-        assert repo.row.routing_decision['self_repair_attempt'] == 1
+        assert integer(present(mapping(repo.row.routing_decision))['self_repair_attempt']) == 1
         assert journey.write_count == 2
         assert [c.tool_name for c in journey.calls[old_count:]] == ['project.verify', 'workspace.bundle']
         assert journey.verify_count == 2 and journey.bundle_bytes
         final = [e.artifact for e in repo.event_log if e.artifact is not None
-                 and e.artifact.content.get('presentation') == 'final_answer']
-        assert len(final) == 1 and final[0].content['text'] == journey.report
+                 and mapping(e.artifact.content).get('presentation') == 'final_answer']
+        assert len(final) == 1 and mapping(final[0].content)['text'] == journey.report
         assert len(set(journey.plans)) == 1
         assert failed.to_payload() == before
-        assert repo.checkpoint.state['usage']['tokens'] >= failed.state['usage']['tokens']
-        assert Decimal(repo.checkpoint.state['usage']['cost_usd']) >= Decimal(failed.state['usage']['cost_usd'])
-        assert repo.checkpoint.state['remaining_absolute_timeout_seconds'] <= failed.state['remaining_absolute_timeout_seconds']
+        assert integer(mapping(mapping(repo.checkpoint.state)['usage'])['tokens']) >= integer(mapping(mapping(failed.state)['usage'])['tokens'])
+        assert Decimal(string(mapping(mapping(repo.checkpoint.state)['usage'])['cost_usd'])) >= Decimal(string(mapping(mapping(failed.state)['usage'])['cost_usd']))
+        assert number(mapping(repo.checkpoint.state)['remaining_absolute_timeout_seconds']) <= number(mapping(failed.state)['remaining_absolute_timeout_seconds'])
         with zipfile.ZipFile(io.BytesIO(journey.bundle_bytes)) as archive:
             assert archive.read('ACCEPTANCE.json') == b'repaired draft'
         return
@@ -522,13 +552,13 @@ async def test_second_fault_preserves_phase_and_cold_restore_never_replays_unkno
     assert failed.to_payload() == before
     if fault in {'unknown_model', 'unknown_write'}:
         key = 'model_ledger' if fault == 'unknown_model' else 'tool_ledger'
-        assert failed.state[key][-1]['status'] == 'running'
+        assert mapping(sequence(failed.state[key])[-1])['status'] == 'running'
         assert events[-1].kind is EventKind.RUNTIME_FAILED
         assert events[-1].reason == ('model_outcome_uncertain' if fault == 'unknown_model' else 'tool_outcome_uncertain')
         assert len(journey.requests) == old_model_count
         assert len(journey.calls) == old_count
-    assert repo.row.routing_decision['runtime_token_absolute_tokens'] == 500
-    assert repo.row.routing_decision['runtime_timeout_absolute_seconds'] == 20.0
+    assert integer(present(mapping(repo.row.routing_decision))['runtime_token_absolute_tokens']) == 500
+    assert number(present(mapping(repo.row.routing_decision))['runtime_timeout_absolute_seconds']) == 20.0
 
 
 @pytest.mark.asyncio
@@ -543,25 +573,25 @@ async def test_late_delivery_progress_continues_after_write_credit_is_consumed(
     journey = ProjectJourney()
     repo = ContinuationRepository(journey)
     runtime = BoundaryFailure(journey)
-    service = RunService(repo, runtime_registry=RuntimeRegistry((runtime,)), router=None, task_queue=object())
+    service = RunService(repo, runtime_registry=RuntimeRegistry((runtime,)), router=None, task_queue=UnexpectedTaskQueue())
     assert (await service.execute(repo.run_id)).status is RunStatus.QUEUED
     runtime.second_fault = 'after_write'
     assert (await service.execute(repo.run_id)).status is RunStatus.QUEUED
     for index, fault in enumerate(faults):
-        consumed = dict(repo.row.routing_decision['self_repair_episode_progress'])
+        consumed = dict(mapping(present(mapping(repo.row.routing_decision))['self_repair_episode_progress']))
         runtime.second_fault = fault
         continued = await service.execute(repo.run_id)
         stopped = repo.checkpoint
         before = stopped.to_payload()
         assert journey.write_count == 2 and journey.verify_count == 2
-        assert all(row['status'] == 'succeeded' for row in stopped.state['model_ledger'])
-        assert all(row['status'] in {'succeeded', 'failed'} for row in stopped.state['tool_ledger'])
-        assert stopped.state['project_repair_phase']['model_floor'] == len(stopped.state['model_ledger'])
-        assert stopped.state['engineering_tool_prefix'] == len(stopped.state['tool_ledger'])
+        assert all(mapping(row)['status'] == 'succeeded' for row in sequence(mapping(stopped.state)['model_ledger']))
+        assert all(mapping(row)['status'] in {'succeeded', 'failed'} for row in sequence(mapping(stopped.state)['tool_ledger']))
+        assert integer(mapping(mapping(stopped.state)['project_repair_phase'])['model_floor']) == len(sequence(mapping(stopped.state)['model_ledger']))
+        assert integer(mapping(stopped.state)['engineering_tool_prefix']) == len(sequence(mapping(stopped.state)['tool_ledger']))
         expected = ['project.verify'] if fault == 'after_verify' else (
             ['workspace.bundle'] if index else ['project.verify', 'workspace.bundle'])
-        assert [row['name'] for row in stopped.state['tool_ledger'][consumed['tool_count']:]] == expected
-        assert not any('report_binding' in row for row in stopped.state['model_ledger'])
+        assert [mapping(row)['name'] for row in sequence(mapping(stopped.state)['tool_ledger'])[integer(mapping(consumed)['tool_count']):]] == expected
+        assert not any('report_binding' in mapping(row) for row in sequence(mapping(stopped.state)['model_ledger']))
         assert continued.status is RunStatus.QUEUED, repo.continuation_errors
     assert repo.accept_count == 1 and len(repo.outbox) == 2 + len(faults)
     calls, models = len(journey.calls), len(journey.requests)
@@ -576,19 +606,36 @@ async def test_late_delivery_progress_continues_after_write_credit_is_consumed(
     assert sum(any(m.role == 'system' and 'Main Agent final delivery' in str(m.content)
                    for m in request.messages) for request in journey.requests) == 1
     final = [event.artifact for event in repo.event_log if event.artifact is not None
-             and event.artifact.content.get('presentation') == 'final_answer']
-    assert len(final) == 1 and final[0].content['text'] == journey.report
+             and mapping(event.artifact.content).get('presentation') == 'final_answer']
+    assert len(final) == 1 and mapping(final[0].content)['text'] == journey.report
     assert stopped.to_payload() == before
-    assert repo.checkpoint.state['model_ledger'][:len(stopped.state['model_ledger'])] == stopped.state['model_ledger']
-    assert repo.checkpoint.state['tool_ledger'][:len(stopped.state['tool_ledger'])] == stopped.state['tool_ledger']
-    assert repo.row.routing_decision['self_repair_attempt'] == 1
-    assert repo.row.routing_decision['runtime_token_absolute_tokens'] == 500
-    assert repo.row.routing_decision['runtime_timeout_absolute_seconds'] == 20.0
-    assert repo.checkpoint.state['usage']['tokens'] >= stopped.state['usage']['tokens']
-    assert Decimal(repo.checkpoint.state['usage']['cost_usd']) >= Decimal(stopped.state['usage']['cost_usd'])
-    assert repo.checkpoint.state['remaining_absolute_timeout_seconds'] <= stopped.state['remaining_absolute_timeout_seconds']
+    assert sequence(mapping(repo.checkpoint.state)['model_ledger'])[:len(sequence(mapping(stopped.state)['model_ledger']))] == sequence(mapping(stopped.state)['model_ledger'])
+    assert sequence(mapping(repo.checkpoint.state)['tool_ledger'])[:len(sequence(mapping(stopped.state)['tool_ledger']))] == sequence(mapping(stopped.state)['tool_ledger'])
+    assert integer(present(mapping(repo.row.routing_decision))['self_repair_attempt']) == 1
+    assert integer(present(mapping(repo.row.routing_decision))['runtime_token_absolute_tokens']) == 500
+    assert number(present(mapping(repo.row.routing_decision))['runtime_timeout_absolute_seconds']) == 20.0
+    assert integer(mapping(mapping(repo.checkpoint.state)['usage'])['tokens']) >= integer(mapping(mapping(stopped.state)['usage'])['tokens'])
+    assert Decimal(string(mapping(mapping(repo.checkpoint.state)['usage'])['cost_usd'])) >= Decimal(string(mapping(mapping(stopped.state)['usage'])['cost_usd']))
+    assert number(mapping(repo.checkpoint.state)['remaining_absolute_timeout_seconds']) <= number(mapping(stopped.state)['remaining_absolute_timeout_seconds'])
     with zipfile.ZipFile(io.BytesIO(journey.bundle_bytes)) as archive:
         assert archive.read('ACCEPTANCE.json') == b'repaired draft'
+
+
+def approval_tool(durable: _DiscussionDurability, backend: ProjectJourney,
+                  records: list[_ToolRecord], *, name: str = 'workspace.write_text',
+                  replay_safe: bool = False) -> GatewayCapabilityTool:
+    class Policy:
+        def is_replay_safe(self, _: str) -> bool:
+            return replay_safe
+
+        async def execute(self, *, tenant_id: UUID, run_id: UUID, actor: str, name: str,
+                          arguments: Mapping[str, JsonValue], idempotency_key: str) -> Mapping[str, JsonValue]:
+            raise AssertionError('approval must use the authenticated harness')
+    ctx = backend.context
+    return GatewayCapabilityTool(Policy(), tenant_id=ctx.tenant_id, run_id=ctx.run_id,
+        actor='implementer', name=name, records=records, durability=durable,
+        harness_tool_gateway=backend, user_id=ctx.actor_id, role=ctx.actor_role,
+        server_context=ctx, sandbox_profile='workspace_write', serialize_tool_calls=True)
 
 
 class ReadBeforeRepairJourney(ProjectJourney):
@@ -596,11 +643,11 @@ class ReadBeforeRepairJourney(ProjectJourney):
                  repeat_summary: bool = False) -> None:
         super().__init__()
         self.context = self.context.model_copy(update={'routing_decision': {
-            **self.context.routing_decision, 'engineering_diagnostic_allowance_version': 1}})
+            **present(self.context.routing_decision), 'engineering_diagnostic_allowance_version': 1}})
         self.cross_read_soft, self.repeat_reads, self.repeat_summary = cross_read_soft, repeat_reads, repeat_summary
         self.read_count = 0
-        self.read_acks: list[Any] = []
-        self.crossed_reads: list[Any] = []
+        self.read_acks = []
+        self.crossed_reads: list[tuple[dict[str, object], dict[str, object]]] = []
 
     def runtime(self) -> AutoGenDiscussionRuntime:
         original = super().runtime()
@@ -612,14 +659,18 @@ class ReadBeforeRepairJourney(ProjectJourney):
             harness_tool_gateway=self, artifact_repository=self.artifacts)
         return self.runner
 
-    def is_available(self, tenant_id, name):
+    def is_available(self, tenant_id: UUID, name: str) -> bool:
         return tenant_id == self.context.tenant_id and (
             name == 'workspace.read' or super().is_available(tenant_id, name))
 
-    def is_replay_safe(self, name):
+    def is_replay_safe(self, name: str) -> bool:
         return name == 'workspace.read' or super().is_replay_safe(name)
 
-    def manifest(self, tenant_id=None):
+    @overload
+    def manifest(self, tenant_id: UUID) -> tuple[Mapping[str, JsonValue], ...]: ...
+    @overload
+    def manifest(self, tenant_id: None = None) -> list[dict[str, JsonValue]]: ...
+    def manifest(self, tenant_id: UUID | None = None) -> tuple[Mapping[str, JsonValue], ...] | list[dict[str, JsonValue]]:
         manifests = super().manifest(tenant_id)
         return (*manifests, {'name': 'workspace.read', 'input_schema': _builtin_input_schema('workspace.read')}) \
             if tenant_id is not None else manifests
@@ -648,7 +699,8 @@ class ReadBeforeRepairJourney(ProjectJourney):
             deployment_id='fixture', logical_model=request.logical_model, provider_id='fixture',
             provider_model='fixture/model', cost_usd=Decimal('0.001'))
 
-    async def invoke(self, tenant_id, request, *, user_id=None, role=None):
+    async def invoke(self, tenant_id: UUID, request: HarnessToolCallRequest, *,
+                     user_id: UUID | None = None, role: Role | None = None) -> HarnessToolCallResult:
         if request.tool_name != 'workspace.read':
             return await super().invoke(tenant_id, request, user_id=user_id, role=role)
         assert tenant_id == self.context.tenant_id and request.run_id == self.context.run_id
@@ -657,27 +709,29 @@ class ReadBeforeRepairJourney(ProjectJourney):
         self.calls.append(request)
         self.read_count += 1
         if self.cross_read_soft and self.read_count == 1:
-            budget = self.runner._wall_budget
+            budget = present(self.runner._wall_budget)
             budget.deadline = asyncio.get_running_loop().time() + 0.01
             before = asdict(budget)
             await self.cross_soft()
             now = asyncio.get_running_loop().time()
             assert budget.remaining(now=now) == 0 and budget.absolute_remaining(now=now) > 0
             self.crossed_reads.append((before, asdict(budget)))
-        text = self.files['ACCEPTANCE.json']
+        text = mapping(self.files)['ACCEPTANCE.json']
         payload = {'path': 'ACCEPTANCE.json', 'text': text, 'truncated': False}
         if self.repeat_summary and self.read_count > 1:
             # Adversarial display metadata is not a fresh file observation.
-            payload['summary'] = 'another attempt, identical file bytes'
+            mutable(payload)['summary'] = 'another attempt, identical file bytes'
         return HarnessToolCallResult(call_id=request.call_id, tool_name=request.tool_name,
-            status='succeeded', payload=payload)
+            status='succeeded', payload=json_map(payload))
 
 
-async def _read_repair_fixture(**options):
-    journey = ReadBeforeRepairJourney(**options)
+async def _read_repair_fixture(*, cross_read_soft: bool = False, repeat_reads: int = 0,
+        repeat_summary: bool = False) -> tuple[ReadBeforeRepairJourney, ContinuationRepository,
+            BoundaryFailure, RunService, SubmittedRun, RuntimeCheckpoint]:
+    journey = ReadBeforeRepairJourney(cross_read_soft=cross_read_soft, repeat_reads=repeat_reads, repeat_summary=repeat_summary)
     repo = ContinuationRepository(journey)
     runtime = BoundaryFailure(journey)
-    service = RunService(repo, runtime_registry=RuntimeRegistry((runtime,)), router=None, task_queue=object())
+    service = RunService(repo, runtime_registry=RuntimeRegistry((runtime,)), router=None, task_queue=UnexpectedTaskQueue())
     first = await service.execute(repo.run_id)
     assert first.status is RunStatus.QUEUED and journey.write_count == journey.verify_count == 1
     return journey, repo, runtime, service, first, repo.checkpoint
@@ -691,14 +745,14 @@ async def test_first_fresh_read_after_failed_check_can_resume_repair_without_rep
     journey = ReadBeforeRepairJourney()
     repo = ContinuationRepository(journey)
     runtime = BoundaryFailure(journey)
-    service = RunService(repo, runtime_registry=RuntimeRegistry((runtime,)), router=None, task_queue=object())
-    assert journey.context.routing_decision['engineering_diagnostic_allowance_version'] == 1
+    service = RunService(repo, runtime_registry=RuntimeRegistry((runtime,)), router=None, task_queue=UnexpectedTaskQueue())
+    assert present(mapping(journey.context.routing_decision))['engineering_diagnostic_allowance_version'] == 1
     first = await service.execute(repo.run_id)
     assert first.status is RunStatus.QUEUED
-    assert repo.row.routing_decision['engineering_diagnostic_allowance_version'] == 1
+    assert present(mapping(repo.row.routing_decision))['engineering_diagnostic_allowance_version'] == 1
     source = repo.checkpoint
-    assert source.state['tool_ledger'][-1]['name'] == 'project.verify'
-    assert source.state['tool_ledger'][-1]['status'] == 'failed'
+    assert mapping(sequence(mapping(source.state)['tool_ledger'])[-1])['name'] == 'project.verify'
+    assert mapping(sequence(mapping(source.state)['tool_ledger'])[-1])['status'] == 'failed'
     assert journey.write_count == journey.verify_count == 1 and repo.accept_count == 1
     runtime.second_fault = 'ack_read'
     continued = await service.execute(repo.run_id)
@@ -706,30 +760,30 @@ async def test_first_fresh_read_after_failed_check_can_resume_repair_without_rep
         continued.status, [(event.kind, event.reason) for event in repo.event_log[-8:]])
     stopped = repo.checkpoint
     before = stopped.to_payload()
-    tools, models = stopped.state['tool_ledger'], stopped.state['model_ledger']
-    assert tools == runtime.ack_checkpoint.state['tool_ledger']
-    assert [row['name'] for row in tools[len(source.state['tool_ledger']):]] == ['workspace.read']
-    assert all(row['status'] in {'succeeded', 'failed'} for row in tools)
-    assert all(row['status'] == 'succeeded' for row in models)
-    assert tools[-1]['status'] == 'succeeded' and tools[-1]['artifact_id'] == str(runtime.ack_artifact.id)
-    assert tools[-1]['artifact_sha256'] == runtime.ack_artifact.content_sha256
-    assert runtime.ack_artifact.content['result']['path'] == 'ACCEPTANCE.json'
-    assert runtime.ack_artifact.content['result']['text'] == 'bad draft'
-    assert runtime.ack_artifact.content['result']['truncated'] is False
-    assert stopped.state['artifact_registry'][str(runtime.ack_artifact.id)] == runtime.ack_artifact.content_sha256
-    refs = tuple(ArtifactReference(id=UUID(key), sha256=value)
-                 for key, value in stopped.state['artifact_registry'].items())
+    tools, models = sequence(mapping(stopped.state)['tool_ledger']), sequence(mapping(stopped.state)['model_ledger'])
+    assert tools == sequence(mapping(runtime.ack_checkpoint.state)['tool_ledger'])
+    assert [mapping(row)['name'] for row in tools[len(sequence(mapping(source.state)['tool_ledger'])):]] == ['workspace.read']
+    assert all(mapping(row)['status'] in {'succeeded', 'failed'} for row in tools)
+    assert all(mapping(row)['status'] == 'succeeded' for row in models)
+    assert mapping(tools[-1])['status'] == 'succeeded' and string(mapping(tools[-1])['artifact_id']) == str(runtime.ack_artifact.id)
+    assert mapping(tools[-1])['artifact_sha256'] == runtime.ack_artifact.content_sha256
+    assert mapping(mapping(runtime.ack_artifact.content)['result'])['path'] == 'ACCEPTANCE.json'
+    assert mapping(mapping(runtime.ack_artifact.content)['result'])['text'] == 'bad draft'
+    assert mapping(mapping(runtime.ack_artifact.content)['result'])['truncated'] is False
+    assert registry(mapping(stopped.state)['artifact_registry'])[str(runtime.ack_artifact.id)] == runtime.ack_artifact.content_sha256
+    refs = tuple(ArtifactReference(id=UUID(string(key)), sha256=value)
+                 for key, value in registry(mapping(mapping(stopped.state)['artifact_registry'])).items())
     artifacts = await journey.artifacts.get_many(stopped.tenant_id, stopped.run_id, refs)
     assert completed_round(journey.context, stopped.state, artifacts)
     allowed = {participant.id: participant.allowed_tools for participant in runtime.runner._plan.participants}
-    old_progress = engineering_work_progress(journey.context, tool_entries=source.state['tool_ledger'],
+    old_progress = engineering_work_progress(journey.context, tool_entries=ledger(sequence(mapping(source.state)['tool_ledger'])),
         artifacts=artifacts, allowed_tools=allowed, include_draft_diagnoses=True)
-    assert engineering_work_progress(journey.context, tool_entries=tools, artifacts=artifacts,
+    assert engineering_work_progress(journey.context, tool_entries=ledger(tools), artifacts=artifacts,
         allowed_tools=allowed, include_draft_diagnoses=True) == old_progress
-    assert stopped.state['usage'] == runtime.ack_checkpoint.state['usage']
-    assert source.state['usage']['tokens'] < stopped.state['usage']['tokens'] < 500
-    assert 0 < stopped.state['remaining_timeout_seconds'] <= source.state['remaining_timeout_seconds']
-    assert 0 < stopped.state['remaining_absolute_timeout_seconds'] <= source.state['remaining_absolute_timeout_seconds']
+    assert mapping(mapping(stopped.state)['usage']) == mapping(mapping(runtime.ack_checkpoint.state)['usage'])
+    assert integer(mapping(mapping(source.state)['usage'])['tokens']) < integer(mapping(mapping(stopped.state)['usage'])['tokens']) < 500
+    assert 0 < number(mapping(stopped.state)['remaining_timeout_seconds']) <= number(mapping(source.state)['remaining_timeout_seconds'])
+    assert 0 < number(mapping(stopped.state)['remaining_absolute_timeout_seconds']) <= number(mapping(source.state)['remaining_absolute_timeout_seconds'])
     assert journey.write_count == journey.verify_count == 1
     assert runtime.ack_counts == (len(journey.calls), len(journey.requests))
     assert continued.id == first.id == repo.run_id
@@ -749,29 +803,29 @@ async def test_first_fresh_read_after_failed_check_can_resume_repair_without_rep
                                  and 'Main Agent final delivery' in str(message.content)
                                  for message in request.messages) else request.logical_model)
             for request in new_requests] == ['selector', 'writer', 'writer', 'selector', 'writer', 'main_report']
-    new_models = repo.checkpoint.state['model_ledger'][len(models):]
-    refs = tuple(ArtifactReference(id=UUID(row['artifact_id']), sha256=row['artifact_sha256']) for row in new_models)
+    new_models = sequence(mapping(repo.checkpoint.state)['model_ledger'])[len(models):]
+    refs = tuple(ArtifactReference(id=UUID(string(string(mapping(row)['artifact_id']))), sha256=string(mapping(row)['artifact_sha256'])) for row in new_models)
     private_models = await journey.artifacts.get_many(repo.checkpoint.tenant_id, repo.run_id, refs)
-    assert [tuple(call['name'] for call in artifact.content['tool_calls']) for artifact in private_models] == [
+    assert [tuple(mapping(call)['name'] for call in sequence(mapping(artifact.content)['tool_calls'])) for artifact in private_models] == [
         (), ('workspace_write_text',), ('project_verify',), (), ('workspace_bundle',), ()]
-    assert [artifact.content['text'] for artifact in private_models if not artifact.content['tool_calls']] == [
+    assert [mapping(artifact.content)['text'] for artifact in private_models if not sequence(mapping(artifact.content)['tool_calls'])] == [
         'implementer', 'implementer', journey.report]
-    assert [artifact.content['logical_model'] for artifact in private_models] == [
+    assert [mapping(artifact.content)['logical_model'] for artifact in private_models] == [
         request.logical_model for request in new_requests]
     assert journey.write_count == journey.verify_count == 2
     assert repo.accept_count == 1 and len(repo.outbox) == 2
-    assert repo.checkpoint.state['tool_ledger'][:len(tools)] == tools
-    assert repo.checkpoint.state['model_ledger'][:len(models)] == models
+    assert sequence(mapping(repo.checkpoint.state)['tool_ledger'])[:len(tools)] == tools
+    assert sequence(mapping(repo.checkpoint.state)['model_ledger'])[:len(models)] == models
     assert stopped.to_payload() == before
-    assert repo.checkpoint.state['usage']['tokens'] >= stopped.state['usage']['tokens']
-    assert Decimal(repo.checkpoint.state['usage']['cost_usd']) >= Decimal(stopped.state['usage']['cost_usd'])
-    assert repo.checkpoint.state['remaining_absolute_timeout_seconds'] <= stopped.state['remaining_absolute_timeout_seconds']
-    assert repo.row.routing_decision['runtime_token_absolute_tokens'] == 500
-    assert repo.row.routing_decision['runtime_timeout_absolute_seconds'] == 20.0
+    assert integer(mapping(mapping(repo.checkpoint.state)['usage'])['tokens']) >= integer(mapping(mapping(stopped.state)['usage'])['tokens'])
+    assert Decimal(string(mapping(mapping(repo.checkpoint.state)['usage'])['cost_usd'])) >= Decimal(string(mapping(mapping(stopped.state)['usage'])['cost_usd']))
+    assert number(mapping(repo.checkpoint.state)['remaining_absolute_timeout_seconds']) <= number(mapping(stopped.state)['remaining_absolute_timeout_seconds'])
+    assert integer(present(mapping(repo.row.routing_decision))['runtime_token_absolute_tokens']) == 500
+    assert number(present(mapping(repo.row.routing_decision))['runtime_timeout_absolute_seconds']) == 20.0
     assert len(set(journey.plans)) == 1
     final = [event.artifact for event in repo.event_log if event.artifact is not None
-             and event.artifact.content.get('presentation') == 'final_answer']
-    assert len(final) == 1 and final[0].content['text'] == journey.report
+             and mapping(event.artifact.content).get('presentation') == 'final_answer']
+    assert len(final) == 1 and mapping(final[0].content)['text'] == journey.report
     with zipfile.ZipFile(io.BytesIO(journey.bundle_bytes)) as archive:
         assert archive.read('ACCEPTANCE.json') == b'repaired draft'
 
@@ -783,30 +837,30 @@ async def test_admitted_diagnostic_read_crosses_soft_then_replans_to_zip_and_rep
     completed = await service.execute(repo.run_id)
     assert journey.read_count == 1 and len(journey.crossed_reads) == len(journey.read_acks) == 1
     before, after = journey.crossed_reads[0]
-    assert before['deadline'] == after['deadline'] < asyncio.get_running_loop().time()
-    assert before['absolute_deadline'] == after['absolute_deadline']
+    assert number(mapping(before)['deadline']) == number(mapping(after)['deadline']) < asyncio.get_running_loop().time()
+    assert number(mapping(before)['absolute_deadline']) == number(mapping(after)['absolute_deadline'])
     acknowledged, granted_budget = journey.read_acks[0]
-    assert granted_budget['deadline'] > after['deadline']
-    assert granted_budget['absolute_deadline'] == after['absolute_deadline']
-    assert granted_budget['progress_units'] == after['progress_units'] + 1
-    assert acknowledged.state['engineering_diagnostic_consumed_through'] == len(acknowledged.state['tool_ledger'])
-    assert acknowledged.state['remaining_timeout_seconds'] > 0
-    assert acknowledged.state['tool_ledger'][-1]['name'] == 'workspace.read'
-    assert acknowledged.state['tool_ledger'][-1]['status'] == 'succeeded'
-    assert 0 < acknowledged.state['remaining_absolute_timeout_seconds'] <= source.state['remaining_absolute_timeout_seconds']
-    assert acknowledged.state['usage']['tokens'] < runtime.runner._plan.token_budget == 500
-    assert Decimal(acknowledged.state['usage']['cost_usd']) < runtime.runner._plan.cost_budget_usd
+    assert number(mapping(granted_budget)['deadline']) > number(mapping(after)['deadline'])
+    assert number(mapping(granted_budget)['absolute_deadline']) == number(mapping(after)['absolute_deadline'])
+    assert integer(mapping(granted_budget)['progress_units']) == integer(mapping(after)['progress_units']) + 1
+    assert integer(mapping(acknowledged.state)['engineering_diagnostic_consumed_through']) == len(sequence(mapping(acknowledged.state)['tool_ledger']))
+    assert number(mapping(acknowledged.state)['remaining_timeout_seconds']) > 0
+    assert mapping(sequence(mapping(acknowledged.state)['tool_ledger'])[-1])['name'] == 'workspace.read'
+    assert mapping(sequence(mapping(acknowledged.state)['tool_ledger'])[-1])['status'] == 'succeeded'
+    assert 0 < number(mapping(acknowledged.state)['remaining_absolute_timeout_seconds']) <= number(mapping(source.state)['remaining_absolute_timeout_seconds'])
+    assert integer(mapping(mapping(acknowledged.state)['usage'])['tokens']) < runtime.runner._plan.token_budget == 500
+    assert Decimal(string(mapping(mapping(acknowledged.state)['usage'])['cost_usd'])) < runtime.runner._plan.cost_budget_usd
     assert completed.id == first.id
     assert completed.status is RunStatus.COMPLETED, [(event.kind, event.reason) for event in repo.event_log[-7:]]
-    assert [call.tool_name for call in journey.calls[len(source.state['tool_ledger']):]] == [
+    assert [call.tool_name for call in journey.calls[len(sequence(mapping(source.state)['tool_ledger'])):]] == [
         'workspace.read', 'workspace.write_text', 'project.verify', 'workspace.bundle']
     assert journey.write_count == journey.verify_count == 2
-    assert repo.checkpoint.state['tool_ledger'][:len(acknowledged.state['tool_ledger'])] == acknowledged.state['tool_ledger']
-    assert repo.row.routing_decision['runtime_token_absolute_tokens'] == 500
-    assert repo.row.routing_decision['runtime_timeout_absolute_seconds'] == 20.0
+    assert sequence(mapping(repo.checkpoint.state)['tool_ledger'])[:len(sequence(mapping(acknowledged.state)['tool_ledger']))] == sequence(mapping(acknowledged.state)['tool_ledger'])
+    assert integer(present(mapping(repo.row.routing_decision))['runtime_token_absolute_tokens']) == 500
+    assert number(present(mapping(repo.row.routing_decision))['runtime_timeout_absolute_seconds']) == 20.0
     final = [event.artifact for event in repo.event_log if event.artifact is not None
-             and event.artifact.content.get('presentation') == 'final_answer']
-    assert len(final) == 1 and final[0].content['text'] == journey.report
+             and mapping(event.artifact.content).get('presentation') == 'final_answer']
+    assert len(final) == 1 and mapping(final[0].content)['text'] == journey.report
     with zipfile.ZipFile(io.BytesIO(journey.bundle_bytes)) as archive:
         assert archive.read('ACCEPTANCE.json') == b'repaired draft'
 
@@ -824,61 +878,61 @@ async def test_same_epoch_repeat_read_preserves_saved_window_but_cannot_regrant(
 
     journey, repo, runtime, service, _first, source = await _read_repair_fixture(
         repeat_reads=2, repeat_summary=summary_only)
-    assert repo.row.routing_decision.get('self_repair_episode_progress') is None
+    assert present(mapping(repo.row.routing_decision)).get('self_repair_episode_progress') is None
     runtime.second_fault = 'ack_repeat_read'
     stopped_run = await service.execute(repo.run_id)
     assert journey.read_count == 2 and len(journey.read_acks) == 2
     first, first_budget = journey.read_acks[0]
     second, second_budget = journey.read_acks[1]
-    assert first.state['tool_ledger'][-1]['name'] == second.state['tool_ledger'][-1]['name'] == 'workspace.read'
-    assert first_budget['deadline'] == second_budget['deadline']
-    assert first_budget['absolute_deadline'] == second_budget['absolute_deadline']
-    assert first_budget['progress_units'] == second_budget['progress_units']
-    assert 0 < second.state['remaining_timeout_seconds'] <= first.state['remaining_timeout_seconds']
-    assert 0 < second.state['remaining_absolute_timeout_seconds'] <= first.state['remaining_absolute_timeout_seconds']
-    elapsed = first.state['remaining_absolute_timeout_seconds'] - second.state['remaining_absolute_timeout_seconds']
-    assert abs(second.state['remaining_timeout_seconds'] - (first.state['remaining_timeout_seconds'] - elapsed)) <= 1e-6
-    assert first.state['project_repair_phase']['source_checkpoint_sha256'] == source.state_sha256
-    assert second.state['project_repair_phase']['source_checkpoint_sha256'] == source.state_sha256
-    refs = tuple(ArtifactReference(id=UUID(key), sha256=value)
-                 for key, value in second.state['artifact_registry'].items())
+    assert mapping(sequence(mapping(first.state)['tool_ledger'])[-1])['name'] == mapping(sequence(mapping(second.state)['tool_ledger'])[-1])['name'] == 'workspace.read'
+    assert number(mapping(first_budget)['deadline']) == number(mapping(second_budget)['deadline'])
+    assert number(mapping(first_budget)['absolute_deadline']) == number(mapping(second_budget)['absolute_deadline'])
+    assert integer(mapping(first_budget)['progress_units']) == integer(mapping(second_budget)['progress_units'])
+    assert 0 < number(mapping(second.state)['remaining_timeout_seconds']) <= number(mapping(first.state)['remaining_timeout_seconds'])
+    assert 0 < number(mapping(second.state)['remaining_absolute_timeout_seconds']) <= number(mapping(first.state)['remaining_absolute_timeout_seconds'])
+    elapsed = number(mapping(first.state)['remaining_absolute_timeout_seconds']) - number(mapping(second.state)['remaining_absolute_timeout_seconds'])
+    assert abs(number(mapping(second.state)['remaining_timeout_seconds']) - (number(mapping(first.state)['remaining_timeout_seconds']) - elapsed)) <= 1e-6
+    assert mapping(mapping(first.state)['project_repair_phase'])['source_checkpoint_sha256'] == source.state_sha256
+    assert mapping(mapping(second.state)['project_repair_phase'])['source_checkpoint_sha256'] == source.state_sha256
+    refs = tuple(ArtifactReference(id=UUID(string(key)), sha256=value)
+                 for key, value in registry(mapping(mapping(second.state)['artifact_registry'])).items())
     artifacts = await journey.artifacts.get_many(second.tenant_id, second.run_id, refs)
     private = {str(artifact.id): artifact for artifact in artifacts}
-    first_result = private[first.state['tool_ledger'][-1]['artifact_id']].content['result']
-    second_result = private[second.state['tool_ledger'][-1]['artifact_id']].content['result']
+    first_result = mapping(mapping(private[string(mapping(sequence(mapping(first.state)['tool_ledger'])[-1])['artifact_id'])].content)['result'])
+    second_result = mapping(mapping(private[string(mapping(sequence(mapping(second.state)['tool_ledger'])[-1])['artifact_id'])].content)['result'])
     assert {key: first_result[key] for key in ('path', 'text', 'truncated')} == {
         key: second_result[key] for key in ('path', 'text', 'truncated')}
     assert ('summary' in second_result) is summary_only
     allowed = {participant.id: participant.allowed_tools for participant in runtime.runner._plan.participants}
-    assert engineering_work_progress(journey.context, tool_entries=first.state['tool_ledger'],
+    assert engineering_work_progress(journey.context, tool_entries=ledger(sequence(mapping(first.state)['tool_ledger'])),
         artifacts=artifacts, allowed_tools=allowed) == engineering_work_progress(
-        journey.context, tool_entries=second.state['tool_ledger'], artifacts=artifacts, allowed_tools=allowed)
-    first_keys = diagnostic_progress(journey.context, phase=first.state['project_repair_phase'],
-        models=first.state['model_ledger'], tools=first.state['tool_ledger'], artifacts=artifacts)
-    second_keys = diagnostic_progress(journey.context, phase=second.state['project_repair_phase'],
-        models=second.state['model_ledger'], tools=second.state['tool_ledger'], artifacts=artifacts)
+        journey.context, tool_entries=ledger(sequence(mapping(second.state)['tool_ledger'])), artifacts=artifacts, allowed_tools=allowed)
+    first_keys = diagnostic_progress(journey.context, phase=json_map(mapping(mapping(first.state)['project_repair_phase'])),
+        models=ledger(sequence(mapping(first.state)['model_ledger'])), tools=ledger(sequence(mapping(first.state)['tool_ledger'])), artifacts=artifacts)
+    second_keys = diagnostic_progress(journey.context, phase=json_map(mapping(mapping(second.state)['project_repair_phase'])),
+        models=ledger(sequence(mapping(second.state)['model_ledger'])), tools=ledger(sequence(mapping(second.state)['tool_ledger'])), artifacts=artifacts)
     assert len(first_keys) == 1 and first_keys == second_keys
-    boundary = next(iter(first_keys.values()))
-    assert boundary == len(first.state['tool_ledger']) < len(second.state['tool_ledger'])
-    assert second.state['project_repair_phase']['source_tool_count'] == len(source.state['tool_ledger']) < boundary
+    boundary = next(iter(mapping(first_keys).values()))
+    assert boundary == len(sequence(mapping(first.state)['tool_ledger'])) < len(sequence(mapping(second.state)['tool_ledger']))
+    assert mapping(mapping(second.state)['project_repair_phase'])['source_tool_count'] == len(sequence(mapping(source.state)['tool_ledger'])) < boundary
     assert first.state[DIAGNOSTIC_WATERMARK] == second.state[DIAGNOSTIC_WATERMARK] == boundary
     assert completed_round(journey.context, second.state, artifacts)
     assert stopped_run.status is RunStatus.QUEUED, repo.continuation_errors
-    consumed = dict(repo.row.routing_decision['self_repair_episode_progress'])
+    consumed = dict(mapping(present(mapping(repo.row.routing_decision))['self_repair_episode_progress']))
     assert consumed == productive_boundary(journey.context, second, artifacts)
-    assert consumed['tool_count'] == len(second.state['tool_ledger'])
-    assert consumed['model_count'] == len(second.state['model_ledger'])
-    consumed_context = journey.context.model_copy(update={'routing_decision': dict(repo.row.routing_decision)})
+    assert integer(mapping(consumed)['tool_count']) == len(sequence(mapping(second.state)['tool_ledger']))
+    assert integer(mapping(consumed)['model_count']) == len(sequence(mapping(second.state)['model_ledger']))
+    consumed_context = journey.context.model_copy(update={'routing_decision': dict(present(mapping(repo.row.routing_decision)))})
     with pytest.raises(ValueError):
         productive_boundary(consumed_context, second, artifacts)
     assert len(repo.outbox) == 2 and repo.accept_count == 1
     queued_version = repo.row.version
-    queued_route = dict(repo.row.routing_decision)
+    queued_route = dict(present(mapping(repo.row.routing_decision)))
     with pytest.raises(RunConflict, match='not quiescent'):
         await repo.continue_project_repair_and_enqueue(tenant_id=repo.row.tenant_id,
             run_id=repo.run_id, version=queued_version, checkpoint_sha256=second.state_sha256)
     assert repo.row.version == queued_version and repo.row.status == RunStatus.QUEUED.value
-    assert repo.row.routing_decision == queued_route and repo.checkpoint.state_sha256 == second.state_sha256
+    assert present(repo.row.routing_decision) == queued_route and repo.checkpoint.state_sha256 == second.state_sha256
     assert len(repo.outbox) == 2 and repo.accept_count == 1
     assert journey.write_count == journey.verify_count == 1
     calls, requests = len(journey.calls), len(journey.requests)
@@ -891,27 +945,27 @@ async def test_same_epoch_repeat_read_preserves_saved_window_but_cannot_regrant(
     third, third_budget = journey.read_acks[-1]
     assert [call.tool_name for call in journey.calls[calls:]] == ['workspace.read']
     assert len(journey.requests) > requests
-    assert third.state['tool_ledger'][:len(second.state['tool_ledger'])] == second.state['tool_ledger']
-    assert third.state['model_ledger'][:len(second.state['model_ledger'])] == second.state['model_ledger']
-    assert third_budget['progress_units'] == second_budget['progress_units']
-    assert 0 < third.state['remaining_timeout_seconds'] <= second.state['remaining_timeout_seconds']
-    assert 0 < third.state['remaining_absolute_timeout_seconds'] <= second.state['remaining_absolute_timeout_seconds']
+    assert sequence(mapping(third.state)['tool_ledger'])[:len(sequence(mapping(second.state)['tool_ledger']))] == sequence(mapping(second.state)['tool_ledger'])
+    assert sequence(mapping(third.state)['model_ledger'])[:len(sequence(mapping(second.state)['model_ledger']))] == sequence(mapping(second.state)['model_ledger'])
+    assert integer(mapping(third_budget)['progress_units']) == integer(mapping(second_budget)['progress_units'])
+    assert 0 < number(mapping(third.state)['remaining_timeout_seconds']) <= number(mapping(second.state)['remaining_timeout_seconds'])
+    assert 0 < number(mapping(third.state)['remaining_absolute_timeout_seconds']) <= number(mapping(second.state)['remaining_absolute_timeout_seconds'])
     assert third.state[DIAGNOSTIC_WATERMARK] == boundary
-    refs = tuple(ArtifactReference(id=UUID(key), sha256=value)
-                 for key, value in third.state['artifact_registry'].items())
+    refs = tuple(ArtifactReference(id=UUID(string(key)), sha256=value)
+                 for key, value in registry(mapping(mapping(third.state)['artifact_registry'])).items())
     artifacts = await journey.artifacts.get_many(third.tenant_id, third.run_id, refs)
-    assert diagnostic_progress(journey.context, phase=third.state['project_repair_phase'],
-        models=third.state['model_ledger'], tools=third.state['tool_ledger'], artifacts=artifacts) == first_keys
+    assert diagnostic_progress(journey.context, phase=json_map(mapping(mapping(third.state)['project_repair_phase'])),
+        models=ledger(sequence(mapping(third.state)['model_ledger'])), tools=ledger(sequence(mapping(third.state)['tool_ledger'])), artifacts=artifacts) == first_keys
     assert completed_round(journey.context, third.state, artifacts)
     with pytest.raises(ValueError):
         productive_boundary(journey.context, third, artifacts)
-    assert repo.row.routing_decision['self_repair_episode_progress'] == consumed
+    assert mapping(present(mapping(repo.row.routing_decision))['self_repair_episode_progress']) == consumed
     assert len(repo.outbox) == 2 and repo.accept_count == 1
     assert journey.write_count == journey.verify_count == 1
-    assert third.state['usage']['tokens'] >= second.state['usage']['tokens']
-    assert Decimal(third.state['usage']['cost_usd']) >= Decimal(second.state['usage']['cost_usd'])
-    assert repo.row.routing_decision['runtime_token_absolute_tokens'] == 500
-    assert repo.row.routing_decision['runtime_timeout_absolute_seconds'] == 20.0
+    assert integer(mapping(mapping(third.state)['usage'])['tokens']) >= integer(mapping(mapping(second.state)['usage'])['tokens'])
+    assert Decimal(string(mapping(mapping(third.state)['usage'])['cost_usd'])) >= Decimal(string(mapping(mapping(second.state)['usage'])['cost_usd']))
+    assert integer(present(mapping(repo.row.routing_decision))['runtime_token_absolute_tokens']) == 500
+    assert number(present(mapping(repo.row.routing_decision))['runtime_timeout_absolute_seconds']) == 20.0
     calls, requests = len(journey.calls), len(journey.requests)
     assert (await service.execute(repo.run_id)).status is RunStatus.FAILED
     assert (len(journey.calls), len(journey.requests)) == (calls, requests)
@@ -929,47 +983,48 @@ async def test_diagnostic_read_checkpoint_ack_failure_leaves_no_budget_or_consum
     journey, repo, runtime, service, _first, source = await _read_repair_fixture(cross_read_soft=True)
     runtime.second_fault = None
     original_success, original_ack = _DiscussionDurability.succeed_tool, PendingCheckpoint.acknowledge
-    observation: dict[str, Any] = {}
-    rejected = []
+    observation: dict[str, object] = {}
+    rejected: list[RuntimeCheckpoint] = []
     failure = OSError('first diagnostic read checkpoint ACK failed')
 
-    def budget_state(durable):
-        return (asdict(journey.runner._wall_budget), journey.runner._wall_deadline,
+    def budget_state(durable: _DiscussionDurability) -> tuple[dict[str, object], float | None, str, str]:
+        return (asdict(present(journey.runner._wall_budget)), journey.runner._wall_deadline,
                 json.dumps(durable.repair_phase, default=dict, sort_keys=True),
-                json.dumps(journey.runner._discussion_control.to_state(), default=dict, sort_keys=True))
+                json.dumps(present(journey.runner._discussion_control).to_state(), default=dict, sort_keys=True))
 
-    async def record_success(durable, artifact):
-        if artifact.content.get('tool_name') != 'workspace.read':
+    async def record_success(durable: _DiscussionDurability, artifact: Artifact) -> None:
+        if mapping(artifact.content).get('tool_name') != 'workspace.read':
             return await original_success(durable, artifact)
         observation.update(durable=durable, artifact=artifact, before=budget_state(durable),
-            usage=dict(journey.runner._last_checkpoint.state['usage']),
-            previous_checkpoint=journey.runner._last_checkpoint,
+            usage=dict(mapping(mapping(present(journey.runner._last_checkpoint).state)['usage'])),
+            previous_checkpoint=present(journey.runner._last_checkpoint),
             calls=len(journey.calls), requests=len(journey.requests))
-        assert observation['before'][0]['deadline'] <= asyncio.get_running_loop().time()
+        assert number(mapping(sequence(mapping(observation)['before'])[0])['deadline']) <= asyncio.get_running_loop().time()
         try:
             await original_success(durable, artifact)
         except BaseException:
             observation.update(after=budget_state(durable), rolled_back=True,
-                rolled_back_checkpoint=journey.runner._last_checkpoint)
+                rolled_back_checkpoint=present(journey.runner._last_checkpoint))
             raise
 
-    def reject_read_ack(pending):
-        checkpoint = journey.runner._last_checkpoint
-        tools = () if checkpoint is None else checkpoint.state['tool_ledger']
-        if tools and tools[-1]['name'] == 'workspace.read' and tools[-1]['status'] == 'succeeded':
-            durable = observation['durable']
+    def reject_read_ack(pending: PendingCheckpoint) -> bool:
+        checkpoint = present(journey.runner._last_checkpoint)
+        tools = () if checkpoint is None else sequence(mapping(checkpoint.state)['tool_ledger'])
+        if tools and mapping(tools[-1])['name'] == 'workspace.read' and mapping(tools[-1])['status'] == 'succeeded':
+            durable = mapping(observation)['durable']
+            assert isinstance(durable, _DiscussionDurability)
             assert completed_round(journey.context, checkpoint.state, durable.artifacts)
-            assert checkpoint.state['usage'] == observation['usage']
-            previous_budget = observation['before'][0]
-            live_budget = asdict(journey.runner._wall_budget)
+            assert mapping(mapping(checkpoint.state)['usage']) == mapping(mapping(observation)['usage'])
+            previous_budget = sequence(mapping(observation)['before'])[0]
+            live_budget = asdict(present(journey.runner._wall_budget))
             now = asyncio.get_running_loop().time()
-            assert previous_budget['deadline'] <= now < live_budget['deadline']
-            assert live_budget['progress_units'] == previous_budget['progress_units'] + 1
-            assert live_budget['absolute_deadline'] == previous_budget['absolute_deadline']
+            assert number(mapping(previous_budget)['deadline']) <= now < number(mapping(live_budget)['deadline'])
+            assert integer(mapping(live_budget)['progress_units']) == integer(mapping(previous_budget)['progress_units']) + 1
+            assert number(mapping(live_budget)['absolute_deadline']) == number(mapping(previous_budget)['absolute_deadline'])
             assert checkpoint.state[DIAGNOSTIC_POLICY] == 1
-            assert checkpoint.state[DIAGNOSTIC_WATERMARK] == len(tools)
-            assert checkpoint.state[DIAGNOSTIC_WATERMARK] > observation['previous_checkpoint'].state[DIAGNOSTIC_WATERMARK]
-            assert checkpoint.state['remaining_timeout_seconds'] > 0
+            assert integer(checkpoint.state[DIAGNOSTIC_WATERMARK]) == len(tools)
+            assert integer(checkpoint.state[DIAGNOSTIC_WATERMARK]) > integer(present_checkpoint(mapping(observation)['previous_checkpoint']).state[DIAGNOSTIC_WATERMARK])
+            assert number(mapping(checkpoint.state)['remaining_timeout_seconds']) > 0
             rejected.append(checkpoint)
             pending.future.set_exception(failure)
             return False
@@ -978,18 +1033,19 @@ async def test_diagnostic_read_checkpoint_ack_failure_leaves_no_budget_or_consum
     with patch.object(_DiscussionDurability, 'succeed_tool', record_success), \
             patch.object(PendingCheckpoint, 'acknowledge', reject_read_ack):
         failed = await service.execute(repo.run_id)
-    assert len(rejected) == 1 and observation.get('rolled_back') is True
-    assert observation['after'] == observation['before']
-    assert observation['rolled_back_checkpoint'] is observation['previous_checkpoint']
-    assert observation['rolled_back_checkpoint'].state[DIAGNOSTIC_WATERMARK] < rejected[0].state[DIAGNOSTIC_WATERMARK]
-    durable = observation['durable']
-    assert durable.tool_entries[-1]['status'] == 'running'
-    assert str(observation['artifact'].id) not in {str(artifact.id) for artifact in durable.artifacts}
-    assert rejected[0].state['usage'] == observation['usage']
+    assert len(rejected) == 1 and mapping(observation).get('rolled_back') is True
+    assert mapping(observation)['after'] == mapping(observation)['before']
+    assert mapping(observation)['rolled_back_checkpoint'] is mapping(observation)['previous_checkpoint']
+    assert integer(present_checkpoint(mapping(observation)['rolled_back_checkpoint']).state[DIAGNOSTIC_WATERMARK]) < integer(rejected[0].state[DIAGNOSTIC_WATERMARK])
+    durable = mapping(observation)['durable']
+    assert isinstance(durable, _DiscussionDurability)
+    assert mapping(durable.tool_entries[-1])['status'] == 'running'
+    assert str(present_artifact(mapping(observation)['artifact']).id) not in {str(artifact.id) for artifact in durable.artifacts}
+    assert mapping(mapping(rejected[0].state)['usage']) == mapping(mapping(observation)['usage'])
     assert journey.read_acks == [] and journey.read_count == 1
-    assert (len(journey.calls), len(journey.requests)) == (observation['calls'], observation['requests'])
+    assert (len(journey.calls), len(journey.requests)) == (mapping(observation)['calls'], mapping(observation)['requests'])
     assert failed.status is RunStatus.FAILED and len(repo.outbox) == 1
-    assert source.state['usage']['tokens'] < observation['usage']['tokens'] < 500
+    assert integer(mapping(mapping(source.state)['usage'])['tokens']) < integer(mapping(mapping(observation)['usage'])['tokens']) < 500
     assert journey.write_count == journey.verify_count == 1
 
 
@@ -1001,27 +1057,30 @@ async def test_diagnostic_cold_restore_uses_saved_remaining_without_new_window(r
     await service.execute(repo.run_id)
     assert journey.read_count == 1 and len(journey.read_acks) == 1
     committed = repo.checkpoint
-    state = committed.to_payload()['state']
-    assert state['remaining_timeout_seconds'] > remaining
+    state = mutable(mapping(committed.to_payload())['state'])
+    assert number(mapping(state)['remaining_timeout_seconds']) > remaining
     # Consume saved soft time without changing private evidence or allowance state.
-    state['remaining_timeout_seconds'] = remaining
+    mutable(state)['remaining_timeout_seconds'] = remaining
     saved = RuntimeCheckpoint(id=uuid4(), runtime_type=committed.runtime_type,
         runtime_version=committed.runtime_version, run_id=committed.run_id, tenant_id=committed.tenant_id,
-        mode=committed.mode, state=state)
+        mode=committed.mode, state=json_map(state))
     before = saved.to_payload()
     calls, requests = len(journey.calls), len(journey.requests)
     cold = journey.runtime()
     await cold.restore_checkpoint(saved)
-    async with aclosing(cold.run(journey.context.model_copy(update={'checkpoint': saved}))) as stream:
+    async with aclosing(closable(cold.run(journey.context.model_copy(update={'checkpoint': saved})))) as stream:
         first = await anext(stream)
         assert first.kind is EventKind.DISCUSSION_STARTED, first.reason
         now = asyncio.get_running_loop().time()
-        assert cold._wall_budget.remaining(now=now) <= remaining
-        assert cold._wall_budget.absolute_remaining(now=now) <= saved.state['remaining_absolute_timeout_seconds']
+        # Compare deadlines directly: subtracting large monotonic floats can
+        # round 0.05 upward. The deadline bound, including exact zero, stays strict.
+        budget = present(cold._wall_budget)
+        assert budget.deadline <= now + remaining
+        assert budget.absolute_deadline <= now + number(mapping(saved.state)['remaining_absolute_timeout_seconds'])
         if remaining == 0.0:
             events = [event async for event in stream]
             assert events[-1].kind is EventKind.RUNTIME_FAILED, events[-1].reason
-            assert all(event.checkpoint.state['remaining_timeout_seconds'] == 0.0
+            assert all(number(mapping(event.checkpoint.state)['remaining_timeout_seconds']) == 0.0
                        for event in events if event.checkpoint is not None)
     assert (len(journey.calls), len(journey.requests)) == (calls, requests)
     assert saved.to_payload() == before
@@ -1038,40 +1097,40 @@ async def test_acknowledged_delivery_before_compact_continues_without_old_replay
     journey = ProjectJourney()
     repo = ContinuationRepository(journey)
     runtime = BoundaryFailure(journey)
-    service = RunService(repo, runtime_registry=RuntimeRegistry((runtime,)), router=None, task_queue=object())
+    service = RunService(repo, runtime_registry=RuntimeRegistry((runtime,)), router=None, task_queue=UnexpectedTaskQueue())
     assert (await service.execute(repo.run_id)).status is RunStatus.QUEUED
     runtime.second_fault = 'after_write'
     assert (await service.execute(repo.run_id)).status is RunStatus.QUEUED
-    consumed = dict(repo.row.routing_decision['self_repair_episode_progress'])
+    consumed = dict(mapping(present(mapping(repo.row.routing_decision))['self_repair_episode_progress']))
     source = repo.checkpoint
     runtime.second_fault = fault
     continued = await service.execute(repo.run_id)
     stopped = repo.checkpoint
     before = stopped.to_payload()
-    tools, models = stopped.state['tool_ledger'], stopped.state['model_ledger']
+    tools, models = sequence(mapping(stopped.state)['tool_ledger']), sequence(mapping(stopped.state)['model_ledger'])
     assert hasattr(runtime, 'ack_checkpoint'), (
         continued.status, repo.continuation_errors,
         [(event.kind, event.reason) for event in repo.event_log[-8:]],
         [call.tool_name for call in journey.calls])
     ack = runtime.ack_checkpoint
-    assert tools == ack.state['tool_ledger'] and models == ack.state['model_ledger']
-    assert tools[-1]['name'] == ('project.verify' if fault == 'ack_verify' else 'workspace.bundle')
-    assert tools[-1]['status'] == 'succeeded'
-    assert tools[-1]['artifact_id'] == str(runtime.ack_artifact.id)
-    assert tools[-1]['artifact_sha256'] == runtime.ack_artifact.content_sha256
-    assert ack.state['artifact_registry'][str(runtime.ack_artifact.id)] == runtime.ack_artifact.content_sha256
-    assert stopped.state['usage'] == ack.state['usage']
-    assert all(row['status'] == 'succeeded' for row in models)
-    assert all(row['status'] in {'succeeded', 'failed'} for row in tools)
-    assert stopped.state['engineering_tool_prefix'] < len(tools)
-    assert stopped.state['project_repair_phase']['model_floor'] < len(models)
-    assert tools[:len(source.state['tool_ledger'])] == source.state['tool_ledger']
-    assert models[:len(source.state['model_ledger'])] == source.state['model_ledger']
-    assert consumed['tool_count'] == len(source.state['tool_ledger'])
-    assert stopped.state['usage']['tokens'] >= source.state['usage']['tokens'] > 0
-    assert Decimal(stopped.state['usage']['cost_usd']) >= Decimal(source.state['usage']['cost_usd']) > 0
-    assert stopped.state['remaining_absolute_timeout_seconds'] <= source.state['remaining_absolute_timeout_seconds']
-    assert stopped.state['remaining_timeout_seconds'] <= source.state['remaining_timeout_seconds']
+    assert tools == sequence(mapping(ack.state)['tool_ledger']) and models == sequence(mapping(ack.state)['model_ledger'])
+    assert mapping(tools[-1])['name'] == ('project.verify' if fault == 'ack_verify' else 'workspace.bundle')
+    assert mapping(tools[-1])['status'] == 'succeeded'
+    assert string(mapping(tools[-1])['artifact_id']) == str(runtime.ack_artifact.id)
+    assert mapping(tools[-1])['artifact_sha256'] == runtime.ack_artifact.content_sha256
+    assert registry(mapping(ack.state)['artifact_registry'])[str(runtime.ack_artifact.id)] == runtime.ack_artifact.content_sha256
+    assert mapping(mapping(stopped.state)['usage']) == mapping(mapping(ack.state)['usage'])
+    assert all(mapping(row)['status'] == 'succeeded' for row in models)
+    assert all(mapping(row)['status'] in {'succeeded', 'failed'} for row in tools)
+    assert integer(mapping(stopped.state)['engineering_tool_prefix']) < len(tools)
+    assert integer(mapping(mapping(stopped.state)['project_repair_phase'])['model_floor']) < len(models)
+    assert tools[:len(sequence(mapping(source.state)['tool_ledger']))] == sequence(mapping(source.state)['tool_ledger'])
+    assert models[:len(sequence(mapping(source.state)['model_ledger']))] == sequence(mapping(source.state)['model_ledger'])
+    assert integer(mapping(consumed)['tool_count']) == len(sequence(mapping(source.state)['tool_ledger']))
+    assert integer(mapping(mapping(stopped.state)['usage'])['tokens']) >= integer(mapping(mapping(source.state)['usage'])['tokens']) > 0
+    assert Decimal(string(mapping(mapping(stopped.state)['usage'])['cost_usd'])) >= Decimal(string(mapping(mapping(source.state)['usage'])['cost_usd'])) > 0
+    assert number(mapping(stopped.state)['remaining_absolute_timeout_seconds']) <= number(mapping(source.state)['remaining_absolute_timeout_seconds'])
+    assert number(mapping(stopped.state)['remaining_timeout_seconds']) <= number(mapping(source.state)['remaining_timeout_seconds'])
     assert runtime.ack_counts == (len(journey.calls), len(journey.requests))
     assert journey.write_count == 2 and journey.verify_count == 2
     assert continued.status is RunStatus.QUEUED, (
@@ -1089,21 +1148,21 @@ async def test_acknowledged_delivery_before_compact_continues_without_old_replay
                                  and 'Main Agent final delivery' in str(message.content)
                                  for message in request.messages) else request.logical_model)
             for request in journey.requests[requests:]] == pending_models
-    assert repo.checkpoint.state['tool_ledger'][:len(tools)] == tools
-    assert repo.checkpoint.state['model_ledger'][:len(models)] == models
+    assert sequence(mapping(repo.checkpoint.state)['tool_ledger'])[:len(tools)] == tools
+    assert sequence(mapping(repo.checkpoint.state)['model_ledger'])[:len(models)] == models
     assert stopped.to_payload() == before
     assert journey.write_count == 2 and journey.verify_count == 2
     assert sum(call.tool_name == 'workspace.bundle' for call in journey.calls) == 1
     final = [event.artifact for event in repo.event_log if event.artifact is not None
-             and event.artifact.content.get('presentation') == 'final_answer']
-    assert len(final) == 1 and final[0].content['text'] == journey.report
-    assert repo.checkpoint.state['usage']['tokens'] >= stopped.state['usage']['tokens']
-    assert Decimal(repo.checkpoint.state['usage']['cost_usd']) >= Decimal(stopped.state['usage']['cost_usd'])
-    assert repo.checkpoint.state['remaining_absolute_timeout_seconds'] <= stopped.state['remaining_absolute_timeout_seconds']
-    assert repo.checkpoint.state['remaining_timeout_seconds'] <= stopped.state['remaining_timeout_seconds']
-    assert repo.row.routing_decision['runtime_token_absolute_tokens'] == 500
-    assert repo.row.routing_decision['runtime_timeout_absolute_seconds'] == 20.0
-    assert repo.row.routing_decision['self_repair_attempt'] == 1
+             and mapping(event.artifact.content).get('presentation') == 'final_answer']
+    assert len(final) == 1 and mapping(final[0].content)['text'] == journey.report
+    assert integer(mapping(mapping(repo.checkpoint.state)['usage'])['tokens']) >= integer(mapping(mapping(stopped.state)['usage'])['tokens'])
+    assert Decimal(string(mapping(mapping(repo.checkpoint.state)['usage'])['cost_usd'])) >= Decimal(string(mapping(mapping(stopped.state)['usage'])['cost_usd']))
+    assert number(mapping(repo.checkpoint.state)['remaining_absolute_timeout_seconds']) <= number(mapping(stopped.state)['remaining_absolute_timeout_seconds'])
+    assert number(mapping(repo.checkpoint.state)['remaining_timeout_seconds']) <= number(mapping(stopped.state)['remaining_timeout_seconds'])
+    assert integer(present(mapping(repo.row.routing_decision))['runtime_token_absolute_tokens']) == 500
+    assert number(present(mapping(repo.row.routing_decision))['runtime_timeout_absolute_seconds']) == 20.0
+    assert integer(present(mapping(repo.row.routing_decision))['self_repair_attempt']) == 1
     with zipfile.ZipFile(io.BytesIO(journey.bundle_bytes)) as archive:
         assert archive.read('ACCEPTANCE.json') == b'repaired draft'
     calls, requests = len(journey.calls), len(journey.requests)
@@ -1120,7 +1179,7 @@ async def test_completed_round_checkpoint_ack_failure_rolls_back_without_provide
     journey = ProjectJourney()
     repo = ContinuationRepository(journey)
     runtime = BoundaryFailure(journey)
-    service = RunService(repo, runtime_registry=RuntimeRegistry((runtime,)), router=None, task_queue=object())
+    service = RunService(repo, runtime_registry=RuntimeRegistry((runtime,)), router=None, task_queue=UnexpectedTaskQueue())
     assert (await service.execute(repo.run_id)).status is RunStatus.QUEUED
     runtime.second_fault = 'after_write'
     assert (await service.execute(repo.run_id)).status is RunStatus.QUEUED
@@ -1129,38 +1188,40 @@ async def test_completed_round_checkpoint_ack_failure_rolls_back_without_provide
     stopped = runtime.ack_checkpoint
     before = stopped.to_payload()
     state = stopped.state
-    references = tuple(ArtifactReference(id=UUID(key), sha256=value)
-                       for key, value in state['artifact_registry'].items())
+    references = tuple(ArtifactReference(id=UUID(string(key)), sha256=value)
+                       for key, value in registry(mapping(mapping(state)['artifact_registry'])).items())
     artifacts = await journey.artifacts.get_many(stopped.tenant_id, stopped.run_id, references)
     calls, requests = len(journey.calls), len(journey.requests)
-    published = []
+    published: list[tuple[int, int]] = []
     failure = OSError('drain checkpoint ACK failed')
 
-    async def publish(saved_artifacts, model_entries, tool_entries):
+    async def publish(saved_artifacts: tuple[Artifact, ...],
+                      model_entries: tuple[dict[str, JsonValue], ...],
+                      tool_entries: tuple[dict[str, JsonValue], ...]) -> None:
         assert durability._model_cursor == len(model_entries)
         assert durability._tool_cursor == len(tool_entries)
         assert durability.engineering_tool_prefix == len(tool_entries)
-        assert durability.repair_phase['model_floor'] == len(model_entries)
-        assert tuple(model_entries) == state['model_ledger']
-        assert tuple(tool_entries) == state['tool_ledger']
+        assert integer(mapping(durability.repair_phase)['model_floor']) == len(model_entries)
+        assert tuple(model_entries) == sequence(mapping(state)['model_ledger'])
+        assert tuple(tool_entries) == sequence(mapping(state)['tool_ledger'])
         assert saved_artifacts == artifacts
         published.append((durability._model_cursor, durability._tool_cursor))
         raise failure
 
-    async def unexpected_artifact_write(*args):
+    async def unexpected_artifact_write(*args: object) -> Never:
         pytest.fail('draining a completed round must not write or abort artifacts')
 
-    def unexpected_finalize(*args):
+    def unexpected_finalize(*args: object) -> Never:
         pytest.fail('draining a completed round must not finalize artifacts')
 
     durability = _DiscussionDurability(publish, unexpected_artifact_write,
         unexpected_artifact_write, unexpected_finalize, run_id=stopped.run_id, tenant_id=stopped.tenant_id,
-        model_entries=state['model_ledger'], tool_entries=state['tool_ledger'], artifacts=artifacts,
-        engineering_tool_prefix=state['engineering_tool_prefix'], repair_phase=state['project_repair_phase'])
+        model_entries=ledger(mapping(state)['model_ledger']), tool_entries=ledger(mapping(state)['tool_ledger']), artifacts=artifacts,
+        engineering_tool_prefix=integer(mapping(state)['engineering_tool_prefix']), repair_phase=mapping(json_map(mapping(state)['project_repair_phase'])))
     previous_cursors = (durability._model_cursor, durability._tool_cursor, durability.engineering_tool_prefix)
-    previous_phase = dict(state['project_repair_phase'])
-    previous_models = [dict(entry) for entry in state['model_ledger']]
-    previous_tools = [dict(entry) for entry in state['tool_ledger']]
+    previous_phase = dict(mapping(mapping(state)['project_repair_phase']))
+    previous_models = [dict(mapping(entry)) for entry in sequence(mapping(state)['model_ledger'])]
+    previous_tools = [dict(mapping(entry)) for entry in sequence(mapping(state)['tool_ledger'])]
     assert previous_cursors[0] < len(previous_models) and previous_cursors[1] < len(previous_tools)
     with pytest.raises(OSError, match='drain checkpoint ACK failed') as raised:
         await durability.drain_completed_round(journey.context, state)
@@ -1172,9 +1233,9 @@ async def test_completed_round_checkpoint_ack_failure_rolls_back_without_provide
     assert durability.model_entries == previous_models and durability.tool_entries == previous_tools
     assert durability.artifacts == artifacts
     assert stopped.to_payload() == before
-    assert state['usage'] == before['state']['usage']
-    assert state['remaining_timeout_seconds'] == before['state']['remaining_timeout_seconds']
-    assert state['remaining_absolute_timeout_seconds'] == before['state']['remaining_absolute_timeout_seconds']
+    assert mapping(mapping(state)['usage']) == mapping(mutable(mapping(mapping(before)['state']))['usage'])
+    assert number(mapping(state)['remaining_timeout_seconds']) == number(mutable(mapping(mapping(before)['state']))['remaining_timeout_seconds'])
+    assert number(mapping(state)['remaining_absolute_timeout_seconds']) == number(mutable(mapping(mapping(before)['state']))['remaining_absolute_timeout_seconds'])
     assert (len(journey.calls), len(journey.requests)) == (calls, requests)
 
 
@@ -1185,60 +1246,60 @@ async def test_pending_round_legacy_fallback_does_not_accept_corrupt_private_int
     journey = ProjectJourney()
     repo = ContinuationRepository(journey)
     runtime = BoundaryFailure(journey)
-    service = RunService(repo, runtime_registry=RuntimeRegistry((runtime,)), router=None, task_queue=object())
+    service = RunService(repo, runtime_registry=RuntimeRegistry((runtime,)), router=None, task_queue=UnexpectedTaskQueue())
     assert (await service.execute(repo.run_id)).status is RunStatus.QUEUED
     runtime.second_fault = 'after_write'
     assert (await service.execute(repo.run_id)).status is RunStatus.QUEUED
     runtime.second_fault = 'ack_verify'
     assert (await service.execute(repo.run_id)).status is RunStatus.QUEUED, repo.continuation_errors
     stopped = runtime.ack_checkpoint
-    state = stopped.to_payload()['state']
-    refs = tuple(ArtifactReference(id=UUID(key), sha256=value)
-                 for key, value in state['artifact_registry'].items())
+    state = mutable(mapping(stopped.to_payload())['state'])
+    refs = tuple(ArtifactReference(id=UUID(string(key)), sha256=value)
+                 for key, value in registry(mapping(mapping(state)['artifact_registry'])).items())
     artifacts = list(await journey.artifacts.get_many(stopped.tenant_id, stopped.run_id, refs))
     if defect.startswith('legacy_selector_'):
-        selection = state['model_ledger'][state['project_repair_phase']['model_floor']]
-        index = next(index for index, artifact in enumerate(artifacts) if str(artifact.id) == selection['artifact_id'])
+        selection = sequence(mapping(state)['model_ledger'])[integer(mapping(mapping(state)['project_repair_phase'])['model_floor'])]
+        index = next(index for index, artifact in enumerate(artifacts) if str(artifact.id) == string(mapping(selection)['artifact_id']))
         original_selection = artifacts[index]
-        content = original_selection.model_dump(mode='json')['content']
-        assert content['project_repair_round']['actor'] == '__selector__' and content['tool_calls'] == []
-        del content['project_repair_round']
+        content = mapping(original_selection.model_dump(mode='json'))['content']
+        assert mapping(mapping(content)['project_repair_round'])['actor'] == '__selector__' and sequence(mapping(content)['tool_calls']) == []
+        del mutable(content)['project_repair_round']
         legacy = Artifact(id=original_selection.id, type=original_selection.type,
-            producer=original_selection.producer, content=content)
+            producer=original_selection.producer, content=json_map(content))
         artifacts[index] = legacy
-        selection['artifact_sha256'] = legacy.content_sha256
-        state['artifact_registry'][str(legacy.id)] = legacy.content_sha256
-    row = state['model_ledger'][-1]
-    position = next(index for index, artifact in enumerate(artifacts) if str(artifact.id) == row['artifact_id'])
+        mutable(selection)['artifact_sha256'] = legacy.content_sha256
+        mutable(mapping(state)['artifact_registry'])[str(legacy.id)] = legacy.content_sha256
+    row = sequence(mapping(state)['model_ledger'])[-1]
+    position = next(index for index, artifact in enumerate(artifacts) if str(artifact.id) == string(mapping(row)['artifact_id']))
     original = artifacts[position]
-    assert original.type == 'model_result' and row['status'] == 'succeeded'
+    assert original.type == 'model_result' and mapping(row)['status'] == 'succeeded'
     assert 'project_repair_round' in original.content
     if defect in {'missing_artifact', 'legacy_selector_missing_writer'}:
         artifacts.pop(position)
     else:
-        content = original.model_dump(mode='json')['content']
+        content = mapping(original.model_dump(mode='json'))['content']
         if defect == 'missing_intent':
-            del content['project_repair_round']
+            del mutable(content)['project_repair_round']
         else:
-            content['project_repair_round'] = {'version': 1}
-        changed = Artifact(id=original.id, type=original.type, producer=original.producer, content=content)
+            mutable(content)['project_repair_round'] = {'version': 1}
+        changed = Artifact(id=original.id, type=original.type, producer=original.producer, content=json_map(content))
         artifacts[position] = changed
-        row['artifact_sha256'] = changed.content_sha256
-        state['artifact_registry'][str(changed.id)] = changed.content_sha256
+        mutable(row)['artifact_sha256'] = changed.content_sha256
+        mutable(mapping(state)['artifact_registry'])[str(changed.id)] = changed.content_sha256
     checkpoint = RuntimeCheckpoint(id=uuid4(), runtime_type=stopped.runtime_type,
         runtime_version=stopped.runtime_version, run_id=stopped.run_id, tenant_id=stopped.tenant_id,
-        mode=stopped.mode, state=state)
+        mode=stopped.mode, state=json_map(state))
 
-    async def unexpected(*args):
+    async def unexpected(*args: object) -> Never:
         pytest.fail('a fallback or rejected round must not publish or write artifacts')
 
     durable = _DiscussionDurability(unexpected, unexpected, unexpected, lambda _: pytest.fail('no finalize'),
-        run_id=stopped.run_id, tenant_id=stopped.tenant_id, model_entries=checkpoint.state['model_ledger'],
-        tool_entries=checkpoint.state['tool_ledger'], artifacts=tuple(artifacts),
-        engineering_tool_prefix=checkpoint.state['engineering_tool_prefix'],
-        repair_phase=checkpoint.state['project_repair_phase'])
+        run_id=stopped.run_id, tenant_id=stopped.tenant_id, model_entries=ledger(mapping(checkpoint.state)['model_ledger']),
+        tool_entries=ledger(mapping(checkpoint.state)['tool_ledger']), artifacts=tuple(artifacts),
+        engineering_tool_prefix=integer(mapping(checkpoint.state)['engineering_tool_prefix']),
+        repair_phase=mapping(json_map(mapping(checkpoint.state)['project_repair_phase'])))
     before = (durable._model_cursor, durable._tool_cursor, durable.engineering_tool_prefix,
-              dict(durable.repair_phase), list(durable.model_entries), list(durable.tool_entries))
+              dict(mapping(durable.repair_phase)), list(durable.model_entries), list(durable.tool_entries))
     calls, requests = len(journey.calls), len(journey.requests)
     if defect == 'missing_intent':
         await durable.drain_completed_round(journey.context, checkpoint.state)
@@ -1257,7 +1318,8 @@ class ApprovalProjectJourney(ProjectJourney):
         super().__init__()
         self.approved = False
 
-    async def invoke(self, tenant_id, request, *, user_id=None, role=None):
+    async def invoke(self, tenant_id: UUID, request: HarnessToolCallRequest, *,
+                     user_id: UUID | None = None, role: Role | None = None) -> HarnessToolCallResult:
         if request.tool_name == 'project.verify' and self.write_count == 2 and not self.approved:
             self.calls.append(request)
             return HarnessToolCallResult(call_id=request.call_id, tool_name=request.tool_name,
@@ -1266,45 +1328,49 @@ class ApprovalProjectJourney(ProjectJourney):
         return await super().invoke(tenant_id, request, user_id=user_id, role=role)
 
 
-async def _active_approval_fixture(journey=None, *, validate_pending: bool = True):
+async def _active_approval_fixture(journey: ApprovalProjectJourney | None = None, *,
+        validate_pending: bool = True) -> tuple[ApprovalProjectJourney, _DiscussionDurability,
+                                              RuntimeCheckpoint, list[RuntimeCheckpoint]]:
     journey = ApprovalProjectJourney() if journey is None else journey
     repo = ContinuationRepository(journey)
     runtime = BoundaryFailure(journey)
-    service = RunService(repo, runtime_registry=RuntimeRegistry((runtime,)), router=None, task_queue=object())
+    service = RunService(repo, runtime_registry=RuntimeRegistry((runtime,)), router=None, task_queue=UnexpectedTaskQueue())
     assert (await service.execute(repo.run_id)).status is RunStatus.QUEUED
     runtime.second_fault = 'after_write'
     assert (await service.execute(repo.run_id)).status is RunStatus.QUEUED
     source = repo.checkpoint
     journey.context = journey.context.model_copy(update={
-        'checkpoint': source, 'routing_decision': dict(repo.row.routing_decision)})
+        'checkpoint': source, 'routing_decision': dict(present(mapping(repo.row.routing_decision)))})
     runner = journey.runtime()
     await runner.restore_checkpoint(source)
     events = [event async for event in runner.run(journey.context)]
-    saved = await runner.save_checkpoint()
+    saved = present(await runner.save_checkpoint())
     assert checkpoint_waits_for_approval(saved, journey.approval_id), [
         (event.kind, event.reason) for event in events[-5:]]
-    assert saved.state['project_repair_phase']['model_floor'] < len(saved.state['model_ledger'])
-    refs = tuple(ArtifactReference(id=UUID(key), sha256=value)
-                 for key, value in saved.state['artifact_registry'].items())
+    assert integer(mapping(mapping(saved.state)['project_repair_phase'])['model_floor']) < len(sequence(mapping(saved.state)['model_ledger']))
+    refs = tuple(ArtifactReference(id=UUID(string(key)), sha256=value)
+                 for key, value in registry(mapping(mapping(saved.state)['artifact_registry'])).items())
     artifacts = await journey.artifacts.get_many(saved.tenant_id, saved.run_id, refs)
-    snapshots = []
-    writes = {}
+    snapshots: list[RuntimeCheckpoint] = []
+    writes: dict[UUID, ArtifactReference] = {}
 
-    async def publish(saved_artifacts, models, tools):
-        state = saved.to_payload()['state']
+    async def publish(saved_artifacts: tuple[Artifact, ...],
+                      models: tuple[dict[str, JsonValue], ...],
+                      tools: tuple[dict[str, JsonValue], ...]) -> None:
+        state = mutable(mapping(saved.to_payload())['state'])
         state.update(model_ledger=models, tool_ledger=tools,
             engineering_tool_prefix=durable.engineering_tool_prefix,
-            project_repair_phase=dict(durable.repair_phase),
+            project_repair_phase=dict(mapping(durable.repair_phase)),
             artifact_registry={str(artifact.id): artifact.content_sha256 for artifact in saved_artifacts})
         if durable.approval_batch is None:
             state.pop('approval_batch', None)
         else:
-            state['approval_batch'] = dict(durable.approval_batch)
+            mutable(state)['approval_batch'] = dict(mapping(durable.approval_batch))
         snapshots.append(RuntimeCheckpoint(id=uuid4(), runtime_type=saved.runtime_type,
             runtime_version=saved.runtime_version, run_id=saved.run_id, tenant_id=saved.tenant_id,
-            mode=saved.mode, state=state))
+            mode=saved.mode, state=json_map(state)))
 
-    async def store(artifact):
+    async def store(artifact: Artifact) -> UUID:
         write_id = uuid4()
         reference = ArtifactReference(id=artifact.id, sha256=artifact.content_sha256)
         writes[write_id] = reference
@@ -1312,15 +1378,15 @@ async def _active_approval_fixture(journey=None, *, validate_pending: bool = Tru
         await journey.artifacts.put(saved.tenant_id, saved.run_id, artifact, write_id=write_id)
         return write_id
 
-    async def abort(write_id):
+    async def abort(write_id: UUID) -> bool:
         return await journey.artifacts.abort_write(saved.tenant_id, saved.run_id,
             writes[write_id], write_id=write_id)
 
     durable = _DiscussionDurability(publish, store, abort, lambda _: None,
-        run_id=saved.run_id, tenant_id=saved.tenant_id, model_entries=saved.state['model_ledger'],
-        tool_entries=saved.state['tool_ledger'], artifacts=artifacts,
-        engineering_tool_prefix=saved.state['engineering_tool_prefix'],
-        repair_phase=saved.state['project_repair_phase'], approval_batch=saved.state['approval_batch'])
+        run_id=saved.run_id, tenant_id=saved.tenant_id, model_entries=ledger(mapping(saved.state)['model_ledger']),
+        tool_entries=ledger(mapping(saved.state)['tool_ledger']), artifacts=artifacts,
+        engineering_tool_prefix=integer(mapping(saved.state)['engineering_tool_prefix']),
+        repair_phase=mapping(json_map(mapping(saved.state)['project_repair_phase'])), approval_batch=json_map(mapping(saved.state)['approval_batch']))
     if validate_pending:
         pending = _pending_approval_call(durable, {'implementer': 'writer', 'reviewer': 'reviewer'})
         assert pending is not None and pending[0] == 'implementer' and pending[2] == 0
@@ -1331,7 +1397,7 @@ async def _active_approval_fixture(journey=None, *, validate_pending: bool = Tru
 async def test_pending_approval_drain_is_noop_and_retains_original_resume_path() -> None:
     journey, durable, saved, snapshots = await _active_approval_fixture()
     before = (durable._model_cursor, durable._tool_cursor, durable.engineering_tool_prefix,
-              dict(durable.repair_phase), dict(durable.approval_batch))
+              dict(mapping(durable.repair_phase)), dict(mapping(durable.approval_batch)))
     calls, requests = len(journey.calls), len(journey.requests)
     pending = _pending_approval_call(durable, {'implementer': 'writer', 'reviewer': 'reviewer'})
     await durable.drain_completed_round(journey.context, saved.state)
@@ -1342,28 +1408,30 @@ async def test_pending_approval_drain_is_noop_and_retains_original_resume_path()
     assert (len(journey.calls), len(journey.requests)) == (calls, requests)
 
 
-async def _complete_approved_fixture():
+async def _complete_approved_fixture() -> tuple[ApprovalProjectJourney, _DiscussionDurability,
+                                              RuntimeCheckpoint, list[RuntimeCheckpoint]]:
     journey, durable, saved, snapshots = await _active_approval_fixture()
-    actor, calls, cursor = _pending_approval_call(durable, {'implementer': 'writer', 'reviewer': 'reviewer'})
+    actor, calls, cursor = present(_pending_approval_call(durable, {'implementer': 'writer', 'reviewer': 'reviewer'}))
     assert actor == 'implementer' and cursor == 0 and len(calls) == 1
     journey.approved = True
     await approval_tool(durable, journey, [], name='project.verify').run_json(
-        {}, CancellationToken(), call_id=calls[0]['id'])
-    assert durable.tool_entries[-1]['status'] == 'succeeded'
-    assert durable.approval_batch['next_index'] == len(calls)
+        {}, CancellationToken(), call_id=string(mapping(calls[0])['id']))
+    assert mapping(durable.tool_entries[-1])['status'] == 'succeeded'
+    assert integer(mapping(durable.approval_batch)['next_index']) == len(calls)
     assert journey.verify_count == 2 and journey.write_count == 2
-    assert durable._model_cursor == saved.state['project_repair_phase']['model_floor']
+    assert durable._model_cursor == integer(mapping(mapping(saved.state)['project_repair_phase'])['model_floor'])
     return journey, durable, saved, snapshots
 
 
-def _replace_approval_model_content(durable, row, content):
-    original = durable._artifacts[row['artifact_id']]
-    assert original.type == 'model_result' and row['status'] == 'succeeded'
-    changed = Artifact(id=original.id, type=original.type, producer=original.producer, content=content)
+def _replace_approval_model_content(durable: _DiscussionDurability, row: dict[str, JsonValue],
+                                    content: Mapping[str, JsonValue]) -> None:
+    original = durable._artifacts[string(mapping(row)['artifact_id'])]
+    assert original.type == 'model_result' and mapping(row)['status'] == 'succeeded'
+    changed = Artifact(id=original.id, type=original.type, producer=original.producer, content=json_map(content))
     durable._artifacts[str(changed.id)] = changed
-    row['artifact_sha256'] = changed.content_sha256
-    if durable.approval_batch['model_artifact_id'] == str(changed.id):
-        durable.approval_batch['model_artifact_sha256'] = changed.content_sha256
+    mutable(row)['artifact_sha256'] = changed.content_sha256
+    if mapping(durable.approval_batch)['model_artifact_id'] == str(changed.id):
+        mutable(durable.approval_batch)['model_artifact_sha256'] = changed.content_sha256
 
 
 class RetriedSelectorApprovalJourney(ApprovalProjectJourney):
@@ -1385,40 +1453,40 @@ class RetriedSelectorApprovalJourney(ApprovalProjectJourney):
 async def test_real_selector_retry_approval_preserves_legacy_and_strict_intent(variant: str) -> None:
     journey, durable, saved, snapshots = await _active_approval_fixture(
         RetriedSelectorApprovalJourney(), validate_pending=False)
-    floor = durable.repair_phase['model_floor']
+    floor = integer(mapping(durable.repair_phase)['model_floor'])
     rows = durable.model_entries[floor:]
-    assert len(rows) == 3 and all(row['status'] == 'succeeded' for row in rows)
-    models = [durable._artifacts[row['artifact_id']] for row in rows]
-    assert [model.content.get('text') for model in models[:2]] == ['no_candidate', 'implementer']
-    assert [model.content['project_repair_round']['actor'] for model in models] == [
+    assert len(rows) == 3 and all(mapping(row)['status'] == 'succeeded' for row in rows)
+    models = [durable._artifacts[string(mapping(row)['artifact_id'])] for row in rows]
+    assert [mapping(model.content).get('text') for model in models[:2]] == ['no_candidate', 'implementer']
+    assert [mapping(mapping(model.content)['project_repair_round'])['actor'] for model in models] == [
         '__selector__', '__selector__', 'implementer']
-    assert models[0].content['tool_calls'] == models[1].content['tool_calls'] == ()
-    assert models[-1].content['tool_calls'][0]['name'] == 'project_verify'
+    assert sequence(mapping(models[0].content)['tool_calls']) == sequence(mapping(models[1].content)['tool_calls']) == ()
+    assert mapping(sequence(mapping(models[-1].content)['tool_calls'])[0])['name'] == 'project_verify'
     participants = {'implementer': 'writer', 'reviewer': 'reviewer'}
     if variant == 'legacy':
         for row, model in zip(rows, models, strict=True):
-            content = model.model_dump(mode='json')['content']
-            del content['project_repair_round']
-            legacy = Artifact(id=uuid4(), type=model.type, producer=model.producer, content=content)
+            content = mapping(model.model_dump(mode='json'))['content']
+            del mutable(content)['project_repair_round']
+            legacy = Artifact(id=uuid4(), type=model.type, producer=model.producer, content=json_map(content))
             write_id = await durable._store(legacy)
             durable._finalize(write_id)
             del durable._artifacts[str(model.id)]
             durable._artifacts[str(legacy.id)] = legacy
             row.update(artifact_id=str(legacy.id), artifact_sha256=legacy.content_sha256)
-            if durable.approval_batch['model_artifact_id'] == str(model.id):
-                durable.approval_batch.update(model_artifact_id=str(legacy.id),
+            if mapping(durable.approval_batch)['model_artifact_id'] == str(model.id):
+                present(durable.approval_batch).update(model_artifact_id=str(legacy.id),
                     model_artifact_sha256=legacy.content_sha256)
         native = _DiscussionDurability(durable._publish, durable._store, durable._abort, durable._finalize,
-            run_id=saved.run_id, tenant_id=saved.tenant_id, model_entries=tuple(durable.model_entries),
-            tool_entries=tuple(durable.tool_entries), artifacts=durable.artifacts,
-            engineering_tool_prefix=durable.engineering_tool_prefix, approval_batch=durable.approval_batch)
+            run_id=saved.run_id, tenant_id=saved.tenant_id, model_entries=ledger(tuple(durable.model_entries)),
+            tool_entries=ledger(tuple(durable.tool_entries)), artifacts=durable.artifacts,
+            engineering_tool_prefix=integer(durable.engineering_tool_prefix), approval_batch=json_map(durable.approval_batch))
         assert _pending_approval_call(native, participants) is not None
     elif variant == 'foreign_prior_actor':
-        content = models[0].model_dump(mode='json')['content']
-        content['project_repair_round']['actor'] = 'reviewer'
+        content = mapping(models[0].model_dump(mode='json'))['content']
+        mutable(mapping(content)['project_repair_round'])['actor'] = 'reviewer'
         _replace_approval_model_content(durable, rows[0], content)
     before = (durable._model_cursor, durable._tool_cursor, durable.engineering_tool_prefix,
-              dict(durable.repair_phase), dict(durable.approval_batch))
+              dict(mapping(durable.repair_phase)), dict(mapping(durable.approval_batch)))
     calls, requests = len(journey.calls), len(journey.requests)
     if variant == 'foreign_prior_actor':
         with pytest.raises((RuntimeExecutionError, ValueError)):
@@ -1431,9 +1499,9 @@ async def test_real_selector_retry_approval_preserves_legacy_and_strict_intent(v
     assert pending is not None and pending[0] == 'implementer' and pending[2] == 0
     journey.approved = True
     await approval_tool(durable, journey, [], name='project.verify').run_json(
-        {}, CancellationToken(), call_id=pending[1][0]['id'])
+        {}, CancellationToken(), call_id=string(mapping(pending[1][0])['id']))
     await durable.acknowledge_approved_round(participants)
-    assert durable.approval_batch is None and durable.repair_phase['model_floor'] == len(durable.model_entries)
+    assert durable.approval_batch is None and integer(mapping(durable.repair_phase)['model_floor']) == len(durable.model_entries)
     acknowledged = snapshots[-1]
     calls = len(journey.calls)
     cold = journey.runtime()
@@ -1443,7 +1511,7 @@ async def test_real_selector_retry_approval_preserves_legacy_and_strict_intent(v
     assert [call.tool_name for call in journey.calls[calls:]] == ['workspace.bundle']
     assert len(journey.requests) == requests + 3
     assert journey.write_count == 2 and journey.verify_count == 2
-    assert tuple(rows) == acknowledged.state['model_ledger'][floor:]
+    assert tuple(rows) == sequence(mapping(acknowledged.state)['model_ledger'])[floor:]
 
 
 @pytest.mark.asyncio
@@ -1452,21 +1520,21 @@ async def test_real_selector_retry_verify_ack_cold_resume_does_not_replay_old_ro
     journey.approved = True
     repo = ContinuationRepository(journey)
     runtime = BoundaryFailure(journey)
-    service = RunService(repo, runtime_registry=RuntimeRegistry((runtime,)), router=None, task_queue=object())
+    service = RunService(repo, runtime_registry=RuntimeRegistry((runtime,)), router=None, task_queue=UnexpectedTaskQueue())
     assert (await service.execute(repo.run_id)).status is RunStatus.QUEUED
     runtime.second_fault = 'after_write'
     assert (await service.execute(repo.run_id)).status is RunStatus.QUEUED
     runtime.second_fault = 'ack_verify'
     continued = await service.execute(repo.run_id)
     stopped = runtime.ack_checkpoint
-    floor = stopped.state['project_repair_phase']['model_floor']
-    pending = stopped.state['model_ledger'][floor:]
-    assert len(pending) == 3 and all(row['status'] == 'succeeded' for row in pending)
-    refs = tuple(ArtifactReference(id=UUID(row['artifact_id']), sha256=row['artifact_sha256']) for row in pending)
+    floor = integer(mapping(mapping(stopped.state)['project_repair_phase'])['model_floor'])
+    pending = sequence(mapping(stopped.state)['model_ledger'])[floor:]
+    assert len(pending) == 3 and all(mapping(row)['status'] == 'succeeded' for row in pending)
+    refs = tuple(ArtifactReference(id=UUID(string(string(mapping(row)['artifact_id']))), sha256=string(mapping(row)['artifact_sha256'])) for row in pending)
     artifacts = await journey.artifacts.get_many(stopped.tenant_id, stopped.run_id, refs)
-    assert [artifact.content.get('text') for artifact in artifacts[:2]] == ['no_candidate', 'implementer']
-    assert stopped.state['tool_ledger'][-1]['name'] == 'project.verify'
-    assert stopped.state['tool_ledger'][-1]['status'] == 'succeeded'
+    assert [mapping(artifact.content).get('text') for artifact in artifacts[:2]] == ['no_candidate', 'implementer']
+    assert mapping(sequence(mapping(stopped.state)['tool_ledger'])[-1])['name'] == 'project.verify'
+    assert mapping(sequence(mapping(stopped.state)['tool_ledger'])[-1])['status'] == 'succeeded'
     assert continued.status is RunStatus.QUEUED, repo.continuation_errors
     calls, requests = len(journey.calls), len(journey.requests)
     before = stopped.to_payload()
@@ -1476,13 +1544,13 @@ async def test_real_selector_retry_verify_ack_cold_resume_does_not_replay_old_ro
     assert len(journey.requests) == requests + 3
     assert journey.write_count == 2 and journey.verify_count == 2
     assert stopped.to_payload() == before
-    assert repo.checkpoint.state['model_ledger'][:len(stopped.state['model_ledger'])] == stopped.state['model_ledger']
-    assert repo.checkpoint.state['tool_ledger'][:len(stopped.state['tool_ledger'])] == stopped.state['tool_ledger']
-    assert repo.checkpoint.state['usage']['tokens'] >= stopped.state['usage']['tokens']
-    assert Decimal(repo.checkpoint.state['usage']['cost_usd']) >= Decimal(stopped.state['usage']['cost_usd'])
-    assert repo.checkpoint.state['remaining_absolute_timeout_seconds'] <= stopped.state['remaining_absolute_timeout_seconds']
-    assert repo.row.routing_decision['runtime_token_absolute_tokens'] == 500
-    assert repo.row.routing_decision['runtime_timeout_absolute_seconds'] == 20.0
+    assert sequence(mapping(repo.checkpoint.state)['model_ledger'])[:len(sequence(mapping(stopped.state)['model_ledger']))] == sequence(mapping(stopped.state)['model_ledger'])
+    assert sequence(mapping(repo.checkpoint.state)['tool_ledger'])[:len(sequence(mapping(stopped.state)['tool_ledger']))] == sequence(mapping(stopped.state)['tool_ledger'])
+    assert integer(mapping(mapping(repo.checkpoint.state)['usage'])['tokens']) >= integer(mapping(mapping(stopped.state)['usage'])['tokens'])
+    assert Decimal(string(mapping(mapping(repo.checkpoint.state)['usage'])['cost_usd'])) >= Decimal(string(mapping(mapping(stopped.state)['usage'])['cost_usd']))
+    assert number(mapping(repo.checkpoint.state)['remaining_absolute_timeout_seconds']) <= number(mapping(stopped.state)['remaining_absolute_timeout_seconds'])
+    assert integer(present(mapping(repo.row.routing_decision))['runtime_token_absolute_tokens']) == 500
+    assert number(present(mapping(repo.row.routing_decision))['runtime_timeout_absolute_seconds']) == 20.0
 
 
 @pytest.mark.asyncio
@@ -1492,31 +1560,31 @@ async def test_completed_approved_round_rejects_present_intent_binding_corruptio
     journey, durable, _saved, snapshots = await _complete_approved_fixture()
     pending = _pending_approval_call(durable, {'implementer': 'writer', 'reviewer': 'reviewer'})
     assert pending is not None and pending[2] == len(pending[1])
-    index = durable.repair_phase['model_floor'] if field.startswith('selector_') else -1
+    index = integer(mapping(durable.repair_phase)['model_floor']) if field.startswith('selector_') else -1
     row = durable.model_entries[index]
-    content = durable._artifacts[row['artifact_id']].model_dump(mode='json')['content']
-    binding = content['project_repair_round']
+    content = mapping(durable._artifacts[string(mapping(row)['artifact_id'])].model_dump(mode='json'))['content']
+    binding = mapping(content)['project_repair_round']
     if field == 'selector_text':
-        assert binding['actor'] == '__selector__' and content['text'].strip() == 'implementer'
-        content['text'] = 'reviewer'
+        assert mapping(binding)['actor'] == '__selector__' and string(mapping(content)['text']).strip() == 'implementer'
+        mutable(content)['text'] = 'reviewer'
     elif field == 'selector_actor':
-        assert binding['actor'] == '__selector__'
-        binding['actor'] = 'implementer'
+        assert mapping(binding)['actor'] == '__selector__'
+        mutable(binding)['actor'] = 'implementer'
     elif field == 'selector_tool_names':
-        assert binding['tool_names'] == {} and content['tool_calls'] == []
-        binding['tool_names'] = {'project_verify': 'project.verify'}
+        assert mapping(binding)['tool_names'] == {} and sequence(mapping(content)['tool_calls']) == []
+        mutable(binding)['tool_names'] = {'project_verify': 'project.verify'}
     elif field == 'tool_names':
-        binding[field] = {'project_verify': 'workspace.list'}
+        mutable(binding)[field] = {'project_verify': 'workspace.list'}
     elif field == 'actor':
-        binding[field] = 'reviewer'
+        mutable(binding)[field] = 'reviewer'
     elif field == 'request_hash':
-        binding[field] = '0' * 64 if row['request_hash'] != '0' * 64 else '1' * 64
+        mutable(binding)[field] = '0' * 64 if mapping(row)['request_hash'] != '0' * 64 else '1' * 64
     else:
-        binding[field] += 1
-    _replace_approval_model_content(durable, row, content)
+        binding[field] = number(binding[field]) + 1
+    _replace_approval_model_content(durable, row, json_map(content))
     # Rebind hashes so rejection must check intent, not merely a stale artifact digest.
     previous = (durable._model_cursor, durable._tool_cursor, durable.engineering_tool_prefix,
-                dict(durable.repair_phase), dict(durable.approval_batch))
+                dict(mapping(durable.repair_phase)), dict(mapping(durable.approval_batch)))
     tools, models, artifacts = list(durable.tool_entries), list(durable.model_entries), durable.artifacts
     calls, requests, publication_count = len(journey.calls), len(journey.requests), len(snapshots)
     with pytest.raises((RuntimeExecutionError, ValueError)):
@@ -1531,11 +1599,11 @@ async def test_completed_approved_round_rejects_present_intent_binding_corruptio
 @pytest.mark.asyncio
 async def test_completed_legacy_approved_round_without_intent_remains_compatible() -> None:
     journey, durable, saved, snapshots = await _complete_approved_fixture()
-    floor = durable.repair_phase['model_floor']
+    floor = integer(mapping(durable.repair_phase)['model_floor'])
     for row in durable.model_entries[floor:]:
-        assert row['status'] == 'succeeded'
-        content = durable._artifacts[row['artifact_id']].model_dump(mode='json')['content']
-        del content['project_repair_round']
+        assert mapping(row)['status'] == 'succeeded'
+        content = mapping(durable._artifacts[string(mapping(row)['artifact_id'])].model_dump(mode='json'))['content']
+        del mutable(content)['project_repair_round']
         _replace_approval_model_content(durable, row, content)
     pending = _pending_approval_call(durable, {'implementer': 'writer', 'reviewer': 'reviewer'})
     assert pending is not None and pending[2] == len(pending[1])
@@ -1543,11 +1611,11 @@ async def test_completed_legacy_approved_round_without_intent_remains_compatible
     calls, requests, publication_count = len(journey.calls), len(journey.requests), len(snapshots)
     await durable.acknowledge_approved_round({'implementer': 'writer', 'reviewer': 'reviewer'})
     assert durable._model_cursor == len(models) and durable._tool_cursor == len(tools)
-    assert durable.repair_phase['model_floor'] == len(models) and durable.engineering_tool_prefix == len(tools)
+    assert integer(mapping(durable.repair_phase)['model_floor']) == len(models) and durable.engineering_tool_prefix == len(tools)
     assert durable.approval_batch is None
     assert durable.model_entries == models and durable.tool_entries == tools
     assert len(snapshots) == publication_count + 1
-    assert snapshots[-1].state['usage'] == saved.state['usage']
+    assert mapping(mapping(snapshots[-1].state)['usage']) == mapping(mapping(saved.state)['usage'])
     assert 'approval_batch' not in snapshots[-1].state
     assert (len(journey.calls), len(journey.requests)) == (calls, requests)
 
@@ -1560,7 +1628,7 @@ async def test_completed_approved_round_acknowledges_then_cold_restores_without_
     await durable.acknowledge_approved_round({'implementer': 'writer', 'reviewer': 'reviewer'})
     assert durable._model_cursor == len(models) and durable._tool_cursor == len(tools)
     assert durable.engineering_tool_prefix == len(tools)
-    assert durable.repair_phase['model_floor'] == len(models) and durable.approval_batch is None
+    assert integer(mapping(durable.repair_phase)['model_floor']) == len(models) and durable.approval_batch is None
     assert durable.tool_entries == tools and durable.model_entries == models
     assert (len(journey.calls), len(journey.requests)) == (calls, requests)
     acknowledged = snapshots[-1]
@@ -1573,25 +1641,25 @@ async def test_completed_approved_round_acknowledges_then_cold_restores_without_
     assert len(journey.requests) == requests + 3
     assert journey.verify_count == 2 and journey.write_count == 2
     final = [event.artifact for event in events if event.artifact is not None
-             and event.artifact.content.get('presentation') == 'final_answer']
-    assert len(final) == 1 and final[0].content['text'] == journey.report
-    assert acknowledged.state['usage'] == saved.state['usage']
-    assert cold._last_checkpoint.state['tool_ledger'][:len(tools)] == tuple(tools)
+             and mapping(event.artifact.content).get('presentation') == 'final_answer']
+    assert len(final) == 1 and mapping(final[0].content)['text'] == journey.report
+    assert mapping(mapping(acknowledged.state)['usage']) == mapping(mapping(saved.state)['usage'])
+    assert sequence(mapping(present(cold._last_checkpoint).state)['tool_ledger'])[:len(tools)] == tuple(tools)
 
 
 @pytest.mark.asyncio
 async def test_approved_round_ack_failure_restores_batch_markers_but_keeps_acked_tool() -> None:
     journey, durable, saved, snapshots = await _complete_approved_fixture()
     previous = (durable._model_cursor, durable._tool_cursor, durable.engineering_tool_prefix,
-                dict(durable.repair_phase), dict(durable.approval_batch))
+                dict(mapping(durable.repair_phase)), dict(mapping(durable.approval_batch)))
     tools, models, artifacts = list(durable.tool_entries), list(durable.model_entries), durable.artifacts
     calls, requests, publication_count = len(journey.calls), len(journey.requests), len(snapshots)
     failure = OSError('approved round checkpoint ACK failed')
-    attempted = []
+    attempted: list[bool] = []
 
-    async def reject(*args):
+    async def reject(*args: object) -> Never:
         assert durable._model_cursor == len(models) and durable.engineering_tool_prefix == len(tools)
-        assert durable.repair_phase['model_floor'] == len(models) and durable.approval_batch is None
+        assert integer(mapping(durable.repair_phase)['model_floor']) == len(models) and durable.approval_batch is None
         attempted.append(True)
         raise failure
 
@@ -1601,9 +1669,9 @@ async def test_approved_round_ack_failure_restores_batch_markers_but_keeps_acked
     assert raised.value is failure and attempted == [True]
     assert (durable._model_cursor, durable._tool_cursor, durable.engineering_tool_prefix,
             durable.repair_phase, durable.approval_batch) == previous
-    assert durable._tool_cursor == len(tools) and tools[-1]['status'] == 'succeeded'
+    assert durable._tool_cursor == len(tools) and mapping(tools[-1])['status'] == 'succeeded'
     assert durable.model_entries == models and durable.tool_entries == tools and durable.artifacts == artifacts
-    assert len(snapshots) == publication_count and snapshots[-1].state['usage'] == saved.state['usage']
+    assert len(snapshots) == publication_count and mapping(mapping(snapshots[-1].state)['usage']) == mapping(mapping(saved.state)['usage'])
     assert (len(journey.calls), len(journey.requests)) == (calls, requests)
 
 
@@ -1611,13 +1679,13 @@ async def test_approved_round_ack_failure_restores_batch_markers_but_keeps_acked
 async def test_approved_round_with_unexecuted_tail_cannot_advance() -> None:
     journey, durable, _saved, snapshots = await _active_approval_fixture()
     before = (durable._model_cursor, durable._tool_cursor, durable.engineering_tool_prefix,
-              dict(durable.repair_phase), dict(durable.approval_batch))
+              dict(mapping(durable.repair_phase)), dict(mapping(durable.approval_batch)))
     calls, requests = len(journey.calls), len(journey.requests)
     with pytest.raises(RuntimeExecutionError):
         await durable.acknowledge_approved_round({'implementer': 'writer', 'reviewer': 'reviewer'})
     assert (durable._model_cursor, durable._tool_cursor, durable.engineering_tool_prefix,
             durable.repair_phase, durable.approval_batch) == before
-    assert durable.tool_entries[-1]['status'] == 'waiting_approval' and snapshots == []
+    assert mapping(durable.tool_entries[-1])['status'] == 'waiting_approval' and snapshots == []
     assert (len(journey.calls), len(journey.requests)) == (calls, requests)
 
 
@@ -1628,7 +1696,7 @@ async def test_active_repair_waiting_approval_native_resume_rechecks_policy_then
     unapproved = journey.runtime()
     await unapproved.restore_checkpoint(saved)
     events = [event async for event in unapproved.run(journey.context.model_copy(update={'checkpoint': saved}))]
-    waiting = await unapproved.save_checkpoint()
+    waiting = present(await unapproved.save_checkpoint())
     assert checkpoint_waits_for_approval(waiting, journey.approval_id), [
         (event.kind, event.reason) for event in events[-5:]]
     assert len(journey.requests) == requests and len(journey.calls) == calls + 1
@@ -1651,7 +1719,8 @@ async def test_active_approved_native_resume_consumes_models_before_compact() ->
     requests, calls = len(journey.requests), len(journey.calls)
     original = _DiscussionDurability.drain_completed_round
 
-    async def skip_only_approval_gate(durable, context, state):
+    async def skip_only_approval_gate(durable: _DiscussionDurability, context: TaskContext,
+                                     state: Mapping[str, JsonValue]) -> None:
         if durable.approval_batch is not None:
             assert _pending_approval_call(durable, {'implementer': 'writer', 'reviewer': 'reviewer'}) is not None
             return
@@ -1673,34 +1742,37 @@ async def test_repair_progress_outbox_key_fits_orm_and_binds_stable_full_scope()
     journey = ProjectJourney()
     repo = ContinuationRepository(journey)
     runtime = BoundaryFailure(journey)
-    service = RunService(repo, runtime_registry=RuntimeRegistry((runtime,)), router=None, task_queue=object())
+    service = RunService(repo, runtime_registry=RuntimeRegistry((runtime,)), router=None, task_queue=UnexpectedTaskQueue())
     assert (await service.execute(repo.run_id)).status is RunStatus.QUEUED
     runtime.second_fault = 'after_write'
     assert (await service.execute(repo.run_id)).status is RunStatus.QUEUED
     stopped = repo.checkpoint
     original = repo.outbox[-1]
     assert isinstance(original, RunOutboxRow)
-    assert len(original.idempotency_key.encode('ascii')) <= RunOutboxRow.__table__.c.idempotency_key.type.length
-    route = {k: v for k, v in repo.row.routing_decision.items() if k != 'self_repair_episode_progress'}
-    state = stopped.to_payload()['state']
-    state['remaining_timeout_seconds'] -= 0.01
+    from sqlalchemy import String
+    outbox_key_type = RunOutboxRow.__table__.c.idempotency_key.type
+    assert isinstance(outbox_key_type, String) and outbox_key_type.length is not None
+    assert len(string(original.idempotency_key).encode('ascii')) <= outbox_key_type.length
+    route = {k: v for k, v in present(mapping(repo.row.routing_decision)).items() if k != 'self_repair_episode_progress'}
+    state = mutable(mapping(stopped.to_payload())['state'])
+    mutable(state)['remaining_timeout_seconds'] = number(mutable(state)['remaining_timeout_seconds']) - 0.01
     later = RuntimeCheckpoint(id=uuid4(), runtime_type='autogen', runtime_version='2',
-        run_id=stopped.run_id, tenant_id=stopped.tenant_id, mode=stopped.mode, state=state)
+        run_id=stopped.run_id, tenant_id=stopped.tenant_id, mode=stopped.mode, state=json_map(state))
     assert later.state_sha256 != stopped.state_sha256
     keys = []
     # Reset only this synthetic in-memory fixture to inspect deterministic enqueue encoding.
     for checkpoint in (stopped, stopped, later):
         repo.row.status = RunStatus.FAILED.value
-        repo.row.routing_decision = dict(route)
+        repo.row.routing_decision = dict(mapping(route))
         repo.checkpoint = checkpoint
         await repo.continue_project_repair_and_enqueue(tenant_id=repo.row.tenant_id,
             run_id=repo.run_id, version=repo.row.version, checkpoint_sha256=checkpoint.state_sha256)
         entry = repo.outbox[-1]
         assert entry.tenant_id == checkpoint.tenant_id and entry.run_id == checkpoint.run_id
         expected = 'repair-progress:' + hashlib.sha256(
-            f'{checkpoint.tenant_id}:{checkpoint.run_id}:{checkpoint.state_sha256}'.encode()).hexdigest()
+            string(f'{checkpoint.tenant_id}:{checkpoint.run_id}:{checkpoint.state_sha256}').encode()).hexdigest()
         assert entry.idempotency_key == expected
-        assert len(entry.idempotency_key) == len(entry.idempotency_key.encode('ascii')) == 80
+        assert len(entry.idempotency_key) == len(string(entry.idempotency_key).encode('ascii')) == 80
         assert entry.payload == {'run_id': str(checkpoint.run_id)}
         keys.append(entry.idempotency_key)
     assert keys[0] == keys[1] == original.idempotency_key
@@ -1722,21 +1794,21 @@ async def test_bundle_readonly_tail_cold_restore_only_adds_report_and_keeps_full
     journey = ReadTailJourney()
     repo = ContinuationRepository(journey)
     runtime = BoundaryFailure(journey)
-    service = RunService(repo, runtime_registry=RuntimeRegistry((runtime,)), router=None, task_queue=object())
+    service = RunService(repo, runtime_registry=RuntimeRegistry((runtime,)), router=None, task_queue=UnexpectedTaskQueue())
     assert (await service.execute(repo.run_id)).status is RunStatus.QUEUED
     runtime.second_fault = 'after_write'
     assert (await service.execute(repo.run_id)).status is RunStatus.QUEUED
-    consumed = repo.row.routing_decision['self_repair_episode_progress']['tool_count']
+    consumed = integer(mapping(present(mapping(repo.row.routing_decision))['self_repair_episode_progress'])['tool_count'])
     runtime.second_fault = 'after_bundle_list'
     assert (await service.execute(repo.run_id)).status is RunStatus.QUEUED, repo.continuation_errors
     stopped = repo.checkpoint
     before = stopped.to_payload()
-    tools, models = stopped.state['tool_ledger'], stopped.state['model_ledger']
-    assert [row['name'] for row in tools[consumed:]] == ['project.verify', 'workspace.bundle', 'workspace.list']
-    assert stopped.state['engineering_tool_prefix'] == len(tools)
-    assert stopped.state['project_repair_phase']['model_floor'] == len(models)
-    assert all(row['status'] == 'succeeded' and 'report_binding' not in row for row in models)
-    assert tools[-1]['status'] == 'succeeded'
+    tools, models = sequence(mapping(stopped.state)['tool_ledger']), sequence(mapping(stopped.state)['model_ledger'])
+    assert [mapping(row)['name'] for row in tools[consumed:]] == ['project.verify', 'workspace.bundle', 'workspace.list']
+    assert integer(mapping(stopped.state)['engineering_tool_prefix']) == len(tools)
+    assert integer(mapping(mapping(stopped.state)['project_repair_phase'])['model_floor']) == len(models)
+    assert all(mapping(row)['status'] == 'succeeded' and 'report_binding' not in mapping(row) for row in models)
+    assert mapping(tools[-1])['status'] == 'succeeded'
     assert repo.accept_count == 1 and len(repo.outbox) == 3
     calls, requests = len(journey.calls), len(journey.requests)
     runtime.second_fault = None
@@ -1746,24 +1818,24 @@ async def test_bundle_readonly_tail_cold_restore_only_adds_report_and_keeps_full
     request = journey.requests[-1]
     assert request.tools == () and request.required_tool is None
     assert any(m.role == 'system' and 'Main Agent final delivery' in str(m.content) for m in request.messages)
-    assert repo.checkpoint.state['tool_ledger'] == tools
-    assert repo.checkpoint.state['model_ledger'][:-1] == models
+    assert sequence(mapping(repo.checkpoint.state)['tool_ledger']) == tools
+    assert sequence(mapping(repo.checkpoint.state)['model_ledger'])[:-1] == models
     assert stopped.to_payload() == before
     final = [event.artifact for event in repo.event_log if event.artifact is not None
-             and event.artifact.content.get('presentation') == 'final_answer']
-    assert len(final) == 1 and final[0].content['text'] == journey.report
-    metadata = final[0].content['engineering_report']
-    assert metadata['bundle_position'] == len(tools) - 2
-    assert metadata['bundle_artifact_id'] == tools[-2]['artifact_id']
-    assert metadata['tool_prefix_length'] == len(tools)
-    assert metadata['tool_prefix_sha256'] == journey.digest(before['state']['tool_ledger'])
+             and mapping(event.artifact.content).get('presentation') == 'final_answer']
+    assert len(final) == 1 and mapping(final[0].content)['text'] == journey.report
+    metadata = mapping(mapping(final[0].content)['engineering_report'])
+    assert integer(mapping(metadata)['bundle_position']) == len(tools) - 2
+    assert mapping(metadata)['bundle_artifact_id'] == string(mapping(tools[-2])['artifact_id'])
+    assert integer(mapping(metadata)['tool_prefix_length']) == len(tools)
+    assert mapping(metadata)['tool_prefix_sha256'] == journey.digest(sequence(mutable(mapping(mapping(before)['state']))['tool_ledger']))
     assert journey.write_count == 2 and journey.verify_count == 2
     assert sum(call.tool_name == 'workspace.bundle' for call in journey.calls) == 1
-    assert repo.row.routing_decision['runtime_token_absolute_tokens'] == 500
-    assert repo.row.routing_decision['runtime_timeout_absolute_seconds'] == 20.0
-    assert repo.checkpoint.state['usage']['tokens'] >= stopped.state['usage']['tokens']
-    assert Decimal(repo.checkpoint.state['usage']['cost_usd']) >= Decimal(stopped.state['usage']['cost_usd'])
-    assert repo.checkpoint.state['remaining_absolute_timeout_seconds'] <= stopped.state['remaining_absolute_timeout_seconds']
+    assert integer(present(mapping(repo.row.routing_decision))['runtime_token_absolute_tokens']) == 500
+    assert number(present(mapping(repo.row.routing_decision))['runtime_timeout_absolute_seconds']) == 20.0
+    assert integer(mapping(mapping(repo.checkpoint.state)['usage'])['tokens']) >= integer(mapping(mapping(stopped.state)['usage'])['tokens'])
+    assert Decimal(string(mapping(mapping(repo.checkpoint.state)['usage'])['cost_usd'])) >= Decimal(string(mapping(mapping(stopped.state)['usage'])['cost_usd']))
+    assert number(mapping(repo.checkpoint.state)['remaining_absolute_timeout_seconds']) <= number(mapping(stopped.state)['remaining_absolute_timeout_seconds'])
     terminal = repo.checkpoint
     cold = journey.runtime()
     await cold.restore_checkpoint(terminal)
@@ -1771,7 +1843,7 @@ async def test_bundle_readonly_tail_cold_restore_only_adds_report_and_keeps_full
     events = [event async for event in cold.run(journey.context.model_copy(update={'checkpoint': terminal}))]
     assert events[-1].kind is EventKind.RUNTIME_COMPLETED, events[-1].reason
     assert len(journey.calls) == calls and len(journey.requests) == requests
-    assert (await cold.save_checkpoint()).state_sha256 == terminal.state_sha256
+    assert (present(await cold.save_checkpoint())).state_sha256 == terminal.state_sha256
 
 
 @pytest.mark.asyncio
@@ -1782,23 +1854,23 @@ async def test_episode_transaction_refuses_replay_or_changed_authority(defect: s
     journey = ProjectJourney()
     repo = ContinuationRepository(journey)
     runtime = BoundaryFailure(journey)
-    service = RunService(repo, runtime_registry=RuntimeRegistry((runtime,)), router=None, task_queue=object())
+    service = RunService(repo, runtime_registry=RuntimeRegistry((runtime,)), router=None, task_queue=UnexpectedTaskQueue())
     assert (await service.execute(repo.run_id)).status is RunStatus.QUEUED
     runtime.second_fault = 'after_write'
     assert (await service.execute(repo.run_id)).status is RunStatus.QUEUED
     repo.row.status = RunStatus.FAILED.value
-    route = dict(repo.row.routing_decision)
+    route = dict(present(mapping(repo.row.routing_decision)))
     if defect != 'consumed':
         route.pop('self_repair_episode_progress')
     state = _mutable_json(repo.checkpoint.state)
     if defect == 'permission':
-        route['requested_permissions'] = ['host_write']
+        mutable(route)['requested_permissions'] = ['host_write']
     elif defect == 'hard_tokens':
-        route['runtime_token_absolute_tokens'] += 1
+        mutable(route)['runtime_token_absolute_tokens'] = number(mutable(route)['runtime_token_absolute_tokens']) + 1
     elif defect == 'tokens_reset':
-        state['usage']['tokens'] = 0
+        mutable(mapping(state)['usage'])['tokens'] = 0
     elif defect == 'time_reset':
-        state['remaining_absolute_timeout_seconds'] += 1
+        mutable(state)['remaining_absolute_timeout_seconds'] = number(mutable(state)['remaining_absolute_timeout_seconds']) + 1
     elif defect == 'lease':
         repo.row.worker_id = 'still-running'
     elif defect == 'unconfirmed_effect':
@@ -1807,15 +1879,15 @@ async def test_episode_transaction_refuses_replay_or_changed_authority(defect: s
     repo.row.routing_decision = route
     old = repo.checkpoint
     repo.checkpoint = RuntimeCheckpoint(id=old.id, runtime_type=old.runtime_type, runtime_version=old.runtime_version,
-        run_id=old.run_id, tenant_id=old.tenant_id, mode=old.mode, state=state)
+        run_id=old.run_id, tenant_id=old.tenant_id, mode=old.mode, state=json_map(state))
     version = repo.row.version - (defect == 'stale_version')
     digest = 'f' * 64 if defect == 'stale_checkpoint' else repo.checkpoint.state_sha256
-    before, outbox = dict(route), len(repo.outbox)
+    before, outbox = dict(mapping(route)), len(repo.outbox)
     with pytest.raises(RunConflict):
         await repo.continue_project_repair_and_enqueue(tenant_id=repo.row.tenant_id, run_id=repo.run_id,
             version=version, checkpoint_sha256=digest)
     assert repo.row.status == RunStatus.FAILED.value
-    assert repo.row.routing_decision == before and len(repo.outbox) == outbox
+    assert present(repo.row.routing_decision) == before and len(repo.outbox) == outbox
 
 
 @pytest.mark.asyncio
@@ -1823,14 +1895,14 @@ async def test_actual_noop_repair_write_does_not_buy_another_episode_continuatio
     journey = ProjectJourney()
     repo = ContinuationRepository(journey)
     runtime = BoundaryFailure(journey)
-    service = RunService(repo, runtime_registry=RuntimeRegistry((runtime,)), router=None, task_queue=object())
+    service = RunService(repo, runtime_registry=RuntimeRegistry((runtime,)), router=None, task_queue=UnexpectedTaskQueue())
     assert (await service.execute(repo.run_id)).status is RunStatus.QUEUED
     journey.repair_content = 'bad draft'
     runtime.second_fault = 'after_write'
     assert (await service.execute(repo.run_id)).status is RunStatus.FAILED
-    assert journey.write_count == 2 and journey.files['ACCEPTANCE.json'] == 'bad draft'
+    assert journey.write_count == 2 and mapping(journey.files)['ACCEPTANCE.json'] == 'bad draft'
     assert len(repo.outbox) == 1 and repo.accept_count == 1
-    assert 'self_repair_episode_progress' not in repo.row.routing_decision
+    assert 'self_repair_episode_progress' not in present(repo.row.routing_decision)
     before = (len(journey.calls), len(journey.requests))
     assert (await service.execute(repo.run_id)).status is RunStatus.FAILED
     assert (len(journey.calls), len(journey.requests)) == before
@@ -1842,22 +1914,22 @@ async def test_real_strict_soft_progress_renewal_survives_service_cold_resume() 
     journey.strict_soft = True
     repo = ContinuationRepository(journey)
     runtime = BoundaryFailure(journey)
-    service = RunService(repo, runtime_registry=RuntimeRegistry((runtime,)), router=None, task_queue=object())
+    service = RunService(repo, runtime_registry=RuntimeRegistry((runtime,)), router=None, task_queue=UnexpectedTaskQueue())
     assert (await service.execute(repo.run_id)).status is RunStatus.QUEUED
     source = repo.checkpoint
-    assert 0 < source.state['remaining_timeout_seconds'] < 0.3
-    assert repo.row.routing_decision['runtime_timeout_source'] == 'project_scale_soft_budget'
+    assert 0 < number(mapping(source.state)['remaining_timeout_seconds']) < 0.3
+    assert present(mapping(repo.row.routing_decision))['runtime_timeout_source'] == 'project_scale_soft_budget'
     runtime.second_fault = 'after_write'
     second = await service.execute(repo.run_id)
     repaired = repo.checkpoint
-    assert repaired.state['remaining_timeout_seconds'] > source.state['remaining_timeout_seconds']
-    assert repaired.state['remaining_absolute_timeout_seconds'] <= source.state['remaining_absolute_timeout_seconds']
+    assert number(mapping(repaired.state)['remaining_timeout_seconds']) > number(mapping(source.state)['remaining_timeout_seconds'])
+    assert number(mapping(repaired.state)['remaining_absolute_timeout_seconds']) <= number(mapping(source.state)['remaining_absolute_timeout_seconds'])
     assert second.status is RunStatus.QUEUED, repo.continuation_errors
     runtime.second_fault = None
     assert (await service.execute(repo.run_id)).status is RunStatus.COMPLETED
     assert journey.write_count == 2 and journey.verify_count == 2 and journey.bundle_bytes
     assert repo.accept_count == 1 and len(repo.outbox) == 2
-    assert repo.checkpoint.state['usage']['tokens'] >= repaired.state['usage']['tokens'] > source.state['usage']['tokens']
+    assert integer(mapping(mapping(repo.checkpoint.state)['usage'])['tokens']) >= integer(mapping(mapping(repaired.state)['usage'])['tokens']) > integer(mapping(mapping(source.state)['usage'])['tokens'])
     assert len(set(journey.plans)) == 1
 
 
@@ -1884,24 +1956,24 @@ async def test_sqlite_transaction_uses_real_private_write_ownership_and_sql_pred
     fake = ContinuationRepository(journey)
     journey.strict_soft = True
     runtime = BoundaryFailure(journey)
-    service = RunService(fake, runtime_registry=RuntimeRegistry((runtime,)), router=None, task_queue=object())
+    service = RunService(fake, runtime_registry=RuntimeRegistry((runtime,)), router=None, task_queue=UnexpectedTaskQueue())
     assert (await service.execute(fake.run_id)).status is RunStatus.QUEUED
     runtime.second_fault = 'after_write'
     await service.execute(fake.run_id)
-    route = dict(fake.row.routing_decision)
+    route = dict(present(mapping(fake.row.routing_decision)))
     if late_bundle:
         runtime.second_fault = 'after_bundle'
         assert (await service.execute(fake.run_id)).status is RunStatus.QUEUED
     else:
         route.pop('self_repair_episode_progress')
     checkpoint = fake.checkpoint
-    refs = tuple(ArtifactReference(id=UUID(k), sha256=v) for k, v in checkpoint.state['artifact_registry'].items())
+    refs = tuple(ArtifactReference(id=UUID(string(k)), sha256=v) for k, v in registry(mapping(mapping(checkpoint.state)['artifact_registry'])).items())
     artifacts = await journey.artifacts.get_many(fake.row.tenant_id, fake.run_id, refs)
     writes = [a for a in artifacts if a.type == 'tool_result']
-    assert sum(a.content.get('tool_name') == 'workspace.write_text' for a in writes) == 2
-    target_id = UUID(checkpoint.state['tool_ledger'][-1]['artifact_id'])
+    assert sum(mapping(a.content).get('tool_name') == 'workspace.write_text' for a in writes) == 2
+    target_id = UUID(string(string(mapping(sequence(mapping(checkpoint.state)['tool_ledger'])[-1])['artifact_id'])))
     if late_bundle:
-        assert next(a for a in writes if a.id == target_id).content['tool_name'] == 'workspace.bundle'
+        assert mapping(next(a for a in writes if a.id == target_id).content)['tool_name'] == 'workspace.bundle'
     engine = create_async_engine('sqlite+aiosqlite:///:memory:')
     factory = async_sessionmaker(engine, expire_on_commit=False)
     # Dialect-only schema adaptation; mapped columns, actual WHERE/EXISTS and transaction logic stay real.
@@ -1916,13 +1988,13 @@ async def test_sqlite_transaction_uses_real_private_write_ownership_and_sql_pred
         async with engine.begin() as connection:
             await connection.run_sync(metadata.create_all)
         values = {c.name: getattr(fake.row, c.name) for c in RunRow.__table__.columns}
-        values['status'] = RunStatus.FAILED.value
-        values['routing_decision'] = route
+        mutable(values)['status'] = RunStatus.FAILED.value
+        mutable(values)['routing_decision'] = route
         async with factory.begin() as session:
             session.add(RunRow(**values))
             session.add(RunCheckpointRow(id=checkpoint.id, tenant_id=fake.row.tenant_id, run_id=fake.run_id,
                 sequence=100, runtime_type='autogen', runtime_version='2', mode=TaskMode.DISCUSS.value,
-                state=checkpoint.to_payload()['state'], state_sha256=checkpoint.state_sha256,
+                state=mutable(mapping(checkpoint.to_payload())['state']), state_sha256=checkpoint.state_sha256,
                 payload=checkpoint.to_payload()))
         store = PostgresArtifactRepository(factory)
         write_ids = {}
@@ -1933,19 +2005,18 @@ async def test_sqlite_transaction_uses_real_private_write_ownership_and_sql_pred
             persisted = (await session.scalars(select(RuntimeArtifactRow))).all()
             assert len(persisted) == len(writes) and all(a.permanent is False for a in persisted)
             owner = await session.get(RuntimeArtifactWriteRow, (fake.row.tenant_id, fake.run_id, write_ids[target_id]))
+            assert owner is not None
             assert owner.status == 'written'
             owner.status = owner_status
         real = RunRepository(factory)
-        kwargs = {'tenant_id': fake.row.tenant_id, 'run_id': fake.run_id,
-                  'version': fake.row.version, 'checkpoint_sha256': checkpoint.state_sha256}
         if owner_status == 'written':
-            continued = await real.continue_project_repair_and_enqueue(**kwargs)
+            continued = await real.continue_project_repair_and_enqueue(tenant_id=fake.row.tenant_id, run_id=fake.run_id, version=fake.row.version, checkpoint_sha256=checkpoint.state_sha256)
             assert continued.status is RunStatus.QUEUED
-            assert continued.routing_decision['runtime_token_absolute_tokens'] == 500
-            assert continued.routing_decision['self_repair_attempt'] == 1
-            assert continued.routing_decision['self_repair_episode_progress']['usage'] == dict(checkpoint.state['usage'])
+            assert integer(present(mapping(continued.routing_decision))['runtime_token_absolute_tokens']) == 500
+            assert integer(present(mapping(continued.routing_decision))['self_repair_attempt']) == 1
+            assert mapping(mapping(present(mapping(continued.routing_decision))['self_repair_episode_progress'])['usage']) == dict(mapping(mapping(checkpoint.state)['usage']))
             # Exercise the SQL-produced durable route through the next real service/runtime execution.
-            fake.row.routing_decision = dict(continued.routing_decision)
+            fake.row.routing_decision = dict(present(mapping(continued.routing_decision)))
             fake.row.status, fake.row.version = continued.status.value, continued.version
             runtime.second_fault = None
             calls, models = len(journey.calls), len(journey.requests)
@@ -1956,15 +2027,15 @@ async def test_sqlite_transaction_uses_real_private_write_ownership_and_sql_pred
                            for m in journey.requests[-1].messages)
             assert journey.write_count == 2 and journey.verify_count == 2 and journey.bundle_bytes
             assert len(set(journey.plans)) == 1
-            assert fake.checkpoint.state['usage']['tokens'] >= checkpoint.state['usage']['tokens']
+            assert integer(mapping(mapping(fake.checkpoint.state)['usage'])['tokens']) >= integer(mapping(mapping(checkpoint.state)['usage'])['tokens'])
         else:
             with pytest.raises(RunConflict):
-                await real.continue_project_repair_and_enqueue(**kwargs)
+                await real.continue_project_repair_and_enqueue(tenant_id=fake.row.tenant_id, run_id=fake.run_id, version=fake.row.version, checkpoint_sha256=checkpoint.state_sha256)
         async with factory() as session:
             outbox = (await session.scalars(select(RunOutboxRow))).all()
             assert len(outbox) == (1 if owner_status == 'written' else 0)
             saved = await real.latest_checkpoint(session, tenant_id=fake.row.tenant_id, run_id=fake.run_id)
-            assert saved.to_payload() == checkpoint.to_payload()
+            assert present(saved).to_payload() == checkpoint.to_payload()
     finally:
         await engine.dispose()
 
@@ -1976,20 +2047,20 @@ async def test_forged_soft_renewal_after_actual_noop_is_rejected_before_any_mode
     journey.strict_soft = True
     repo = ContinuationRepository(journey)
     runtime = BoundaryFailure(journey)
-    service = RunService(repo, runtime_registry=RuntimeRegistry((runtime,)), router=None, task_queue=object())
+    service = RunService(repo, runtime_registry=RuntimeRegistry((runtime,)), router=None, task_queue=UnexpectedTaskQueue())
     assert (await service.execute(repo.run_id)).status is RunStatus.QUEUED
     journey.repair_content = 'bad draft'
     runtime.second_fault = 'after_write'
     assert (await service.execute(repo.run_id)).status is RunStatus.FAILED
     saved = repo.checkpoint
     state = _mutable_json(saved.state)
-    state['remaining_timeout_seconds'] = 1.0
+    mutable(state)['remaining_timeout_seconds'] = 1.0
     forged = RuntimeCheckpoint(id=saved.id, runtime_type='autogen', runtime_version='2',
-        run_id=saved.run_id, tenant_id=saved.tenant_id, mode=saved.mode, state=state)
+        run_id=saved.run_id, tenant_id=saved.tenant_id, mode=saved.mode, state=json_map(state))
     cold = journey.runtime()
     await cold.restore_checkpoint(forged)
     before = (len(journey.calls), len(journey.requests))
-    context = journey.context.model_copy(update={'checkpoint': forged, 'routing_decision': repo.row.routing_decision})
+    context = journey.context.model_copy(update={'checkpoint': forged, 'routing_decision': present(repo.row.routing_decision)})
     events = [e async for e in cold.run(context)]
     assert events[-1].kind is EventKind.RUNTIME_FAILED
     assert events[-1].reason == 'project repair progress evidence is invalid'

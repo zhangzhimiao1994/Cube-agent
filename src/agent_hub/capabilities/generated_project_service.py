@@ -617,6 +617,13 @@ class GeneratedProjectService:
             # Durable data is registered before an action can wait or enter Root IO.
             await persist(cast(str, request.arguments['key']),
                 cast(str | None, request.arguments.get('plan_sha256')))
+            from agent_hub.capabilities.python_resolution_authorization import (
+                resolution_policy_allowed,
+            )
+
+            current_policy = await resolution_policy_allowed(request)
+            if current_policy is not None:
+                return current_policy
             checker = getattr(self.repository, 'is_capability_approval_scope_approved', None)
             _need(callable(checker), 'resolution_authority_unavailable')
             assert callable(checker)

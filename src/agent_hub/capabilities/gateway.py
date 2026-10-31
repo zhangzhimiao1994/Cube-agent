@@ -272,15 +272,19 @@ class CapabilityGateway:
         expected_go_recipe: Mapping[str, object] | None = None,
     ) -> bool:
         recorder = getattr(self._run_repository, "record_capability_approval_review", None)
+        resolution = request.resource.startswith('workspace/current/project-resolution/')
         if not callable(recorder):
             return (self._toolchain_authority is None and self._go_recipe_authority is None
-                    and not _is_metadata_preparation_request(request))
+                    and not _is_metadata_preparation_request(request) and not resolution)
         fingerprint = fingerprint_capability_request(request)
         approval_id = f"auto_review_{hashlib.sha256(fingerprint.encode()).hexdigest()[:24]}"
         try:
             toolchain_options: dict[str, object] = {}
             if _is_metadata_preparation_request(request):
                 toolchain_options['approval_scope'] = capability_approval_scope(request)
+            if resolution:
+                toolchain_options['approval_scope'] = capability_approval_scope(request)
+                toolchain_options['approval_request'] = request
             if self._toolchain_authority is not None:
                 toolchain_options = {'toolchain_authority': self._toolchain_authority,
                                      'approval_scope': capability_approval_scope(request)}

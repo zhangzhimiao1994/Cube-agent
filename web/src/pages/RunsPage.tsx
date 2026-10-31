@@ -21,6 +21,7 @@ import { repairActionLabel, repairErrorCodeLabel, repairFailureKindLabel, repair
 import { useCapabilityApprovalDecisions } from "./useCapabilityApprovalDecisions";
 import { RunApprovalHistory } from "./RunApprovalHistory";
 import { useRunCapabilityApprovals } from "./useRunCapabilityApprovals";
+import { executionBackendOptionLabel, isExecutionBackendPending, useExecutionBackends } from "./useExecutionBackends";
 import { CapabilityApprovalCard } from "../components/CapabilityApprovalCard";
 import { useAuth } from "../auth/AuthProvider";
 import { PermissionSelector, type PermissionMode } from "../components/PermissionSelector";
@@ -6438,10 +6439,7 @@ function RunsPageForActor() {
   const workflows = useQuery({ queryKey: ["workflows", ...permissionActorKey], queryFn: () => api.workflows(), enabled: hasPermission("agent:read") });
   const settings = useQuery({ queryKey: ["settings", ...permissionActorKey], queryFn: () => api.settings(), enabled: Boolean(permissionActor) });
   const permissionSettingsReady = Boolean(permissionActor && settings.data && !settings.isError);
-  const executionBackends = useQuery({
-    queryKey: ["execution-backends"],
-    queryFn: () => api.executionBackends(),
-  });
+  const executionBackends = useExecutionBackends();
   const mainAgent = useQuery({ queryKey: ["main-agent"], queryFn: () => api.mainAgent() });
   const conversations = useQuery({
     queryKey: ["conversations", false],
@@ -6811,7 +6809,7 @@ function RunsPageForActor() {
   useEffect(() => {
     const firstAvailableBackend = executionBackends.data?.find((backend) => backend.available);
     if (!firstAvailableBackend) return;
-    if (executionBackends.data?.some((backend) => backend.id === executionBackend && backend.available)) return;
+    if (executionBackends.data?.some((backend) => backend.id === executionBackend && (backend.available || isExecutionBackendPending(backend)))) return;
     setExecutionBackend(firstAvailableBackend.id);
   }, [executionBackend, executionBackends.data]);
 
@@ -8333,6 +8331,7 @@ function RunsPageForActor() {
     availableExecutionBackends.length > 0 &&
     settings.data &&
     (!configuredExecutionBackend || !configuredExecutionBackend.available) &&
+    !isExecutionBackendPending(configuredExecutionBackend) &&
     executionBackend === availableExecutionBackends[0].id
       ? `默认执行环境不可用，已自动切换到${availableExecutionBackends[0].name}。`
       : null;
@@ -8341,21 +8340,25 @@ function RunsPageForActor() {
     : executionBackends.isError
       ? "执行环境状态读取失败。本次仍可普通对话，但不会执行 Skill。"
       : availableExecutionBackends.length === 0
-        ? `服务器暂时无法安全运行 Skill：${Array.from(new Set(
+        ? executionBackends.data?.some(isExecutionBackendPending)
+          ? "执行环境准备中，正在确认可用状态；确认完成前不会执行 Skill。"
+          : `服务器暂时无法安全运行 Skill：${Array.from(new Set(
             (executionBackends.data ?? [])
               .filter((backend) => !backend.available)
               .map((backend) => backend.reason ? EXECUTION_BACKEND_REASON_TEXT[backend.reason] ?? backend.reason : "原因未知"),
           )).join("；") || "未接入隔离执行器"}。本次仍可普通对话，但不会执行 Skill。`
         : null;
   const executionBackendLabel = selectedExecutionBackend
-    ? `${selectedExecutionBackend.name}${selectedExecutionBackend.available ? "" : "（不可用）"}`
+    ? executionBackendOptionLabel(selectedExecutionBackend)
     : executionBackendNotice
       ? "未指定 Skill 执行环境"
       : executionBackend;
   const executionBackendStatus =
     executionBackendFallbackNotice ??
     executionBackendNotice ??
-    (selectedExecutionBackend
+    (isExecutionBackendPending(selectedExecutionBackend)
+      ? `${selectedExecutionBackend?.name}准备中，正在确认可用状态。`
+      : selectedExecutionBackend
       ? `${selectedExecutionBackend.isolation} · ${selectedExecutionBackend.cost}`
       : "正在确认执行环境...");
   const slashCommandSuggestions = slashCommandsForQuery(message);
@@ -8939,7 +8942,7 @@ function RunsPageForActor() {
                 ) : null}
                 {(executionBackends.data ?? []).map((backend) => (
                   <option key={backend.id} value={backend.id} disabled={!backend.available}>
-                    {backend.name}{backend.available ? "" : "（不可用）"}
+                    {executionBackendOptionLabel(backend)}
                   </option>
                 ))}
               </select>

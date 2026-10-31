@@ -7,7 +7,7 @@ import time
 from dataclasses import dataclass
 from typing import Literal, cast
 
-from agent_hub.skills.sandbox.broker import probe_skill_broker
+from agent_hub.skills.sandbox.broker import BROKER_PROBE_TIMEOUT_SECONDS, probe_skill_broker
 from agent_hub.skills.sandbox.remote import remote_backend_unavailable_reason
 
 ExecutionBackendId = Literal["systemd", "docker", "ssh", "modal", "daytona", "vercel"]
@@ -17,6 +17,21 @@ DOCKER_SKILL_RUNNER_IMAGE = "agent-hub-skill-runner:latest"
 _PROBE_CACHE_TTL_SECONDS = 10.0
 _PROBE_CACHE: dict[ExecutionBackendId, tuple[float, str | None]] = {}
 _PROBE_LOCK = threading.Lock()
+# Discovery must fit comfortably inside the ordinary GET's 20s caller budget.
+# Selected admission instead waits for the same probe's full bounded protocol.
+_DISCOVERY_WAIT_SECONDS = 1.0
+_PROBE_TRANSIENT_TTL_SECONDS = 1.0
+_PROBE_GENERATION = 0
+
+
+@dataclass(slots=True)
+class _Probe:
+    generation: int
+    done: threading.Event
+    reason: str | None = None
+
+
+_PROBE_IN_FLIGHT: dict[ExecutionBackendId, _Probe] = {}
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,12 +57,17 @@ def normalize_execution_backend(value: str | None) -> ExecutionBackendId:
 
 
 def probe_execution_backends() -> tuple[ExecutionBackendStatus, ...]:
-    systemd_reason = _cached_unavailable_reason("systemd")
-    docker_reason = _cached_unavailable_reason("docker")
-    ssh_reason = _cached_unavailable_reason("ssh")
-    modal_reason = _cached_unavailable_reason("modal")
-    daytona_reason = _cached_unavailable_reason("daytona")
-    vercel_reason = _cached_unavailable_reason("vercel")
+    deadline = time.monotonic() + _DISCOVERY_WAIT_SECONDS
+    order: tuple[ExecutionBackendId, ...] = ("systemd", "docker", "ssh", "modal", "daytona", "vercel")
+    # Start all expired backends before waiting: one slow broker never holds
+    # the cache lock or consumes the next backend's discovery window.
+    for backend in order:
+        with _PROBE_LOCK:
+            if _fresh_cached_reason(backend) is None:
+                _start_probe(backend)
+    systemd_reason, docker_reason, ssh_reason, modal_reason, daytona_reason, vercel_reason = (
+        _cached_unavailable_reason(backend, deadline=deadline) for backend in order
+    )
     return (
         ExecutionBackendStatus(
             id="systemd",
@@ -91,9 +111,14 @@ def probe_execution_backends() -> tuple[ExecutionBackendStatus, ...]:
 def execution_backend_unavailable_reason(
     value: str | None,
     sandbox_profile: str | None = None,
+    *,
+    timeout_seconds: float | None = None,
 ) -> str | None:
     backend = normalize_execution_backend(value)
-    reason = _cached_unavailable_reason(backend)
+    wait_seconds = BROKER_PROBE_TIMEOUT_SECONDS + 1.0
+    if timeout_seconds is not None:
+        wait_seconds = max(0.0, min(wait_seconds, timeout_seconds))
+    reason = _cached_unavailable_reason(backend, deadline=time.monotonic() + wait_seconds)
     if reason is not None:
         return reason
     if sandbox_profile is not None and sandbox_profile not in {
@@ -107,24 +132,83 @@ def execution_backend_unavailable_reason(
 
 
 def clear_execution_backend_probe_cache() -> None:
+    global _PROBE_GENERATION
     with _PROBE_LOCK:
+        _PROBE_GENERATION += 1
         _PROBE_CACHE.clear()
+        # Keep ownership of running probes; invalidation cannot spawn duplicates
+        # or allow a stale result to certify availability in the new generation.
 
 
-def _cached_unavailable_reason(backend: ExecutionBackendId) -> str | None:
-    now = time.monotonic()
-    with _PROBE_LOCK:
-        cached = _PROBE_CACHE.get(backend)
-        if cached is not None and now - cached[0] < _PROBE_CACHE_TTL_SECONDS:
-            return cached[1]
-        if backend == "systemd":
-            reason = _systemd_unavailable_reason()
-        elif backend == "docker":
-            reason = _docker_unavailable_reason()
-        else:
-            reason = remote_backend_unavailable_reason(backend)
-        _PROBE_CACHE[backend] = (time.monotonic(), reason)
-        return reason
+def _transient_reason(reason: str | None) -> bool:
+    return reason is not None and reason.endswith(("_probe_timeout", "_probe_failed"))
+
+
+def _fresh_cached_reason(backend: ExecutionBackendId) -> tuple[float, str | None] | None:
+    # Caller owns _PROBE_LOCK.
+    cached = _PROBE_CACHE.get(backend)
+    if cached is None:
+        return None
+    ttl = _PROBE_TRANSIENT_TTL_SECONDS if _transient_reason(cached[1]) else _PROBE_CACHE_TTL_SECONDS
+    return cached if time.monotonic() - cached[0] < ttl else None
+
+
+def _start_probe(backend: ExecutionBackendId) -> _Probe:
+    # Caller owns _PROBE_LOCK. At most one daemon worker per fixed backend ID,
+    # including across clear_cache; pending never certifies availability.
+    existing = _PROBE_IN_FLIGHT.get(backend)
+    if existing is not None:
+        return existing
+    probe = _Probe(_PROBE_GENERATION, threading.Event())
+    _PROBE_IN_FLIGHT[backend] = probe
+
+    def refresh() -> None:
+        try:
+            if backend == "systemd":
+                reason = _systemd_unavailable_reason()
+            elif backend == "docker":
+                reason = _docker_unavailable_reason()
+            else:
+                reason = remote_backend_unavailable_reason(backend)
+        except Exception:  # noqa: BLE001 - discovery errors never grant availability
+            reason = f"{backend}_probe_failed"
+        with _PROBE_LOCK:
+            probe.reason = reason
+            if probe.generation == _PROBE_GENERATION:
+                _PROBE_CACHE[backend] = (time.monotonic(), reason)
+            _PROBE_IN_FLIGHT.pop(backend, None)
+            probe.done.set()
+
+    try:
+        threading.Thread(target=refresh, name=f"backend-probe-{backend}", daemon=True).start()
+    except RuntimeError:
+        _PROBE_IN_FLIGHT.pop(backend, None)
+        probe.reason = f"{backend}_probe_failed"
+        _PROBE_CACHE[backend] = (time.monotonic(), probe.reason)
+        probe.done.set()
+    return probe
+
+
+def _cached_unavailable_reason(
+    backend: ExecutionBackendId, *, deadline: float | None = None,
+) -> str | None:
+    if deadline is None:
+        deadline = time.monotonic() + BROKER_PROBE_TIMEOUT_SECONDS + 1.0
+    while True:
+        with _PROBE_LOCK:
+            cached = _fresh_cached_reason(backend)
+            if cached is not None:
+                return cached[1]
+            probe = _start_probe(backend)
+        if not probe.done.wait(max(0.0, deadline - time.monotonic())):
+            return f"{backend}_probe_pending"
+        with _PROBE_LOCK:
+            if probe.generation == _PROBE_GENERATION:
+                # Return this caller's actual result even when its retry TTL is
+                # zero. Only subsequent callers should start a fresh attempt.
+                return probe.reason
+        if time.monotonic() >= deadline:
+            return f"{backend}_probe_pending"
 
 
 def _systemd_unavailable_reason() -> str | None:

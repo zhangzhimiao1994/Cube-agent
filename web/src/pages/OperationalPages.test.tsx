@@ -8097,6 +8097,26 @@ describe("operational management pages", () => {
     expect(screen.getByRole("region", { name: "主对话内容" })).not.toBeNull();
   });
 
+  it("keeps a preparing default backend selected without granting it availability", async () => {
+    const user = userEvent.setup();
+    visibleExecutionBackends = [
+      { ...executionBackends[0], available: false, reason: "systemd_probe_pending" },
+      executionBackends[1],
+    ];
+    render(<TestApp initialPath="/" />);
+    expect(await screen.findByRole("form", { name: "发送消息" })).not.toBeNull();
+    await openRunConfig(user);
+    await expandRunConfigDetails(user);
+    const selector = screen.getByLabelText("执行环境") as HTMLSelectElement;
+    await waitFor(() => expect(selector.value).toBe("systemd"));
+    expect((within(selector).getByRole("option", { name: "本机 systemd 隔离（准备中）" }) as HTMLOptionElement).disabled).toBe(true);
+    expect(screen.queryByText(/默认执行环境不可用，已自动切换/)).toBeNull();
+    visibleExecutionBackends = executionBackends;
+    await waitFor(() => expect((within(selector).getByRole("option", { name: "本机 systemd 隔离" }) as HTMLOptionElement).disabled).toBe(false), { timeout: 4000 });
+    expect(selector.value).toBe("systemd");
+    expect(requests.some((request) => request.path === "/api/v1/runs")).toBe(false);
+  });
+
   it("falls back to the first available execution backend when the configured default is unavailable", async () => {
     const user = userEvent.setup();
     visibleSettings = { ...settings, default_execution_backend: "docker" };

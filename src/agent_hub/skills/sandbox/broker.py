@@ -14,8 +14,10 @@ import struct
 import subprocess
 import tempfile
 import textwrap
+import time
 import uuid
 import zipfile
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast
@@ -23,6 +25,7 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 from pydantic import BaseModel, ConfigDict, model_validator
 
 from agent_hub.skills.sandbox.base import (
+    _TERMINATION_GRACE_SECONDS,
     SkillInvocation,
     SkillResult,
     run_subprocess_with_limits,
@@ -34,6 +37,7 @@ from agent_hub.skills.sandbox.project import (
     ProjectExecutionBroker,
     ProjectTerminateRequest,
 )
+from agent_hub.subprocess_cleanup import drain_and_reap_process
 
 if TYPE_CHECKING:
     from agent_hub.skills.sandbox.python_dependency_protocol import PythonDependencyClosureResponse
@@ -69,6 +73,13 @@ BrokerBackend = Literal["systemd", "docker"]
 _MAX_REQUEST_BYTES = 2_000_000
 _MAX_RESPONSE_BYTES = 22_000_000
 _FRAME_HEADER_BYTES = 4
+# Probe only: 2s startup allowance + the existing 10s Docker execution guard.
+# Cancellation inherits base.py's termination grace and up to 3x1s drain/reap.
+# Neither run/terminate requests nor their workload limits use this budget.
+_PROBE_WORK_SECONDS = 12.0
+_PROBE_CLEANUP_SECONDS = _TERMINATION_GRACE_SECONDS + 3.0
+BROKER_PROBE_TIMEOUT_SECONDS = _PROBE_WORK_SECONDS + _PROBE_CLEANUP_SECONDS + 1.0
+_PROBE_PROCESS_STARTED: ContextVar[bool | None] = ContextVar("probe_process_started", default=None)
 _SANDBOX_ROOT = "/run/agent-hub-skill"
 _LOGGER = logging.getLogger(__name__)
 
@@ -295,7 +306,9 @@ async def request_skill_broker(
         open_unix_connection = cast(Any, _module_attribute(asyncio, "open_unix_connection"))
     except AttributeError:
         raise OSError("Unix sockets are unavailable for the Skill broker") from None
-    timeout_seconds = request.invocation.timeout_seconds + 10 if request.invocation else 10
+    timeout_seconds: float = request.invocation.timeout_seconds + 10 if request.invocation else 10
+    if request.action == "probe":
+        timeout_seconds = BROKER_PROBE_TIMEOUT_SECONDS
     async with asyncio.timeout(timeout_seconds):
         reader, writer = await open_unix_connection(socket_path.as_posix())
         try:
@@ -311,18 +324,25 @@ def probe_skill_broker(
     backend: BrokerBackend,
     socket_path: Path = BROKER_SOCKET_PATH,
 ) -> str | None:
+    deadline = time.monotonic() + BROKER_PROBE_TIMEOUT_SECONDS
     try:
         address_family = _module_attribute(socket, "AF_UNIX")
         with socket.socket(address_family, socket.SOCK_STREAM) as client:
-            client.settimeout(6)
+            _set_probe_socket_timeout(client, deadline)
             client.connect(socket_path.as_posix())
             payload = BrokerRequest.probe(backend=backend).model_dump_json().encode("utf-8")
+            _set_probe_socket_timeout(client, deadline)
             client.sendall(struct.pack("!I", len(payload)) + payload)
-            header = _recv_exact(client, _FRAME_HEADER_BYTES)
+            header = _recv_exact(client, _FRAME_HEADER_BYTES, deadline=deadline)
             length = struct.unpack("!I", header)[0]
             if length < 1 or length > _MAX_RESPONSE_BYTES:
                 return f"{backend}_broker_invalid_response"
-            response = BrokerResponse.model_validate_json(_recv_exact(client, length), strict=True)
+            response = BrokerResponse.model_validate_json(
+                _recv_exact(client, length, deadline=deadline), strict=True
+            )
+            _set_probe_socket_timeout(client, deadline)
+    except TimeoutError:
+        return f"{backend}_broker_probe_timeout"
     except (AttributeError, OSError, ValueError):
         return f"{backend}_broker_unavailable"
     if response.ok:
@@ -340,6 +360,20 @@ async def request_systemd_broker(
 
 def probe_systemd_broker(socket_path: Path = BROKER_SOCKET_PATH) -> str | None:
     return probe_skill_broker("systemd", socket_path)
+
+
+async def _await_probe_cleanup(recovery: asyncio.Task[None]) -> None:
+    cancellation: asyncio.CancelledError | None = None
+    while not recovery.done():
+        try:
+            await asyncio.shield(recovery)
+        except asyncio.CancelledError as error:
+            cancellation = error
+        except Exception:  # noqa: BLE001 - retrieve the owned cleanup failure below
+            break
+    recovery.result()
+    if cancellation is not None:
+        raise cancellation
 
 
 class SkillBroker:
@@ -422,13 +456,16 @@ class SkillBroker:
             )
         else:
             command = build_broker_systemd_command(invocation, self._policy)
+        def process_started(process: asyncio.subprocess.Process) -> None:
+            self._processes[invocation.execution_id] = process
+            if _PROBE_PROCESS_STARTED.get() is not None:
+                _PROBE_PROCESS_STARTED.set(True)
+
         try:
             return await run_subprocess_with_limits(
                 command,
                 invocation,
-                process_started=lambda process: self._processes.__setitem__(
-                    invocation.execution_id, process
-                ),
+                process_started=process_started,
                 on_forced_terminate=lambda: self._terminate(invocation.execution_id, backend),
             )
         finally:
@@ -491,9 +528,18 @@ class SkillBroker:
             raise failure
 
     async def _probe(self, backend: BrokerBackend) -> BrokerResponse:
-        if backend == "docker":
-            return await self._probe_docker()
-        return await self._probe_systemd()
+        # Includes subprocess startup. Owned-resource cancellation is allowed to
+        # finish its existing bounded cleanup before reporting the probe timeout.
+        token = _PROBE_PROCESS_STARTED.set(False)
+        try:
+            async with asyncio.timeout(_PROBE_WORK_SECONDS):
+                if backend == "docker":
+                    return await self._probe_docker()
+                return await self._probe_systemd()
+        except TimeoutError:
+            return BrokerResponse(ok=False, error=f"{backend}_broker_probe_timeout")
+        finally:
+            _PROBE_PROCESS_STARTED.reset(token)
 
     async def _probe_docker(self) -> BrokerResponse:
         try:
@@ -524,11 +570,25 @@ class SkillBroker:
                     sandbox_profile="read_only",
                     writable_tmp_path=workdir,
                 )
-                result = await self._run(invocation, "docker")
-        except (OSError, TimeoutError, ValueError):
+                try:
+                    result = await self._run(invocation, "docker")
+                except asyncio.CancelledError:
+                    if _PROBE_PROCESS_STARTED.get() is False:
+                        # base.py has no owned process before startup returns.
+                        # Reclaim the fixed probe container even in that window,
+                        # before deleting its temporary package/workspace.
+                        await _await_probe_cleanup(asyncio.create_task(
+                            self._terminate(invocation.execution_id, "docker")
+                        ))
+                    raise
+        except TimeoutError:
+            return BrokerResponse(ok=False, error="docker_broker_probe_timeout")
+        except (OSError, ValueError):
             _LOGGER.exception("Docker Skill broker probe could not start the runner")
             return BrokerResponse(ok=False, error="docker_broker_unavailable")
-        if result.timed_out or result.exit_code != 0:
+        if result.timed_out:
+            return BrokerResponse(ok=False, error="docker_broker_probe_timeout")
+        if result.exit_code != 0:
             detail = result.stderr.casefold()
             if "no such image" in detail or "not found" in detail:
                 return BrokerResponse(ok=False, error="docker_runner_image_not_found")
@@ -543,7 +603,8 @@ class SkillBroker:
         return BrokerResponse(ok=True)
 
     async def _probe_systemd(self) -> BrokerResponse:
-        unit = f"agent-hub-skill-probe-{uuid.uuid4().hex[:12]}"
+        execution_id = f"probe-{uuid.uuid4().hex[:12]}"
+        unit = f"agent-hub-skill-{execution_id}"
         command = (
             self._policy.systemd_run,
             "--wait",
@@ -565,6 +626,7 @@ class SkillBroker:
             "RuntimeMaxSec=5s",
             "/usr/bin/true",
         )
+        process: asyncio.subprocess.Process | None = None
         try:
             process = await asyncio.create_subprocess_exec(
                 *command,
@@ -572,9 +634,33 @@ class SkillBroker:
                 stderr=asyncio.subprocess.PIPE,
             )
             _, stderr = await asyncio.wait_for(process.communicate(), timeout=6)
-        except (OSError, TimeoutError):
+        except asyncio.CancelledError:
+            if process is None:
+                # Startup cancellation may precede a Process handle; the fixed
+                # transient unit still needs a bounded termination attempt.
+                await _await_probe_cleanup(asyncio.create_task(
+                    self._terminate(execution_id, "systemd")
+                ))
+            raise
+        except TimeoutError:
+            return BrokerResponse(ok=False, error="systemd_broker_probe_timeout")
+        except OSError:
             _LOGGER.exception("systemd Skill broker probe could not start a transient unit")
             return BrokerResponse(ok=False, error="systemd_transient_unit_unavailable")
+        finally:
+            if process is not None and process.returncode is None:
+                async def cleanup() -> None:
+                    self._processes[execution_id] = process
+                    try:
+                        try:
+                            await self._terminate(execution_id, "systemd")
+                        finally:
+                            await drain_and_reap_process(process)
+                    finally:
+                        self._processes.pop(execution_id, None)
+
+                # _terminate (5+1s) and drain/reap (3x1s) are bounded.
+                await _await_probe_cleanup(asyncio.create_task(cleanup()))
         if process.returncode != 0:
             detail = stderr.decode("utf-8", errors="replace").strip()
             _LOGGER.warning("systemd Skill broker probe failed: %s", detail or "no stderr")
@@ -855,9 +941,17 @@ async def _read_frame(reader: asyncio.StreamReader, limit: int) -> bytes:
     return await reader.readexactly(length)
 
 
-def _recv_exact(client: socket.socket, length: int) -> bytes:
+def _set_probe_socket_timeout(client: socket.socket, deadline: float) -> None:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("Skill broker probe deadline expired")
+    client.settimeout(remaining)
+
+
+def _recv_exact(client: socket.socket, length: int, *, deadline: float) -> bytes:
     chunks = bytearray()
     while len(chunks) < length:
+        _set_probe_socket_timeout(client, deadline)
         chunk = client.recv(length - len(chunks))
         if not chunk:
             raise OSError("broker connection closed")

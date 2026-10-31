@@ -7,20 +7,22 @@ import socket
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import httpx
 import pytest
 
 from agent_hub.app import create_app
 from agent_hub.auth.models import AuthenticatedPrincipal, Role
+from agent_hub.config.repository import ConfigRevision, ConfigStatus
+from agent_hub.config.service import ConfigService
 from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.runs.conversations import ConversationRecord
 from agent_hub.runs.service import RunService
 from agent_hub.runtime.defaults import UnavailableRuntime
 from agent_hub.runtime.registry import RuntimeRegistry
+from agent_hub.security.secrets import SecretService
 from tests.api.test_runs_api import StubAuthService, bearer
 from tests.unit.runs.test_conversation_mode import (
     ConversationMetadataRepository,
@@ -233,10 +235,18 @@ async def test_ordinary_delivery_reaches_real_factory_request_and_workspace_writ
     for agent in document['agents']:
         agent['model'] = 'deepseek'
 
-    class Configs:
-        async def get_current(self, tenant: Any) -> Any:
-            assert tenant == principal.tenant_id
-            return SimpleNamespace(version=1, document=document)
+    class Configs(ConfigService):
+        def __init__(self) -> None:
+            pass
+
+        async def get_current(self, tenant_id: UUID) -> ConfigRevision:
+            assert tenant_id == principal.tenant_id
+            return ConfigRevision(id=uuid4(), tenant_id=tenant_id, version=1,
+                status=ConfigStatus.PUBLISHED, document=document, created_by=principal.user_id,
+                created_at=datetime.now(UTC))
+
+    class Secrets(FakeSecretService, SecretService):
+        """Retain the existing local secret IO seam under the service contract."""
 
     content = 'def total(values):\n    return sum(values)\n'
     requests: list[ModelRequest] = []
@@ -268,7 +278,7 @@ async def test_ordinary_delivery_reaches_real_factory_request_and_workspace_writ
         return value
 
     runtime = ConfigBackedDirectRuntime(
-        config_service=Configs(), secret_service=FakeSecretService(),
+        config_service=Configs(), secret_service=Secrets(),
         capacity_factory=capacity, transport=Transport(),
         capability_gateway=stack.runtime_gateway, harness_tool_gateway=stack.harness_tool_gateway,
         action_capability_gateway=stack.runtime_gateway,

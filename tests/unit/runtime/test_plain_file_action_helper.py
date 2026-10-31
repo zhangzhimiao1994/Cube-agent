@@ -1,6 +1,7 @@
 """Shared plain-note input and local-only capacity boundary; no native grant."""
 
 import json
+from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
@@ -8,9 +9,10 @@ from uuid import uuid4
 from agent_hub.api.routers.runs import CreateRunRequest
 from agent_hub.domain.runs import TaskMode
 from agent_hub.models.capacity import CapacityLease
+from agent_hub.models.types import Deployment
 
 
-def plain_note_submission():
+def plain_note_submission() -> tuple[CreateRunRequest, str, str]:
     timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     path = f"plain-note-{timestamp}.txt"
     content = "A plain note saved at the user's explicit request.\n"
@@ -36,17 +38,20 @@ def plain_note_submission():
 class LocalCapacityBoundary:
     """Explicit no-Redis diagnostic seam; never a native CapacityPool proof."""
 
-    def __init__(self):
-        self.acquired = []
-        self.released = []
+    def __init__(self) -> None:
+        self.acquired: list[CapacityLease] = []
+        self.released: list[CapacityLease] = []
 
-    async def initialize(self):
+    async def initialize(self) -> None:
         pass
 
-    def validate_configuration(self, deployments):
+    def validate_configuration(self, deployments: Sequence[Deployment]) -> None:
         self.deployments = tuple(deployments)
 
-    async def acquire(self, candidates, wait_timeout, *, estimated_tokens):
+    async def acquire(
+        self, candidates: Sequence[Deployment], wait_timeout: float,
+        *, estimated_tokens: int | Mapping[str, int],
+    ) -> CapacityLease:
         selected = candidates[0]
         lease = CapacityLease(
             str(uuid4()),
@@ -58,12 +63,15 @@ class LocalCapacityBoundary:
         self.acquired.append(lease)
         return lease
 
-    async def release(self, lease):
+    async def release(self, lease: CapacityLease) -> bool:
         self.released.append(lease)
         return True
 
-    async def renew(self, lease):
+    async def renew(self, lease: CapacityLease) -> CapacityLease:
         return replace(lease, expires_at=datetime.now(UTC) + timedelta(seconds=120))
 
-    async def record_outcome(self, quota_scope_id, *, status_code, latency_seconds, succeeded):
+    async def record_outcome(
+        self, quota_scope_id: str, *, status_code: int | None,
+        latency_seconds: float, succeeded: bool,
+    ) -> None:
         pass

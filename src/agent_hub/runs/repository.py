@@ -161,6 +161,7 @@ def _repair_routing_sha256(route: Mapping[str, JsonValue]) -> str:
 
 
 class _PythonApprovalOptions(TypedDict, total=False):
+    python_resolution_binding: dict[str, object]
     python_binding: dict[str, object]
     python_input_binding: dict[str, object]
     toolchain_input_binding: dict[str, object]
@@ -169,6 +170,7 @@ class _PythonApprovalOptions(TypedDict, total=False):
 
 
 class _ToolchainReviewOptions(TypedDict, total=False):
+    python_resolution_binding: dict[str, object]
     approval_scope: str
     toolchain_input_binding: dict[str, object]
     go_recipe_binding: dict[str, object]
@@ -1481,6 +1483,29 @@ class RunRepository:
         return user
 
     @staticmethod
+    async def _require_resolution_manual_approval(
+        session: AsyncSession, row: RunRow, *, approval_id: str, fingerprint: str, scope: str = 'once',
+    ) -> bool:
+        approval_scope = (row.routing_decision or {}).get('approval_scope')
+        if not isinstance(approval_scope, str) or 'resource=workspace/current/project-resolution/' not in approval_scope:
+            return False
+        from agent_hub.capabilities.python_resolution_authorization import (
+            resolution_binding_matches,
+        )
+
+        stored = await session.scalar(select(RunApprovalRow).where(
+            RunApprovalRow.tenant_id == row.tenant_id, RunApprovalRow.run_id == row.id,
+            RunApprovalRow.approval_id == approval_id,
+        ).with_for_update())
+        if (scope != 'once' or stored is None or stored.status != 'pending'
+                or stored.payload.get('approval_fingerprint') != fingerprint
+                or stored.payload.get('approval_scope') != approval_scope
+                or not resolution_binding_matches(RunRepository._record(row),
+                    stored.payload.get('python_resolution_binding'), approval_scope)):
+            raise RunConflict('resolution approval scope changed')
+        return True
+
+    @staticmethod
     async def _revalidate_metadata_manual_approval(
         session: AsyncSession, row: RunRow, *, approval_id: str, fingerprint: str, grant: bool,
     ) -> dict[str, object] | None:
@@ -2532,6 +2557,17 @@ class RunRepository:
                 conversation_binding = conversation_approval_binding(row, approval_request)
             toolchain_binding = None
             metadata_binding = None
+            resolution_binding = None
+            if isinstance(approval_scope, str) and 'resource=workspace/current/project-resolution/' in approval_scope:
+                from agent_hub.capabilities.approvals import capability_approval_scope
+                from agent_hub.capabilities.python_resolution_authorization import (
+                    resolution_approval_binding,
+                )
+
+                if (approval_request is None or plugin_identity is not None
+                        or capability_approval_scope(approval_request) != approval_scope):
+                    raise RunConflict('resolution approval request binding is invalid')
+                resolution_binding = resolution_approval_binding(self._record(row), approval_request)
             if _is_metadata_preparation_scope(approval_scope):
                 from agent_hub.capabilities.approvals import fingerprint_capability_request
                 from agent_hub.capabilities.python_metadata_preparation import (
@@ -2566,6 +2602,8 @@ class RunRepository:
             checkpoint_required = _has_generated_preparation(routing_decision) or (
                 approval_worker_token is not None and not original_capture)
             python_options: _PythonApprovalOptions = {}
+            if resolution_binding is not None:
+                python_options['python_resolution_binding'] = resolution_binding
             if metadata_binding is not None:
                 python_options['python_metadata_binding'] = metadata_binding
             if go_scope:
@@ -2587,7 +2625,7 @@ class RunRepository:
                 python_options['toolchain_input_binding'] = toolchain_binding
             if toolchain_authority is not None:
                 toolchain_authority.require_current(self._record(row), tenant_id, run_id)
-            if go_recipe_authority is not None or metadata_binding is not None:
+            if go_recipe_authority is not None or metadata_binding is not None or resolution_binding is not None:
                 # The approval INSERT may wait on its row/unique constraint. Keep
                 # the run lease intact until that await and its second fence pass.
                 await self._upsert_capability_approval(
@@ -2599,6 +2637,10 @@ class RunRepository:
                 if (metadata_binding is not None and metadata_binding
                         != _metadata_approval_binding(row, approval_scope, planned=True, live=True)):
                     raise RunConflict('metadata preparation approval scope changed')
+                if resolution_binding is not None:
+                    assert approval_request is not None
+                    if resolution_approval_binding(self._record(row), approval_request) != resolution_binding:
+                        raise RunConflict('resolution approval scope changed')
             row.status = RunStatus.WAITING_APPROVAL.value
             self.clear_worker_lease(row)
             row.routing_decision = {
@@ -2613,7 +2655,7 @@ class RunRepository:
                 **({"approval_scope": approval_scope} if approval_scope else {}),
             }
             row.version += 1
-            if go_recipe_authority is None and metadata_binding is None:
+            if go_recipe_authority is None and metadata_binding is None and resolution_binding is None:
                 await self._upsert_capability_approval(
                     session,
                     tenant_id,
@@ -2691,6 +2733,8 @@ class RunRepository:
             if metadata_binding is not None and status is RunStatus.RUNNING:
                 await self._revalidate_metadata_manual_approval(session, row,
                     approval_id=approval_id, fingerprint=approval_fingerprint, grant=True)
+            resolution_grant = status is RunStatus.RUNNING and await self._require_resolution_manual_approval(
+                session, row, approval_id=approval_id, fingerprint=approval_fingerprint)
             row.status = status.value
             self.clear_worker_lease(row)
             row.routing_decision = {
@@ -2712,6 +2756,7 @@ class RunRepository:
                 approval_scope=_optional_string(routing_decision.get("approval_scope")),
                 status="approved" if status is RunStatus.RUNNING else "rejected",
                 resolution_version=row.version,
+                decision_scope='once' if resolution_grant else None,
                 **go_options,
             )
             await session.flush()
@@ -2729,6 +2774,7 @@ class RunRepository:
         status: str,
         toolchain_authority: ToolchainSupplyAuthority | None = None,
         approval_scope: str | None = None,
+        approval_request: CapabilityRequest | None = None,
         go_recipe_authority: ToolchainSupplyAuthority | None = None,
         expected_go_recipe: Mapping[str, object] | None = None,
     ) -> RunRecord:
@@ -2761,6 +2807,22 @@ class RunRepository:
             if row is None:
                 raise RunNotFound("run was not found")
             toolchain_options: _ToolchainReviewOptions = {}
+            resolution_binding = None
+            if isinstance(approval_scope, str) and 'resource=workspace/current/project-resolution/' in approval_scope:
+                from agent_hub.capabilities.approvals import (
+                    capability_approval_scope,
+                    fingerprint_capability_request,
+                )
+                from agent_hub.capabilities.python_resolution_authorization import (
+                    resolution_approval_binding,
+                )
+
+                if (approval_request is None or capability_approval_scope(approval_request) != approval_scope
+                        or fingerprint_capability_request(approval_request) != approval_fingerprint):
+                    raise RunConflict('resolution review request binding is invalid')
+                toolchain_options['approval_scope'] = approval_scope
+                resolution_binding = resolution_approval_binding(self._record(row), approval_request)
+                toolchain_options['python_resolution_binding'] = resolution_binding
             metadata_binding = None
             if _is_metadata_preparation_scope(approval_scope):
                 metadata_binding = _metadata_approval_binding(row, approval_scope, planned=True, live=True)
@@ -2796,8 +2858,29 @@ class RunRepository:
             if (metadata_binding is not None and metadata_binding
                     != _metadata_approval_binding(row, approval_scope, planned=True, live=True)):
                 raise RunConflict('metadata preparation approval scope changed')
+            if resolution_binding is not None:
+                assert approval_request is not None
+                if resolution_approval_binding(self._record(row), approval_request) != resolution_binding:
+                    raise RunConflict('resolution review scope changed')
             await session.flush()
             return self._record(row)
+
+    @staticmethod
+    def _resolution_approval_matches(run: RunRow, row: RunApprovalRow) -> bool:
+        from agent_hub.capabilities.python_resolution_authorization import (
+            resolution_binding_matches,
+        )
+
+        fingerprint = row.payload.get('approval_fingerprint')
+        if (run.tenant_id != row.tenant_id or run.id != row.run_id or row.status != 'approved'
+                or type(fingerprint) is not str or re.fullmatch(r'[a-f0-9]{64}', fingerprint) is None):
+            return False
+        manual = row.action == 'capability_tool' and row.payload.get('decision_scope') == 'once'
+        automatic = (row.action == 'capability_tool.auto_review' and 'decision_scope' not in row.payload
+            and type(row.payload.get('reviewer')) is str and bool(row.payload['reviewer'])
+            and row.approval_id == 'auto_review_' + hashlib.sha256(fingerprint.encode()).hexdigest()[:24])
+        return (manual or automatic) and resolution_binding_matches(RunRepository._record(run),
+            row.payload.get('python_resolution_binding'), row.payload.get('approval_scope'))
 
     async def is_capability_approval_approved(
         self,
@@ -2825,6 +2908,13 @@ class RunRepository:
                 if (tool_origin is not None and "approval_origin" in row.payload
                     and row.payload["approval_origin"] != tool_origin):
                     continue
+                approval_scope = row.payload.get('approval_scope')
+                if ('python_resolution_binding' in row.payload or isinstance(approval_scope, str)
+                        and 'resource=workspace/current/project-resolution/' in approval_scope):
+                    run = await session.scalar(self._run_select(tenant_id, run_id))
+                    if run is not None and self._resolution_approval_matches(run, row):
+                        return True
+                    continue
                 if _is_go_recipe_scope(row.payload.get('approval_scope')) or 'go_recipe_binding' in row.payload:
                     continue
                 if (_is_metadata_preparation_scope(row.payload.get('approval_scope'))
@@ -2848,6 +2938,8 @@ class RunRepository:
         run_id: UUID,
         approval_scope: str,
     ) -> bool:
+        if type(approval_scope) is not str:
+            return False
         async with self._session_factory() as session:
             rows = (
                 await session.scalars(
@@ -2860,6 +2952,12 @@ class RunRepository:
             ).all()
             for row in rows:
                 if row.payload.get('approval_scope') != approval_scope:
+                    continue
+                if ('python_resolution_binding' in row.payload
+                        or 'resource=workspace/current/project-resolution/' in approval_scope):
+                    run = await session.scalar(self._run_select(tenant_id, run_id))
+                    if run is not None and self._resolution_approval_matches(run, row):
+                        return True
                     continue
                 if ("decision_scope" in row.payload and not any(key in row.payload for key in (
                     "python_binding", "python_input_binding", "toolchain_input_binding", "go_recipe_binding",
@@ -3038,6 +3136,8 @@ class RunRepository:
             await self._require_capability_approval_checkpoint(
                 session, row, routing_decision, approval_id=approval_id,
             )
+            await self._require_resolution_manual_approval(session, row, approval_id=approval_id,
+                fingerprint=approval_fingerprint, scope=scope)
             if metadata_binding is not None:
                 await self._revalidate_metadata_manual_approval(session, row,
                     approval_id=approval_id, fingerprint=approval_fingerprint, grant=True)
@@ -3926,6 +4026,7 @@ class RunRepository:
         toolchain_input_binding: dict[str, object] | None = None,
         go_recipe_binding: dict[str, object] | None = None,
         python_metadata_binding: dict[str, object] | None = None,
+        python_resolution_binding: dict[str, object] | None = None,
         conversation_binding: dict[str, object] | None = None,
         approval_origin: str | None = None,
         request_version: int | None = None,
@@ -3944,6 +4045,7 @@ class RunRepository:
             **({'toolchain_input_binding': toolchain_input_binding} if toolchain_input_binding is not None else {}),
             **({'go_recipe_binding': go_recipe_binding} if go_recipe_binding is not None else {}),
             **({'python_metadata_binding': python_metadata_binding} if python_metadata_binding is not None else {}),
+            **({'python_resolution_binding': python_resolution_binding} if python_resolution_binding is not None else {}),
             **({"conversation_binding": conversation_binding} if conversation_binding is not None else {}),
             **({"approval_origin": approval_origin} if approval_origin is not None else {}),
             **({"decision_scope": decision_scope} if decision_scope is not None else {}),
@@ -4010,6 +4112,7 @@ class RunRepository:
         toolchain_input_binding: dict[str, object] | None = None,
         go_recipe_binding: dict[str, object] | None = None,
         python_metadata_binding: dict[str, object] | None = None,
+        python_resolution_binding: dict[str, object] | None = None,
     ) -> None:
         payload: dict[str, object] = {
             "approval_id": approval_id,
@@ -4018,6 +4121,8 @@ class RunRepository:
             "reviewer": reviewer,
             "reason": reason,
             "status": status,
+            **({'approval_scope': approval_scope, 'python_resolution_binding': python_resolution_binding}
+               if python_resolution_binding is not None else {}),
             **({'approval_scope': approval_scope, 'toolchain_input_binding': toolchain_input_binding}
                if toolchain_input_binding is not None else {}),
             **({'approval_scope': approval_scope, 'go_recipe_binding': go_recipe_binding}
@@ -4287,6 +4392,17 @@ def _public_plugin_approval_events(
                     'approval_scope': approval.payload['approval_scope'],
                 })
         elif "public_binding" not in approval.payload and isinstance(run.actor_id, UUID):
+            from agent_hub.capabilities.python_resolution_authorization import (
+                resolution_binding_matches,
+                resolution_scope_resource,
+            )
+
+            resolution_resource = resolution_scope_resource(approval.payload.get('approval_scope'),
+                tenant_id=run.tenant_id, user_id=run.actor_id, run_id=run.id)
+            if resolution_resource is not None and resolution_binding_matches(RunRepository._record(run),
+                    approval.payload.get('python_resolution_binding'), approval.payload.get('approval_scope')):
+                public_binding.update({'capability': 'command', 'operation': 'run',
+                    'resource': resolution_resource, 'approval_scope': approval.payload['approval_scope']})
             for capability, operation, resource in (
                 ("file", "write", "workspace/current"),
                 ("command", "run", "workspace/current/project-verification"),

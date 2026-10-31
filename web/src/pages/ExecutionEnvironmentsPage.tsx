@@ -1,6 +1,5 @@
-import { useQuery } from "@tanstack/react-query";
-
-import { api, formatApiError, type ExecutionBackend } from "../api/client";
+import { formatApiError, type ExecutionBackend } from "../api/client";
+import { isExecutionBackendPending, useExecutionBackends } from "./useExecutionBackends";
 
 const REASON_TEXT: Record<string, string> = {
   systemd_tools_not_found: "服务器未安装 systemd-run 或 systemctl。",
@@ -31,14 +30,12 @@ const REASON_TEXT: Record<string, string> = {
 
 function backendStatusText(backend: ExecutionBackend) {
   if (backend.available) return "可用";
+  if (isExecutionBackendPending(backend)) return "准备中";
   return backend.reason ? REASON_TEXT[backend.reason] ?? `不可用：${backend.reason}` : "不可用";
 }
 
 export function ExecutionEnvironmentsPage() {
-  const backends = useQuery({
-    queryKey: ["execution-backends"],
-    queryFn: () => api.executionBackends(),
-  });
+  const backends = useExecutionBackends();
 
   if (backends.isLoading) return <p>正在探测执行环境...</p>;
   if (backends.isError) {
@@ -47,6 +44,7 @@ export function ExecutionEnvironmentsPage() {
 
   const items = backends.data ?? [];
   const availableCount = items.filter((item) => item.available).length;
+  const pendingCount = items.filter(isExecutionBackendPending).length;
 
   return (
     <section>
@@ -64,9 +62,10 @@ export function ExecutionEnvironmentsPage() {
         </article>
         <article className="status-card">
           <span>不可用</span>
-          <p>{items.length - availableCount} 个</p>
+          <p>{items.length - availableCount - pendingCount} 个</p>
         </article>
       </div>
+      {pendingCount > 0 ? <p role="status">{pendingCount} 个执行环境准备中，正在确认可用状态。</p> : null}
 
       <div className="card-grid execution-environment-grid" aria-label="执行环境列表">
         {items.map((backend) => (
@@ -76,7 +75,7 @@ export function ExecutionEnvironmentsPage() {
                 <p className="eyebrow">{backend.adapter}</p>
                 <h3>{backend.name}</h3>
               </div>
-              <span className={`status-pill ${backend.available ? "success" : "danger"}`}>
+              <span className={`status-pill ${backend.available ? "success" : isExecutionBackendPending(backend) ? "warning" : "danger"}`}>
                 {backendStatusText(backend)}
               </span>
             </div>

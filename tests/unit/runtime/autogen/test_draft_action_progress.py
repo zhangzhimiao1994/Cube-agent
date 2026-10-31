@@ -3,13 +3,15 @@
 import asyncio
 import hashlib
 import json
-from collections.abc import Mapping
+from collections.abc import AsyncGenerator, Mapping
 from decimal import Decimal
-from uuid import uuid4
+from typing import TypeGuard
+from uuid import UUID, uuid4
 
 import pytest
 
-from agent_hub.harness.types import HarnessToolCallResult
+from agent_hub.auth.models import Role
+from agent_hub.harness.types import HarnessToolCallRequest, HarnessToolCallResult
 from agent_hub.models.gateway import GatewayCompletion
 from agent_hub.models.types import ModelRequest, ModelResponse, TokenUsage, ToolCall
 from agent_hub.runtime.artifacts import InMemoryArtifactRepository
@@ -22,7 +24,14 @@ from agent_hub.runtime.autogen.engineering_delivery import (
     engineering_delivery_ready,
     engineering_progress,
 )
-from agent_hub.runtime.contracts import Artifact, EventKind, JsonValue, TaskContext, _mutable_json
+from agent_hub.runtime.contracts import (
+    Artifact,
+    EventKind,
+    JsonValue,
+    TaskContext,
+    _freeze_object,
+    _mutable_json,
+)
 from agent_hub.runtime.engineering_actions import required_engineering_action
 from tests.unit.runtime.test_generated_draft_autogen import (
     EMPTY_HASH,
@@ -35,6 +44,15 @@ from tests.unit.runtime.test_generated_draft_autogen import (
 ALLOWED = {"implementer": (*TOOLS, "project.inspect")}
 
 
+def _string_keyed_dict(value: object) -> TypeGuard[dict[str, object]]:
+    return isinstance(value, dict) and all(isinstance(key, str) for key in value)
+
+
+def mutable_object(value: object) -> dict[str, object]:
+    assert _string_keyed_dict(value)
+    return value
+
+
 def action_context() -> TaskContext:
     ctx = context()
     return ctx.model_copy(update={"routing_decision": {
@@ -43,7 +61,10 @@ def action_context() -> TaskContext:
     }})
 
 
-def append(ctx, rows, artifacts, artifact, *, status="succeeded") -> None:
+def append(
+    ctx: TaskContext, rows: list[dict[str, JsonValue]], artifacts: list[Artifact],
+    artifact: Artifact, *, status: str = "succeeded",
+) -> None:
     position = len(rows)
     name = artifact.content["tool_name"]
     args = artifact.content["arguments_sha256"]
@@ -63,9 +84,10 @@ def result(name: str, value: dict[str, JsonValue]) -> Artifact:
     })
 
 
-def draft_case():
+def draft_case() -> tuple[TaskContext, list[dict[str, JsonValue]], list[Artifact]]:
     ctx = action_context()
-    rows, artifacts = [], []
+    rows: list[dict[str, JsonValue]] = []
+    artifacts: list[Artifact] = []
     append(ctx, rows, artifacts, result("project.inspect", {
         "schema_version": 1, "scope": {"tenant_id": str(ctx.tenant_id),
             "run_id": str(ctx.run_id), "project_id": "draft-project",
@@ -76,10 +98,11 @@ def draft_case():
         "path": "ACCEPTANCE.json", "sha256": "b" * 64, "size_bytes": 10,
     }))
     draft = draft_artifact(ctx)
-    content = _mutable_json(draft.content)
-    content["result"]["generated_draft_rejection"].update(
+    content = mutable_object(_mutable_json(draft.content))
+    mutable_object(mutable_object(content["result"])["generated_draft_rejection"]).update(
         reason="generated_acceptance_manifest_required", issues=["manifest_missing"])
-    draft = Artifact(id=draft.id, type=draft.type, producer=draft.producer, content=content)
+    draft = Artifact(id=draft.id, type=draft.type, producer=draft.producer,
+                     content=_freeze_object(content, name="artifact content"))
     append(ctx, rows, artifacts, draft, status="failed")
     return ctx, rows, artifacts
 
@@ -119,8 +142,9 @@ def test_valid_draft_is_failed_observation_until_actual_productive_write() -> No
 def test_corrupt_draft_never_becomes_recoverable_progress(defect: str) -> None:
     ctx, rows, artifacts = draft_case()
     original = artifacts[-1]
-    content = _mutable_json(original.content)
-    rejection = content["result"]["generated_draft_rejection"]
+    content = mutable_object(_mutable_json(original.content))
+    outcome = mutable_object(content["result"])
+    rejection = mutable_object(outcome["generated_draft_rejection"])
     fields = {"actor": "proposer_actor", "tenant": "tenant_id", "user": "user_id",
               "run": "run_id", "request": "request_sha256", "project": "project_id",
               "session": "session_id"}
@@ -134,15 +158,16 @@ def test_corrupt_draft_never_becomes_recoverable_progress(defect: str) -> None:
         rows[-1]["idempotency_key"] = hashlib.sha256(
             f"{ctx.run_id}:implementer:2:project.verify:{'d' * 64}".encode()).hexdigest()
     elif defect == "truncated":
-        content["result"]["truncated"] = True
+        outcome["truncated"] = True
     elif defect in {"execution_started", "phase"}:
         rejection[defect] = True if defect == "execution_started" else "captured"
     elif defect == "extra":
-        content["result"]["approval_id"] = str(uuid4())
+        outcome["approval_id"] = str(uuid4())
     elif defect in {"succeeded", "running", "UNKNOWN"}:
         rows[-1]["status"] = defect
     changed = Artifact(id=original.id, type=original.type,
-        producer="other" if defect == "producer" else original.producer, content=content)
+        producer="other" if defect == "producer" else original.producer,
+        content=_freeze_object(content, name="artifact content"))
     artifacts[-1] = changed
     rows[-1]["artifact_sha256"] = "f" * 64 if defect == "sha" else changed.content_sha256
     if defect == "content_sha":
@@ -162,33 +187,39 @@ async def test_real_action_v1_runtime_receives_manifest_missing_then_writes_corr
     correction_seen = False
 
     class NativeDraftGateway(DraftGateway):
-        def is_available(self, tenant_id, name):
+        def is_available(self, tenant_id: UUID, name: str) -> bool:
             return tenant_id == ctx.tenant_id and name in ALLOWED["implementer"]
 
-        async def invoke(self, tenant_id, request, *, user_id=None, role=None):
+        async def invoke(
+            self, tenant_id: UUID, request: HarnessToolCallRequest,
+            *, user_id: UUID | None = None, role: Role | None = None,
+        ) -> HarnessToolCallResult:
             assert tenant_id == ctx.tenant_id and user_id == ctx.actor_id and role == ctx.actor_role
             if request.tool_name == "project.verify":
                 row = await super().invoke(tenant_id, request, user_id=user_id, role=role)
-                payload = _mutable_json(row.payload)
-                payload["generated_draft_rejection"].update(
+                payload = mutable_object(_mutable_json(row.payload))
+                mutable_object(payload["generated_draft_rejection"]).update(
                     reason="generated_acceptance_manifest_required", issues=["manifest_missing"])
                 return HarnessToolCallResult(call_id=row.call_id, tool_name=row.tool_name,
-                    status=row.status, failure_reason=row.failure_reason, payload=payload)
+                    status=row.status, failure_reason=row.failure_reason,
+                    payload=_freeze_object(payload, name="tool payload"))
             self.calls.append(request)
             if request.tool_name == "project.inspect":
-                payload = _mutable_json(draft_case_for_context(ctx))
+                payload = mutable_object(_mutable_json(draft_case_for_context(ctx)))
             else:
                 assert request.tool_name == "workspace.write_text"
                 text = request.arguments["content"]
+                assert isinstance(text, str)
                 payload = {"path": request.arguments["path"],
                            "sha256": hashlib.sha256(text.encode()).hexdigest(),
                            "size_bytes": len(text.encode())}
             return HarnessToolCallResult(call_id=request.call_id, tool_name=request.tool_name,
-                                         status="succeeded", payload=payload)
+                                         status="succeeded",
+                                         payload=_freeze_object(payload, name="tool payload"))
 
     class Model:
-        def __init__(self):
-            self.requests = []
+        def __init__(self) -> None:
+            self.requests: list[ModelRequest] = []
             self.stage = 0
 
         async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
@@ -205,7 +236,8 @@ async def test_real_action_v1_runtime_receives_manifest_missing_then_writes_corr
                 if stage == 3:
                     for message in request.messages:
                         prefix = "UNTRUSTED_CAPABILITY_RESULTS_JSON="
-                        if message.role == "user" and str(message.content).startswith(prefix):
+                        if (message.role == "user" and isinstance(message.content, str)
+                                and message.content.startswith(prefix)):
                             for item in json.loads(message.content[len(prefix):]):
                                 try:
                                     value = json.loads(item["content"].removeprefix("Error: "))
@@ -235,6 +267,7 @@ async def test_real_action_v1_runtime_receives_manifest_missing_then_writes_corr
         harness_tool_gateway=gateway, artifact_repository=InMemoryArtifactRepository())
     events = []
     stream = runner.run(ctx)
+    assert isinstance(stream, AsyncGenerator)
     try:
         async with asyncio.timeout(10):
             async for event in stream:

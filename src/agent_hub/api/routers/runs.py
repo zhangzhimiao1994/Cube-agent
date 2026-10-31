@@ -1351,10 +1351,15 @@ async def create_run(
         body = await _resolve_permission_selection(request, principal, body)
         execution_backend = body.execution_backend or await _default_execution_backend(request)
         if body.execution_backend is not None:
+            probe_options = (
+                {} if body.runtime_timeout_seconds is None
+                else {"timeout_seconds": body.runtime_timeout_seconds}
+            )
             unavailable_reason = await asyncio.to_thread(
                 execution_backend_unavailable_reason,
                 execution_backend,
                 body.sandbox_profile,
+                **probe_options,
             )
             if unavailable_reason is not None:
                 raise PublicAPIError(
