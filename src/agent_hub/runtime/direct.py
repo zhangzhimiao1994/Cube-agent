@@ -3104,7 +3104,9 @@ class DirectRuntime:
                 if generated_entry and (response.tool_calls or response.text is None
                         or _workspace_batch_from_model_text(response.text, allow_reads=True,
                             allow_catalog=_catalog_workspace_reads(context)) is None):
-                    if protocol_corrections >= 1 or attempt_count >= self._available_model_attempts:
+                    # A known response can be corrected on the same authorized
+                    # model. Alias/fallback count is not a protocol retry budget.
+                    if protocol_corrections >= 1:
                         _raise_execution_error('generated project response did not satisfy workspace_batch protocol')
                     rejected_text = response.text or json.dumps([
                         {'name': call.name, 'arguments': dict(call.arguments)} for call in response.tool_calls],
@@ -3124,8 +3126,11 @@ class DirectRuntime:
                         'The prior response did not provide a valid structured workspace_batch. '
                         'No requested native/model tools were executed and no source was written. '
                         'The Harness has already performed project.inspect. Use its supplied profile pins. '
-                        'Continue the same user request and return only workspace_batch JSON with full file '
-                        'contents, complete boolean and continuation. Tool requests/planning text cannot complete delivery. '
+                        'Continue the same user request and return only JSON shaped as '
+                        '{"workspace_batch":{"files":{"safe/relative/path":"full UTF-8 contents"},'
+                        '"complete":true,"continuation":""},"summary":"delivery summary"}. '
+                        'The complete boolean and continuation MUST be INSIDE workspace_batch, not at the root. '
+                        'Tool requests/planning text cannot complete delivery. '
                         '<UNTRUSTED_REJECTED_DIRECT_RESPONSE>' + preview + '</UNTRUSTED_REJECTED_DIRECT_RESPONSE>')))
                     next_estimate = _estimate_text_tokens(json.dumps([
                         {'role': message.role, 'content': message.content} for message in messages],

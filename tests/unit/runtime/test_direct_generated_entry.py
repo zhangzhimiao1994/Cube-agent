@@ -97,7 +97,10 @@ def batch() -> str:
 
 
 @pytest.mark.parametrize('first', ['valid', 'planning', 'tool-json', 'native'])
-async def test_generated_entry_inspects_before_model_and_recovers_protocol_once(tmp_path: Path, first: str) -> None:
+@pytest.mark.parametrize('available_attempts', [1, 2])
+async def test_generated_entry_inspects_before_model_and_recovers_protocol_once(
+    tmp_path: Path, first: str, available_attempts: int,
+) -> None:
     context, verified, bundle = await evidence(tmp_path)
     context = context.model_copy(update={'token_budget': 50_000})
     harness = Harness(context, verified, bundle)
@@ -106,6 +109,7 @@ async def test_generated_entry_inspects_before_model_and_recovers_protocol_once(
         'native': response(None, tools=(ToolCall('call-1', 'project.inspect', {}),))}[first]
     model = Model(initial, *(() if first == 'valid' else (response(batch()),)))
     runtime = DirectRuntime(model, logical_model='fixture', capability_gateway=harness,
+        available_model_attempts=available_attempts,
         harness_tool_gateway=cast(Any, harness))
     events = [event async for event in runtime.run(context)]
     assert events[-1].kind is EventKind.RUNTIME_COMPLETED
@@ -148,11 +152,15 @@ async def test_inspect_failure_never_calls_model_or_writes(tmp_path: Path, defec
     assert not model.requests and harness.calls == ['project.inspect']
 
 
-async def test_continuous_invalid_output_is_bounded_and_never_writes(tmp_path: Path) -> None:
+@pytest.mark.parametrize('available_attempts', [1, 2])
+async def test_continuous_invalid_output_is_bounded_and_never_writes(
+    tmp_path: Path, available_attempts: int,
+) -> None:
     context, verified, bundle = await evidence(tmp_path)
     harness = Harness(context, verified, bundle)
     model = Model(response('I will inspect.'), response('All done.'))
     runtime = DirectRuntime(model, logical_model='fixture', capability_gateway=harness,
+        available_model_attempts=available_attempts,
         harness_tool_gateway=cast(Any, harness))
     with pytest.raises(RuntimeExecutionError):
         _ = [event async for event in runtime.run(context)]
