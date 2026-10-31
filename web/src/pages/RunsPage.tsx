@@ -6413,7 +6413,7 @@ export function RunsPage() {
 }
 
 function RunsPageForActor() {
-  const { user: permissionActor } = useAuth();
+  const { user: permissionActor, hasPermission } = useAuth();
   const permissionActorKey = [permissionActor?.tenant_id, permissionActor?.user_id, permissionActor?.role];
   const queryClient = useQueryClient();
   const navigate = useNavigate();
@@ -6428,13 +6428,14 @@ function RunsPageForActor() {
   });
   const runListItems = runs.data ?? [];
   const agents = useQuery({
-    queryKey: ["agents"],
+    queryKey: ["agents", ...permissionActorKey],
     queryFn: () => api.agents(),
+    enabled: hasPermission("agent:read"),
     refetchInterval: 1000,
     refetchIntervalInBackground: true,
   });
   const models = useQuery({ queryKey: ["models"], queryFn: () => api.models() });
-  const workflows = useQuery({ queryKey: ["workflows"], queryFn: () => api.workflows() });
+  const workflows = useQuery({ queryKey: ["workflows", ...permissionActorKey], queryFn: () => api.workflows(), enabled: hasPermission("agent:read") });
   const settings = useQuery({ queryKey: ["settings", ...permissionActorKey], queryFn: () => api.settings(), enabled: Boolean(permissionActor) });
   const permissionSettingsReady = Boolean(permissionActor && settings.data && !settings.isError);
   const executionBackends = useQuery({
