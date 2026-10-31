@@ -57,7 +57,7 @@ def _workspace_tool_manifest_items(
                 "required": ("path", "content"),
                 "properties": {
                     "path": {"type": "string", "minLength": 1, "maxLength": 512},
-                    "content": {"type": "string", "minLength": 1},
+                    "content": {"type": "string"},
                 },
             },
         },

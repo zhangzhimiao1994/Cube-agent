@@ -290,6 +290,14 @@ async def test_gateway_read_denial_cannot_turn_into_prose_completion(tmp_path: P
     # A syntactically safe path still has to pass the real scoped reader.
     outside = tmp_path / 'other-project-secret.js'
     outside.write_text('PRIVATE_OTHER_PROJECT', encoding='utf-8')
+    # A missing in-scope child is a legitimate negative observation. This
+    # denial case must exercise a real scope escape rather than nonexistence.
+    try:
+        (configured.source / 'other-project-secret.js').symlink_to(outside)
+    except OSError as error:
+        if getattr(error, 'winerror', None) == 1314:
+            pytest.skip('Windows symbolic-link privilege unavailable; covered by Linux native regression')
+        raise
     model = Model(batch(reads=['other-project-secret.js']))
     runtime, _, _ = configured.runtime(model)
     with pytest.raises(direct.RuntimeExecutionError, match='workspace read failed') as caught:
@@ -297,6 +305,7 @@ async def test_gateway_read_denial_cannot_turn_into_prose_completion(tmp_path: P
     assert 'PRIVATE_OTHER_PROJECT' not in str(caught.value)
     assert [name for name, _ in configured.backend.calls] == ['read_context']
     assert len(model.requests) == 1
+    assert outside.read_text(encoding='utf-8') == 'PRIVATE_OTHER_PROJECT'
 
 
 async def test_reads_preserve_current_native_failure_as_well_as_original_observation(tmp_path: Path) -> None:

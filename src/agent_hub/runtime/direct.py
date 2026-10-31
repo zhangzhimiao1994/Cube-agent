@@ -121,7 +121,8 @@ _WORKSPACE_PATH_POLICY = (
     "or parent traversal. Hidden directories and files are forbidden except these root "
     "metadata files: " + ", ".join(sorted(WORKSPACE_METADATA_DOTFILES)) + ". "
     "Use visible configuration filenames or package.json fields for other configuration. "
-    "Never write secrets or credentials; file contents must not be blank. "
+    "Never write secrets or credentials. Empty text files are allowed when intentional; "
+    "they do not establish a valid dependency lock or successful verification. "
 )
 
 
@@ -982,6 +983,33 @@ def _project_scale_workspace_bundle_from_model_text(
     return _workspace_bundle_from_markdown_file_blocks(text)
 
 
+def _single_batch_envelope(text: str) -> Mapping[str, object] | None:
+    """Strict source check for the control-placement compatibility path only."""
+    candidate = text.strip()
+    if candidate.startswith('```'):
+        fenced = re.fullmatch(r'```(?:json)?[ \t]*\r?\n([\s\S]*?)\r?\n```', candidate, re.IGNORECASE)
+        if fenced is None:
+            return None
+        candidate = fenced.group(1)
+
+    def unique(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError('duplicate batch key')
+            result[key] = value
+        return result
+
+    def finite(_value: str) -> Never:
+        raise ValueError('nonfinite batch value')
+
+    try:
+        value = json.loads(candidate, object_pairs_hook=unique, parse_constant=finite)
+    except (ValueError, TypeError):
+        return None
+    return value if isinstance(value, Mapping) else None
+
+
 def _workspace_batch_from_model_text(
     text: str, *, allow_reads: bool = False, allow_catalog: bool = False,
 ) -> _WorkspaceBatch | None:
@@ -999,6 +1027,22 @@ def _workspace_batch_from_model_text(
     else:
         raw_workspace_batch = parsed.get("workspace_batch")
         if isinstance(raw_workspace_batch, Mapping):
+            # Some TEXT adapters place both batch controls beside the envelope.
+            # Recover only that single unambiguous layout, never merge controls
+            # from two scopes or accept extra actions as part of this recovery.
+            if {"complete", "continuation"} & parsed.keys():
+                if (
+                    _single_batch_envelope(text) != parsed
+                    or {"complete", "continuation"} & raw_workspace_batch.keys()
+                    or not {"complete", "continuation"} <= parsed.keys()
+                    or not parsed.keys() <= {"workspace_batch", "summary", "complete", "continuation"}
+                    or not raw_workspace_batch.keys() <= {"files", "summary", "read_paths", "python_catalog"}
+                    or type(parsed["complete"]) is not bool
+                    or type(parsed["continuation"]) is not str
+                ):
+                    return None
+                raw_workspace_batch = {**raw_workspace_batch,
+                    "complete": parsed["complete"], "continuation": parsed["continuation"]}
             raw_batch = raw_workspace_batch
             complete = raw_workspace_batch.get("complete")
             continuation = raw_workspace_batch.get("continuation", "")

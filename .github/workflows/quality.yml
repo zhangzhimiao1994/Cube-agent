@@ -1,6 +1,24 @@
 name: quality
 
 on:
+  push:
+    branches:
+      - fix/direct-hybrid-final-report-atomicity-oct29
+    paths:
+      - .github/workflows/quality.yml
+      - tests/**
+      - src/**
+      - web/**
+      - scripts/**
+      - deploy/**
+      - alembic/**
+      - alembic.ini
+      - pyproject.toml
+      - uv.lock
+      - install.sh
+      - Dockerfile
+      - .dockerignore
+      - .gitattributes
   workflow_dispatch:
 
 jobs:

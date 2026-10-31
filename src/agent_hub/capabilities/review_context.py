@@ -333,7 +333,6 @@ class TrustedReviewContextLoader:
         if (
             "/".join(_path_parts(path)) != path
             or _safe_workspace_path(path) != path
-            or not content.strip()
         ):
             raise ValueError("review action requires human")
         # Source digests are continuity, never an editable-file permission. The backend

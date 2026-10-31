@@ -955,16 +955,19 @@ class RuntimeCapabilityGateway:
                 raise RuntimeCapabilityError(
                     "workspace content reference is invalid or unavailable"
                 ) from None
-            if type(loaded) is not str or not loaded.strip():
+            if type(loaded) is not str:
                 raise RuntimeCapabilityError(
-                    "workspace referenced content must be a nonempty string"
+                    "workspace referenced content must be a string"
                 )
             content = loaded
             # Hydration may await remote storage; do not write using a stale workspace grant.
             if await self._project_workspace_scope(tenant_id, run_id) != (project_id, session_id):
                 raise RuntimeCapabilityError("workspace scope changed during content resolution")
         else:
-            content = _required_string(arguments, "content")
+            inline_content = arguments.get("content")
+            if not isinstance(inline_content, str):
+                raise RuntimeCapabilityError("content must be a string")
+            content = inline_content
         contract = await self._original_project_contract(tenant_id, run_id)
         if (
             contract is not None
@@ -1898,7 +1901,7 @@ def _builtin_input_schema(
             "required": ("path", "content"),
             "properties": {
                 "path": {"type": "string", "minLength": 1, "maxLength": 512},
-                "content": {"type": "string", "minLength": 1},
+                "content": {"type": "string"},
             },
         }
         if content_references:
