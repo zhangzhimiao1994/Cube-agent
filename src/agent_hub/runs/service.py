@@ -730,8 +730,8 @@ class RunService:
         if automatic_action:
             operator_selection[automatic_version] = 1
         project_delivery = _project_delivery_assessment(message)
-        if automatic_candidate and not automatic_action:
-            project_delivery = None
+        # Conversation metadata does not imply an existing implementation. Keep
+        # build delivery independent of the stricter existing-project selection.
         if (project_input is None and resolved_execution_backend == 'systemd'
                 and workspace.sandbox_profile == 'workspace_write'
                 and {'workspace.read', 'workspace.write', 'command.run'}.issubset(
@@ -4731,8 +4731,19 @@ def _message_suggests_tool_use(message: str) -> bool:
 def _project_delivery_assessment(message: str) -> dict[str, object] | None:
     """Classify executable software requests before model routing."""
 
-    text = " ".join(message.casefold().split())
+    from agent_hub.workspace_maintenance_contract import _v2_intent_text
+
+    text = " ".join(_v2_intent_text(message).casefold().split())
+    if re.match(
+        r"^(?:(?:请问|请教|我想知道|我想了解|请告诉我|告诉我)\s*)?(?:如何|怎样|怎么)",
+        text,
+    ) or re.match(r"^(?:(?:please\s+)?(?:explain|describe|tell me)\s+)?how\b", text):
+        return None
     non_execution_markers = (
+        "只规划",
+        "仅规划",
+        "只做计划",
+        "仅做计划",
         "不要开始",
         "不要实现",
         "不要构建",
