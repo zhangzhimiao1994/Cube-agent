@@ -1,4 +1,4 @@
-"""Dedicated-PG dynamic resolution checkpoint integration; native execution PENDING.
+"""Dedicated-PG dynamic resolution checkpoint integration; native setup FAILED, fix rerun PENDING.
 
 Actual RunRecord/private execution binding, PostgresArtifactRepository lookup/hash
 readback and original pool. Only the final Root inspect transport is deterministic.
@@ -37,17 +37,36 @@ from tests.unit.skills.test_python_registry_read import environment
 pytestmark = [pytest.mark.integration, pytest.mark.asyncio(loop_scope="module")]
 
 
-async def test_pg_dynamic_resolution_cold_restore_keeps_scope_and_original_pool(storage):
-    route = {"generated_project_contract_version": 1, "python_dependency_preflight_version": 1,
+def _recovery_route():
+    return {"generated_project_contract_version": 1, "python_dependency_preflight_version": 1,
              "python_dependency_preflight_submission_version": 1, "project_id": "generated-project",
              "workspace_session_id": "session", "sandbox_profile": "workspace_write",
              "requested_permissions": ["workspace.read", "workspace.write", "command.run"],
-             "execution_backend": "systemd", "runtime_timeout_seconds": 120}
-    pool_repo, binding, _ = await prepare(storage, route=route)
+             "execution_backend": "systemd", "runtime_timeout_seconds": 120,
+             "runtime_token_absolute_tokens": 100, "runtime_plan_token_budget": 100}
+
+
+async def _prepare_resolution_pool(storage, *, route):
+    # Keep prepare's original grant/evidence/lease. Narrow its generic 30-minute
+    # deadline to this fixture's existing 120-second runtime before the first open.
+    repository, binding, opening = await prepare(storage, route=route, open_now=False)
+    async with storage[0]() as session:
+        original = await session.get(RunRow, binding["run_id"])
+    opening = {**opening, "original_deadline": min(opening["original_deadline"],
+        original.created_at + timedelta(seconds=route["runtime_timeout_seconds"]))}
+    await repository.open_pool(**opening)
+    return repository, binding, opening
+
+
+async def test_pg_dynamic_resolution_cold_restore_keeps_scope_and_original_pool(storage):
+    route = _recovery_route()
+    pool_repo, binding, _ = await _prepare_resolution_pool(storage, route=route)
     factory = storage[0]
     repository = RunRepository(factory)
     record = await repository.get(binding["tenant_id"], binding["run_id"])
     before = await pool_repo.get_pool(record.tenant_id, record.id)
+    assert before.original_token_grant == 100
+    assert before.original_deadline == record.created_at + timedelta(seconds=120)
     scope = metadata_scope(record, actor="engineer", live=True)
     deadline = record.created_at + timedelta(seconds=120)
     data_scope = {**scope.model_dump(mode="json"), "root_sha256": "8" * 64,
@@ -114,3 +133,134 @@ async def test_pg_dynamic_resolution_cold_restore_keeps_scope_and_original_pool(
     foreign = dict(data_scope, run_id=str(UUID(int=999)))
     with pytest.raises(ValueError):
         await DynamicResolutionJournal(PostgresArtifactRepository(factory)).load(foreign)
+
+
+class _PreparationSession:
+    """Only SQL storage IO is simulated; real prepare/auth/admission DAO code runs."""
+
+    def __init__(self):
+        from datetime import UTC, datetime
+        self.now = datetime.now(UTC)
+        self.rows = []
+        self.active = False
+        self.authorization_reads = 0
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        pass
+
+    def begin(self):
+        from contextlib import asynccontextmanager
+        @asynccontextmanager
+        async def transaction():
+            assert not self.active
+            self.active = True
+            try:
+                yield
+            finally:
+                self.active = False
+        return transaction()
+
+    def in_transaction(self):
+        return self.active
+
+    def add(self, row):
+        if isinstance(row, RunRow) and row.created_at is None:
+            row.created_at = self.now
+        self.rows.append(row)
+
+    async def flush(self):
+        pass
+
+    async def get(self, kind, key):
+        return next((row for row in self.rows if type(row) is kind
+                     and (row.id if kind is RunRow else row.run_id) == key), None)
+
+    async def scalar(self, statement):
+        if "clock_timestamp()" in str(statement):
+            return self.now
+        entity = statement.column_descriptions[0]["entity"]
+        parameters = tuple(statement.compile().params.values())
+        candidates = [row for row in self.rows if type(row) is entity]
+        return next((row for row in candidates if row.tenant_id in parameters
+                     and (row.id if entity is RunRow else row.run_id) in parameters), None)
+
+    async def execute(self, statement):
+        from types import SimpleNamespace
+
+        from agent_hub.db.models import RunAuthenticatedInputRow, RunInputAuthorizationRow
+        if "clock_timestamp()" in str(statement):
+            return SimpleNamespace(scalar_one=lambda: self.now)
+        assert [column["entity"] for column in statement.column_descriptions] == [RunInputAuthorizationRow, RunAuthenticatedInputRow]
+        self.authorization_reads += 1
+        parameters = tuple(statement.compile().params.values())
+        link = next((row for row in self.rows if type(row) is RunInputAuthorizationRow and row.run_id in parameters), None)
+        turn = None if link is None else next((row for row in self.rows if type(row) is RunAuthenticatedInputRow and row.turn_id == link.turn_id), None)
+        return SimpleNamespace(one_or_none=lambda: None if link is None or turn is None else (link, turn))
+
+
+async def test_local_recovery_preparation_uses_real_authenticated_original_pool_contract():
+    from agent_hub.db.models import RunAdmissionEventRow
+    session = _PreparationSession()
+    storage = (lambda: session, [])
+    route = _recovery_route()
+    repository, binding, opening = await _prepare_resolution_pool(storage, route=route)
+    before = await repository.get_pool(binding["tenant_id"], binding["run_id"])
+    row = await session.get(RunRow, binding["run_id"])
+    assert before.original_token_grant == opening["original_token_grant"] == 100
+    assert before.original_deadline == row.created_at + timedelta(seconds=120)
+    assert before.authorization_turn_id == binding["authorization_turn_id"]
+    assert row.routing_decision == route
+    assert row.worker_lease_token == binding["lease"].token
+    assert metadata_scope(row, actor="engineer", live=True).actor_role == "operator"
+    await repository.require_current(**binding)
+    assert await repository.open_pool(**opening) == before
+    assert await repository.get_pool(binding["tenant_id"], binding["run_id"]) == before
+    assert session.authorization_reads >= 3
+    assert len([row for row in session.rows if type(row) is RunAdmissionEventRow]) == 1
+
+
+@pytest.mark.parametrize("changed", ["lease", "authenticated_input"])
+async def test_local_recovery_prepare_retains_original_identity_fences(changed):
+    from agent_hub.db.models import RunAuthenticatedInputRow
+    from agent_hub.models.run_admission_repository import AdmissionConflict
+    session = _PreparationSession()
+    repository, binding, _ = await _prepare_resolution_pool((lambda: session, []), route=_recovery_route())
+    before = await repository.get_pool(binding["tenant_id"], binding["run_id"])
+    if changed == "lease":
+        row = await session.get(RunRow, binding["run_id"])
+        row.worker_lease_token = uuid4()
+    else:
+        row = next(row for row in session.rows if type(row) is RunAuthenticatedInputRow)
+        row.message = "altered authenticated original"
+    with pytest.raises(AdmissionConflict):
+        await repository.require_current(**binding)
+    assert await repository.get_pool(binding["tenant_id"], binding["run_id"]) == before
+
+
+@pytest.mark.parametrize("changed", ["grant", "deadline"])
+async def test_local_recovery_prepare_cannot_extend_the_original_pool(changed):
+    from agent_hub.models.run_admission_repository import AdmissionConflict
+    session = _PreparationSession()
+    repository, binding, opening = await _prepare_resolution_pool((lambda: session, []), route=_recovery_route())
+    before = await repository.get_pool(binding["tenant_id"], binding["run_id"])
+    updated = dict(opening)
+    if changed == "grant":
+        updated["original_token_grant"] += 1
+    else:
+        updated["original_deadline"] += timedelta(seconds=1)
+    with pytest.raises(AdmissionConflict):
+        await repository.open_pool(**updated)
+    assert await repository.get_pool(binding["tenant_id"], binding["run_id"]) == before
+
+
+async def test_local_generic_admission_deadline_cannot_bypass_recovery_timeout():
+    from agent_hub.db.models import RunAdmissionPoolRow
+    from agent_hub.models.run_admission_repository import AdmissionConflict
+    session = _PreparationSession()
+    # The shared helper's 30-minute default must still fail for this 120s route.
+    with pytest.raises(AdmissionConflict):
+        await prepare((lambda: session, []), route=_recovery_route())
+    assert not any(type(row) is RunAdmissionPoolRow for row in session.rows)
