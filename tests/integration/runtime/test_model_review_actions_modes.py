@@ -139,7 +139,7 @@ class DeclaredActionRoles(RolePlanner):
                     allowed_tools=(),
                     forbidden_actions=("Do not claim unobserved execution.",),
                     skills=(),
-                    output_schema={},
+                    output_schema={"summary": "string", "evidence": "string[]"},
                     model="primary",
                 ),
             ),
@@ -345,6 +345,32 @@ def _assert_execution_observed(events, wire, mode):
     return observed
 
 
+def _assert_action_review_independence(primary, review_attempt, scope, wire_attempts, *, actor, action_digest):
+    """Compare actual issued primaries at this action, never later unrelated calls."""
+    from agent_hub.models.physical_budget import _same_model
+    from agent_hub.models.run_admission_repository import DeploymentIdentity
+
+    def identity(value):
+        return DeploymentIdentity(**dict(value))
+
+    assert scope["actor"] == actor and scope["action_digest"] == action_digest
+    assert scope["review_attempt_id"] == review_attempt.attempt_id
+    before = set(scope["primary_attempt_ids"])
+    assert before and scope["proposal_attempt_id"] in before
+    issued = {row.attempt_id: row for row in primary}
+    assert before <= issued.keys()
+    assert all(wire_attempts[key]["purpose"] == "primary" for key in before)
+    proposal = wire_attempts[scope["proposal_attempt_id"]]
+    assert proposal["logical_model"] in (scope["actor_model"], *scope["actor_fallbacks"])
+    acting = {identity(issued[key].deployment) for key in before}
+    assert acting == {identity(value) for value in scope["acting_models"]}
+    assert {wire_attempts[key]["wire_model"] for key in before} == set(scope["acting_wire_models"])
+    reviewed = identity(review_attempt.deployment)
+    assert all(not _same_model(reviewed, previous) for previous in acting)
+    assert wire_attempts[review_attempt.attempt_id]["purpose"] == "review"
+    assert wire_attempts[review_attempt.attempt_id]["wire_model"] not in scope["acting_wire_models"]
+
+
 class ActionWire(FixedWire):
     """No primary/Gateway/adapter replacement: fixed *last* SDK HTTP response."""
 
@@ -353,6 +379,7 @@ class ActionWire(FixedWire):
         self.body, self.path, self.content = body, path, content
         self.proposals = []
         self.actual_types = set()
+        self.review_scopes = []
 
     def primary_text_for(self, payload):
         # Preserve the actual selector and exact schema/enum structure. Only the
@@ -386,7 +413,12 @@ class ActionWire(FixedWire):
         assert payload["model"] == meta.provider_model.rsplit("/", 1)[-1]
         physical = call.scope._admission._attempts[attempt.permit.attempt_id].physical_id
         assert physical is not None
+        contracts = [entry for entry in self.budgets[-1]._trusted_contexts
+                     if entry.deployment_id == meta.deployment_id]
+        assert len(contracts) == 1
         self.attempts[attempt.permit.attempt_id] = {
+            "logical_model": contracts[0].logical_model,
+            "wire_model": payload["model"],
             "stage": stage,
             "request_sha256": meta.request_sha256,
             "purpose": meta.purpose,
@@ -413,6 +445,23 @@ class ActionWire(FixedWire):
                 "path": self.path,
                 "content": self.content,
             }
+            actor = material["exact_action"]["request"]["agent_id"]
+            participants = adapter._plan.agents if type(adapter) is CrewDispatchRuntime else adapter._plan.participants
+            matches = [entry for entry in participants if entry.id == actor]
+            assert len(matches) == 1 and "workspace.write_text" in matches[0].allowed_tools
+            assert len(self.proposals) == 1 and self.budgets[-1].config.require_distinct_model
+            acting = self.budgets[-1]
+            self.review_scopes.append({
+                "actor": actor, "actor_model": matches[0].logical_model,
+                "actor_fallbacks": tuple(getattr(matches[0], "fallback_models", ())),
+                "action_digest": material["action_digest"],
+                "proposal_attempt_id": self.proposals[0], "review_attempt_id": attempt.permit.attempt_id,
+                "primary_attempt_ids": tuple(key for key, value in self.attempts.items() if value["purpose"] == "primary"),
+                "acting_models": tuple({"provider_id": value.provider_id, "deployment_id": value.deployment_id,
+                                        "model_id": value.model_id} for value in acting.acting_models),
+                "acting_wire_models": tuple(acting.acting_wire_models),
+            })
+            assert self.attempts[self.proposals[0]]["stage"] == stage
             text, tool = FixedWire.text_for(self, payload), None
         else:
             assert meta.purpose == "primary"
@@ -436,19 +485,24 @@ class ActionWire(FixedWire):
         )
 
 
+def _action_review_config():
+    return ApprovalReviewConfig(
+        engine="rules_then_model",
+        require_distinct_model=True,
+        reviewer_logical_model="reviewer",
+        max_input_tokens=1000000,
+        max_output_tokens=512,
+        max_cost_usd_per_run="100.00",
+    )
+
+
 async def _case(storage, tmp_path, mode, redis_client):
     """New action config fixture, existing PG/Redis ownership and actual factories."""
     factory = storage[0]
     _, binding, _ = await prepare(storage, open_now=False)
     repository = RunRepository(factory)
     platform = fixture_platform()
-    config = ApprovalReviewConfig(
-        engine="rules_then_model",
-        reviewer_logical_model="reviewer",
-        max_input_tokens=1000000,
-        max_output_tokens=512,
-        max_cost_usd_per_run="100.00",
-    )
+    config = _action_review_config()
 
     class Configs:
         async def get_current(self, tenant):
@@ -727,7 +781,6 @@ async def test_native_action_review_composition_missing_modes(
             )
             _assert_accounting_receipt(row, sent)
         review_attempt = reviewed[0]
-        assert all(row.deployment != review_attempt.deployment for row in primary)
         assert (review.attempt_id, review.request_sha256, review.physical_identity) == (
             review_attempt.attempt_id,
             review_attempt.request_sha256,
@@ -740,6 +793,9 @@ async def test_native_action_review_composition_missing_modes(
         assert receipt["evidence"]["model_identity"] == review_attempt.deployment
         assert receipt["evidence"]["verdict"]["action_digest"] == review.action_digest
         action = json.loads(review.private_action)
+        assert len(case.wire.review_scopes) == 1 and action["request"]["agent_id"] == call.actor
+        _assert_action_review_independence(primary, review_attempt, case.wire.review_scopes[0],
+            case.wire.attempts, actor=call.actor, action_digest=review.action_digest)
         assert action["request"]["arguments"] == {"path": case.path, "content": case.content}
         assert action["normalized_effect"]["target"] == case.path
         root_identity = action["source_binding"]["root_identity"]
@@ -1087,3 +1143,127 @@ async def test_action_mode_hybrid_execution_requires_wire_and_lifecycle(defect):
         wire.attempts = attempts
     with pytest.raises(AssertionError):
         _assert_execution_observed(events, wire, TaskMode.HYBRID)
+
+
+def _local_declared_mode_plan(tmp_path, mode):
+    from agent_hub.capabilities.runtime import RuntimeCapabilityGateway
+    from agent_hub.runtime.contracts import TaskContext
+    from agent_hub.runtime.defaults import _assign_models_to_roles, _role_tools_by_id
+
+    body, _, _ = plain_note_submission()
+    context = TaskContext(run_id=uuid4(), tenant_id=uuid4(), mode=mode, request=body.message,
+        timeout_seconds=180, token_budget=1000000, routing_decision={
+            "project_id": body.project_id, "workspace_session_id": body.workspace_session_id,
+            "sandbox_profile": body.sandbox_profile, "permission_mode": body.permission_mode,
+            "requested_permissions": list(body.requested_permissions), "execution_backend": body.execution_backend})
+    backend = RuntimeCapabilityGateway(skill_store_dir=tmp_path / "skills", project_workspace_dir=tmp_path)
+    platform = fixture_platform()
+    declared = DeclaredActionRoles().plan(RolePlanningRequest(task=context.request, mode=mode,
+        profile=TaskProfile.GENERAL, default_model="primary")).roles
+    assigned = _assign_models_to_roles(declared, platform, default_model="primary", task=context.request,
+        role_tools_by_id=_role_tools_by_id(declared, context, capability_gateway=backend))
+    return context, backend, platform, assigned
+
+
+@pytest.mark.parametrize("mode", (TaskMode.DISPATCH, TaskMode.HYBRID), ids=lambda mode: mode.value)
+async def test_action_mode_declarations_construct_current_dispatch_handoffs(tmp_path, mode):
+    from agent_hub.runtime.crew.plan import DispatchPlan
+    from agent_hub.runtime.defaults import _dispatch_plan
+
+    context, backend, platform, roles = _local_declared_mode_plan(tmp_path, mode)
+    plan = _dispatch_plan(roles, context, config=platform, capability_gateway=backend)
+    assert type(plan) is DispatchPlan
+    dependent = {source for step in plan.steps for source in step.depends_on}
+    agents = {agent.id: agent for agent in plan.agents}
+    assert all(agents[step.agent].output_schema for step in plan.steps if step.id in dependent)
+    assert "workspace.write_text" in agents["analyst"].allowed_tools
+    assert agents["critic"].allowed_tools == ()
+    from agent_hub.runtime.crew.adapter import _agent_response_schema, _parse_structured_role_output
+
+    for agent in (agents["analyst"], agents["critic"]):
+        schema = _agent_response_schema(agent)
+        assert schema is not None
+        wire = ActionWire(None, "synthetic-note.txt", "synthetic")
+        payload = {"model": "fixture-primary", "messages": [{"role": "user", "content": "Return bounded evidence."}],
+                   "response_format": {"json_schema": {"schema": schema.schema}}}
+        text = wire.primary_text_for(payload)
+        raw, _ = _wire_reply(payload, text=text)
+        actual = json.loads(raw)["choices"][0]["message"]["content"]
+        parsed = _parse_structured_role_output(agent, actual)
+        assert set(parsed) == set(agent.output_schema)
+        _assert_delivery_text(parsed["summary"], "synthetic-note.txt")
+
+
+
+async def test_action_mode_current_discussion_actor_binding_allows_only_scoped_review(tmp_path):
+    from agent_hub.runtime.defaults import _discussion_plan
+
+    context, backend, _platform, roles = _local_declared_mode_plan(tmp_path, TaskMode.DISCUSS)
+    plan = _discussion_plan(roles, "primary", context, capability_gateway=backend)
+    actors = {participant.id: participant for participant in plan.participants}
+    assert actors["analyst"].logical_model == "primary"
+    assert actors["critic"].logical_model == "reviewer"
+    assert "workspace.write_text" in actors["analyst"].allowed_tools and not actors["critic"].allowed_tools
+    from agent_hub.auth.models import Role
+    from agent_hub.capabilities.execution_authority import (
+        bind_execution_authority,
+        get_verification_authority,
+    )
+    from agent_hub.capabilities.model_review import _ReviewAdmission
+    from agent_hub.models import physical_budget as budget_api
+    from agent_hub.models.physical_admission import (
+        _PhysicalAdmissionStopped,
+        _PhysicalAttemptMetadata,
+    )
+    from agent_hub.runtime.contracts import TaskContext
+    from tests.unit.capabilities.test_model_review import ReviewStore, snapshot
+    from tests.unit.models.test_physical_budget import configured, logical_request
+
+    budget, store, writer, reviewer = configured(config=_action_review_config())
+    binding = TaskContext(run_id=budget.run_id, tenant_id=budget.tenant_id, mode=TaskMode.DISCUSS,
+        request=budget.evidence.message, actor_id=budget.evidence.actor_id, actor_role=Role.OPERATOR,
+        execution_token=budget.lease.token, routing_decision=context.routing_decision)
+    wire_attempts = {}
+    async def issue_primary(deployment):
+        admission = budget_api._BudgetAdmission(budget)
+        selected, _request, selection = admission.select(deployment,
+            logical_request(logical_model=deployment.logical_model, max_output_tokens=100), None)
+        meta = _PhysicalAttemptMetadata(selected.id, selected.provider_model, selection.request_sha256,
+            "primary", "chat_completions", False, 1, selection)
+        permit = await admission.before_send(meta, deadline=budget.deadline)
+        identity = {"provider_id": budget_api._identity(selected).provider_id,
+                    "deployment_id": selected.id, "model_id": selected.provider_model}
+        row = SimpleNamespace(attempt_id=permit.attempt_id, deployment=identity, purpose="primary")
+        wire_attempts[row.attempt_id] = {"deployment": identity, "purpose": "primary",
+            "logical_model": selected.logical_model, "wire_model": budget_api._wire_model(selected)}
+        return row
+
+    proposal = await issue_primary(writer)
+    with bind_execution_authority(binding, worker_id=budget.lease.worker_id, actor=actors["analyst"].id):
+        current = get_verification_authority(tenant_id=budget.tenant_id, run_id=budget.run_id,
+            user_id=budget.evidence.actor_id, role=Role.OPERATOR)
+        scope = {"actor": current.actor, "actor_model": actors[current.actor].logical_model,
+            "actor_fallbacks": (), "action_digest": "a" * 64, "proposal_attempt_id": proposal.attempt_id,
+            "primary_attempt_ids": tuple(wire_attempts),
+            "acting_models": tuple({"provider_id": d.provider_id, "deployment_id": d.deployment_id,
+                                     "model_id": d.model_id} for d in budget.acting_models),
+            "acting_wire_models": tuple(budget.acting_wire_models)}
+    review = _ReviewAdmission(budget, ReviewStore(store), snapshot(budget))
+    review.select(reviewer, logical_request(logical_model="reviewer", max_output_tokens=100), None)
+    with pytest.raises(_PhysicalAdmissionStopped):
+        review.select(writer, logical_request(max_output_tokens=100), None)
+    review_row = SimpleNamespace(attempt_id=uuid4(), deployment={
+        "provider_id": budget_api._identity(reviewer).provider_id, "deployment_id": reviewer.id,
+        "model_id": reviewer.provider_model})
+    wire_attempts[review_row.attempt_id] = {"deployment": review_row.deployment, "purpose": "review",
+                                         "wire_model": budget_api._wire_model(reviewer)}
+    scope["review_attempt_id"] = review_row.attempt_id
+    later = await issue_primary(reviewer)  # Actual current factory assigns the critic to this alias.
+    with pytest.raises(_PhysicalAdmissionStopped):
+        review.select(reviewer, logical_request(logical_model="reviewer", max_output_tokens=100), None)
+    _assert_action_review_independence([proposal, later], review_row, scope, wire_attempts,
+        actor=current.actor, action_digest="a" * 64)
+
+
+async def test_action_mode_fixture_enforces_distinct_model_policy():
+    assert _action_review_config().require_distinct_model is True
