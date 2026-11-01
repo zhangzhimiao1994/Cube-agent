@@ -85,11 +85,13 @@ class PythonResolutionPreparation:
         current: Callable[[], Awaitable[RunRecord | None]],
         approved: Callable[[CapabilityRequest], Awaitable[bool]] | None,
         transport: Callable[[ResolutionRequest], Awaitable[ResolutionStatus]] | None = None,
+        original_deadline: datetime | None = None,
     ) -> None:
         self.current = current
         self.approved = approved
         self.transport = transport
         self._original: ResolutionClaim | None = None
+        self._original_deadline = original_deadline
 
     async def _claim(self, planning: PythonMetadataPlanningRequest) -> ResolutionClaim:
         budget = _run_budget.get()
@@ -146,12 +148,19 @@ class PythonResolutionPreparation:
         if self._original is None:
             # Conservatively include queue time. This cannot restart the run's budget.
             maximum = min(float(context.timeout_seconds), float(live.timeout_seconds))
-            original_deadline = record.created_at + timedelta(seconds=maximum)
-            remaining = (original_deadline - datetime.now(UTC)).total_seconds()
-            deadline = _budget_deadline(time.monotonic() + remaining)
+            original_deadline = self._original_deadline or record.created_at + timedelta(seconds=maximum)
         else:
             original_deadline = self._original.original_deadline
-            deadline = _budget_deadline(self._original.monotonic_deadline)
+        # Registered data can retain an earlier exact cutoff across workers. It
+        # cannot extend the durable authority or this worker's remaining budget.
+        need(original_deadline.tzinfo is not None and record.created_at < original_deadline
+             <= record.created_at + timedelta(seconds=live.timeout_seconds), "resolution_deadline")
+        remaining = (original_deadline - datetime.now(UTC)).total_seconds()
+        deadline = _budget_deadline(time.monotonic() + remaining if self._original is None
+            else self._original.monotonic_deadline)
+        deadline = min(deadline, time.monotonic() + min(
+            float(context.timeout_seconds), float(live.timeout_seconds),
+            (original_deadline - datetime.now(UTC)).total_seconds()))
         if budget is not None:
             budget.check()
             deadline = min(deadline, budget.deadline)
@@ -173,7 +182,9 @@ class PythonResolutionPreparation:
             else:
                 # Both authority accessors above verified the fresh private binding.
                 result.require_data_origin(self._original)
-                self._original = result
+            # Keep each tighter monotonic bound, including on the same worker;
+            # subsequent wall-clock conversions must never regain microseconds.
+            self._original = result
         return result
 
     async def _send(

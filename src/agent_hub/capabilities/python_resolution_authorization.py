@@ -52,9 +52,35 @@ class _ResolutionPolicyBinding:
     active: bool = True
     busy: bool = False
     decision: tuple[str, CapabilityResult] | None = None
+    deadline_scope: dict[str, object] | None = None
+    original_deadline: datetime | None = None
 
 
 _RESOLUTION_POLICY: ContextVar[_ResolutionPolicyBinding | None] = ContextVar('resolution_policy', default=None)
+
+
+def bind_resolution_original_deadline(scope: Mapping[str, object], deadline: datetime) -> None:
+    """Attach validated checkpoint data to this owned call, never a grant."""
+    binding = _RESOLUTION_POLICY.get()
+    if binding is None:
+        return
+    if (not binding.active or binding.owner is not asyncio.current_task()
+            or tuple(str(value) for value in binding.identity)
+            != tuple(scope.get(key) for key in ('tenant_id', 'run_id', 'user_id', 'actor'))
+            or binding.deadline_scope is not None and (
+                binding.deadline_scope != dict(scope) or binding.original_deadline != deadline)):
+        raise InvalidResolutionAuthorization('project verification scope is not authorized')
+    binding.deadline_scope, binding.original_deadline = dict(scope), deadline
+
+
+def resolution_original_deadline(scope: Mapping[str, object]) -> datetime | None:
+    binding = _RESOLUTION_POLICY.get()
+    if binding is None or binding.deadline_scope is None:
+        return None
+    if (not binding.active or binding.owner is not asyncio.current_task()
+            or binding.deadline_scope != dict(scope)):
+        raise InvalidResolutionAuthorization('project verification scope is not authorized')
+    return binding.original_deadline
 
 
 @contextmanager

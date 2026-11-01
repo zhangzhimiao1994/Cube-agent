@@ -585,12 +585,38 @@ class GeneratedProjectService:
         scope = metadata_scope(latest, actor=actor, live=True)
         context, _ = _trusted_review_context(tenant_id=authority.tenant_id, run_id=authority.run_id,
             user_id=authority.user_id, role=authority.role, current_record=latest)
+        original_deadline = latest.created_at + timedelta(
+            seconds=min(context.timeout_seconds, authority.timeout_seconds))
         journal_scope = {**scope.model_dump(mode='json'), 'root_sha256': root_config_sha256,
-            'catalog_sha256': base.profile.catalog_sha256,
-            'original_deadline': (latest.created_at + timedelta(
-                seconds=min(context.timeout_seconds, authority.timeout_seconds))).isoformat()}
+            'catalog_sha256': base.profile.catalog_sha256}
         journal = self._resolution_journal
-        recovered = await journal.load(journal_scope) if flow is None and journal is not None else None
+        if journal is not None:
+            checkpoints = await journal.read_artifacts(authority.tenant_id, authority.run_id,
+                artifact_type='python_resolution_checkpoint', producer='python_resolution')
+            if checkpoints:
+                stored = checkpoints[0].content.get('scope')
+                _need(isinstance(stored, Mapping), 'resolution_checkpoint_scope_changed')
+                assert isinstance(stored, Mapping)
+                _need({name: value for name, value in stored.items() if name != 'original_deadline'}
+                      == journal_scope, 'resolution_checkpoint_scope_changed')
+                raw_deadline = stored.get('original_deadline')
+                _need(isinstance(raw_deadline, str), 'resolution_checkpoint_scope_changed')
+                assert isinstance(raw_deadline, str)
+                original_deadline = datetime.fromisoformat(raw_deadline)
+                _need(original_deadline.tzinfo is not None and original_deadline.isoformat() == raw_deadline
+                      and latest.created_at < original_deadline
+                      <= latest.created_at + timedelta(seconds=authority.timeout_seconds),
+                      'resolution_checkpoint_scope_changed')
+        # A checkpoint is data, not a grant. Keep its first exact deadline, then
+        # validate the COMPLETE immutable history, including every scope field.
+        journal_scope['original_deadline'] = original_deadline.isoformat()
+        recovered = await journal.load(journal_scope) if journal is not None else None
+        from agent_hub.capabilities.python_resolution_authorization import (
+            bind_resolution_original_deadline,
+        )
+
+        bind_resolution_original_deadline(
+            {name: value for name, value in journal_scope.items() if name != 'original_deadline'}, original_deadline)
         if flow is None and recovered is None and not force and all(any(
             wheel.name == canonicalize_name(requirement(n.requirement).name)
             and Version(wheel.version) in requirement(n.requirement).specifier
@@ -630,7 +656,8 @@ class GeneratedProjectService:
             return await checker(authority.tenant_id, authority.run_id, capability_approval_scope(request)) is True
 
         # Retain immutable data, but never retain a previous call's source/actor fences.
-        client = PythonResolutionPreparation(current=current, approved=approved)
+        client = PythonResolutionPreparation(current=current, approved=approved,
+            original_deadline=original_deadline)
         if flow is None:
             flow = DynamicPythonResolutionFlow(client, checkpoint=persist)
             if recovered is not None:

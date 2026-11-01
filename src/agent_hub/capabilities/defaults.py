@@ -659,13 +659,24 @@ async def _project_resolution_preparation_effect(
             return PolicyEffect.DENY
         for name in ('key', 'source_sha256', 'root_sha256', 'catalog_sha256', 'permissions_sha256'):
             require_sha(cast(str, args[name]))
+        from agent_hub.capabilities.python_resolution_authorization import (
+            resolution_original_deadline,
+        )
+
+        original_deadline = resolution_original_deadline({**scope.model_dump(mode='json'),
+            'root_sha256': args['root_sha256'], 'catalog_sha256': args['catalog_sha256']})
+        if original_deadline is None:
+            original_deadline = record.created_at + timedelta(
+                seconds=min(context.timeout_seconds, live.timeout_seconds))
         if (args['permissions_sha256'] != scope.permissions_sha256 or record.worker_id != worker
                 or record.worker_lease_token != authority.execution_token
                 or args['registry'] != 'https://pypi.org' or args['artifact_host'] != 'files.pythonhosted.org'
                 or args['install_allowed'] is not False or type(args['max_wheel_bytes']) is not int
                 or args['max_wheel_bytes'] != 64 * 1024**2
-                or args['original_deadline'] != (record.created_at + timedelta(
-                    seconds=min(context.timeout_seconds, live.timeout_seconds))).isoformat()):
+                or original_deadline.tzinfo is None
+                or not record.created_at < original_deadline <= record.created_at + timedelta(seconds=live.timeout_seconds)
+                or original_deadline <= datetime.now(UTC)
+                or args['original_deadline'] != original_deadline.isoformat()):
             return PolicyEffect.DENY
         requirements = args['requirements']
         if type(requirements) is not list or not 0 < len(requirements) <= 128:
