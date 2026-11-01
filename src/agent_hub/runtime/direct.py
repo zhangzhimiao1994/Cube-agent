@@ -1150,6 +1150,44 @@ def _workspace_batch_from_model_text(
     )
 
 
+def _workspace_batch_budget_text(response: ModelResponse) -> str:
+    text = response.text or ""
+    if response.tool_calls:
+        text += json.dumps([
+            {"name": call.name, "arguments": dict(call.arguments)} for call in response.tool_calls
+        ], ensure_ascii=True, default=dict, separators=(",", ":"))
+    return text
+
+
+def _workspace_batch_rejection_code(response: ModelResponse) -> str:
+    """Finite feedback for a rejected response; never relax the batch parser."""
+    if response.tool_calls:
+        return "native_tools_not_executed"
+    if not response.text or not response.text.strip():
+        return "empty_response"
+    parsed = _single_batch_envelope(response.text)
+    if parsed is None:
+        return "invalid_json_envelope"
+    raw = parsed.get("workspace_batch", parsed.get("workspace_bundle", parsed))
+    if not isinstance(raw, Mapping):
+        return "invalid_batch_envelope"
+    if {"complete", "continuation"} & parsed.keys() and raw is not parsed:
+        return "invalid_control_placement"
+    if "workspace_batch" in parsed and type(raw.get("complete")) is not bool:
+        return "invalid_completion_control"
+    files = raw.get("files")
+    if not isinstance(files, Mapping):
+        return "invalid_files_mapping"
+    for path, content in files.items():
+        if type(path) is not str or _safe_workspace_bundle_path(path) is None:
+            return "invalid_relative_path"
+        if type(content) is not str:
+            return "invalid_file_content"
+    if not files and "read_paths" not in raw and "python_catalog" not in raw:
+        return "empty_batch_without_completion"
+    return "invalid_batch_controls"
+
+
 def _workspace_files_from_truncated_json(text: str) -> dict[str, str]:
     decoder = json.JSONDecoder()
     for marker in re.finditer(r'"files"\s*:\s*\{', text):
@@ -2731,6 +2769,12 @@ class DirectRuntime:
                 ))
             elif protected_feedback:
                 progress_message = ModelMessage(role='user', content=protected_feedback + 'Progress: ' + progress_payload)
+            progress_message = ModelMessage(role="user", content=cast(str, progress_message.content) + (
+                '\nReturn only {"workspace_batch":{"files":{"safe/relative/path":"full UTF-8 contents"},'
+                '"complete":true,"continuation":""},"summary":"delivery summary"}. '
+                'Keep complete and continuation inside workspace_batch. For unfinished work use '
+                'complete=false and a nonempty continuation. Preserve frozen controls and prior valid files.'
+            ))
             read_messages: tuple[ModelMessage, ...] = ()
             if reads:
                 read_payload = json.dumps(reads, ensure_ascii=False, allow_nan=False,
@@ -2780,38 +2824,105 @@ class DirectRuntime:
                 max_output_tokens=next_output_tokens,
             )
             prompt_estimate = next_prompt_estimate
-            if self._cancel_requested:
-                raise asyncio.CancelledError
-            gateway_task = asyncio.create_task(self._complete_with_scope(request))
-            self._active_task = gateway_task
-            failure_source: RuntimeExecutionError | None = None
-            try:
-                async with asyncio.timeout(remaining_seconds):
-                    completion = await gateway_task
-            except asyncio.CancelledError:
-                raise
-            except Exception as error:  # noqa: BLE001 - redact gateway boundary
-                failure_reason = _gateway_failure_reason(error)
-                failure_source = RuntimeExecutionError(failure_reason)
-                preserve_gateway_scope_diagnostic(failure_source, error)
-                error.__traceback__ = None
-                error.__context__ = None
-                error.__cause__ = None
-                del error
-            if failure_source is not None:
-                _raise_execution_error(str(failure_source), source=failure_source)
-            validated_completion = self._strict_completion(completion)
-            if validated_completion is None:
-                _raise_execution_error("model response is invalid")
-            completion = validated_completion
-            response = completion.response
-            if response.tool_calls or response.text is None or not response.text.strip():
-                _raise_execution_error("model response is unsupported")
-            next_batch = _workspace_batch_from_model_text(response.text, allow_reads=scoped_reads,
-                allow_catalog=_catalog_workspace_reads(context),
-                allow_completion=bool(known_files) and verification_enabled and not validation_failures)
-            if next_batch is None:
-                _raise_execution_error("workspace batch is invalid")
+            # A received, invalid protocol response is not an unknown tool outcome.
+            # Correct it in this same task, preserving the draft/verification evidence
+            # above. Repeated failure classes without an accepted batch stop; actual
+            # progress can start another correction cycle within the original budget.
+            protocol_failures: set[str] = set()
+            while True:
+                if self._cancel_requested:
+                    raise asyncio.CancelledError
+                remaining_seconds = deadline - asyncio.get_running_loop().time()
+                if remaining_seconds <= 0:
+                    _raise_execution_error("workspace delivery budget is exhausted")
+                gateway_task = asyncio.create_task(self._complete_with_scope(request))
+                self._active_task = gateway_task
+                failure_source: RuntimeExecutionError | None = None
+                try:
+                    async with asyncio.timeout(remaining_seconds):
+                        completion = await gateway_task
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:  # noqa: BLE001 - redact gateway boundary
+                    failure_reason = _gateway_failure_reason(error)
+                    failure_source = RuntimeExecutionError(failure_reason)
+                    preserve_gateway_scope_diagnostic(failure_source, error)
+                    error.__traceback__ = None
+                    error.__context__ = None
+                    error.__cause__ = None
+                    del error
+                if failure_source is not None:
+                    _raise_execution_error(str(failure_source), source=failure_source)
+                validated_completion = self._strict_completion(completion)
+                if validated_completion is None:
+                    _raise_execution_error("model response is invalid")
+                completion = validated_completion
+                response = completion.response
+                next_batch = None if response.tool_calls or not response.text else (
+                    _workspace_batch_from_model_text(response.text, allow_reads=scoped_reads,
+                        allow_catalog=_catalog_workspace_reads(context),
+                        allow_completion=bool(known_files) and verification_enabled and not validation_failures))
+                if next_batch is not None:
+                    break
+                parsed_rejection = _json_mapping_from_model_text(response.text or "")
+                rejected_batch: object = None
+                if parsed_rejection is not None:
+                    rejected_batch = parsed_rejection.get("workspace_batch",
+                        parsed_rejection.get("workspace_bundle", parsed_rejection))
+                if isinstance(rejected_batch, Mapping) and (
+                    ("read_paths" in rejected_batch and not scoped_reads)
+                    or ("python_catalog" in rejected_batch and not _catalog_workspace_reads(context))
+                    or (validation_failures and rejected_batch.get("files") == {}
+                        and rejected_batch.get("complete") is True)
+                ):
+                    # A protocol retry cannot turn a disabled read into a grant or
+                    # clear a rejected write using an empty completion claim.
+                    _raise_execution_error("workspace batch is invalid")
+                rejected_text = _workspace_batch_budget_text(response)
+                rejected = self._verified_budget_usage(response.usage,
+                    prompt_estimate=prompt_estimate, response_text=rejected_text,
+                    request_max_output_tokens=request.max_output_tokens,
+                    context_token_budget=_effective_context_token_budget(context))
+                if rejected.usage is None:
+                    _raise_execution_error(rejected.error_code or "model response budget is unverifiable")
+                total_prompt_tokens += rejected.usage.prompt_tokens
+                total_completion_tokens += rejected.usage.completion_tokens
+                total_reported_tokens += rejected.usage.total_tokens
+                consumed_tokens = total_reported_tokens
+                usage_estimated = usage_estimated or rejected.estimated
+                if consumed_tokens > active_token_limit:
+                    _raise_execution_error("model response budget exceeds runtime limit")
+                rejection_code = _workspace_batch_rejection_code(response)
+                if rejection_code in protocol_failures:
+                    _raise_execution_error("workspace batch is invalid")
+                protocol_failures.add(rejection_code)
+                correction = ModelMessage(role="user", content=(
+                    "The received response was rejected: workspace_batch_is_invalid ("
+                    + rejection_code + "). No requested tools or rejected file writes were executed. "
+                    "Preserve already written files and the original acceptance requirements. "
+                    "Return only JSON shaped as "
+                    '{"workspace_batch":{"files":{"safe/relative/path":"full UTF-8 contents"},'
+                    '"complete":true,"continuation":""},"summary":"delivery summary"}. '
+                    "complete must be boolean and inside workspace_batch. Use complete=false with "
+                    "a nonempty continuation for unfinished work. A read request needs files={}, "
+                    "1..8 safe relative read_paths, complete=false and nonempty continuation; "
+                    "only use reads already enabled by the task. No native tool calls. "
+                    "This correction grants no permissions, budget, successful verification or completion."
+                ))
+                corrected_messages = (*next_messages, correction)
+                corrected_estimate = _estimate_text_tokens(json.dumps([
+                    {"role": item.role, "content": item.content} for item in corrected_messages
+                ], ensure_ascii=False, allow_nan=False, separators=(",", ":")))
+                remaining_seconds = deadline - asyncio.get_running_loop().time()
+                corrected_output_tokens = min(initial_request.max_output_tokens,
+                    _effective_context_token_budget(context) - corrected_estimate,
+                    active_token_limit - consumed_tokens - corrected_estimate)
+                if remaining_seconds <= 0 or corrected_output_tokens <= 0:
+                    _raise_execution_error("workspace delivery budget is exhausted")
+                request = replace(initial_request, messages=corrected_messages,
+                    timeout_seconds=min(request.timeout_seconds, remaining_seconds),
+                    max_output_tokens=corrected_output_tokens)
+                prompt_estimate = corrected_estimate
             batch = next_batch
 
     @staticmethod
@@ -3195,9 +3306,7 @@ class DirectRuntime:
                     # model. Alias/fallback count is not a protocol retry budget.
                     if protocol_corrections >= 1:
                         _raise_execution_error('generated project response did not satisfy workspace_batch protocol')
-                    rejected_text = response.text or json.dumps([
-                        {'name': call.name, 'arguments': dict(call.arguments)} for call in response.tool_calls],
-                        ensure_ascii=True, default=dict, separators=(',', ':'))
+                    rejected_text = _workspace_batch_budget_text(response)
                     rejected_usage = self._verified_budget_usage(response.usage, prompt_estimate=prompt_estimate,
                         response_text=rejected_text, request_max_output_tokens=request.max_output_tokens,
                         context_token_budget=_effective_context_token_budget(context))
