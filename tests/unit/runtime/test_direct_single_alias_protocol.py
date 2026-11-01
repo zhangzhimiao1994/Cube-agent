@@ -17,7 +17,7 @@ from agent_hub.harness.types import HarnessToolCallResult
 from agent_hub.runtime.action_direct import ActionApprovedDirectRuntime
 from agent_hub.runtime.artifacts import InMemoryArtifactRepository
 from agent_hub.runtime.continuation_artifacts import load_continuation
-from agent_hub.runtime.contracts import EventKind
+from agent_hub.runtime.contracts import EventKind, RunEvent
 from agent_hub.runtime.defaults import ConfigBackedDirectRuntime
 from tests.unit.runtime.test_action_admission_helper import OfflineTransport, configured_document
 from tests.unit.runtime.test_configured_runtime import (
@@ -63,8 +63,8 @@ async def test_single_alias_factory_corrects_known_response_before_workspace_act
     harness = WorkspaceHarness(context, verified, bundle)
     repository = InMemoryArtifactRepository()
     children: list[ActionApprovedDirectRuntime] = []
-    observations: list[tuple[int, bool, tuple[EventKind, ...]]] = []
-    events = []
+    observations: list[tuple[int, bool, tuple[str, ...]]] = []
+    events: list[RunEvent] = []
 
     class ObservedTransport(OfflineTransport):
         async def complete(self, deployment: Any, request: Any, api_key: str) -> Any:
@@ -76,11 +76,12 @@ async def test_single_alias_factory_corrects_known_response_before_workspace_act
             assert deployment.logical_model == request.logical_model == 'main'
             return await super().complete(deployment, request, api_key)
 
-    # Shape-only reproduction: valid JSON, ten synthetic files, controls at the wrong level.
+    # Conflicting controls remain invalid even though unambiguous root controls
+    # are now supported by the separate batch-envelope compatibility path.
     malformed = json.dumps({'complete': True, 'continuation': '', 'summary': 'Synthetic draft.',
         'workspace_batch': {'files': {
             f'synthetic/file-{index}.txt': f'Synthetic fixture {index}.\n' for index in range(10)
-        }}})
+        }, 'complete': False, 'continuation': 'Conflicting unfinished control.'}})
     transport = ObservedTransport([response(malformed), response(batch())])
 
     async def capacity(tenant_id: Any, deployments: Any) -> ImmediateCapacity:
@@ -151,7 +152,7 @@ async def test_single_alias_factory_corrects_known_response_before_workspace_act
     assert not first.tools and not corrected.tools
     assert 0 < corrected.timeout_seconds <= first.timeout_seconds <= context.timeout_seconds
     assert 0 < corrected.max_output_tokens <= first.max_output_tokens
-    assert sum(event.payload['total_tokens'] for event in completions) == 360
+    assert sum(cast(int, event.payload['total_tokens']) for event in completions) == 360
 
     journal = children[0]._journal
     assert journal is not None and journal.replay_complete and len(journal.references) == 2

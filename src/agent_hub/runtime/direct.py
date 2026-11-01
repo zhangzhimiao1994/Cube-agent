@@ -1012,6 +1012,7 @@ def _single_batch_envelope(text: str) -> Mapping[str, object] | None:
 
 def _workspace_batch_from_model_text(
     text: str, *, allow_reads: bool = False, allow_catalog: bool = False,
+    allow_completion: bool = False,
 ) -> _WorkspaceBatch | None:
     parsed = _json_mapping_from_model_text(text)
     markdown_fallback = False
@@ -1124,7 +1125,20 @@ def _workspace_batch_from_model_text(
     if markdown_fallback and _markdown_workspace_batch_is_complete(files):
         complete = True
         continuation = ""
-    if (not files and not read_paths and catalog is None) or (not complete and not continuation.strip()):
+    # A later batch may finish files already written, but is never evidence that
+    # those files pass verification. Only a single, unambiguous control envelope
+    # is eligible; initial responses and envelopes with extra actions stay invalid.
+    completion_only = (
+        allow_completion and complete is True and not files and not read_paths and catalog is None
+        and parsed is not None and _single_batch_envelope(text) == parsed
+        and parsed.keys() <= {'workspace_batch', 'summary'}
+        and isinstance(parsed.get('workspace_batch'), Mapping)
+        and raw_batch.keys() <= {'files', 'complete', 'continuation', 'summary'}
+        and type(raw_batch.get('continuation', '')) is str
+        and not raw_batch.get('continuation', '')
+    )
+    if ((not files and not read_paths and catalog is None and not completion_only)
+            or (not complete and not continuation.strip())):
         return None
     return _WorkspaceBatch(
         files=files,
@@ -2442,8 +2456,12 @@ class DirectRuntime:
                     raise _WorkspacePrerequisiteBlocked(prerequisite_feedback)
             changed_files = sum(known_files.get(path) != hashlib.sha256(content.encode("utf-8")).hexdigest()
                                 for path, content in batch.files.items())
+            completion_only = (batch.complete and not batch.files and not batch.read_paths
+                               and batch.python_catalog is None and bool(known_files) and verification_enabled
+                               and not validation_failures)
             try:
-                if changed_files or not original_policy and not batch.read_paths and catalog_read is None:
+                if not completion_only and (changed_files or not original_policy
+                                           and not batch.read_paths and catalog_read is None):
                     await self._write_workspace_batch(
                         context, batch, known_files=known_files, deadline=deadline,
                     )
@@ -2471,16 +2489,17 @@ class DirectRuntime:
                     _raise_execution_error("incremental workspace delivery failed")
             else:
                 validation_failures.clear()
-                gain = (0 if catalog_read is not None else changed_files if diagnostic_reads else
+                gain = (0 if catalog_read is not None or completion_only else changed_files if diagnostic_reads else
                         changed_files + read_gain if scoped_reads else max(1, len(batch.files)))
                 if (gain == 0 and catalog_read is None and (not diagnostic_reads or read_gain == 0)
-                        and not new_missing_observation):
+                        and not new_missing_observation and not completion_only):
                     _raise_execution_error("workspace batch made no progress")
                 progress_units += gain
                 completed_batches += int(gain > 0 and catalog_read is None
                                          and (not diagnostic_reads or changed_files > 0))
             # Observations can inform repair within the saved window, never earn another one.
-            if (catalog_read is None and (not diagnostic_reads or validation_code is None and changed_files > 0)
+            if (not completion_only and catalog_read is None
+                    and (not diagnostic_reads or validation_code is None and changed_files > 0)
                     and (not new_missing_observation or changed_files > 0 or read_gain > 0)):
                 active_token_limit = _workspace_delivery_token_limit(
                     context,
@@ -2789,7 +2808,8 @@ class DirectRuntime:
             if response.tool_calls or response.text is None or not response.text.strip():
                 _raise_execution_error("model response is unsupported")
             next_batch = _workspace_batch_from_model_text(response.text, allow_reads=scoped_reads,
-                                                        allow_catalog=_catalog_workspace_reads(context))
+                allow_catalog=_catalog_workspace_reads(context),
+                allow_completion=bool(known_files) and verification_enabled and not validation_failures)
             if next_batch is None:
                 _raise_execution_error("workspace batch is invalid")
             batch = next_batch
