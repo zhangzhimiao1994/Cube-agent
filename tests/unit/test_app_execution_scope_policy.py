@@ -11,12 +11,12 @@ from agent_hub import app as app_module
 from agent_hub.api.routers.admin import InMemoryAdminResourceService, PluginResourceResponse
 from agent_hub.app import create_app
 from agent_hub.settings import Settings
+from tests.unit.app_wiring_stack_fixture import capture_stacks
 from tests.unit.test_app_wiring import (
     FakeDatabase,
     FakeRedis,
     StubAuthService,
     StubConfigService,
-    StubProjectInputPreparer,
     StubRateLimiter,
     valid_settings,
 )
@@ -25,8 +25,6 @@ from tests.unit.test_app_wiring import (
 def _application(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Any, dict[str, Any]]:
     assert "execution_scope_policy_file" in Settings.model_fields
     captured: dict[str, Any] = {}
-    preparer = StubProjectInputPreparer()
-    captured["project_input_preparer"] = preparer
 
     class Runtime:
         async def reload(self, tenant_id: Any = None) -> None:
@@ -49,12 +47,7 @@ def _application(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Any, 
     monkeypatch.setattr(app_module, "build_runtime_plugin_service", build_plugin)
     monkeypatch.setattr(app_module, "build_runtime_mcp_service", build_mcp)
     monkeypatch.setattr(app_module, "configured_runtime_registry", lambda **kwargs: object())
-    monkeypatch.setattr(
-        app_module,
-        "build_runtime_capability_stack",
-        lambda **kwargs: SimpleNamespace(runtime_gateway=object(), harness_tool_gateway=object(),
-                                        project_input_preparer=preparer),
-    )
+    capture_stacks(monkeypatch, app_module, captured)
     app = create_app(
         settings=valid_settings(
             tmp_path / "attachments",

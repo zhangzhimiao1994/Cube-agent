@@ -107,6 +107,21 @@ class FakeRuntime:
         raise AssertionError("not used")
 
 
+class HermesCompletedRuntime(FakeRuntime):
+    """Successful Hermes cases explicitly complete; interruption cases keep FakeRuntime."""
+
+    async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
+        last_sequence = 0
+        terminal = False
+        async for event in super().run(context):
+            last_sequence = event.sequence
+            terminal = terminal or event.kind == EventKind.RUNTIME_COMPLETED
+            yield event
+        if not terminal:
+            yield RunEvent(kind=EventKind.RUNTIME_COMPLETED, sequence=last_sequence + 1,
+                           run_id=context.run_id, reason="explicit_completion")
+
+
 class ApprovalAfterArtifactRuntime:
     mode = TaskMode.DISPATCH
 
@@ -1339,7 +1354,7 @@ async def test_completed_run_records_bounded_hermes_outcome(
     user_id = uuid4()
     outcomes: list[HermesRunOutcome] = []
     advisor = RecordingHermesAdvisor(outcomes=outcomes)
-    runtime = FakeRuntime()
+    runtime = HermesCompletedRuntime()
     repository = RunRepository(run_session_factory)
     service = RunService(
         repository,
@@ -1399,7 +1414,7 @@ async def test_continued_conversation_records_visible_hermes_ledger_after_clear(
     repository = RunRepository(run_session_factory)
     service = RunService(
         repository,
-        runtime_registry=RuntimeRegistry((FakeRuntime(),)),
+        runtime_registry=RuntimeRegistry((HermesCompletedRuntime(),)),
         router=None,
         task_queue=RecordingQueue([]),
         hermes_advisor=PersistentHermesRunAdvisor(run_session_factory),

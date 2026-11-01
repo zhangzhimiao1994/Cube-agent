@@ -389,9 +389,11 @@ class ConcreteModelReviewGate:
         repository: ConcreteReviewRepository,
         *,
         dispatch_check: Callable[[], Awaitable[None]] | None = None,
+        model_dispatch_check: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         self.loader, self.service, self.repository = loader, service, repository
         self.dispatch_check = dispatch_check
+        self.model_dispatch_check = model_dispatch_check
 
     def invocation(
         self, *, tool_name: str, backend: object, backend_getter: Callable[[], object]
@@ -523,6 +525,7 @@ class _ConcreteReviewCall:
         self._check: Callable[[], Awaitable[bool]] | None = None
         self._source_check: Callable[[], None] | None = None
         self._dispatched = False
+        self._model_permit_consumed = False
         self._identity_check: Callable[[], object] | None = None
         self._budget: _RunBudgetContext | None = None
         self._write_request: CapabilityRequest | None = None
@@ -721,6 +724,7 @@ class _ConcreteReviewCall:
                 ),
             ):
                 return denied
+            self._model_permit_consumed = True
             self._check = model_check
             self._set_source_check(
                 captured,
@@ -788,6 +792,8 @@ class _ConcreteReviewCall:
                 return False
             if self.gate.dispatch_check is not None:
                 await self.gate.dispatch_check()
+            if self._model_permit_consumed and self.gate.model_dispatch_check is not None:
+                await self.gate.model_dispatch_check()
             if self._source_check is not None:
                 self._source_check()
             # Nothing asynchronous may follow these revocation checks before

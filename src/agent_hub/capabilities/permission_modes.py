@@ -98,7 +98,7 @@ def _pending_concrete_write(record: object, request: CapabilityRequest, role: Ro
         type(budget) is not _RunBudgetContext
         or not isinstance(profile, Mapping)
         or type(profile.get("version")) is not int
-        or profile["version"] != 1
+        or profile["version"] not in (1, 2)
         or profile.get("config_sha256") != review_config_sha256(budget.config)
         or type(profile.get("catalog_version")) is not int
         or profile["catalog_version"] < 1

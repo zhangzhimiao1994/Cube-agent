@@ -10,7 +10,7 @@ from agent_hub.auth.passwords import PasswordService
 from agent_hub.auth.service import AuthService
 from agent_hub.auth.tokens import AccessTokenService
 from agent_hub.config.service import ConfigService
-from agent_hub.db.models import TenantRow
+from agent_hub.db.models import TenantRow, UserRow
 
 
 class AllowAllLimiter:
@@ -146,7 +146,27 @@ async def test_real_foundation_api_workflow_and_tenant_authorization(
         assert diff.json()["changed"][0]["path"] == "/agents"
         assert rollback.json()["version"] == 3
 
-        operator_token = tokens.encode(uuid4(), tenant_id, Role.OPERATOR)
+        # Signed claims require a real, enabled current identity. Keep the
+        # operator permission and cross-tenant resource checks beyond auth.
+        operator_id, other_user_id, other_tenant_id = uuid4(), uuid4(), uuid4()
+        async with auth_session_factory() as session, session.begin():
+            session.add(TenantRow(id=other_tenant_id, slug="other-api", name="Other API"))
+            await session.flush()
+            session.add_all([
+                UserRow(id=operator_id, tenant_id=tenant_id, username="operator",
+                        role=Role.OPERATOR.value, disabled=False),
+                UserRow(id=other_user_id, tenant_id=other_tenant_id, username="other-admin",
+                        role=Role.ADMIN.value, disabled=False),
+            ])
+
+        absent_user_token = tokens.encode(uuid4(), tenant_id, Role.OPERATOR)
+        absent = await client.get(
+            "/api/v1/config/current", headers={"Authorization": f"Bearer {absent_user_token}"}
+        )
+        assert absent.status_code == 401
+        assert absent.headers["www-authenticate"] == "Bearer"
+
+        operator_token = tokens.encode(operator_id, tenant_id, Role.OPERATOR)
         operator_headers = {"Authorization": f"Bearer {operator_token}"}
         assert (
             await client.get("/api/v1/config/current", headers=operator_headers)
@@ -173,7 +193,7 @@ async def test_real_foundation_api_workflow_and_tenant_authorization(
         )
         assert admin_publish.status_code == 200
 
-        other_tenant_token = tokens.encode(uuid4(), uuid4(), Role.ADMIN)
+        other_tenant_token = tokens.encode(other_user_id, other_tenant_id, Role.ADMIN)
         other_headers = {"Authorization": f"Bearer {other_tenant_token}"}
         idor = await client.post(
             f"/api/v1/config/drafts/{first.json()['id']}/publish",

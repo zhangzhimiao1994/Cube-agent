@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -12,6 +13,7 @@ from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.files.workspace import ProjectWorkspaceStore
 from agent_hub.runs.repository import RunRepository
 from agent_hub.runs.workspace import workspace_selection
+from agent_hub.runtime.contracts import JsonValue
 
 
 @pytest.mark.parametrize("tool", ("workspace_read", "workspace.read", "read_context"))
@@ -49,12 +51,17 @@ async def test_persisted_run_controls_file_scope_and_permission_revocation(
             workspace_root=attachments, project_workspace_dir=project_root,
         ).runtime_gateway
 
-        async def read(path: str, *, owner: UUID = tenant, run: UUID = record.id) -> str:
-            result = await gateway.execute(
+        async def probe(
+            path: str, *, owner: UUID = tenant, run: UUID = record.id,
+        ) -> Mapping[str, JsonValue]:
+            return await gateway.execute(
                 tenant_id=owner, run_id=run, actor="worker", name=tool,
                 arguments={"path": path, "workspace_session_id": "other"},
                 idempotency_key=f"scope-{uuid4().hex}",
             )
+
+        async def read(path: str, *, owner: UUID = tenant, run: UUID = record.id) -> str:
+            result = await probe(path, owner=owner, run=run)
             text = result["text"]
             assert isinstance(text, str)
             return text
@@ -63,8 +70,16 @@ async def test_persisted_run_controls_file_scope_and_permission_revocation(
             f"{other_tenant}/{attachment}.bin", f"{tenant}/{unattached}.bin",
             "../other/AGENTS.md", "projects/project/sessions/other/AGENTS.md",
         ):
-            with pytest.raises(RuntimeCapabilityError):
-                await read(path)
+            try:
+                result = await probe(path)
+            except RuntimeCapabilityError:
+                continue
+            # Missing paths are a structured, non-disclosing observation. They
+            # may never contain file text or weaken tenant/permission checks below.
+            assert set(result) == {"path", "status", "error_code", "truncated"}
+            assert result["status"] == "not_found"
+            assert result["error_code"] == "workspace.file_not_found"
+            assert result["truncated"] is False and "text" not in result
         with pytest.raises(RuntimeCapabilityError):
             await read("AGENTS.md", owner=other_tenant)
         with pytest.raises(RuntimeCapabilityError):

@@ -31,6 +31,7 @@ from agent_hub.capabilities.gateway import (
     CapabilityStatus,
 )
 from agent_hub.capabilities.generated_project_service import GeneratedProjectService
+from agent_hub.capabilities.python_input_preparation import dynamic_python_pins
 from agent_hub.capabilities.runtime import RuntimeCapabilityGateway
 from agent_hub.capabilities.types import CapabilityRequest
 from agent_hub.db.models import RunApprovalRow, RunCheckpointRow
@@ -478,7 +479,7 @@ async def test_resolution_publication_and_real_prepare_share_one_run_without_ear
     assert case.native['saved'] is not None and 'generated_project_preparation' not in dao.run.routing_decision
     # Model correction uses the actual resolved distribution pins; test project only.
     (work / 'pyproject.toml').write_bytes((work / 'pyproject.toml').read_bytes().replace(b'demo-dep>=1', b'demo-dep==1.0'))
-    (work / 'requirements.lock').write_bytes(_fixtures.api().dynamic_python_pins(
+    (work / 'requirements.lock').write_bytes(dynamic_python_pins(
         case.native['saved'].to_payload()).encode())
     case.native['lose_publication_response'] = unknown
     second = await invoke(case)
@@ -585,7 +586,7 @@ async def test_current_exact_deny_after_publication_approval_precedes_root_publi
     project_path = importlib.import_module('tests.unit.capabilities.test_scoped_read').project_path()
     work = case.service.root / project_path
     (work / 'pyproject.toml').write_bytes((work / 'pyproject.toml').read_bytes().replace(b'demo-dep>=1', b'demo-dep==1.0'))
-    (work / 'requirements.lock').write_bytes(_fixtures.api().dynamic_python_pins(
+    (work / 'requirements.lock').write_bytes(dynamic_python_pins(
         case.native['saved'].to_payload()).encode())
     pending = await invoke(case)
     assert case.calls.count('publish_python_resolution') == 0

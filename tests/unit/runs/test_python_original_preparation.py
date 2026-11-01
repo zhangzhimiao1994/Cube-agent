@@ -6,18 +6,29 @@ import importlib
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
+from uuid import UUID
 
 import pytest
 
+from agent_hub.auth.models import Role
 from agent_hub.capabilities.approvals import capability_approval_scope
+from agent_hub.capabilities.gateway import CapabilityResult, CapabilityStatus
 from agent_hub.capabilities.project_verification import ProjectVerificationService
 from agent_hub.capabilities.types import CapabilityRequest
 from agent_hub.harness.tool_gateway import HarnessToolGateway
-from agent_hub.harness.types import HarnessToolCallResult
+from agent_hub.harness.types import HarnessToolCallRequest, HarnessToolCallResult
 from agent_hub.runs.repository import RunRepository
 from tests.unit.capabilities.test_python_project_input_store import python_controls
 from tests.unit.capabilities.test_python_project_service import PythonExecutor
 from tests.unit.runs.test_original_project_preparation import setup
+
+
+class InstallPolicy:
+    def __init__(self, owner: Authorizer) -> None:
+        self.owner = owner
+
+    async def invoke(self, request: CapabilityRequest, *, role: Role) -> CapabilityResult:
+        return await self.owner.install(request, role=role)
 
 
 class Authorizer:
@@ -31,8 +42,10 @@ class Authorizer:
         self.allowed = False
         self.scopes: set[str] = set()
         self.calls = 0
+        self._policy_gateway = InstallPolicy(self)
 
-    async def authorize(self, tenant_id: Any, request: Any, **kwargs: Any) -> HarnessToolCallResult:
+    async def install(self, request: CapabilityRequest, *, role: Role) -> CapabilityResult:
+        tenant_id = request.tenant_id
         self.calls += 1
         state = self.repository.row.routing_decision["project_input_preparation"]
         assert state["schema_version"] == 2 and state["phase"] == "captured"
@@ -52,9 +65,9 @@ class Authorizer:
         exact = await self.verifier.authorization_request(
             CapabilityRequest(
                 tenant_id=tenant_id,
-                user_id=kwargs["user_id"],
+                user_id=request.user_id,
                 run_id=request.run_id,
-                agent_id=request.actor,
+                agent_id=request.agent_id,
                 capability="command",
                 operation="run",
                 resource="workspace/current/project-verification",
@@ -63,16 +76,28 @@ class Authorizer:
             )
         )
         assert exact is not None
+        assert exact == request and role is Role.OPERATOR
         if self.allowed:
             scope = capability_approval_scope(exact)
             assert scope is not None
             self.scopes.add(scope)
+        return CapabilityResult(
+            CapabilityStatus.ALLOWED if self.allowed else CapabilityStatus.DENIED,
+            request.run_id, reason=None if self.allowed else "denied",
+        )
+
+    async def authorize(self, tenant_id: UUID, request: HarnessToolCallRequest, *,
+                        user_id: UUID | None = None, role: Role | None = None) -> HarnessToolCallResult:
+        # Static discovery grants nothing. Only InstallPolicy models the
+        # concrete IO boundary and publishes the test repository's receipt.
+        assert (tenant_id, request.run_id, user_id, role) == (
+            self.invocation.tenant_id, self.invocation.run_id,
+            self.repository.row.actor_id, Role.OPERATOR,
+        )
         return HarnessToolCallResult(
             call_id=request.call_id,
             tool_name=request.tool_name,
-            status="succeeded" if self.allowed else "failed",
-            payload={"authorized": self.allowed},
-            failure_reason=None if self.allowed else "denied",
+            status="succeeded", payload={"authorized": True},
         )
 
 

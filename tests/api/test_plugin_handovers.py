@@ -30,6 +30,7 @@ from agent_hub.plugins.handover_storage import (
     WorkspaceSource,
 )
 from agent_hub.plugins.handover_verification import PackageVerificationError
+from tests.api.live_principal_fixture_nov02 import require_current_principal
 
 HID = "gh-" + "a" * 64
 PLAN_HASH = "b" * 64
@@ -86,6 +87,11 @@ class StubAuth:
         if token != "valid-token":
             raise InvalidCredentials("invalid token")
         return self.principal
+
+    async def validate_principal(
+        self, principal: AuthenticatedPrincipal
+    ) -> AuthenticatedPrincipal:
+        return require_current_principal(principal, self.principal)
 
 
 @dataclass

@@ -44,7 +44,7 @@ class History:
         )
 
 
-def history(*, reuse: bool = True, tool: str = "workspace.read") -> History:
+def history(*, reuse: bool = True, tool: str = "read_context") -> History:
     step = tool_plan().steps[0].model_copy(update={"tools": (tool,)})
     models, tools = a._ModelLedger(), a._ToolLedger()
     evidence: list[str] = []
@@ -52,7 +52,8 @@ def history(*, reuse: bool = True, tool: str = "workspace.read") -> History:
     provenance = GatewayProvenance(logical_model="selected", deployment_id="synthetic",
         provider_id="openai", provider_model="openai/synthetic")
     for index in range(2):
-        arguments = {"path": "synthetic" if reuse else f"synthetic-{index}"}
+        arguments = {"query" if tool == "read_context" else "path":
+                     "synthetic" if reuse else f"synthetic-{index}"}
         artifact = Artifact(id=uuid4(), type="model_response", producer=step.agent,
             source_ids=a._lineage_window_ids(tuple(evidence), anchor_count=0), provenance=provenance,
             content={"text": None, "tool_calls": cast(JsonValue, [{"id": f"call-{index}", "name": tool,
@@ -185,8 +186,8 @@ def test_future_matching_receipt_first_cannot_shadow_consumed_past() -> None:
     previous = case.models.artifacts["model-1"]
     fields = previous.to_payload()
     content = cast(dict[str, JsonValue], fields["content"])
-    arguments: dict[str, JsonValue] = {"path": "synthetic-0"}
-    content["tool_calls"] = cast(JsonValue, [{"id": f"repeat-{i}", "name": "workspace.read", "arguments": arguments} for i in range(2)])
+    arguments: dict[str, JsonValue] = {"query": "synthetic-0"}
+    content["tool_calls"] = cast(JsonValue, [{"id": f"repeat-{i}", "name": "read_context", "arguments": arguments} for i in range(2)])
     fields["content_sha256"] = ""
     changed = Artifact.from_payload(fields)
     case.models.artifacts["model-1"] = changed
@@ -231,7 +232,10 @@ def test_shared_graph_resolver_preserves_mutable_and_fresh_bundle_guards(name: s
             trigger_model_artifact_id=str(case.models.artifacts["model-1"].id),
             workspace_continuation=workspace, context_refresh=refresh,
         )
-    assert resolve(False) is artifact
+    if name in {"workspace.read", "workspace_read"}:
+        assert resolve(False) is None
+    else:
+        assert resolve(False) is artifact
     assert resolve(True) is None
 
 
@@ -248,3 +252,11 @@ def test_model_prefix_scope_and_order_are_verified_before_reuse(field: str, valu
     case = history()
     case.models.states["model-0"] = {**case.models.states["model-0"], field: value}
     assert case.verify() is None
+
+
+@pytest.mark.parametrize("name", ["workspace.read", "workspace_read"])
+def test_new_mutable_read_call_cannot_borrow_a_previous_receipt(name: str) -> None:
+    case = history(tool=name)
+    before = (dict(case.models.states), dict(case.tools.states), case.sources)
+    assert case.verify() is None
+    assert (case.models.states, case.tools.states, case.sources) == before

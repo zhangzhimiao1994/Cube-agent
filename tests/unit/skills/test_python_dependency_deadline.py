@@ -11,9 +11,14 @@ import pytest
 
 from agent_hub.skills.sandbox import python_dependency_index_store as store
 from agent_hub.skills.sandbox import python_dependency_inspection as inspection
+from agent_hub.skills.sandbox import python_dependency_metadata as metadata
+from agent_hub.skills.sandbox import python_input_fetch as fetch
 from agent_hub.skills.sandbox import python_input_supply_catalog as catalog
+from agent_hub.skills.sandbox import python_resolution_overlay as overlay
+from agent_hub.skills.sandbox.project import ProjectInvocation
 from agent_hub.skills.sandbox.python_dependency_metadata import PythonDependencyMetadataIndex
 from agent_hub.skills.sandbox.python_input_supply_catalog import RootSupplyConfig
+from agent_hub.skills.sandbox.python_resolution_overlay import effective_supply
 from tests.unit.skills import test_python_dependency_inspection as inspection_tests
 from tests.unit.skills.test_python_dependency_index_store import (
     STATE,
@@ -39,8 +44,12 @@ def simulated(monkeypatch: pytest.MonkeyPatch) -> Iterator[Any]:
     monkeypatch.setattr(store, "os", filesystem)
     monkeypatch.setattr(catalog, "os", filesystem)
     monkeypatch.setattr(store, "sys", SimpleNamespace(platform="linux"))
-    monkeypatch.setattr(store, "time", SimpleNamespace(
-        monotonic=lambda: filesystem.clock, sleep=filesystem.sleep))
+    clock = SimpleNamespace(monotonic=lambda: filesystem.clock, sleep=filesystem.sleep)
+    monkeypatch.setattr(store, "time", clock)
+    # Every deadline consumer uses the same simulated monotonic epoch. Keep
+    # wheel validation real, including its absolute deadline checks.
+    monkeypatch.setattr(metadata, "time", clock)
+    monkeypatch.setattr(fetch, "time", clock)
     locks = ModuleType("fcntl")
     for name, value in (("LOCK_SH", 1), ("LOCK_EX", 2), ("LOCK_NB", 4),
                         ("flock", filesystem.flock)):
@@ -161,7 +170,10 @@ async def test_inspection_passes_original_deadline_once(
 ) -> None:
     request = await inspection_tests.request_for(configured)
     clock = SimpleNamespace(now=100.0)
-    monkeypatch.setattr(inspection, "time", SimpleNamespace(monotonic=lambda: clock.now))
+    monotonic = SimpleNamespace(monotonic=lambda: clock.now)
+    monkeypatch.setattr(inspection, "time", monotonic)
+    monkeypatch.setattr(store, "time", monotonic)
+    monkeypatch.setattr(inspection_tests, "time", monotonic)
     original = configured.api.read_root_configuration
 
     def read_root() -> Any:
@@ -170,11 +182,24 @@ async def test_inspection_passes_original_deadline_once(
 
     monkeypatch.setattr(inspection, "read_root_configuration", read_root)
     seen: list[float | None] = []
+    selected: list[RootSupplyConfig] = []
+
+    def select_supply(base: RootSupplyConfig, invocation: ProjectInvocation, *,
+                      source_sha256: str, deadline: float) -> RootSupplyConfig:
+        assert base is configured.supply and deadline == 100.05
+        value = effective_supply(base, invocation, source_sha256=source_sha256, deadline=deadline)
+        selected.append(value)
+        return value
+
+    monkeypatch.setattr(overlay, "effective_supply", select_supply)
 
     def read_index(
         supply: RootSupplyConfig, *, deadline: float | None = None,
     ) -> PythonDependencyMetadataIndex:
-        assert supply is configured.supply
+        # Overlay selection owns an immutable copy. Require the exact object
+        # returned by the real selector, with the complete unchanged base value.
+        assert len(selected) == 1 and supply is selected[0]
+        assert supply == configured.supply
         seen.append(deadline)
         if outcome == "timeout":
             raise store.PythonDependencyIndexError("timeout")

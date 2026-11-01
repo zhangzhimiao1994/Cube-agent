@@ -8,6 +8,7 @@ import pytest
 from agent_hub.api.routers.admin import PluginResourceResponse
 from agent_hub.auth.models import AuthenticatedPrincipal, InvalidCredentials, Role
 from agent_hub.capabilities.runtime import RuntimeCapabilityError
+from tests.api.live_principal_fixture_nov02 import require_current_principal
 from tests.api.test_admin_resources import client
 
 _A = UUID("11111111-1111-4111-8111-111111111111")
@@ -20,6 +21,15 @@ class Auth:
         if tenant is None:
             raise InvalidCredentials("unknown test token")
         return AuthenticatedPrincipal(_A, tenant, Role.SUPER_ADMIN)
+
+    async def validate_principal(
+        self, principal: AuthenticatedPrincipal
+    ) -> AuthenticatedPrincipal:
+        current = {
+            _A: AuthenticatedPrincipal(_A, _A, Role.SUPER_ADMIN),
+            _B: AuthenticatedPrincipal(_A, _B, Role.SUPER_ADMIN),
+        }.get(principal.tenant_id)
+        return require_current_principal(principal, current)
 
 
 @pytest.mark.parametrize("tenant,token", [(_A, "tenant-a"), (_B, "tenant-b")])

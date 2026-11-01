@@ -57,7 +57,16 @@ def test_single_head_extends_0032_without_altering_old_revisions() -> None:
     assert current.revision == "0033_provider_continuations"
     assert current.down_revision == "0032_plugin_handover" and len(current.revision) <= 32
     scripts = ScriptDirectory.from_config(config())
-    assert scripts.get_heads() == [current.revision]
+    assert scripts.get_heads() == ["0036_review_ledger"]
+    chain = list(scripts.iterate_revisions("0036_review_ledger", "0032_plugin_handover"))
+    assert [revision.revision for revision in chain] == [
+        "0036_review_ledger", "0035_run_admission", "0034_authenticated_inputs",
+        current.revision,
+    ]
+    assert [revision.down_revision for revision in chain] == [
+        "0035_run_admission", "0034_authenticated_inputs", current.revision,
+        "0032_plugin_handover",
+    ]
 
 
 @pytest.mark.parametrize("direction", ["upgrade", "downgrade"])

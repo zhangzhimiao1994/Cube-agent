@@ -12,7 +12,6 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from agent_hub.api.routers import admin as admin_router
 from agent_hub.api.routers.admin import SystemSettingsResponse
-from agent_hub.capabilities.defaults import RuntimeCapabilityStack
 from agent_hub.config.service import ConfigService
 from agent_hub.evolution_hooks import EvolutionExecutionIngestHook
 from agent_hub.plugins import handover_reviews
@@ -21,6 +20,7 @@ from agent_hub.runs.repository import RunRepository
 from agent_hub.runtime import worker
 from agent_hub.security.secrets import SecretService
 from agent_hub.settings import Settings
+from tests.unit.app_wiring_stack_fixture import capture_stacks
 
 TENANT_ID = UUID("00000000-0000-4000-8000-000000000001")
 OTHER_TENANT_ID = UUID("00000000-0000-4000-8000-000000000002")
@@ -31,8 +31,6 @@ def test_worker_runtime_stack_uses_configured_artifacts_and_sql_approval_validat
     monkeypatch: MonkeyPatch, tmp_path: Path, shared_artifacts: bool,
 ) -> None:
     captured: dict[str, object] = {}
-    stack_calls: list[dict[str, object]] = []
-    stacks: list[RuntimeCapabilityStack] = []
 
     class FakeDatabase:
         session_factory = object()
@@ -61,13 +59,10 @@ def test_worker_runtime_stack_uses_configured_artifacts_and_sql_approval_validat
         def master_key_bytes(self) -> bytes:
             return b"0" * 32
 
-    class FakeRuntimeStack:
-        runtime_gateway = object()
-        harness_tool_gateway = object()
-        project_input_preparer = object()
 
-    class FakePostgresArtifactRepository:
-        def __init__(self, session_factory: object) -> None:
+    class FakePostgresArtifactRepository(PostgresArtifactRepository):
+        def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
+            super().__init__(session_factory)
             captured["artifact_session_factory"] = session_factory
 
     class Source:
@@ -102,21 +97,6 @@ def test_worker_runtime_stack_uses_configured_artifacts_and_sql_approval_validat
         def capability_manifest_source(self) -> object:
             return Source("calendar.create_event", "plugin")
 
-    def fake_build_runtime_capability_stack(**kwargs: object) -> RuntimeCapabilityStack:
-        captured["runtime_stack"] = kwargs
-        # The registry consumer receives the exact gateway built from these args.
-        gateway = SimpleNamespace(
-            artifact_repository=kwargs.get("artifact_repository"),
-            original_project_preparer=lambda harness: FakeRuntimeStack.project_input_preparer,
-        )
-        stack = RuntimeCapabilityStack(
-            runtime_gateway=cast(Any, gateway), policy_gateway=cast(Any, object()),
-            harness_tool_gateway=cast(Any, object()),
-            project_input_preparer=cast(Any, FakeRuntimeStack.project_input_preparer),
-        )
-        stack_calls.append(kwargs)
-        stacks.append(stack)
-        return stack
 
     def fake_configured_runtime_registry(**kwargs: object) -> object:
         captured["runtime_registry"] = kwargs
@@ -133,7 +113,6 @@ def test_worker_runtime_stack_uses_configured_artifacts_and_sql_approval_validat
     monkeypatch.setattr(worker, "build_database", lambda url: FakeDatabase())
     monkeypatch.setattr(worker, "Redis", FakeRedis)
     monkeypatch.setattr(worker, "ConfigService", lambda session_factory: object())
-    monkeypatch.setattr(worker, "RunRepository", lambda session_factory: object())
     monkeypatch.setattr(worker, "SecretCipher", lambda key: object())
     monkeypatch.setattr(worker, "SecretService", lambda session_factory, cipher: object())
     monkeypatch.setattr(worker, "PersistentHermesRunAdvisor", lambda session_factory: object())
@@ -148,10 +127,10 @@ def test_worker_runtime_stack_uses_configured_artifacts_and_sql_approval_validat
     monkeypatch.setattr(worker, "RunService", fake_run_service)
     monkeypatch.setattr(worker, "RuntimeMcpService", FakeMcpService)
     monkeypatch.setattr(worker, "RuntimePluginService", FakePluginService)
-    monkeypatch.setattr(worker, "build_runtime_capability_stack", fake_build_runtime_capability_stack)
+    wired = capture_stacks(monkeypatch, worker, captured, 'runtime_stack')
 
     resources = worker.build_worker_service(cast(Settings, FakeSettings()))
-    assert cast(dict[str, object], captured['run_service'])['project_input_preparer'] is FakeRuntimeStack.project_input_preparer
+    assert cast(dict[str, object], captured['run_service'])['project_input_preparer'] is wired.last.project_input_preparer
 
     runtime_stack = captured["runtime_stack"]
     mcp_service = captured["mcp_service"]
@@ -200,15 +179,15 @@ def test_worker_runtime_stack_uses_configured_artifacts_and_sql_approval_validat
     else:
         assert isinstance(repository, PostgresArtifactRepository)
         assert repository._session_factory is FakeDatabase.session_factory
-        assert len(stack_calls) == len(stacks) == 2
-        action_call, main_call = stack_calls
+        assert len(wired.options) == len(wired.stacks) == 2
+        action_call, main_call = wired.options
         assert action_call["artifact_repository"] is repository
         assert main_call.get("artifact_repository") is repository
         assert "receipt_repository" in action_call and "receipt_repository" not in main_call
-        assert runtime_registry["capability_gateway"] is stacks[1].runtime_gateway
-        assert runtime_registry["action_capability_gateway"] is stacks[0].runtime_gateway
-        assert cast(Any, runtime_registry["capability_gateway"]).artifact_repository is repository
-        assert cast(Any, runtime_registry["action_capability_gateway"]).artifact_repository is repository
+        assert runtime_registry["capability_gateway"] is wired.stacks[1].runtime_gateway
+        assert runtime_registry["action_capability_gateway"] is wired.stacks[0].runtime_gateway
+        assert cast(Any, runtime_registry["capability_gateway"])._artifact_repository is repository
+        assert cast(Any, runtime_registry["action_capability_gateway"])._artifact_repository is repository
         assert cast(dict[str, object], captured["run_service"])["conversation_artifact_repository"] is repository
 
 
@@ -273,19 +252,11 @@ def test_worker_runtime_stack_reads_tool_approval_settings_for_target_tenant(
         def capability_manifest_source(self) -> object:
             return object()
 
-    class FakeRuntimeStack:
-        runtime_gateway = object()
-        harness_tool_gateway = object()
-        project_input_preparer = None
 
-    def fake_build_runtime_capability_stack(**kwargs: object) -> FakeRuntimeStack:
-        captured["runtime_stack"] = kwargs
-        return FakeRuntimeStack()
 
     monkeypatch.setattr(worker, "build_database", lambda url: FakeDatabase())
     monkeypatch.setattr(worker, "Redis", FakeRedis)
     monkeypatch.setattr(worker, "ConfigService", lambda session_factory: object())
-    monkeypatch.setattr(worker, "RunRepository", lambda session_factory: object())
     monkeypatch.setattr(worker, "SecretCipher", lambda key: object())
     monkeypatch.setattr(worker, "SecretService", lambda session_factory, cipher: object())
     monkeypatch.setattr(worker, "PersistentHermesRunAdvisor", lambda session_factory: object())
@@ -294,7 +265,7 @@ def test_worker_runtime_stack_reads_tool_approval_settings_for_target_tenant(
     monkeypatch.setattr(worker, "RunService", lambda *args, **kwargs: object())
     monkeypatch.setattr(worker, "RuntimeMcpService", FakeRuntimeService)
     monkeypatch.setattr(worker, "RuntimePluginService", FakeRuntimeService)
-    monkeypatch.setattr(worker, "build_runtime_capability_stack", fake_build_runtime_capability_stack)
+    capture_stacks(monkeypatch, worker, captured, 'runtime_stack')
     monkeypatch.setattr(admin_router, "PersistentAdminResourceService", FakeAdminResourceService)
 
     worker.build_worker_service(cast(Settings, FakeSettings()))
@@ -357,10 +328,6 @@ def test_worker_registers_enabled_plugin_package_subprocess_adapters(
         def capability_manifest_source(self) -> object:
             return object()
 
-    class FakeRuntimeStack:
-        runtime_gateway = object()
-        harness_tool_gateway = object()
-        project_input_preparer = None
 
     def fake_build_plugin_package_subprocess_adapters(**kwargs: object) -> dict[str, object]:
         captured["plugin_package_adapter_kwargs"] = kwargs
@@ -369,7 +336,6 @@ def test_worker_registers_enabled_plugin_package_subprocess_adapters(
     monkeypatch.setattr(worker, "build_database", lambda url: FakeDatabase())
     monkeypatch.setattr(worker, "Redis", FakeRedis)
     monkeypatch.setattr(worker, "ConfigService", lambda session_factory: object())
-    monkeypatch.setattr(worker, "RunRepository", lambda session_factory: object())
     monkeypatch.setattr(worker, "SecretCipher", lambda key: object())
     monkeypatch.setattr(worker, "SecretService", lambda session_factory, cipher: object())
     monkeypatch.setattr(worker, "PersistentHermesRunAdvisor", lambda session_factory: object())
@@ -383,11 +349,7 @@ def test_worker_registers_enabled_plugin_package_subprocess_adapters(
         "build_plugin_package_subprocess_adapters",
         fake_build_plugin_package_subprocess_adapters,
     )
-    monkeypatch.setattr(
-        worker,
-        "build_runtime_capability_stack",
-        lambda **kwargs: FakeRuntimeStack(),
-    )
+    capture_stacks(monkeypatch, worker, captured, 'runtime_stack')
 
     worker.build_worker_service(cast(Settings, FakeSettings()))
 

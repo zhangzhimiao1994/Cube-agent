@@ -4431,7 +4431,8 @@ async def test_workspace_delivery_observation_refreshes_after_changed_write(
     stream._state.workspace_delivery_continuation = not legacy
 
     events: list[RunEvent] = []
-    if legacy:
+    fresh = not legacy or name == "workspace.read"
+    if not fresh:
         with pytest.raises(RuntimeExecutionError, match="step repeated an identical capability after result synthesis"):
             async for event in stream:
                 events.append(event)
@@ -4439,12 +4440,12 @@ async def test_workspace_delivery_observation_refreshes_after_changed_write(
         events = [event async for event in stream]
         assert events[-1].kind is EventKind.RUNTIME_COMPLETED
     observations = [result for result in harness.results if result.tool_name == name]
-    assert len(observations) == (1 if legacy else 2)
+    assert len(observations) == (2 if fresh else 1)
     assert all(result.status == "succeeded" for result in harness.results)
     before: JsonValue = _WORKSPACE_OBSERVATION_BEFORE if name == "workspace.read" else ("src/types.ts",)
     after: JsonValue = _WORKSPACE_OBSERVATION_AFTER if name == "workspace.read" else ("src/added.ts", "src/types.ts")
     assert _workspace_observation_value(observations[0].payload, name) == before
-    if not legacy:
+    if fresh:
         assert _workspace_observation_value(observations[1].payload, name) == after
     marker = "UNTRUSTED_CAPABILITY_RESULTS_JSON="
     result_message = next(message for message in reversed(gateway.requests[4].messages) if isinstance(message.content, str) and message.content.startswith(marker))
@@ -4452,10 +4453,10 @@ async def test_workspace_delivery_observation_refreshes_after_changed_write(
     packet = json.loads(result_message.content[len(marker):])
     result = packet[0]["result"]
     if name == "workspace.read":
-        assert result["text"] == (before if legacy else after)
+        assert result["text"] == (after if fresh else before)
     else:
-        assert tuple(sorted(row["path"] for row in result["workspace_files"])) == (before if legacy else after)
-    assert bool(gateway.requests[4].tools) is (not legacy)
+        assert tuple(sorted(row["path"] for row in result["workspace_files"])) == (after if fresh else before)
+    assert bool(gateway.requests[4].tools) is fresh
 
 
 @pytest.mark.parametrize("name", ("workspace.read", "workspace.list"))

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from typing import Any, cast
 from uuid import uuid4
 
@@ -141,6 +141,13 @@ async def test_hybrid_child_context_preserves_actor_identity_and_routing_decisio
 
 async def test_dispatch_to_hybrid_upgrade_does_not_repeat_existing_artifacts() -> None:
     existing = artifact("researcher", "already complete")
+    original_context = context()
+    original_dispatch = RecordingRuntime(TaskMode.DISPATCH, existing)
+    dispatch_events = [
+        event async for event in original_dispatch.run(
+            original_context.model_copy(update={"mode": TaskMode.DISPATCH})
+        )
+    ]
     dispatch = RecordingRuntime(TaskMode.DISPATCH, artifact("researcher", "duplicate"))
     discussion = RecordingRuntime(TaskMode.DISCUSS, artifact("critic", "review"))
     synthesis = RecordingRuntime(TaskMode.DIRECT, artifact("main", "answer"))
@@ -149,12 +156,32 @@ async def test_dispatch_to_hybrid_upgrade_does_not_repeat_existing_artifacts() -
         discussion,
         synthesis,
         plan=HybridPlan(upgrade=HybridUpgrade.DISPATCH_TO_HYBRID),
+        dispatch_events=tuple(dispatch_events),
     )
 
-    await collect(runtime, context((existing,)))
+    await collect(runtime, original_context.model_copy(update={"artifacts": (existing,)}))
 
     assert dispatch.contexts == []
     assert discussion.contexts[0].artifacts == (existing,)
+    transferred = (await runtime.save_checkpoint()).state["output_artifact_registry"]
+    assert isinstance(transferred, Mapping) and str(existing.id) in transferred
+
+    # A historical input without same-run completion evidence is not this
+    # round's output and cannot skip a fresh dispatch.
+    fresh = artifact("researcher", "new evidence")
+    fresh_dispatch = RecordingRuntime(TaskMode.DISPATCH, fresh)
+    history_only = HybridRuntime(
+        fresh_dispatch,
+        RecordingRuntime(TaskMode.DISCUSS, artifact("critic", "new review")),
+        RecordingRuntime(TaskMode.DIRECT, artifact("main", "new answer")),
+        plan=HybridPlan(upgrade=HybridUpgrade.DISPATCH_TO_HYBRID),
+    )
+    await collect(history_only, context((existing,)))
+    assert len(fresh_dispatch.contexts) == 1
+    assert fresh_dispatch.contexts[0].artifacts == (existing,)
+    outputs = (await history_only.save_checkpoint()).state["output_artifact_registry"]
+    assert isinstance(outputs, Mapping)
+    assert str(existing.id) not in outputs and str(fresh.id) in outputs
 
 
 async def test_direct_to_dispatch_and_discuss_dispatch_discuss_upgrades() -> None:

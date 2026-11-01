@@ -4266,7 +4266,7 @@ class CrewDispatchRuntime:
                 await asyncio.gather(next_event, return_exceptions=True)
         finally:
             state.artifact_writes_open = False
-            if not coordinator.done():
+            if not coordinator.done() and not coordinator.cancelling():
                 coordinator.cancel()
             await asyncio.gather(coordinator, return_exceptions=True)
             self._active_task = None
@@ -13371,6 +13371,7 @@ class CrewDispatchRuntime:
         *,
         preserve_cancel: bool = False,
     ) -> None:
+        active_done: asyncio.Event | None = None
         async with self._cancel_lock:
             if stream._closed:
                 if stream._state.cleanup_error is not None:
@@ -13381,7 +13382,7 @@ class CrewDispatchRuntime:
                 return
             stream._state.artifact_writes_open = False
             task = self._active_task
-            if task is not None and not task.done():
+            if task is not None and not task.done() and not task.cancelling():
                 task.cancel()
             generator = stream._generator
             if not bool(getattr(generator, "ag_running", False)):
@@ -13391,12 +13392,16 @@ class CrewDispatchRuntime:
                         stream._state.cleanup_error or asyncio.CancelledError()
                     )
             else:
-                done = self._active_done
-                if done is not None:
-                    try:
-                        await asyncio.wait_for(done.wait(), timeout=_RUNTIME_CANCEL_TIMEOUT_SECONDS)
-                    except TimeoutError:
-                        _fail("runtime cancellation timed out")
+                active_done = self._active_done
+        # The consumer may receive a queued event before cancellation finishes.
+        # It must acquire this lock to close the suspended generator and run its
+        # real finally; holding the lock while waiting for that finally deadlocks.
+        if active_done is not None:
+            try:
+                await asyncio.wait_for(active_done.wait(), timeout=_RUNTIME_CANCEL_TIMEOUT_SECONDS)
+            except TimeoutError:
+                _fail("runtime cancellation timed out")
+        async with self._cancel_lock:
             if self._active_stream is stream:
                 self._active_stream = None
                 self._active_task = None

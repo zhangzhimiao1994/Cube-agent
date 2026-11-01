@@ -649,12 +649,17 @@ async def test_actual_direct_cancel_stops_http_but_drains_network_cleanup(tmp_pa
         DiscussionParticipant,
         DiscussionPlan,
     )
-    from agent_hub.runtime.crew.adapter import CrewDispatchRuntime
+    from agent_hub.runtime.crew.adapter import CrewAIObjectFactory, CrewDispatchRuntime
     from agent_hub.runtime.crew.plan import AgentSpec, DispatchPlan, DispatchStep
     from agent_hub.runtime.defaults import _gateway_for_config
     from agent_hub.runtime.direct import DirectRuntime
     from agent_hub.runtime.hybrid import HybridRuntime
 
+    crew_factory = CrewAIObjectFactory(storage_dir=tmp_path / "crewai")
+    if mode is TaskMode.HYBRID:
+        # Initialize the real optional SDK before creating the admitted run.
+        # The original 3s HTTP barrier and 10s runtime budget stay unchanged.
+        crew_factory.build((), (), share_crew=False, telemetry_disabled=True)
     f = await fixture(tmp_path, mode=mode)
     entered, cleanup, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
     budgets, cancel_calls = [], []
@@ -706,6 +711,7 @@ async def test_actual_direct_cancel_stops_http_but_drains_network_cleanup(tmp_pa
             total_token_budget=20000,
             total_timeout_seconds=10,
         ),
+        crew_factory=crew_factory,
     )
     runtimes: dict[TaskMode, ExecutionRuntime] = {
         TaskMode.DIRECT: direct,

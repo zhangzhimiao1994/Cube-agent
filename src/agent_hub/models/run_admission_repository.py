@@ -17,7 +17,7 @@ import hashlib
 import json
 import math
 import re
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -54,6 +54,7 @@ _TERMINAL = frozenset({'completed', 'cancelled', 'unknown', 'invalid'})
 # STEP_RETRYING and final synthesis/delivery do not change the RunRow status;
 # renew_active_worker_lease only renews RUNNING. Domain enums alone grant nothing.
 _EXECUTABLE_RUN_STATUSES = frozenset({RunStatus.RUNNING.value})
+type _ProfileJson = None | bool | int | float | str | list[_ProfileJson] | dict[str, _ProfileJson]
 
 
 class AdmissionConflict(RuntimeError):
@@ -224,6 +225,81 @@ def _canonical(value: dict[str, object]) -> bytes:
                       ensure_ascii=True, allow_nan=False).encode('utf-8')
 
 
+def _continuity_profile_json(profile: object) -> dict[str, _ProfileJson]:
+    """Normalize a small JSON profile without adopting caller-owned containers."""
+    nodes = 0
+
+    def visit(value: object, depth: int) -> _ProfileJson:
+        nonlocal nodes
+        nodes += 1
+        if nodes > 512 or depth > 16:
+            raise ValueError(_INVALID)
+        if value is None or type(value) is bool:
+            return value
+        if type(value) is int:
+            if value.bit_length() > 64:
+                raise ValueError(_INVALID)
+            return value
+        if type(value) is float:
+            if not math.isfinite(value):
+                raise ValueError(_INVALID)
+            return value
+        if type(value) is str:
+            if len(value.encode('utf-8')) > 4096:
+                raise ValueError(_INVALID)
+            return value
+        if isinstance(value, Mapping):
+            result: dict[str, _ProfileJson] = {}
+            for key, item in value.items():
+                nodes += 1
+                if type(key) is not str or len(key.encode('utf-8')) > 256:
+                    raise ValueError(_INVALID)
+                result[key] = visit(item, depth+1)
+            return result
+        if isinstance(value, (list, tuple)):
+            return [visit(item, depth+1) for item in value]
+        raise ValueError(_INVALID)
+
+    try:
+        value = visit(profile, 0)
+        if not isinstance(value, dict):
+            raise TypeError(_INVALID)
+        raw = json.dumps(value, sort_keys=True, separators=(',', ':'), ensure_ascii=True, allow_nan=False).encode()
+        if len(raw) > 16*1024:
+            raise ValueError(_INVALID)
+        return value
+    except (TypeError, ValueError, UnicodeError, RecursionError, OverflowError):
+        raise ValueError(_INVALID) from None
+
+
+def continuity_profile_fingerprint(profile: object) -> str:
+    """Pure canonical JSON SHA; mappingproxy/tuple and dict/list have one identity."""
+    value = _continuity_profile_json(profile)
+    raw = json.dumps(value, sort_keys=True, separators=(',', ':'), ensure_ascii=True, allow_nan=False).encode()
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _continuity_binding(run: RunRow, config_sha256: str) -> tuple[str, datetime]:
+    try:
+        route = run.routing_decision
+        if type(route) is not dict:
+            raise ValueError
+        value = _continuity_profile_json(route.get('approval_review_profile'))
+        activation = value.get('activation')
+        if (type(value.get('version')) is not int or value.get('version') != 2
+                or value.get('config_sha256') != config_sha256 or not isinstance(activation, dict)):
+            raise ValueError
+        expiry = activation.get('valid_until')
+        if type(expiry) is not str:
+            raise ValueError
+        valid_until = datetime.fromisoformat(expiry)
+        if valid_until.utcoffset() != timedelta(0):
+            raise ValueError
+        return continuity_profile_fingerprint(value), valid_until
+    except (TypeError, ValueError, UnicodeError, OverflowError):
+        raise AdmissionConflict(_CONFLICT) from None
+
+
 @dataclass(frozen=True, slots=True)
 class PoolSnapshot:
     tenant_id: UUID
@@ -277,6 +353,8 @@ class _OpenArguments(_ExecutionArguments):
     review_token_limit: int
     review_count_limit: int
     review_cost_limit: Decimal
+    continuity_profile_sha256: NotRequired[str]
+    activation_valid_until: NotRequired[datetime]
 
 
 class _ReserveArguments(_ExecutionArguments):
@@ -461,11 +539,45 @@ class RunAdmissionRepository:
         deadline = a['original_deadline']
         if type(deadline) is not datetime or deadline.utcoffset() != timedelta(0):
             raise ValueError(_INVALID)
+        has_digest = 'continuity_profile_sha256' in a
+        has_expiry = 'activation_valid_until' in a
+        if has_digest != has_expiry:
+            raise ValueError(_INVALID)
+        continuity_sha = a.get('continuity_profile_sha256')
+        activation_expiry = a.get('activation_valid_until')
+        if has_digest:
+            _digest(continuity_sha)
+            if type(activation_expiry) is not datetime or activation_expiry.utcoffset() != timedelta(0):
+                raise ValueError(_INVALID)
         run, pool = await self._locked(session, a['tenant_id'], a['run_id'])
         evidence, now, ceiling, timeout = await self._fence(session, run, pool,
             a['authorization_turn_id'], a['lease'], a['config_sha256'])
         if grant > ceiling or not now < deadline <= now + timedelta(seconds=timeout):
             raise AdmissionConflict(_CONFLICT)
+        route = run.routing_decision or {}
+        profile: object = route.get('approval_review_profile')
+        v2 = isinstance(profile, Mapping) and type(profile.get('version')) is int and profile.get('version') == 2
+        seal: dict[str, object] = {}
+        if has_digest or v2:
+            if not has_digest:
+                raise AdmissionConflict(_CONFLICT)
+            current_sha, current_expiry = _continuity_binding(run, a['config_sha256'])
+            if continuity_sha != current_sha or activation_expiry != current_expiry:
+                raise AdmissionConflict(_CONFLICT)
+            if pool is None:
+                # The actual post-lock database clock from _fence, never caller time.
+                if not now < current_expiry:
+                    raise AdmissionConflict(_CONFLICT)
+                seal = {'continuity_profile_sha256': current_sha, 'admitted_at': now.isoformat()}
+            else:
+                original = await self._continuity_seal_in_session(session, run, pool)
+                if original is None or original[0] != current_sha:
+                    raise AdmissionConflict(_CONFLICT)
+        elif pool is not None:
+            # A previously sealed v2 pool cannot become a legacy pool by losing
+            # its routing profile. This read never adds or repairs old evidence.
+            if await self._continuity_seal_in_session(session, run, pool) is not None:
+                raise AdmissionConflict(_CONFLICT)
         if pool is not None:
             if (pool.original_token_grant, pool.original_deadline, pool.review_token_limit,
                 pool.review_count_limit, pool.review_cost_limit) != (
@@ -485,8 +597,82 @@ class RunAdmissionRepository:
             'authorization_turn_id': str(evidence.turn_id), 'config_sha256': pool.config_sha256,
             'original_token_grant': grant, 'original_deadline': deadline.isoformat(),
             'review_token_limit': review_tokens, 'review_count_limit': review_count,
-            'review_cost_limit': str(review_cost)})
+            'review_cost_limit': str(review_cost), **seal})
         return _pool_snapshot(pool)
+
+    async def _continuity_seal_in_session(
+        self, session: AsyncSession, run: RunRow, pool: RunAdmissionPoolRow,
+    ) -> tuple[str, datetime] | None:
+        events = (await session.scalars(select(RunAdmissionEventRow).where(
+            RunAdmissionEventRow.tenant_id == pool.tenant_id,
+            RunAdmissionEventRow.run_id == pool.run_id, RunAdmissionEventRow.kind == 'opened')
+            .limit(2).execution_options(populate_existing=True))).all()
+        if not events:
+            return None
+        if len(events) != 1:
+            raise AdmissionConflict(_CONFLICT)
+        event = events[0]
+        value = event.evidence
+        if type(value) is not dict:
+            raise AdmissionConflict(_CONFLICT)
+        if not {'continuity_profile_sha256', 'admitted_at'} & value.keys():
+            return None  # Legacy evidence is never backfilled into a v2 seal.
+        try:
+            profile_sha, expiry = _continuity_binding(run, pool.config_sha256)
+            pin = value.get('continuity_profile_sha256')
+            _digest(pin)
+            stamp = value.get('admitted_at')
+            if type(stamp) is not str:
+                raise ValueError
+            admitted = datetime.fromisoformat(stamp)
+            if (event.attempt_id is not None or event.tenant_id != run.tenant_id
+                    or event.run_id != run.id or pool.run_id != run.id or pool.tenant_id != run.tenant_id
+                    or pool.actor_id != run.actor_id or pool.actor_role != run.actor_role
+                    or pin != profile_sha or admitted.utcoffset() != timedelta(0)
+                    or not admitted < expiry or not admitted < pool.original_deadline
+                    or value.get('authorization_turn_id') != str(pool.authorization_turn_id)
+                    or value.get('config_sha256') != pool.config_sha256):
+                raise ValueError
+            for key in ('original_token_grant', 'review_token_limit', 'review_count_limit'):
+                recorded = value.get(key)
+                if type(recorded) is not int or recorded != getattr(pool, key):
+                    raise ValueError
+            original_deadline, review_cost = value.get('original_deadline'), value.get('review_cost_limit')
+            if (type(original_deadline) is not str or datetime.fromisoformat(original_deadline) != pool.original_deadline
+                    or type(review_cost) is not str or Decimal(review_cost) != pool.review_cost_limit):
+                raise ValueError
+            rows = (await session.execute(select(RunInputAuthorizationRow, RunAuthenticatedInputRow)
+                .join(RunAuthenticatedInputRow, RunAuthenticatedInputRow.turn_id == RunInputAuthorizationRow.turn_id)
+                .where(RunInputAuthorizationRow.run_id == run.id)
+                .execution_options(populate_existing=True))).one_or_none()
+            evidence = None if rows is None else _validated_persisted_input(run, *rows)
+            if evidence is None or (
+                pool.authorization_turn_id, pool.actor_id, pool.actor_role, pool.message_sha256, pool.scope_sha256
+            ) != (evidence.turn_id, evidence.actor_id, evidence.actor_role.value, evidence.message_sha256, evidence.scope_sha256):
+                raise ValueError
+            return profile_sha, admitted
+        except (TypeError, ValueError, ArithmeticError, UnicodeError):
+            raise AdmissionConflict(_CONFLICT) from None
+
+    async def get_continuity_seal(self, tenant_id: UUID, run_id: UUID) -> tuple[str, datetime] | None:
+        """Read the one original opened seal; no grant, balance or expiry mutation.
+
+        Run/pool locks retain a coherent identity/profile while reading immutable
+        opened evidence. Historical reads do not require a currently live lease.
+        """
+        _uuid(tenant_id)
+        _uuid(run_id)
+        async with self._transaction() as session:
+            run = await session.scalar(select(RunRow).where(RunRow.tenant_id == tenant_id, RunRow.id == run_id)
+                .with_for_update().execution_options(populate_existing=True))
+            if run is None:
+                return None
+            pool = await session.scalar(select(RunAdmissionPoolRow).where(
+                RunAdmissionPoolRow.tenant_id == tenant_id, RunAdmissionPoolRow.run_id == run_id)
+                .with_for_update().execution_options(populate_existing=True))
+            if pool is None:
+                return None
+            return await self._continuity_seal_in_session(session, run, pool)
 
     async def reserve(self, **arguments: Unpack[_ReserveArguments]) -> AttemptReservation:
         async with self._transaction() as session:

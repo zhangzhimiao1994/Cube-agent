@@ -7,6 +7,7 @@ from fastapi.testclient import TestClient
 from agent_hub.app import create_app
 from agent_hub.auth.models import AuthenticatedPrincipal, InvalidCredentials, Role
 from agent_hub.runs.service import RunSummary
+from tests.api.live_principal_fixture_nov02 import require_current_principal
 from tests.api.test_runs_api import StubRunService
 
 
@@ -19,6 +20,11 @@ class TenantAuth:
             UUID("00000000-0000-4000-8000-000000000001"),
             Role.OPERATOR,
         )
+
+    async def validate_principal(
+        self, principal: AuthenticatedPrincipal
+    ) -> AuthenticatedPrincipal:
+        return require_current_principal(principal, self.authenticate_token("valid-token"))
 
 
 class TenantScopedRunService(StubRunService):

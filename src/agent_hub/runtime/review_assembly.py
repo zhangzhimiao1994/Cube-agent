@@ -11,6 +11,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import time
 from collections.abc import Awaitable, Callable, Mapping
 from contextvars import ContextVar
@@ -57,15 +58,18 @@ from agent_hub.models.physical_budget import _run_budget, _RunBudgetContext
 from agent_hub.models.run_admission_repository import (
     AdmissionConflict,
     AttemptSnapshot,
+    PoolSnapshot,
     RunAdmissionRepository,
     _ExecutionArguments,
     _IssueArguments,
+    _OpenArguments,
     _ReserveArguments,
     _WorkerLease,
+    continuity_profile_fingerprint,
 )
 from agent_hub.models.types import Deployment, ModelCapability, effective_deployment_capabilities
 from agent_hub.runs.repository import RunRepository
-from agent_hub.runtime.contracts import TaskContext
+from agent_hub.runtime.contracts import JsonValue, TaskContext
 from agent_hub.security.secrets import SecretService
 
 _MODES = frozenset({TaskMode.DIRECT, TaskMode.DISPATCH, TaskMode.DISCUSS, TaskMode.HYBRID})
@@ -190,7 +194,7 @@ class ProviderBillingContract:
     v1 means ALL billed prompt/completion/hidden tokens fit the configured
     context, both configured rates cover them, and internal proxy retries add
     no separately billed attempt. A context size or a client boolean is not
-    evidence. Production currently has no issuer/source for these records.
+    evidence. These records come from the server's verified activation document.
     """
 
     tenant_id: UUID
@@ -249,16 +253,36 @@ class _EvidenceDocument(BaseModel):
     worker_verification: _VerificationItem
 
 
-def load_server_review_evidence(
+@dataclass(frozen=True, slots=True)
+class VerifiedReviewActivation:
+    record_reference: str
+    evidence_sha256: str
+    valid_until: datetime
+    source_sha256: str
+    contracts_sha256: str
+    contracts: tuple[ProviderBillingContract, ...]
+    verification: WorkerReviewVerification
+
+    def binding(self) -> dict[str, JsonValue]:
+        return {
+            "record_reference": self.record_reference,
+            "evidence_sha256": self.evidence_sha256,
+            "valid_until": self.valid_until.isoformat(),
+            "source_sha256": self.source_sha256,
+            "contracts_sha256": self.contracts_sha256,
+        }
+
+
+def _load_verified_server_review_evidence(
     path: Path,
     *,
     expected_sha256: str,
-) -> tuple[tuple[ProviderBillingContract, ...], WorkerReviewVerification]:
-    """Read an ops-installed, digest-pinned document. Never an admin/API upload.
+    valid_at: datetime,
+) -> VerifiedReviewActivation:
+    """Read the exact server document, validating its qualification at valid_at.
 
-    File integrity is not a provider proof: its installer is the trusted issuer
-    responsible for the referenced contract and native verification reports.
-    Re-read before admission so removal, expiry or replacement revokes use.
+    Historical validation is private to a sealed, already admitted pool. Fresh
+    admission and automatic review always pass the actual current time.
     """
 
     def unique(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -270,7 +294,11 @@ def load_server_review_evidence(
         return result
 
     try:
-        if not path.is_absolute() or len(expected_sha256) != 64:
+        if (
+            not path.is_absolute()
+            or not re.fullmatch("[a-f0-9]{64}", expected_sha256)
+            or valid_at.utcoffset() != timedelta(0)
+        ):
             raise ValueError
         with path.open("rb") as stream:
             body = stream.read(131073)
@@ -282,7 +310,7 @@ def load_server_review_evidence(
         if (
             document.schema_version != 1
             or expiry.utcoffset() != timedelta(0)
-            or expiry <= datetime.now(UTC)
+            or expiry <= valid_at
             or item.profile_version != 1
             or item.source_sha256 != runtime_source_fingerprint()
             or len(set(item.modes)) != 4
@@ -296,14 +324,80 @@ def load_server_review_evidence(
         )
         if len({(entry.tenant_id, entry.deployment_id) for entry in contracts}) != len(contracts):
             raise ValueError
-        return contracts, WorkerReviewVerification(
+        verification = WorkerReviewVerification(
             _MODES,
             item.evidence_reference,
             source_sha256=item.source_sha256,
             checks=frozenset(item.checks),
         )
+        contract_payload = [
+            {
+                "tenant_id": str(entry.tenant_id),
+                "catalog_sha256": entry.catalog_sha256,
+                "deployment_id": entry.deployment_id,
+                "evidence_reference": entry.evidence_reference,
+                "contract": entry.contract,
+            }
+            for entry in sorted(contracts, key=lambda entry: (str(entry.tenant_id), entry.deployment_id))
+        ]
+        contract_sha = hashlib.sha256(json.dumps(
+            contract_payload, sort_keys=True, separators=(",", ":"), allow_nan=False,
+        ).encode()).hexdigest()
+        return VerifiedReviewActivation(
+            str(path), expected_sha256, expiry, item.source_sha256, contract_sha,
+            contracts, verification,
+        )
     except (OSError, ValueError, TypeError, KeyError):
         raise ValueError("invalid server review evidence") from None
+
+
+def load_server_review_evidence(
+    path: Path, *, expected_sha256: str,
+) -> tuple[tuple[ProviderBillingContract, ...], WorkerReviewVerification]:
+    """Legacy fresh-only API; expiry/removal/replacement continue to revoke it."""
+    result = _load_verified_server_review_evidence(
+        path, expected_sha256=expected_sha256, valid_at=datetime.now(UTC),
+    )
+    if datetime.now(UTC) >= result.valid_until:
+        raise ValueError("invalid server review evidence")
+    return result.contracts, result.verification
+
+
+@dataclass(frozen=True, slots=True)
+class ServerReviewEvidenceSource:
+    path: Path
+    expected_sha256: str
+
+    def current(self) -> VerifiedReviewActivation:
+        result = _load_verified_server_review_evidence(
+            self.path, expected_sha256=self.expected_sha256, valid_at=datetime.now(UTC),
+        )
+        if datetime.now(UTC) >= result.valid_until:
+            raise ValueError("invalid server review evidence")
+        return result
+
+    def admitted(
+        self, binding: Mapping[str, JsonValue], *, admitted_at: datetime,
+    ) -> VerifiedReviewActivation:
+        if set(binding) != {
+            "record_reference", "evidence_sha256", "valid_until", "source_sha256", "contracts_sha256",
+        } or admitted_at.utcoffset() != timedelta(0) or admitted_at > datetime.now(UTC):
+            raise ValueError("invalid admitted activation")
+        reference, digest = binding["record_reference"], binding["evidence_sha256"]
+        if not isinstance(reference, str) or not isinstance(digest, str):
+            raise TypeError("invalid admitted activation")
+        original = Path(reference)
+        # Only original server records in this configured namespace are eligible.
+        # The immutable pool seal must already match the full profile before this
+        # method is called; a caller-supplied path is never an admission source.
+        if not original.is_absolute() or original.parent != self.path.parent or ".." in original.parts:
+            raise ValueError("invalid admitted activation")
+        result = _load_verified_server_review_evidence(
+            original, expected_sha256=digest, valid_at=admitted_at,
+        )
+        if result.binding() != binding:
+            raise ValueError("admitted activation changed")
+        return result
 
 
 @dataclass(frozen=True, slots=True)
@@ -314,16 +408,22 @@ class _Snapshot:
     catalog_version: int
     catalog_sha256: str
     contracts: tuple[TrustedContextBound, ...]
+    activation: VerifiedReviewActivation | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class ReviewExecution:
     budget: _RunBudgetContext
     snapshot: _Snapshot
+    activation_binding: Mapping[str, JsonValue] | None = None
+    admitted_at: datetime | None = None
 
 
 _execution: ContextVar[ReviewExecution | None] = ContextVar(
     "assembled_review_execution", default=None
+)
+_review_dispatch: ContextVar[ReviewExecution | None] = ContextVar(
+    "owned_independent_review_dispatch", default=None,
 )
 
 
@@ -357,6 +457,12 @@ class _CurrentAdmission(RunAdmissionRepository):
     ) -> None:
         super().__init__(sessions)
         self._check_configuration = check
+
+    async def open_pool(self, **a: Unpack[_OpenArguments]) -> PoolSnapshot:
+        await self._check_configuration()
+        result = await super().open_pool(**a)
+        await self._check_configuration()
+        return result
 
     async def require_current(self, **a: Unpack[_ExecutionArguments]) -> None:
         await self._check_configuration()
@@ -469,6 +575,7 @@ class ReviewAssemblyBroker:
             [], tuple[tuple[ProviderBillingContract, ...], WorkerReviewVerification] | None
         ]
         | None = None,
+        evidence_source: ServerReviewEvidenceSource | None = None,
     ) -> None:
         self._configs, self._get_config = config_service, config_getter
         self._runs, self._sessions = run_repository, session_factory
@@ -476,7 +583,8 @@ class ReviewAssemblyBroker:
         self._transport = transport or LiteLLMClient()
         self._contracts, self._verification = tuple(billing_contracts), verification
         self._evidence_loader = evidence_loader
-        self.review_repository = _AssembledReviewRepository(session_factory, self._dispatch_check)
+        self._evidence_source = evidence_source
+        self.review_repository = _AssembledReviewRepository(session_factory, self._review_dispatch_check)
 
     async def current_config(self, tenant_id: UUID) -> ApprovalReviewConfig:
         return ApprovalReviewConfig.from_payload((await self._get_config(tenant_id)).to_payload())
@@ -485,7 +593,11 @@ class ReviewAssemblyBroker:
         """Final synchronous evidence fence after all awaited control-plane IO."""
         try:
             records, verification = self._contracts, self._verification
-            if self._evidence_loader is not None:
+            installed_source = None
+            if self._evidence_source is not None:
+                installed_source = self._evidence_source.current()
+                records, verification = installed_source.contracts, installed_source.verification
+            elif self._evidence_loader is not None:
                 installed = self._evidence_loader()
                 records, verification = ((), None) if installed is None else installed
             if (
@@ -506,8 +618,30 @@ class ReviewAssemblyBroker:
             }
             if not {bound.deployment_id for bound in snapshot.contracts}.issubset(available):
                 raise ValueError
+            if installed_source is not None and datetime.now(UTC) >= installed_source.valid_until:
+                raise ValueError
         except (OSError, ValueError, TypeError):
             raise ReviewAssemblyUnavailable("review_activation_changed") from None
+
+    def _admitted_activation(
+        self, binding: Mapping[str, JsonValue], admitted_at: datetime,
+    ) -> VerifiedReviewActivation:
+        if self._evidence_source is None:
+            raise ReviewAssemblyUnavailable("review_profile_unsupported")
+        try:
+            return self._evidence_source.admitted(binding, admitted_at=admitted_at)
+        except (OSError, ValueError, TypeError):
+            raise ReviewAssemblyUnavailable("review_activation_changed") from None
+
+    def _require_execution_activation(self, execution: ReviewExecution) -> None:
+        if execution.activation_binding is None or _review_dispatch.get() is execution:
+            self._require_activation_current(execution.snapshot)
+            return
+        if execution.admitted_at is None:
+            raise ReviewAssemblyUnavailable("recovery_original_pool_missing")
+        activation = self._admitted_activation(execution.activation_binding, execution.admitted_at)
+        if execution.snapshot.activation is None or activation.binding() != execution.snapshot.activation.binding():
+            raise ReviewAssemblyUnavailable("review_activation_changed")
 
     async def _dispatch_check(self) -> None:
         """Use the original binding at consumption and the last async gate seam."""
@@ -526,11 +660,30 @@ class ReviewAssemblyBroker:
         ):
             raise ReviewAssemblyUnavailable("review_configuration_changed")
         # No await may follow this file hash/expiry/source check in this callback.
-        self._require_activation_current(execution.snapshot)
+        self._require_execution_activation(execution)
+        from agent_hub.capabilities.execution_authority import _trusted_review_context
+
+        evidence = execution.budget.evidence
+        _trusted_review_context(
+            tenant_id=execution.budget.tenant_id,
+            run_id=execution.budget.run_id,
+            user_id=evidence.actor_id,
+            role=evidence.actor_role,
+        )
         execution.budget.check()
 
+    async def _review_dispatch_check(self) -> None:
+        execution = _execution.get()
+        if execution is None or execution.budget is not _run_budget.get():
+            raise ReviewAssemblyUnavailable("original_budget_binding_missing")
+        token = _review_dispatch.set(execution)
+        try:
+            await self._dispatch_check()
+        finally:
+            _review_dispatch.reset(token)
+
     async def _compile(
-        self, tenant_id: UUID
+        self, tenant_id: UUID, *, activation: VerifiedReviewActivation | None = None,
     ) -> tuple[_Snapshot | None, ApprovalReviewReadinessReason]:
         from agent_hub.runtime.defaults import _deployments
 
@@ -545,7 +698,15 @@ class ReviewAssemblyBroker:
             return None, "model_alias_missing"
         fingerprint = catalog_fingerprint(platform)
         records, verification = self._contracts, self._verification
-        if self._evidence_loader is not None:
+        if activation is not None:
+            records, verification = activation.contracts, activation.verification
+        elif self._evidence_source is not None:
+            try:
+                activation = self._evidence_source.current()
+            except ValueError:
+                return None, "evidence_invalid"
+            records, verification = activation.contracts, activation.verification
+        elif self._evidence_loader is not None:
             try:
                 installed = self._evidence_loader()
             except ValueError:
@@ -627,7 +788,7 @@ class ReviewAssemblyBroker:
         if type(self._transport) is not LiteLLMClient:
             return None, "transport_unsupported"
         return _Snapshot(
-            tenant_id, config, platform, current.version, fingerprint, tuple(contracts)
+            tenant_id, config, platform, current.version, fingerprint, tuple(contracts), activation,
         ), "ready"
 
     async def readiness(
@@ -663,14 +824,26 @@ class ReviewAssemblyBroker:
             or not 0 < timeout_seconds <= 3600
         ):
             raise ValueError("invalid original review timeout")
-        return {
-            _PROFILE: {
+        profile: dict[str, object] = {
                 "version": 1,
                 "config_sha256": review_config_sha256(snapshot.config),
                 "catalog_version": snapshot.catalog_version,
                 "catalog_sha256": snapshot.catalog_sha256,
                 "timeout_seconds": timeout_seconds,
-            },
+        }
+        if snapshot.activation is not None and self._evidence_source is not None:
+            try:
+                current_activation = self._evidence_source.current()
+            except ValueError:
+                return {}
+            if current_activation.binding() != snapshot.activation.binding():
+                raise ReviewAssemblyUnavailable("review_activation_changed")
+            prepared = datetime.now(UTC)
+            if prepared >= current_activation.valid_until:
+                return {}
+            profile.update(version=2, prepared_at=prepared.isoformat(), activation=current_activation.binding())
+        return {
+            _PROFILE: profile,
             "runtime_timeout_absolute_seconds": timeout_seconds,
             "runtime_plan_timeout_seconds": timeout_seconds,
         }
@@ -723,19 +896,10 @@ class ReviewAssemblyBroker:
         if (
             not isinstance(profile, Mapping)
             or type(profile.get("version")) is not int
-            or profile.get("version") != 1
+            or profile.get("version") not in (1, 2)
             or context.mode not in _MODES
         ):
             raise ReviewAssemblyUnavailable("review_profile_unsupported")
-        snapshot, reason = await self._compile(context.tenant_id)
-        if snapshot is None:
-            raise ReviewAssemblyUnavailable(reason)
-        if (
-            profile.get("config_sha256") != review_config_sha256(snapshot.config)
-            or profile.get("catalog_version") != snapshot.catalog_version
-            or profile.get("catalog_sha256") != snapshot.catalog_sha256
-        ):
-            raise ReviewAssemblyUnavailable("review_configuration_changed")
         if (
             context.execution_token is None
             or context.actor_id is None
@@ -756,6 +920,57 @@ class ReviewAssemblyBroker:
             or record.routing_decision.get(_PROFILE) != dict(profile)
         ):
             raise ReviewAssemblyUnavailable("original_authenticated_context_missing")
+        admission_repository = RunAdmissionRepository(self._sessions)
+        pool = await admission_repository.get_pool(context.tenant_id, context.run_id)
+        activation_binding: Mapping[str, JsonValue] | None = None
+        admitted_at: datetime | None = None
+        prepared_at: datetime | None = None
+        selected_activation: VerifiedReviewActivation | None = None
+        profile_sha: str | None = None
+        if profile["version"] == 2:
+            if set(profile) != {
+                "version", "prepared_at", "config_sha256", "catalog_version", "catalog_sha256",
+                "timeout_seconds", "activation",
+            } or self._evidence_source is None:
+                raise ReviewAssemblyUnavailable("review_profile_unsupported")
+            binding = profile.get("activation")
+            prepared = profile.get("prepared_at")
+            if not isinstance(binding, Mapping) or not isinstance(prepared, str):
+                raise ReviewAssemblyUnavailable("review_profile_unsupported")
+            try:
+                prepared_at = datetime.fromisoformat(prepared)
+                if prepared_at.utcoffset() != timedelta(0) or prepared_at > datetime.now(UTC):
+                    raise ValueError
+            except ValueError:
+                raise ReviewAssemblyUnavailable("review_profile_unsupported") from None
+            activation_binding = binding
+            profile_sha = continuity_profile_fingerprint(profile)
+            seal = await admission_repository.get_continuity_seal(context.tenant_id, context.run_id)
+            if pool is None:
+                if context.checkpoint is not None or seal is not None:
+                    raise ReviewAssemblyUnavailable("recovery_original_pool_missing")
+                try:
+                    selected_activation = self._evidence_source.current()
+                except ValueError:
+                    raise ReviewAssemblyUnavailable("evidence_invalid") from None
+                if selected_activation.binding() != binding:
+                    raise ReviewAssemblyUnavailable("review_activation_changed")
+            else:
+                if pool.closed or seal is None or seal[0] != profile_sha:
+                    raise ReviewAssemblyUnavailable("recovery_original_pool_missing")
+                admitted_at = seal[1]
+                if prepared_at > admitted_at:
+                    raise ReviewAssemblyUnavailable("review_profile_unsupported")
+                selected_activation = self._admitted_activation(binding, admitted_at)
+        snapshot, reason = await self._compile(context.tenant_id, activation=selected_activation)
+        if snapshot is None:
+            raise ReviewAssemblyUnavailable(reason)
+        if (
+            profile.get("config_sha256") != review_config_sha256(snapshot.config)
+            or profile.get("catalog_version") != snapshot.catalog_version
+            or profile.get("catalog_sha256") != snapshot.catalog_sha256
+        ):
+            raise ReviewAssemblyUnavailable("review_configuration_changed")
         # A genuine accepted repair requeues the SAME RunRow. Children still have
         # no trusted parent-pool continuity and cannot borrow their parent's frame.
         repair = None
@@ -797,7 +1012,14 @@ class ReviewAssemblyBroker:
                 current_run = await self._runs.get(context.tenant_id, context.run_id)
                 if not repair.matches_routing(current_run.routing_decision or {}):
                     raise ReviewAssemblyUnavailable("derived_run_pool_continuity_unsupported")
-            current, current_reason = await self._compile(context.tenant_id)
+            owned = _execution.get()
+            reviewing = owned is not None and _review_dispatch.get() is owned
+            budget_activation = None
+            if activation_binding is not None and admitted_at is not None and not reviewing:
+                budget_activation = self._admitted_activation(activation_binding, admitted_at)
+            current, current_reason = await self._compile(
+                context.tenant_id, activation=budget_activation,
+            )
             local_worker_scope()
             if (
                 current is None
@@ -809,11 +1031,21 @@ class ReviewAssemblyBroker:
                 raise ReviewAssemblyUnavailable(
                     current_reason if current is None else "review_configuration_changed"
                 )
-            self._require_activation_current(snapshot)
+            if activation_binding is not None and admitted_at is not None and not reviewing:
+                final_activation = self._admitted_activation(activation_binding, admitted_at)
+                if snapshot.activation is None or final_activation.binding() != snapshot.activation.binding():
+                    raise ReviewAssemblyUnavailable("review_activation_changed")
+                seal_now = await admission_repository.get_continuity_seal(context.tenant_id, context.run_id)
+                if seal_now != (profile_sha, admitted_at):
+                    raise ReviewAssemblyUnavailable("recovery_original_pool_missing")
+                # The DAO wait above must not hide a qualification replacement.
+                self._admitted_activation(activation_binding, admitted_at)
+            else:
+                self._require_activation_current(snapshot)
+            local_worker_scope()
 
         repository = _CurrentAdmission(self._sessions, check)
         lease = _WorkerLease(worker_id, context.execution_token)
-        pool = await repository.get_pool(context.tenant_id, context.run_id)
         if pool is None:
             if repair is not None or context.checkpoint is not None:
                 raise ReviewAssemblyUnavailable("recovery_original_pool_missing")
@@ -837,18 +1069,28 @@ class ReviewAssemblyBroker:
                 raise ReviewAssemblyUnavailable("original_hard_envelope_missing")
             # Anchored to persisted creation, not this (possibly late) factory call.
             deadline = record.created_at + timedelta(seconds=float(original_timeout))
-            pool = await repository.open_pool(
-                tenant_id=context.tenant_id,
-                run_id=context.run_id,
-                authorization_turn_id=evidence.turn_id,
-                lease=lease,
-                config_sha256=review_config_sha256(snapshot.config),
-                original_token_grant=min(absolute, plan),
-                original_deadline=deadline,
-                review_token_limit=min(absolute, plan),
-                review_count_limit=snapshot.config.max_reviews_per_run,
-                review_cost_limit=Decimal(snapshot.config.max_cost_usd_per_run),
-            )
+            open_arguments: _OpenArguments = {
+                "tenant_id": context.tenant_id,
+                "run_id": context.run_id,
+                "authorization_turn_id": evidence.turn_id,
+                "lease": lease,
+                "config_sha256": review_config_sha256(snapshot.config),
+                "original_token_grant": min(absolute, plan),
+                "original_deadline": deadline,
+                "review_token_limit": min(absolute, plan),
+                "review_count_limit": snapshot.config.max_reviews_per_run,
+                "review_cost_limit": Decimal(snapshot.config.max_cost_usd_per_run),
+            }
+            if activation_binding is not None:
+                assert profile_sha is not None and selected_activation is not None
+                open_arguments["continuity_profile_sha256"] = profile_sha
+                open_arguments["activation_valid_until"] = selected_activation.valid_until
+            pool = await repository.open_pool(**open_arguments)
+            if activation_binding is not None:
+                seal = await repository.get_continuity_seal(context.tenant_id, context.run_id)
+                if seal is None or seal[0] != profile_sha or prepared_at is None or prepared_at > seal[1]:
+                    raise ReviewAssemblyUnavailable("recovery_original_pool_missing")
+                admitted_at = seal[1]
         await repository.require_current(
             tenant_id=context.tenant_id,
             run_id=context.run_id,
@@ -865,7 +1107,7 @@ class ReviewAssemblyBroker:
             deadline=captured + context.timeout_seconds,
             trusted_contexts=snapshot.contracts,
         )
-        return ReviewExecution(budget, snapshot)
+        return ReviewExecution(budget, snapshot, activation_binding, admitted_at)
 
     def gate_factory(self, backend: object) -> ConcreteModelReviewGate:
         from agent_hub.capabilities.review_context import (
@@ -887,6 +1129,7 @@ class ReviewAssemblyBroker:
             self,
             cast(ConcreteReviewRepository, self.review_repository),
             dispatch_check=self._dispatch_check,
+            model_dispatch_check=self._review_dispatch_check,
         )
 
     async def review(
@@ -898,16 +1141,21 @@ class ReviewAssemblyBroker:
         if execution is None or execution.budget is not _run_budget.get():
             raise ReviewAssemblyUnavailable("original_budget_binding_missing")
         await execution.budget.require_current()
-        gateway, _, _ = await _gateway_for_config(
-            execution.snapshot.platform,
-            tenant_id=execution.budget.tenant_id,
-            secret_service=self._secrets,
-            capacity_factory=self._capacity,
-            transport=self._transport,
-        )
-        return await ModelApprovalReviewService(gateway, self.review_repository).review(
-            snapshot, live_context
-        )
+        token = _review_dispatch.set(execution)
+        try:
+            await self._review_dispatch_check()
+            gateway, _, _ = await _gateway_for_config(
+                execution.snapshot.platform,
+                tenant_id=execution.budget.tenant_id,
+                secret_service=self._secrets,
+                capacity_factory=self._capacity,
+                transport=self._transport,
+            )
+            return await ModelApprovalReviewService(gateway, self.review_repository).review(
+                snapshot, live_context,
+            )
+        finally:
+            _review_dispatch.reset(token)
 
 
 def build_review_broker(
@@ -944,7 +1192,8 @@ def build_review_broker(
         session_factory=session_factory,
         secret_service=secret_service,
         capacity_factory=capacity,
-        evidence_loader=evidence,
+        evidence_loader=evidence if not path or not digest else None,
+        evidence_source=ServerReviewEvidenceSource(Path(path), digest) if path and digest else None,
     )
 
 

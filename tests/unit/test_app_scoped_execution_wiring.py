@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import inspect
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 from uuid import UUID
 
@@ -12,12 +11,12 @@ from fastapi.testclient import TestClient
 from agent_hub import app as app_module
 from agent_hub.api.routers.admin import InMemoryAdminResourceService
 from agent_hub.app import create_app
+from tests.unit.app_wiring_stack_fixture import capture_stacks
 from tests.unit.test_app_wiring import (
     FakeDatabase,
     FakeRedis,
     StubAuthService,
     StubConfigService,
-    StubProjectInputPreparer,
     StubRateLimiter,
     valid_settings,
 )
@@ -29,7 +28,6 @@ def test_app_lifespan_passes_both_trusted_scope_selectors(
     assert "plugin_adapter_factory" in inspect.signature(create_app).parameters
     assert "mcp_client_factory" in inspect.signature(create_app).parameters
     captured: dict[str, Any] = {}
-    preparer = StubProjectInputPreparer()
 
     class RuntimeService:
         async def reload(self, tenant_id: UUID | None = None) -> None:
@@ -58,12 +56,7 @@ def test_app_lifespan_passes_both_trusted_scope_selectors(
     monkeypatch.setattr(app_module, "build_runtime_plugin_service", build_plugin)
     monkeypatch.setattr(app_module, "build_runtime_mcp_service", build_mcp)
     monkeypatch.setattr(app_module, "configured_runtime_registry", lambda **kwargs: object())
-    monkeypatch.setattr(
-        app_module,
-        "build_runtime_capability_stack",
-        lambda **kwargs: SimpleNamespace(runtime_gateway=object(), harness_tool_gateway=object(),
-                                        project_input_preparer=preparer),
-    )
+    capture_stacks(monkeypatch, app_module, captured)
     application = create_app(
         settings=valid_settings(
             tmp_path / "attachments",
@@ -82,8 +75,8 @@ def test_app_lifespan_passes_both_trusted_scope_selectors(
         mcp_client_factory=mcp_factory,
     )
     with TestClient(application):
-        assert application.state.project_input_preparer is preparer
-        assert application.state.run_service._project_input_preparer is preparer
+        assert application.state.project_input_preparer is captured["project_input_preparer"]
+        assert application.state.run_service._project_input_preparer is captured["project_input_preparer"]
     assert captured["plugin"]["adapter_factory"] is plugin_factory
     assert captured["mcp"]["client_factory"] is mcp_factory
     assert "adapters" in captured["plugin"]

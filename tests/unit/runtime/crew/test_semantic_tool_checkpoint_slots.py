@@ -342,7 +342,11 @@ async def test_legacy_flags_preserve_prior_semantic_reuse_rules(name: str) -> No
         state.pop(flag, None)
     payload["state_sha256"] = ""
     graph.checkpoint = RuntimeCheckpoint.from_payload(payload)
-    graph.validate()
+    if name in {"workspace.read", "workspace_read"}:
+        with pytest.raises(RuntimeExecutionError, match="checkpoint capability artifact lineage"):
+            graph.validate()
+    else:
+        graph.validate()
 
 
 @pytest.mark.parametrize("kind", ["duplicate_coordinate", "past_call_count"])

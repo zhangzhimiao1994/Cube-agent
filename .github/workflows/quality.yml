@@ -38,6 +38,19 @@ jobs:
       - run: uv run ruff check .
       - run: uv run mypy --strict --platform linux src tests
       - run: uv run mypy --strict --platform win32 src tests
+      - name: Install Redis executable for private Unix-socket tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Package installation must not start a host daemon beside Compose.
+          sudo systemctl mask --runtime redis-server.service redis-server@.service
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends redis-server
+          redis-server --version
+          if pgrep -x redis-server >/dev/null; then
+            printf 'Unexpected host Redis daemon before isolated tests\n' >&2
+            exit 1
+          fi
       - name: Configure Docker Hub cache on hosted runner
         shell: bash
         run: |

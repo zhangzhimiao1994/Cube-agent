@@ -11,6 +11,7 @@ from typing import Any
 
 import pytest
 
+from agent_hub.capability_installer.python_attestation import ScanLimits
 from agent_hub.skills.sandbox.broker import BrokerPolicy
 from agent_hub.skills.sandbox.python_project_process import PythonPhaseProcessResult
 from agent_hub.skills.sandbox.python_project_protocol import PythonProjectBrokerRequest
@@ -35,11 +36,16 @@ def test_root_retains_only_after_quiescence_and_final_rechecks(
 
     class Lease:
         path = Path("/not-read")
+        limits = ScanLimits(min(
+            backend.RootConfig.from_payload(helpers.configuration_payload()).max_environment_bytes,
+            invocation.workspace_limit_bytes,
+        ))
 
         def current(self, **kwargs: Any) -> Any:
             return reference
 
         def publish(self, *args: Any, **kwargs: Any) -> Any:
+            assert kwargs["execution"].quiet is True and "quiet" in events
             events.append("environment")
             return helpers.expected_reference(invocation)
 
@@ -51,7 +57,7 @@ def test_root_retains_only_after_quiescence_and_final_rechecks(
         def reserve(self, *args: Any, **kwargs: Any) -> Any:
             yield Lease()
 
-    def quiet(*args: Any) -> None:
+    async def quiet(_broker: object, _job: object) -> None:
         events.append("quiet")
         if uncertain:
             raise ProcessCleanupIncomplete("python_project_cleanup_incomplete")
@@ -76,9 +82,11 @@ def test_root_retains_only_after_quiescence_and_final_rechecks(
     monkeypatch.setattr(backend, "_recheck_source", lambda *args: None)
     monkeypatch.setattr(backend, "_write_plan", lambda *args: stage / "plan.json")
     monkeypatch.setattr(backend, "_make_export", lambda *args: stage / "export")
-    monkeypatch.setattr(backend, "_publish_export", lambda lease, *args: lease.publish())
+    monkeypatch.setattr(
+        backend, "_publish_export", lambda lease, *args, **kwargs: lease.publish(*args, **kwargs)
+    )
     monkeypatch.setattr(backend, "_export_empty", lambda *args: None)
-    monkeypatch.setattr(backend, "_quiesce", quiet)
+    monkeypatch.setattr(backend.ProjectExecutionBroker, "_kill_and_confirm", quiet)
     monkeypatch.setattr(backend, "_measured_inputs", inputs)
     monkeypatch.setattr(backend, "retain_python_product", retain, raising=False)
     monkeypatch.setattr(

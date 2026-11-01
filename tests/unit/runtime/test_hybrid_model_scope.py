@@ -495,15 +495,21 @@ async def test_hybrid_success_boundary_rejects_unsealed_scope(
 async def test_hybrid_success_boundary_accepts_complete_scope_shards(checkpoint: bool) -> None:
     parent_id, child_id, tenant_id = uuid4(), uuid4(), uuid4()
     original = completed_scope_events(child_id, tenant_id, variant="valid", checkpoint=checkpoint)
+    delivery = Artifact(id=uuid4(), type="text", producer="main_agent",
+                        content={"text": "Actual synthesized delivery after complete scope shards."})
     runtime = HybridRuntime(
         ScopeRuntime(TaskMode.DISPATCH, original), MultiArtifactRuntime(TaskMode.DISCUSS, ()),
-        MultiArtifactRuntime(TaskMode.DIRECT, ()),
+        MultiArtifactRuntime(TaskMode.DIRECT, (delivery,)),
     )
     events = [event async for event in runtime.run(TaskContext(
         run_id=parent_id, tenant_id=tenant_id, mode=TaskMode.HYBRID, request="answer",
     ))]
     assert events[-1].kind is EventKind.RUNTIME_COMPLETED
     assert sum(event.kind == "model.failure_receipt" for event in events) == 2
+    delivered = next(event.artifact for event in events
+                     if event.artifact is not None and event.artifact.id == delivery.id)
+    assert delivered.type == "text" and delivered.content["text"] == delivery.content["text"]
+    assert delivery.content_sha256 == delivery.recompute_content_sha256()
     assert [event.sequence for event in events] == list(range(1, len(events) + 1))
     for source in original:
         if source.artifact is not None:

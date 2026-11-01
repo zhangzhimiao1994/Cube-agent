@@ -422,11 +422,8 @@ async def test_output_is_drained_while_stdin_is_blocked(
 @pytest.mark.parametrize("trigger", ["timeout", "output", "cancel"])
 async def test_hung_backend_termination_has_a_bounded_cleanup_deadline(
     tmp_path: Path, processes: list[asyncio.subprocess.Process],
-    monkeypatch: pytest.MonkeyPatch, trigger: str,
+    trigger: str,
 ) -> None:
-    monkeypatch.setattr(
-        "agent_hub.skills.sandbox.base._TERMINATION_GRACE_SECONDS", 0.05, raising=False,
-    )
     existing_tasks = asyncio.all_tasks()
     entered, release, started = asyncio.Event(), asyncio.Event(), asyncio.Event()
 
@@ -445,6 +442,7 @@ async def test_hung_backend_termination_has_a_bounded_cleanup_deadline(
     task = asyncio.create_task(run_subprocess_with_limits(
         (sys.executable, "-c", script), invocation(tmp_path, output_limit=32),
         process_started=process_started, on_forced_terminate=cleanup,
+        termination_grace_seconds=0.05,
     ))
     try:
         await asyncio.wait_for(started.wait(), timeout=3)

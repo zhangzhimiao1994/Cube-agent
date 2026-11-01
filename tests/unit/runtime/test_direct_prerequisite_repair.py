@@ -10,13 +10,16 @@ from typing import Any
 import pytest
 
 from agent_hub.capabilities.project_prerequisites import validate_project_prerequisite_report
-from agent_hub.capabilities.runtime import RuntimeCapabilityError
+from agent_hub.capabilities.runtime import RuntimeCapabilityError, RuntimeCapabilityGateway
 from agent_hub.runtime.action_direct import _binding
 from agent_hub.runtime.contracts import EventKind, TaskContext
 from agent_hub.runtime.direct import RuntimeExecutionError, _manifest_prerequisite_repair
+from agent_hub.skills.sandbox.base import SkillResult
 from agent_hub.skills.sandbox.project import ProjectInvocation, project_source_fingerprint
 from agent_hub.skills.sandbox.project_runner import Blocked, _manifest
 from tests.unit.capabilities.test_project_prerequisites import raw_report
+from tests.unit.capabilities.test_project_verification import Executor
+from tests.unit.capabilities.test_scoped_read import FakeRunRepository, stored_run
 from tests.unit.runtime.test_direct_project_verification import (
     BROKEN,
     FIXED,
@@ -38,6 +41,42 @@ def repair_context(**route: Any) -> TaskContext:
 def manifest_backend(backend: Any, ctx: TaskContext, monkeypatch: pytest.MonkeyPatch,
                      *, reason: str | None = None) -> None:
     original = backend.execute
+    # Route successful verification through the actual service/receipt cache.
+    # The controlled executor retains Backend's real Python child and its exit
+    # assertions; it is not a native Node/install qualification.
+    class VerifiedChildExecutor(Executor):
+        async def run(self, invocation: ProjectInvocation) -> SkillResult:
+            before = len(backend.process_results)
+            try:
+                await original(name="project.verify", tenant_id=ctx.tenant_id, run_id=ctx.run_id,
+                    actor="main_agent", arguments={}, idempotency_key=invocation.execution_id)
+            except RuntimeCapabilityError as error:
+                if error.execution_diagnostic is None or len(backend.process_results) != before + 1:
+                    raise
+            actual = backend.process_results[-1]
+            assert isinstance(actual, SkillResult)
+            if actual.timed_out:
+                return actual
+            report = await super().run(invocation)
+            body = json.loads(report.stdout)
+            body["status"] = "passed" if actual.exit_code == 0 else "failed"
+            body["checks"][-1] = {"phase": "test", "status": body["status"],
+                "exit_code": actual.exit_code, "timed_out": False,
+                "stdout": actual.stdout, "stderr": actual.stderr}
+            return report.model_copy(update={"stdout": json.dumps(body)})
+
+    executor = VerifiedChildExecutor()
+    executor.root = backend.workspace_root
+    repository = FakeRunRepository(stored_run(
+        tenant=ctx.tenant_id, run=ctx.run_id, project_id="direct-verification", session="same-task",
+        requested_permissions=["workspace.read", "workspace.write", "command.run", "network.read"],
+        execution_backend="systemd", runtime_timeout_seconds=60,
+    ))
+    backend._run_repository = repository
+    assert backend._project_verification is not None
+    backend._project_verification.repository = repository
+    backend._project_verification.executor = executor
+    backend._project_executor_configured = True
 
     async def execute(*, name: str, **kwargs: Any) -> Any:
         if name == 'project.verify':
@@ -58,6 +97,7 @@ def manifest_backend(backend: Any, ctx: TaskContext, monkeypatch: pytest.MonkeyP
                     'project verification blocked by execution prerequisites',
                     project_prerequisite=validate_project_prerequisite_report(raw, source),
                 ) from None
+            return await RuntimeCapabilityGateway.execute(backend, name=name, **kwargs)
         return await original(name=name, **kwargs)
 
     monkeypatch.setattr(backend, 'execute', execute)

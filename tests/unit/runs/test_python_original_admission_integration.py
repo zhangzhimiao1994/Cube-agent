@@ -24,6 +24,8 @@ from agent_hub.capabilities.defaults import (
     DefaultRuntimeCapabilityPolicyGateway,
     build_runtime_capability_stack,
 )
+from agent_hub.capabilities.gateway import CapabilityResult, CapabilityStatus
+from agent_hub.capabilities.project_verification import ProjectVerificationError
 from agent_hub.capabilities.runtime import RuntimeCapabilityGateway
 from agent_hub.capabilities.tools.registry import CompositeCapabilityManifestSource
 from agent_hub.capabilities.types import CapabilityRequest
@@ -33,12 +35,17 @@ from agent_hub.harness.tool_gateway import HarnessToolGateway, _python_recipe_au
 from agent_hub.harness.types import HarnessToolCallRequest
 from agent_hub.mcp.runtime import RuntimeMcpService
 from agent_hub.plugins.runtime import RuntimePluginService
+from agent_hub.runs.project_inputs import OriginalProjectApprovalPending
 from agent_hub.runs.repository import RunRecord, RunRepository
 from agent_hub.runtime.contracts import JsonValue, TaskContext, _freeze_object
 from agent_hub.runtime.worker import (
     _admin_settings_getter_for_tenant,
     _require_tool_approval_from_settings,
     _tool_approval_mode_from_settings,
+)
+from agent_hub.skills.sandbox.python_project_protocol import (
+    PythonProjectBrokerResponse,
+    PythonProjectInvocation,
 )
 from tests.unit.capabilities.test_project_baselines import source_tree
 from tests.unit.capabilities.test_python_project_input_store import python_controls
@@ -416,3 +423,58 @@ async def test_production_stack_with_persisted_settings_and_plugin_rules_reaches
     assert pending.status == "pending"
     assert isinstance(public, dict) and public["kind"] == "approval.requested"
     assert len(executor.probes) == 1 and not executor.calls
+
+
+@pytest.mark.parametrize("frozen", [False, True])
+async def test_actual_install_unknown_keeps_write_ahead_state_and_never_replays(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, frozen: bool,
+) -> None:
+    preparer, repository, context, executor, runtime, store, approvals = await admission(
+        tmp_path, frozen=frozen,
+    )
+    with pytest.raises(OriginalProjectApprovalPending):
+        await preparer(context)
+    assert repository.row.routing_decision["project_input_preparation"]["phase"] == "captured"
+    assert not executor.calls
+    pending, = await store.list_pending()
+    exact = await runtime.project_verification_authorization(generic_request(context))
+    assert exact is not None
+    await approvals.approve(pending.id, exact, actor_id=context.actor_id)
+    dispatched: list[PythonProjectInvocation] = []
+
+    async def unknown_after_dispatch(invocation: PythonProjectInvocation) -> PythonProjectBrokerResponse:
+        state = repository.row.routing_decision["project_input_preparation"]
+        assert state["phase"] == "executing" and state["execution_id"] == invocation.execution_id
+        assert invocation.install_allowed is True
+        dispatched.append(invocation)
+        raise TimeoutError("native reply unavailable after dispatch")
+
+    monkeypatch.setattr(executor, "run", unknown_after_dispatch)
+    resumed = context.model_copy(update={"routing_decision": repository.row.routing_decision})
+    with pytest.raises(ProjectVerificationError, match="^python_project_service_unavailable$"):
+        await preparer(resumed)
+    assert len(dispatched) == 1 and len(executor.probes) == 1
+    assert repository.row.routing_decision["project_input_preparation"]["phase"] == "executing"
+    with pytest.raises(RuntimeError, match="original project preparation is unavailable or changed"):
+        await preparer(context.model_copy(update={"routing_decision": repository.row.routing_decision}))
+    assert len(dispatched) == 1 and len(executor.probes) == 1
+    assert len(repository.intents) == 1
+
+
+@pytest.mark.parametrize("status", [CapabilityStatus.DENIED, CapabilityStatus.ALLOWED],
+                         ids=["current-policy-denied", "allowed-without-persisted-exact-approval"])
+async def test_install_cannot_leave_capture_without_policy_and_actual_exact_approval(
+    tmp_path: Path, status: CapabilityStatus,
+) -> None:
+    preparer, repository, context, executor, _, store, _ = await admission(tmp_path)
+
+    class DecisionWithoutReceipt(DefaultRuntimeCapabilityPolicyGateway):
+        async def invoke(self, request: CapabilityRequest, *, role: Role) -> CapabilityResult:
+            return CapabilityResult(status, request.run_id, reason="capability denied")
+
+    preparer.authorizer._policy_gateway = DecisionWithoutReceipt(ApprovalService(store), repository)
+    with pytest.raises(RuntimeError, match="authorization required or denied"):
+        await preparer(context)
+    assert repository.row.routing_decision["project_input_preparation"]["phase"] == "captured"
+    assert not executor.calls and len(executor.probes) == 1
+    assert not await store.list_pending() and not repository.intents

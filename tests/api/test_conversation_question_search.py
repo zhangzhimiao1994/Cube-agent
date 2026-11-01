@@ -8,6 +8,7 @@ from agent_hub.api.routers import admin as admin_router
 from agent_hub.app import create_app
 from agent_hub.auth.models import AuthenticatedPrincipal, InvalidCredentials, Role
 from agent_hub.settings import Settings
+from tests.api.live_principal_fixture_nov02 import require_current_principal
 
 TENANT_ID = UUID("00000000-0000-4000-8000-000000000001")
 USER_ID = UUID("11111111-1111-4111-8111-111111111111")
@@ -19,6 +20,11 @@ class StubAuthService:
         if token != "valid-token":
             raise InvalidCredentials("bad token")
         return AuthenticatedPrincipal(USER_ID, TENANT_ID, Role.SUPER_ADMIN)
+
+    async def validate_principal(
+        self, principal: AuthenticatedPrincipal
+    ) -> AuthenticatedPrincipal:
+        return require_current_principal(principal, AuthenticatedPrincipal(USER_ID, TENANT_ID, Role.SUPER_ADMIN))
 
 
 class SearchService:

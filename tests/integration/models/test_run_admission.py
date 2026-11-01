@@ -141,9 +141,16 @@ async def prepare(
     repository = RunAdmissionRepository(factory)
     binding: Binding = {'tenant_id': user.tenant_id, 'run_id': run_id,
         'authorization_turn_id': evidence.turn_id, 'lease': lease, 'config_sha256': CONFIG}
-    opening: Opening = {**binding, 'original_token_grant': 100,
-        'original_deadline': now + timedelta(minutes=30), 'review_token_limit': 80,
-        'review_count_limit': 3, 'review_cost_limit': Decimal(1), **limits}
+    opening: Opening = {
+        'tenant_id': binding['tenant_id'], 'run_id': binding['run_id'],
+        'authorization_turn_id': binding['authorization_turn_id'],
+        'lease': binding['lease'], 'config_sha256': binding['config_sha256'],
+        'original_token_grant': limits.get('original_token_grant', 100),
+        'original_deadline': limits.get('original_deadline', now + timedelta(minutes=30)),
+        'review_token_limit': limits.get('review_token_limit', 80),
+        'review_count_limit': limits.get('review_count_limit', 3),
+        'review_cost_limit': limits.get('review_cost_limit', Decimal(1)),
+    }
     if open_now:
         await repository.open_pool(**opening)
     return repository, binding, opening

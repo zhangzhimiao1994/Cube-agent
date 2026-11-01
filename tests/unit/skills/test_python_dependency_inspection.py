@@ -233,6 +233,9 @@ async def test_cold_wheel_cache_does_not_need_install_fetch_project_execution_or
         guard.setattr(builtins, "open", read_only_open)
         guard.setattr(io, "open", read_only_io_open)
         guard.setattr(os, "open", read_only_os_open)
+        if real_os_open in os.supports_dir_fd:
+            # Preserve the native held-dirfd reader despite wrapping os.open.
+            guard.setattr(os, "supports_dir_fd", {*os.supports_dir_fd, read_only_os_open})
         for name in ("mkdir", "rename", "replace", "unlink", "remove", "system"):
             guard.setattr(os, name, forbidden)
         guard.setattr(subprocess, "Popen", forbidden)

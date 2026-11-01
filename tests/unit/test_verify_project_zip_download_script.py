@@ -5,6 +5,10 @@ import zipfile
 from pathlib import Path
 from typing import Any
 
+import pytest
+
+from agent_hub.auth.models import AuthenticatedPrincipal, InvalidCredentials
+
 
 def load_verifier() -> Any:
     module_path = Path("scripts/verify_user_project_zip_download.py")
@@ -16,8 +20,24 @@ def load_verifier() -> Any:
     return module
 
 
-def test_verify_project_zip_download_script_runs_user_flow(tmp_path: Path) -> None:
+def test_verify_project_zip_download_script_runs_user_flow(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     module = load_verifier()
+
+    class CurrentPrincipalAuth:
+        def __init__(self, principal: AuthenticatedPrincipal) -> None:
+            self.principal = principal
+
+        def authenticate_token(self, token: str) -> AuthenticatedPrincipal:
+            if token != "valid-token":
+                raise InvalidCredentials("bad token")
+            return self.principal
+
+        async def validate_principal(self, principal: AuthenticatedPrincipal) -> AuthenticatedPrincipal:
+            if principal != self.principal:
+                raise InvalidCredentials("principal is not current")
+            return self.principal
+
+    monkeypatch.setattr(module, "_StubAuthService", CurrentPrincipalAuth)
 
     result = module.run_verification(tmp_path)
 

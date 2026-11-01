@@ -25,6 +25,7 @@ from agent_hub.previews.cleanup import (
     PreviewOwnerScope,
 )
 from agent_hub.previews.dynamic_runtime import DynamicPreviewResponse
+from tests.api.live_principal_fixture_nov02 import require_current_principal
 from tests.unit.previews.test_cleanup import broker_observation, identity
 
 
@@ -36,6 +37,11 @@ class StubAuthService:
         if token != "valid-token":
             raise InvalidCredentials("bad token")
         return self.principal
+
+    async def validate_principal(
+        self, principal: AuthenticatedPrincipal
+    ) -> AuthenticatedPrincipal:
+        return require_current_principal(principal, self.principal)
 
 
 class StubConversationService:

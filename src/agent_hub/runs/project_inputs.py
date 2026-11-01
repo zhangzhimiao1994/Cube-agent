@@ -16,6 +16,8 @@ from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 from pydantic import ValidationError
 
 from agent_hub.auth.models import Role
+from agent_hub.capabilities.approvals import capability_approval_scope
+from agent_hub.capabilities.gateway import CapabilityResult, CapabilityStatus
 from agent_hub.capabilities.project_baselines import (
     ProjectBaselineReference,
     ProjectBaselineStore,
@@ -449,6 +451,27 @@ class OriginalProjectPreparer:
                 approval_required=False, sandbox='workspace_write',
                 idempotency_key='original-project-admission-' + context.run_id.hex,
             )
+            if python_inputs is not None:
+                # This is the concrete, once-only original observation, not
+                # static tool discovery. Keep the capture resumable while its
+                # exact recipe installation awaits the ordinary policy/ledger.
+                policy = self.authorizer._policy_gateway
+                if policy is None:
+                    raise RuntimeError('original project preparation authorization required or denied')
+                install_request = python_inputs.approval_request(user_id=context.actor_id,
+                    agent_id=request.actor, idempotency_key=request.idempotency_key)
+                decision = await policy.invoke(install_request, role=context.actor_role)
+                if type(decision) is not CapabilityResult or decision.run_id != context.run_id:
+                    raise RuntimeError('original project preparation authorization required or denied')
+                if (decision.status is CapabilityStatus.WAITING_APPROVAL
+                        and isinstance(decision.approval_id, str)):
+                    raise OriginalProjectApprovalPending(decision.approval_id, state)
+                install_scope = capability_approval_scope(install_request)
+                if (decision.status is not CapabilityStatus.ALLOWED
+                        or not isinstance(install_scope, str)
+                        or await self.repository.is_capability_approval_scope_approved(
+                            context.tenant_id, context.run_id, install_scope) is not True):
+                    raise RuntimeError('original project preparation authorization required or denied')
             allowed = await self.authorizer.authorize(
                 context.tenant_id, request, user_id=context.actor_id, role=context.actor_role,
             )

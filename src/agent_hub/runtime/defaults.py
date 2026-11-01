@@ -970,7 +970,7 @@ class ConfigBackedDirectRuntime:
             or execution is not None and execution.budget is not budget
             or not isinstance(getattr(getattr(harness, "_fresh", harness), "_review_gate", None), ConcreteModelReviewGate)
             or not isinstance(profile, Mapping) or type(profile.get("version")) is not int
-            or profile["version"] != 1 or profile.get("config_sha256") != review_config_sha256(budget.config)
+            or profile["version"] not in (1, 2) or profile.get("config_sha256") != review_config_sha256(budget.config)
             or budget.config.engine != "rules_then_model"):
             return False
         try:

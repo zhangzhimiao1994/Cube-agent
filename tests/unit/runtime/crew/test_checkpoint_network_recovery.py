@@ -19,6 +19,7 @@ from agent_hub.runtime.crew.adapter import (
     RuntimeExecutionError,
 )
 from agent_hub.runtime.crew.plan import DispatchPlan
+from tests.unit.runtime.crew.runtime_contract_fixture_nov02 import legacy_checkpoint_state
 from tests.unit.runtime.crew.test_adapter_failure_reason import (
     FastFactory,
     RoleAwareGateway,
@@ -167,9 +168,7 @@ async def test_exhausted_network_checkpoint_preserves_failure_without_new_calls(
 async def test_v9_network_checkpoint_continues_remaining_final_candidate() -> None:
     plan, repository, events = await failed_candidate_run(429)
     checkpoint = failed_checkpoint(events, model_count=2)
-    state = dict(checkpoint.state)
-    state.pop("incomplete_recovery_output_growth", None)
-    state.pop("initial_incomplete_chain_growth", None)
+    state = legacy_checkpoint_state(checkpoint)
     # V9 checkpoints omit the later persisted timeout fields and use a stride of two.
     for key in (
         "remaining_timeout_seconds", "remaining_absolute_timeout_seconds", "timeout_progress_units",

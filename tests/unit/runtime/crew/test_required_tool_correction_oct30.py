@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
@@ -57,6 +57,7 @@ from tests.unit.runtime.crew.required_correction_typed_fixture import (
     object_list,
     state_of,
 )
+from tests.unit.runtime.crew.runtime_contract_fixture_nov02 import unavailable_python_profile
 from tests.unit.runtime.crew.test_adapter_failure_reason import (
     WorkspaceDeliverySequenceGateway,
     _workspace_delivery_bundle_response,
@@ -71,6 +72,32 @@ from tests.unit.runtime.crew.test_engineering_delivery_execution import (
 from tests.unit.runtime.crew.test_invalid_tool_correction import PRIVATE, InvalidToolGateway
 from tests.unit.runtime.crew.test_meaningful_workspace_progress import offline_only  # noqa: F401
 from tests.unit.runtime.crew.test_structured_handoff_repair import assert_private_rejection
+
+
+@pytest.fixture(autouse=True)
+def unavailable_profile(monkeypatch: pytest.MonkeyPatch) -> None:
+    from agent_hub.skills.sandbox import python_project_profile
+
+    # Preserve offline_only's blanket network rejection. Simulate only the
+    # optional Root profile IPC returning its documented unavailable outcome.
+    monkeypatch.setattr(python_project_profile, "request_python_project_profile_broker",
+                        unavailable_python_profile)
+
+
+async def test_optional_unavailable_profile_is_not_reported_as_healthy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agent_hub.skills.sandbox import python_project_profile
+
+    # Exercise the legal unavailable IPC response even on the Windows test host.
+    monkeypatch.setattr(python_project_profile, "_systemd_supported", lambda: True)
+    harness = ActualCapabilityHarness(tmp_path, Executor())
+    result = await harness.backend.execute(tenant_id=TENANT, run_id=RUN, actor="implementer",
+        name="project.inspect", arguments={}, idempotency_key="unavailable-profile-inspection")
+    profile = result["python_build_profile"]
+    assert isinstance(profile, Mapping)
+    assert profile["status"] == "unavailable" and profile["readiness"] == "not_probed"
+    assert "catalog" not in profile
 
 
 class RequiredGateway(WorkspaceDeliverySequenceGateway):

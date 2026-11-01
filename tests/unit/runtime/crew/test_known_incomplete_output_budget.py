@@ -536,7 +536,8 @@ async def test_grown_runtime_request_traverses_owned_gateway_hard_and_context_ca
     subject = runtime(cast(IncompleteGateway, gateway))
     await collect(subject)
     assert len(gateway.requests) == len(transport.requests) == len(capacity.releases) == 3
-    assert gateway.requests[1].max_output_tokens == 12288
+    # Full-context fitting precedes gateway hashing: 20000 - 11500 = 8500.
+    assert gateway.requests[1].max_output_tokens == 8500
     assert transport.requests[1].max_output_tokens == expected
     assert transport.requests[1].allow_fallback is False
     assert transport.requests[1].logical_model == "general" and transport.requests[1].tools == ()

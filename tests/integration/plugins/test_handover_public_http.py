@@ -467,7 +467,11 @@ async def test_disabled_user_stale_real_login_token_is_not_authority(
         )
     else:
         response = await c.confirm(plan)
-    assert response.status_code == 403
+    assert response.status_code == 401
+    assert response.headers["www-authenticate"] == "Bearer"
+    assert response.json() == {
+        "error": {"code": "invalid_token", "message": "invalid access token"}
+    }
     assert await c.sql.rows() == before
     assert not c.sql.canonical.exists()
 
@@ -482,7 +486,12 @@ async def test_demoted_installer_stale_token_cannot_confirm(context: Context) ->
             .values(role=Role.OPERATOR.value)
         )
     before = await c.sql.rows()
-    assert (await c.confirm(plan)).status_code == 403
+    response = await c.confirm(plan)
+    assert response.status_code == 401
+    assert response.headers["www-authenticate"] == "Bearer"
+    assert response.json() == {
+        "error": {"code": "invalid_token", "message": "invalid access token"}
+    }
     assert await c.sql.rows() == before and not c.sql.canonical.exists()
 
 

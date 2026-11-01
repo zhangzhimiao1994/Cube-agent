@@ -19,6 +19,7 @@ from agent_hub.auth.models import AuthenticatedPrincipal, InvalidCredentials, Ro
 from agent_hub.capabilities.runtime import RuntimeCapabilityGateway
 from agent_hub.files import workspace as workspace_module
 from agent_hub.files.workspace import ProjectWorkspaceBundle, ProjectWorkspaceStore
+from tests.api.live_principal_fixture_nov02 import require_current_principal
 
 
 class StubAuthService:
@@ -29,6 +30,11 @@ class StubAuthService:
         if token != "valid-token":
             raise InvalidCredentials("bad token")
         return self.principal
+
+    async def validate_principal(
+        self, principal: AuthenticatedPrincipal
+    ) -> AuthenticatedPrincipal:
+        return require_current_principal(principal, self.principal)
 
 
 def bearer() -> dict[str, str]:

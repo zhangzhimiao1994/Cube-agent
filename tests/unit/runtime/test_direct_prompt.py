@@ -150,8 +150,7 @@ async def test_direct_workspace_failure_logs_only_fixed_diagnostic_code(
 
 @pytest.mark.parametrize(
     ("path", "content", "expected_code"),
-    (("src/empty.ts", "", "empty_content"),
-     (".prettierrc", "{}", "hidden_path"),
+    ((".prettierrc", "{}", "hidden_path"),
      (" src/main.ts", "export {}", "invalid_path")),
 )
 async def test_direct_real_workspace_boundary_preserves_partial_files_and_safe_diagnostic(
@@ -186,6 +185,30 @@ async def test_direct_real_workspace_boundary_preserves_partial_files_and_safe_d
     assert f"failure_code={expected_code}" in caplog.text
     assert raised.value.__context__ is None
     assert path not in caplog.text
+
+
+async def test_direct_real_workspace_boundary_preserves_intentional_empty_text(tmp_path: Path) -> None:
+    context = TaskContext(run_id=uuid4(), tenant_id=uuid4(), mode=TaskMode.DIRECT,
+                          request="Create an intentionally empty source file")
+    root = tmp_path / "workspaces"
+    capabilities = RuntimeCapabilityGateway(
+        skill_store_dir=tmp_path / "skills", project_workspace_dir=root,
+        run_repository=FakeRunRepository(stored_run(
+            tenant=context.tenant_id, run=context.run_id,
+            project_id="diagnostic-project", session="diagnostic-session",
+        )),
+    )
+    runtime = DirectRuntime(FakeGateway(), logical_model="main", capability_gateway=capabilities)
+    result = await runtime._execute_workspace_capability(
+        context, name="workspace.write_text", arguments={"path": "src/empty.ts", "content": ""},
+        idempotency_key="intentional-empty", deadline=asyncio.get_running_loop().time() + 10,
+    )
+    saved = root / str(context.tenant_id) / "projects/diagnostic-project/sessions/diagnostic-session/src/empty.ts"
+    assert saved.is_file() and saved.read_bytes() == b""
+    metadata = result["file"]
+    assert isinstance(metadata, Mapping)
+    assert metadata["size_bytes"] == 0
+    assert metadata["sha256"] == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
 
 class SequencedDirectGateway:

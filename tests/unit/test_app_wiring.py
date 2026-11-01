@@ -10,6 +10,7 @@ from uuid import UUID, uuid4
 import pytest
 from fastapi.responses import FileResponse
 from fastapi.testclient import TestClient
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from agent_hub import app as app_module
 from agent_hub.api.routers.admin import (
@@ -49,22 +50,32 @@ from agent_hub.multimodal.generation import MultimediaGenerationKind
 from agent_hub.multimodal.minimax import MiniMaxGeneratedVideo
 from agent_hub.multimodal.video_providers import TextToVideoProviderRouter
 from agent_hub.routing.types import RiskLevel
+from agent_hub.runs.artifacts import PostgresArtifactRepository
 from agent_hub.runtime.contracts import RunEvent, RuntimeCheckpoint, TaskContext
 from agent_hub.runtime.registry import RuntimeRegistry
 from agent_hub.settings import Settings
 from tests.api.test_foundation_api import (
     unwritable_default_workspace,  # noqa: F401 -- pytest fixture
 )
+from tests.unit.app_wiring_stack_fixture import capture_stacks
 
 TENANT_ID = UUID("00000000-0000-4000-8000-000000000001")
 OTHER_TENANT_ID = UUID("00000000-0000-4000-8000-000000000002")
 
 
 class StubAuthService:
+    def __init__(self) -> None:
+        self.principal = AuthenticatedPrincipal(uuid4(), TENANT_ID, Role.SUPER_ADMIN)
+
     def authenticate_token(self, token: str) -> AuthenticatedPrincipal:
         if token != "valid-token":
             raise InvalidCredentials("bad token")
-        return AuthenticatedPrincipal(uuid4(), TENANT_ID, Role.SUPER_ADMIN)
+        return self.principal
+
+    async def validate_principal(self, principal: AuthenticatedPrincipal) -> AuthenticatedPrincipal:
+        if principal != self.principal:
+            raise InvalidCredentials("principal is not current")
+        return self.principal
 
 
 class StubRateLimiter:
@@ -622,13 +633,10 @@ def test_create_app_wires_runtime_mcp_and_plugin_manifest_sources(
         def capability_manifest_source(self) -> object:
             return plugin_source
 
-    class FakeRuntimeStack:
-        runtime_gateway = object()
-        harness_tool_gateway = object()
-        project_input_preparer = StubProjectInputPreparer()
 
-    class FakePostgresArtifactRepository:
-        def __init__(self, session_factory: object) -> None:
+    class FakePostgresArtifactRepository(PostgresArtifactRepository):
+        def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
+            super().__init__(session_factory)
             captured["artifact_session_factory"] = session_factory
 
     async def fake_build_runtime_mcp_service(**kwargs: object) -> FakeMcpService:
@@ -639,9 +647,6 @@ def test_create_app_wires_runtime_mcp_and_plugin_manifest_sources(
         captured["plugin_service_kwargs"] = kwargs
         return FakePluginService()
 
-    def fake_build_runtime_capability_stack(**kwargs: object) -> FakeRuntimeStack:
-        captured["runtime_stack_kwargs"] = kwargs
-        return FakeRuntimeStack()
 
     def fake_configured_runtime_registry(**kwargs: object) -> object:
         captured["runtime_registry_kwargs"] = kwargs
@@ -657,11 +662,7 @@ def test_create_app_wires_runtime_mcp_and_plugin_manifest_sources(
         "build_runtime_plugin_service",
         fake_build_runtime_plugin_service,
     )
-    monkeypatch.setattr(
-        app_module,
-        "build_runtime_capability_stack",
-        fake_build_runtime_capability_stack,
-    )
+    wired = capture_stacks(monkeypatch, app_module, captured, 'runtime_stack_kwargs')
     monkeypatch.setattr(app_module, "PostgresArtifactRepository", FakePostgresArtifactRepository, raising=False)
     monkeypatch.setattr(app_module, "configured_runtime_registry", fake_configured_runtime_registry)
 
@@ -677,8 +678,8 @@ def test_create_app_wires_runtime_mcp_and_plugin_manifest_sources(
     )
 
     with TestClient(application):
-        assert application.state.project_input_preparer is FakeRuntimeStack.project_input_preparer
-        assert application.state.run_service._project_input_preparer is FakeRuntimeStack.project_input_preparer
+        assert application.state.project_input_preparer is wired.last.project_input_preparer
+        assert application.state.run_service._project_input_preparer is wired.last.project_input_preparer
 
     runtime_kwargs = captured["runtime_stack_kwargs"]
     assert isinstance(runtime_kwargs, dict)
@@ -721,10 +722,6 @@ def test_create_app_registers_enabled_plugin_package_subprocess_adapters(
         def capability_manifest_source(self) -> object:
             return object()
 
-    class FakeRuntimeStack:
-        runtime_gateway = object()
-        harness_tool_gateway = object()
-        project_input_preparer = StubProjectInputPreparer()
 
     async def fake_build_runtime_mcp_service(**kwargs: object) -> FakeRuntimeService:
         del kwargs
@@ -749,11 +746,7 @@ def test_create_app_registers_enabled_plugin_package_subprocess_adapters(
         "build_plugin_package_subprocess_adapters",
         fake_build_plugin_package_subprocess_adapters,
     )
-    monkeypatch.setattr(
-        app_module,
-        "build_runtime_capability_stack",
-        lambda **kwargs: FakeRuntimeStack(),
-    )
+    wired = capture_stacks(monkeypatch, app_module, captured, 'runtime_stack_kwargs')
     monkeypatch.setattr(app_module, "configured_runtime_registry", lambda **kwargs: object())
 
     application = create_app(
@@ -785,8 +778,8 @@ def test_create_app_registers_enabled_plugin_package_subprocess_adapters(
     )
 
     with TestClient(application):
-        assert application.state.project_input_preparer is FakeRuntimeStack.project_input_preparer
-        assert application.state.run_service._project_input_preparer is FakeRuntimeStack.project_input_preparer
+        assert application.state.project_input_preparer is wired.last.project_input_preparer
+        assert application.state.run_service._project_input_preparer is wired.last.project_input_preparer
 
     plugin_kwargs = cast(dict[str, object], captured["plugin_service_kwargs"])
     adapters = cast(dict[str, Any], plugin_kwargs["adapters"])
@@ -906,10 +899,6 @@ def test_create_app_publishes_runtime_invalidation_after_admin_reload(
         def capability_manifest_source(self) -> object:
             return object()
 
-    class FakeRuntimeStack:
-        runtime_gateway = object()
-        harness_tool_gateway = object()
-        project_input_preparer = StubProjectInputPreparer()
 
     async def fake_build_runtime_mcp_service(**kwargs: object) -> FakeMcpService:
         del kwargs
@@ -930,11 +919,7 @@ def test_create_app_publishes_runtime_invalidation_after_admin_reload(
         "build_runtime_plugin_service",
         fake_build_runtime_plugin_service,
     )
-    monkeypatch.setattr(
-        app_module,
-        "build_runtime_capability_stack",
-        lambda **kwargs: FakeRuntimeStack(),
-    )
+    wired = capture_stacks(monkeypatch, app_module, captured, 'runtime_stack_kwargs')
     monkeypatch.setattr(app_module, "configured_runtime_registry", lambda **kwargs: object())
 
     application = create_app(
@@ -949,8 +934,8 @@ def test_create_app_publishes_runtime_invalidation_after_admin_reload(
     )
 
     with TestClient(application):
-        assert application.state.project_input_preparer is FakeRuntimeStack.project_input_preparer
-        assert application.state.run_service._project_input_preparer is FakeRuntimeStack.project_input_preparer
+        assert application.state.project_input_preparer is wired.last.project_input_preparer
+        assert application.state.run_service._project_input_preparer is wired.last.project_input_preparer
         asyncio.run(application.state.reload_mcp_runtime_config(OTHER_TENANT_ID))
         asyncio.run(application.state.reload_plugin_runtime_config(OTHER_TENANT_ID))
         asyncio.run(application.state.reload_plugin_runtime_config_strict(OTHER_TENANT_ID))
@@ -1072,10 +1057,6 @@ def test_create_app_reads_tool_approval_settings_for_target_tenant(
         def capability_manifest_source(self) -> object:
             return object()
 
-    class FakeRuntimeStack:
-        runtime_gateway = object()
-        harness_tool_gateway = object()
-        project_input_preparer = StubProjectInputPreparer()
 
     async def fake_build_runtime_mcp_service(**kwargs: object) -> FakeRuntimeService:
         return FakeRuntimeService()
@@ -1083,9 +1064,6 @@ def test_create_app_reads_tool_approval_settings_for_target_tenant(
     async def fake_build_runtime_plugin_service(**kwargs: object) -> FakeRuntimeService:
         return FakeRuntimeService()
 
-    def fake_build_runtime_capability_stack(**kwargs: object) -> FakeRuntimeStack:
-        captured["runtime_stack_kwargs"] = kwargs
-        return FakeRuntimeStack()
 
     monkeypatch.setattr(app_module, "build_runtime_mcp_service", fake_build_runtime_mcp_service)
     monkeypatch.setattr(
@@ -1093,11 +1071,7 @@ def test_create_app_reads_tool_approval_settings_for_target_tenant(
         "build_runtime_plugin_service",
         fake_build_runtime_plugin_service,
     )
-    monkeypatch.setattr(
-        app_module,
-        "build_runtime_capability_stack",
-        fake_build_runtime_capability_stack,
-    )
+    wired = capture_stacks(monkeypatch, app_module, captured, 'runtime_stack_kwargs')
     monkeypatch.setattr(app_module, "configured_runtime_registry", lambda **kwargs: object())
 
     admin_service = TenantScopedSettingsService(TENANT_ID)
@@ -1113,8 +1087,8 @@ def test_create_app_reads_tool_approval_settings_for_target_tenant(
     )
 
     with TestClient(application):
-        assert application.state.project_input_preparer is FakeRuntimeStack.project_input_preparer
-        assert application.state.run_service._project_input_preparer is FakeRuntimeStack.project_input_preparer
+        assert application.state.project_input_preparer is wired.last.project_input_preparer
+        assert application.state.run_service._project_input_preparer is wired.last.project_input_preparer
 
     runtime_kwargs = cast(dict[str, object], captured["runtime_stack_kwargs"])
     require_approval = cast(Any, runtime_kwargs["require_approval_for_tools"])

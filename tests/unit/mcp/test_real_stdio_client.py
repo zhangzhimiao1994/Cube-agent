@@ -23,8 +23,7 @@ async def test_stdio_log_flood_does_not_block_protocol(
         "sys.stderr.buffer.write(b'x' * 1_000_000)\n"
         "sys.stderr.buffer.flush()\n"
         "sys.stdout.buffer.write("
-        "b'Content-Length: 36\\r\\n\\r\\n'"
-        'b\'{"jsonrpc":"2.0","id":1,"result":{}}\')\n'
+        'b\'{"jsonrpc":"2.0","id":1,"result":{}}\\n\')\n'
         "sys.stdout.buffer.flush()\n"
         "sys.stdin.buffer.read()\n",
         encoding="utf-8",
@@ -81,22 +80,15 @@ import sys
 
 
 def read_message():
-    header = sys.stdin.buffer.readline()
-    if not header:
+    line = sys.stdin.buffer.readline()
+    if not line:
         return None
-    if not header.lower().startswith(b"content-length:"):
-        raise SystemExit(2)
-    length = int(header.decode("ascii").split(":", 1)[1].strip())
-    while True:
-        line = sys.stdin.buffer.readline()
-        if line in {b"\\r\\n", b"\\n", b""}:
-            break
-    return json.loads(sys.stdin.buffer.read(length).decode("utf-8"))
+    return json.loads(line)
 
 
 def write_message(payload):
     raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-    sys.stdout.buffer.write(f"Content-Length: {len(raw)}\\r\\n\\r\\n".encode("ascii") + raw)
+    sys.stdout.buffer.write(raw + b"\\n")
     sys.stdout.buffer.flush()
 
 

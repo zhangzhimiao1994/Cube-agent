@@ -29,6 +29,7 @@ from agent_hub.auth.models import (
 from agent_hub.config.repository import ConfigNotFoundError, ConfigRevision, ConfigStatus
 from agent_hub.config.service import ConfigPublishedEvent, PostCommitNotificationError
 from agent_hub.settings import Settings
+from tests.api.live_principal_fixture_nov02 import require_current_principal
 
 
 @pytest.fixture
@@ -283,6 +284,8 @@ def test_default_app_wires_user_management_service(tmp_path: Path) -> None:
 class StubAuthService:
     def __init__(self, principal: AuthenticatedPrincipal | None = None) -> None:
         self.principal = principal or AuthenticatedPrincipal(uuid4(), uuid4(), Role.ADMIN)
+        self.current_identity: AuthenticatedPrincipal | None = self.principal
+        self.disabled = False
         self.login_error: Exception | None = None
         self.seen_tokens: list[str] = []
         self.login_tenant_ids: list[UUID] = []
@@ -303,6 +306,11 @@ class StubAuthService:
         if token != "valid-token":
             raise InvalidCredentials("internal token detail")
         return self.principal
+
+    async def validate_principal(
+        self, principal: AuthenticatedPrincipal
+    ) -> AuthenticatedPrincipal:
+        return require_current_principal(principal, self.current_identity, disabled=self.disabled)
 
 
 @dataclass(frozen=True)
@@ -690,6 +698,74 @@ def test_bearer_scheme_is_case_insensitive() -> None:
     assert response.status_code == 200
     assert response.json()["role"] == "admin"
 
+
+
+@pytest.mark.parametrize("changed", ["missing", "disabled", "user", "tenant", "role"])
+def test_bearer_rejects_claims_that_no_longer_match_the_live_identity(changed: str) -> None:
+    auth = StubAuthService()
+    if changed == "missing":
+        auth.current_identity = None
+    elif changed == "disabled":
+        auth.disabled = True
+    elif changed == "user":
+        auth.current_identity = replace(auth.principal, user_id=uuid4())
+    elif changed == "tenant":
+        auth.current_identity = replace(auth.principal, tenant_id=uuid4())
+    else:
+        auth.current_identity = replace(auth.principal, role=Role.VIEWER)
+
+    response = auth_client(auth).get(
+        "/api/v1/auth/me", headers={"Authorization": "Bearer valid-token"}
+    )
+
+    assert response.status_code == 401
+    assert response.headers["www-authenticate"] == "Bearer"
+    assert response.json() == {
+        "error": {"code": "invalid_token", "message": "invalid access token"}
+    }
+    assert auth.seen_tokens == ["valid-token"]
+    assert str(auth.principal.user_id) not in response.text
+    assert str(auth.principal.tenant_id) not in response.text
+    assert "valid-token" not in response.text
+
+
+def test_bearer_returns_only_the_current_enabled_identity() -> None:
+    auth = StubAuthService()
+    response = auth_client(auth).get(
+        "/api/v1/auth/me", headers={"Authorization": "Bearer valid-token"}
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "user_id": str(auth.principal.user_id),
+        "tenant_id": str(auth.principal.tenant_id),
+        "role": auth.principal.role.value,
+    }
+    assert auth.seen_tokens == ["valid-token"]
+
+
+@pytest.mark.parametrize("failure", ["unavailable", "mismatched_return"])
+def test_bearer_live_validation_failure_never_falls_back_to_signed_claims(failure: str) -> None:
+    class BrokenLiveAuth(StubAuthService):
+        async def validate_principal(
+            self, principal: AuthenticatedPrincipal
+        ) -> AuthenticatedPrincipal:
+            if failure == "unavailable":
+                raise AuthenticationPersistenceError("private identity database detail")
+            return replace(principal, tenant_id=uuid4())
+
+    auth = BrokenLiveAuth()
+    response = auth_client(auth).get(
+        "/api/v1/auth/me", headers={"Authorization": "Bearer valid-token"}
+    )
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "error": {"code": "service_unavailable", "message": "service unavailable"}
+    }
+    assert auth.seen_tokens == ["valid-token"]
+    assert "private identity database detail" not in response.text
+    assert "valid-token" not in response.text
 
 def test_auth_rate_limit_uses_socket_client_and_returns_retry_after() -> None:
     limiter = StubRateLimiter(LimitDecision(False, retry_after=37))
