@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import os
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from typing import cast
@@ -22,10 +23,15 @@ from agent_hub.models.capacity import (
 from agent_hub.models.gateway import ConservativeTokenEstimator, ModelGateway
 from agent_hub.models.registry import ModelRegistry
 from agent_hub.models.types import Deployment, ModelMessage, ModelRequest, ModelResponse
+from tests.integration.models.capacity_native_redis_fixture import owned_native_redis
 
 
 @pytest.fixture
 async def redis_client(redis_url: str) -> AsyncIterator[Redis]:
+    if os.environ.get("AGENT_HUB_NATIVE_OWNED_UNIX_REDIS") == "1":
+        async with owned_native_redis() as client:
+            yield client
+        return
     client = Redis.from_url(redis_url)
     try:
         await client.ping()

@@ -14,6 +14,7 @@ import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta, tzinfo
+from decimal import Decimal
 from pathlib import Path
 from typing import Unpack
 from uuid import UUID, uuid4
@@ -53,7 +54,13 @@ from agent_hub.runs.repository import RunRepository
 from agent_hub.runs.workspace import workspace_selection
 from agent_hub.runtime import review_assembly as assembly
 from agent_hub.runtime.artifacts import InMemoryArtifactRepository
-from agent_hub.runtime.contracts import EventKind, RunEvent
+from agent_hub.runtime.contracts import (
+    EventKind,
+    JsonValue,
+    RunEvent,
+    _canonical_json_bytes,
+    _freeze_object,
+)
 from agent_hub.runtime.defaults import ConfigBackedDirectRuntime, _deployments
 from agent_hub.runtime.direct import RuntimeExecutionError
 from agent_hub.runtime.worker_execution import worker_runtime_events
@@ -71,8 +78,13 @@ from tests.integration.runtime.review_mode_import_closure_typed_fixture import (
     NativeRuntime,
     RuntimeArguments,
     TokenPool,
+    WireAttempt,
 )
-from tests.integration.runtime.test_model_review_action import _DirectWriteAudit, _install_note_wire
+from tests.integration.runtime.test_model_review_action import (
+    _assert_accounting_receipt,
+    _DirectWriteAudit,
+    _install_note_wire,
+)
 from tests.integration.runtime.test_model_review_modes import (
     own_redis as own_redis,  # noqa: PLC0414 - owned Unix socket Redis, no production service
 )
@@ -107,6 +119,62 @@ class V2Native:
     seal: tuple[str, datetime]
     unknown: AttemptSnapshot
     note: tuple[str, str] | None
+
+
+def assert_same_routing_json(actual: Mapping[str, object], expected: Mapping[str, JsonValue]) -> None:
+    """Compare every JSON field, permitting only the contract's container thaw.
+
+    No default serializer/string coercion or ignored route fields: freeze rejects
+    non-JSON values and canonical bytes still distinguish bool/int and int/float.
+    """
+    frozen = _freeze_object(actual, name='persisted routing snapshot')
+    assert set(frozen) == set(expected)
+    for key in expected:
+        assert _canonical_json_bytes({key: frozen[key]}) == _canonical_json_bytes({key: expected[key]}), key
+    assert _canonical_json_bytes(frozen) == _canonical_json_bytes(expected)
+
+
+def assert_action_wire_receipts(
+    completed: Sequence[RunAdmissionAttemptRow], wire: Mapping[UUID, WireAttempt],
+    pool: PoolSnapshot, unknown: AttemptSnapshot, reviews: Sequence[RunReviewIntentRow],
+) -> None:
+    """Account primary and reviewer IO separately; retain the UNKNOWN debit."""
+    assert unknown.state == 'unknown' and unknown.token_hold == 11
+    assert unknown.attempt_id not in wire
+    assert len(completed) == len(wire) and {r.attempt_id for r in completed} == set(wire)
+    assert all(r.purpose in {'primary', 'review'} for r in completed)
+    primary = [r for r in completed if r.purpose == 'primary']
+    reviewer = [r for r in completed if r.purpose == 'review']
+    primary_wire = {key: row for key, row in wire.items() if row['purpose'] == 'primary'}
+    review_wire = {key: row for key, row in wire.items() if row['purpose'] == 'review'}
+    assert len(primary_wire) + len(review_wire) == len(wire)
+    primary_tokens = sum(row['usage']['total_tokens'] for row in primary_wire.values())
+    # Retain the chat helper's full primary identity/receipt/hash assertions,
+    # but never pass a genuine review attempt into its primary-only contract.
+    assert_wire_receipts(primary, primary_wire, TokenPool(token_charged=primary_tokens))
+    assert {r.attempt_id for r in reviewer} == set(review_wire) == {r.attempt_id for r in reviews}
+    review_tokens = 0
+    review_cost = Decimal(0)
+    for row in reviewer:
+        sent = review_wire[row.attempt_id]
+        assert row.purpose == sent['purpose'] == 'review'
+        assert row.state == 'completed' and row.physical_transport_id is not None
+        assert row.request_sha256 == sent['request_sha256'] and row.deployment == sent['deployment']
+        assert str(row.physical_transport_id) == sent['physical_transport_id']
+        _assert_accounting_receipt(row, sent)
+        cost = Decimal(sent['usage']['cost_usd']['decimal'])
+        assert sent['usage']['total_tokens'] == 5 and cost == Decimal('0.000008')
+        review_tokens += sent['usage']['total_tokens']
+        review_cost += cost
+        intent = next(r for r in reviews if r.attempt_id == row.attempt_id)
+        assert (intent.tenant_id, intent.run_id, intent.authorization_turn_id) == (
+            pool.tenant_id, pool.run_id, pool.authorization_turn_id)
+        assert intent.request_sha256 == row.request_sha256
+        assert intent.physical_identity == row.physical_transport_id
+    assert pool.review_token_charged == review_tokens
+    assert pool.review_count_charged == len(reviewer)
+    assert pool.review_cost_charged == review_cost
+    assert pool.token_charged == 11 + primary_tokens + review_tokens
 
 
 async def fresh_v2_native_case(storage: Storage, tmp_path: Path,
@@ -265,6 +333,7 @@ async def test_real_pg_v2_native_modes_continue_original_balance_and_unknown_aft
 ) -> None:
     prepared = await fresh_v2_native_case(storage, tmp_path, mode, own_redis)
     case = prepared.case
+    routing_snapshot = _freeze_object(case.context.routing_decision, name='original routing snapshot')
     expired = prepared.expires_at + timedelta(seconds=1)
 
     class ExpiredQualification(datetime):
@@ -308,12 +377,12 @@ async def test_real_pg_v2_native_modes_continue_original_balance_and_unknown_aft
         assert not reviews and prepared.path.read_bytes() == prepared.body
         persisted = await case.repository.get(case.context.tenant_id, case.context.run_id)
         assert mapping(present(persisted.routing_decision)['approval_review_profile'])['version'] == 2
-        assert persisted.routing_decision == dict(case.context.routing_decision)
         assert case.wire.calls and all(budget is case.wire.budgets[0] for budget in case.wire.budgets)
         assert not case.wire.budgets[0]._active and all(body.closed for body in case.wire.bodies)
         for capacity in case.capacities:
             for scope in ('fixture-primary', 'fixture-reviewer'):
                 assert await case.redis.zcard(capacity._keys(scope)['leases']) == 0
+        assert_same_routing_json(present(persisted.routing_decision), routing_snapshot)
     finally:
         case.wire.release.set()
         await case.runtime.cancel_run_owned(case.context.run_id, present(case.context.execution_token))
@@ -457,7 +526,7 @@ async def test_real_pg_v2_native_direct_root_write_preserves_exact_vs_model_fres
             approvals = list(await session.scalars(select(RunApprovalRow).where(
                 RunApprovalRow.run_id == case.context.run_id)))
         completed = [r for r in attempts if r.attempt_id != prepared.unknown.attempt_id]
-        assert_wire_receipts(completed, case.wire.attempts, TokenPool(token_charged=pool.token_charged - 11))
+        assert_action_wire_receipts(completed, case.wire.attempts, pool, prepared.unknown, reviews)
         assert all(r.worker_id == case.binding['lease'].worker_id
                    and r.worker_lease_token == case.context.execution_token for r in completed)
         if authorization == 'manual_expired':
