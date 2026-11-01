@@ -3184,7 +3184,8 @@ async def test_shared_repository_recovers_long_chain_without_context_artifacts(
     step_count: int,
 ) -> None:
     repository = InMemoryArtifactRepository()
-    dispatch_plan = chain_plan(step_count)
+    # Artifact recovery, not one-second scheduler latency; match the review-chain fixture.
+    dispatch_plan = chain_plan(step_count, step_timeout=30)
     first = make_runtime(FakeGateway(), dispatch_plan, artifact_repository=repository)
     await collect(first, context(token_budget=dispatch_plan.total_token_budget))
     checkpoint = await first.save_checkpoint()
