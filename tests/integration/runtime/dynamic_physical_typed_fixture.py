@@ -5,9 +5,9 @@ from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import TypeGuard
-from uuid import UUID
+from uuid import UUID, uuid4
 
-from sqlalchemy import event
+from sqlalchemy import event, select
 from sqlalchemy.engine.result import IteratorResult, SimpleResultMetaData
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import ORMExecuteState, Session
@@ -19,6 +19,7 @@ from sqlalchemy.sql.visitors import iterate
 
 from agent_hub.db.base import Base
 from agent_hub.db.models import (
+    RunAdmissionEventRow,
     RunAdmissionPoolRow,
     RunAuthenticatedInputRow,
     RunInputAuthorizationRow,
@@ -151,6 +152,24 @@ def selected(state: ORMExecuteState) -> IteratorResult[tuple[object, ...]]:
         return result_rows([] if link is None or turn is None or not tenant_matches(link, statement) or not tenant_matches(turn, statement) else [(link, turn)])
     assert len(entities) == 1
     entity = entities[0]
+    if entity is RunAdmissionEventRow:
+        # Preserve the DAO's real opened-event SELECT and its duplicate fence.
+        # Unsupported predicates/limits must fail rather than return a seal.
+        predicates: dict[str, object] = {}
+        for term in statement._where_criteria:
+            assert isinstance(term, BinaryExpression) and term.operator is eq
+            assert isinstance(term.right, BindParameter)
+            name = getattr(term.left, 'key', None)
+            assert name in {'tenant_id', 'run_id', 'kind'} and name not in predicates
+            predicates[name] = term.right.value
+        assert set(predicates) == {'tenant_id', 'run_id', 'kind'}
+        assert predicates['kind'] == 'opened'
+        limit = statement._limit_clause
+        assert isinstance(limit, BindParameter) and limit.value == 2
+        rows = [(row,) for row in owner.rows if isinstance(row, RunAdmissionEventRow)
+                and row.tenant_id == predicates['tenant_id']
+                and row.run_id == predicates['run_id'] and row.kind == predicates['kind']]
+        return result_rows(rows[:2])
     assert entity in (RunRow, RunAdmissionPoolRow, RunInputAuthorizationRow, RunAuthenticatedInputRow)
     for row in owner.rows:
         if type(row) is not entity or not tenant_matches(row, statement):
@@ -179,3 +198,25 @@ class PreparationStorage(async_sessionmaker[AsyncSession]):
     async def get[T: Base](self, kind: type[T], key: UUID) -> T | None:
         async with self() as session:
             return await session.get(kind, key)
+
+
+async def test_opened_event_projection_filters_scope_and_retains_duplicates() -> None:
+    """Deliver actual matching rows, including duplicates needed by the DAO fence."""
+    storage = PreparationStorage()
+    tenant, run = uuid4(), uuid4()
+    first = RunAdmissionEventRow(tenant_id=tenant, run_id=run, kind='opened', evidence={})
+    second = RunAdmissionEventRow(tenant_id=tenant, run_id=run, kind='opened', evidence={})
+    storage.rows.extend((
+        RunAdmissionEventRow(tenant_id=uuid4(), run_id=run, kind='opened', evidence={}),
+        RunAdmissionEventRow(tenant_id=tenant, run_id=uuid4(), kind='opened', evidence={}),
+        RunAdmissionEventRow(tenant_id=tenant, run_id=run, kind='reserved', evidence={}),
+        first, second,
+        RunAdmissionEventRow(tenant_id=tenant, run_id=run, kind='opened', evidence={}),
+    ))
+    async with storage() as session:
+        rows = (await session.scalars(select(RunAdmissionEventRow).where(
+            RunAdmissionEventRow.tenant_id == tenant,
+            RunAdmissionEventRow.run_id == run,
+            RunAdmissionEventRow.kind == 'opened',
+        ).limit(2).execution_options(populate_existing=True))).all()
+    assert list(rows) == [first, second]

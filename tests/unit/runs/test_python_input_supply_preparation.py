@@ -3,24 +3,32 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 
-from agent_hub.capabilities.project_baselines import ProjectBaselineStore
+from agent_hub.auth.models import Role
+from agent_hub.capabilities.approvals import capability_approval_scope
+from agent_hub.capabilities.gateway import CapabilityResult, CapabilityStatus
+from agent_hub.capabilities.project_baselines import ProjectBaselineReference, ProjectBaselineStore
 from agent_hub.capabilities.project_verification import (
     ProjectVerificationError,
     ProjectVerificationService,
 )
+from agent_hub.capabilities.python_project_input_store import _capture
+from agent_hub.capabilities.python_project_inputs import PythonProjectInputs
 from agent_hub.capabilities.python_project_recipe import parse_python_project_declaration
+from agent_hub.capabilities.types import CapabilityRequest
 from agent_hub.domain.runs import RunStatus
-from agent_hub.harness.types import HarnessToolCallResult
+from agent_hub.harness.types import HarnessToolCallRequest, HarnessToolCallResult
 from agent_hub.runs.project_inputs import OriginalProjectApprovalPending
 from agent_hub.runs.repository import RunConflict, RunRepository
+from agent_hub.runtime.contracts import TaskContext
 from agent_hub.skills.sandbox.python_input_supply_protocol import (
     PythonInputSupplyPlan,
     PythonInputSupplyReceipt,
@@ -106,8 +114,39 @@ class Root(PythonExecutor):
             receipt=self.last if self.inspect_state == 'supplied' else None)
 
 
+class RecipeConsent:
+    """Only the actual captured recipe can receive this fixture's exact grant."""
+
+    def __init__(self, context: TaskContext, current_recipe: Callable[[], PythonProjectInputs]) -> None:
+        assert isinstance(context.actor_id, UUID)
+        assert context.actor_role is Role.OPERATOR
+        self.context = context
+        self.actor_id = context.actor_id
+        self.current_recipe = current_recipe
+        self.allowed = False
+        self.requests: list[CapabilityRequest] = []
+        self.grants: set[str] = set()
+
+    async def invoke(self, request: CapabilityRequest, *, role: Role) -> CapabilityResult:
+        expected = self.current_recipe().approval_request(
+            user_id=self.actor_id, agent_id='main_agent',
+            idempotency_key='original-project-admission-' + self.context.run_id.hex)
+        if (request != expected or role is not self.context.actor_role
+                or role is not Role.OPERATOR or not self.allowed):
+            return CapabilityResult(CapabilityStatus.DENIED, request.run_id)
+        scope = capability_approval_scope(request)
+        assert isinstance(scope, str)
+        self.requests.append(request)
+        self.grants.add(scope)
+        return CapabilityResult(CapabilityStatus.ALLOWED, request.run_id)
+
+    async def scope_approved(self, tenant: UUID, run: UUID, scope: str) -> bool:
+        return (tenant, run) == (self.context.tenant_id, self.context.run_id) and scope in self.grants
+
+
 async def configured(tmp_path: Path) -> tuple[Any, ...]:
     preparer, repository, context, _, calls, root, invocation = await setup(tmp_path)
+    assert isinstance(context, TaskContext)
     source = root / str(invocation.tenant_id) / 'projects' / invocation.project_id / 'sessions' / invocation.session_id
     python_controls(source)
     client = Root(root)
@@ -116,21 +155,29 @@ async def configured(tmp_path: Path) -> tuple[Any, ...]:
         assert (tenant, run) == (repository.row.tenant_id, repository.row.id)
         return RunRepository._record(repository.row)
 
-    async def approved(*_: Any) -> bool:
-        return True
+    def current_recipe() -> PythonProjectInputs:
+        reference = ProjectBaselineReference.from_payload(
+            repository.row.routing_decision['project_input_preparation']['reference'])
+        stored = ProjectBaselineStore(root).load(invocation, reference)
+        return _capture(stored, interpreter=interpreter(), wheels=selected(),
+                        max_control_bytes=256 * 1024, max_requirements=128)
+
+    recipe_consent = RecipeConsent(context, current_recipe)
+    # Explicit test consent for this recipe; supply approval remains independent.
+    recipe_consent.allowed = True
 
     repository.get = get
-    repository.is_capability_approval_scope_approved = approved
+    repository.is_capability_approval_scope_approved = recipe_consent.scope_approved
     preparer.verifier = ProjectVerificationService(root=root, repository=repository,
                                                   executor=None, python_executor=client)
     preparer.input_supply = client
 
     class Admission:
+        _policy_gateway = recipe_consent
         allowed = False
         resolved: str | None = None
 
         async def authorize_project_inputs(self, tenant: Any, request: Any, **kwargs: Any) -> Any:
-            from agent_hub.capabilities.approvals import capability_approval_scope
             from agent_hub.capabilities.python_input_preparation import input_supply_request
             calls.append('supply-authorize')
             plan = kwargs['plan']
@@ -156,7 +203,16 @@ async def configured(tmp_path: Path) -> tuple[Any, ...]:
                 status='failed', payload={'approval_id': 'approval_input_supply'},
                 failure_reason='capability requires approval')
 
-        async def authorize(self, tenant: Any, request: Any, **kwargs: Any) -> Any:
+        async def authorize(self, tenant: UUID, request: HarnessToolCallRequest, *,
+                            user_id: UUID, role: Role) -> HarnessToolCallResult:
+            assert (tenant, request.run_id, user_id, role) == (
+                context.tenant_id, context.run_id, context.actor_id, context.actor_role)
+            assert request.tool_name == 'project.verify' and not request.arguments
+            exact = current_recipe().approval_request(user_id=user_id, agent_id=request.actor,
+                                                     idempotency_key=request.idempotency_key)
+            scope = capability_approval_scope(exact)
+            assert isinstance(scope, str)
+            assert await recipe_consent.scope_approved(tenant, request.run_id, scope)
             calls.append('recipe-authorize')
             return HarnessToolCallResult(call_id=request.call_id, tool_name=request.tool_name,
                 status='succeeded', payload={'authorized': True})
@@ -207,6 +263,7 @@ async def test_missing_inputs_wait_supply_then_fresh_probe_without_recapture(
     assert json.loads(json.dumps(prepared.routing_decision['python_input_supply']['receipt']['plan'],
                                  default=dict)) == state['python_input_supply']['plan']
     assert any(a.type == 'python_project_input_supply' for a in prepared.artifacts)
+    assert len(admission._policy_gateway.requests) == 1
 
 
 @pytest.mark.parametrize('code', ['python_project_wheel_integrity', 'python_project_runtime_missing',
@@ -240,6 +297,43 @@ async def test_lost_supply_reply_only_inspects_old_execution(tmp_path: Path, sta
         assert repo.row.routing_decision['python_input_supply'] == state
     assert len(client.supply_ids) == 1 and len(client.inspect_ids) == 1
     assert client.inspect_ids[0] != state['execution_id']
+    assert len(admission._policy_gateway.requests) == (1 if status == 'supplied' else 0)
+
+
+async def test_recipe_consent_double_requires_exact_request_role_and_grant(tmp_path: Path) -> None:
+    preparer, _, context, client, admission, _, _ = await configured(tmp_path)
+    with pytest.raises(OriginalProjectApprovalPending):
+        await preparer(context)
+    policy = admission._policy_gateway
+    assert isinstance(policy, RecipeConsent)
+    exact = policy.current_recipe().approval_request(user_id=context.actor_id, agent_id='main_agent',
+        idempotency_key='original-project-admission-' + context.run_id.hex)
+    scope = capability_approval_scope(exact)
+    assert isinstance(scope, str)
+    assert not await policy.scope_approved(context.tenant_id, context.run_id, scope)
+    policy.allowed = False
+    assert (await policy.invoke(exact, role=Role.OPERATOR)).status is CapabilityStatus.DENIED
+    policy.allowed = True
+    for changed in (
+        exact.model_copy(update={'tenant_id': uuid4()}),
+        exact.model_copy(update={'run_id': uuid4()}),
+        exact.model_copy(update={'user_id': uuid4()}),
+        exact.model_copy(update={'agent_id': 'other_agent'}),
+        exact.model_copy(update={'idempotency_key': 'other-action'}),
+        exact.model_copy(update={'resource': 'workspace/current/project-verification'}),
+        exact.model_copy(update={'arguments': {**exact.arguments, 'recipe_sha256': '0' * 64}}),
+    ):
+        assert (await policy.invoke(changed, role=Role.OPERATOR)).status is CapabilityStatus.DENIED
+    assert (await policy.invoke(exact, role=Role.VIEWER)).status is CapabilityStatus.DENIED
+    assert not policy.grants and not policy.requests
+    assert not await policy.scope_approved(context.tenant_id, context.run_id, scope)
+    assert (await policy.invoke(exact, role=Role.OPERATOR)).status is CapabilityStatus.ALLOWED
+    assert policy.requests == [exact] and policy.grants == {scope}
+    assert await policy.scope_approved(context.tenant_id, context.run_id, scope)
+    assert not await policy.scope_approved(uuid4(), context.run_id, scope)
+    assert not await policy.scope_approved(context.tenant_id, uuid4(), scope)
+    assert not await policy.scope_approved(context.tenant_id, context.run_id, 'generic-command-grant')
+    assert not client.supply_ids and not client.calls
 
 
 @pytest.mark.parametrize('point', ['plan', 'supply'])
