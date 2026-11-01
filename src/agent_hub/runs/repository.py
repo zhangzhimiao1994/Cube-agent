@@ -4397,8 +4397,11 @@ def _public_plugin_approval_events(
                 resolution_scope_resource,
             )
 
+            # SQL drivers can return UUID subclasses; use the same canonical
+            # identities as _record before entering the strict scope validator.
             resolution_resource = resolution_scope_resource(approval.payload.get('approval_scope'),
-                tenant_id=run.tenant_id, user_id=run.actor_id, run_id=run.id)
+                tenant_id=_database_uuid(run.tenant_id), user_id=_database_uuid(run.actor_id),
+                run_id=_database_uuid(run.id))
             if resolution_resource is not None and resolution_binding_matches(RunRepository._record(run),
                     approval.payload.get('python_resolution_binding'), approval.payload.get('approval_scope')):
                 public_binding.update({'capability': 'command', 'operation': 'run',
