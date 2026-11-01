@@ -10,6 +10,10 @@ import pytest
 
 from agent_hub.capabilities.python_project_lifecycle import PythonProjectTerminalHook
 from agent_hub.domain.runs import RunStatus
+from tests.unit.capabilities.capability_lifecycle_typed_fixture import (
+    UnusedContextReader,
+    UnusedReleaser,
+)
 from tests.unit.capabilities.test_python_project_lifecycle import (
     Rows,
     Session,
@@ -40,7 +44,7 @@ def hook_for(session: Session, *, refs: Any = None, inv: Any = None, fail_once: 
         async def run_transaction(self) -> Any:
             return session
 
-    class OriginalReader:
+    class OriginalReader(UnusedContextReader):
         async def python_original_context(self, *args: Any) -> Any:
             raise AssertionError('generated history must never select original context')
 
@@ -52,7 +56,7 @@ def hook_for(session: Session, *, refs: Any = None, inv: Any = None, fail_once: 
             return SimpleNamespace(invocation=inv or invocation(),
                 environment_references=(reference(),) if refs is None else refs)
 
-    class Releaser:
+    class Releaser(UnusedReleaser):
         async def release_completed(self, item: Any, *, expected_environment: Any) -> Any:
             assert session.open and item.install_allowed is False
             assert item.execution_id != invocation().execution_id

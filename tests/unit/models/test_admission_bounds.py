@@ -1,13 +1,14 @@
 """Pure reservation math and private logical request freezing (no transport)."""
 
 import hashlib
-import importlib
 import json
 from dataclasses import fields, replace
 from decimal import Decimal, localcontext
+from typing import Never, Unpack
 
 import pytest
 
+from agent_hub.models.admission_bounds import AdmissionBounds, TrustedContextBound
 from agent_hub.models.native_messages import NativeAssistantMessage, NativeToolCall
 from agent_hub.models.types import (
     Deployment,
@@ -18,13 +19,22 @@ from agent_hub.models.types import (
     ToolDefinition,
     model_message_payload,
 )
+from tests.unit.models.admission_bounds_typed_fixture import (
+    BoundsAPI,
+    DeploymentOverrides,
+    MutableEnumSchema,
+    RequestOverrides,
+    ReserveOverrides,
+)
 
 
-def api():
-    return importlib.import_module("agent_hub.models.admission_bounds")
+def api() -> BoundsAPI:
+    from agent_hub.models import admission_bounds
+
+    return admission_bounds
 
 
-def deployment(**changes):
+def deployment(**changes: Unpack[DeploymentOverrides]) -> Deployment:
     return replace(
         Deployment(
             id="resolved",
@@ -37,31 +47,36 @@ def deployment(**changes):
     )
 
 
-def request(**changes):
+def request(**changes: Unpack[RequestOverrides]) -> ModelRequest:
     return replace(
         ModelRequest("main", (ModelMessage("user", "私密 prompt"),), max_output_tokens=16),
         **changes,
     )
 
 
-def trust(d):
+def trust(d: Deployment) -> TrustedContextBound:
+    assert d.context_window_tokens is not None
     return api().TrustedContextBound(
         d.id, d.logical_model, d.provider_model, d.context_window_tokens
     )
 
 
-def reserve(d=None, r=None, **kwargs):
+def reserve(
+    d: Deployment | None = None, r: ModelRequest | None = None,
+    **kwargs: Unpack[ReserveOverrides],
+) -> AdmissionBounds:
     d = d or deployment()
     return api().compute_admission_bounds(d, r or request(), trusted_context=trust(d), **kwargs)
 
 
-def rich_request():
+def rich_request() -> ModelRequest:
     native = NativeAssistantMessage(
         "resolved",
         "private native",
         (NativeToolCall("call-1", "lookup", '{"嵌套":{"x":[1,true]}}'),),
         "hidden reasoning",
     )
+    assert native.content is not None
     return request(
         messages=(
             ModelMessage(
@@ -85,7 +100,7 @@ def rich_request():
             "Verdict",
             {
                 "type": "object",
-                "properties": {"a": {"enum": ["私密", "x"]}},
+                "properties": {"a": {"enum": ("私密", "x")}},
             },
         ),
         tools=(
@@ -114,7 +129,9 @@ def rich_request():
         (10_000_000, "0", "0", "0.000000"),
     ],
 )
-def test_context_is_total_hold_and_cost_rounds_up(ctx, inp, out, expected):
+def test_context_is_total_hold_and_cost_rounds_up(
+    ctx: int, inp: str, out: str, expected: str,
+) -> None:
     d = deployment(
         context_window_tokens=ctx,
         input_per_million_usd=Decimal(inp),
@@ -128,7 +145,7 @@ def test_context_is_total_hold_and_cost_rounds_up(ctx, inp, out, expected):
     assert b.known_zero is (inp == "0" and out == "0")
 
 
-def test_missing_trust_is_unsupported_and_private():
+def test_missing_trust_is_unsupported_and_private() -> None:
     with pytest.raises(api().UnsupportedAdmissionBounds, match="^admission bounds unsupported$"):
         api().compute_admission_bounds(deployment(), request())
 
@@ -155,7 +172,7 @@ def test_missing_trust_is_unsupported_and_private():
         ("max_output_tokens", 0),
     ],
 )
-def test_revalidates_tampered_deployment_without_io(field, bad):
+def test_revalidates_tampered_deployment_without_io(field: str, bad: object) -> None:
     d = deployment()
     t = trust(d)
     object.__setattr__(d, field, bad)
@@ -165,19 +182,19 @@ def test_revalidates_tampered_deployment_without_io(field, bad):
         api().compute_admission_bounds(d, request(), trusted_context=t)
 
 
-def test_missing_prices_are_unknown_even_when_trust_is_present():
+def test_missing_prices_are_unknown_even_when_trust_is_present() -> None:
     d = deployment(input_per_million_usd=None, output_per_million_usd=None)
     with pytest.raises(api().UnsupportedAdmissionBounds):
         reserve(d)
 
 
-def test_cost_above_dao_ceiling_rejected():
+def test_cost_above_dao_ceiling_rejected() -> None:
     with pytest.raises(ValueError):
         reserve(deployment(context_window_tokens=1_000_001, input_per_million_usd=Decimal(1000000)))
 
 
 @pytest.mark.parametrize("limit", [8, 15])
-def test_selected_effective_request_must_fit_context_and_deployment_output(limit):
+def test_selected_effective_request_must_fit_context_and_deployment_output(limit: int) -> None:
     d = deployment(context_window_tokens=limit)
     with pytest.raises(ValueError):
         reserve(d)
@@ -190,7 +207,7 @@ def test_selected_effective_request_must_fit_context_and_deployment_output(limit
 @pytest.mark.parametrize(
     "field", ["deployment_id", "logical_model", "provider_model", "total_tokens"]
 )
-def test_trust_must_match_resolved_deployment_and_be_revalidated(field):
+def test_trust_must_match_resolved_deployment_and_be_revalidated(field: str) -> None:
     d = deployment()
     t = trust(d)
     object.__setattr__(t, field, "private changed" if field != "total_tokens" else 4)
@@ -198,7 +215,7 @@ def test_trust_must_match_resolved_deployment_and_be_revalidated(field):
         api().compute_admission_bounds(d, request(), trusted_context=t)
 
 
-def test_effective_rates_override_config_and_are_owned_copies():
+def test_effective_rates_override_config_and_are_owned_copies() -> None:
     d = deployment(input_per_million_usd=None, output_per_million_usd=None)
     p = api().KnownPricing(Decimal(9), Decimal(2))
     b = reserve(d, effective_pricing=p)
@@ -216,7 +233,7 @@ def test_effective_rates_override_config_and_are_owned_copies():
     assert b.pricing().output_per_million_usd == Decimal(2)
 
 
-def test_fingerprint_is_full_sorted_compact_utf8_logical_json():
+def test_fingerprint_is_full_sorted_compact_utf8_logical_json() -> None:
     r = rich_request()
     frozen = api().freeze_model_request(r)
     encoded = frozen.canonical_bytes()
@@ -256,7 +273,7 @@ def test_fingerprint_is_full_sorted_compact_utf8_logical_json():
         },
     ],
 )
-def test_each_request_scalar_changes_digest(change):
+def test_each_request_scalar_changes_digest(change: RequestOverrides) -> None:
     r = rich_request()
     assert (
         api().freeze_model_request(r).digest
@@ -283,7 +300,7 @@ def test_each_request_scalar_changes_digest(change):
         "parameters",
     ],
 )
-def test_nested_semantic_changes_change_digest(target):
+def test_nested_semantic_changes_change_digest(target: str) -> None:
     r = rich_request()
     before = api().freeze_model_request(r).digest
     if target == "text":
@@ -301,6 +318,7 @@ def test_nested_semantic_changes_change_digest(target):
         "call_name",
     }:
         n = r.messages[1].native_assistant
+        assert n is not None
         if target == "native_content":
             object.__setattr__(n, "content", "changed")
             object.__setattr__(r.messages[1], "content", "changed")
@@ -330,7 +348,7 @@ def test_nested_semantic_changes_change_digest(target):
     assert api().freeze_model_request(r).digest != before
 
 
-def test_native_continuation_and_tool_call_id_do_not_collapse_into_wire_only_hash():
+def test_native_continuation_and_tool_call_id_do_not_collapse_into_wire_only_hash() -> None:
     plain = request()
     assert (
         api().freeze_model_request(plain).digest
@@ -342,16 +360,19 @@ def test_native_continuation_and_tool_call_id_do_not_collapse_into_wire_only_has
         api().freeze_model_request(r)
 
 
-def test_freeze_rebuilds_all_nested_objects_and_each_read_is_independent():
+def test_freeze_rebuilds_all_nested_objects_and_each_read_is_independent() -> None:
     r = rich_request()
-    schema = {"type": "object", "properties": {"x": {"enum": ["before"]}}}
-    params = {"type": "object", "properties": {"q": {"enum": ["before"]}}}
+    schema: MutableEnumSchema = {"type": "object", "properties": {"x": {"enum": ["before"]}}}
+    params: MutableEnumSchema = {"type": "object", "properties": {"q": {"enum": ["before"]}}}
     object.__setattr__(r.response_schema, "schema", schema)
     object.__setattr__(r.tools[0], "parameters", params)
     frozen = api().freeze_model_request(r)
     before = frozen.digest
     a = frozen.request()
     b = frozen.request()
+    assert a.messages[1].native_assistant is not None
+    assert b.messages[1].native_assistant is not None
+    assert r.messages[1].native_assistant is not None
     assert a is not b and a.messages[0] is not b.messages[0]
     assert a.response_schema is not b.response_schema
     assert a.tools[0] is not b.tools[0]
@@ -370,21 +391,20 @@ def test_freeze_rebuilds_all_nested_objects_and_each_read_is_independent():
     assert frozen.digest == before
     assert frozen.request() == b
     assert frozen.request().max_output_tokens == 16
-    assert (
-        frozen.request().messages[1].native_assistant.tool_calls[0].arguments
-        == '{"嵌套":{"x":[1,true]}}'
-    )
+    restored = frozen.request()
+    assert restored.messages[1].native_assistant is not None
+    assert restored.messages[1].native_assistant.tool_calls[0].arguments == '{"嵌套":{"x":[1,true]}}'
 
 
 @pytest.mark.parametrize("bad", [float("nan"), float("inf"), {1: "bad"}, object(), "\ud800"])
-def test_nonfinite_nonjson_and_invalid_utf8_fail_closed_with_private_error(bad):
+def test_nonfinite_nonjson_and_invalid_utf8_fail_closed_with_private_error(bad: object) -> None:
     r = rich_request()
     object.__setattr__(r.tools[0], "parameters", {"private-key": bad})
     with pytest.raises(ValueError, match="^invalid model request snapshot$"):
         api().freeze_model_request(r)
 
 
-def test_unknown_native_types_and_hidden_state_fail_closed():
+def test_unknown_native_types_and_hidden_state_fail_closed() -> None:
     class ExtraNative(NativeAssistantMessage):
         pass
 
@@ -404,7 +424,7 @@ def test_unknown_native_types_and_hidden_state_fail_closed():
         api().freeze_model_request(r)
 
 
-def test_private_repr_contains_no_prompt_native_tools_schema_url_or_secret():
+def test_private_repr_contains_no_prompt_native_tools_schema_url_or_secret() -> None:
     r = rich_request()
     f = api().freeze_model_request(r)
     d = deployment(api_base="https://private-provider.invalid/v1", secret_ref="private-secret")
@@ -435,14 +455,14 @@ def test_private_repr_contains_no_prompt_native_tools_schema_url_or_secret():
         True,
     ],
 )
-def test_effective_rates_revalidated_even_after_frozen_dataclass_tamper(bad):
+def test_effective_rates_revalidated_even_after_frozen_dataclass_tamper(bad: object) -> None:
     p = api().KnownPricing(Decimal(1), Decimal(2))
     object.__setattr__(p, "output_per_million_usd", bad)
     with pytest.raises(ValueError, match="^invalid admission bounds$"):
         reserve(effective_pricing=p)
 
 
-def test_known_zero_effective_override_is_explicit_and_no_provider_config_enters_digest():
+def test_known_zero_effective_override_is_explicit_and_no_provider_config_enters_digest() -> None:
     r = rich_request()
     d = deployment()
     b = reserve(d, r, effective_pricing=api().KnownPricing(Decimal(0), Decimal(0)))
@@ -459,7 +479,7 @@ def test_known_zero_effective_override_is_explicit_and_no_provider_config_enters
     assert b.request().tools[0].description == "private description"
 
 
-def test_key_insertion_and_capability_order_do_not_change_logical_fingerprint():
+def test_key_insertion_and_capability_order_do_not_change_logical_fingerprint() -> None:
     a = rich_request()
     b = rich_request()
     object.__setattr__(
@@ -481,20 +501,20 @@ def test_key_insertion_and_capability_order_do_not_change_logical_fingerprint():
     assert api().freeze_model_request(a).digest == api().freeze_model_request(b).digest
 
 
-def test_invalid_selected_request_and_cyclic_json_fail_closed():
+def test_invalid_selected_request_and_cyclic_json_fail_closed() -> None:
     r = request()
     object.__setattr__(r, "max_output_tokens", True)
     with pytest.raises(ValueError, match="^invalid admission bounds$"):
         reserve(r=r)
     r = rich_request()
-    cycle = {}
+    cycle: dict[str, object] = {}
     cycle["self"] = cycle
     object.__setattr__(r.response_schema, "schema", cycle)
     with pytest.raises(ValueError, match="^invalid model request snapshot$"):
         api().freeze_model_request(r)
 
 
-def test_success_and_unsupported_are_pure_zero_io(monkeypatch):
+def test_success_and_unsupported_are_pure_zero_io(monkeypatch: pytest.MonkeyPatch) -> None:
     import builtins
     import io
     import socket
@@ -503,7 +523,7 @@ def test_success_and_unsupported_are_pure_zero_io(monkeypatch):
     d, r = deployment(), rich_request()
     t = trust(d)
 
-    def forbidden(*args, **kwargs):
+    def forbidden(*args: object, **kwargs: object) -> Never:
         pytest.fail("pure helper performed I/O")
 
     with monkeypatch.context() as m:
@@ -521,7 +541,7 @@ def test_success_and_unsupported_are_pure_zero_io(monkeypatch):
             helper.compute_admission_bounds(d, r, trusted_context=t)
 
 
-def test_selected_gateway_clamp_is_validated_without_mutating_logical_request():
+def test_selected_gateway_clamp_is_validated_without_mutating_logical_request() -> None:
     from agent_hub.models.gateway import ModelGateway
 
     d = deployment(max_output_tokens=32)

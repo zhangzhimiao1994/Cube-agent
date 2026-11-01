@@ -11,7 +11,7 @@ import pytest
 
 from agent_hub.domain.runs import TaskMode
 from agent_hub.runs.approval_checkpoint import checkpoint_waits_for_approval
-from agent_hub.runtime.contracts import JsonValue, RuntimeCheckpoint
+from agent_hub.runtime.contracts import JsonValue, RuntimeCheckpoint, _freeze_json
 
 APPROVAL = 'approval_verify_once'
 VERSION = '2'
@@ -176,7 +176,7 @@ def test_hybrid_autogen_remains_unsupported(version: str, stage: int) -> None:
     child = checkpoint()
     outer = RuntimeCheckpoint(id=uuid4(), runtime_type='hybrid', runtime_version=version,
         run_id=RUN, tenant_id=TENANT, mode=TaskMode.HYBRID,
-        state={'terminal': False, 'next_stage': stage, 'child_checkpoint': child.to_payload()})
+        state={'terminal': False, 'next_stage': stage, 'child_checkpoint': _freeze_json(child.to_payload())})
     assert not checkpoint_waits_for_approval(outer, APPROVAL)
 
 

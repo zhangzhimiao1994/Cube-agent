@@ -3,8 +3,9 @@
 import asyncio
 import json
 import time
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, replace
-from datetime import timedelta
+from datetime import datetime, timedelta
 from decimal import Decimal
 from uuid import uuid4
 
@@ -12,6 +13,7 @@ import httpx
 import pytest
 import pytest_asyncio
 from sqlalchemy import delete, func, select
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from agent_hub.auth.models import AuthenticatedPrincipal
 from agent_hub.capabilities.model_review import ModelApprovalReviewService, _LiveReviewContext
@@ -37,10 +39,12 @@ from agent_hub.runs.authorization import _capture_authenticated_input, _persist_
 from tests.integration.capabilities.test_review_repository import (
     database_url as database_url,  # noqa: PLC0414 - imported pytest fixture
 )
+from tests.integration.models.run_admission_typed_fixture import Storage
 from tests.integration.models.test_run_admission import prepare
 from tests.integration.models.test_run_admission import (
     storage as storage,  # noqa: PLC0414 - imported pytest fixture
 )
+from tests.integration.runtime.dynamic_physical_typed_fixture import mapping, present
 from tests.unit.capabilities.test_model_review import snapshot, verdict
 from tests.unit.models.test_physical_budget import gateway, logical_request, response
 
@@ -49,14 +53,14 @@ pytestmark = [pytest.mark.integration, pytest.mark.asyncio(loop_scope="module")]
 
 @dataclass
 class Composition:
-    factory: object
+    factory: async_sessionmaker[AsyncSession]
     context: _RunBudgetContext
     primary: Deployment
     reviewer: Deployment
 
 
 @pytest_asyncio.fixture(loop_scope="module")
-async def composition(storage):
+async def composition(storage: Storage) -> AsyncIterator[Composition]:
     factory = storage[0]
     config = ApprovalReviewConfig(
         engine="rules_then_model",
@@ -86,7 +90,7 @@ async def composition(storage):
         row = await session.get(RunRow, binding["run_id"])
         link = await session.get(RunInputAuthorizationRow, binding["run_id"])
         turn = await session.get(RunAuthenticatedInputRow, binding["authorization_turn_id"])
-        evidence = _validated_persisted_input(row, link, turn)
+        evidence = _validated_persisted_input(present(row), link, turn)
     assert evidence is not None
     primary = Deployment(
         id="selected",
@@ -127,11 +131,12 @@ async def composition(storage):
             )
 
 
-async def test_real_primary_review_shared_pool_and_cold_repeated_effect(composition):
+async def test_real_primary_review_shared_pool_and_cold_repeated_effect(composition: Composition) -> None:
     c = composition
-    action, wires = snapshot(c.context), []
+    action = snapshot(c.context)
+    wires: list[httpx.Request] = []
 
-    def handle(req):
+    def handle(req: httpx.Request) -> httpx.Response:
         wires.append(req)
         return httpx.Response(200, json=response(verdict(action)))
 
@@ -146,6 +151,7 @@ async def test_real_primary_review_shared_pool_and_cold_repeated_effect(composit
         )
     assert result.status == "allow" and repeated.status == "needs_human" and len(wires) == 2
     pool = await RunAdmissionRepository(c.factory).get_pool(c.context.tenant_id, c.context.run_id)
+    assert pool is not None
     assert pool.tokens_remaining == 14990 and pool.review_count_charged == 1
     async with c.factory() as session:
         rows = (
@@ -160,22 +166,23 @@ async def test_real_primary_review_shared_pool_and_cold_repeated_effect(composit
     assert len({row.physical_transport_id for row in rows}) == 2
     repository = ReviewRepository(c.factory)
     async with c.factory() as session:
-        row = await session.get(RunReviewIntentRow, result.review_id)
-        attempt = await session.get(RunAdmissionAttemptRow, row.attempt_id)
-        receipt = json.loads(row.private_receipt)
+        row = await session.get(RunReviewIntentRow, present(result.review_id))
+        assert row is not None
+        attempt = present(await session.get(RunAdmissionAttemptRow, row.attempt_id))
+        receipt = json.loads(present(row.private_receipt))
         assert receipt["accounting_receipt_sha256"] == attempt.receipt_sha256
-        assert receipt["evidence"]["usage"] == attempt.receipt["usage"]
+        assert receipt["evidence"]["usage"] == mapping(present(attempt.receipt))["usage"]
     current = _CurrentReviewBinding(action, c.context.config, c.context.lease)
     assert await repository.consume_permit(
         tenant_id=c.context.tenant_id,
         run_id=c.context.run_id,
-        review_id=result.review_id,
+        review_id=present(result.review_id),
         current_binding=current,
     )
     assert not await repository.consume_permit(
         tenant_id=c.context.tenant_id,
         run_id=c.context.run_id,
-        review_id=result.review_id,
+        review_id=present(result.review_id),
         current_binding=current,
     )
 
@@ -193,11 +200,12 @@ async def test_real_primary_review_shared_pool_and_cold_repeated_effect(composit
         ("protocol", "unknown"),
     ],
 )
-async def test_real_review_receipt_accounting_and_cold_state(composition, kind, expected):
+async def test_real_review_receipt_accounting_and_cold_state(composition: Composition, kind: str, expected: str) -> None:
     c = composition
-    action, wires = snapshot(c.context), []
+    action = snapshot(c.context)
+    wires: list[httpx.Request] = []
 
-    def handle(req):
+    def handle(req: httpx.Request) -> httpx.Response:
         wires.append(req)
         if kind == "protocol":
             return httpx.Response(
@@ -218,7 +226,9 @@ async def test_real_review_receipt_accounting_and_cold_state(composition, kind, 
         )
         body = response(verdict(action, decision), kind not in ("missing", "deny_missing"))
         if kind == "malformed":
-            body["usage"]["total_tokens"] = 99
+            usage = body["usage"]
+            assert isinstance(usage, dict)
+            usage["total_tokens"] = 99
         if kind == "overbound":
             body["usage"] = {"prompt_tokens": 10001, "completion_tokens": 3, "total_tokens": 10004}
         return httpx.Response(200, json=body)
@@ -236,24 +246,27 @@ async def test_real_review_receipt_accounting_and_cold_state(composition, kind, 
             assert repeated.status == "unknown" and len(wires) == 1
     assert result.status == expected and len(wires) == 1
     cold = await ReviewRepository(c.factory).get(
-        c.context.tenant_id, c.context.run_id, result.review_id
+        c.context.tenant_id, c.context.run_id, present(result.review_id)
     )
+    assert cold is not None
     assert cold.status == expected
     budget = RunAdmissionRepository(c.factory)
     pool = await budget.get_pool(c.context.tenant_id, c.context.run_id)
+    assert pool is not None
     attempt = await budget.get_attempt(c.context.tenant_id, c.context.run_id, cold.attempt_id)
+    assert attempt is not None
     assert pool.review_count_charged == 1
     assert pool.token_charged == (5 if kind in ("allow", "deny", "needs_human") else 10000)
     assert pool.closed == (kind == "overbound")
     if kind == "overbound":
-        assert attempt.state == "invalid" and b"10004" in attempt.receipt_bytes
+        assert attempt.state == "invalid" and b"10004" in present(attempt.receipt_bytes)
 
 
-async def test_primary_unknown_debit_leaves_insufficient_original_balance_for_review(composition):
+async def test_primary_unknown_debit_leaves_insufficient_original_balance_for_review(composition: Composition) -> None:
     c = composition
-    wires = []
+    wires: list[httpx.Request] = []
 
-    def handle(req):
+    def handle(req: httpx.Request) -> httpx.Response:
         wires.append(req)
         return httpx.Response(200, json=response(usage=False))
 
@@ -266,17 +279,19 @@ async def test_primary_unknown_debit_leaves_insufficient_original_balance_for_re
         )
     assert result.status == "needs_human" and len(wires) == 1
     pool = await RunAdmissionRepository(c.factory).get_pool(c.context.tenant_id, c.context.run_id)
+    assert pool is not None
     assert pool.tokens_remaining == 5000 and pool.review_count_charged == 0
 
 
-async def test_cancelled_review_cold_unknown_cannot_pay_again(composition):
+async def test_cancelled_review_cold_unknown_cannot_pay_again(composition: Composition) -> None:
     c = composition
-    wires, entered = [], asyncio.Event()
+    wires: list[httpx.Request] = []
+    entered = asyncio.Event()
 
-    async def handle(req):
+    async def handle(req: httpx.Request) -> httpx.Response:
         wires.append(req)
         entered.set()
-        await asyncio.Future()
+        return await asyncio.Future[httpx.Response]()
 
     gw, _ = gateway([c.primary, c.reviewer], handle)
     action = snapshot(c.context)
@@ -294,15 +309,16 @@ async def test_cancelled_review_cold_unknown_cannot_pay_again(composition):
         )
     assert result.status == "unknown" and len(wires) == 1
     pool = await RunAdmissionRepository(c.factory).get_pool(c.context.tenant_id, c.context.run_id)
+    assert pool is not None
     assert pool.token_charged == 10000 and pool.review_count_charged == 1
 
 
-async def test_concurrent_primary_hold_blocks_review_before_extra_network(composition):
+async def test_concurrent_primary_hold_blocks_review_before_extra_network(composition: Composition) -> None:
     c = composition
     entered, release = asyncio.Event(), asyncio.Event()
-    wires = []
+    wires: list[httpx.Request] = []
 
-    async def handle(req):
+    async def handle(req: httpx.Request) -> httpx.Response:
         wires.append(req)
         entered.set()
         await release.wait()
@@ -321,11 +337,13 @@ async def test_concurrent_primary_hold_blocks_review_before_extra_network(compos
             pool = await RunAdmissionRepository(c.factory).get_pool(
                 c.context.tenant_id, c.context.run_id
             )
+            assert pool is not None
             assert pool.token_charged == 10000 and pool.tokens_remaining == 5000
         finally:
             release.set()
             await primary
     pool = await RunAdmissionRepository(c.factory).get_pool(c.context.tenant_id, c.context.run_id)
+    assert pool is not None
     assert pool.token_charged == 5 and pool.review_count_charged == 0
 
 
@@ -333,14 +351,15 @@ async def test_concurrent_primary_hold_blocks_review_before_extra_network(compos
     "invalid", ["lease_expired", "lease_replaced", "run_cancelled", "turn_replaced"]
 )
 async def test_post_issue_stale_fence_refuses_new_allow_after_known_accounting(
-    composition, invalid
-):
+    composition: Composition, invalid: str
+) -> None:
     """Commit real state changes while actual guarded HTTP is already issued."""
     c = composition
-    action, wires = snapshot(c.context), []
+    action = snapshot(c.context)
+    wires: list[httpx.Request] = []
     entered, release = asyncio.Event(), asyncio.Event()
 
-    async def handle(req):
+    async def handle(req: httpx.Request) -> httpx.Response:
         wires.append(req)
         entered.set()
         await release.wait()
@@ -366,7 +385,9 @@ async def test_post_issue_stale_fence_refuses_new_allow_after_known_accounting(
                     )
                 ).one()
                 assert issued.state == "issued" and issued.physical_transport_id is not None
+                assert row is not None
                 now = await session.scalar(select(func.clock_timestamp()))
+                assert isinstance(now, datetime)
                 if invalid == "lease_expired":
                     row.worker_lease_expires_at = now - timedelta(seconds=1)
                 elif invalid == "lease_replaced":
@@ -404,14 +425,14 @@ async def test_post_issue_stale_fence_refuses_new_allow_after_known_accounting(
                         )
                     )
                 ).one()
-                attempt = await session.get(RunAdmissionAttemptRow, intent.attempt_id)
+                attempt = present(await session.get(RunAdmissionAttemptRow, intent.attempt_id))
                 # Late accounting remains committed; no stale fence is put
                 # inside finish, and its known usage/receipt is not rolled back.
                 assert intent.status == "allow" and attempt.state == "completed"
-                receipt = json.loads(intent.private_receipt)
+                receipt = json.loads(present(intent.private_receipt))
                 assert receipt["accounting_receipt_sha256"] == attempt.receipt_sha256
-                assert receipt["evidence"]["usage"] == attempt.receipt["usage"]
-                assert attempt.receipt["usage"] == {
+                assert receipt["evidence"]["usage"] == mapping(present(attempt.receipt))["usage"]
+                assert mapping(present(attempt.receipt))["usage"] == {
                     "prompt_tokens": 2,
                     "completion_tokens": 3,
                     "total_tokens": 5,
@@ -425,6 +446,7 @@ async def test_post_issue_stale_fence_refuses_new_allow_after_known_accounting(
             assert repeated.status == "needs_human" and len(wires) == 1
             cold = RunAdmissionRepository(c.factory)
             pool = await cold.get_pool(c.context.tenant_id, c.context.run_id)
+            assert pool is not None
             assert pool.token_charged == 5 and pool.review_count_charged == 1
             assert pool.original_deadline == c.context._pool.original_deadline
             async with c.factory() as session:

@@ -52,8 +52,8 @@ def test_actual_factories_consume_validated_domain_only_for_new_policy(
         capacity_factory=cast(Any, object()), transport=cast(Any, object()), role_planner=Capture())
     context = TaskContext(run_id=uuid4(), tenant_id=uuid4(), actor_id=uuid4(), actor_role=Role.OPERATOR,
         mode=mode, request='Add CSV export.', routing_decision={
-            'role_planning_intent_version': 3, 'direct_model': 'fixture', 'allowed_models': ['fixture'],
-            'sandbox_profile': 'read_only', 'requested_permissions': ['workspace.read'],
+            'role_planning_intent_version': 3, 'direct_model': 'fixture', 'allowed_models': ('fixture',),
+            'sandbox_profile': 'read_only', 'requested_permissions': ('workspace.read',),
         })
     before = context.to_payload()
     pending = runtime._runtime_for(context)

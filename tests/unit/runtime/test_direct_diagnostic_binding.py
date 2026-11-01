@@ -8,6 +8,7 @@ import pytest
 
 from agent_hub.runtime.action_direct import _binding, _json
 from agent_hub.runtime.engineering_admission import _fingerprint
+from tests.unit.runs.reviewed_report_revision_typed_fixture import string_value
 from tests.unit.runtime.test_direct_project_verification import Model, context, runner
 
 
@@ -39,5 +40,5 @@ def test_direct_prompt_advertises_only_selected_diagnostic_read_protocol(
     runtime, _, _, _ = runner(tmp_path, ctx, Model())
     prompt = runtime._build_prompt(ctx)
     assert prompt.messages is not None
-    text = '\n'.join(message.content for message in prompt.messages)
+    text = '\n'.join(string_value(message.content) for message in prompt.messages)
     assert ('read_paths' in text) is (type(version) is int and version == 1)

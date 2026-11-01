@@ -1,10 +1,9 @@
 """Policy pauses are known pre-execution boundaries, never unknown outcomes."""
 import copy
 import json
-from collections.abc import AsyncGenerator, Mapping
+from collections.abc import Mapping
 from dataclasses import replace
 from decimal import Decimal
-from typing import Any, cast
 from uuid import UUID
 
 import pytest
@@ -19,9 +18,23 @@ from agent_hub.runtime.autogen.adapter import (
     AutoGenDiscussionRuntime,
     GatewayCapabilityTool,
     RuntimeExecutionError,
+    _DiscussionDurability,
     _pending_approval_call,
+    _ToolRecord,
 )
-from agent_hub.runtime.contracts import Artifact, EventKind, RunEvent
+from agent_hub.runtime.contracts import Artifact, EventKind, JsonValue, TaskContext
+from tests.unit.runs.project_auto_repair_typed_fixture import (
+    json_map,
+    ledger,
+    mapping,
+    string,
+)
+from tests.unit.runs.reviewed_report_revision_typed_fixture import object_array, object_map
+from tests.unit.runtime.approval_failure_trace_typed_fixture import (
+    HarnessOnlyExecution,
+    approval_result,
+    event_stream,
+)
 from tests.unit.runtime.autogen.test_model_tool_bridge import _durability
 from tests.unit.runtime.autogen.test_ordered_tool_calls import (
     ReplayPolicy,
@@ -36,12 +49,12 @@ APPROVAL = 'approval_verified_action'
 
 
 class ApprovalHarness:
-    def __init__(self, context: Any) -> None:
+    def __init__(self, context: TaskContext) -> None:
         self.context = context
         self.approved = False
         self.calls: list[HarnessToolCallRequest] = []
         self.executions = 0
-        self.overrides: dict[str, Any] = {}
+        self.overrides: dict[str, JsonValue] = {}
 
     async def invoke(self, tenant_id: UUID, request: HarnessToolCallRequest, *,
                      user_id: UUID | None = None, role: Role | None = None) -> HarnessToolCallResult:
@@ -49,23 +62,19 @@ class ApprovalHarness:
         assert user_id == self.context.actor_id and role == self.context.actor_role
         self.calls.append(request)
         if not self.approved:
-            return HarnessToolCallResult(**{
-                'call_id': request.call_id, 'tool_name': request.tool_name, 'status': 'failed',
-                'failure_reason': 'capability requires approval', 'payload': {'approval_id': APPROVAL},
-                **self.overrides,
-            })
+            return approval_result(request, APPROVAL, self.overrides)
         self.executions += 1
         return HarnessToolCallResult(call_id=request.call_id, tool_name=request.tool_name,
             status='succeeded', payload={'summary': 'verified'})
 
 
-def tool(durable: Any, backend: ApprovalHarness, records: list[Any], *,
+def tool(durable: _DiscussionDurability, backend: ApprovalHarness, records: list[_ToolRecord], *,
          name: str = 'workspace.write_text', replay_safe: bool = False) -> GatewayCapabilityTool:
-    class Policy(ReplayPolicy):
-        def is_replay_safe(self, _: str) -> bool:
+    class Policy(ReplayPolicy, HarnessOnlyExecution):
+        def is_replay_safe(self, name: str) -> bool:
             return self.replay_safe
     ctx = backend.context
-    return GatewayCapabilityTool(cast(Any, Policy(replay_safe)), tenant_id=ctx.tenant_id,
+    return GatewayCapabilityTool(Policy(replay_safe), tenant_id=ctx.tenant_id,
         run_id=ctx.run_id, actor='implementer', name=name, records=records,
         durability=durable, harness_tool_gateway=backend, user_id=ctx.actor_id,
         role=ctx.actor_role, server_context=ctx, sandbox_profile='workspace_write',
@@ -76,7 +85,7 @@ def tool(durable: Any, backend: ApprovalHarness, records: list[Any], *,
 async def test_approval_pause_can_resume_once_even_for_nonreplayable_effect(name: str) -> None:
     durable = _durability()
     backend = ApprovalHarness(context_for(durable))
-    records: list[Any] = []
+    records: list[_ToolRecord] = []
     args = arguments(0) if name == 'workspace.write_text' else {}
     with pytest.raises(RuntimeExecutionError):
         await tool(durable, backend, records, name=name).run_json(
@@ -107,7 +116,7 @@ async def test_approval_pause_can_resume_once_even_for_nonreplayable_effect(name
     {'payload': {'approval_id': 'not a valid id'}}, {'payload': {'approval_id': APPROVAL, 'extra': True}},
     {'failure_reason': 'capability denied'},
 ])
-async def test_malformed_or_denied_result_cannot_become_resumable(override: dict[str, Any]) -> None:
+async def test_malformed_or_denied_result_cannot_become_resumable(override: dict[str, JsonValue]) -> None:
     durable = _durability()
     backend = ApprovalHarness(context_for(durable))
     backend.overrides = override
@@ -129,7 +138,7 @@ async def test_unapproved_resumption_rechecks_policy_without_executing() -> None
     assert restored.tool_entries[0]['status'] == 'waiting_approval'
 
 
-async def test_waiting_checkpoint_failure_rolls_back_to_uncertain_not_resumable() -> None:
+async def test_waiting_checkpoint_failure_rolls_back_to_uncertain_not_resumable(monkeypatch: pytest.MonkeyPatch) -> None:
     durable = _durability()
     backend = ApprovalHarness(context_for(durable))
     original = durable._checkpoint
@@ -142,7 +151,7 @@ async def test_waiting_checkpoint_failure_rolls_back_to_uncertain_not_resumable(
             raise RuntimeError('checkpoint storage unavailable')
         await original()
 
-    durable._checkpoint = checkpoint
+    monkeypatch.setattr(durable, '_checkpoint', checkpoint)
     with pytest.raises(RuntimeError):
         await tool(durable, backend, []).run_json(arguments(0), CancellationToken(), call_id='write')
     assert count == 2
@@ -155,7 +164,7 @@ async def test_waiting_checkpoint_failure_rolls_back_to_uncertain_not_resumable(
     ('approval_id', ''), ('replay_safe', 1), ('position', True),
     ('idempotency_key', 'a' * 64), ('artifact_id', 'unexpected'),
 ])
-async def test_tampered_waiting_row_never_crosses_policy(field: str, value: object) -> None:
+async def test_tampered_waiting_row_never_crosses_policy(field: str, value: JsonValue) -> None:
     durable = _durability()
     backend = ApprovalHarness(context_for(durable))
     with pytest.raises(RuntimeExecutionError):
@@ -171,7 +180,7 @@ async def test_tampered_waiting_row_never_crosses_policy(field: str, value: obje
     assert len(backend.calls) == 1 and backend.executions == 0
 
 
-class RealDiscussionApproval(Journey):
+class RealDiscussionApproval(Journey, HarnessOnlyExecution):
     def __init__(self) -> None:
         super().__init__()
         self.approved = False
@@ -223,7 +232,7 @@ async def test_actual_autogen_checkpoint_cold_resume_without_replaying_model_or_
     restored = AutoGenDiscussionRuntime(case, case.runner._plan, capability_gateway=case,
         harness_tool_gateway=case, artifact_repository=case.runner._repository)
     await restored.restore_checkpoint(saved)
-    stream = cast(AsyncGenerator[RunEvent, None], restored.run(case.context.model_copy(update={'checkpoint': saved})))
+    stream = event_stream( restored.run(case.context.model_copy(update={'checkpoint': saved})))
     resumed = None
     events = []
     try:
@@ -289,17 +298,17 @@ async def test_ordered_batch_approval_at_first_middle_last_and_repeated_position
         assert checkpoint_waits_for_approval(saved, f'approval_batch_{position}'), [
             (event.kind, event.reason) for event in events[-3:]]
         assert case.effects == list(range(position))
-        assert saved.state['approval_batch']['next_index'] == position
+        assert mapping(saved.state['approval_batch'])['next_index'] == position
         case.granted.add(position)
         runner = AutoGenDiscussionRuntime(case, case.runner._plan, capability_gateway=case,
             harness_tool_gateway=case, artifact_repository=case.runner._repository)
         await runner.restore_checkpoint(saved)
-        stream = cast(AsyncGenerator[RunEvent, None], runner.run(case.context.model_copy(update={'checkpoint': saved})))
+        stream = event_stream( runner.run(case.context.model_copy(update={'checkpoint': saved})))
         events = []
         try:
             async for event in stream:
                 events.append(event)
-                if (event.checkpoint is not None and event.checkpoint.state.get('approval_batch', {}).get('next_index') == 3):
+                if (event.checkpoint is not None and mapping(event.checkpoint.state.get('approval_batch', {})).get('next_index') == 3):
                     # Resume once to acknowledge this committed result, but do not
                     # commit the next publication: emulate a crash at that boundary.
                     saved = event.checkpoint
@@ -314,7 +323,7 @@ async def test_ordered_batch_approval_at_first_middle_last_and_repeated_position
     cold = AutoGenDiscussionRuntime(case, case.runner._plan, capability_gateway=case,
         harness_tool_gateway=case, artifact_repository=case.runner._repository)
     await cold.restore_checkpoint(saved)
-    stream = cast(AsyncGenerator[RunEvent, None], cold.run(case.context.model_copy(update={'checkpoint': saved})))
+    stream = event_stream( cold.run(case.context.model_copy(update={'checkpoint': saved})))
     compacted = False
     cold_events = []
     try:
@@ -337,11 +346,11 @@ async def test_cold_restore_after_one_success_ack_keeps_next_batch_approval() ->
     runner = AutoGenDiscussionRuntime(case, case.runner._plan, capability_gateway=case,
         harness_tool_gateway=case, artifact_repository=case.runner._repository)
     await runner.restore_checkpoint(saved)
-    stream = cast(AsyncGenerator[RunEvent, None], runner.run(case.context.model_copy(update={'checkpoint': saved})))
+    stream = event_stream( runner.run(case.context.model_copy(update={'checkpoint': saved})))
     try:
         async for event in stream:
             if (event.checkpoint is not None
-                    and event.checkpoint.state.get('approval_batch', {}).get('next_index') == 1):
+                    and mapping(event.checkpoint.state.get('approval_batch', {})).get('next_index') == 1):
                 saved = event.checkpoint
                 await anext(stream)
                 break
@@ -365,7 +374,7 @@ class FailedBatchCheck(BatchDiscussionApproval):
             return await super().invoke(tenant_id, request, user_id=user_id, role=role)
         self.calls.append(request)
         artifact = draft_artifact(self.context, call=request.call_id)
-        result = artifact.content['result']
+        result = json_map(artifact.content['result'])
         return HarnessToolCallResult(call_id=request.call_id, tool_name=request.tool_name,
             status='failed', failure_reason='generated project draft requires correction',
             payload={'generated_draft_rejection': result['generated_draft_rejection'],
@@ -380,11 +389,11 @@ async def test_failed_check_aborts_bundle_suffix_including_cold_restore_after_fa
     runner = AutoGenDiscussionRuntime(case, case.runner._plan, capability_gateway=case,
         harness_tool_gateway=case, artifact_repository=case.runner._repository)
     await runner.restore_checkpoint(saved)
-    stream = cast(AsyncGenerator[RunEvent, None], runner.run(case.context.model_copy(update={'checkpoint': saved})))
+    stream = event_stream( runner.run(case.context.model_copy(update={'checkpoint': saved})))
     failed = None
     try:
         async for event in stream:
-            if event.checkpoint is not None and event.checkpoint.state.get('approval_batch', {}).get('next_index') == 2:
+            if event.checkpoint is not None and mapping(event.checkpoint.state.get('approval_batch', {})).get('next_index') == 2:
                 failed = event.checkpoint
                 await anext(stream)
                 break
@@ -394,7 +403,7 @@ async def test_failed_check_aborts_bundle_suffix_including_cold_restore_after_fa
     cold = AutoGenDiscussionRuntime(case, case.runner._plan, capability_gateway=case,
         harness_tool_gateway=case, artifact_repository=case.runner._repository)
     await cold.restore_checkpoint(failed)
-    stream = cast(AsyncGenerator[RunEvent, None], cold.run(case.context.model_copy(update={'checkpoint': failed})))
+    stream = event_stream( cold.run(case.context.model_copy(update={'checkpoint': failed})))
     compacted = False
     try:
         async for event in stream:
@@ -416,12 +425,12 @@ async def test_cold_batch_binding_rejects_metadata_corruption_and_unknown_prefix
     artifacts = await case.runner._hydrate_checkpoint(saved, case.context)
     durable = _durability(artifacts=artifacts)
     durable._context_run_id = case.context.run_id
-    durable.tool_entries = [dict(row) for row in saved.state['tool_ledger']]
-    durable.model_entries = [dict(row) for row in saved.state['model_ledger']]
-    durable.approval_batch = dict(saved.state['approval_batch'])
+    durable.tool_entries = list(ledger(saved.state['tool_ledger']))
+    durable.model_entries = list(ledger(saved.state['model_ledger']))
+    durable.approval_batch = dict(json_map(saved.state['approval_batch']))
     entry = durable.model_entries[-1]
-    artifact = durable._artifacts[entry['artifact_id']]
-    content = json.loads(artifact.model_dump_json())['content']
+    artifact = durable._artifacts[string(entry['artifact_id'])]
+    content = object_map(object_map(json.loads(artifact.model_dump_json()))['content'])
     if defect == 'provider_missing':
         content.pop('provider_id')
     elif defect == 'logical_missing':
@@ -431,14 +440,14 @@ async def test_cold_batch_binding_rejects_metadata_corruption_and_unknown_prefix
     elif defect == 'invalid_fallback':
         content.update(fallback_used=True, fallback_from_logical_model='unrelated')
     elif defect == 'duplicate_call':
-        content['tool_calls'][1]['id'] = content['tool_calls'][0]['id']
+        object_map(object_array(content['tool_calls'])[1])['id'] = object_map(object_array(content['tool_calls'])[0])['id']
     elif defect == 'wrong_arguments':
-        content['tool_calls'][0]['arguments'] = {'path': 'foreign', 'content': 'changed'}
+        object_map(object_array(content['tool_calls'])[0])['arguments'] = {'path': 'foreign', 'content': 'changed'}
     elif defect == 'unknown_tool_prefix':
         durable.tool_entries[0]['status'] = 'running'
     else:
         durable.model_entries.insert(0, {'status': 'running'})
-    changed = Artifact(id=artifact.id, type=artifact.type, producer=artifact.producer, content=content)
+    changed = Artifact(id=artifact.id, type=artifact.type, producer=artifact.producer, content=json_map(content))
     durable._artifacts[str(changed.id)] = changed
     entry['artifact_sha256'] = changed.content_sha256
     durable.approval_batch['model_artifact_sha256'] = changed.content_sha256

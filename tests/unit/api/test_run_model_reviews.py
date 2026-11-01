@@ -7,32 +7,38 @@ ownership/keyset/zero-write checks are in a separate focused file.
 
 from __future__ import annotations
 
-import importlib
 import json
-from contextlib import contextmanager
+from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
-from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy import Column, DateTime, MetaData, String, Table, Uuid, create_engine, event
+from sqlalchemy.engine import Result
+from sqlalchemy.orm import ORMExecuteState
 from sqlalchemy.pool import StaticPool
 
 from agent_hub.api.errors import PublicAPIError, public_error_handler
 from agent_hub.api.routers import runs
 from agent_hub.auth.models import AuthenticatedPrincipal, Role
+from agent_hub.capabilities import review_repository
+from agent_hub.domain.runs import TaskMode
 from agent_hub.runs.repository import RunNotFound, RunRepository
 from agent_hub.runs.service import RunService
+from agent_hub.runtime.defaults import UnavailableRuntime
+from agent_hub.runtime.registry import RuntimeRegistry
+from tests.unit.capabilities.review_repository_api_typed_fixture import (
+    ReviewStore,
+    SQLSession,
+    SQLSessions,
+    UnexpectedTaskQueue,
+)
 
 TENANT, ACTOR, RUN = UUID(int=1), UUID(int=2), UUID(int=3)
 CREATED = datetime(2026, 10, 31, tzinfo=UTC)
 PRIVATE = "private-body-action-rationale-secret-never-public"
-
-
-def history():
-    return importlib.import_module("agent_hub.capabilities.review_repository")
 
 
 @pytest.mark.parametrize(
@@ -51,16 +57,18 @@ def history():
         (PRIVATE, "unknown"),
     ],
 )
-def test_storage_state_is_only_a_review_outcome(state, expected):
-    item = history()._model_review_item(UUID(int=7), CREATED, state, "low", "authorized_action")
+def test_storage_state_is_only_a_review_outcome(state: str, expected: str) -> None:
+    item = review_repository._model_review_item(
+        UUID(int=7), CREATED, state, "low", "authorized_action"
+    )
     assert item.status == expected
     assert item.id == "model-review:00000000-0000-0000-0000-000000000007"
     assert item.reviewer == "independent_model"
     assert item.tool_name == "workspace.write_text"
 
 
-def test_projection_sanitizes_untrusted_risk_reason_and_dto_rejects_private_fields():
-    item = history()._model_review_item(uuid4(), CREATED, "allow", PRIVATE, PRIVATE)
+def test_projection_sanitizes_untrusted_risk_reason_and_dto_rejects_private_fields() -> None:
+    item = review_repository._model_review_item(uuid4(), CREATED, "allow", PRIVATE, PRIVATE)
     assert (item.risk, item.reason_code) == (None, None)
     response = runs.RunModelReviewItemResponse.from_record(item)
     payload = response.model_dump(mode="json")
@@ -89,45 +97,8 @@ def test_projection_sanitizes_untrusted_risk_reason_and_dto_rejects_private_fiel
             runs.RunModelReviewItemResponse.model_validate({**payload, field: value})
 
 
-class SQLSession:
-    """Replace DB transport only. Execute the production SELECTs unchanged."""
-
-    def __init__(self, engine):
-        self.connection = engine.connect()
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *args):
-        self.connection.close()
-
-    @property
-    def no_autoflush(self):
-        @contextmanager
-        def guard():
-            yield
-
-        return guard()
-
-    async def scalar(self, statement):
-        return self.connection.execute(statement).scalar()
-
-    async def execute(self, statement):
-        rows = self.connection.execute(statement).all()
-        values = [
-            tuple(
-                v.replace(tzinfo=UTC) if isinstance(v, datetime) and v.tzinfo is None else v
-                for v in row
-            )
-            for row in rows
-        ]
-        return SimpleNamespace(
-            all=lambda: values, one_or_none=lambda: values[0] if values else None
-        )
-
-
 @pytest.fixture
-def store():
+def store() -> Iterator[ReviewStore]:
     engine = create_engine(
         "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool
     )
@@ -162,12 +133,12 @@ def store():
                 {"id": UUID(int=5), "tenant_id": UUID(int=8), "actor_id": ACTOR},
             ],
         )
-    statements = []
+    statements: list[str] = []
     event.listen(
         engine, "before_cursor_execute", lambda c, cur, sql, p, ctx, many: statements.append(sql)
     )
 
-    def seed(count=1):
+    def seed(count: int = 1) -> None:
         with engine.begin() as conn:
             conn.execute(
                 reviews.insert(),
@@ -188,40 +159,43 @@ def store():
             )
         statements.clear()
 
-    value = SimpleNamespace(
+    value = ReviewStore(
         engine=engine,
         reviews=reviews,
         owners=owners,
         seed=seed,
         statements=statements,
-        factory=lambda: SQLSession(engine),
+        factory=SQLSessions(engine),
     )
     yield value
     engine.dispose()
 
 
-def repository(store):
+def repository(store: ReviewStore) -> RunRepository:
     return RunRepository(store.factory)
 
 
 class Auth:
-    def __init__(self, principal):
+    def __init__(self, principal: AuthenticatedPrincipal) -> None:
         self.principal = principal
 
-    def authenticate_token(self, token):
+    def authenticate_token(self, token: str) -> AuthenticatedPrincipal:
         return self.principal
 
-    async def validate_principal(self, principal):
+    async def validate_principal(self, principal: AuthenticatedPrincipal) -> AuthenticatedPrincipal:
         return self.principal
 
 
-def client(store, *, tenant=TENANT, actor=ACTOR):
+def client(store: ReviewStore, *, tenant: UUID = TENANT, actor: UUID = ACTOR) -> TestClient:
     app = FastAPI()
     app.state.auth_service = Auth(
         AuthenticatedPrincipal(tenant_id=tenant, user_id=actor, role=Role.OPERATOR)
     )
     app.state.run_service = RunService(
-        repository(store), runtime_registry=None, router=None, task_queue=None
+        repository(store),
+        runtime_registry=RuntimeRegistry([UnavailableRuntime(TaskMode.DIRECT)]),
+        router=None,
+        task_queue=UnexpectedTaskQueue(),
     )
     app.add_exception_handler(PublicAPIError, public_error_handler)
     app.include_router(runs.router)
@@ -229,9 +203,12 @@ def client(store, *, tenant=TENANT, actor=ACTOR):
 
 
 @pytest.mark.asyncio
-async def test_keyset_has_no_global_cap_and_stable_equal_timestamp_order(store):
+async def test_keyset_has_no_global_cap_and_stable_equal_timestamp_order(
+    store: ReviewStore,
+) -> None:
     store.seed(207)
-    ids, cursor = [], None
+    ids: list[str] = []
+    cursor: UUID | None = None
     repo = repository(store)
     for _ in range(10):
         page = await repo.model_reviews(TENANT, RUN, actor_id=ACTOR, cursor=cursor, limit=50)
@@ -257,14 +234,18 @@ async def test_keyset_has_no_global_cap_and_stable_equal_timestamp_order(store):
         (TENANT, ACTOR, uuid4()),
     ],
 )
-async def test_repository_uses_real_current_run_ownership(store, tenant, actor, run):
+async def test_repository_uses_real_current_run_ownership(
+    store: ReviewStore, tenant: UUID, actor: UUID, run: UUID
+) -> None:
     store.seed()
     with pytest.raises(RunNotFound):
         await repository(store).model_reviews(tenant, run, actor_id=actor)
 
 
 @pytest.mark.asyncio
-async def test_cursor_must_be_in_owned_run_and_never_falls_back_to_first_page(store):
+async def test_cursor_must_be_in_owned_run_and_never_falls_back_to_first_page(
+    store: ReviewStore,
+) -> None:
     store.seed(3)
     foreign = uuid4()
     with store.engine.begin() as conn:
@@ -290,7 +271,7 @@ async def test_cursor_must_be_in_owned_run_and_never_falls_back_to_first_page(st
     assert final.next_cursor is None
 
 
-def test_http_projection_and_pagination_preserve_only_public_fields(store):
+def test_http_projection_and_pagination_preserve_only_public_fields(store: ReviewStore) -> None:
     store.seed(3)
     with client(store) as api:
         first = api.get(
@@ -325,7 +306,9 @@ def test_http_projection_and_pagination_preserve_only_public_fields(store):
 
 
 @pytest.mark.parametrize("tenant,actor", [(UUID(int=8), ACTOR), (TENANT, UUID(int=9))])
-def test_http_cross_tenant_or_actor_is_not_found(store, tenant, actor):
+def test_http_cross_tenant_or_actor_is_not_found(
+    store: ReviewStore, tenant: UUID, actor: UUID
+) -> None:
     store.seed()
     with client(store, tenant=tenant, actor=actor) as api:
         result = api.get(
@@ -340,7 +323,7 @@ def test_http_cross_tenant_or_actor_is_not_found(store, tenant, actor):
 @pytest.mark.parametrize(
     "query", ["limit=0", "limit=201", "limit=-1", "limit=true", "cursor=private-invalid-uuid"]
 )
-def test_http_invalid_query_is_rejected(store, query):
+def test_http_invalid_query_is_rejected(store: ReviewStore, query: str) -> None:
     with client(store) as api:
         result = api.get(
             "/api/v1/runs/" + str(RUN) + "/model-reviews?" + query,
@@ -349,7 +332,7 @@ def test_http_invalid_query_is_rejected(store, query):
     assert result.status_code == 422
 
 
-def test_http_legacy_empty_and_scoped_missing_cursor(store):
+def test_http_legacy_empty_and_scoped_missing_cursor(store: ReviewStore) -> None:
     with client(store) as api:
         result = api.get(
             "/api/v1/runs/" + str(RUN) + "/model-reviews",
@@ -383,20 +366,22 @@ def test_http_legacy_empty_and_scoped_missing_cursor(store):
         "review_cancelled",
     ],
 )
-def test_all_existing_fixed_reason_codes_are_preserved_without_raw_labels(reason):
-    item = history()._model_review_item(uuid4(), CREATED, "unknown", "unknown", reason)
+def test_all_existing_fixed_reason_codes_are_preserved_without_raw_labels(reason: str) -> None:
+    item = review_repository._model_review_item(uuid4(), CREATED, "unknown", "unknown", reason)
     assert runs.RunModelReviewItemResponse.from_record(item).reason_code == reason
 
 
 @pytest.mark.parametrize("limit", [True, 0, -1, 201])
 @pytest.mark.asyncio
-async def test_direct_repository_invalid_page_size_never_queries_or_writes(store, limit):
+async def test_direct_repository_invalid_page_size_never_queries_or_writes(
+    store: ReviewStore, limit: int
+) -> None:
     with pytest.raises(ValueError):
         await repository(store).model_reviews(TENANT, RUN, actor_id=ACTOR, limit=limit)
     assert store.statements == []
 
 
-def test_http_cross_run_cursor_returns_fixed_422_without_details(store):
+def test_http_cross_run_cursor_returns_fixed_422_without_details(store: ReviewStore) -> None:
     store.seed()
     foreign = uuid4()
     with store.engine.begin() as conn:
@@ -422,59 +407,93 @@ def test_http_cross_run_cursor_returns_fixed_422_without_details(store):
 
 
 @pytest.mark.asyncio
-async def test_each_history_select_rechecks_ownership_after_initial_read(store):
+async def test_each_history_select_rechecks_ownership_after_initial_read(
+    store: ReviewStore,
+) -> None:
     store.seed()
 
     class ChangedOwner(SQLSession):
-        async def scalar(self, query):
-            result = await super().scalar(query)
-            self.connection.execute(
-                store.owners.update().where(store.owners.c.id == RUN).values(actor_id=UUID(int=9))
-            )
+        owner_changed = False
+
+        def _execute_sql(self, state: ORMExecuteState) -> Result[tuple[object, ...]]:
+            result = super()._execute_sql(state)
+            if not self.owner_changed:
+                self.sql_connection.execute(
+                    store.owners.update()
+                    .where(store.owners.c.id == RUN)
+                    .values(actor_id=UUID(int=9))
+                )
+                self.owner_changed = True
             return result
 
-    repo = RunRepository(lambda: ChangedOwner(store.engine))
+    repo = RunRepository(SQLSessions(store.engine, ChangedOwner))
     page = await repo.model_reviews(TENANT, RUN, actor_id=ACTOR)
     assert page.items == ()
     assert page.next_cursor is None
 
 
-@pytest.mark.parametrize('limit', [1, 200])
-def test_http_page_boundary_limits_and_default_are_not_history_total_caps(store, limit):
+@pytest.mark.parametrize("limit", [1, 200])
+def test_http_page_boundary_limits_and_default_are_not_history_total_caps(
+    store: ReviewStore, limit: int
+) -> None:
     store.seed(207)
     with client(store) as api:
-        response = api.get('/api/v1/runs/'+str(RUN)+'/model-reviews?limit='+str(limit),
-                           headers={'Authorization': 'Bearer synthetic'})
+        response = api.get(
+            "/api/v1/runs/" + str(RUN) + "/model-reviews?limit=" + str(limit),
+            headers={"Authorization": "Bearer synthetic"},
+        )
     assert response.status_code == 200
-    assert len(response.json()['items']) == limit
-    assert response.json()['next_cursor'] == str(UUID(int=1000+limit-1))
+    assert len(response.json()["items"]) == limit
+    assert response.json()["next_cursor"] == str(UUID(int=1000 + limit - 1))
 
 
-def test_http_requires_current_authenticated_principal_before_any_read(store):
+def test_http_requires_current_authenticated_principal_before_any_read(store: ReviewStore) -> None:
     with client(store) as api:
-        response = api.get('/api/v1/runs/'+str(RUN)+'/model-reviews')
+        response = api.get("/api/v1/runs/" + str(RUN) + "/model-reviews")
     assert response.status_code == 401
     assert store.statements == []
 
 
-def test_read_dto_openapi_has_only_whitelist_and_exact_page_contract():
+def test_read_dto_openapi_has_only_whitelist_and_exact_page_contract() -> None:
     app = FastAPI()
     app.include_router(runs.router)
     schema = app.openapi()
-    operation = schema['paths']['/api/v1/runs/{run_id}/model-reviews']['get']
-    parameters = {item['name']: item['schema'] for item in operation['parameters']}
-    assert parameters['limit']['default'] == 50
-    assert parameters['limit']['minimum'] == 1
-    assert parameters['limit']['maximum'] == 200
-    components = schema['components']['schemas']
-    assert set(components['RunModelReviewsResponse']['properties']) == {'items', 'next_cursor'}
-    assert set(components['RunModelReviewItemResponse']['properties']) == {
-        'id', 'created_at', 'status', 'risk', 'reason_code', 'reviewer', 'tool_name'}
-    assert components['RunModelReviewItemResponse']['additionalProperties'] is False
-    assert set(components['ModelReviewStatus']['enum']) == {
-        'pending', 'allow', 'deny', 'needs_human', 'unknown'}
-    assert set(components['ModelReviewReasonCode']['enum']) == {
-        'authorized_action', 'outside_authorized_scope', 'protected_resource', 'untrusted_content',
-        'unclear_impact', 'missing_context', 'policy_requires_human', 'accounting_unknown',
-        'review_timeout', 'review_unavailable', 'review_invalid_response', 'review_unknown',
-        'review_cancelled'}
+    operation = schema["paths"]["/api/v1/runs/{run_id}/model-reviews"]["get"]
+    parameters = {item["name"]: item["schema"] for item in operation["parameters"]}
+    assert parameters["limit"]["default"] == 50
+    assert parameters["limit"]["minimum"] == 1
+    assert parameters["limit"]["maximum"] == 200
+    components = schema["components"]["schemas"]
+    assert set(components["RunModelReviewsResponse"]["properties"]) == {"items", "next_cursor"}
+    assert set(components["RunModelReviewItemResponse"]["properties"]) == {
+        "id",
+        "created_at",
+        "status",
+        "risk",
+        "reason_code",
+        "reviewer",
+        "tool_name",
+    }
+    assert components["RunModelReviewItemResponse"]["additionalProperties"] is False
+    assert set(components["ModelReviewStatus"]["enum"]) == {
+        "pending",
+        "allow",
+        "deny",
+        "needs_human",
+        "unknown",
+    }
+    assert set(components["ModelReviewReasonCode"]["enum"]) == {
+        "authorized_action",
+        "outside_authorized_scope",
+        "protected_resource",
+        "untrusted_content",
+        "unclear_impact",
+        "missing_context",
+        "policy_requires_human",
+        "accounting_unknown",
+        "review_timeout",
+        "review_unavailable",
+        "review_invalid_response",
+        "review_unknown",
+        "review_cancelled",
+    }

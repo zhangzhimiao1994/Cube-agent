@@ -3,10 +3,12 @@ from __future__ import annotations
 
 import copy
 import hashlib
+from collections.abc import Mapping
 from uuid import UUID, uuid4
 
 import pytest
 
+from agent_hub.runs.service import RunService
 from agent_hub.runtime.artifacts import ArtifactReference
 from agent_hub.runtime.autogen.engineering_delivery import engineering_progress
 from agent_hub.runtime.autogen.project_repair_phase import (
@@ -17,26 +19,43 @@ from agent_hub.runtime.autogen.project_repair_phase import (
     productive_boundary,
     validate,
 )
-from agent_hub.runtime.contracts import Artifact, RuntimeCheckpoint, _mutable_json
+from agent_hub.runtime.contracts import Artifact, JsonValue, RuntimeCheckpoint, TaskContext
+from agent_hub.runtime.registry import RuntimeRegistry
 from tests.unit.runs.test_project_auto_repair_runtime import (
     BoundaryFailure,
     ContinuationRepository,
     ProjectJourney,
-    RunService,
-    RuntimeRegistry,
+)
+from tests.unit.runtime.autogen.project_repair_phase_typed_fixture import (
+    UnexpectedTaskQueue,
+    fixture,
+    integer,
+    json_map,
+    ledger,
+    mapping,
+    mutable,
+    mutable_rows,
+    number,
+    pair,
+    rows,
+    sequence,
+    string,
 )
 
 
-async def case():
+async def case() -> tuple[
+    TaskContext, RuntimeCheckpoint, tuple[Mapping[str, JsonValue], ...],
+    tuple[Mapping[str, JsonValue], ...], dict[str, object],
+]:
     journey = ProjectJourney()
     repo = ContinuationRepository(journey)
     runtime = BoundaryFailure(journey)
-    service = RunService(repo, runtime_registry=RuntimeRegistry((runtime,)), router=None, task_queue=object())
+    service = RunService(repo, runtime_registry=RuntimeRegistry((runtime,)), router=None, task_queue=UnexpectedTaskQueue())
     await service.execute(repo.run_id)
     saved = repo.checkpoint
     context = journey.context.model_copy(update={'checkpoint': saved, 'routing_decision': repo.row.routing_decision})
-    models, tools = saved.state['model_ledger'], saved.state['tool_ledger']
-    phase = prepare(context, saved, models, tools)
+    models, tools = ledger(saved.state['model_ledger']), ledger(saved.state['tool_ledger'])
+    phase = mutable(prepare(context, saved, models, tools))
     return context, saved, models, tools, phase
 
 
@@ -44,7 +63,7 @@ async def case():
 async def test_boundary_reconstructs_original_checkpoint_without_dropping_any_rows() -> None:
     context, saved, models, tools, phase = await case()
     before = saved.to_payload()
-    assert validate(phase, context=context, models=models, tools=tools, tool_prefix=len(tools), state=saved.state) == phase
+    assert validate(phase, context=context, models=ledger(models), tools=ledger(tools), tool_prefix=len(tools), state=saved.state) == phase
     assert phase['model_floor'] == len(models)
     assert phase['source_tool_count'] == len(tools)
     assert phase['failure_tool_position'] == len(tools) - 1
@@ -59,8 +78,8 @@ async def test_boundary_reconstructs_original_checkpoint_without_dropping_any_ro
 ])
 async def test_phase_tampering_and_consumed_unknown_cannot_be_restored(defect: str) -> None:
     context, saved, original_models, original_tools, original_phase = await case()
-    models, tools = _mutable_json(original_models), _mutable_json(original_tools)
-    phase = copy.deepcopy(_mutable_json(original_phase))
+    models, tools = mutable_rows(original_models), mutable_rows(original_tools)
+    phase = copy.deepcopy(original_phase)
     if defect == 'source_sha':
         phase['source_checkpoint_sha256'] = 'f' * 64
     elif defect == 'scope_sha':
@@ -69,20 +88,20 @@ async def test_phase_tampering_and_consumed_unknown_cannot_be_restored(defect: s
         phase['source_model_count'] = 0
         phase['source_model_sha256'] = prefix_digest([])
     elif defect == 'source_tool_count':
-        phase['source_tool_count'] -= 1
-        phase['source_tool_sha256'] = prefix_digest(tools[:-1])
+        phase['source_tool_count'] = integer(phase['source_tool_count']) - 1
+        phase['source_tool_sha256'] = prefix_digest(ledger(tools[:-1]))
     elif defect == 'source_row_rehash':
         models[0]['request_hash'] = 'e' * 64
-        phase['source_model_sha256'] = prefix_digest(models)
+        phase['source_model_sha256'] = prefix_digest(ledger(models))
     elif defect == 'metadata':
-        phase['source_checkpoint_metadata']['usage']['tokens'] = 0
+        mapping(mapping(phase['source_checkpoint_metadata'])['usage'])['tokens'] = 0
     elif defect == 'failure_artifact':
         phase['failure_artifact_sha256'] = 'f' * 64
     elif defect == 'floor':
-        phase['model_floor'] += 1
+        phase['model_floor'] = integer(phase['model_floor']) + 1
     elif defect == 'unknown_consumed':
         models.append({'status': 'running', 'request_hash': 'f' * 64})
-        phase['model_floor'] += 1
+        phase['model_floor'] = integer(phase['model_floor']) + 1
     elif defect == 'fingerprint':
         phase['failure_fingerprint'] = 'f' * 64
     elif defect == 'strategy':
@@ -90,35 +109,35 @@ async def test_phase_tampering_and_consumed_unknown_cannot_be_restored(defect: s
     elif defect == 'version':
         phase['version'] = True
     with pytest.raises(ValueError):
-        validate(phase, context=context, models=models, tools=tools, tool_prefix=len(tools), state=saved.state)
-    assert saved.state['usage']['tokens'] > 0
+        validate(phase, context=context, models=ledger(models), tools=ledger(tools), tool_prefix=len(tools), state=saved.state)
+    assert integer(json_map(saved.state['usage'])['tokens']) > 0
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('defect', ['permission', 'hard_tokens', 'tokens_reset', 'cost_reset', 'absolute_reset', 'soft_reset'])
 async def test_current_authority_and_budget_cannot_diverge_from_source(defect: str) -> None:
     context, saved, models, tools, phase = await case()
-    route, state = _mutable_json(context.routing_decision), _mutable_json(saved.state)
+    route, state = mutable(context.routing_decision), mutable(saved.state)
     if defect == 'permission':
         route['requested_permissions'] = ['host_write']
     elif defect == 'hard_tokens':
-        route['runtime_token_absolute_tokens'] += 1
+        route['runtime_token_absolute_tokens'] = integer(route['runtime_token_absolute_tokens']) + 1
     elif defect == 'tokens_reset':
-        state['usage']['tokens'] = 0
+        mapping(state['usage'])['tokens'] = 0
     elif defect == 'cost_reset':
-        state['usage']['cost_usd'] = '0'
+        mapping(state['usage'])['cost_usd'] = '0'
     elif defect == 'absolute_reset':
-        state['remaining_absolute_timeout_seconds'] += 1
+        state['remaining_absolute_timeout_seconds'] = number(state['remaining_absolute_timeout_seconds']) + 1
     else:
-        state['remaining_timeout_seconds'] += 1
+        state['remaining_timeout_seconds'] = number(state['remaining_timeout_seconds']) + 1
     context = context.model_copy(update={'routing_decision': route})
     with pytest.raises(ValueError):
-        validate(phase, context=context, models=models, tools=tools, tool_prefix=len(tools), state=state)
+        validate(phase, context=context, models=ledger(models), tools=ledger(tools), tool_prefix=len(tools), state=json_map(state))
     from agent_hub.runtime.autogen.adapter import RuntimeExecutionError
     from agent_hub.runtime.contracts import RuntimeCheckpoint
     state['project_repair_phase'] = phase
     checkpoint = RuntimeCheckpoint(id=saved.id, runtime_type='autogen', runtime_version='2',
-        run_id=context.run_id, tenant_id=context.tenant_id, mode=context.mode, state=state)
+        run_id=context.run_id, tenant_id=context.tenant_id, mode=context.mode, state=json_map(state))
     with pytest.raises(RuntimeExecutionError, match='project repair phase is invalid'):
         ProjectJourney().runtime()._validate_checkpoint(checkpoint, context)
 
@@ -126,14 +145,13 @@ async def test_current_authority_and_budget_cannot_diverge_from_source(defect: s
 @pytest.mark.asyncio
 @pytest.mark.parametrize('defect', ['', 'unknown', 'wrong_scope', 'wrong_link', 'wrong_request'])
 async def test_phase_retains_fully_bound_completed_model_correction(defect: str) -> None:
-    from tests.unit.runtime.autogen.test_model_tool_correction import pair
     context, saved, original, tools, phase = await case()
-    route = _mutable_json(context.routing_decision)
+    route = mutable(context.routing_decision)
     # The correction policy is part of the source authority, not granted at restore.
     assert route['engineering_tool_correction_version'] == 1
     rows = pair()
     position = len(original)
-    receipt = rows[0]['rejection']
+    receipt = mapping(rows[0]['rejection'])
     receipt.update(run_id=str(context.run_id), tenant_id=str(context.tenant_id), position=position)
     rows[1]['correction_for'] = position
     if defect == 'unknown':
@@ -146,25 +164,23 @@ async def test_phase_retains_fully_bound_completed_model_correction(defect: str)
         rows[1]['correction_for'] = 0
     elif defect == 'wrong_request':
         receipt['request_hash'] = 'd' * 64
-    models = [*_mutable_json(original), *rows]
+    models = [*original, *rows]
     phase['model_floor'] = len(models)
     if defect:
         with pytest.raises(ValueError):
-            validate(phase, context=context, models=models, tools=tools, tool_prefix=len(tools), state=saved.state)
+            validate(phase, context=context, models=ledger(models), tools=ledger(tools), tool_prefix=len(tools), state=saved.state)
     else:
-        assert validate(phase, context=context, models=models, tools=tools, tool_prefix=len(tools), state=saved.state) == phase
+        assert validate(phase, context=context, models=ledger(models), tools=ledger(tools), tool_prefix=len(tools), state=saved.state) == phase
         assert models[position]['status'] == 'rejected'
 
 
 def test_final_report_retains_bound_correction_chain_without_hiding_unknown() -> None:
-    from tests.unit.runtime.autogen.test_delivery_report import fixture
-    from tests.unit.runtime.autogen.test_model_tool_correction import pair
     evidence = fixture()
     route = {**evidence.context.routing_decision, 'engineering_auto_repair_version': 1,
              'source': 'self_repair', 'self_repair_accepted': True, 'engineering_tool_correction_version': 1}
     evidence.context = evidence.context.model_copy(update={'routing_decision': route})
     rows = pair()
-    rows[0]['rejection'].update(run_id=str(evidence.context.run_id), tenant_id=str(evidence.context.tenant_id))
+    mapping(rows[0]['rejection']).update(run_id=str(evidence.context.run_id), tenant_id=str(evidence.context.tenant_id))
     evidence.models[:0] = rows
     metadata = evidence.metadata()
     assert metadata['model_position'] == 2
@@ -175,38 +191,41 @@ def test_final_report_retains_bound_correction_chain_without_hiding_unknown() ->
         evidence.metadata()
 
 
-async def late_case(fault='after_bundle', *, include_models=False):
+async def late_case(fault: str = 'after_bundle', *, include_models: bool = False) -> tuple[TaskContext, RuntimeCheckpoint, list[Artifact]]:
     journey = ProjectJourney()
     repo = ContinuationRepository(journey)
     runtime = BoundaryFailure(journey)
-    service = RunService(repo, runtime_registry=RuntimeRegistry((runtime,)), router=None, task_queue=object())
+    service = RunService(repo, runtime_registry=RuntimeRegistry((runtime,)), router=None, task_queue=UnexpectedTaskQueue())
     await service.execute(repo.run_id)
     runtime.second_fault = 'after_write'
     await service.execute(repo.run_id)
-    route = _mutable_json(repo.row.routing_decision)
+    route = mutable(repo.row.routing_decision)
     runtime.second_fault = fault
     await service.execute(repo.run_id)
     saved = repo.checkpoint
     context = journey.context.model_copy(update={'checkpoint': saved, 'routing_decision': route})
-    refs = tuple(ArtifactReference(id=UUID(k), sha256=v) for k, v in saved.state['artifact_registry'].items())
+    refs = tuple(ArtifactReference(id=UUID(k), sha256=string(v)) for k, v in json_map(saved.state['artifact_registry']).items())
     artifacts = await journey.artifacts.get_many(context.tenant_id, context.run_id, refs)
     return context, saved, [a for a in artifacts if include_models or a.type == 'tool_result']
 
 
-def boundary_checkpoint(saved, state):
+def boundary_checkpoint(saved: RuntimeCheckpoint, state: Mapping[str, object]) -> RuntimeCheckpoint:
     return RuntimeCheckpoint(id=saved.id, runtime_type='autogen', runtime_version='2',
-        run_id=saved.run_id, tenant_id=saved.tenant_id, mode=saved.mode, state=state)
+        run_id=saved.run_id, tenant_id=saved.tenant_id, mode=saved.mode, state=json_map(state))
 
 
-def bind_tool_artifact(state, artifacts, position, content, *, producer=None):
-    row = state['tool_ledger'][position]
+def bind_tool_artifact(
+    state: dict[str, object], artifacts: list[Artifact], position: int,
+    content: Mapping[str, object], *, producer: str | None = None,
+) -> None:
+    row = rows(state['tool_ledger'])[position]
     original = next(a for a in artifacts if str(a.id) == row['artifact_id'])
     artifact = Artifact(id=original.id, type=original.type,
         producer=original.producer if producer is None else producer,
-        content=content, source_ids=original.source_ids)
+        content=json_map(content), source_ids=original.source_ids)
     artifacts[artifacts.index(original)] = artifact
     row['artifact_sha256'] = artifact.content_sha256
-    state['artifact_registry'][str(artifact.id)] = artifact.content_sha256
+    mapping(state['artifact_registry'])[str(artifact.id)] = artifact.content_sha256
 
 
 @pytest.mark.asyncio
@@ -218,12 +237,12 @@ def bind_tool_artifact(state, artifacts, position, content, *, producer=None):
 ])
 async def test_late_progress_rejects_forged_stale_or_unsafe_evidence(defect: str) -> None:
     context, saved, artifacts = await late_case()
-    state = _mutable_json(saved.state)
-    route = _mutable_json(context.routing_decision)
-    tools = state['tool_ledger']
+    state = mutable(saved.state)
+    route = mutable(context.routing_decision)
+    tools = rows(state['tool_ledger'])
     last = tools[-1]
     artifact = next(a for a in artifacts if str(a.id) == last['artifact_id'])
-    content = _mutable_json(artifact.content)
+    content = mutable(artifact.content)
     if defect == 'missing_receipt':
         artifacts.remove(artifact)
     elif defect == 'artifact_hash':
@@ -237,11 +256,11 @@ async def test_late_progress_rejects_forged_stale_or_unsafe_evidence(defect: str
         last['idempotency_key'] = 'f' * 64
     elif defect == 'verify_scope':
         verify = next(a for a in artifacts if str(a.id) == tools[-2]['artifact_id'])
-        changed = _mutable_json(verify.content)
-        changed['result']['generated_project_acceptance']['run_id'] = str(uuid4())
+        changed = mutable(verify.content)
+        mapping(mapping(changed['result'])['generated_project_acceptance'])['run_id'] = str(uuid4())
         bind_tool_artifact(state, artifacts, len(tools) - 2, changed)
     elif defect.startswith('zip_'):
-        result = content['result']
+        result = mapping(content['result'])
         key = {'zip_source': 'verification_source_sha256', 'zip_receipt': 'verification_receipt_sha256',
                'zip_manifest': 'workspace_files', 'zip_presentation': 'presentation'}[defect]
         result[key] = [] if defect == 'zip_manifest' else 'f' * 64
@@ -252,31 +271,32 @@ async def test_late_progress_rejects_forged_stale_or_unsafe_evidence(defect: str
         row.update(position=len(tools), artifact_id=str(uuid4()))
         row['idempotency_key'] = hashlib.sha256(
             f"{context.run_id}:{row['actor']}:{row['position']}:{row['name']}:{row['arguments_hash']}".encode()).hexdigest()
-        stale = Artifact(id=UUID(row['artifact_id']), type=write.type, producer=write.producer,
+        stale = Artifact(id=UUID(string(row['artifact_id'])), type=write.type, producer=write.producer,
             content=write.content)
         row['artifact_sha256'] = stale.content_sha256
         tools.append(row)
         artifacts.append(stale)
-        state['artifact_registry'][str(stale.id)] = stale.content_sha256
+        mapping(state['artifact_registry'])[str(stale.id)] = stale.content_sha256
         state['engineering_tool_prefix'] = len(tools)
     elif defect == 'unknown_model':
-        state['model_ledger'][-1]['status'] = 'running'
+        rows(state['model_ledger'])[-1]['status'] = 'running'
     elif defect == 'unknown_tool':
         last['status'] = 'running'
     elif defect == 'permission':
         route['requested_permissions'] = ['host_write']
     elif defect == 'hard_tokens':
-        route['runtime_token_absolute_tokens'] += 1
+        route['runtime_token_absolute_tokens'] = integer(route['runtime_token_absolute_tokens']) + 1
     elif defect == 'tokens_reset':
-        state['usage']['tokens'] = 0
+        mapping(state['usage'])['tokens'] = 0
     elif defect == 'cost_reset':
-        state['usage']['cost_usd'] = '0'
+        mapping(state['usage'])['cost_usd'] = '0'
     elif defect == 'uncommitted_models':
-        state['project_repair_phase']['model_floor'] -= 1
+        phase = mapping(state['project_repair_phase'])
+        phase['model_floor'] = integer(phase['model_floor']) - 1
     elif defect == 'uncommitted_tools':
-        state['engineering_tool_prefix'] -= 1
+        state['engineering_tool_prefix'] = integer(state['engineering_tool_prefix']) - 1
     else:
-        state['remaining_absolute_timeout_seconds'] += 1
+        state['remaining_absolute_timeout_seconds'] = number(state['remaining_absolute_timeout_seconds']) + 1
     context = context.model_copy(update={'routing_decision': route})
     with pytest.raises(ValueError):
         productive_boundary(context, boundary_checkpoint(saved, state), artifacts)
@@ -289,30 +309,31 @@ async def test_repeated_delivery_semantics_cannot_buy_another_continuation(fault
     progress = productive_boundary(context, saved, artifacts)
     context = context.model_copy(update={'routing_decision': {
         **context.routing_decision, 'self_repair_episode_progress': progress}})
-    state = _mutable_json(saved.state)
-    tools = state['tool_ledger']
+    state = mutable(saved.state)
+    tools = rows(state['tool_ledger'])
     row = dict(tools[-1])
     original = next(a for a in artifacts if str(a.id) == row['artifact_id'])
-    content = _mutable_json(original.content)
+    content = mutable(original.content)
     if fault == 'after_verify':
-        diagnostic = content['result']['verification']['checks'][0]['execution_diagnostic']
+        checks = rows(mapping(mapping(content['result'])['verification'])['checks'])
+        diagnostic = mapping(checks[0]['execution_diagnostic'])
         output = 'same source verified again\n'
         diagnostic['stdout'] = output
-        diagnostic['stdout_metadata'].update(sanitized_bytes=len(output), returned_bytes=len(output),
+        mapping(diagnostic['stdout_metadata']).update(sanitized_bytes=len(output), returned_bytes=len(output),
             sha256=hashlib.sha256(output.encode()).hexdigest())
     else:
-        content['result']['artifact_id'] = str(uuid4())
-        content['result']['file']['filename'] = 'another-attempt.zip'
-    duplicate = Artifact(id=uuid4(), type=original.type, producer=original.producer, content=content)
+        mapping(content['result'])['artifact_id'] = str(uuid4())
+        mapping(mapping(content['result'])['file'])['filename'] = 'another-attempt.zip'
+    duplicate = Artifact(id=uuid4(), type=original.type, producer=original.producer, content=json_map(content))
     row.update(position=len(tools), artifact_id=str(duplicate.id), artifact_sha256=duplicate.content_sha256)
     row['idempotency_key'] = hashlib.sha256(
         f"{context.run_id}:{row['actor']}:{row['position']}:{row['name']}:{row['arguments_hash']}".encode()).hexdigest()
     tools.append(row)
     artifacts.append(duplicate)
-    state['artifact_registry'][str(duplicate.id)] = duplicate.content_sha256
+    mapping(state['artifact_registry'])[str(duplicate.id)] = duplicate.content_sha256
     state['engineering_tool_prefix'] = len(tools)
     stopped = boundary_checkpoint(saved, state)
-    current = engineering_progress(context, tool_entries=stopped.state['tool_ledger'], artifacts=artifacts,
+    current = engineering_progress(context, tool_entries=ledger(stopped.state['tool_ledger']), artifacts=artifacts,
         allowed_tools={'implementer': ('project.inspect', 'workspace.list', 'workspace.write_text',
                                       'project.verify', 'workspace.bundle')})
     assert not current.uncertain and current.verification_current
@@ -328,9 +349,9 @@ async def test_complete_bound_round_is_pure_and_does_not_grant_repeat_credit(fau
     original = saved.to_payload()
     assert completed_round(context, saved.state, artifacts)
     progress = productive_boundary(context, saved, artifacts)
-    state = _mutable_json(saved.state)
-    state['project_repair_phase']['model_floor'] = len(state['model_ledger'])
-    state['engineering_tool_prefix'] = len(state['tool_ledger'])
+    state = mutable(saved.state)
+    mapping(state['project_repair_phase'])['model_floor'] = len(rows(state['model_ledger']))
+    state['engineering_tool_prefix'] = len(rows(state['tool_ledger']))
     settled = boundary_checkpoint(saved, state)
     assert not completed_round(context, settled.state, artifacts)
     assert saved.to_payload() == original
@@ -350,12 +371,12 @@ async def test_complete_bound_round_is_pure_and_does_not_grant_repeat_credit(fau
 ])
 async def test_known_round_requires_exact_private_intent_and_complete_effect_batch(defect: str) -> None:
     context, saved, artifacts = await late_case('ack_verify', include_models=True)
-    state = _mutable_json(saved.state)
-    models, tools = state['model_ledger'], state['tool_ledger']
+    state = mutable(saved.state)
+    models, tools = rows(state['model_ledger']), rows(state['tool_ledger'])
     row, tool = models[-1], tools[-1]
     artifact = next(a for a in artifacts if str(a.id) == row['artifact_id'])
-    content = _mutable_json(artifact.content)
-    binding = content[ROUND_INTENT]
+    content = mutable(artifact.content)
+    binding = mapping(content[ROUND_INTENT])
     if defect == 'legacy':
         del content[ROUND_INTENT]
     elif defect in {'actor', 'request', 'tenant', 'run', 'model_position', 'tool_start', 'logical_model'}:
@@ -364,17 +385,17 @@ async def test_known_round_requires_exact_private_intent_and_complete_effect_bat
             'tenant_id': str(uuid4()), 'run_id': str(uuid4()), 'model_position': 0,
             'tool_start': 0, 'logical_model': 'another_model'}[key]
     elif defect == 'alias':
-        binding['tool_names']['project_verify'] = 'workspace.bundle'
+        mapping(binding['tool_names'])['project_verify'] = 'workspace.bundle'
     elif defect == 'missing_call':
         content['tool_calls'] = []
     elif defect == 'extra_call':
-        extra = copy.deepcopy(content['tool_calls'][-1])
+        extra = copy.deepcopy(mapping(sequence(content['tool_calls'])[-1]))
         extra['id'] = 'unexecuted-tail'
-        content['tool_calls'].append(extra)
+        sequence(content['tool_calls']).append(extra)
     elif defect in {'arguments', 'call_name'}:
-        call = content['tool_calls'][-1]
+        call = mapping(sequence(content['tool_calls'])[-1])
         if defect == 'arguments':
-            call['arguments']['unexpected'] = True
+            mapping(call['arguments'])['unexpected'] = True
         else:
             call['name'] = 'workspace_bundle'
     elif defect == 'missing_model':
@@ -386,7 +407,7 @@ async def test_known_round_requires_exact_private_intent_and_complete_effect_bat
     elif defect == 'tool_actor':
         tool['actor'] = 'another_actor'
     elif defect == 'tool_position':
-        tool['position'] -= 1
+        tool['position'] = integer(tool['position']) - 1
     elif defect == 'tool_idempotency':
         tool['idempotency_key'] = 'f' * 64
     elif defect == 'unknown_tool':
@@ -399,27 +420,27 @@ async def test_known_round_requires_exact_private_intent_and_complete_effect_bat
     elif defect == 'approval':
         state['approval_batch'] = {}
     elif defect.startswith('selector_'):
-        selector = models[state['project_repair_phase']['model_floor']]
+        selector = models[integer(mapping(state['project_repair_phase'])['model_floor'])]
         source = next(a for a in artifacts if str(a.id) == selector['artifact_id'])
-        changed = _mutable_json(source.content)
+        changed = mutable(source.content)
         if defect == 'selector_actor':
-            changed[ROUND_INTENT]['actor'] = 'implementer'
+            mapping(changed[ROUND_INTENT])['actor'] = 'implementer'
         elif defect == 'selector_request':
-            changed[ROUND_INTENT]['request_hash'] = 'f' * 64
+            mapping(changed[ROUND_INTENT])['request_hash'] = 'f' * 64
         elif defect == 'selector_text':
             changed['text'] = 'another_actor'
         else:
             changed['tool_calls'] = content['tool_calls']
-        replacement = Artifact(id=source.id, type=source.type, producer=source.producer, content=changed)
+        replacement = Artifact(id=source.id, type=source.type, producer=source.producer, content=json_map(changed))
         artifacts[artifacts.index(source)] = replacement
         selector['artifact_sha256'] = replacement.content_sha256
-        state['artifact_registry'][str(replacement.id)] = replacement.content_sha256
+        mapping(state['artifact_registry'])[str(replacement.id)] = replacement.content_sha256
     if defect in {'legacy', 'actor', 'request', 'tenant', 'run', 'model_position', 'tool_start',
                   'logical_model', 'alias', 'missing_call', 'extra_call', 'arguments', 'call_name'}:
-        replacement = Artifact(id=artifact.id, type=artifact.type, producer=artifact.producer, content=content)
+        replacement = Artifact(id=artifact.id, type=artifact.type, producer=artifact.producer, content=json_map(content))
         artifacts[artifacts.index(artifact)] = replacement
         row['artifact_sha256'] = replacement.content_sha256
-        state['artifact_registry'][str(replacement.id)] = replacement.content_sha256
+        mapping(state['artifact_registry'])[str(replacement.id)] = replacement.content_sha256
     before = copy.deepcopy(state)
     with pytest.raises(ValueError):
         completed_round(context, boundary_checkpoint(saved, state).state, artifacts)

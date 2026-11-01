@@ -4,7 +4,8 @@ from __future__ import annotations
 import pytest
 
 from agent_hub.runs.service import _delivery_publication_batches
-from agent_hub.runtime.contracts import Artifact, EventKind
+from agent_hub.runtime.contracts import Artifact, EventKind, RunEvent
+from tests.unit.runs.reviewed_report_revision_typed_fixture import object_map
 from tests.unit.runs.test_crew_report_publication_red_oct29 import (
     NativeCase,
     native_case,  # noqa: F401
@@ -45,7 +46,7 @@ async def test_stale_hash_report_carrier_is_rejected_before_publication(
     else:
         pytest.fail("native fixture is missing the selected report carrier")
 
-    published = []
+    published: list[RunEvent] = []
     with pytest.raises(RuntimeError, match="crew report publication .*invalid"):
         async for group in _delivery_publication_batches(
             stream(tuple(events)), case.context, runtime=case.runtime,
@@ -61,7 +62,7 @@ async def test_rehashed_report_input_cannot_replace_current_native_report(
     case = native_case
     original = case.candidate
     payload = original.to_payload()
-    binding = payload["content"]["delivery_report_binding"]
+    binding = object_map(object_map(payload["content"])["delivery_report_binding"])
     if defect in {"run", "tenant"}:
         binding[defect + "_id"] = "00000000-0000-4000-8000-000000000099"
     elif defect == "actor":
@@ -79,7 +80,7 @@ async def test_rehashed_report_input_cannot_replace_current_native_report(
         "inputs": tuple(altered if item == original else item for item in events[index].inputs),
     })
 
-    published = []
+    published: list[RunEvent] = []
     with pytest.raises(RuntimeError, match="crew report publication .*invalid"):
         async for group in _delivery_publication_batches(
             stream(tuple(events)), case.context, runtime=case.runtime,

@@ -13,8 +13,10 @@ import hashlib
 import io
 import json
 import zipfile
+from collections.abc import Awaitable
 from email.parser import BytesParser
 from pathlib import Path
+from uuid import UUID
 
 import pytest
 
@@ -27,33 +29,40 @@ from agent_hub.capabilities.generated_project_service import (
 from agent_hub.capabilities.python_dependency_closure import check_python_dependency_closure
 from agent_hub.capabilities.python_project_recipe import parse_python_project_declaration
 from agent_hub.capabilities.runtime import RuntimeCapabilityError, RuntimeCapabilityGateway
-from agent_hub.skills.sandbox.project import project_source_fingerprint
+from agent_hub.skills.sandbox.project import ProjectInvocation, project_source_fingerprint
 from agent_hub.skills.sandbox.python_dependency_metadata import (
     PythonDependencyMetadataIndex,
     extract_python_wheel_metadata,
 )
 from agent_hub.skills.sandbox.python_dependency_protocol import PythonDependencyClosureObservation
 from agent_hub.skills.sandbox.python_input_fetch import WheelDownload, validate_wheel_bytes
+from tests.unit.capabilities.capability_lifecycle_typed_fixture import string_map
 from tests.unit.capabilities.test_generated_dependency_draft import observation
 from tests.unit.capabilities.test_generated_project_service import USER, Repository, setup
 from tests.unit.capabilities.test_python_project_recipe import MANIFEST
 from tests.unit.capabilities.test_scoped_read import RUN, TENANT, project_path, write_file
+from tests.unit.runs.reviewed_report_revision_typed_fixture import read_map
 
 
 class NormalizedRepository(Repository):
     """Match production normalization before comparing nested JSON state."""
 
-    async def get(self, tenant_id, run_id):
+    async def get(self, tenant_id: UUID, run_id: UUID) -> object:
         row = await super().get(tenant_id, run_id)
+        assert row is self.row
+        row = self.row
         if 'generated_project_preparation' in row.routing_decision:
             row.routing_decision = {**row.routing_decision, 'generated_project_preparation':
                 validate_generated_preparation(row.routing_decision['generated_project_preparation'])}
         return row
 
-    async def compare_and_set_generated_preparation(self, tenant_id, run_id, **kw):
+    async def compare_and_set_generated_preparation(self, tenant_id: UUID, run_id: UUID, **kw: object) -> object:
         guard = kw.pop('before_reservation', None)
         if guard is not None:
-            await guard()
+            assert callable(guard)
+            pending: object = guard()
+            assert isinstance(pending, Awaitable)
+            await pending
         if 'generated_project_preparation' in self.row.routing_decision:
             self.row.routing_decision = {**self.row.routing_decision, 'generated_project_preparation':
                 validate_generated_preparation(self.row.routing_decision['generated_project_preparation'])}
@@ -145,7 +154,7 @@ def draft(tmp_path: Path) -> tuple[GeneratedProjectService, Repository, str]:
         key=lambda row:(row.wheel.name,row.wheel.version,row.wheel.filename,row.wheel.sha256)))
     index = PythonDependencyMetadataIndex('d'*64, records)
 
-    async def inspect_dependencies(invocation, expected_source):
+    async def inspect_dependencies(invocation: ProjectInvocation, expected_source: str) -> PythonDependencyClosureObservation:
         assert invocation.sandbox_profile == 'restricted' and invocation.install_allowed is False
         assert await project_source_fingerprint(service.root, invocation) == expected_source
         manifest_bytes = (source / 'pyproject.toml').read_bytes()
@@ -157,7 +166,7 @@ def draft(tmp_path: Path) -> tuple[GeneratedProjectService, Repository, str]:
             manifest_sha256=hashlib.sha256(manifest_bytes).hexdigest(),
             lock_sha256=hashlib.sha256(lock_bytes).hexdigest(), metadata_index_sha256=index.sha256,
             closure=check_python_dependency_closure(declared.requirements, index.records,
-                data['target_environment']).to_payload())
+                string_map(data['target_environment'])).to_payload())
         return PythonDependencyClosureObservation.model_validate(data, strict=True)
 
     return GeneratedProjectService(root=service.root, repository=repo,
@@ -200,7 +209,7 @@ async def test_missing_transitive_dependency_is_repairable_before_generated_capt
     assert not (service.root / '.project-contracts' / str(TENANT) / str(RUN)).exists()
 
 
-async def test_rejection_then_actual_lock_write_recheck_and_capture(draft, tmp_path: Path) -> None:
+async def test_rejection_then_actual_lock_write_recheck_and_capture(draft: tuple[GeneratedProjectService, Repository, str], tmp_path: Path) -> None:
     service, repo, corrected = draft
     repo.row.routing_decision['python_dependency_preflight_version'] = 1
     with pytest.raises(GeneratedProjectDraftRejected):
@@ -213,17 +222,18 @@ async def test_rejection_then_actual_lock_write_recheck_and_capture(draft, tmp_p
     context = await service.prepare(TENANT, RUN, 'engineer', user_id=USER)
     assert context is not None and context.state['phase'] == 'captured'
     assert repo.updates == 2
-    proof = context.state['python_dependency_preflight']
-    assert proof['closure']['status'] == 'complete'
+    proof = read_map(context.state['python_dependency_preflight'])
+    assert read_map(proof['closure'])['status'] == 'complete'
     assert proof['source_sha256'] == context.stored.reference.input_source_sha256
 
 
-async def test_forged_preflight_source_cannot_capture(draft) -> None:
+async def test_forged_preflight_source_cannot_capture(draft: tuple[GeneratedProjectService, Repository, str]) -> None:
     service, repo, _ = draft
     repo.row.routing_decision['python_dependency_preflight_version'] = 1
     actual = service._dependency_inspector
+    assert actual is not None
 
-    async def changed(invocation, source):
+    async def changed(invocation: ProjectInvocation, source: str) -> PythonDependencyClosureObservation:
         value = await actual(invocation, source)
         return value.model_copy(update={'source_sha256':'f'*64})
 

@@ -12,6 +12,11 @@ from agent_hub.runs.artifacts import PostgresArtifactRepository
 from agent_hub.runtime.contracts import Artifact
 from agent_hub.runtime.model_scope import ModelScopeTracker, validate_model_scope_artifact
 from tests.unit.models.test_provider_diagnostics_oct28 import gateway_fixture
+from tests.unit.runs.reviewed_report_revision_typed_fixture import (
+    object_array,
+    object_map,
+    read_map,
+)
 
 
 @pytest.mark.parametrize("protocol", ["chat_completions", "responses", "messages", "stream"])
@@ -41,15 +46,18 @@ async def test_provider_class_persists_through_actual_scope_artifact_and_private
                              byte_size=len(serialized.encode()), content_sha256=artifact.content_sha256)
     hydrated = PostgresArtifactRepository._hydrate(row)
     scope = validate_model_scope_artifact(hydrated, str(run))
-    receipt = scope["calls"][0]["receipt"]
+    receipt = read_map(object_array(scope["calls"])[0])["receipt"]
+    receipt = read_map(receipt)
     assert receipt["schema_version"] == 2
-    diagnostic = receipt["attempts"][0]["provider_diagnostic"]
-    assert diagnostic["rejections"][0]["rejection_class"] == "tool_history"
-    assert diagnostic["rejections"][0]["parameter_family"] == "messages"
-    assert diagnostic["rejections"][0]["request_shape"]["send_ordinal"] == 1
+    diagnostic = read_map(read_map(object_array(receipt["attempts"])[0])["provider_diagnostic"])
+    assert read_map(object_array(diagnostic["rejections"])[0])["rejection_class"] == "tool_history"
+    assert read_map(object_array(diagnostic["rejections"])[0])["parameter_family"] == "messages"
+    assert read_map(read_map(object_array(diagnostic["rejections"])[0])["request_shape"])["send_ordinal"] == 1
     assert "PRIVATE" not in serialized
     broken = copy.deepcopy(hydrated.to_payload())
-    broken["content"]["calls"][0]["receipt"]["attempts"][0]["provider_diagnostic"]["raw_body"] = "PRIVATE"
+    call = object_map(object_array(object_map(broken["content"])["calls"])[0])
+    attempt = object_map(object_array(object_map(call["receipt"])["attempts"])[0])
+    object_map(attempt["provider_diagnostic"])["raw_body"] = "PRIVATE"
     broken.pop("content_sha256")
     with pytest.raises(ValueError):
         validate_model_scope_artifact(Artifact.from_payload(broken), str(run))

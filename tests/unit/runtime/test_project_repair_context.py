@@ -9,6 +9,8 @@ from agent_hub.capabilities.generated_project_draft import GeneratedDraftRejecti
 from agent_hub.runtime import self_repair_context as repair_context
 from agent_hub.runtime.contracts import Artifact
 from agent_hub.runtime.self_repair_context import self_repair_context_text
+from tests.unit.runs.project_auto_repair_typed_fixture import json_map
+from tests.unit.runs.reviewed_report_revision_typed_fixture import read_map, string_value
 
 
 def automatic_route() -> dict[str, object]:
@@ -79,7 +81,7 @@ def test_bound_failure_projection_keeps_diagnosis_as_untrusted_data() -> None:
     text = repair_context.project_repair_failure_text(
         artifact, expected_artifact_id=str(artifact.id),
         expected_artifact_sha256=artifact.content_sha256,
-        validated_feedback=artifact.content["result"],
+        validated_feedback=json_map(read_map(artifact.content["result"])),
     )
     assert text.startswith("UNTRUSTED_PROJECT_REPAIR_FEEDBACK_JSON=")
     assert "Cannot find module required-for-build" in text
@@ -90,7 +92,7 @@ def test_bound_failure_projection_keeps_diagnosis_as_untrusted_data() -> None:
 @pytest.mark.parametrize("defect", ["artifact_id", "hash", "changed_feedback", "success"])
 def test_failure_projection_does_not_forge_evidence(defect: str) -> None:
     artifact = failure_artifact()
-    feedback = dict(artifact.content["result"])
+    feedback = dict(read_map(artifact.content["result"]))
     expected_id, expected_hash = str(artifact.id), artifact.content_sha256
     if defect == "artifact_id":
         expected_id = str(uuid4())
@@ -103,7 +105,7 @@ def test_failure_projection_does_not_forge_evidence(defect: str) -> None:
     with pytest.raises(ValueError, match="repair failure evidence"):
         repair_context.project_repair_failure_text(artifact,
             expected_artifact_id=expected_id, expected_artifact_sha256=expected_hash,
-            validated_feedback=feedback)
+            validated_feedback=json_map(feedback))
 
 
 def test_draft_projection_preserves_actual_issue_and_observation_not_private_identity() -> None:
@@ -113,15 +115,15 @@ def test_draft_projection_preserves_actual_issue_and_observation_not_private_ide
         reason="generated_acceptance_manifest_required", issues=("manifest_missing",)).to_payload()
     artifact = Artifact(id=uuid4(), type="tool_result", producer="implementer", content={
         "tool_name": "project.verify", "result": {
-            "status": "failed", "untrusted": True, "generated_draft_rejection": draft,
+            "status": "failed", "untrusted": True, "generated_draft_rejection": json_map(draft),
         },
     })
     text = repair_context.project_repair_failure_text(artifact,
         expected_artifact_id=str(artifact.id), expected_artifact_sha256=artifact.content_sha256,
-        validated_feedback=artifact.content["result"])
+        validated_feedback=json_map(read_map(artifact.content["result"])))
     assert "generated_acceptance_manifest_required" in text and "manifest_missing" in text
     assert "c" * 64 in text and '"execution_started":false' in text
-    assert draft["user_id"] not in text and "private-project" not in text
+    assert string_value(draft["user_id"]) not in text and "private-project" not in text
 
 
 def test_diagnostic_projection_redacts_sensitive_stream_text_without_mutating_receipt() -> None:
@@ -132,7 +134,7 @@ def test_diagnostic_projection_redacts_sensitive_stream_text_without_mutating_re
     original = artifact.content_sha256
     text = repair_context.project_repair_failure_text(artifact,
         expected_artifact_id=str(artifact.id), expected_artifact_sha256=original,
-        validated_feedback=artifact.content["result"])
+        validated_feedback=json_map(read_map(artifact.content["result"])))
     assert "PRIVATE" not in text and "Bearer" not in text
     assert '"diagnostic_projection_redacted":true' in text
     assert artifact.recompute_content_sha256() == original

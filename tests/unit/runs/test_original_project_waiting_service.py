@@ -12,6 +12,7 @@ from agent_hub.runs.repository import RunRepository
 from agent_hub.runs.service import RunService
 from agent_hub.runtime.contracts import TaskContext
 from agent_hub.runtime.registry import RuntimeRegistry
+from tests.unit.runs.snapshot_approval_types_fixture import json_state
 from tests.unit.runs.test_terminal_hooks import ExecutableFakeRepository, RuntimeCompletes
 
 
@@ -64,7 +65,7 @@ async def test_original_admission_wait_exits_service_without_runtime_failure(
                                     if not key.startswith('approval_')}
             if resolved == 'running':
                 row.worker_id, row.worker_lease_token = 'replacement-worker', uuid4()
-        raise OriginalProjectApprovalPending("approval_" + "e" * 32, preparation)
+        raise OriginalProjectApprovalPending("approval_" + "e" * 32, json_state(preparation))
 
     service = RunService(cast(RunRepository, repository),
         runtime_registry=RuntimeRegistry((RuntimeCompletes(),)), router=None,
@@ -77,7 +78,7 @@ async def test_original_admission_wait_exits_service_without_runtime_failure(
         assert all(getattr(repository.row, field) is None for field in (
             "worker_id", "worker_lease_token", "worker_lease_expires_at", "worker_heartbeat_at"))
     assert not repository.artifacts
-    assert not any(event.kind.value in {"runtime.failed", "runtime.completed", "model.started"}
+    assert not any(event.kind in {"runtime.failed", "runtime.completed", "model.started"}
                    for event in repository.event_log)
     assert "run_execute_failed" not in caplog.text
     assert "cleanup is not confirmed" not in caplog.text
@@ -114,7 +115,7 @@ def test_pending_original_approval_requires_exact_durable_capture(mutation: str 
             f"capability-scope:v1:tenant={row.tenant_id}:user={row.actor_id}:run={row.id}:"
             "capability=command:operation=run:resource=workspace/current/project-verification/python/" + "c" * 64),
     }
-    pending = OriginalProjectApprovalPending("approval_" + "e" * 32, preparation)
+    pending = OriginalProjectApprovalPending("approval_" + "e" * 32, json_state(preparation))
     changed = cast(dict[str, Any], row.routing_decision)
     if mutation == "scope":
         changed["approval_scope"] = "workspace/current/project-verification"

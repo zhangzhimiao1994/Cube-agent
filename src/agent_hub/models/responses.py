@@ -9,7 +9,7 @@ from collections.abc import Mapping
 from enum import Enum
 from typing import Any, Protocol, cast
 
-from jsonschema import Draft202012Validator, SchemaError  # type: ignore[import-untyped]
+from jsonschema import Draft202012Validator, SchemaError
 
 from agent_hub.models.types import (
     Deployment,

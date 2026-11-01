@@ -21,18 +21,23 @@ from agent_hub.runtime.failure_reason import (
     safe_runtime_failure_diagnostic,
     safe_runtime_failure_reason,
 )
+from tests.unit.runs.checkpoint_project_failure_typed_fixture import (
+    NoExecutionService,
+    present,
+    text,
+)
 
 BASE = "project verification failed"
 PRODUCT = "python_project_product_unavailable"
 
 
-def reason(code="outcome_unconfirmed", backend=PRODUCT, prefix=""):
+def reason(code: str = "outcome_unconfirmed", backend: str | None = PRODUCT, prefix: str = "") -> str:
     return prefix + str(_WorkspaceVerificationError(code, backend_error_code=backend))
 
 
 @pytest.mark.parametrize("prefix", ["", "hybrid direct failed: ", "hybrid dispatch failed: ", "hybrid discuss failed: "])
 @pytest.mark.parametrize("backend", [PRODUCT, "python_project_execution_unavailable", "input_supply_unknown"])
-def test_current_finite_backend_reason_is_engineering_not_model_or_internal(prefix, backend):
+def test_current_finite_backend_reason_is_engineering_not_model_or_internal(prefix: str, backend: str) -> None:
     raw = reason(backend=backend, prefix=prefix)
     diagnostic = safe_runtime_failure_diagnostic(RuntimeError(raw))
     assert diagnostic["error_stage"] == "project_verification"
@@ -42,12 +47,12 @@ def test_current_finite_backend_reason_is_engineering_not_model_or_internal(pref
     assert diagnostic["error_summary"] == reason(backend=backend)
     RunEvent(kind=EventKind.RUNTIME_FAILED, sequence=1, run_id=uuid4(), reason=raw, payload=diagnostic)
     assert safe_runtime_failure_reason(RuntimeError(raw)) == raw
-    assert "inspect/reconcile existing execution" in diagnostic["suggested_action"]
+    assert "inspect/reconcile existing execution" in text(diagnostic["suggested_action"])
     if prefix:
         assert diagnostic["hybrid_child_mode"] == prefix.split()[1]
 
 
-def test_all_current_direct_literals_have_exact_central_coverage():
+def test_all_current_direct_literals_have_exact_central_coverage() -> None:
     for code in _VERIFICATION_FAILURE_CODES:
         raw = reason(code=code, backend=None)
         diagnostic = safe_runtime_failure_diagnostic(RuntimeError(raw))
@@ -66,7 +71,7 @@ def test_all_current_direct_literals_have_exact_central_coverage():
 
 @pytest.mark.parametrize("backend", [None, PRODUCT, "python_project_cleanup_incomplete", "input_supply_unknown"])
 @pytest.mark.parametrize("requires_approval", [True, False])
-def test_verification_never_proposes_platform_repair_or_replays_existing_execution(backend, requires_approval):
+def test_verification_never_proposes_platform_repair_or_replays_existing_execution(backend: str | None, requires_approval: bool) -> None:
     run_id = uuid4()
     raw = reason(backend=backend)
     event = RunEvent(kind=EventKind.RUNTIME_FAILED, sequence=3, run_id=run_id, reason=raw,
@@ -92,19 +97,19 @@ def test_verification_never_proposes_platform_repair_or_replays_existing_executi
     assert recorded.payload["requires_approval"] is False
     assert recorded.payload["automatic_execution"] is False
     assert "PRIVATE_RETRY_HINT" not in json.dumps(recorded.to_payload())
-    assert "inspect/reconcile existing execution" in decision.suggested_action
+    assert "inspect/reconcile existing execution" in present(decision.suggested_action)
     assert classify_terminal_run(status=RunStatus.FAILED, mode=TaskMode.DIRECT,
         routing_decision={}, events=(event, recorded), policy=SelfRepairPolicy()) is None
 
 
 @pytest.mark.parametrize("code", ["approval_required", "capability_denied", "identity_unavailable", "scope_denied"])
-def test_permissions_stay_current_scoped_and_never_gain_auto_execution(code):
+def test_permissions_stay_current_scoped_and_never_gain_auto_execution(code: str) -> None:
     raw = reason(code=code, backend=None)
     diagnostic = safe_runtime_failure_diagnostic(RuntimeError(raw))
     assert diagnostic["error_stage"] == "project_verification"
     assert diagnostic["error_category"] == "permission"
-    assert "当前具体动作" in diagnostic["suggested_action"]
-    assert "审批" in diagnostic["suggested_action"]
+    assert "当前具体动作" in text(diagnostic["suggested_action"])
+    assert "审批" in text(diagnostic["suggested_action"])
     run_id = uuid4()
     event = RunEvent(kind=EventKind.RUNTIME_FAILED, sequence=1, run_id=run_id, reason=raw)
     # The terminal classifier must not take over a live current-action approval.
@@ -125,7 +130,7 @@ def test_permissions_stay_current_scoped_and_never_gain_auto_execution(code):
     BASE + ": outcome unconfirmed (backend=python_project_product_unavailable/PRIVATE_PATH)",
     "hybrid direct failed: hybrid discuss failed: " + BASE + ": outcome unconfirmed",
 ])
-def test_arbitrary_or_nested_failure_strings_do_not_gain_engineering_exception(raw):
+def test_arbitrary_or_nested_failure_strings_do_not_gain_engineering_exception(raw: str) -> None:
     diagnostic = runtime_failure_diagnostic_from_reason(raw)
     assert diagnostic["error_stage"] != "project_verification"
     assert "verification_backend_code" not in diagnostic
@@ -133,14 +138,14 @@ def test_arbitrary_or_nested_failure_strings_do_not_gain_engineering_exception(r
     assert "PRIVATE_" not in safe_runtime_failure_reason(RuntimeError(raw))
 
 
-def test_model_transport_type_wins_over_project_looking_exception_body():
+def test_model_transport_type_wins_over_project_looking_exception_body() -> None:
     diagnostic = safe_runtime_failure_diagnostic(ModelTransportError(reason(), status_code=503))
     assert diagnostic["error_stage"] == "model_provider"
     assert diagnostic["error_code"] == "model.provider_unavailable"
     assert "verification_backend_code" not in diagnostic
 
 
-def test_old_aggregate_has_no_invented_backend_or_execution_evidence():
+def test_old_aggregate_has_no_invented_backend_or_execution_evidence() -> None:
     diagnostic = runtime_failure_diagnostic_from_reason(BASE)
     assert diagnostic["error_stage"] == "project_verification"
     assert diagnostic["error_category"] == "unknown"
@@ -149,7 +154,7 @@ def test_old_aggregate_has_no_invented_backend_or_execution_evidence():
 
 
 @pytest.mark.parametrize("requires_approval", [True, False])
-async def test_record_only_verification_never_enters_service_recovery_or_enqueue(requires_approval):
+async def test_record_only_verification_never_enters_service_recovery_or_enqueue(requires_approval: bool) -> None:
     run_id = uuid4()
     event = RunEvent(kind=EventKind.RUNTIME_FAILED, sequence=1, run_id=run_id,
         reason=reason(backend="python_project_cleanup_incomplete"))
@@ -157,11 +162,7 @@ async def test_record_only_verification_never_enters_service_recovery_or_enqueue
         routing_decision={}, events=(event,), policy=SelfRepairPolicy(requires_approval=requires_approval))
     assert decision is not None and decision.kind == "repair.skipped"
 
-    class NoExecution:
-        def __getattr__(self, name):
-            pytest.fail("verification diagnostic attempted service work: " + name)
-
-    service = NoExecution()
+    service = NoExecutionService()
     assert await RunService._safe_project_repair_decision(
         service, tenant_id=uuid4(), run_id=run_id, decision=decision) == decision
     assert await RunService._safe_auto_accept_self_repair_if_allowed(
@@ -175,7 +176,7 @@ async def test_record_only_verification_never_enters_service_recovery_or_enqueue
     BASE + ": outcome unconfirmed (backend=python_project_product_unavailable) password=PRIVATE_SECRET",
     BASE + ": outcome unconfirmed (backend=python_project_product_unavailable)",
 ])
-def test_wrapper_chain_is_rejected_at_any_depth_without_suffix_leak_or_retry(depth, case, tail):
+def test_wrapper_chain_is_rejected_at_any_depth_without_suffix_leak_or_retry(depth: int, case: str, tail: str) -> None:
     wrappers = ["hybrid direct failed: ", "hybrid dispatch failed: ", "hybrid discuss failed: "]
     if case == "upper":
         wrappers = [wrapper.upper() for wrapper in wrappers]
@@ -194,7 +195,7 @@ def test_wrapper_chain_is_rejected_at_any_depth_without_suffix_leak_or_retry(dep
 
 
 @pytest.mark.parametrize("wrapper", ["hybrid direct failed: ", "HYBRID DISPATCH FAILED: ", "Hybrid Discuss Failed: "])
-def test_single_wrapper_case_guard_keeps_only_the_existing_finite_contract(wrapper):
+def test_single_wrapper_case_guard_keeps_only_the_existing_finite_contract(wrapper: str) -> None:
     raw = wrapper + reason()
     diagnostic = runtime_failure_diagnostic_from_reason(raw)
     assert diagnostic["error_stage"] == "project_verification"

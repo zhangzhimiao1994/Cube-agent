@@ -11,6 +11,7 @@ import pytest
 
 from agent_hub.domain.runs import TaskMode
 from agent_hub.runtime.contracts import Artifact, JsonValue, TaskContext
+from tests.unit.runtime.diagnostic_action_artifact_typed_fixture import mapping, mutable
 
 RUN = UUID("00000000-0000-4000-8000-000000000001")
 OWNER = "delivery_main_agent"
@@ -25,88 +26,150 @@ class Evidence:
     tools: list[dict[str, JsonValue]]
     artifacts: list[Artifact]
 
-    def metadata(self, *, text: str = TEXT, logical_model: str = MODEL,
-                 owner: str = OWNER) -> dict[str, JsonValue]:
+    def metadata(
+        self, *, text: str = TEXT, logical_model: str = MODEL, owner: str = OWNER
+    ) -> dict[str, JsonValue]:
         from agent_hub.runtime.autogen.delivery_report import engineering_report_metadata
 
         return engineering_report_metadata(
-            context=self.context, text=text, logical_model=logical_model, owner=owner,
-            model_entries=self.models, tool_entries=self.tools, artifacts=self.artifacts,
+            context=self.context,
+            text=text,
+            logical_model=logical_model,
+            owner=owner,
+            model_entries=self.models,
+            tool_entries=self.tools,
+            artifacts=self.artifacts,
         )
 
-    def report(self, *, metadata: Mapping[str, JsonValue] | None = None,
-               text: str = TEXT, source_ids: tuple[str, ...] | None = None,
-               producer: str = OWNER, presentation: str = "final_answer") -> Artifact:
+    def report(
+        self,
+        *,
+        metadata: Mapping[str, JsonValue] | None = None,
+        text: str = TEXT,
+        source_ids: tuple[str, ...] | None = None,
+        producer: str = OWNER,
+        presentation: str = "final_answer",
+    ) -> Artifact:
         from agent_hub.runtime.autogen.delivery_report import engineering_report_id
 
         bound = self.metadata() if metadata is None else metadata
         return Artifact(
-            id=engineering_report_id(self.context, bound), type="text", producer=producer,
-            content={"text": text, "presentation": presentation,
-                     "engineering_report": bound},
+            id=engineering_report_id(self.context, bound),
+            type="text",
+            producer=producer,
+            content={"text": text, "presentation": presentation, "engineering_report": bound},
             source_ids=(str(self.artifacts[-1].id), str(self.artifacts[-2].id))
-            if source_ids is None else source_ids,
+            if source_ids is None
+            else source_ids,
         )
 
     def valid(self, report: Artifact, *, logical_model: str = MODEL) -> bool:
         from agent_hub.runtime.autogen.delivery_report import engineering_report_valid
 
         return engineering_report_valid(
-            report, context=self.context, logical_model=logical_model, model_entries=self.models,
-            tool_entries=self.tools, artifacts=self.artifacts,
+            report,
+            context=self.context,
+            logical_model=logical_model,
+            model_entries=self.models,
+            tool_entries=self.tools,
+            artifacts=self.artifacts,
         )
 
 
 def fixture() -> Evidence:
     context = TaskContext(
-        run_id=RUN, tenant_id=uuid4(), mode=TaskMode.DISCUSS, request="deliver",
+        run_id=RUN,
+        tenant_id=uuid4(),
+        mode=TaskMode.DISCUSS,
+        request="deliver",
         routing_decision={"engineering_final_report_version": 1},
     )
     artifacts: list[Artifact] = []
     tools: list[dict[str, JsonValue]] = []
     for position, name in enumerate(("workspace.read", "workspace.bundle")):
-        artifact = Artifact(id=uuid4(), type="tool_result", producer="engineer", content={
-            "tool_name": name, "arguments_sha256": "a" * 64,
-            "result": {"text": "tool summary", "presentation": "final_attachment"},
-        })
+        artifact = Artifact(
+            id=uuid4(),
+            type="tool_result",
+            producer="engineer",
+            content={
+                "tool_name": name,
+                "arguments_sha256": "a" * 64,
+                "result": {"text": "tool summary", "presentation": "final_attachment"},
+            },
+        )
         artifacts.append(artifact)
-        tools.append({
-            "position": position, "actor": "engineer", "name": name,
-            "arguments_hash": "a" * 64, "status": "succeeded", "replay_safe": False,
-            "idempotency_key": hashlib.sha256(
-                f"{RUN}:engineer:{position}:{name}:{'a' * 64}".encode()).hexdigest(),
-            "artifact_id": str(artifact.id), "artifact_sha256": artifact.content_sha256,
-        })
-    model = Artifact(id=uuid4(), type="model_result", producer="agent_hub", content={
-        "text": TEXT, "tool_calls": (), "logical_model": MODEL,
-        "usage": {"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30},
-        "deployment_id": "deployment", "provider_id": "provider",
-        "provider_model": "provider/model", "cost_usd": "0",
-    })
+        tools.append(
+            {
+                "position": position,
+                "actor": "engineer",
+                "name": name,
+                "arguments_hash": "a" * 64,
+                "status": "succeeded",
+                "replay_safe": False,
+                "idempotency_key": hashlib.sha256(
+                    f"{RUN}:engineer:{position}:{name}:{'a' * 64}".encode()
+                ).hexdigest(),
+                "artifact_id": str(artifact.id),
+                "artifact_sha256": artifact.content_sha256,
+            }
+        )
+    model = Artifact(
+        id=uuid4(),
+        type="model_result",
+        producer="agent_hub",
+        content={
+            "text": TEXT,
+            "tool_calls": (),
+            "logical_model": MODEL,
+            "usage": {"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30},
+            "deployment_id": "deployment",
+            "provider_id": "provider",
+            "provider_model": "provider/model",
+            "cost_usd": "0",
+        },
+    )
     artifacts.append(model)
-    models: list[dict[str, JsonValue]] = [{
-        "status": "succeeded", "request_hash": "b" * 64,
-        "artifact_id": str(model.id), "artifact_sha256": model.content_sha256,
-    }]
+    models: list[dict[str, JsonValue]] = [
+        {
+            "status": "succeeded",
+            "request_hash": "b" * 64,
+            "artifact_id": str(model.id),
+            "artifact_sha256": model.content_sha256,
+        }
+    ]
     models[-1]["report_binding"] = {
-        "version": 1, "run_id": str(RUN), "tenant_id": str(context.tenant_id),
-        "owner": OWNER, "requested_logical_model": MODEL,
+        "version": 1,
+        "run_id": str(RUN),
+        "tenant_id": str(context.tenant_id),
+        "owner": OWNER,
+        "requested_logical_model": MODEL,
         "bundle_artifact_id": str(artifacts[-2].id),
         "bundle_artifact_sha256": artifacts[-2].content_sha256,
         "tool_prefix_length": len(tools),
-        "tool_prefix_sha256": hashlib.sha256(json.dumps(
-            tools, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
-            allow_nan=False,
-        ).encode("utf-8")).hexdigest(),
+        "tool_prefix_sha256": hashlib.sha256(
+            json.dumps(
+                tools,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+        ).hexdigest(),
     }
     return Evidence(context, models, tools, artifacts)
 
 
-def replace_model(evidence: Evidence, changes: Mapping[str, JsonValue] | None = None,
-                  *, producer: str = "agent_hub", kind: str = "model_result") -> None:
+def replace_model(
+    evidence: Evidence,
+    changes: Mapping[str, JsonValue] | None = None,
+    *,
+    producer: str = "agent_hub",
+    kind: str = "model_result",
+) -> None:
     old = evidence.artifacts[-1]
-    model = Artifact(id=old.id, type=kind, producer=producer,
-                     content={**old.content, **(changes or {})})
+    model = Artifact(
+        id=old.id, type=kind, producer=producer, content={**old.content, **(changes or {})}
+    )
     evidence.artifacts[-1] = model
     evidence.models[-1]["artifact_sha256"] = model.content_sha256
 
@@ -116,17 +179,28 @@ def test_metadata_binds_exact_latest_native_outcomes_without_mutation() -> None:
     before = repr(evidence)
     metadata = evidence.metadata()
     assert metadata == {
-        "version": 1, "run_id": str(RUN), "tenant_id": str(evidence.context.tenant_id),
-        "owner": OWNER, "logical_model": MODEL, "model_position": 0,
-        "model_request_hash": "b" * 64, "model_artifact_id": str(evidence.artifacts[-1].id),
+        "version": 1,
+        "run_id": str(RUN),
+        "tenant_id": str(evidence.context.tenant_id),
+        "owner": OWNER,
+        "logical_model": MODEL,
+        "model_position": 0,
+        "model_request_hash": "b" * 64,
+        "model_artifact_id": str(evidence.artifacts[-1].id),
         "model_artifact_sha256": evidence.artifacts[-1].content_sha256,
-        "bundle_position": 1, "bundle_artifact_id": str(evidence.artifacts[-2].id),
+        "bundle_position": 1,
+        "bundle_artifact_id": str(evidence.artifacts[-2].id),
         "bundle_artifact_sha256": evidence.artifacts[-2].content_sha256,
         "tool_prefix_length": 2,
-        "tool_prefix_sha256": hashlib.sha256(json.dumps(
-            evidence.tools, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
-            allow_nan=False,
-        ).encode("utf-8")).hexdigest(),
+        "tool_prefix_sha256": hashlib.sha256(
+            json.dumps(
+                evidence.tools,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+        ).hexdigest(),
     }
     report = evidence.report(metadata=metadata)
     assert evidence.valid(Artifact.from_payload(report.to_payload()))
@@ -143,8 +217,14 @@ def test_unknown_earlier_model_cannot_be_hidden_by_a_later_report() -> None:
 
 def test_fallback_metadata_cannot_claim_an_unchanged_actual_model() -> None:
     evidence = fixture()
-    replace_model(evidence, {"fallback_used": True, "fallback_from_logical_model": "different-request",
-                             "fallback_reason": "capacity_unavailable"})
+    replace_model(
+        evidence,
+        {
+            "fallback_used": True,
+            "fallback_from_logical_model": "different-request",
+            "fallback_reason": "capacity_unavailable",
+        },
+    )
     with pytest.raises(ValueError):
         evidence.metadata()
 
@@ -157,9 +237,9 @@ def test_report_phase_binding_is_required_for_fresh_and_restored_reports(defect:
     else:
         binding = evidence.models[-1]["report_binding"]
         assert isinstance(binding, dict)
-        binding[{"tenant": "tenant_id", "prefix": "tool_prefix_sha256", "version": "version"}[defect]] = (
-            True if defect == "version" else str(uuid4()) if defect == "tenant" else "f" * 64
-        )
+        binding[
+            {"tenant": "tenant_id", "prefix": "tool_prefix_sha256", "version": "version"}[defect]
+        ] = True if defect == "version" else str(uuid4()) if defect == "tenant" else "f" * 64
     with pytest.raises(ValueError):
         evidence.metadata()
 
@@ -167,15 +247,26 @@ def test_report_phase_binding_is_required_for_fresh_and_restored_reports(defect:
 @pytest.mark.parametrize("version", [None, True, False, 0, 2, "1", 1.0])
 def test_policy_requires_strict_integer_one(version: JsonValue) -> None:
     evidence = fixture()
-    evidence.context = evidence.context.model_copy(update={
-        "routing_decision": {"engineering_final_report_version": version},
-    })
+    evidence.context = evidence.context.model_copy(
+        update={
+            "routing_decision": {"engineering_final_report_version": version},
+        }
+    )
     with pytest.raises(ValueError):
         evidence.metadata()
 
 
-@pytest.mark.parametrize("text", ["", " ", "\n\t", TEXT.rstrip(), "tool summary",
-                                  "I am delivery_main_agent; everything passed."])
+@pytest.mark.parametrize(
+    "text",
+    [
+        "",
+        " ",
+        "\n\t",
+        TEXT.rstrip(),
+        "tool summary",
+        "I am delivery_main_agent; everything passed.",
+    ],
+)
 def test_text_must_be_nonblank_and_exact_model_response(text: str) -> None:
     with pytest.raises(ValueError):
         fixture().metadata(text=text)
@@ -196,22 +287,36 @@ def test_latest_model_only_not_any_historical_matching_text() -> None:
     evidence.models.append({"status": "running", "request_hash": "c" * 64})
     with pytest.raises(ValueError):
         evidence.metadata()
-    other = Artifact(id=uuid4(), type="model_result", producer="agent_hub", content={
-        **evidence.artifacts[-1].content, "text": "later answer",
-    })
+    other = Artifact(
+        id=uuid4(),
+        type="model_result",
+        producer="agent_hub",
+        content={
+            **evidence.artifacts[-1].content,
+            "text": "later answer",
+        },
+    )
     evidence.artifacts.append(other)
-    evidence.models[-1].update(status="succeeded", artifact_id=str(other.id),
-                               artifact_sha256=other.content_sha256)
+    evidence.models[-1].update(
+        status="succeeded", artifact_id=str(other.id), artifact_sha256=other.content_sha256
+    )
     with pytest.raises(ValueError):
         evidence.metadata()
 
 
-@pytest.mark.parametrize("field,value", [
-    ("text", " \n\t"), ("tool_calls", ({"name": "workspace.bundle"},)),
-    ("tool_calls", None), ("tool_calls", {}), ("logical_model", "another-model"),
-])
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("text", " \n\t"),
+        ("tool_calls", ({"name": "workspace.bundle"},)),
+        ("tool_calls", None),
+        ("tool_calls", {}),
+        ("logical_model", "another-model"),
+    ],
+)
 def test_model_result_requires_real_text_only_matching_logical_model(
-    field: str, value: JsonValue,
+    field: str,
+    value: JsonValue,
 ) -> None:
     evidence = fixture()
     replace_model(evidence, {field: value})
@@ -219,8 +324,7 @@ def test_model_result_requires_real_text_only_matching_logical_model(
         evidence.metadata()
 
 
-@pytest.mark.parametrize("producer,kind", [(OWNER, "model_result"),
-                                           ("agent_hub", "tool_result")])
+@pytest.mark.parametrize("producer,kind", [(OWNER, "model_result"), ("agent_hub", "tool_result")])
 def test_producer_or_tool_summary_cannot_impersonate_model(producer: str, kind: str) -> None:
     evidence = fixture()
     replace_model(evidence, producer=producer, kind=kind)
@@ -228,10 +332,15 @@ def test_producer_or_tool_summary_cannot_impersonate_model(producer: str, kind: 
         evidence.metadata()
 
 
-@pytest.mark.parametrize("field,value", [
-    ("request_hash", "invalid"), ("request_hash", None),
-    pytest.param("artifact_id", str(uuid4()), id="artifact_id-unrelated"), ("artifact_sha256", "d" * 64),
-])
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("request_hash", "invalid"),
+        ("request_hash", None),
+        pytest.param("artifact_id", str(uuid4()), id="artifact_id-unrelated"),
+        ("artifact_sha256", "d" * 64),
+    ],
+)
 def test_model_ledger_reference_must_match_actual_artifact(field: str, value: JsonValue) -> None:
     evidence = fixture()
     evidence.models[-1][field] = value
@@ -254,11 +363,18 @@ def test_hash_only_and_orphaned_artifacts_are_insufficient() -> None:
         evidence.metadata()
 
 
-@pytest.mark.parametrize("field,value", [
-    ("name", "workspace.read"), ("actor", "outsider"), ("position", True),
-    ("arguments_hash", "d" * 64), ("idempotency_key", "d" * 64),
-    ("artifact_sha256", "d" * 64), pytest.param("artifact_id", str(uuid4()), id="artifact_id-unrelated"),
-])
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("name", "workspace.read"),
+        ("actor", "outsider"),
+        ("position", True),
+        ("arguments_hash", "d" * 64),
+        ("idempotency_key", "d" * 64),
+        ("artifact_sha256", "d" * 64),
+        pytest.param("artifact_id", str(uuid4()), id="artifact_id-unrelated"),
+    ],
+)
 def test_last_tool_row_must_be_current_run_bundle(field: str, value: JsonValue) -> None:
     evidence = fixture()
     evidence.tools[-1][field] = value
@@ -268,8 +384,13 @@ def test_last_tool_row_must_be_current_run_bundle(field: str, value: JsonValue) 
 
 def test_actual_read_after_bundle_is_not_final_report_boundary() -> None:
     evidence = fixture()
-    row = {**evidence.tools[0], "position": 2, "idempotency_key": hashlib.sha256(
-        f"{RUN}:engineer:2:workspace.read:{'a' * 64}".encode()).hexdigest()}
+    row = {
+        **evidence.tools[0],
+        "position": 2,
+        "idempotency_key": hashlib.sha256(
+            f"{RUN}:engineer:2:workspace.read:{'a' * 64}".encode()
+        ).hexdigest(),
+    }
     evidence.tools.append(row)
     with pytest.raises(ValueError):
         evidence.metadata()
@@ -306,13 +427,23 @@ def test_changed_model_hash_or_request_binding_invalidates_report() -> None:
     assert not evidence.valid(report)
 
 
-@pytest.mark.parametrize("field,value", [
-    ("version", True), ("version", 1.0), ("version", "1"), ("version", 2),
-    ("model_position", False), ("bundle_position", True),
-    ("tool_prefix_length", 2.0), ("extra", "unsupported"),
-    ("owner", "engineer"), ("logical_model", "other"),
-    ("model_artifact_sha256", "d" * 64), ("tool_prefix_sha256", "d" * 64),
-])
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("version", True),
+        ("version", 1.0),
+        ("version", "1"),
+        ("version", 2),
+        ("model_position", False),
+        ("bundle_position", True),
+        ("tool_prefix_length", 2.0),
+        ("extra", "unsupported"),
+        ("owner", "engineer"),
+        ("logical_model", "other"),
+        ("model_artifact_sha256", "d" * 64),
+        ("tool_prefix_sha256", "d" * 64),
+    ],
+)
 def test_report_metadata_is_exact_and_strict(field: str, value: JsonValue) -> None:
     evidence = fixture()
     metadata = evidence.metadata()
@@ -350,9 +481,11 @@ def test_duplicate_registry_and_in_place_hash_tampering_are_rejected() -> None:
     assert not evidence.valid(report)
     evidence = fixture()
     report = evidence.report()
-    evidence.artifacts[-1] = evidence.artifacts[-1].model_copy(update={
-        "content": {**evidence.artifacts[-1].content, "text": "tampered"},
-    })
+    evidence.artifacts[-1] = evidence.artifacts[-1].model_copy(
+        update={
+            "content": {**evidence.artifacts[-1].content, "text": "tampered"},
+        }
+    )
     assert not evidence.valid(report)
     evidence = fixture()
     report = evidence.report().model_copy(update={"content_sha256": "0" * 64})
@@ -388,8 +521,12 @@ def test_required_tool_model_cannot_be_used_as_no_tool_final_invocation() -> Non
 def test_no_tool_calls_field_is_not_an_explicit_text_only_outcome() -> None:
     evidence = fixture()
     old = evidence.artifacts[-1]
-    model = Artifact(id=old.id, type=old.type, producer=old.producer,
-                     content={key: value for key, value in old.content.items() if key != "tool_calls"})
+    model = Artifact(
+        id=old.id,
+        type=old.type,
+        producer=old.producer,
+        content={key: value for key, value in old.content.items() if key != "tool_calls"},
+    )
     evidence.artifacts[-1] = model
     evidence.models[-1]["artifact_sha256"] = model.content_sha256
     with pytest.raises(ValueError):
@@ -407,13 +544,21 @@ def test_uncertain_earlier_tool_prefix_is_rejected(status: str) -> None:
 def test_latest_model_with_same_text_still_invalidates_older_report_binding() -> None:
     evidence = fixture()
     report = evidence.report()
-    replacement = Artifact(id=uuid4(), type="model_result", producer="agent_hub",
-                           content=evidence.artifacts[-1].content)
+    replacement = Artifact(
+        id=uuid4(),
+        type="model_result",
+        producer="agent_hub",
+        content=evidence.artifacts[-1].content,
+    )
     evidence.artifacts.append(replacement)
-    evidence.models.append({
-        "status": "succeeded", "request_hash": "c" * 64,
-        "artifact_id": str(replacement.id), "artifact_sha256": replacement.content_sha256,
-    })
+    evidence.models.append(
+        {
+            "status": "succeeded",
+            "request_hash": "c" * 64,
+            "artifact_id": str(replacement.id),
+            "artifact_sha256": replacement.content_sha256,
+        }
+    )
     assert not evidence.valid(report)
 
 
@@ -438,53 +583,104 @@ def test_binding_is_not_business_verification_or_authorization() -> None:
     assert evidence.valid(evidence.report())
 
 
-def append_tail(evidence: Evidence, name: str = 'workspace.list', status: str = 'succeeded') -> Artifact:
+def append_tail(
+    evidence: Evidence, name: str = "workspace.list", status: str = "succeeded"
+) -> Artifact:
     position = len(evidence.tools)
-    artifact = Artifact(id=uuid4(), type='tool_result', producer='engineer', content={
-        'tool_name': name, 'arguments_sha256': 'a' * 64, 'result': {'workspace_files': ()},
-    })
+    artifact = Artifact(
+        id=uuid4(),
+        type="tool_result",
+        producer="engineer",
+        content={
+            "tool_name": name,
+            "arguments_sha256": "a" * 64,
+            "result": {"workspace_files": ()},
+        },
+    )
     evidence.artifacts.insert(-1, artifact)
-    evidence.tools.append({
-        'position': position, 'actor': 'engineer', 'name': name, 'arguments_hash': 'a' * 64,
-        'status': status, 'replay_safe': False,
-        'idempotency_key': hashlib.sha256(f"{RUN}:engineer:{position}:{name}:{'a' * 64}".encode()).hexdigest(),
-        'artifact_id': str(artifact.id), 'artifact_sha256': artifact.content_sha256,
-    })
-    binding = evidence.models[-1]['report_binding']
-    binding['tool_prefix_length'] = len(evidence.tools)
-    binding['tool_prefix_sha256'] = hashlib.sha256(json.dumps(
-        evidence.tools, ensure_ascii=False, sort_keys=True, separators=(',', ':'), allow_nan=False,
-    ).encode()).hexdigest()
+    evidence.tools.append(
+        {
+            "position": position,
+            "actor": "engineer",
+            "name": name,
+            "arguments_hash": "a" * 64,
+            "status": status,
+            "replay_safe": False,
+            "idempotency_key": hashlib.sha256(
+                f"{RUN}:engineer:{position}:{name}:{'a' * 64}".encode()
+            ).hexdigest(),
+            "artifact_id": str(artifact.id),
+            "artifact_sha256": artifact.content_sha256,
+        }
+    )
+    binding = mutable(evidence.models[-1]["report_binding"])
+    binding["tool_prefix_length"] = len(evidence.tools)
+    binding["tool_prefix_sha256"] = hashlib.sha256(
+        json.dumps(
+            evidence.tools,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode()
+    ).hexdigest()
     return artifact
 
 
-@pytest.mark.parametrize('name', [
-    'read_context', 'project.inspect', 'workspace.read', 'workspace_read', 'workspace.list', 'workspace.search',
-])
+@pytest.mark.parametrize(
+    "name",
+    [
+        "read_context",
+        "project.inspect",
+        "workspace.read",
+        "workspace_read",
+        "workspace.list",
+        "workspace.search",
+    ],
+)
 def test_verified_readonly_tail_keeps_bundle_position_and_full_prefix_binding(name: str) -> None:
     evidence = fixture()
     bundle = evidence.artifacts[1]
     append_tail(evidence, name)
     before = repr(evidence)
     metadata = evidence.metadata()
-    assert metadata['bundle_position'] == 1
-    assert metadata['bundle_artifact_id'] == str(bundle.id)
-    assert metadata['tool_prefix_length'] == 3
-    assert metadata['tool_prefix_sha256'] == hashlib.sha256(json.dumps(
-        evidence.tools, ensure_ascii=False, sort_keys=True, separators=(',', ':'), allow_nan=False,
-    ).encode()).hexdigest()
-    report = evidence.report(metadata=metadata, source_ids=(str(evidence.artifacts[-1].id), str(bundle.id)))
+    assert metadata["bundle_position"] == 1
+    assert metadata["bundle_artifact_id"] == str(bundle.id)
+    assert metadata["tool_prefix_length"] == 3
+    assert (
+        metadata["tool_prefix_sha256"]
+        == hashlib.sha256(
+            json.dumps(
+                evidence.tools,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode()
+        ).hexdigest()
+    )
+    report = evidence.report(
+        metadata=metadata, source_ids=(str(evidence.artifacts[-1].id), str(bundle.id))
+    )
     assert evidence.valid(Artifact.from_payload(report.to_payload()))
     assert repr(evidence) == before
-    evidence.tools[-1]['replay_safe'] = True
+    evidence.tools[-1]["replay_safe"] = True
     assert not evidence.valid(report)
 
 
-@pytest.mark.parametrize('name,status', [
-    ('workspace.list', 'running'), ('workspace.list', 'UNKNOWN'), ('workspace.list', 'failed'),
-    ('workspace.write_text', 'succeeded'), ('project.verify', 'succeeded'),
-    ('workspace.bundle', 'failed'), ('plugin.read', 'succeeded'), ('unknown', 'succeeded'),
-])
+@pytest.mark.parametrize(
+    "name,status",
+    [
+        ("workspace.list", "running"),
+        ("workspace.list", "UNKNOWN"),
+        ("workspace.list", "failed"),
+        ("workspace.write_text", "succeeded"),
+        ("project.verify", "succeeded"),
+        ("workspace.bundle", "failed"),
+        ("plugin.read", "succeeded"),
+        ("unknown", "succeeded"),
+    ],
+)
 def test_unknown_failed_or_mutating_tail_cannot_be_ignored(name: str, status: str) -> None:
     evidence = fixture()
     append_tail(evidence, name, status)
@@ -493,10 +689,17 @@ def test_unknown_failed_or_mutating_tail_cannot_be_ignored(name: str, status: st
         evidence.metadata()
 
 
-@pytest.mark.parametrize('field,value', [
-    ('position', True), ('actor', 'outsider'), ('arguments_hash', 'f' * 64),
-    ('idempotency_key', 'f' * 64), ('artifact_sha256', 'f' * 64), ('artifact_id', str(RUN)),
-])
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("position", True),
+        ("actor", "outsider"),
+        ("arguments_hash", "f" * 64),
+        ("idempotency_key", "f" * 64),
+        ("artifact_sha256", "f" * 64),
+        ("artifact_id", str(RUN)),
+    ],
+)
 def test_readonly_tail_requires_full_receipt_binding(field: str, value: JsonValue) -> None:
     evidence = fixture()
     append_tail(evidence)
@@ -510,18 +713,21 @@ def test_valid_old_report_is_not_rebound_to_a_new_tail_or_truncated_prefix() -> 
     old_report = evidence.report()
     append_tail(evidence)
     assert not evidence.valid(old_report)
-    evidence.models[-1]['report_binding']['tool_prefix_length'] = 2
+    mutable(evidence.models[-1]["report_binding"])["tool_prefix_length"] = 2
     with pytest.raises(ValueError):
         evidence.metadata()
 
 
 def test_legacy_report_binding_id_and_content_hash_remain_unchanged() -> None:
-    identifiers = [UUID(f'00000000-0000-4000-8000-{n:012d}') for n in range(2, 6)]
-    with patch(__name__ + '.uuid4', side_effect=identifiers):
+    identifiers = [UUID(f"00000000-0000-4000-8000-{n:012d}") for n in range(2, 6)]
+    with patch(__name__ + ".uuid4", side_effect=identifiers):
         evidence = fixture()
     report = evidence.report()
-    assert report.id == UUID('f74d9a1f-9cdf-55b4-8007-a8bd2a944560')
-    assert report.content_sha256 == 'dc990ad7da77e0897c7d73e2152513b4c7a07b68cfe6cc7e1312ae0eab33b724'
-    assert report.content['engineering_report']['tool_prefix_sha256'] == (
-        '44ac837261862a2ce70f3a10fd98b1850cffc96fe99d96609518b64c2103b0e9')
+    assert report.id == UUID("f74d9a1f-9cdf-55b4-8007-a8bd2a944560")
+    assert (
+        report.content_sha256 == "dc990ad7da77e0897c7d73e2152513b4c7a07b68cfe6cc7e1312ae0eab33b724"
+    )
+    assert mapping(report.content["engineering_report"])["tool_prefix_sha256"] == (
+        "44ac837261862a2ce70f3a10fd98b1850cffc96fe99d96609518b64c2103b0e9"
+    )
     assert evidence.valid(Artifact.from_payload(report.to_payload()))

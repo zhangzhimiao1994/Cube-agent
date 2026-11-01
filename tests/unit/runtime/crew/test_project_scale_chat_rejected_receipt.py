@@ -20,6 +20,7 @@ from agent_hub.runtime.contracts import EventKind, RunEvent
 from agent_hub.runtime.crew.adapter import CrewDispatchRuntime, RuntimeExecutionError
 from agent_hub.runtime.crew.plan import AgentSpec, DispatchPlan, DispatchStep
 from tests.unit.models.test_gateway import CapacityStub, SecretStub, lease
+from tests.unit.runs.project_auto_repair_typed_fixture import mapping
 from tests.unit.runtime.crew.test_adapter_failure_reason import (
     FakeCapabilities,
     FastFactory,
@@ -164,9 +165,9 @@ async def test_chat_rejected_receipt_accounts_without_execution_or_paid_replay(
             assert receipt["output_status"] == "unknown"
             assert receipt["text_sha256"] is None
         if correctable:
-            repairs = checkpoint.state["structured_repairs"]
+            repairs = mapping(checkpoint.state["structured_repairs"])
             assert len(repairs) == 1
-            repair = next(iter(repairs.values()))
+            repair = mapping(next(iter(repairs.values())))
             assert repair["mode"] == "invalid_tool_correction" and repair["status"] == "rejected"
         else:
             assert checkpoint.state["structured_repairs"] == {}

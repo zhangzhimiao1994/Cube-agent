@@ -2,35 +2,44 @@
 from __future__ import annotations
 
 import json
+import types
 import zipfile
 from dataclasses import replace
 from pathlib import Path
+from typing import Never
 
 import pytest
 
+from agent_hub.capabilities.runtime import RuntimeCapabilityGateway
 from agent_hub.domain.runs import TaskMode
 from agent_hub.models.gateway import GatewayCompletion
 from agent_hub.models.types import ModelRequest, ModelResponse, ToolCall
 from agent_hub.runtime import direct, direct_delivery_report, hybrid_delivery_report
 from agent_hub.runtime.artifacts import InMemoryArtifactRepository
-from agent_hub.runtime.contracts import EventKind
+from agent_hub.runtime.contracts import EventKind, JsonValue
 from agent_hub.runtime.crew.adapter import RuntimeExecutionError as CrewRuntimeExecutionError
 from agent_hub.runtime.crew.delivery_report import final_evidence
 from agent_hub.runtime.direct import DirectRuntime, RuntimeExecutionError
 from agent_hub.runtime.hybrid import HybridRuntime
 from tests.unit.capabilities.test_project_verification import Executor
-from tests.unit.runtime.autogen.test_delivery_report import fixture as discussion_fixture
-from tests.unit.runtime.autogen.test_delivery_report import replace_model
+from tests.unit.runs.final_report_boundaries_typed_fixture import context as crew_context
+from tests.unit.runs.final_report_boundaries_typed_fixture import (
+    replace_model,
+    report_context,
+    responses,
+    subject,
+)
+from tests.unit.runs.reviewed_report_revision_typed_fixture import read_map, string_value
+from tests.unit.runtime.autogen.project_repair_phase_typed_fixture import (
+    fixture as discussion_fixture,
+)
 from tests.unit.runtime.crew.test_adapter_failure_reason import WorkspaceDeliverySequenceGateway
-from tests.unit.runtime.crew.test_delivery_report import context as crew_context
-from tests.unit.runtime.crew.test_delivery_report import responses, subject
 from tests.unit.runtime.crew.test_engineering_delivery_execution import ActualCapabilityHarness
 from tests.unit.runtime.crew.test_framework_parser_boundary import (
     installed_parser,  # noqa: F401
     offline_only,  # noqa: F401
 )
-from tests.unit.runtime.test_direct_final_report import report_context
-from tests.unit.runtime.test_direct_project_verification import FIXED, Model, batch, runner
+from tests.unit.runtime.test_direct_project_verification import FIXED, Backend, Model, batch, runner
 from tests.unit.runtime.test_hybrid import MultiArtifactRuntime, artifact
 
 PLAIN = "已交付项目 ZIP。验证已通过，使用方法见 README；部署尚未验证。请反馈使用情况。"
@@ -66,7 +75,7 @@ CASES = [
 
 
 @pytest.mark.parametrize("text,accepted", CASES)
-def test_discussion_current_report_and_cold_binding_use_whole_body_rule(text, accepted):
+def test_discussion_current_report_and_cold_binding_use_whole_body_rule(text: str, accepted: bool) -> None:
     evidence = discussion_fixture()
     replace_model(evidence, {"text": text})
     if not accepted:
@@ -79,11 +88,11 @@ def test_discussion_current_report_and_cold_binding_use_whole_body_rule(text, ac
 
 
 @pytest.mark.parametrize("defect", [None, "path", "source", "execution", "size"])
-def test_final_model_receives_actual_product_name_not_private_storage(defect):
-    product = {"filename": "receipt-1.0-py3-none-any.whl", "sha256": "a" * 64,
+def test_final_model_receives_actual_product_name_not_private_storage(defect: str | None) -> None:
+    product: dict[str, JsonValue] = {"filename": "receipt-1.0-py3-none-any.whl", "sha256": "a" * 64,
                "size": 123, "source_sha256": "b" * 64, "execution_id": "python_build"}
     verification = {"source_sha256": "b" * 64, "execution_id": "python_build"}
-    delivery = {"python_product": product, "python_product_path": "dist/" + product["filename"],
+    delivery: dict[str, JsonValue] = {"python_product": product, "python_product_path": "dist/" + string_value(product["filename"]),
                 "private_storage_key": "DO_NOT_EXPOSE", "arbitrary": "IGNORE"}
     if defect == "path":
         delivery["python_product_path"] = "/host/private.whl"
@@ -101,7 +110,7 @@ def test_final_model_receives_actual_product_name_not_private_storage(defect):
         assert "DO_NOT_EXPOSE" not in json.dumps(observed)
 
 
-def assert_zip(folder: Path):
+def assert_zip(folder: Path) -> None:
     archives = list(folder.rglob("*.zip"))
     assert archives, "must reach real workspace.bundle, not a parser-only mirror"
     for path in archives:
@@ -111,7 +120,7 @@ def assert_zip(folder: Path):
 
 
 @pytest.mark.parametrize("text,accepted", CASES)
-async def test_direct_native_verified_bundle_report(tmp_path, text, accepted):
+async def test_direct_native_verified_bundle_report(tmp_path: Path, text: str, accepted: bool) -> None:
     ctx = report_context()
     model = Model(batch({"main.py": FIXED, "README.md": "Run main.py.\n"}), text)
     runtime, backend, shared, _ = runner(tmp_path, ctx, model)
@@ -134,8 +143,8 @@ async def test_direct_native_verified_bundle_report(tmp_path, text, accepted):
     assert request.max_output_tokens <= ctx.token_budget - model.usage
     inputs = "\n".join(str(message.content) for message in request.messages)
     evidence = json.loads(inputs.split("<UNTRUSTED_VERIFIED_DELIVERY_JSON>", 1)[1].split("</", 1)[0])
-    assert evidence["verification"]["status"] == "passed"
-    assert len(evidence["verification"]["source_sha256"]) == 64
+    assert read_map(evidence["verification"])["status"] == "passed"
+    assert len(string_value(read_map(evidence["verification"])["source_sha256"])) == 64
     assert_zip(tmp_path / "generated")
     print(f"DIRECT native verify+zip, calls=2, report_error={error!r}")
     if not accepted:
@@ -152,17 +161,19 @@ async def test_direct_native_verified_bundle_report(tmp_path, text, accepted):
 @pytest.mark.parametrize("text", [READ_EXAMPLE, BATCH_EXAMPLE, CATALOG_EXAMPLE, BUNDLE_EXAMPLE],
                          ids=["read-paths", "workspace-batch", "python-catalog", "workspace-bundle"])
 async def test_bound_main_never_parses_or_executes_example_instructions(
-    tmp_path, installed_parser, monkeypatch, mode, text,  # noqa: F811
-):
-    def forbidden(*args, **kwargs):
+    tmp_path: Path, installed_parser: types.ModuleType, monkeypatch: pytest.MonkeyPatch, mode: str, text: str,  # noqa: F811
+) -> None:
+    backend: Backend | RuntimeCapabilityGateway
+
+    def forbidden(*args: object, **kwargs: object) -> Never:
         pytest.fail("bound final report reached generation parsing or a capability")
 
-    def files():
+    def files() -> dict[Path, bytes]:
         return {path.relative_to(tmp_path): path.read_bytes()
                 for path in tmp_path.rglob("*") if path.is_file()}
 
     class BoundaryModel(Model):
-        async def complete_with_context(self, request):
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
             completion = await super().complete_with_context(request)
             if not self.texts:
                 self.before = files()
@@ -203,7 +214,7 @@ async def test_bound_main_never_parses_or_executes_example_instructions(
 
 
 @pytest.mark.parametrize("text,accepted", CASES)
-async def test_crew_native_verified_bundle_report(tmp_path, installed_parser, text, accepted):  # noqa: F811
+async def test_crew_native_verified_bundle_report(tmp_path: Path, installed_parser: types.ModuleType, text: str, accepted: bool) -> None:  # noqa: F811
     ctx = crew_context()
     executor = Executor()
     harness = ActualCapabilityHarness(tmp_path, executor)
@@ -230,12 +241,12 @@ async def test_crew_native_verified_bundle_report(tmp_path, installed_parser, te
     report = next(a for a in created if a.type == "text" and a.producer == "reporter")
     assert report.content["text"] == text
     facts = final_evidence(report, ctx, created)
-    assert facts["verification"]["verification"]["status"] == "passed"
-    assert facts["bundle"]["presentation"] == "final_attachment"
+    assert read_map(read_map(facts["verification"])["verification"])["status"] == "passed"
+    assert read_map(facts["bundle"])["presentation"] == "final_attachment"
 
 
 @pytest.mark.parametrize("text,accepted", CASES)
-async def test_hybrid_native_verified_bundle_main_report(tmp_path, installed_parser, text, accepted):  # noqa: F811
+async def test_hybrid_native_verified_bundle_main_report(tmp_path: Path, installed_parser: types.ModuleType, text: str, accepted: bool) -> None:  # noqa: F811
     base = crew_context()
     ctx = base.model_copy(update={"mode": TaskMode.HYBRID, "routing_decision": {
         **base.routing_decision, "engineering_delivery_contract_version": 1,
@@ -269,26 +280,28 @@ async def test_hybrid_native_verified_bundle_main_report(tmp_path, installed_par
 
 
 @pytest.mark.parametrize("reason", ["completion_missing", "tool_calls", "empty_text", "json_only"])
-async def test_direct_final_rejection_has_finite_reason_without_retry(tmp_path, reason):
-    class RejectedReport(Model):
-        async def complete_with_context(self, request):
-            completion = await super().complete_with_context(request)
-            if len(self.requests) != 2:
-                return completion
-            if reason == "completion_missing":
-                return None
-            response = completion.response
-            if reason == "tool_calls":
-                response = replace(response, tool_calls=(ToolCall(
-                    id="private-key", name="read_context", arguments={"path": "private-path"}),))
-            elif reason == "empty_text":
-                response = replace(response, text=" \n\t")
-            else:
-                response = replace(response, text='{"private-key":"private-provider-text"}')
-            return replace(completion, response=response)
-
+async def test_direct_final_rejection_has_finite_reason_without_retry(tmp_path: Path, reason: str, monkeypatch: pytest.MonkeyPatch) -> None:
     ctx = report_context()
-    model = RejectedReport(batch({"main.py": FIXED}), PLAIN)
+    model = Model(batch({"main.py": FIXED}), PLAIN)
+    original = model.complete_with_context
+
+    async def rejected(request: ModelRequest) -> GatewayCompletion | None:
+        completion = await original(request)
+        if len(model.requests) != 2:
+            return completion
+        if reason == "completion_missing":
+            return None
+        response = completion.response
+        if reason == "tool_calls":
+            response = replace(response, tool_calls=(ToolCall(
+                id="private-key", name="read_context", arguments={"path": "private-path"}),))
+        elif reason == "empty_text":
+            response = replace(response, text=" \n\t")
+        else:
+            response = replace(response, text='{"private-key":"private-provider-text"}')
+        return replace(completion, response=response)
+
+    monkeypatch.setattr(model, "complete_with_context", rejected)
     runtime, backend, _, _ = runner(tmp_path, ctx, model)
     events = []
     with pytest.raises(RuntimeExecutionError) as error:
@@ -301,9 +314,9 @@ async def test_direct_final_rejection_has_finite_reason_without_retry(tmp_path, 
     assert not any(event.kind is EventKind.RUNTIME_COMPLETED for event in events)
 
 
-def test_binding_rejection_uses_finite_reason():
+def test_binding_rejection_uses_finite_reason() -> None:
     ctx = report_context()
-    delivery = {"verification": {"status": "passed"}, "file": {"filename": "project.zip"},
+    delivery: dict[str, JsonValue] = {"verification": {"status": "passed"}, "file": {"filename": "project.zip"},
                 "artifact_id": "native-bundle"}
     request = ModelRequest(logical_model="main", messages=())
     completion = GatewayCompletion(response=ModelResponse(text=""), deployment_id="fixture",

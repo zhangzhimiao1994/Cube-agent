@@ -16,6 +16,7 @@ from agent_hub.capabilities.approvals import (
 from agent_hub.capabilities.generated_project_service import generated_authority
 from agent_hub.runs.repository import RunConflict
 from tests.unit.capabilities.test_python_metadata_preparation import setup
+from tests.unit.runs.conversation_authenticated_input_typed_fixture import mutable
 from tests.unit.runs.test_database_uuid_boundary import _repository_session
 
 
@@ -227,7 +228,7 @@ async def test_metadata_approval_history_names_action_without_private_configurat
     row.version = 2
     if captured: row.routing_decision['generated_project_preparation'] = {}
     events = _public_plugin_approval_events([approval], row)
-    payload = events[0]['payload']
+    payload = mutable(events[0]['payload'])
     assert payload['resource'] == 'workspace/current/project-metadata/python/' + plan.sha256
     assert payload['download_count'] == plan.missing_count and payload['download_bytes'] == plan.missing_bytes
     assert all(secret not in str(events) for secret in ('root_config_sha256', 'catalog_sha256', 'request_sha256'))
@@ -245,7 +246,7 @@ async def test_real_policy_auto_review_keeps_metadata_grant_usable_at_dao() -> N
     )
 
     m, dao, session, row, _, approval, _ = fixture()
-    rows = []
+    rows: list[SimpleNamespace] = []
     session.scalars.return_value = SimpleNamespace(all=lambda: rows)
     dao.get = AsyncMock(return_value=dao._record(row))
 

@@ -14,6 +14,7 @@ from asyncpg.pgproto.pgproto import UUID as DatabaseUUID  # type: ignore[import-
 
 from agent_hub.capabilities.project_contracts import build_project_check_contract
 from agent_hub.capabilities.python_project_lifecycle import PythonProjectTerminalHook
+from tests.unit.capabilities.capability_lifecycle_typed_fixture import UnusedReleaser
 from tests.unit.capabilities.test_python_expired_capacity_oct29 import Session as CapacitySession
 from tests.unit.capabilities.test_python_project_lifecycle import Rows, Session
 from tests.unit.skills.sandbox.test_python_project_client import invocation, reference
@@ -37,7 +38,9 @@ class RetrySession(Session):
     async def scalars(self, query: Any) -> Rows:
         if query.column_descriptions[0]["name"] == "RunRow":
             return Rows([getattr(self, "scan_row", self.row)])
-        return await super().scalars(query)
+        result: object = await super().scalars(query)
+        assert isinstance(result, Rows)
+        return result
 
 
 def driver_row(session: Any) -> None:
@@ -69,7 +72,7 @@ def hook_for(session: Any, calls: list[str]) -> PythonProjectTerminalHook:
                 "tenant_id": tenant, "run_id": run, "source_kind": "original", "install_allowed": False,
             })
 
-    class Executor:
+    class Executor(UnusedReleaser):
         async def release_completed(self, item: Any, *, expected_environment: Any) -> Any:
             assert session.open and item.install_allowed is False
             assert type(item.tenant_id) is UUID and type(item.run_id) is UUID

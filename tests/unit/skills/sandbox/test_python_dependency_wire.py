@@ -9,6 +9,7 @@ from typing import Any
 import pytest
 
 from agent_hub.skills.sandbox import python_dependency_inspection, python_dependency_protocol
+from agent_hub.skills.sandbox.python_project_profile import PythonProjectProfileScope
 from tests.unit.skills.sandbox.test_python_project_profile_wire import serve
 from tests.unit.skills.test_python_dependency_protocol import observation, request
 
@@ -20,7 +21,7 @@ async def test_v8_dispatches_validated_request_after_peer_authorization(monkeypa
         received.append(value)
         assert policy.allowed_uid == 10001
         return python_dependency_protocol.PythonDependencyClosureResponse(
-            scope=python_dependency_protocol.PythonProjectProfileScope.for_invocation(value.invocation), ok=True,
+            scope=PythonProjectProfileScope.for_invocation(value.invocation), ok=True,
             observation=python_dependency_protocol.PythonDependencyClosureObservation(**observation()),
         )
 

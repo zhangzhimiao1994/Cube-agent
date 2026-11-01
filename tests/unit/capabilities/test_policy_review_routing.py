@@ -11,12 +11,17 @@ from agent_hub.auth.models import Role
 from agent_hub.capabilities.defaults import default_capability_policy
 from agent_hub.capabilities.policy import CapabilityPolicy, CapabilityRule, PolicyDecision
 from agent_hub.capabilities.types import CapabilityRequest, PolicyEffect
+from tests.unit.capabilities.permission_modes_typed_fixture import (
+    untrusted_policy,
+    untrusted_request,
+    untrusted_rule,
+)
 
 TENANT = UUID("11111111-1111-4111-8111-111111111111")
 OTHER_TENANT = UUID("22222222-2222-4222-8222-222222222222")
 
 
-def rule(effect: PolicyEffect = PolicyEffect.REQUIRE_APPROVAL, **changes: object) -> CapabilityRule:
+def rule(effect: object = PolicyEffect.REQUIRE_APPROVAL, **changes: object) -> CapabilityRule:
     fields: dict[str, object] = {
         "tenant_id": TENANT,
         "role": Role.OPERATOR,
@@ -27,7 +32,7 @@ def rule(effect: PolicyEffect = PolicyEffect.REQUIRE_APPROVAL, **changes: object
         "effect": effect,
     }
     fields.update(changes)
-    return CapabilityRule(**fields)  # type: ignore[arg-type]
+    return untrusted_rule(fields)
 
 
 def request(**changes: object) -> CapabilityRequest:
@@ -42,7 +47,7 @@ def request(**changes: object) -> CapabilityRequest:
         "run_id": UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"),
     }
     fields.update(changes)
-    return CapabilityRequest(**fields)  # type: ignore[arg-type]
+    return untrusted_request(fields)
 
 
 @pytest.mark.parametrize(
@@ -218,7 +223,7 @@ def test_policy_rejects_tampered_effect_disposition_combination() -> None:
 
 def test_policy_rejects_non_rule_objects() -> None:
     with pytest.raises(ValueError, match="rule"):
-        CapabilityPolicy((object(),))  # type: ignore[arg-type]
+        untrusted_policy((object(),))
 
 
 @pytest.mark.parametrize("value", [True, [], -1, 1 << 128])

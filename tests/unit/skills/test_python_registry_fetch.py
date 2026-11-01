@@ -3,16 +3,27 @@
 from __future__ import annotations
 
 import asyncio
-import importlib
 import json
 from contextvars import ContextVar
+from typing import Never, Unpack
 
 import pytest
 
-from agent_hub.skills.sandbox.base import SkillResult
+from agent_hub.capabilities.tools.http_read import HttpResponse
+from agent_hub.skills.sandbox.base import ProcessLimits, SkillResult
 from agent_hub.skills.sandbox.broker import BrokerPolicy
+from agent_hub.skills.sandbox.python_input_fetch import WheelDownload
 from tests.unit.skills import test_python_registry_read as registry
 from tests.unit.skills import test_python_resolution_store as state_tests
+from tests.unit.skills.resolution_overlay_process_typed_fixture import (
+    NetworkCase,
+    RootStoreCase,
+    RunOptions,
+    configured_worker,
+    object_array,
+    object_map,
+    present,
+)
 
 root_store = state_tests.root_store
 worker_case_fixture = state_tests.worker_case
@@ -22,37 +33,43 @@ QUIET = "LoadState=not-found\nActiveState=inactive\nSubState=dead\nMainPID=0\nCo
 
 
 @pytest.fixture
-async def case(root_store, monkeypatch):
-    worker = importlib.import_module("agent_hub.skills.sandbox.python_resolution_worker")
-    real_factory = worker.RegistryReader
-    c = worker_case_fixture.__wrapped__(root_store, monkeypatch)
+async def case(root_store: RootStoreCase, monkeypatch: pytest.MonkeyPatch) -> NetworkCase:
+    from agent_hub.skills.sandbox import python_resolution_worker as worker
+    from agent_hub.skills.sandbox.python_registry_fetch import BrokerRegistryReader
+
+    real_factory = BrokerRegistryReader
+    assert vars(worker)["RegistryReader"] is real_factory
+    c = NetworkCase(configured_worker(worker_case_fixture, root_store, monkeypatch))
     monkeypatch.setattr(worker, "RegistryReader", real_factory)
-    supply_worker = importlib.import_module("agent_hub.skills.sandbox.python_input_supply_worker")
+    from agent_hub.skills.sandbox import python_input_supply_worker as supply_worker
+
     c.policy = BrokerPolicy()
     c.processes = []
     c.child_reads = []
     c.root_dns = []
     c.fail = None
 
-    async def root_dns(*args, **kwargs):
+    async def root_dns(*args: object, **kwargs: object) -> Never:
         c.root_dns.append(args)
         raise PermissionError("AF_UNIX-only Root cannot resolve AF_INET")
 
     monkeypatch.setattr(asyncio.get_running_loop(), "getaddrinfo", root_dns)
 
     class DNS:
-        async def resolve(self, host):
+        async def resolve(self, host: str) -> list[str]:
             assert child.get(), "Root performed DNS"
             c.child_reads.append(("dns", host))
             return ["93.184.216.34"]
 
     class Wire:
-        async def get(self, url, *, resolved_addresses):
+        async def get(self, url: str, *, resolved_addresses: tuple[str, ...]) -> HttpResponse:
             assert child.get(), "Root performed HTTP"
             c.child_reads.append(("http", url, resolved_addresses))
             return await c.wire.get(url, resolved_addresses=resolved_addresses)
 
-    async def run(command, limits, **kwargs):
+    async def run(
+        command: tuple[str, ...], limits: ProcessLimits, **kwargs: Unpack[RunOptions]
+    ) -> SkillResult:
         c.processes.append((command, limits, kwargs))
         if command[0].endswith("systemd-run"):
             assert "DynamicUser=yes" in command
@@ -61,9 +78,10 @@ async def case(root_store, monkeypatch):
                 "agent_hub.skills.sandbox.python_registry_fetch",
                 "--metadata-worker",
             )
-            module = importlib.import_module("agent_hub.skills.sandbox.python_registry_fetch")
+            from agent_hub.skills.sandbox import python_registry_fetch as module
+
             query = module.MetadataReadRequest.model_validate_json(
-                kwargs["stdin_payload"], strict=True
+                present(kwargs["stdin_payload"]), strict=True
             )
             assert query.deadline <= c.request.claim.monotonic_deadline
             token = child.set(True)
@@ -84,7 +102,9 @@ async def case(root_store, monkeypatch):
     return c
 
 
-async def test_af_unix_root_resolves_only_via_nonroot_fixed_metadata_unit(case):
+async def test_af_unix_root_resolves_only_via_nonroot_fixed_metadata_unit(
+    case: NetworkCase,
+) -> None:
     c = case
     result = await c.worker.execute_resolution(
         c.request, policy=c.policy, root=c.root, supply=c.supply
@@ -94,14 +114,17 @@ async def test_af_unix_root_resolves_only_via_nonroot_fixed_metadata_unit(case):
     assert len([r for r in c.child_reads if r[0] == "http"]) == 4
     assert len([r for r in c.processes if r[0][0].endswith("systemd-run")]) == 4
     assert c.processes[-1][0][1] == "show"
-    assert {w["candidate"]["download"]["name"] for w in result.descriptor["wheels"]} == {
+    assert {
+        object_map(object_map(object_map(w)["candidate"])["download"])["name"]
+        for w in object_array(present(result.descriptor)["wheels"])
+    } == {
         "demo",
         "helper",
     }
 
 
 @pytest.mark.parametrize("fault", ["spoof", "url"])
-async def test_child_stdout_is_bounded_data_not_a_grant(case, fault):
+async def test_child_stdout_is_bounded_data_not_a_grant(case: NetworkCase, fault: str) -> None:
     c = case
     c.fail = fault
     with pytest.raises(ValueError):
@@ -110,8 +133,9 @@ async def test_child_stdout_is_bounded_data_not_a_grant(case, fault):
     assert c.store.inspect(c.request.key, c.request.claim).state == "unknown"
 
 
-async def test_original_budget_is_shared_across_child_reads(case):
-    module = importlib.import_module("agent_hub.skills.sandbox.python_registry_fetch")
+async def test_original_budget_is_shared_across_child_reads(case: NetworkCase) -> None:
+    from agent_hub.skills.sandbox import python_registry_fetch as module
+
     p = registry.api()[0]
     c = case
     reader = module.BrokerRegistryReader(c.request, c.policy, c.root, c.supply)
@@ -140,10 +164,13 @@ async def test_original_budget_is_shared_across_child_reads(case):
         {"approved": True},
     ],
 )
-def test_metadata_worker_request_rejects_arbitrary_target_or_grant(values):
+def test_metadata_worker_request_rejects_arbitrary_target_or_grant(
+    values: dict[str, object],
+) -> None:
     import time
 
-    module = importlib.import_module("agent_hub.skills.sandbox.python_registry_fetch")
+    from agent_hub.skills.sandbox import python_registry_fetch as module
+
     with pytest.raises(ValueError):
         module.MetadataReadRequest.model_validate(
             {"name": "demo", "version": None, "maximum": 1024, "deadline": time.monotonic() + 1}
@@ -152,19 +179,23 @@ def test_metadata_worker_request_rejects_arbitrary_target_or_grant(values):
         )
 
 
-async def test_metadata_cancel_drains_its_existing_fetch_unit(case, monkeypatch):
+async def test_metadata_cancel_drains_its_existing_fetch_unit(
+    case: NetworkCase, monkeypatch: pytest.MonkeyPatch
+) -> None:
     from agent_hub.skills.sandbox import python_input_supply_worker as supply_worker
+    from agent_hub.skills.sandbox import python_registry_fetch as module
 
-    module = importlib.import_module("agent_hub.skills.sandbox.python_registry_fetch")
     c = case
     entered = asyncio.Event()
-    commands = []
+    commands: list[tuple[str, ...]] = []
 
-    async def run(command, limits, **kwargs):
+    async def run(
+        command: tuple[str, ...], limits: ProcessLimits, **kwargs: Unpack[RunOptions]
+    ) -> SkillResult:
         commands.append(command)
         if command[0].endswith("systemd-run"):
             entered.set()
-            await asyncio.Future()
+            await asyncio.Future[None]()
         return SkillResult(exit_code=0, stdout=QUIET, stderr="", timed_out=False)
 
     monkeypatch.setattr(supply_worker, "run_subprocess_with_limits", run)
@@ -185,10 +216,11 @@ async def test_metadata_cancel_drains_its_existing_fetch_unit(case, monkeypatch)
     assert set(asyncio.all_tasks()) == before
 
 
-async def test_expired_original_budget_never_starts_metadata_unit(case):
+async def test_expired_original_budget_never_starts_metadata_unit(case: NetworkCase) -> None:
     import time
 
-    module = importlib.import_module("agent_hub.skills.sandbox.python_registry_fetch")
+    from agent_hub.skills.sandbox import python_registry_fetch as module
+
     c = case
     reader = module.BrokerRegistryReader(c.request, c.policy, c.root, c.supply)
     budget = registry.api()[0].ResolutionBudget(
@@ -199,22 +231,25 @@ async def test_expired_original_budget_never_starts_metadata_unit(case):
     assert c.processes == [] and c.root_dns == []
 
 
-async def test_legacy_wheel_fetch_keeps_original_batch_command_and_payload(case, monkeypatch):
+async def test_legacy_wheel_fetch_keeps_original_batch_command_and_payload(
+    case: NetworkCase, monkeypatch: pytest.MonkeyPatch
+) -> None:
     import base64
 
     from agent_hub.skills.sandbox import python_input_supply_worker as supply_worker
-    from agent_hub.skills.sandbox.python_input_fetch import WheelDownload
 
     c = case
     row, raw = registry.wheel("legacy")
     entry = WheelDownload(
         row["filename"], "legacy", "1.0", row["digests"]["sha256"], len(raw), row["url"]
     )
-    launched = []
+    launched: list[tuple[tuple[str, ...], dict[str, object]]] = []
 
-    async def run(command, limits, **kwargs):
+    async def run(
+        command: tuple[str, ...], limits: ProcessLimits, **kwargs: Unpack[RunOptions]
+    ) -> SkillResult:
         if command[0].endswith("systemd-run"):
-            launched.append((command, json.loads(kwargs["stdin_payload"])))
+            launched.append((command, json.loads(present(kwargs["stdin_payload"]))))
             return SkillResult(
                 exit_code=0,
                 stdout=json.dumps(
@@ -247,23 +282,24 @@ async def test_legacy_wheel_fetch_keeps_original_batch_command_and_payload(case,
     assert command[-2:] == ("agent_hub.skills.sandbox.python_input_fetch", "--worker-batch")
     assert (
         set(payload) == {"artifacts", "timeout_seconds"}
-        and payload["artifacts"][0]["sha256"] == entry.sha256
+        and object_map(object_array(payload["artifacts"])[0])["sha256"] == entry.sha256
     )
 
 
-async def test_child_metadata_uses_exact_original_deadline_and_rejects_private_dns():
+async def test_child_metadata_uses_exact_original_deadline_and_rejects_private_dns() -> None:
     import time
 
-    module = importlib.import_module("agent_hub.skills.sandbox.python_registry_fetch")
+    from agent_hub.skills.sandbox import python_registry_fetch as module
+
     deadline = time.monotonic() + 1
     query = module.MetadataReadRequest(name="demo", maximum=1024, deadline=deadline)
 
     class PrivateDNS:
-        async def resolve(self, host):
+        async def resolve(self, host: str) -> list[str]:
             return ["127.0.0.1"]
 
     class Wire:
-        async def get(self, *args, **kwargs):
+        async def get(self, *args: object, **kwargs: object) -> HttpResponse:
             raise AssertionError("private DNS reached HTTP")
 
     with pytest.raises(ValueError, match="registry_dns"):

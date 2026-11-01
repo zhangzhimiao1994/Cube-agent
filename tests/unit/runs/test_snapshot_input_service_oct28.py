@@ -14,13 +14,14 @@ from typing import Any, cast
 from uuid import UUID, uuid4
 
 import pytest
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from agent_hub.auth.models import Role
 from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.harness.types import HarnessToolCallRequest
 from agent_hub.runs import service as service_module
 from agent_hub.runs.conversation_inputs import STATE, VERSION, ConversationInputs
-from agent_hub.runs.repository import ConversationContextItem, RunRepository
+from agent_hub.runs.repository import ConversationContextItem, RunRecord, RunRepository
 from agent_hub.runs.service import RunService
 from agent_hub.runtime.action_continuation import read_action_continuation
 from agent_hub.runtime.action_direct import _binding, _tighten_budgets
@@ -38,50 +39,63 @@ from agent_hub.runtime.defaults import UnavailableRuntime
 from agent_hub.runtime.direct import RuntimeExecutionError
 from agent_hub.runtime.instruction_context import InstructionContextLoader
 from agent_hub.runtime.registry import RuntimeRegistry
+from tests.unit.runs.conversation_authenticated_input_typed_fixture import (
+    LockSession,
+    UnexpectedQueue,
+    mutable,
+    present,
+)
+from tests.unit.runs.delivery_context_revision_typed_fixture import DeliveryRecord
+from tests.unit.runs.project_auto_repair_typed_fixture import RepairRepository
+from tests.unit.runs.snapshot_approval_types_fixture import number, record
 from tests.unit.runs.test_conversation_inputs_oct28 import MemoryRuns
+from tests.unit.runs.test_delivery_context_oct28 import Repository as DeliveryRepository
 from tests.unit.runs.test_delivery_context_oct28 import fixture as delivery_fixture
 from tests.unit.runs.test_delivery_context_oct28 import view
-from tests.unit.runs.test_terminal_hooks import ExecutableFakeRepository
 
 OLD = '8c79e1e987cc3a1f743130c2403ef61bf4967717'
 CHANGED = b'# Updated usage\npython -m demo --format ndjson\n'
 
 
-class HistoryRuns(MemoryRuns, ExecutableFakeRepository):
+class HistoryRuns(RepairRepository):
     """Reuse Boole row locks and existing execute transport; no SQL/network."""
-    def __init__(self, delivery: Any, current: Any, source: Any) -> None:
-        ExecutableFakeRepository.__init__(self, routing_decision={})
-        MemoryRuns.__init__(self)
+    def __init__(self, delivery: DeliveryRepository, current: DeliveryRecord | RunRecord, source: DeliveryRecord) -> None:
+        super().__init__(routing_decision={})
+        memory = MemoryRuns()
+        self.row, self.lock = memory.row, memory.lock
         self.row.id, self.row.tenant_id, self.row.actor_id = current.id, current.tenant_id, current.actor_id
         self.row.mode, self.row.request, self.row.created_at = 'direct', current.request, current.created_at
-        self.row.routing_decision = {**current.routing_decision, VERSION: 1, 'permission_mode': 'read_only'}
+        self.row.routing_decision = {**present(current.routing_decision), VERSION: 1, 'permission_mode': 'read_only'}
         self.run_id, self.delivery, self.source = current.id, delivery, source
         self.history_reads = 0
         self.raw_reads: list[UUID] = []
 
-    def _record(self) -> Any:
-        return RunRepository._record(self.row)
+    async def run_transaction(self) -> AsyncSession:
+        return LockSession(self.lock)
 
-    async def get(self, tenant_id: UUID, run_id: UUID) -> Any:
+    async def get(self, tenant_id: UUID, run_id: UUID, *, actor_id: UUID | None = None) -> RunRecord:
         assert tenant_id == self.row.tenant_id
-        return self._record() if run_id == self.row.id else await self.delivery.get(tenant_id, run_id)
+        return RunRepository._record(self.row) if run_id == self.row.id else record(await self.delivery.get(tenant_id, run_id))
 
     async def raw_events(self, tenant_id: UUID, run_id: UUID) -> tuple[RunEvent, ...]:
         self.raw_reads.append(run_id)
         assert tenant_id == self.row.tenant_id
         return tuple(self.event_log) if run_id == self.row.id else await self.delivery.raw_events(tenant_id, run_id)
 
-    async def conversation_context(self, tenant_id: UUID, conversation_id: str, **kwargs: Any) -> tuple[ConversationContextItem, ...]:
-        assert tenant_id == self.row.tenant_id and conversation_id == self.row.routing_decision['conversation_id']
-        assert kwargs['before_run_id'] == self.row.id
+    async def conversation_context(self, tenant_id: UUID, conversation_id: str, *,
+        before_run_id: UUID, limit: int | None = 32, query: str | None = None,
+        candidate_limit: int | None = None,
+    ) -> tuple[ConversationContextItem, ...]:
+        assert tenant_id == self.row.tenant_id and conversation_id == mutable(self.row.routing_decision)['conversation_id']
+        assert before_run_id == self.row.id
         self.history_reads += 1
         return (ConversationContextItem(self.source.id, self.source.request,
             ({'type': 'text', 'producer': 'main', 'content': {'text': 'Prior report.'}},)),)
 
 
 def service(runs: HistoryRuns, artifacts: InMemoryArtifactRepository, root: Path) -> RunService:
-    return RunService(cast(RunRepository, runs), runtime_registry=RuntimeRegistry((UnavailableRuntime(TaskMode.DIRECT),)),
-        router=None, task_queue=cast(Any, object()), worker_id=runs.row.worker_id,
+    return RunService(runs, runtime_registry=RuntimeRegistry((UnavailableRuntime(TaskMode.DIRECT),)),
+        router=None, task_queue=UnexpectedQueue(), worker_id=runs.row.worker_id,
         conversation_artifact_repository=artifacts,
         instruction_context_loader=InstructionContextLoader(repository=runs, project_root=root))
 
@@ -101,6 +115,7 @@ def case(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Case:
     runs = HistoryRuns(delivery, current, source)
     # Only the inherited in-memory execute transport uses this fixed fixture constant.
     monkeypatch.setattr('tests.unit.runs.test_terminal_hooks.TENANT_ID', current.tenant_id)
+    monkeypatch.setattr('tests.unit.runs.project_auto_repair_typed_fixture.TENANT_ID', current.tenant_id)
     artifacts = InMemoryArtifactRepository()
     return Case(runs, artifacts, service(runs, artifacts, tmp_path), tmp_path,
         tmp_path / str(current.tenant_id) / 'projects/demo/sessions/session-a/README.md')
@@ -111,12 +126,12 @@ async def inputs(case: Case, checkpoint: RuntimeCheckpoint | None = None) -> Con
     return await case.service._runtime_context_inputs(tenant_id=row.tenant_id, run_id=row.id,
         actor_id=row.actor_id, actor_role=Role.OPERATOR, mode=TaskMode.DIRECT,
         execution_token=row.worker_lease_token, current_request=row.request,
-        routing_decision=dict(row.routing_decision), runtime_token_budget=1_000_000, checkpoint=checkpoint)
+        routing_decision=dict(mutable(row.routing_decision)), runtime_token_budget=1_000_000, checkpoint=checkpoint)
 
 
 def context(case: Case, prepared: ConversationInputs, checkpoint: RuntimeCheckpoint | None = None) -> TaskContext:
     row = case.runs.row
-    route = dict(row.routing_decision)
+    route = dict(mutable(row.routing_decision))
     if prepared.snapshot is not None:
         route[STATE] = prepared.snapshot
     return TaskContext(tenant_id=row.tenant_id, run_id=row.id, actor_id=row.actor_id,
@@ -160,14 +175,14 @@ async def test_same_run_keeps_first_readme_history_and_real_action_sources(case:
     first = await inputs(case)
     original = context(case, first)
     before = historical(first.artifacts)
-    assert view((before,))['readme']['status'] == 'same_as_delivery'
-    assert _encode(original.routing_decision[STATE]) == _encode(first.snapshot) == _encode(case.runs.row.routing_decision[STATE])
+    assert mutable(view((before,))['readme'])['status'] == 'same_as_delivery'
+    assert _encode(original.routing_decision[STATE]) == _encode(first.snapshot) == _encode(mutable(case.runs.row.routing_decision)[STATE])
     checkpoint = await action_checkpoint(case, original, raw_source)
     case.readme.write_bytes(CHANGED)
     fresh = await case.service._conversation_artifacts(tenant_id=original.tenant_id, run_id=original.run_id,
         current_request=original.request, routing_decision=original.routing_decision, runtime_token_budget=1_000_000)
     assert historical(fresh).id != before.id and historical(fresh).content != before.content
-    assert view((historical(fresh),))['readme']['status'] == 'changed'
+    assert mutable(view((historical(fresh),))['readme'])['status'] == 'changed'
     reads = case.runs.history_reads
     publish_checkpoint(case, checkpoint)
     case.runs.row.worker_id, case.runs.row.worker_lease_token = 'worker-b', uuid4()
@@ -225,13 +240,13 @@ async def test_frozen_history_does_not_bypass_current_inspection_event_scope_che
 
 
 async def test_legacy_unmarked_wrapper_reads_live_history_each_time(case: Case) -> None:
-    case.runs.row.routing_decision.pop(VERSION)
+    mutable(case.runs.row.routing_decision).pop(VERSION)
     first = await inputs(case)
-    assert first.snapshot is None and STATE not in case.runs.row.routing_decision
+    assert first.snapshot is None and STATE not in mutable(case.runs.row.routing_decision)
     case.readme.write_bytes(CHANGED)
     row = case.runs.row
     fresh = await case.service._runtime_context_artifacts(tenant_id=row.tenant_id, run_id=row.id,
-        current_request=row.request, routing_decision=row.routing_decision, runtime_token_budget=1_000_000,
+        current_request=row.request, routing_decision=mutable(row.routing_decision), runtime_token_budget=1_000_000,
         checkpoint=None)
     assert historical(fresh).id != historical(first.artifacts).id and case.runs.history_reads == 2
 
@@ -242,11 +257,11 @@ async def test_new_run_captures_current_readme_instead_of_previous_run_snapshot(
     next_row = await case.runs.get(case.runs.row.tenant_id, case.runs.row.id)
     runs = HistoryRuns(case.runs.delivery, next_row, case.runs.source)
     runs.row.id = runs.run_id = uuid4()
-    runs.row.routing_decision.pop(STATE, None)
+    mutable(runs.row.routing_decision).pop(STATE, None)
     next_case = Case(runs, case.artifacts, service(runs, case.artifacts, case.root), case.root, case.readme)
     fresh = await inputs(next_case)
     assert fresh.snapshot != first.snapshot and runs.history_reads == 1
-    assert view((historical(fresh.artifacts),))['readme']['status'] == 'changed'
+    assert mutable(view((historical(fresh.artifacts),))['readme'])['status'] == 'changed'
 
 
 class ContextProbe:
@@ -269,14 +284,14 @@ async def test_actual_execute_first_task_context_already_contains_persisted_snap
     result = await case.service.execute(case.runs.row.id)
     assert result.status is RunStatus.COMPLETED
     assert probe.seen is not None and STATE in probe.seen.routing_decision
-    assert _encode(probe.seen.routing_decision[STATE]) == _encode(case.runs.row.routing_decision[STATE])
+    assert _encode(probe.seen.routing_decision[STATE]) == _encode(mutable(case.runs.row.routing_decision)[STATE])
     assert historical(probe.seen.artifacts).producer == 'historical_delivery_evidence'
 
 
 async def test_snapshot_restore_time_is_charged_after_saved_total_cap(
     case: Case, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    case.runs.row.routing_decision['runtime_timeout_seconds'] = 3600
+    mutable(case.runs.row.routing_decision)['runtime_timeout_seconds'] = 3600
     first = await inputs(case)
     original = context(case, first).model_copy(update={'timeout_seconds': 3500.0})
     saved = await action_checkpoint(case, original)
@@ -287,7 +302,9 @@ async def test_snapshot_restore_time_is_charged_after_saved_total_cap(
     claim = case.runs.claim_for_execution
 
     async def restore_claim(*args: Any, **kwargs: Any) -> Any:
-        row, _ = await claim(*args, **kwargs)
+        claimed = await claim(*args, **kwargs)
+        assert not isinstance(claimed, RunRecord)
+        row, _ = claimed
         return row, saved
 
     class RestoreProbe(ContextProbe):
@@ -314,7 +331,7 @@ async def test_snapshot_restore_time_is_charged_after_saved_total_cap(
     assert result.status is RunStatus.COMPLETED and probe.seen is not None
     assert probe.seen.timeout_seconds == 3490.0
     narrowed = _tighten_budgets(original, probe.seen)
-    assert narrowed.timeout_seconds - saved.state['elapsed_seconds'] == 2490.0
+    assert narrowed.timeout_seconds - number(saved.state['elapsed_seconds']) == 2490.0
     assert probe.seen.checkpoint == saved and original.timeout_seconds == 3500.0
     assert probe.seen.token_budget == 1_000_000
     assert _encode(probe.seen.routing_decision[STATE]) == _encode(first.snapshot)
@@ -340,7 +357,7 @@ def old_inputs() -> Any:
 async def test_8c_negative_control_readme_drift_rejects_real_continuation_sources(case: Case, old_inputs: Any) -> None:
     row = case.runs.row
     kwargs = {'tenant_id': row.tenant_id, 'run_id': row.id, 'current_request': row.request,
-        'routing_decision': dict(row.routing_decision), 'runtime_token_budget': 1_000_000, 'checkpoint': None}
+        'routing_decision': dict(mutable(row.routing_decision)), 'runtime_token_budget': 1_000_000, 'checkpoint': None}
     first = await old_inputs(case.service, **kwargs)
     original = context(case, ConversationInputs(first, None))
     checkpoint = await action_checkpoint(case, original)

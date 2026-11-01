@@ -17,6 +17,7 @@ from agent_hub.models.types import (
 )
 from agent_hub.runtime.crew.context_window import fit_request
 from agent_hub.runtime.crew.native_history import tool_result_messages
+from tests.unit.runs.project_auto_repair_typed_fixture import json_map, string
 from tests.unit.runtime.crew.test_native_tool_continuation import native
 
 
@@ -47,7 +48,7 @@ def test_json_feedback_fits_actual_tokens_without_changing_contract() -> None:
                        ModelMessage('user', 'Validate the actual project.'),
                        feedback('older'), feedback('latest'))
     gateway = Window(13000)
-    assert sum(len(m.content.encode()) for m in original.messages) < 13000 * 4 * 3 // 4
+    assert sum(len(string(m.content).encode()) for m in original.messages) < 13000 * 4 * 3 // 4
     assert gateway.estimate_input_tokens(original) >= 13000
     fitted = fit_request(original, gateway)
     assert gateway.estimate_input_tokens(fitted) < 13000
@@ -63,7 +64,7 @@ def test_schema_and_tools_are_part_of_the_same_estimate() -> None:
         required_capabilities=frozenset({ModelCapability.STRUCTURED_OUTPUT, ModelCapability.TOOL_CALLING}),
         tools=(ToolDefinition(name='read_context', description='Inspect evidence',
                               parameters={'type':'object','properties':{'query':{'type':'string'}}}),),
-        response_schema=StructuredResponseSchema(name='result', schema={'type':'object','properties':{'result':{'type':'string'}},'required':['result']}))
+        response_schema=StructuredResponseSchema(name='result', schema=json_map({'type':'object','properties':{'result':{'type':'string'}},'required':['result']})))
     gateway = Window(7000)
     assert gateway.estimate_input_tokens(original) >= 7000
     fitted = fit_request(original, gateway)

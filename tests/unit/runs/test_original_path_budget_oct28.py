@@ -19,10 +19,10 @@ from agent_hub.runs.project_inputs import python_original_source_index
 from agent_hub.runtime.contracts import Artifact
 from agent_hub.runtime.python_project_history import _files
 from agent_hub.skills.sandbox.project import ProjectInvocation
+from tests.unit.runs.conversation_authenticated_input_typed_fixture import mutable, run
 from tests.unit.runs.test_automatic_project_inputs_oct28 import (
     STATE,
     memory_threads,  # noqa: F401
-    run,
     selector,
 )
 
@@ -46,7 +46,7 @@ async def test_real_large_original_selection_snapshot_and_history_keep_exact_fil
     assert 'tests/test_original.py' not in selection.editable_paths
     assert 'src/config.py' not in selection.editable_paths
     assert 'src/ticket_summary/__init__.py' not in selection.editable_paths
-    assert repository.row.routing_decision[STATE]['kind'] == 'original'
+    assert mutable(mutable(repository.row.routing_decision)[STATE])['kind'] == 'original'
     before = repository.row.version
     restored = await preparer.select_existing(selected)
     assert restored.routing_decision == selected.routing_decision and repository.row.version == before
@@ -127,7 +127,7 @@ def test_context_node_budget_blocks_before_selected_state_is_committed(
     with pytest.raises(RuntimeError, match='automatic project'):
         run(preparer.select_existing(context))
     assert calls == [True, True]
-    assert repository.row.routing_decision[STATE]['kind'] == 'blocked'
-    assert repository.row.routing_decision[STATE]['reason'] == 'scope_limit'
-    assert 'editable_paths' not in repository.row.routing_decision[STATE]
-    assert 'project_input' not in repository.row.routing_decision
+    assert mutable(mutable(repository.row.routing_decision)[STATE])['kind'] == 'blocked'
+    assert mutable(mutable(repository.row.routing_decision)[STATE])['reason'] == 'scope_limit'
+    assert 'editable_paths' not in mutable(mutable(repository.row.routing_decision)[STATE])
+    assert 'project_input' not in mutable(repository.row.routing_decision)

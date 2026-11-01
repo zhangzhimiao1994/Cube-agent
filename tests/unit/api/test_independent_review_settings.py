@@ -7,7 +7,7 @@ import socket
 from copy import deepcopy
 from dataclasses import FrozenInstanceError
 from types import SimpleNamespace
-from typing import Any
+from typing import Literal, Never
 from uuid import UUID
 
 import pytest
@@ -17,6 +17,9 @@ from starlette.requests import Request
 
 from agent_hub.api.routers import admin
 from agent_hub.capabilities.review_contracts import ApprovalReviewConfig
+from agent_hub.models.litellm_client import LiteLLMClient
+
+type SettingsModel = type[admin.SystemSettingsRequest | admin.SystemSettingsResponse]
 
 RULES: dict[str, object] = {
     "schema_version": 1,
@@ -45,20 +48,22 @@ MODEL: dict[str, object] = {
 
 @pytest.fixture(autouse=True)
 def forbid_network_and_provider(monkeypatch: pytest.MonkeyPatch) -> None:
-    def forbidden(*args: object, **kwargs: object) -> Any:
+    def forbidden(*args: object, **kwargs: object) -> Never:
         raise AssertionError("settings must not perform network/provider I/O")
 
     monkeypatch.setattr(socket, "create_connection", forbidden)
     # Windows asyncio creates a loopback socketpair before each async test.
     # Block outbound name resolution without breaking that event-loop primitive.
     monkeypatch.setattr(socket, "getaddrinfo", forbidden)
-    monkeypatch.setattr(admin.LiteLLMClient, "complete", forbidden)
+    monkeypatch.setattr(LiteLLMClient, "complete", forbidden)
     monkeypatch.setattr(admin, "probe_execution_backends", forbidden)
 
 
 @pytest.mark.parametrize("model", [admin.SystemSettingsRequest, admin.SystemSettingsResponse])
 @pytest.mark.parametrize("payload", [{}, {"tool_approval_mode": "auto_review"}])
-def test_missing_review_stays_complete_rules(model: Any, payload: dict[str, object]) -> None:
+def test_missing_review_stays_complete_rules(
+    model: SettingsModel, payload: dict[str, object]
+) -> None:
     settings = model.model_validate(payload)
     assert settings.model_dump(mode="json")["approval_review"] == RULES
     assert isinstance(settings.approval_review, ApprovalReviewConfig)
@@ -66,7 +71,7 @@ def test_missing_review_stays_complete_rules(model: Any, payload: dict[str, obje
 
 @pytest.mark.parametrize("model", [admin.SystemSettingsRequest, admin.SystemSettingsResponse])
 @pytest.mark.parametrize("review", [{}, None, MODEL])
-def test_canonical_roundtrip_uses_task1(model: Any, review: object) -> None:
+def test_canonical_roundtrip_uses_task1(model: SettingsModel, review: object) -> None:
     settings = model.model_validate({"approval_review": review})
     expected = ApprovalReviewConfig.from_payload(review).to_payload()
     assert settings.approval_review.to_payload() == expected
@@ -121,7 +126,7 @@ def test_canonical_roundtrip_uses_task1(model: Any, review: object) -> None:
 )
 @pytest.mark.parametrize("model", [admin.SystemSettingsRequest, admin.SystemSettingsResponse])
 def test_review_rejects_coercion_extra_and_invalid_model_parameters(
-    model: Any, review: object
+    model: SettingsModel, review: object
 ) -> None:
     with pytest.raises(ValidationError) as exc:
         model.model_validate({"approval_review": review})
@@ -147,7 +152,8 @@ def test_input_and_serialized_output_do_not_alias_review_config() -> None:
     settings.approval_review.to_payload()["max_input_tokens"] = 999
     assert settings.approval_review.to_payload() == MODEL
     with pytest.raises(FrozenInstanceError):
-        settings.approval_review.engine = "rules"
+        field = "engine"
+        setattr(settings.approval_review, field, "rules")
 
 
 @pytest.mark.parametrize(("review", "reason"), [({}, "rules_only"), (MODEL, "runtime_not_ready")])
@@ -167,7 +173,9 @@ def test_request_cannot_forge_response_only_readiness(readiness: object) -> None
 
 
 @pytest.mark.parametrize("mode", ["validation", "serialization"])
-def test_schema_exposes_nested_contract_without_provider_fields(mode: Any) -> None:
+def test_schema_exposes_nested_contract_without_provider_fields(
+    mode: Literal["validation", "serialization"],
+) -> None:
     schema = admin.SystemSettingsRequest.model_json_schema(mode=mode)
     review = schema["properties"]["approval_review"]
     if mode == "validation":
@@ -190,7 +198,9 @@ def test_schema_exposes_nested_contract_without_provider_fields(mode: Any) -> No
 
 
 @pytest.mark.parametrize("model", [admin.SystemSettingsRequest, admin.SystemSettingsResponse])
-def test_nullable_schema_matches_codec_and_serializes_canonical_object(model: Any) -> None:
+def test_nullable_schema_matches_codec_and_serializes_canonical_object(
+    model: SettingsModel,
+) -> None:
     incoming = {"approval_review": None}
     Draft202012Validator(model.model_json_schema(mode="validation")).validate(incoming)
     outgoing = model.model_validate(incoming).model_dump(mode="json")
@@ -266,7 +276,15 @@ class StoredSettingsService(admin.PersistentAdminResourceService):
         self.payload = json.loads(json.dumps(payload))
         return True
 
-    async def _record_audit(self, action: str, resource: str, details: dict[str, Any]) -> None:
+    async def _record_audit(
+        self,
+        action: str,
+        resource: str,
+        payload: dict[str, object] | None = None,
+        *,
+        actor_id: UUID | None = None,
+        tenant_id: UUID | None = None,
+    ) -> None:
         assert (action, resource) == ("settings.update", "settings:system")
 
 

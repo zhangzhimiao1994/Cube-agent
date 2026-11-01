@@ -3,15 +3,29 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any, cast
 
-from jsonschema import SchemaError  # type: ignore[import-untyped]
-from jsonschema.protocols import Validator  # type: ignore[import-untyped]
-from jsonschema.validators import validator_for  # type: ignore[import-untyped]
+from jsonschema import Draft4Validator, Draft202012Validator, SchemaError
+from jsonschema.protocols import Validator
+from jsonschema.validators import validator_for
 
 from agent_hub.runtime.contracts import JsonValue, _mutable_json
 
 
 class PluginSchemaError(ValueError):
     """Raised when plugin-provided JSON Schema is unsafe or invalid."""
+
+
+def known_schema_validator(schema: Mapping[str, JsonValue] | bool) -> type[Validator] | None:
+    """Resolve only registered dialects, without falling back for an unknown URI.
+
+    jsonschema supports a None default at runtime but its public type signature
+    requires a validator class. Two distinct class defaults preserve that lookup
+    semantics without depending on its private registry or discarding type checks.
+    """
+    selected = validator_for(schema, default=Draft4Validator)
+    if selected is not Draft4Validator:
+        return selected
+    confirmed = validator_for(schema, default=Draft202012Validator)
+    return selected if confirmed is Draft4Validator else None
 
 
 def plugin_schema_validator(

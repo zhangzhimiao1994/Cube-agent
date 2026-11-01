@@ -14,29 +14,37 @@ import json
 import os
 import re
 import sys
+from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from decimal import Decimal
-from types import SimpleNamespace
-from uuid import uuid4
+from pathlib import Path
+from typing import Unpack
+from uuid import UUID, uuid4
 
 import httpx
 import pytest
+from redis.asyncio import Redis
 from sqlalchemy import select
 
+from agent_hub.api.routers.runs import CreateRunRequest
 from agent_hub.auth.models import AuthenticatedPrincipal, Role
 from agent_hub.capabilities.defaults import build_runtime_capability_stack
+from agent_hub.config.repository import ConfigRevision
 from agent_hub.db.models import RunAdmissionAttemptRow, RunReviewEventRow, RunReviewIntentRow
 from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.files.workspace import ProjectWorkspaceStore
+from agent_hub.harness.types import HarnessToolCallRequest, HarnessToolCallResult
 from agent_hub.models.litellm_client import LiteLLMClient
 from agent_hub.models.physical_admission import _call as physical_call
+from agent_hub.models.physical_budget import _BudgetAdmission
 from agent_hub.models.run_admission_repository import RunAdmissionRepository
+from agent_hub.models.types import Deployment
 from agent_hub.runs.authorization import _capture_authenticated_input
 from agent_hub.runs.repository import RunRecord
 from agent_hub.runs.service import _project_delivery_assessment
 from agent_hub.runs.workspace import workspace_selection
 from agent_hub.runtime.artifacts import InMemoryArtifactRepository
-from agent_hub.runtime.contracts import Artifact, EventKind, TaskContext
+from agent_hub.runtime.contracts import Artifact, EventKind, RunEvent, TaskContext, _freeze_object
 from agent_hub.runtime.defaults import ConfigBackedDirectRuntime
 from agent_hub.runtime.direct import DirectRuntime, RuntimeExecutionError
 from agent_hub.runtime.review_assembly import runtime_source_fingerprint
@@ -44,7 +52,19 @@ from agent_hub.runtime.streams import closing_runtime_events
 from tests.integration.capabilities.test_review_repository import (
     database_url as database_url,  # noqa: PLC0414
 )
+from tests.integration.models.run_admission_typed_fixture import Storage
 from tests.integration.models.test_run_admission import storage as storage  # noqa: PLC0414
+from tests.integration.runtime.review_actions_typed_fixture import (
+    AccountingRow,
+    AccountingSent,
+    ConfigFixture,
+    InvokeArguments,
+    NoteWireCase,
+    NoteWireRecord,
+    PurposeAccountingSent,
+    WireOwner,
+    config_revision,
+)
 from tests.integration.runtime.test_model_review_modes import (
     capacity_is_clean,
     collect,
@@ -60,6 +80,8 @@ from tests.integration.runtime.test_model_review_modes_helper import (
     fixture_platform,
     submitted_input_scope,
 )
+from tests.unit.harness.review_typed_fixture import present
+from tests.unit.runs.project_auto_repair_typed_fixture import mapping, sequence, string
 from tests.unit.runtime.test_plain_file_action_helper import (
     LocalCapacityBoundary,
     plain_note_submission,
@@ -69,7 +91,9 @@ pytestmark = [pytest.mark.integration, pytest.mark.asyncio(loop_scope="module")]
 
 
 @pytest.mark.parametrize("reply_kind", ["capability_calls_text", "native_tool_calls"])
-async def test_plain_note_direct_protocol_blocker_without_pg(tmp_path, reply_kind):
+async def test_plain_note_direct_protocol_blocker_without_pg(
+    tmp_path: Path, reply_kind: str
+) -> None:
     """Observe real factory/SDK execution, not source-text assertions or fake tools."""
     body, path, content = plain_note_submission()
     assert _project_delivery_assessment(body.message) is None
@@ -81,7 +105,7 @@ async def test_plain_note_direct_protocol_blocker_without_pg(tmp_path, reply_kin
     evidence = _capture_authenticated_input(principal, body.message, submitted_input_scope(body))
     selection = workspace_selection(
         project_id=body.project_id,
-        session_id=body.workspace_session_id,
+        session_id=present(body.workspace_session_id),
         sandbox_profile=body.sandbox_profile,
         requested_permissions=body.requested_permissions,
         permission_mode=body.permission_mode,
@@ -105,7 +129,7 @@ async def test_plain_note_direct_protocol_blocker_without_pg(tmp_path, reply_kin
     )
 
     class RecordReader:
-        async def get(self, tenant, run):
+        async def get(self, tenant: UUID, run: UUID) -> RunRecord:
             assert (tenant, run) == (record.tenant_id, record.id)
             return record
 
@@ -117,16 +141,19 @@ async def test_plain_note_direct_protocol_blocker_without_pg(tmp_path, reply_kin
         project_workspace_dir=tmp_path,
         artifact_repository=InMemoryArtifactRepository(),
     )
-    harness_calls = []
+    harness_calls: list[tuple[tuple[UUID, HarnessToolCallRequest], InvokeArguments]] = []
     actual_invoke = stack.harness_tool_gateway.invoke
 
-    async def observe_harness(*args, **kwargs):
-        harness_calls.append((args, kwargs))
-        return await actual_invoke(*args, **kwargs)
+    async def observe_harness(
+        tenant_id: UUID, request: HarnessToolCallRequest, **kwargs: Unpack[InvokeArguments]
+    ) -> HarnessToolCallResult:
+        call = request
+        harness_calls.append(((tenant_id, call), kwargs))
+        return await actual_invoke(tenant_id, call, **kwargs)
 
-    stack.harness_tool_gateway.invoke = observe_harness
-    owner = SimpleNamespace(bodies=[])
-    wire = []
+    pytest.MonkeyPatch().setattr(stack.harness_tool_gateway, "invoke", observe_harness)
+    owner = WireOwner()
+    wire: list[Mapping[str, object]] = []
     tool = {
         "id": "plain-note-write",
         "type": "function",
@@ -143,8 +170,8 @@ async def test_plain_note_direct_protocol_blocker_without_pg(tmp_path, reply_kin
         }
     )
 
-    async def transport(request):
-        payload = json.loads(request.content)
+    async def transport(request: httpx.Request) -> httpx.Response:
+        payload = mapping(json.loads(request.content))
         wire.append(payload)
         assert path in json.dumps(payload) and json.dumps(content) in body.message
         assert not payload.get("stream"), "update diagnostic for the actual streaming protocol"
@@ -177,14 +204,14 @@ async def test_plain_note_direct_protocol_blocker_without_pg(tmp_path, reply_kin
 
     platform = fixture_platform()
 
-    class Configs:
-        async def get_current(self, tenant):
+    class Configs(ConfigFixture):
+        async def get_current(self, tenant: UUID) -> ConfigRevision:
             assert tenant == record.tenant_id
-            return SimpleNamespace(version=1, document=platform.model_dump(mode="json"))
+            return config_revision(tenant, platform)
 
-    capacities = []
+    capacities: list[LocalCapacityBoundary] = []
 
-    async def capacity(tenant, deployments):
+    async def capacity(tenant: UUID, deployments: Sequence[Deployment]) -> LocalCapacityBoundary:
         value = LocalCapacityBoundary()
         capacities.append(value)
         return value
@@ -208,7 +235,7 @@ async def test_plain_note_direct_protocol_blocker_without_pg(tmp_path, reply_kin
         execution_token=uuid4(),
         mode=TaskMode.DIRECT,
         request=body.message,
-        routing_decision=route,
+        routing_decision=_freeze_object(route, name="routing decision"),
         timeout_seconds=30,
         token_budget=1000000,
     )
@@ -216,7 +243,7 @@ async def test_plain_note_direct_protocol_blocker_without_pg(tmp_path, reply_kin
     assert evidence.message == body.message and json.loads(
         evidence.input_scope
     ) == submitted_input_scope(body)
-    events = []
+    events: list[RunEvent] = []
     try:
         async with closing_runtime_events(runtime.run(context)) as stream:
             async for event in stream:
@@ -227,15 +254,15 @@ async def test_plain_note_direct_protocol_blocker_without_pg(tmp_path, reply_kin
         assert reply_kind == "capability_calls_text"
         assert events[-1].kind is EventKind.RUNTIME_COMPLETED
         texts = [
-            event.artifact.content["text"]
+            present(event.artifact).content["text"]
             for event in events
-            if event.kind is EventKind.ARTIFACT_CREATED and event.artifact.type == "text"
+            if event.kind is EventKind.ARTIFACT_CREATED and present(event.artifact).type == "text"
         ]
         assert texts == [text_reply]  # A request printed as text is not a file action.
     assert wire and all(not payload.get("tools") for payload in wire)
     assert harness_calls == []
     assert not ProjectWorkspaceStore(tmp_path).list_files(
-        record.tenant_id, body.project_id, body.workspace_session_id
+        record.tenant_id, present(body.project_id), present(body.workspace_session_id)
     )
     assert all(capacity.acquired == capacity.released for capacity in capacities)
     assert all(response.closed for response in owner.bodies)
@@ -255,18 +282,26 @@ async def test_plain_note_direct_protocol_blocker_without_pg(tmp_path, reply_kin
     )
 
 
-def _install_note_wire(case, body, path, content):
-    proposals = []
+def _install_note_wire(
+    case: NoteWireCase, body: CreateRunRequest, path: str, content: str
+) -> list[Mapping[str, object]]:
+    proposals: list[Mapping[str, object]] = []
 
-    def reply(payload):
+    def reply(payload: Mapping[str, object]) -> str:
         call = physical_call.get()
         assert call is not None and call.attempts
         attempt = call.attempts[-1]
+        admission = call.scope._admission
+        assert isinstance(admission, _BudgetAdmission)
         case.wire.attempts[attempt.permit.attempt_id]["physical_transport_id"] = str(
-            call.scope._admission._attempts[attempt.permit.attempt_id].physical_id
+            admission._attempts[attempt.permit.attempt_id].physical_id
         )
-        schema = payload.get("response_format", {}).get("json_schema", {}).get("schema", {})
-        if set(schema.get("properties", {})) == {
+        schema = mapping(
+            mapping(mapping(payload.get("response_format", {})).get("json_schema", {})).get(
+                "schema", {}
+            )
+        )
+        if set(mapping(schema.get("properties", {}))) == {
             "schema_version",
             "decision",
             "risk",
@@ -274,16 +309,19 @@ def _install_note_wire(case, body, path, content):
             "rationale",
             "action_digest",
         }:
-            material = json.loads(payload["messages"][-1]["content"])
-            assert material["authenticated_authorization"]["message"] == body.message
-            assert material["exact_action"]["request"]["arguments"] == {
+            material = mapping(
+                json.loads(string(mapping(sequence(payload["messages"])[-1])["content"]))
+            )
+            assert mapping(material["authenticated_authorization"])["message"] == body.message
+            assert mapping(mapping(material["exact_action"])["request"])["arguments"] == {
                 "path": path,
                 "content": content,
             }
             return FixedWire.text_for(case.wire, payload)
         assert any(
             "PLAIN_FILE_ACTION:" in str(message.get("content", ""))
-            for message in payload["messages"]
+            for raw_message in sequence(payload["messages"])
+            for message in (mapping(raw_message),)
         ), "actual Direct protocol is not plain-file capable"
         assert not payload.get("tools")
         proposals.append(payload)
@@ -294,11 +332,11 @@ def _install_note_wire(case, body, path, content):
             }
         )
 
-    case.wire.text_for = reply
+    pytest.MonkeyPatch().setattr(case.wire, "text_for", reply)
     return proposals
 
 
-def _assert_accounting_receipt(row, sent):
+def _assert_accounting_receipt(row: AccountingRow, sent: AccountingSent) -> None:
     """Compare durable accounting against the guarded wire for either purpose."""
     expected = {
         "outcome": "completed",
@@ -319,10 +357,10 @@ def _assert_accounting_receipt(row, sent):
 
 
 @pytest.mark.parametrize("purpose", ["primary", "review"])
-async def test_plain_note_accounting_receipt_rejects_rehashed_identity_drift(purpose):
+async def test_plain_note_accounting_receipt_rejects_rehashed_identity_drift(purpose: str) -> None:
     """Pure assertion check: a valid hash must not hide incorrect receipt identity."""
     attempt_id, physical_id = uuid4(), uuid4()
-    sent = {
+    sent: PurposeAccountingSent = {
         "purpose": purpose,
         "physical_transport_id": str(physical_id),
         "deployment": {
@@ -337,7 +375,7 @@ async def test_plain_note_accounting_receipt_rejects_rehashed_identity_drift(pur
             "cost_usd": {"decimal": "0.000008"},
         },
     }
-    receipt = {
+    receipt: dict[str, object] = {
         "outcome": "completed",
         "deployment": sent["deployment"],
         "attempt_id": str(attempt_id),
@@ -345,8 +383,8 @@ async def test_plain_note_accounting_receipt_rejects_rehashed_identity_drift(pur
         "usage": sent["usage"],
     }
 
-    def row_with(value):
-        return SimpleNamespace(
+    def row_with(value: dict[str, object]) -> RunAdmissionAttemptRow:
+        return RunAdmissionAttemptRow(
             attempt_id=attempt_id,
             purpose=purpose,
             deployment=sent["deployment"],
@@ -372,22 +410,23 @@ async def test_plain_note_accounting_receipt_rejects_rehashed_identity_drift(pur
             _assert_accounting_receipt(row_with({**receipt, key: wrong}), sent)
 
 
-async def test_plain_note_actual_review_wire_and_storage_without_pg(tmp_path):
+async def test_plain_note_actual_review_wire_and_storage_without_pg(tmp_path: Path) -> None:
     """Actual service/SDK plus focused DB; not PG/Redis/worker acceptance."""
     from agent_hub.capabilities.execution_authority import bind_execution_authority
     from agent_hub.capabilities.model_review import ModelApprovalReviewService
     from agent_hub.config.schema import PlatformConfig
     from agent_hub.models.physical_budget import _bind_run_budget
     from agent_hub.runtime.defaults import _gateway_for_config
-    from tests.unit.runtime.test_plain_file_action import note_case
+    from tests.integration.runtime.review_actions_typed_fixture import typed_note_case as note_case
 
     s = note_case(tmp_path)
     wire = FixedWire(runtime=s.runtime)
-    case = SimpleNamespace(wire=wire)
+    case = NoteWireRecord(wire)
     proposals = _install_note_wire(case, s.body, s.path, s.content)
     transport = LiteLLMClient(_network_delegate_factory=lambda: httpx.MockTransport(wire))
     s.runtime._transport = transport
     current = await s.runtime._config_service.get_current(s.task.tenant_id)
+    assert current is not None
     gateway, _, _ = await _gateway_for_config(
         PlatformConfig.model_validate(current.document),
         tenant_id=s.task.tenant_id,
@@ -422,17 +461,18 @@ async def test_plain_note_actual_review_wire_and_storage_without_pg(tmp_path):
         assert str(row.physical_transport_id) == sent["physical_transport_id"]
         _assert_accounting_receipt(row, sent)
     (review_attempt,) = [row for row in attempts if row.purpose == "review"]
-    receipt = json.loads(intents[0].private_receipt)
+    receipt = json.loads(present(intents[0].private_receipt))
     assert receipt["accounting_receipt_sha256"] == review_attempt.receipt_sha256
-    assert receipt["evidence"]["usage"] == review_attempt.receipt["usage"]
+    assert receipt["evidence"]["usage"] == present(review_attempt.receipt)["usage"]
     assert receipt["evidence"]["model_identity"] == review_attempt.deployment
     assert (
-        hashlib.sha256(intents[0].private_receipt.encode()).hexdigest() == intents[0].receipt_sha256
+        hashlib.sha256(present(intents[0].private_receipt).encode()).hexdigest()
+        == intents[0].receipt_sha256
     )
     assert all(response.closed for response in wire.bodies)
 
 
-def _direct_delivery_metadata(artifact, path):
+def _direct_delivery_metadata(artifact: Artifact, path: str) -> dict[str, str | int]:
     text = artifact.content.get("text")
     assert artifact.type == "text" and artifact.producer == "main"
     assert isinstance(text, str) and text.strip() and not text.lstrip().startswith("{")
@@ -452,11 +492,11 @@ def _direct_delivery_metadata(artifact, path):
 class _DirectWriteAudit:
     """Observe real writable opens of the exact target, without replacing IO."""
 
-    def __init__(self, target):
+    def __init__(self, target: Path) -> None:
         self.target = os.path.normcase(str(target.resolve()))
         self.count, self.active = 0, True
 
-    def __call__(self, event, args):
+    def __call__(self, event: str, args: tuple[object, ...]) -> None:
         if (
             self.active
             and event == "open"
@@ -469,13 +509,18 @@ class _DirectWriteAudit:
 
 
 @pytest.mark.parametrize("text", ["{}", "Saved other.txt.", "Saved other-note.txt.", "note.txt"])
-async def test_direct_delivery_metadata_rejects_unreadable_or_wrong_filename(text):
-    artifact = Artifact(id=uuid4(), type="text", producer="main", content={"text": text})
+async def test_direct_delivery_metadata_rejects_unreadable_or_wrong_filename(text: object) -> None:
+    artifact = Artifact(
+        id=uuid4(),
+        type="text",
+        producer="main",
+        content=_freeze_object({"text": text}, name="artifact content"),
+    )
     with pytest.raises(AssertionError):
         _direct_delivery_metadata(artifact, "note.txt")
 
 
-async def test_direct_delivery_metadata_contains_only_actual_artifact_hashes():
+async def test_direct_delivery_metadata_contains_only_actual_artifact_hashes() -> None:
     artifact = Artifact(
         id=uuid4(), type="text", producer="main", content={"text": "Saved note.txt."}
     )
@@ -490,7 +535,7 @@ async def test_direct_delivery_metadata_contains_only_actual_artifact_hashes():
     assert "Saved" not in json.dumps(facts) and "note.txt" not in json.dumps(facts)
 
 
-async def test_direct_write_audit_metadata_counts_only_target_writes(tmp_path):
+async def test_direct_write_audit_metadata_counts_only_target_writes(tmp_path: Path) -> None:
     target = tmp_path / "note.txt"
     audit = _DirectWriteAudit(target)
     sys.addaudithook(audit)
@@ -507,32 +552,40 @@ async def test_direct_write_audit_metadata_counts_only_target_writes(tmp_path):
 
 
 async def test_native_direct_plain_note_review_consumes_once_and_writes(
-    storage, own_redis, tmp_path, request, record_property
-):
+    storage: Storage,
+    own_redis: Redis,
+    tmp_path: Path,
+    request: pytest.FixtureRequest,
+    record_property: Callable[[str, object], None],
+) -> None:
     """One actual PG/Redis/worker/broker/factory/Harness action, fixed wire only."""
     body, path, content = plain_note_submission()
     case = await build_case(storage, tmp_path, TaskMode.DIRECT, own_redis, body=body)
     proposals = _install_note_wire(case, body, path, content)
     source_sha = runtime_source_fingerprint()
     root = ProjectWorkspaceStore(tmp_path).session_root(
-        case.context.tenant_id, body.project_id, body.workspace_session_id
+        case.context.tenant_id, present(body.project_id), present(body.workspace_session_id)
     )
     audit = _DirectWriteAudit(root / path)
     sys.addaudithook(audit)
-    invoked = []
+    invoked: list[tuple[HarnessToolCallRequest, HarnessToolCallResult]] = []
     original_invoke = case.stack.harness_tool_gateway.invoke
 
-    async def observe(tenant_id, call, **kwargs):
+    async def observe(
+        tenant_id: UUID, request: HarnessToolCallRequest, **kwargs: Unpack[InvokeArguments]
+    ) -> HarnessToolCallResult:
+        call = request
         result = await original_invoke(tenant_id, call, **kwargs)
         if call.tool_name == "workspace.write_text":
             invoked.append((call, result))
         return result
 
-    case.stack.harness_tool_gateway.invoke = observe
+    pytest.MonkeyPatch().setattr(case.stack.harness_tool_gateway, "invoke", observe)
     try:
         evidence = await case.repository.load_authenticated_input(
             case.context.tenant_id, case.context.run_id
         )
+        assert evidence is not None
         assert evidence.message == body.message and json.loads(
             evidence.input_scope
         ) == submitted_input_scope(body)
@@ -545,11 +598,11 @@ async def test_native_direct_plain_note_review_consumes_once_and_writes(
         )
         assert not case.wire.budgets[0]._active
         root = ProjectWorkspaceStore(tmp_path).session_root(
-            case.context.tenant_id, body.project_id, body.workspace_session_id
+            case.context.tenant_id, present(body.project_id), present(body.workspace_session_id)
         )
         assert (root / path).read_bytes() == content.encode()
         files = ProjectWorkspaceStore(tmp_path).list_files(
-            case.context.tenant_id, body.project_id, body.workspace_session_id
+            case.context.tenant_id, present(body.project_id), present(body.workspace_session_id)
         )
         assert [item.path for item in files] == [path]
         digest = hashlib.sha256(content.encode()).hexdigest()
@@ -561,8 +614,10 @@ async def test_native_direct_plain_note_review_consumes_once_and_writes(
             and event.artifact is not None
             and event.artifact.type == "text"
         ]
-        assert len(text_artifacts) == 1 and path in text_artifacts[0].content["text"]
-        assert text_artifacts[0].content["workspace_files"][0]["sha256"] == digest
+        assert len(text_artifacts) == 1 and path in string(text_artifacts[0].content["text"])
+        assert (
+            mapping(sequence(text_artifacts[0].content["workspace_files"])[0])["sha256"] == digest
+        )
         final_delivery = _direct_delivery_metadata(text_artifacts[0], path)
         assert events[-1].inputs == (text_artifacts[0],)
         assert audit.count == len(invoked) == 1
@@ -570,7 +625,7 @@ async def test_native_direct_plain_note_review_consumes_once_and_writes(
         assert result.status == "succeeded" and result.failure_reason is None
         assert call.run_id == case.context.run_id
         assert dict(call.arguments) == {"path": path, "content": content}
-        assert result.payload["file"]["sha256"] == digest
+        assert mapping(result.payload["file"])["sha256"] == digest
         async with case.factory() as session:
             attempts = list(
                 await session.scalars(
@@ -610,10 +665,13 @@ async def test_native_direct_plain_note_review_consumes_once_and_writes(
         assert review.attempt_id == review_attempt.attempt_id
         assert review.request_sha256 == review_attempt.request_sha256
         assert review.physical_identity == review_attempt.physical_transport_id
-        receipt = json.loads(review.private_receipt)
-        assert hashlib.sha256(review.private_receipt.encode()).hexdigest() == review.receipt_sha256
+        receipt = json.loads(present(review.private_receipt))
+        assert (
+            hashlib.sha256(present(review.private_receipt).encode()).hexdigest()
+            == review.receipt_sha256
+        )
         assert receipt["accounting_receipt_sha256"] == review_attempt.receipt_sha256
-        assert receipt["evidence"]["usage"] == review_attempt.receipt["usage"]
+        assert receipt["evidence"]["usage"] == present(review_attempt.receipt)["usage"]
         assert receipt["evidence"]["model_identity"] == review_attempt.deployment
         assert receipt["evidence"]["verdict"]["action_digest"] == review.action_digest
         action = json.loads(review.private_action)
@@ -623,6 +681,7 @@ async def test_native_direct_plain_note_review_consumes_once_and_writes(
         pool = await RunAdmissionRepository(case.factory).get_pool(
             case.context.tenant_id, case.context.run_id
         )
+        assert pool is not None
         assert (
             pool.authorization_turn_id == evidence.turn_id and pool.original_token_grant == 10000000
         )
@@ -633,6 +692,7 @@ async def test_native_direct_plain_note_review_consumes_once_and_writes(
         )
         assert pool.review_cost_charged == Decimal("0.000008")
         record = await case.repository.get(case.context.tenant_id, case.context.run_id)
+        assert record is not None and record.routing_decision is not None
         assert record.routing_decision["requested_permissions"] == ["workspace.read", "command.run"]
         assert all(response.closed for response in case.wire.bodies)
         await capacity_is_clean(case)
@@ -689,4 +749,6 @@ async def test_native_direct_plain_note_review_consumes_once_and_writes(
     finally:
         audit.active = False
         case.wire.release.set()
-        await case.runtime.cancel_run_owned(case.context.run_id, case.context.execution_token)
+        await case.runtime.cancel_run_owned(
+            case.context.run_id, present(case.context.execution_token)
+        )

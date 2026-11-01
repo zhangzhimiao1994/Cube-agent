@@ -2,43 +2,55 @@
 
 import asyncio
 import hashlib
-import importlib
 import io
 import json
 import socket
 import time
 import zipfile
+from collections.abc import Iterable
 from contextvars import ContextVar
 from dataclasses import replace
+from ssl import SSLContext
+from typing import Never, Unpack
 from uuid import UUID
 
 import pytest
 
 from agent_hub.capabilities.tools.http_read import HttpResponse
+from agent_hub.skills.sandbox.python_registry_protocol import ResolutionBudget, ResolutionScope
+from agent_hub.skills.sandbox.python_registry_read import RegistryReader
+from tests.unit.skills.python_registry_typed_fixture import (
+    LimitOverrides,
+    ProtocolAPI,
+    ReaderAPI,
+    WheelEntry,
+    object_array,
+    object_map,
+)
 
 
 @pytest.fixture(autouse=True)
-def offline_network(monkeypatch):
+def offline_network(monkeypatch: pytest.MonkeyPatch) -> None:
     """Forbid live IO, retaining only Python's synchronous local socketpair construction."""
     pairing = ContextVar("g1_test_socketpair", default=False)
     original_pair = socket.socketpair
     original_connect = socket.socket.connect
     original_connect_ex = socket.socket.connect_ex
 
-    def forbidden(*args, **kwargs):
+    def forbidden(*args: object, **kwargs: object) -> Never:
         raise AssertionError("real network disabled in G1 tests")
 
-    def connect(connection, address):
+    def connect(connection: socket.socket, address: tuple[object, ...] | str | bytes) -> None:
         if pairing.get() and isinstance(address, tuple) and address[0] in {"127.0.0.1", "::1"}:
             return original_connect(connection, address)
-        return forbidden()
+        forbidden()
 
-    def connect_ex(connection, address):
+    def connect_ex(connection: socket.socket, address: tuple[object, ...] | str | bytes) -> int:
         if pairing.get() and isinstance(address, tuple) and address[0] in {"127.0.0.1", "::1"}:
             return original_connect_ex(connection, address)
         return forbidden()
 
-    def socketpair(*args, **kwargs):
+    def socketpair(*args: int, **kwargs: int) -> tuple[socket.socket, socket.socket]:
         token = pairing.set(True)
         try:
             return original_pair(*args, **kwargs)
@@ -54,14 +66,15 @@ def offline_network(monkeypatch):
     monkeypatch.setattr(asyncio, "open_connection", forbidden)
 
 
-def api():
-    return (
-        importlib.import_module("agent_hub.skills.sandbox.python_registry_protocol"),
-        importlib.import_module("agent_hub.skills.sandbox.python_registry_read"),
-    )
+def api() -> tuple[ProtocolAPI, ReaderAPI]:
+    from agent_hub.skills.sandbox import python_registry_protocol, python_registry_read
+
+    protocol: ProtocolAPI = python_registry_protocol
+    reader_api: ReaderAPI = python_registry_read
+    return protocol, reader_api
 
 
-def scope():
+def scope() -> ResolutionScope:
     p, _ = api()
     return p.ResolutionScope(
         UUID(int=1),
@@ -76,7 +89,9 @@ def scope():
     )
 
 
-def wheel(name, version="1.0", deps=()):
+def wheel(
+    name: str, version: str = "1.0", deps: Iterable[str] = ()
+) -> tuple[WheelEntry, bytes]:
     filename = f"{name.replace('-', '_')}-{version}-py3-none-any.whl"
     prefix = filename.removesuffix("-py3-none-any.whl") + ".dist-info/"
     data = io.BytesIO()
@@ -105,7 +120,7 @@ def wheel(name, version="1.0", deps=()):
     }, body
 
 
-def environment():
+def environment() -> dict[str, str]:
     return {
         "implementation_name": "cpython",
         "implementation_version": "3.12.14",
@@ -122,21 +137,21 @@ def environment():
 
 
 class DNS:
-    def __init__(self, addresses=None):
+    def __init__(self, addresses: list[str] | None = None) -> None:
         self.addresses = ["93.184.216.34"] if addresses is None else addresses
-        self.hosts = []
+        self.hosts: list[str] = []
 
-    async def resolve(self, host):
+    async def resolve(self, host: str) -> list[str]:
         self.hosts.append(host)
         return self.addresses
 
 
 class Wire:
-    def __init__(self):
-        self.documents = {}
-        self.requests = []
+    def __init__(self) -> None:
+        self.documents: dict[str, object] = {}
+        self.requests: list[tuple[str, tuple[str, ...]]] = []
 
-    async def get(self, url, *, resolved_addresses):
+    async def get(self, url: str, *, resolved_addresses: tuple[str, ...]) -> HttpResponse:
         self.requests.append((url, resolved_addresses))
         value = self.documents[url]
         if isinstance(value, HttpResponse):
@@ -144,7 +159,9 @@ class Wire:
         kind = "application/vnd.pypi.simple.v1+json" if "/simple/" in url else "application/json"
         return HttpResponse(200, {"Content-Type": kind}, json.dumps(value).encode())
 
-    def release(self, name, version="1.0", deps=()):
+    def release(
+        self, name: str, version: str = "1.0", deps: Iterable[str] = ()
+    ) -> tuple[WheelEntry, bytes]:
         entry, body = wheel(name, version, deps)
         self.documents[f"https://pypi.org/pypi/{name}/{version}/json"] = {
             "info": {
@@ -161,21 +178,21 @@ class Wire:
             f"https://pypi.org/simple/{name}/",
             {"meta": {"api-version": "1.1"}, "name": name, "versions": [], "files": []},
         )
-        index["versions"].append(version)
+        object_array(object_map(index)["versions"]).append(version)
         return entry, body
 
 
-def reader(wire, dns=None):
+def reader(wire: Wire, dns: DNS | None = None) -> RegistryReader:
     _, r = api()
     return r.RegistryReader(resolver=dns or DNS(), transport=wire)
 
 
-def budget(**limits):
+def budget(**limits: Unpack[LimitOverrides]) -> ResolutionBudget:
     p, _ = api()
     return p.ResolutionBudget(p.ResolutionLimits(**limits), time.monotonic() + 30)
 
 
-async def test_real_json_candidate_carries_official_hash_and_snapshot():
+async def test_real_json_candidate_carries_official_hash_and_snapshot() -> None:
     p, _ = api()
     wire = Wire()
     row, _ = wire.release("demo-lib")
@@ -201,7 +218,7 @@ async def test_real_json_candidate_carries_official_hash_and_snapshot():
         "demo; os_name == 'x'",
     ],
 )
-def test_need_cannot_supply_urls_paths_headers_or_root_markers(requirement):
+def test_need_cannot_supply_urls_paths_headers_or_root_markers(requirement: str) -> None:
     p, _ = api()
     with pytest.raises(ValueError):
         p.DependencyNeed(requirement, "a" * 64)
@@ -217,7 +234,7 @@ def test_need_cannot_supply_urls_paths_headers_or_root_markers(requirement):
         ["93.184.216.34", "10.0.0.1"],
     ],
 )
-async def test_dns_refuses_nonpublic_or_mixed_answers_before_http(addresses):
+async def test_dns_refuses_nonpublic_or_mixed_answers_before_http(addresses: list[str]) -> None:
     p, _ = api()
     wire = Wire()
     with pytest.raises(ValueError):
@@ -241,11 +258,12 @@ async def test_dns_refuses_nonpublic_or_mixed_answers_before_http(addresses):
         ("requires_python", ">=9"),
     ],
 )
-async def test_ineligible_release_never_yields_a_descriptor(field, value):
+async def test_ineligible_release_never_yields_a_descriptor(field: str, value: object) -> None:
     p, _ = api()
     wire = Wire()
     wire.release("demo")
-    wire.documents["https://pypi.org/pypi/demo/1.0/json"]["urls"][0][field] = value
+    document = object_map(wire.documents["https://pypi.org/pypi/demo/1.0/json"])
+    object_map(object_array(document["urls"])[0])[field] = value
     with pytest.raises(ValueError):
         await reader(wire).candidates(
             p.DependencyNeed("demo", "a" * 64),
@@ -268,7 +286,7 @@ async def test_ineligible_release_never_yields_a_descriptor(field, value):
         HttpResponse(200, {"Content-Type": "application/json", "Content-Encoding": "gzip"}, b"{}"),
     ],
 )
-async def test_untrusted_http_and_json_do_not_escape_fixed_protocol(response):
+async def test_untrusted_http_and_json_do_not_escape_fixed_protocol(response: HttpResponse) -> None:
     p, _ = api()
     wire = Wire()
     wire.documents["https://pypi.org/simple/demo/"] = response
@@ -281,13 +299,14 @@ async def test_untrusted_http_and_json_do_not_escape_fixed_protocol(response):
     assert len(wire.requests) == 1
 
 
-async def test_more_than_four_candidates_are_soft_not_a_human_or_hard_gate():
+async def test_more_than_four_candidates_are_soft_not_a_human_or_hard_gate() -> None:
     p, _ = api()
     wire = Wire()
     for i in range(1, 7):
         wire.release("demo", f"{i}.0")
         if i > 1:
-            wire.documents[f"https://pypi.org/pypi/demo/{i}.0/json"]["urls"][0]["yanked"] = True
+            document = object_map(wire.documents[f"https://pypi.org/pypi/demo/{i}.0/json"])
+            object_map(object_array(document["urls"])[0])["yanked"] = True
     found = await reader(wire).candidates(
         p.DependencyNeed("demo", "a" * 64),
         environment=environment(),
@@ -297,7 +316,7 @@ async def test_more_than_four_candidates_are_soft_not_a_human_or_hard_gate():
     assert len(wire.requests) == 7
 
 
-async def test_deadline_and_byte_limits_are_not_renewed():
+async def test_deadline_and_byte_limits_are_not_renewed() -> None:
     p, _ = api()
     wire = Wire()
     wire.release("demo")
@@ -318,7 +337,7 @@ async def test_deadline_and_byte_limits_are_not_renewed():
         )
 
 
-async def test_candidate_provenance_must_name_its_exact_release():
+async def test_candidate_provenance_must_name_its_exact_release() -> None:
     p, _ = api()
     wire = Wire()
     wire.release("demo")
@@ -339,7 +358,7 @@ async def test_candidate_provenance_must_name_its_exact_release():
         )
 
 
-def test_soft_milestones_follow_project_demand_without_changing_hard_ceiling():
+def test_soft_milestones_follow_project_demand_without_changing_hard_ceiling() -> None:
     allowance = budget()
     before = allowance.limits
     assert allowance.soft_limit("packages", demand=32) >= 32
@@ -347,7 +366,7 @@ def test_soft_milestones_follow_project_demand_without_changing_hard_ceiling():
     assert allowance.limits == before
 
 
-def test_actual_work_publishes_adaptive_soft_milestones():
+def test_actual_work_publishes_adaptive_soft_milestones() -> None:
     allowance = budget()
     deadline = allowance.deadline
     for _ in range(17):
@@ -357,11 +376,12 @@ def test_actual_work_publishes_adaptive_soft_milestones():
     assert allowance.deadline == deadline
 
 
-async def test_index_api_version_is_not_coerced_from_a_number():
+async def test_index_api_version_is_not_coerced_from_a_number() -> None:
     p, _ = api()
     wire = Wire()
     wire.release("demo")
-    wire.documents["https://pypi.org/simple/demo/"]["meta"]["api-version"] = 1.1
+    document = object_map(wire.documents["https://pypi.org/simple/demo/"])
+    object_map(document["meta"])["api-version"] = 1.1
     with pytest.raises(ValueError, match="api_version"):
         await reader(wire).candidates(
             p.DependencyNeed("demo", "a" * 64),
@@ -370,7 +390,7 @@ async def test_index_api_version_is_not_coerced_from_a_number():
         )
 
 
-async def test_request_budget_is_shared_between_index_and_release():
+async def test_request_budget_is_shared_between_index_and_release() -> None:
     p, _ = api()
     wire = Wire()
     wire.release("demo")
@@ -383,7 +403,7 @@ async def test_request_budget_is_shared_between_index_and_release():
     assert len(wire.requests) == 1
 
 
-async def test_all_unmocked_network_entries_are_hard_blocked(request):
+async def test_all_unmocked_network_entries_are_hard_blocked(request: pytest.FixtureRequest) -> None:
     request.getfixturevalue("offline_network")
     left, right = socket.socketpair()
     try:
@@ -410,17 +430,19 @@ async def test_all_unmocked_network_entries_are_hard_blocked(request):
         await asyncio.open_connection("93.184.216.34", 443)
 
 
-async def test_slow_metadata_cannot_outlive_original_remaining_deadline():
+async def test_slow_metadata_cannot_outlive_original_remaining_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     p, _ = api()
     wire = Wire()
     wire.release("demo")
     original = wire.get
 
-    async def slow(*args, **kwargs):
+    async def slow(url: str, *, resolved_addresses: tuple[str, ...]) -> HttpResponse:
         await asyncio.sleep(1)
-        return await original(*args, **kwargs)
+        return await original(url, resolved_addresses=resolved_addresses)
 
-    wire.get = slow
+    monkeypatch.setattr(wire, "get", slow)
     allowance = p.ResolutionBudget(p.ResolutionLimits(), time.monotonic() + 0.03)
     started = time.monotonic()
     with pytest.raises(ValueError):
@@ -433,7 +455,7 @@ async def test_slow_metadata_cannot_outlive_original_remaining_deadline():
     assert wire.requests == []
 
 
-def test_scope_and_limits_are_validated_and_cannot_gain_authority():
+def test_scope_and_limits_are_validated_and_cannot_gain_authority() -> None:
     p, _ = api()
     with pytest.raises(ValueError):
         replace(scope(), source_sha256="fake")
@@ -443,9 +465,11 @@ def test_scope_and_limits_are_validated_and_cannot_gain_authority():
         p.DependencyNeed("demo", "fake")
 
 
-async def test_production_transport_uses_pinned_tls_and_strict_wire(monkeypatch):
+async def test_production_transport_uses_pinned_tls_and_strict_wire(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     _, r = api()
-    calls = []
+    calls: list[bytes] = []
     stream = asyncio.StreamReader()
     stream.feed_data(
         b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Type: application/json\r\n\r\n{}"
@@ -453,24 +477,26 @@ async def test_production_transport_uses_pinned_tls_and_strict_wire(monkeypatch)
     stream.feed_eof()
 
     class Writer:
-        def write(self, data):
+        def write(self, data: bytes) -> None:
             calls.append(data)
 
-        async def drain(self):
+        async def drain(self) -> None:
             pass
 
-        def close(self):
+        def close(self) -> None:
             pass
 
-        async def wait_closed(self):
+        async def wait_closed(self) -> None:
             pass
 
-    async def connect(address, port, *, ssl, server_hostname):
+    async def connect(
+        address: str, port: int, *, ssl: SSLContext, server_hostname: str
+    ) -> tuple[asyncio.StreamReader, Writer]:
         assert address == "93.184.216.34" and port == 443
         assert server_hostname == "pypi.org" and ssl is not None
         return stream, Writer()
 
-    monkeypatch.setattr(r.asyncio, "open_connection", connect)
+    monkeypatch.setattr(asyncio, "open_connection", connect)
     result = await r.RegistryReader(resolver=DNS()).read("demo", "1.0", budget=budget())
     assert result[0] == {}
     assert b"Host: pypi.org\r\n" in calls[0]

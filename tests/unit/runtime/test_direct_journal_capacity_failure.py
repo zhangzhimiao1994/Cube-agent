@@ -12,6 +12,7 @@ from agent_hub.models.capacity import (
     CapacityUnavailable,
     CapacityWaitTimeout,
 )
+from agent_hub.models.gateway import GatewayCompletion
 from agent_hub.models.types import ModelMessage, ModelRequest
 from agent_hub.runtime.artifacts import InMemoryArtifactRepository
 from agent_hub.runtime.contracts import TaskContext
@@ -27,7 +28,7 @@ from agent_hub.runtime.failure_reason import (
     CapacityRequestTooLarge, CapacityQueueFull, CapacityWaitTimeout,
     CapacityUnavailable, CapacityBackendError, CapacityConfigurationError,
 ])
-async def test_journal_preserves_capacity_classification_without_private_error_or_replay(failure_type):
+async def test_journal_preserves_capacity_classification_without_private_error_or_replay(failure_type: type[Exception]) -> None:
     private = 'PRIVATE redis://password@private.invalid provider body'
     original = failure_type(private)
     provider = AsyncMock(side_effect=original)
@@ -47,7 +48,7 @@ async def test_journal_preserves_capacity_classification_without_private_error_o
     provider.assert_awaited_once()
 
 
-async def test_journal_still_redacts_unknown_failure_and_forbids_replay():
+async def test_journal_still_redacts_unknown_failure_and_forbids_replay() -> None:
     provider = AsyncMock(side_effect=RuntimeError('PRIVATE source and credential'))
     request = ModelRequest(logical_model='primary', messages=(ModelMessage(role='user', content='Build'),))
     journal = DirectCompletionJournal(InMemoryArtifactRepository(), tenant_id=uuid4(), run_id=uuid4())
@@ -58,9 +59,9 @@ async def test_journal_still_redacts_unknown_failure_and_forbids_replay():
     assert not journal.replay_complete and journal.references == ()
 
 
-async def test_journal_never_calls_unknown_exception_metaclass_equality():
+async def test_journal_never_calls_unknown_exception_metaclass_equality() -> None:
     class ComparisonTrap(type):
-        def __eq__(cls, other):
+        def __eq__(cls, other: object) -> bool:
             raise RuntimeError('PRIVATE metaclass comparison')
 
     class UnknownFailure(Exception, metaclass=ComparisonTrap):
@@ -76,13 +77,13 @@ async def test_journal_never_calls_unknown_exception_metaclass_equality():
     assert not journal.replay_complete
 
 
-async def test_direct_runtime_reports_journal_capacity_failure_instead_of_generic_gateway():
+async def test_direct_runtime_reports_journal_capacity_failure_instead_of_generic_gateway() -> None:
     run_id, tenant_id = uuid4(), uuid4()
     journal = DirectCompletionJournal(InMemoryArtifactRepository(), tenant_id=tenant_id, run_id=run_id)
     provider = AsyncMock(side_effect=CapacityRequestTooLarge('PRIVATE backend detail'))
 
     class JournalGateway:
-        async def complete_with_context(self, request):
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
             return await journal.complete(request, provider)
 
     runtime = DirectRuntime(JournalGateway(), logical_model='primary', available_model_attempts=1)

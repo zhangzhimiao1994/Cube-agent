@@ -6,10 +6,11 @@ import json
 import zipfile
 from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from uuid import UUID
 
 import pytest
 
+from agent_hub.auth.models import Role
 from agent_hub.capabilities.gateway import CapabilityStatus
 from agent_hub.capabilities.tools.builtin_contracts import (
     builtin_tool_description,
@@ -17,6 +18,9 @@ from agent_hub.capabilities.tools.builtin_contracts import (
 )
 from agent_hub.domain.runs import TaskMode
 from agent_hub.harness.tool_gateway import HarnessToolGateway
+from agent_hub.harness.types import HarnessToolCallRequest, HarnessToolCallResult
+from agent_hub.models.gateway import GatewayCompletion
+from agent_hub.models.types import ModelRequest
 from agent_hub.runtime import direct
 from agent_hub.runtime.contracts import EventKind, TaskContext
 from agent_hub.runtime.direct import (
@@ -24,6 +28,7 @@ from agent_hub.runtime.direct import (
     RuntimeExecutionError,
     _workspace_batch_from_model_text,
 )
+from agent_hub.skills.sandbox.project import ProjectInvocation
 from agent_hub.skills.sandbox.python_project_profile import (
     PythonProjectProfile,
     PythonProjectProfileInterpreter,
@@ -33,6 +38,14 @@ from agent_hub.skills.sandbox.python_project_profile import (
     PythonProjectProfileWheel,
 )
 from tests.unit.capabilities.test_generated_project_delivery import configured
+from tests.unit.runs.project_auto_repair_typed_fixture import (
+    json_map,
+    mapping,
+    present,
+    string,
+)
+from tests.unit.runs.reviewed_report_revision_typed_fixture import object_array, object_map
+from tests.unit.runtime.direct_catalog_diagnostic_typed_fixture import BudgetWindow
 from tests.unit.runtime.test_direct_project_verification import (
     FIXED,
     Model,
@@ -46,7 +59,7 @@ from tests.unit.runtime.test_direct_project_verification import (
 DIGEST = 'a' * 64
 
 
-def catalog_batch(**updates: Any) -> str:
+def catalog_batch(**updates: object) -> str:
     return json.dumps({'workspace_batch': {
         'files': {}, 'complete': False, 'continuation': 'Select only needed exact dependency pins.',
         'python_catalog': {'catalog_sha256': DIGEST, 'names': ['pkg0500']}, **updates,
@@ -64,7 +77,7 @@ def profile() -> PythonProjectProfile:
 
 
 def profile_transport(monkeypatch: pytest.MonkeyPatch) -> None:
-    async def inspect(_self: Any, invocation: Any) -> PythonProjectProfileResponse:
+    async def inspect(_self: PythonProjectProfileSandbox, invocation: ProjectInvocation) -> PythonProjectProfileResponse:
         return PythonProjectProfileResponse(ok=True,
             scope=PythonProjectProfileScope.for_invocation(invocation), profile=profile())
     monkeypatch.setattr(PythonProjectProfileSandbox, 'inspect', inspect)
@@ -73,7 +86,7 @@ def profile_transport(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_catalog_query_has_its_own_exclusive_readonly_batch() -> None:
     parsed = _workspace_batch_from_model_text(catalog_batch(), allow_catalog=True)
     assert parsed is not None and parsed.files == {} and parsed.read_paths == ()
-    assert not parsed.complete and parsed.python_catalog['catalog_sha256'] == DIGEST
+    assert not parsed.complete and present(parsed.python_catalog)['catalog_sha256'] == DIGEST
 
 
 @pytest.mark.parametrize('updates', [
@@ -83,7 +96,7 @@ def test_catalog_query_has_its_own_exclusive_readonly_batch() -> None:
     {'python_catalog': {'catalog_sha256': DIGEST, 'names': ['../private']}},
     {'python_catalog': {'catalog_sha256': DIGEST, 'extra': 'authority'}},
 ])
-def test_catalog_query_cannot_be_mixed_with_writes_or_invalid_controls(updates: Any) -> None:
+def test_catalog_query_cannot_be_mixed_with_writes_or_invalid_controls(updates: dict[str, object]) -> None:
     assert _workspace_batch_from_model_text(catalog_batch(**updates), allow_catalog=True) is None
 
 
@@ -94,17 +107,17 @@ def test_legacy_parser_rejects_catalog_even_when_mixed_with_valid_files() -> Non
 
 def test_inspection_schema_advertises_readonly_catalog_but_verify_remains_no_arguments() -> None:
     schema = builtin_tool_input_schema('project.inspect')
-    assert schema is not None and 'python_catalog' in schema['properties']
-    query = schema['properties']['python_catalog']
+    assert schema is not None and 'python_catalog' in mapping(schema['properties'])
+    query = mapping(mapping(schema['properties'])['python_catalog'])
     assert query['required'] == ('catalog_sha256',) and query['additionalProperties'] is False
-    assert query['properties']['names']['maxItems'] == 16
-    assert builtin_tool_input_schema('project.verify')['properties'] == {}
-    assert 'catalog_complete=false' in builtin_tool_description('project.inspect')
+    assert mapping(mapping(query['properties'])['names'])['maxItems'] == 16
+    assert present(builtin_tool_input_schema('project.verify'))['properties'] == {}
+    assert 'catalog_complete=false' in present(builtin_tool_description('project.inspect'))
 
 
 @pytest.mark.parametrize('version', [None, True, '1', 2, 1])
 def test_direct_advertises_catalog_batch_only_for_exact_selected_protocol(
-    tmp_path: Path, version: Any,
+    tmp_path: Path, version: int | str | None,
 ) -> None:
     ctx = diagnostic_context()
     ctx = ctx.model_copy(update={'routing_decision': {
@@ -113,7 +126,7 @@ def test_direct_advertises_catalog_batch_only_for_exact_selected_protocol(
     runtime, _, _, _ = runner(tmp_path, ctx, Model())
     prompt = runtime._build_prompt(ctx)
     assert prompt.messages is not None
-    content = '\n'.join(message.content for message in prompt.messages)
+    content = '\n'.join(string(message.content) for message in prompt.messages)
     assert ('workspace_batch.python_catalog' in content) is (type(version) is int and version == 1)
 
 
@@ -127,13 +140,14 @@ async def test_direct_queries_real_pins_before_actual_local_child_and_zip(
         'project_id': 'direct-verification', 'workspace_session_id': 'same-task',
     }})
     class PinModel(Model):
-        async def complete_with_context(self, request: Any) -> Any:
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
             if len(self.requests) == 1:
-                message = next(item.content for item in request.messages
-                               if 'UNTRUSTED_PYTHON_CATALOG_JSON' in item.content)
+                message = next(string(item.content) for item in request.messages
+                               if 'UNTRUSTED_PYTHON_CATALOG_JSON' in string(item.content))
                 raw = message.split('<UNTRUSTED_PYTHON_CATALOG_JSON>', 1)[1].split(
                     '</UNTRUSTED_PYTHON_CATALOG_JSON>', 1)[0]
-                wheel, = json.loads(raw)['python_build_profile']['catalog']
+                wheel_data, = object_array(object_map(object_map(json.loads(raw))['python_build_profile'])['catalog'])
+                wheel = object_map(wheel_data)
                 lock = f"{wheel['name']}=={wheel['version']} --hash=sha256:{wheel['sha256']}\n"
                 self.texts[:] = [batch({'main.py': FIXED, 'requirements.lock': lock})]
             return await super().complete_with_context(request)
@@ -147,9 +161,9 @@ async def test_direct_queries_real_pins_before_actual_local_child_and_zip(
     assert 'workspace.bundle' in backend.calls and len(list((tmp_path / 'generated').rglob('*.zip'))) == 1
     query = shared.requests[0]
     assert query.tool_name == 'project.inspect' and query.actor == 'main_agent'
-    assert query.arguments['python_catalog']['catalog_sha256'] == DIGEST
+    assert mapping(query.arguments['python_catalog'])['catalog_sha256'] == DIGEST
     assert query.run_id == ctx.run_id and query.sandbox == 'workspace_write'
-    message = '\n'.join(item.content for item in model.requests[1].messages)
+    message = '\n'.join(string(item.content) for item in model.requests[1].messages)
     assert 'UNTRUSTED_PYTHON_CATALOG_JSON' in message
     assert profile().catalog[500].sha256 in message and 'not installation' in message.lower()
     assert not shared.results[0].truncated and shared.results[0].status == 'succeeded'
@@ -180,9 +194,9 @@ async def test_unrelated_large_python_catalog_does_not_block_generated_node_entr
     assert len(model.requests) == 1
     inspection = next(event.artifact for event in events if event.artifact is not None
                       and event.artifact.content.get('tool_name') == 'project.inspect')
-    assert inspection.content['result']['python_build_profile']['catalog_complete'] is False
-    assert inspection.content['result']['scope']['run_id'] == str(ctx.run_id)
-    first_prompt = '\n'.join(message.content for message in model.requests[0].messages)
+    assert mapping(mapping(inspection.content['result'])['python_build_profile'])['catalog_complete'] is False
+    assert mapping(mapping(inspection.content['result'])['scope'])['run_id'] == str(ctx.run_id)
+    first_prompt = '\n'.join(string(message.content) for message in model.requests[0].messages)
     assert 'UNTRUSTED_PROJECT_INSPECTION_JSON' in first_prompt and DIGEST in first_prompt
     assert 'pkg0511' not in first_prompt
 
@@ -192,17 +206,22 @@ async def test_catalog_read_cannot_extend_saved_time_token_or_completed_batch_wi
 ) -> None:
     profile_transport(monkeypatch)
     deadlines = capture_delivery_deadline(monkeypatch)
-    limits: list[Any] = []
-    before: list[Any] = []
+    limits: list[tuple[int, int, int]] = []
+    before: list[BudgetWindow] = []
     token_limit = direct._workspace_delivery_token_limit
 
-    def limit(*args: Any, **kwargs: Any) -> int:
-        result = token_limit(*args, **kwargs)
-        limits.append((kwargs['completed_files'], kwargs['completed_batches'], result))
+    def limit(context: TaskContext, *, initial_soft_limit: int, completed_files: int,
+              completed_batches: int, consumed_tokens: int, last_batch_tokens: int) -> int:
+        result = token_limit(context, initial_soft_limit=initial_soft_limit, completed_files=completed_files,
+                             completed_batches=completed_batches, consumed_tokens=consumed_tokens,
+                             last_batch_tokens=last_batch_tokens)
+        limits.append((completed_files, completed_batches, result))
         return result
 
-    def window() -> Any:
+    def window() -> BudgetWindow:
         value = deadlines[-1]
+        from agent_hub.runtime.adaptive_budget import AdaptiveDeadline
+        assert isinstance(value, AdaptiveDeadline)
         return value.deadline, value.absolute_deadline, value.progress_units, tuple(limits)
 
     monkeypatch.setattr(direct, '_workspace_delivery_token_limit', limit)
@@ -213,7 +232,7 @@ async def test_catalog_read_cannot_extend_saved_time_token_or_completed_batch_wi
     }})
 
     class ObservedModel(Model):
-        async def complete_with_context(self, request: Any) -> Any:
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
             if len(self.requests) == 1:
                 assert window() == before[0]
                 assert limits == [(0, 0, ctx.token_budget)]
@@ -223,10 +242,11 @@ async def test_catalog_read_cannot_extend_saved_time_token_or_completed_batch_wi
     runtime, _, shared, _ = runner(tmp_path, ctx, model)
     invoke = shared.invoke
 
-    async def observe(*args: Any, **kwargs: Any) -> Any:
-        if args[1].tool_name == 'project.inspect':
+    async def observe(tenant_id: UUID, request: HarnessToolCallRequest, *,
+                      user_id: UUID | None = None, role: Role | None = None) -> HarnessToolCallResult:
+        if request.tool_name == 'project.inspect':
             before.append(window())
-        return await invoke(*args, **kwargs)
+        return await invoke(tenant_id, request, user_id=user_id, role=role)
 
     monkeypatch.setattr(shared, 'invoke', observe)
     events = [event async for event in runtime.run(ctx)]
@@ -250,27 +270,28 @@ async def test_catalog_receipt_mismatch_never_reaches_model_files_or_delivery(
     runtime, backend, shared, _ = runner(tmp_path, ctx, model)
     invoke = shared.invoke
 
-    async def tamper(*args: Any, **kwargs: Any) -> Any:
-        result = await invoke(*args, **kwargs)
-        if args[1].tool_name != 'project.inspect':
+    async def tamper(tenant_id: UUID, request: HarnessToolCallRequest, *,
+                     user_id: UUID | None = None, role: Role | None = None) -> HarnessToolCallResult:
+        result = await invoke(tenant_id, request, user_id=user_id, role=role)
+        if request.tool_name != 'project.inspect':
             return result
-        payload = json.loads(json.dumps(result.to_payload()['payload']))
-        value = payload['python_build_profile']
+        payload = object_map(json.loads(json.dumps(result.to_payload()['payload'])))
+        value = object_map(payload['python_build_profile'])
         if fault == 'scope':
-            payload['scope']['run_id'] = str(ctx.actor_id)
+            object_map(payload['scope'])['run_id'] = str(ctx.actor_id)
         elif fault == 'digest':
             value['catalog_sha256'] = 'f' * 64
         elif fault == 'names':
-            value['catalog_page']['names'] = ['other-package']
+            object_map(value['catalog_page'])['names'] = ['other-package']
         elif fault == 'next_offset':
-            value['catalog_page']['next_offset'] = 0
+            object_map(value['catalog_page'])['next_offset'] = 0
         elif fault == 'boolean_count':
-            value['catalog_page']['returned_count'] = True
+            object_map(value['catalog_page'])['returned_count'] = True
         elif fault == 'installed_status':
             value['status'] = 'installed'
         elif fault == 'bad_hash':
-            value['catalog'][0]['sha256'] = 'pretend-wheel-hash'
-        return replace(result, payload=payload, truncated=fault == 'gateway_truncated',
+            object_map(object_array(value['catalog'])[0])['sha256'] = 'pretend-wheel-hash'
+        return replace(result, payload=json_map(payload), truncated=fault == 'gateway_truncated',
                        call_id='foreign-call' if fault == 'wrong_call' else result.call_id)
 
     monkeypatch.setattr(shared, 'invoke', tamper)
@@ -302,7 +323,7 @@ async def test_duplicate_catalog_observation_cannot_buy_more_work_or_write_files
 
 @pytest.mark.parametrize('version', [None, True, '1', 2])
 async def test_unselected_catalog_request_cannot_fall_back_to_text_delivery(
-    tmp_path: Path, version: Any,
+    tmp_path: Path, version: int | str | None,
 ) -> None:
     ctx = diagnostic_context()
     ctx = ctx.model_copy(update={'routing_decision': {

@@ -1,20 +1,45 @@
 """Concrete action authority must precede Root calls; no descriptor grants."""
 
-import importlib
+from dataclasses import dataclass
+from typing import Protocol
 
 import pytest
 
+from agent_hub.capabilities.python_resolution_preparation import PythonResolutionPreparation
+from agent_hub.capabilities.types import CapabilityRequest
+from agent_hub.runs.repository import RunRecord
+from agent_hub.runtime.contracts import TaskContext, _freeze_object
+from agent_hub.skills.sandbox.python_metadata_plan_protocol import PythonMetadataPlanningRequest
+from agent_hub.skills.sandbox.python_registry_protocol import DependencyNeed
+from agent_hub.skills.sandbox.python_resolution_protocol import (
+    ResolutionClaim,
+    ResolutionPlan,
+    ResolutionRequest,
+    ResolutionStatus,
+)
 from tests.unit.skills import test_python_registry_read as registry
 from tests.unit.skills.test_python_resolution_store import claim
 
 offline_network = registry.offline_network
 
 
-def api():
-    return importlib.import_module("agent_hub.capabilities.python_resolution_preparation")
+class PreparationAPI(Protocol):
+    PREFIX: str
+    PythonResolutionPreparation: type[PythonResolutionPreparation]
+
+    def resolution_action(
+        self, claim: ResolutionClaim, needs: tuple[DependencyNeed, ...],
+        environment: dict[str, str], *, plan: ResolutionPlan | None = None,
+    ) -> CapabilityRequest: ...
 
 
-def test_resolution_action_is_specific_and_not_install_or_generic_command():
+def api() -> PreparationAPI:
+    from agent_hub.capabilities import python_resolution_preparation
+
+    return python_resolution_preparation
+
+
+def test_resolution_action_is_specific_and_not_install_or_generic_command() -> None:
     p = api()
     original = claim()
     request = p.resolution_action(
@@ -27,14 +52,14 @@ def test_resolution_action_is_specific_and_not_install_or_generic_command():
     assert request.arguments["requirements"] == ["demo>=1"]
 
 
-async def test_no_bound_worker_means_no_root_call():
+async def test_no_bound_worker_means_no_root_call() -> None:
     p = api()
-    calls = []
+    calls: list[str] = []
 
-    async def current():
+    async def current() -> None:
         calls.append("read")
 
-    async def transport(request):
+    async def transport(request: ResolutionRequest) -> ResolutionStatus:
         calls.append("root")
         raise AssertionError("must not dispatch")
 
@@ -48,10 +73,18 @@ async def test_no_bound_worker_means_no_root_call():
     assert "root" not in calls
 
 
+@dataclass
+class Live:
+    row: RunRecord
+    context: TaskContext
+    planning: PythonMetadataPlanningRequest
+    events: list[ResolutionRequest]
+    revoked: bool = False
+
+
 @pytest.fixture
-def live():
+def live() -> Live:
     from datetime import UTC, datetime, timedelta
-    from types import SimpleNamespace
 
     from agent_hub.auth.models import Role
     from agent_hub.capabilities.python_metadata_preparation import metadata_scope
@@ -60,7 +93,7 @@ def live():
     from agent_hub.runtime.contracts import TaskContext
 
     original = claim()
-    route = {
+    route: dict[str, object] = {
         "generated_project_contract_version": 1,
         "python_dependency_preflight_version": 1,
         "python_dependency_preflight_submission_version": 1,
@@ -86,6 +119,7 @@ def live():
         worker_lease_token=original.lease_token,
         worker_lease_expires_at=datetime.now(UTC) + timedelta(seconds=30),
     )
+    assert row.mode is not None
     context = TaskContext(
         run_id=row.id,
         tenant_id=row.tenant_id,
@@ -94,20 +128,20 @@ def live():
         execution_token=row.worker_lease_token,
         mode=row.mode,
         request=row.request,
-        routing_decision=route,
+        routing_decision=_freeze_object(route, name="routing decision"),
         timeout_seconds=30,
     )
     planning = original.planning.model_copy(
         update={"scope": metadata_scope(row, actor="implementer", live=True)}
     )
-    return SimpleNamespace(row=row, context=context, planning=planning, events=[], revoked=False)
+    return Live(row=row, context=context, planning=planning, events=[], revoked=False)
 
 
 @pytest.mark.parametrize(
     "change",
     ["none", "token", "actor", "tenant", "role", "grant", "request", "permissions", "lease_expiry"],
 )
-async def test_fresh_original_worker_and_concrete_grant_fences(live, change):
+async def test_fresh_original_worker_and_concrete_grant_fences(live: Live, change: str) -> None:
     from dataclasses import replace
     from datetime import UTC, datetime, timedelta
     from uuid import UUID
@@ -121,10 +155,11 @@ async def test_fresh_original_worker_and_concrete_grant_fences(live, change):
     reads = 0
     grants = 0
 
-    async def current():
+    async def current() -> RunRecord:
         nonlocal reads
         reads += 1
         row = c.row
+        assert row.routing_decision is not None
         if change != "none" and reads >= 2:
             if change == "token":
                 return replace(row, worker_lease_token=UUID(int=999))
@@ -150,13 +185,13 @@ async def test_fresh_original_worker_and_concrete_grant_fences(live, change):
                 )
         return row
 
-    async def approved(request):
+    async def approved(request: CapabilityRequest) -> bool:
         nonlocal grants
         grants += 1
         assert request.resource.startswith(p.PREFIX)
         return not (change == "grant" and grants >= 2)
 
-    async def transport(request):
+    async def transport(request: ResolutionRequest) -> ResolutionStatus:
         c.events.append(request)
         assert request.claim.lease_token == c.context.execution_token
         return ResolutionStatus(state="unknown", key=request.key)
@@ -182,7 +217,7 @@ async def test_fresh_original_worker_and_concrete_grant_fences(live, change):
             assert c.events == []
 
 
-def test_public_approval_arguments_never_expose_private_worker_lease():
+def test_public_approval_arguments_never_expose_private_worker_lease() -> None:
     p = api()
     original = claim()
     request = p.resolution_action(

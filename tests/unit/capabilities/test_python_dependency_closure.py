@@ -305,9 +305,9 @@ def test_missing_metadata_has_its_own_status_and_no_invented_candidates(api: Any
 
 @pytest.mark.parametrize('field', ['name', 'version', 'sha'])
 def test_metadata_cannot_substitute_wrong_locked_identity(api: Any, field: str) -> None:
-    kwargs = {'name': 'wrong'} if field == 'name' else {
+    kwargs: dict[str, str] = {'name': 'wrong'} if field == 'name' else {
         field: '2.0' if field == 'version' else OTHER_SHA}
-    result = api.check_python_dependency_closure((lock(),), (meta(api, **kwargs),), ENV)
+    result = api.check_python_dependency_closure((lock(),), (meta(api, name=kwargs.get('name', 'demo'), version=kwargs.get('version', '1.0'), sha=kwargs.get('sha', SHA)),), ENV)
     assert result.status != 'complete'
     assert not any(issue.candidates for issue in result.issues)
     if field != 'name':
@@ -380,7 +380,7 @@ def test_issue_count_and_safe_summary_bytes_are_bounded(api: Any) -> None:
 @pytest.mark.parametrize('kind', ['requirements', 'metadata', 'duplicate_lock', 'list_lock'])
 def test_input_cardinality_and_shapes_are_finite(api: Any, kind: str) -> None:
     locks: Any = (lock(),)
-    items = (meta(api),)
+    items: tuple[object, ...] = (meta(api),)
     if kind == 'requirements':
         locks = tuple(lock(f'pkg-{i}') for i in range(129))
     elif kind == 'metadata':
@@ -492,7 +492,7 @@ def test_issue_semantics_restrict_new_fields_to_meaningful_codes(
 
 @pytest.mark.parametrize('field', ['constraint', 'locked_version'])
 def test_issue_payload_requires_new_fields_even_when_defaulted(api: Any, field: str) -> None:
-    payload = {'code': 'missing_dependency', 'source': 'demo', 'dependency': 'helper',
+    payload: dict[str, object] = {'code': 'missing_dependency', 'source': 'demo', 'dependency': 'helper',
         'candidates': [], 'constraint': '>=2', 'locked_version': None}
     del payload[field]
     with pytest.raises(ValueError):

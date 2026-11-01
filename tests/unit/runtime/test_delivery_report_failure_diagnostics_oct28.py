@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from typing import Never
 from uuid import uuid4
 
 import pytest
@@ -86,7 +87,7 @@ REPORTS = [
 
 
 @pytest.mark.parametrize("reason,category", REPORTS)
-def test_exact_current_report_rejection_has_finite_nonretryable_stage(reason, category):
+def test_exact_current_report_rejection_has_finite_nonretryable_stage(reason: str, category: str) -> None:
     diagnostic = safe_runtime_failure_diagnostic(RuntimeError(reason))
     assert diagnostic == runtime_failure_diagnostic_from_reason(reason)
     assert diagnostic["error_stage"] == "delivery_report"
@@ -107,7 +108,7 @@ def test_exact_current_report_rejection_has_finite_nonretryable_stage(reason, ca
     ("final_report_missing", TaskMode.HYBRID, "HYBRID DISCUSS FAILED: "),
     ("final report policy or text is invalid", TaskMode.HYBRID, "Hybrid Direct Failed: "),
 ])
-async def test_real_terminal_consumer_records_only_no_approval_proposal_or_service_action(reason, mode, wrapper):
+async def test_real_terminal_consumer_records_only_no_approval_proposal_or_service_action(reason: str, mode: TaskMode, wrapper: str) -> None:
     run_id = uuid4()
     raw = wrapper + reason
     diagnostic = runtime_failure_diagnostic_from_reason(raw)
@@ -129,14 +130,14 @@ async def test_real_terminal_consumer_records_only_no_approval_proposal_or_servi
     assert decision.to_proposal(run_id=run_id) is None
     assert "PRIVATE_RETRY_HINT" not in json.dumps(decision.to_event(run_id=run_id, sequence=2).to_payload())
 
-    class NoExecution:
-        def __getattr__(self, name):
+    class NoExecution(RunService):
+        def __getattribute__(self, name: str) -> Never:
             pytest.fail("report classification attempted service work: " + name)
 
     assert await RunService._safe_project_repair_decision(
-        NoExecution(), tenant_id=uuid4(), run_id=run_id, decision=decision) == decision
+        object.__new__(NoExecution), tenant_id=uuid4(), run_id=run_id, decision=decision) == decision
     assert await RunService._safe_auto_accept_self_repair_if_allowed(
-        NoExecution(), tenant_id=uuid4(), run_id=run_id, decision=decision) is None
+        object.__new__(NoExecution), tenant_id=uuid4(), run_id=run_id, decision=decision) is None
 
 
 @pytest.mark.parametrize("raw", [
@@ -150,7 +151,7 @@ async def test_real_terminal_consumer_records_only_no_approval_proposal_or_servi
     "delivery report invented failure",
     "hybrid direct failed: FINAL REPORT EVIDENCE IS INVALID",
 ])
-def test_unknown_report_text_is_redacted_without_granting_report_credit_or_retry(raw):
+def test_unknown_report_text_is_redacted_without_granting_report_credit_or_retry(raw: str) -> None:
     assert safe_runtime_failure_reason(RuntimeError(raw)) == "runtime_failed"
     diagnostic = runtime_failure_diagnostic_from_reason(raw)
     assert diagnostic["error_code"] == "runtime.failed"
@@ -161,7 +162,7 @@ def test_unknown_report_text_is_redacted_without_granting_report_credit_or_retry
 
 @pytest.mark.parametrize("depth", [2, 3, 4, 64, 1024])
 @pytest.mark.parametrize("tail", ["final_report_missing", "delivery report policy is invalid PRIVATE_PROVIDER_TEXT"])
-def test_nested_wrappers_fail_closed_at_any_depth(depth, tail):
+def test_nested_wrappers_fail_closed_at_any_depth(depth: int, tail: str) -> None:
     wrappers = ["hybrid direct failed: ", "HYBRID DISPATCH FAILED: ", "Hybrid Discuss Failed: "]
     raw = "".join(wrappers[index % 3] for index in range(depth)) + tail
     assert safe_runtime_failure_reason(RuntimeError(raw)) == "runtime_failed"
@@ -180,13 +181,13 @@ def test_nested_wrappers_fail_closed_at_any_depth(depth, tail):
     ("hybrid discuss failed: model_outcome_uncertain", "runtime.model_outcome_uncertain"),
     ("final report cannot hide an uncertain model outcome", "runtime.model_outcome_uncertain"),
 ])
-def test_model_or_uncertain_outcome_is_never_mislabeled_as_received_report(reason, code):
+def test_model_or_uncertain_outcome_is_never_mislabeled_as_received_report(reason: str, code: str) -> None:
     diagnostic = safe_runtime_failure_diagnostic(RuntimeError(reason))
     assert diagnostic["error_code"] == code
     assert diagnostic["error_stage"] != "delivery_report"
 
 
-def test_typed_transport_failure_wins_over_report_looking_exception_text():
+def test_typed_transport_failure_wins_over_report_looking_exception_text() -> None:
     diagnostic = safe_runtime_failure_diagnostic(
         ModelTransportError("final report evidence is invalid", status_code=503))
     assert diagnostic["error_code"] == "model.provider_unavailable"
@@ -194,7 +195,7 @@ def test_typed_transport_failure_wins_over_report_looking_exception_text():
 
 
 @pytest.mark.parametrize("uncertainty", ["model_outcome_uncertain", "tool_outcome_uncertain", "payload"])
-def test_existing_uncertain_evidence_wins_over_later_report_rejection(uncertainty):
+def test_existing_uncertain_evidence_wins_over_later_report_rejection(uncertainty: str) -> None:
     run_id = uuid4()
     first = (RunEvent(kind=EventKind.TOOL_FAILED, sequence=1, run_id=run_id,
         actor="main_agent", tool_call_id="call_1", tool_name="workspace_read",
@@ -210,13 +211,13 @@ def test_existing_uncertain_evidence_wins_over_later_report_rejection(uncertaint
     assert decision.to_proposal(run_id=run_id) is None
 
 
-def test_unrelated_report_wording_is_not_accepted_by_substring():
+def test_unrelated_report_wording_is_not_accepted_by_substring() -> None:
     diagnostic = runtime_failure_diagnostic_from_reason("provider says final_report_missing")
     assert diagnostic["error_stage"] != "delivery_report"
 
 
 @pytest.mark.parametrize("requires_approval", [True, False])
-def test_live_action_waiting_approval_contract_is_unchanged(requires_approval):
+def test_live_action_waiting_approval_contract_is_unchanged(requires_approval: bool) -> None:
     run_id = uuid4()
     event = RunEvent(kind=EventKind.RUNTIME_FAILED, sequence=1, run_id=run_id,
         reason="delivery report requires a no-tool native model request")

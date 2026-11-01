@@ -63,8 +63,8 @@ def configured(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
     monkeypatch.setattr(catalog, "os", fs)
     monkeypatch.setattr(store, "sys", SimpleNamespace(platform="linux"))
     lock = ModuleType("fcntl")
-    for name, value in (("LOCK_SH", 1), ("LOCK_EX", 2), ("LOCK_NB", 4), ("flock", fs.flock)):
-        monkeypatch.setattr(lock, name, value, raising=False)
+    for name, lock_value in (("LOCK_SH", 1), ("LOCK_EX", 2), ("LOCK_NB", 4), ("flock", fs.flock)):
+        monkeypatch.setattr(lock, name, lock_value, raising=False)
     monkeypatch.setitem(sys.modules, "fcntl", lock)
     monkeypatch.setattr(api, "_require_root", lambda: None)
     invocation = ProjectInvocation(execution_id="metadata_1", tenant_id=UUID(int=1),
@@ -294,7 +294,9 @@ async def test_cache_fails_closed(configured: Any, monkeypatch: pytest.MonkeyPat
         def disappear(name: str, flags: int, *args: Any, **kwargs: Any) -> int:
             if name == entry.filename:
                 del c.fs.nodes[path]
-            return original(name, flags, *args, **kwargs)
+            result: object = original(name, flags, *args, **kwargs)
+            assert isinstance(result, int)
+            return result
         monkeypatch.setattr(c.fs, "open", disappear)
         c.fs.supports_dir_fd = {c.fs.open, c.fs.stat, c.fs.link, c.fs.unlink}
     if fault == "after_read":
@@ -309,7 +311,9 @@ async def test_cache_fails_closed(configured: Any, monkeypatch: pytest.MonkeyPat
             if calls == 2:
                 if fault == "end_change": node.ctime += 1
                 else: c.fs.nodes[path] = node
-            return await original_source(*args, **kwargs)
+            result: object = await original_source(*args, **kwargs)
+            assert isinstance(result, str)
+            return result
         monkeypatch.setattr(c.api, "project_source_fingerprint", source)
     result = await plan(c)
     assert result.error == "metadata_plan_cache_untrusted" and result.plan is None
@@ -327,7 +331,9 @@ async def test_cancelled_worker_holds_inspection_slot(configured: Any,
     def slow() -> RootConfig:
         started.set()
         assert release.wait(5)
-        return original()
+        result: object = original()
+        assert isinstance(result, RootConfig)
+        return result
     monkeypatch.setattr(c.api, "read_root_configuration", slow)
     task = asyncio.create_task(plan(c, request))
     try:

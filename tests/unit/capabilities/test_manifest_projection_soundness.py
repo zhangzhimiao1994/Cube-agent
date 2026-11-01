@@ -5,8 +5,8 @@ from collections.abc import Mapping
 from typing import Any, cast
 
 import pytest
-from jsonschema import Draft202012Validator  # type: ignore[import-untyped]
-from jsonschema.validators import validator_for  # type: ignore[import-untyped]
+from jsonschema import Draft202012Validator
+from jsonschema.validators import validator_for
 
 from agent_hub.capabilities.manifest import project_capability_manifest_item
 from agent_hub.runtime.contracts import JsonValue

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from pathlib import Path
 from types import ModuleType
 from typing import Any, cast
@@ -8,6 +9,7 @@ from uuid import UUID
 
 import pytest
 from fastapi.testclient import TestClient
+from redis.asyncio import Redis
 
 from agent_hub import app as app_module
 from agent_hub.api.routers.admin import InMemoryAdminResourceService
@@ -15,13 +17,23 @@ from agent_hub.capabilities.defaults import RuntimeCapabilityStack, build_runtim
 from agent_hub.capabilities.project_verification import ProjectVerificationError
 from agent_hub.capabilities.python_project_lifecycle import PythonProjectTerminalHook
 from agent_hub.capabilities.types import CapabilityRequest
+from agent_hub.domain.runs import TaskMode
 from agent_hub.runs.artifacts import PostgresArtifactRepository
 from agent_hub.runs.project_verification_receipts import (
     RECEIPT_KEY,
     ProjectVerificationReceiptRepository,
 )
 from agent_hub.runtime import worker
+from agent_hub.runtime.defaults import UnavailableRuntime
+from agent_hub.runtime.registry import RuntimeRegistry
+from agent_hub.runtime.review_assembly import (
+    ReviewAssemblyBroker,
+    _ProfiledHarness,
+    assemble_review_capability_stack,
+)
 from tests.unit.capabilities.test_verification_cold_recovery import Fixture
+from tests.unit.runs.project_auto_repair_typed_fixture import present
+from tests.unit.runtime.product_stack_diagnostic_typed_fixture import ReceiptOption
 from tests.unit.test_app_wiring import (
     TENANT_ID,
     FakeDatabase,
@@ -76,14 +88,32 @@ def _capture_builds(monkeypatch: pytest.MonkeyPatch, module: ModuleType) -> dict
         captured["registry"] = kwargs
         return object()
 
+    def assembled(
+        broker: ReviewAssemblyBroker,
+        builder: Callable[..., RuntimeCapabilityStack],
+        **options: object,
+    ) -> RuntimeCapabilityStack:
+        stack = assemble_review_capability_stack(broker, builder, **options)
+        original_options, raw = captured["stacks"][-1]
+        assert isinstance(raw, RuntimeCapabilityStack)
+        assert isinstance(stack.harness_tool_gateway, _ProfiledHarness)
+        assert stack.harness_tool_gateway._fresh is raw.harness_tool_gateway
+        assert stack.runtime_gateway is raw.runtime_gateway
+        assert stack.policy_gateway is raw.policy_gateway
+        assert stack.project_cache_cleanup_hook is raw.project_cache_cleanup_hook
+        captured["stacks"][-1] = (original_options, stack)
+        return stack
+
     monkeypatch.setattr(module, "build_runtime_capability_stack", build_stack)
     monkeypatch.setattr(module, "PostgresArtifactRepository", artifacts)
     monkeypatch.setattr(module, "configured_runtime_registry", registry)
+    monkeypatch.setattr(module, "assemble_review_capability_stack", assembled)
     return captured
 
 
 def _assert_isolated_stacks(
     captured: dict[str, Any], settings: Any, factory: Any,
+    *, legacy_artifacts: bool = False,
 ) -> tuple[RuntimeCapabilityStack, RuntimeCapabilityStack]:
     assert len(captured["stacks"]) == 2
     registry = captured["registry"]
@@ -100,11 +130,12 @@ def _assert_isolated_stacks(
     assert registry["harness_tool_gateway"] is legacy.harness_tool_gateway
     assert registry["action_harness_tool_gateway"] is action.harness_tool_gateway
     assert legacy_options.get("receipt_repository") is None
-    assert legacy_options.get("artifact_repository") is None
-    assert legacy.runtime_gateway._artifact_repository is None
     assert legacy.runtime_gateway._project_verification._durable is None
     assert len(captured["artifacts"]) == 1
     artifacts = captured["artifacts"][0]
+    expected_legacy_artifacts = artifacts if legacy_artifacts else None
+    assert legacy_options.get("artifact_repository") is expected_legacy_artifacts
+    assert legacy.runtime_gateway._artifact_repository is expected_legacy_artifacts
     assert registry["artifact_repository"] is artifacts
     assert action_options["artifact_repository"] is artifacts
     assert artifacts._session_factory is factory
@@ -138,7 +169,7 @@ def test_capability_stack_forwards_optional_receipt_repository(
     database = FakeDatabase()
     artifacts = PostgresArtifactRepository(cast(Any, database.session_factory))
     receipts = ProjectVerificationReceiptRepository(cast(Any, database.session_factory))
-    options = {"receipt_repository": receipts} if durable else {}
+    options: ReceiptOption = {"receipt_repository": receipts} if durable else {}
     stack = build_runtime_capability_stack(
         tenant_id=TENANT_ID,
         run_repository=object(),
@@ -148,10 +179,10 @@ def test_capability_stack_forwards_optional_receipt_repository(
         artifact_repository=artifacts,
         **options,
     )
-    verifier = stack.runtime_gateway._project_verification
+    verifier = present(stack.runtime_gateway._project_verification)
     if durable:
-        assert verifier._durable.receipts is receipts
-        assert verifier._durable.artifacts is artifacts
+        assert present(verifier._durable).receipts is receipts
+        assert present(verifier._durable).artifacts is artifacts
     else:
         assert verifier._durable is None
 
@@ -229,7 +260,9 @@ def _build_worker(
     database = FakeDatabase()
     settings = _settings(tmp_path)
     monkeypatch.setattr(worker, "build_database", lambda url: database)
-    monkeypatch.setattr(worker.Redis, "from_url", lambda url: FakeRedis())
+    worker_redis: object = vars(worker)["Redis"]
+    assert worker_redis is Redis
+    monkeypatch.setattr(Redis, "from_url", lambda url: FakeRedis())
     monkeypatch.setattr(worker, "ConfigService", lambda factory: StubConfigService())
     monkeypatch.setattr(worker, "RuntimeMcpService", lambda **kwargs: RuntimeAdapter())
     monkeypatch.setattr(worker, "RuntimePluginService", lambda **kwargs: RuntimeAdapter())
@@ -244,7 +277,9 @@ def test_worker_routes_action_stack_and_preserves_all_terminal_hooks(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     resources, captured, settings, database = _build_worker(tmp_path, monkeypatch)
-    legacy, action = _assert_isolated_stacks(captured, settings, database.session_factory)
+    legacy, action = _assert_isolated_stacks(
+        captured, settings, database.session_factory, legacy_artifacts=True,
+    )
     assert resources.service._project_input_preparer is legacy.project_input_preparer
     assert resources.service._terminal_run_hooks == (
         captured["evolution"], legacy.project_cache_cleanup_hook, action.project_cache_cleanup_hook,
@@ -300,14 +335,16 @@ def test_injected_services_do_not_construct_or_start_runtime_stacks(
     ):
         monkeypatch.setattr(app_module, name, unexpected)
     injected_service = object()
-    injected_registry = object()
+    injected_registry = RuntimeRegistry((UnavailableRuntime(TaskMode.DIRECT),))
+    async def redis_probe() -> None:
+        return None
     application = app_module.create_app(
         settings=_settings(tmp_path), database=FakeDatabase() if with_database else None,
         database_factory=unexpected, redis_client=FakeRedis(),
         auth_service=StubAuthService(), rate_limiter=StubRateLimiter(),
         config_service=StubConfigService(), admin_resource_service=InMemoryAdminResourceService(),
         user_admin_service=object(), run_service=injected_service,
-        runtime_registry=injected_registry, redis_probe=lambda: True,
+        runtime_registry=injected_registry, redis_probe=redis_probe,
     )
     with TestClient(application):
         assert application.state.run_service is injected_service

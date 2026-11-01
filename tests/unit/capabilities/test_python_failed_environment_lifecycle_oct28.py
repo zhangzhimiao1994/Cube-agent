@@ -16,6 +16,10 @@ import pytest
 from agent_hub.capabilities.python_project_lifecycle import PythonProjectTerminalHook
 from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.subprocess_cleanup import ProcessCleanupIncomplete
+from tests.unit.capabilities.capability_lifecycle_typed_fixture import (
+    UnusedContextReader,
+    UnusedReleaser,
+)
 from tests.unit.capabilities.test_python_generated_lifecycle import generated_session, hook_for
 from tests.unit.capabilities.test_python_project_lifecycle import (
     Rows,
@@ -220,7 +224,7 @@ async def test_failed_hook_calls_actual_release_client_with_fresh_no_install_con
         async def run_transaction(self) -> Any:
             return session
 
-    class Reader:
+    class Reader(UnusedContextReader):
         async def python_original_context(self, tenant: UUID, run: UUID) -> Any:
             assert session.open and (tenant, run) == (session.row.tenant_id, session.row.id)
             return SimpleNamespace(invocation=invocation(), environment_references=(reference(),))
@@ -349,7 +353,7 @@ async def test_restarted_actual_original_readonly_service_failed_metadata_only(
 
     releases = []
 
-    class Releaser:
+    class Releaser(UnusedReleaser):
         async def release_completed(self, item: Any, *, expected_environment: Any) -> Any:
             assert session.open and item.install_allowed is False
             releases.append(expected_environment)
@@ -404,7 +408,7 @@ async def test_restarted_actual_generated_readonly_service_failed_keeps_live_aut
 
     releases = []
 
-    class Releaser:
+    class Releaser(UnusedReleaser):
         async def release_completed(self, item: Any, *, expected_environment: Any) -> Any:
             assert session.open and item.install_allowed is False and item.source_kind == "candidate"
             releases.append(expected_environment)

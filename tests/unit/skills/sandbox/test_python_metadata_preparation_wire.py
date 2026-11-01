@@ -10,7 +10,7 @@ import socket
 import struct
 from pathlib import Path
 from types import ModuleType
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import pytest
 
@@ -18,6 +18,7 @@ from agent_hub.skills.sandbox import broker
 from agent_hub.skills.sandbox import python_project_profile as profile_api
 from agent_hub.skills.sandbox.project import ProjectExecutionBroker
 from agent_hub.skills.sandbox.python_metadata_plan_protocol import (
+    MetadataPlanningError,
     PythonMetadataPlan,
     PythonMetadataPlanningRequest,
     PythonMetadataPlanningResponse,
@@ -749,9 +750,14 @@ async def test_bound_v6_profile_negative_preserves_cause_without_extra_authority
 
 
 def test_failure_constructor_is_finite_and_has_keyword_interface() -> None:
+    from agent_hub.skills.sandbox.python_metadata_preparation_client import (
+        PythonMetadataPreparationFailure,
+    )
+
     failure = failure_type()
     value = failure(phase="profile", code="metadata_prepare_unavailable")
     assert type(value) is failure and isinstance(value, RuntimeError)
+    assert isinstance(value, PythonMetadataPreparationFailure)
     assert (value.phase, value.code) == ("profile", "metadata_prepare_unavailable")
     assert value.public_code == str(value) == "python_metadata.profile.metadata_prepare_unavailable"
     codes = client().PUBLIC_FAILURE_CODES
@@ -779,7 +785,8 @@ def test_failure_constructor_is_finite_and_has_keyword_interface() -> None:
     ("plan", "metadata_plan_unavailable"), ("plan", "metadata_plan_timeout"),
 ])
 async def test_trusted_negative_reconnects_once_then_returns_plan(
-    monkeypatch: pytest.MonkeyPatch, phase: str, code: str,
+    monkeypatch: pytest.MonkeyPatch, phase: str,
+    code: Literal["metadata_prepare_unavailable", "metadata_plan_unavailable", "metadata_plan_timeout"],
 ) -> None:
     api = client()
     value = request().planning
@@ -796,9 +803,13 @@ async def test_trusted_negative_reconnects_once_then_returns_plan(
     async def planning(item: PythonMetadataPlanningRequest, **kwargs: Any) -> Any:
         seen.append("plan")
         negative = phase == "plan" and seen == ["profile", "plan"]
+        plan_error: MetadataPlanningError | None = None
+        if negative:
+            assert code != "metadata_prepare_unavailable"
+            plan_error = code
         return PythonMetadataPlanningResponse(
             scope=profile_api.PythonProjectProfileScope.for_invocation(item.invocation),
-            ok=not negative, error=code if negative else None,
+            ok=not negative, error=plan_error,
             plan=None if negative else approved_plan())
 
     monkeypatch.setattr(profile_api.PythonProjectProfileSandbox, "inspect", inspect)
@@ -848,7 +859,8 @@ async def test_plain_errors_never_authorize_readonly_retry(
 @pytest.mark.parametrize("code", ["metadata_plan_unavailable", "metadata_plan_timeout",
                                   "metadata_plan_cache_untrusted"])
 async def test_repeated_or_nonretryable_root_plan_failure_is_typed(
-    monkeypatch: pytest.MonkeyPatch, code: str,
+    monkeypatch: pytest.MonkeyPatch,
+    code: Literal["metadata_plan_unavailable", "metadata_plan_timeout", "metadata_plan_cache_untrusted"],
 ) -> None:
     api = client()
     failure = failure_type()
@@ -1009,7 +1021,7 @@ async def test_negative_response_must_validate_before_retry(
 
 @pytest.mark.parametrize("state", ["unknown", "absent"])
 async def test_readonly_inspect_returns_unknown_or_absent_without_preparing(
-    monkeypatch: pytest.MonkeyPatch, state: str,
+    monkeypatch: pytest.MonkeyPatch, state: Literal["unknown", "absent"],
 ) -> None:
     from agent_hub.skills.sandbox.python_metadata_preparation_protocol import (
         PythonMetadataPreparationStatus,
@@ -1017,6 +1029,7 @@ async def test_readonly_inspect_returns_unknown_or_absent_without_preparing(
 
     api = client()
     expected = request(True)
+    assert expected.preparation_execution_id is not None
     status = PythonMetadataPreparationStatus(plan_sha256=expected.expected_plan_sha256,
         preparation_execution_id=expected.preparation_execution_id, state=state)
     calls = 0

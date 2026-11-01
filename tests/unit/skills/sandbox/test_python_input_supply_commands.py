@@ -1,33 +1,41 @@
+from dataclasses import replace
 from pathlib import Path
-from types import SimpleNamespace
 from uuid import UUID
 
+from agent_hub.skills.sandbox.broker import BrokerPolicy
+from agent_hub.skills.sandbox.project import OriginalProjectReference
 from agent_hub.skills.sandbox.python_input_supply_broker import build_input_supply_root_command
+from agent_hub.skills.sandbox.python_input_supply_catalog import RootSupplyConfig
 from agent_hub.skills.sandbox.python_input_supply_worker import build_fetch_command
+from agent_hub.skills.sandbox.python_project_backend import RootConfig
 from agent_hub.skills.sandbox.python_project_protocol import (
     PythonProjectProbeInvocation,
     base_python_invocation,
 )
+from tests.unit.skills.test_python_dependency_index_store import (
+    root_configuration,
+    supply_configuration,
+)
 
 
-def invocation():
+def invocation() -> PythonProjectProbeInvocation:
     return PythonProjectProbeInvocation(execution_id="supply_" + "1" * 32,
         tenant_id=UUID(int=1), run_id=UUID(int=2), project_id="project", session_id="session",
         sandbox_profile="workspace_write", timeout_seconds=30,
-        original_reference={"schema_version": 1, "contract_sha256": "1" * 64,
-                            "input_source_sha256": "2" * 64, "file_count": 6})
+        original_reference=OriginalProjectReference(schema_version=1, contract_sha256="1" * 64,
+                            input_source_sha256="2" * 64, file_count=6))
 
 
-def settings():
-    policy = SimpleNamespace(python="/opt/app/bin/python", systemd_run="/usr/bin/systemd-run",
+def settings() -> tuple[BrokerPolicy, RootConfig, RootSupplyConfig]:
+    policy = BrokerPolicy(python="/opt/app/bin/python", systemd_run="/usr/bin/systemd-run",
         systemctl="/usr/bin/systemctl", service_group="agent_hub", project_workspace_root=Path("/var/lib/workspaces"))
-    config = SimpleNamespace(stage_root=Path("/var/lib/stages"), environment_root=Path("/var/lib/environments"),
+    config = replace(root_configuration(), stage_root=Path("/var/lib/stages"), environment_root=Path("/var/lib/environments"),
                              wheel_root=Path("/var/lib/wheels"))
-    supply = SimpleNamespace(state_root=Path("/var/lib/input-supply"), fetch_timeout_seconds=15)
+    supply = replace(supply_configuration(), state_root=Path("/var/lib/input-supply"), fetch_timeout_seconds=15)
     return policy, config, supply
 
 
-def test_root_worker_is_offline_and_only_writes_explicit_supply_roots():
+def test_root_worker_is_offline_and_only_writes_explicit_supply_roots() -> None:
     policy, config, supply = settings()
     command = build_input_supply_root_command(base_python_invocation(invocation()), policy,
         configuration=config, supply=supply, stage=config.stage_root / "owned")
@@ -38,7 +46,7 @@ def test_root_worker_is_offline_and_only_writes_explicit_supply_roots():
     assert not any("ReadWritePaths=" in item and "environments" in item for item in command)
 
 
-def test_fetch_unit_has_no_project_cache_secret_or_broker_access():
+def test_fetch_unit_has_no_project_cache_secret_or_broker_access() -> None:
     policy, config, supply = settings()
     command = build_fetch_command(invocation(), policy, configuration=config, supply=supply)
     assert "DynamicUser=yes" in command and "CapabilityBoundingSet=" in command
@@ -57,10 +65,10 @@ def test_fetch_unit_has_no_project_cache_secret_or_broker_access():
     assert "-i" in command and "-I" in command and "-B" in command
 
 
-def test_fetch_still_masks_a_project_outside_empty_runtime_filesystems():
+def test_fetch_still_masks_a_project_outside_empty_runtime_filesystems() -> None:
     policy, config, supply = settings()
-    policy.project_workspace_root = Path("/srv/private-projects")
-    config.wheel_root = Path("/mnt/private-wheels")
+    policy = replace(policy, project_workspace_root=Path("/srv/private-projects"))
+    config = replace(config, wheel_root=Path("/mnt/private-wheels"))
     command = build_fetch_command(invocation(), policy, configuration=config, supply=supply)
     masked = next(item for item in command if item.startswith("InaccessiblePaths="))
     assert set(masked.split("=", 1)[1].split()) == {

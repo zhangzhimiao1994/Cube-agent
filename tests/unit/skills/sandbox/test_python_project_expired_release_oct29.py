@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import sys
 import time
@@ -19,6 +20,8 @@ from agent_hub.skills.sandbox import python_project_client as client
 from agent_hub.skills.sandbox import python_project_protocol as protocol
 from agent_hub.skills.sandbox.broker import BrokerPolicy
 from agent_hub.skills.sandbox.project import ProjectExecutionBroker
+from agent_hub.skills.sandbox.project_contract_broker import _encoded
+from agent_hub.skills.sandbox.python_project_copy import PythonProjectCopyError
 from agent_hub.subprocess_cleanup import ProcessCleanupIncomplete
 from tests.unit.skills.sandbox.test_python_project_broker import api as api  # noqa: PLC0414
 from tests.unit.skills.sandbox.test_python_project_broker import (
@@ -141,7 +144,7 @@ def test_cache_selects_full_expired_ready_and_deletes_only_exact_key_under_lock(
     case = cache_boundary
     chosen = selection(case)
     assert chosen.reference == reference()
-    assert chosen.reservation_sha256 == cache_api.hashlib.sha256(cache_api._encoded(case.reservation)).hexdigest()
+    assert chosen.reservation_sha256 == hashlib.sha256(_encoded(case.reservation)).hexdigest()
     assert case.cache.release_expired(case.inv, chosen, deadline=time.monotonic() + 5) is True
     assert case.erased == [case.key] and case.locked == []
 
@@ -275,14 +278,14 @@ def test_expiry_known_predelete_refusal_is_not_native_uncertainty_but_delete_and
     monkeypatch.setattr(backend, 'load_broker_policy', BrokerPolicy)
     monkeypatch.setattr(backend, 'load_root_configuration', lambda: config)
     monkeypatch.setattr(backend, '_root', lambda *args, **kwargs: 42)
-    actual_stat = backend.os.stat
+    actual_stat = os.stat
 
     def stat(path: Any, *args: Any, **kwargs: Any) -> Any:
         if path == 'request.json' and kwargs.get('dir_fd') == 42:
             return SimpleNamespace(st_size=len(item.model_dump_json().encode()))
         return actual_stat(path, *args, **kwargs)
 
-    monkeypatch.setattr(backend.os, 'stat', stat)
+    monkeypatch.setattr(os, 'stat', stat)
     monkeypatch.setattr(backend, '_read_control', lambda *a, **k: item.model_dump_json().encode())
     monkeypatch.setattr(backend, 'execute_python_project_request', lambda actual, **kw:
         backend._release_expired(actual, kw['policy'], kw['configuration'],
@@ -456,7 +459,7 @@ def test_native_fd_expiry_measures_and_preserves_unsafe_or_changed_entries(
     key = cache_api.python_project_cache_key(inv)
     entry = cache.root / key
     wall = time.time() + cache.policy.retention_seconds + 1
-    monkeypatch.setattr(cache_api.time, 'time', lambda: wall)
+    monkeypatch.setattr(time, 'time', lambda: wall)
     if defect == 'partial':
         (entry / 'reference.json').unlink()
         with pytest.raises(cache_api.PythonProjectCacheError):
@@ -474,9 +477,9 @@ def test_native_fd_expiry_measures_and_preserves_unsafe_or_changed_entries(
         path = entry / 'reservation.json'
         reservation = json.loads(path.read_bytes())
         reservation['expires_at'] = int(wall + 60)
-        path.write_bytes(cache_api._encoded(reservation))
+        path.write_bytes(_encoded(reservation))
     if defect is not None:
-        with pytest.raises((cache_api.PythonProjectCacheError, cache_api.PythonProjectCopyError)):
+        with pytest.raises((cache_api.PythonProjectCacheError, PythonProjectCopyError)):
             cache.release_expired(inv, selected, deadline=time.monotonic() + 10)
         assert entry.is_dir()
     else:

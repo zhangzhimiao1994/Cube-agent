@@ -28,9 +28,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Never, Protocol, cast
 from uuid import UUID, uuid4
 
-from jsonschema import Draft202012Validator, SchemaError  # type: ignore[import-untyped]
-from jsonschema.protocols import Validator  # type: ignore[import-untyped]
-from jsonschema.validators import validator_for  # type: ignore[import-untyped]
+from jsonschema import Draft202012Validator, SchemaError
+from jsonschema.protocols import Validator
+from jsonschema.validators import validator_for
 
 from agent_hub.auth.models import Role
 from agent_hub.capabilities.project_verification import validated_project_failure_payload
@@ -78,7 +78,11 @@ from agent_hub.models.types import (
     model_message_payload,
 )
 from agent_hub.plugins.contracts import plugin_package_generation_guidance
-from agent_hub.plugins.schemas import PluginSchemaError, plugin_schema_validator
+from agent_hub.plugins.schemas import (
+    PluginSchemaError,
+    known_schema_validator,
+    plugin_schema_validator,
+)
 from agent_hub.project_preflight import scoped_project_preflight_arguments
 from agent_hub.recovery_metadata import ORCHESTRATION_CONTRACT_RECOVERY_HINT
 from agent_hub.runtime.adaptive_budget import AdaptiveDeadline, deadline_from_routing
@@ -587,6 +591,17 @@ def _mutable_json(value: object) -> object:
     return value
 
 
+type _MutableSchemaJson = JsonScalar | list["_MutableSchemaJson"] | dict[str, "_MutableSchemaJson"]
+
+
+def _mutable_schema_json(value: JsonValue) -> _MutableSchemaJson:
+    if isinstance(value, Mapping):
+        return {key: _mutable_schema_json(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_mutable_schema_json(item) for item in value]
+    return value
+
+
 def _model_tool_name(internal_name: str) -> str:
     safe = re.sub(r"[^A-Za-z0-9_-]+", "_", internal_name).strip("_")
     if not safe:
@@ -921,7 +936,7 @@ def _plugin_argument_prevalidation(
     if schema is None:
         _fail("plugin input schema is invalid")
     try:
-        if "$schema" in schema and validator_for(schema, default=None) is None:
+        if "$schema" in schema and known_schema_validator(schema) is None:
             _fail("plugin input schema is invalid")
         validator = plugin_schema_validator(
             schema=schema, invalid_schema_message="plugin input schema is invalid",
@@ -929,7 +944,7 @@ def _plugin_argument_prevalidation(
         )
         if validator is None:
             _fail("plugin input schema is invalid")
-        error = next(validator.iter_errors(_mutable_json(tool_call.arguments)), None)
+        error = next(validator.iter_errors(_mutable_schema_json(tool_call.arguments)), None)
     except (PluginSchemaError, TypeError, ValueError, RecursionError, re.error):
         _fail("plugin input schema is invalid")
     if error is None:
@@ -1935,9 +1950,12 @@ def _validate_structured_role_output(
 
 def _structured_validator(schema: StructuredResponseSchema) -> Validator:
     try:
-        payload = _mutable_json(_freeze_bounded_json(schema.schema))
+        payload = _mutable_schema_json(_freeze_bounded_json(schema.schema))
     except (ValueError, TypeError, RecursionError):
         _fail("structured output schema exceeds limits")
+
+    if not isinstance(payload, dict):
+        _fail("structured output schema is invalid")
 
     def check(item: object) -> None:
         if not isinstance(item, dict):
@@ -1977,7 +1995,7 @@ def _structured_validator(schema: StructuredResponseSchema) -> Validator:
         validator.check_schema(payload)
     except SchemaError:
         _fail("structured output schema is invalid")
-    return cast(Validator, validator(payload))
+    return validator(payload)
 
 
 def _parse_structured_output(
@@ -2022,11 +2040,15 @@ def _parse_structured_output(
         _fail(f"{prefix} is not an object")
     error = next(validator.iter_errors(payload), None)
     if error is not None:
-        reason = {
+        reasons = {
             "required": "missing field",
             "type": "field type mismatch",
             "additionalProperties": "has unexpected fields",
-        }.get(error.validator, "does not match schema")
+        }
+        reason = (
+            reasons.get(error.validator, "does not match schema")
+            if isinstance(error.validator, str) else "does not match schema"
+        )
         _fail(f"{prefix} {reason}")
     return frozen
 

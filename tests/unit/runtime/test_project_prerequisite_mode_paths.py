@@ -38,6 +38,7 @@ from agent_hub.runtime.crew.adapter import CrewDispatchRuntime, RuntimeExecution
 from agent_hub.runtime.crew.plan import AgentSpec, DispatchPlan, DispatchStep
 from agent_hub.runtime.hybrid import HybridRuntime
 from tests.unit.capabilities.test_project_prerequisites import SOURCE, raw_report
+from tests.unit.runs.project_auto_repair_typed_fixture import json_map
 from tests.unit.runtime.crew.test_adapter_failure_reason import FastFactory
 from tests.unit.runtime.crew.test_execution_diagnostic_continuation import Policy, context
 from tests.unit.runtime.test_hybrid import UnusedRuntime
@@ -305,6 +306,7 @@ async def test_engineering_blocked_then_complete_claim_cannot_publish_delivery(m
                 events.append(event)
         except RuntimeExecutionError as error:
             if mode is TaskMode.DISPATCH:
+                assert isinstance(error, crew_adapter._ProjectPrerequisiteBlocked)
                 assert error.project_prerequisite_payload == backend.observation.to_payload()
             else:
                 assert "delivery" in str(error) or "bundle is missing" in str(error)
@@ -440,7 +442,7 @@ def private_prerequisite_ledger() -> tuple[TaskContext, DispatchStep, Any, str]:
     row = {"step_id": "observe", "status": "failed", "attempt": 0, "round": 0, "tool_index": 0,
            "name": "project.verify", "arguments_sha256": digest, "trigger_model_artifact_id": trigger,
            "artifact_id": str(artifact.id), "sha256": artifact.content_sha256}
-    return ctx, step, crew_adapter._ToolLedger(states={key: row}, artifacts={key: artifact}), key
+    return ctx, step, crew_adapter._ToolLedger(states={key: json_map(row)}, artifacts={key: artifact}), key
 
 
 @pytest.mark.parametrize("trigger_key", [False, True])

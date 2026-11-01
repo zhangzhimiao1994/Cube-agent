@@ -21,7 +21,7 @@ import time
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 
 import pytest
@@ -300,7 +300,9 @@ async def test_catalog_and_root_configuration_are_bound_before_and_after(
     ("timeout", "python_dependency_unavailable"),
 ])
 async def test_index_errors_map_to_finite_path_free_codes(
-    configured: Any, monkeypatch: pytest.MonkeyPatch, code: str, expected: str,
+    configured: Any, monkeypatch: pytest.MonkeyPatch,
+    code: Literal["metadata_unavailable", "metadata_untrusted", "catalog_changed", "unsupported", "timeout"],
+    expected: str,
 ) -> None:
     def fail(*args: Any, **kwargs: Any) -> Any:
         raise PythonDependencyIndexError(code)
@@ -327,7 +329,7 @@ async def test_forged_requests_fail_before_root_or_io(
     configured: Any, monkeypatch: pytest.MonkeyPatch, mutation: str,
 ) -> None:
     request = await request_for(configured)
-    changes = {"install": {"install_allowed": True}, "profile": {"sandbox_profile": "workspace_write"},
+    changes: dict[str, dict[str, object]] = {"install": {"install_allowed": True}, "profile": {"sandbox_profile": "workspace_write"},
                "timeout_bool": {"timeout_seconds": True}, "extra": {"original_reference": {}}}
     if mutation == "version":
         request = request.model_copy(update={"version": True})

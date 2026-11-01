@@ -10,9 +10,9 @@ import pytest
 from agent_hub.capabilities.project_prerequisites import validate_project_prerequisite_report
 from agent_hub.capabilities.runtime import RuntimeCapabilityError
 from agent_hub.runs.repository import _public_event_payload
-from agent_hub.runtime.autogen.adapter import _execution_failure_result as discuss_feedback
 from agent_hub.runtime.crew.adapter import _execution_failure_result as dispatch_feedback
 from agent_hub.runtime.direct import RuntimeExecutionError
+from agent_hub.runtime.execution_failure import execution_failure_result as discuss_feedback
 from agent_hub.runtime.failure_reason import (
     runtime_failure_diagnostic_from_reason,
     safe_runtime_failure_diagnostic,

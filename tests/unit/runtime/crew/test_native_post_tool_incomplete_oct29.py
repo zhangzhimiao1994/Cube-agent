@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import replace
 from decimal import Decimal
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 
 import pytest
@@ -45,7 +45,7 @@ FINAL = ModelResponse(text="Workspace delivered with its actual bundle.", usage=
 
 
 class NativeGateway:
-    def __init__(self, *outcomes: Any, status: str = "incomplete", trusted: bool = True,
+    def __init__(self, *outcomes: Any, status: Literal["completed", "incomplete", "refused", "unknown"] = "incomplete", trusted: bool = True,
                  entries: int = 1, usage_known: bool = True) -> None:
         self.outcomes = outcomes
         self.requests: list[ModelRequest] = []

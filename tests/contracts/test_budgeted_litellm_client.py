@@ -2,16 +2,26 @@
 import asyncio
 import json
 import traceback
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Coroutine
 from dataclasses import replace
 from decimal import Decimal
 
 import httpx
 import pytest
 
-from agent_hub.models.litellm_client import LiteLLMClient, ModelResponseError, ModelTransportError
-from agent_hub.models.physical_admission import _bind_physical_admission, _PhysicalAdmissionStopped
-from agent_hub.models.types import TokenUsage
+from agent_hub.models.litellm_client import (
+    LiteLLMClient,
+    ModelResponseError,
+    ModelTransportError,
+    _OpenAICompatibleChunkStream,
+)
+from agent_hub.models.physical_admission import (
+    _bind_physical_admission,
+    _PhysicalAdmissionStopped,
+    _PhysicalPermit,
+    _PhysicalReceipt,
+)
+from agent_hub.models.types import ModelResponse, TokenUsage
 from tests.contracts import test_litellm_client as legacy
 from tests.contracts.test_required_tool_transport import (
     deployment,
@@ -19,6 +29,7 @@ from tests.contracts.test_required_tool_transport import (
     request,
     transport,
 )
+from tests.unit.models.review_admission_contract_typed_fixture import present
 from tests.unit.models.test_physical_admission import Admission, RemainingAdmission, admission_scope
 
 
@@ -110,8 +121,10 @@ async def test_lazy_capture_revoked_before_first_await_cannot_escape(streaming: 
                    client.complete(deployment("chat_completions"), request("chat_completions"), "mock-key"))
     with pytest.raises(_PhysicalAdmissionStopped):
         if streaming:
+            assert isinstance(pending, AsyncIterator)
             await anext(pending)
         else:
+            assert isinstance(pending, Awaitable)
             await pending
 
 
@@ -162,7 +175,7 @@ async def test_receipt_failure_keeps_permit_and_blocks_next_call() -> None:
                 await client.complete(deployment("chat_completions"), request("chat_completions"), "mock-key")
     assert len(wire) == 1
     assert len(scope.attempts) == 1
-    assert scope.attempts[0].receipt.usage == TokenUsage(2, 3, 5)
+    assert present(scope.attempts[0].receipt).usage == TokenUsage(2, 3, 5)
     assert not scope.attempts[0].delivered
 
 
@@ -191,7 +204,7 @@ async def test_stream_known_usage_survives_cancel_and_scope_is_shared() -> None:
         async def __aiter__(self) -> AsyncIterator[bytes]:
             yield ("data: " + json.dumps(chunk) + "\n\n").encode()
             entered.set()
-            await asyncio.Future()
+            await asyncio.Future[None]()
 
     client = LiteLLMClient(_network_delegate_factory=lambda: httpx.MockTransport(
         lambda r: httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=Body())))
@@ -199,7 +212,9 @@ async def test_stream_known_usage_survives_cancel_and_scope_is_shared() -> None:
         chunks = client.stream_openai_compatible_chunks(deployment("chat_completions"),
                                                        request("chat_completions"), "mock-key")
         await anext(chunks)
-        task = asyncio.create_task(anext(chunks))
+        advance = anext(chunks)
+        assert isinstance(advance, Coroutine)
+        task = asyncio.create_task(advance)
         await entered.wait()
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -342,7 +357,7 @@ async def test_issued_network_unknown_keeps_identity_and_primary_error() -> None
         with pytest.raises(ModelTransportError):
             await client.complete(deployment("chat_completions"), request("chat_completions"), "mock-key")
         issued = scope.attempts[0]
-        unknown_receipt = issued.receipt
+        unknown_receipt = present(issued.receipt)
         result = await client.complete(replace(deployment("chat_completions"), id="fallback"),
                                        request("chat_completions"), "mock-key")
         assert result.usage == TokenUsage(2, 3, 5)
@@ -366,7 +381,7 @@ async def test_absolute_deadline_covers_admission_and_request(streaming: bool) -
 
     async def handle(req: httpx.Request) -> httpx.Response:
         entered.set()
-        await asyncio.Future()
+        await asyncio.Future[None]()
         raise AssertionError("unreachable")
 
     admission = Admission()
@@ -380,12 +395,13 @@ async def test_absolute_deadline_covers_admission_and_request(streaming: bool) -
             await client.complete(deployment("chat_completions"), request("chat_completions"), "mock-key")
     assert entered.is_set()
     assert len(scope.attempts) == 1 and scope.attempts[0].receipt is not None
-    assert scope.attempts[0].receipt.usage is None
+    assert present(scope.attempts[0].receipt).usage is None
 
 
 @pytest.mark.parametrize("streaming", [False, True])
 async def test_lazy_default_capture_does_not_adopt_later_scope(streaming: bool) -> None:
     client = transport(lambda r: httpx.Response(200, json=provider_response("chat_completions")))
+    pending: AsyncIterator[object] | Awaitable[ModelResponse]
     if streaming:
         # A custom legacy stream factory is allowed only because creation captured None.
         client = transport(lambda r: httpx.Response(200, headers={"content-type": "text/event-stream"},
@@ -397,8 +413,10 @@ async def test_lazy_default_capture_does_not_adopt_later_scope(streaming: bool) 
     admission = Admission()
     with _bind_physical_admission(admission_scope(admission)):
         if streaming:
+            assert isinstance(pending, AsyncIterator)
             assert [x async for x in pending] == []
         else:
+            assert isinstance(pending, Awaitable)
             await pending
     assert admission.metadata == []
 
@@ -420,7 +438,7 @@ async def test_gateway_selected_sha_and_pricing_handoff_captured_at_call_creatio
             pending = client.complete(actual, request("chat_completions", max_output_tokens=10), "mock-key")
         await pending
     assert admission.metadata[0].request_sha256 == "b" * 64
-    selected = admission.metadata[0].selection
+    selected = present(admission.metadata[0].selection)
     assert selected.deployment == actual
     assert selected.token_hold == 1000 and selected.cost_hold_usd == Decimal("0.003000")
     assert "selection=" not in repr(admission.metadata[0])
@@ -514,7 +532,7 @@ async def test_complete_external_cancel_retains_issued_unknown_and_closes() -> N
 
     async def handle(req: httpx.Request) -> httpx.Response:
         entered.set()
-        await asyncio.Future()
+        await asyncio.Future[None]()
         raise AssertionError("unreachable")
 
     client = LiteLLMClient(_network_delegate_factory=lambda: Delegate(handle))
@@ -600,7 +618,7 @@ _RECEIPT_PRIVATE_SENTINEL = "private-db-url-and-secret-receipt-sentinel"
 @pytest.mark.parametrize("streaming", [False, True])
 async def test_after_receipt_failure_has_no_reachable_private_exception(streaming: bool) -> None:
     class PrivateFailure(Admission):
-        async def after_receipt(self, permit, receipt, *, deadline) -> None:
+        async def after_receipt(self, permit: _PhysicalPermit, receipt: _PhysicalReceipt, *, deadline: float) -> None:
             raise RuntimeError(_RECEIPT_PRIVATE_SENTINEL)
 
     scope = admission_scope(PrivateFailure())
@@ -626,7 +644,7 @@ async def test_after_receipt_failure_has_no_reachable_private_exception(streamin
         caught.value, capture_locals=True).format())
     assert _RECEIPT_PRIVATE_SENTINEL not in rendered
     assert len(scope.attempts) == 1
-    assert scope.attempts[0].receipt.usage == TokenUsage(2, 3, 5)
+    assert present(scope.attempts[0].receipt).usage == TokenUsage(2, 3, 5)
     assert not scope.attempts[0].delivered
 
 
@@ -644,7 +662,7 @@ async def test_paused_stream_stop_closes_response_body_before_return(stop: str, 
                      "model": "test-model", "choices": [],
                      "usage": {"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5}}
             yield ("data: " + json.dumps(chunk) + "\n\n").encode()
-            await asyncio.Future()
+            await asyncio.Future[None]()
 
         async def aclose(self) -> None:
             assert admission.receipts[0][1].usage == TokenUsage(2, 3, 5)
@@ -687,5 +705,6 @@ async def test_paused_stream_stop_closes_response_body_before_return(stop: str, 
                 await asyncio.create_task(advance())
         assert body_events == ["started", {"normal": "finished", "error": "error", "blocked": "cancelled"}[cleanup]]
         assert transport_closes == [True]
+        assert isinstance(chunks, _OpenAICompatibleChunkStream)
         await chunks.aclose()
         assert len(body_events) == 2  # explicit close is idempotent after the stop

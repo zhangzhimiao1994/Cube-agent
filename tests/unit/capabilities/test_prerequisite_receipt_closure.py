@@ -18,6 +18,8 @@ from tests.unit.capabilities.test_project_prerequisites import raw_report
 from tests.unit.capabilities.test_project_verification import Executor
 from tests.unit.capabilities.test_scoped_read import project_path, write_file
 from tests.unit.capabilities.test_verification_cold_recovery import Fixture, restore, verify
+from tests.unit.runs.project_auto_repair_typed_fixture import sequence
+from tests.unit.runs.reviewed_report_revision_typed_fixture import read_map
 
 ERROR = "project verification receipt is unavailable or changed"
 BLOCKED = "project verification blocked by execution prerequisites"
@@ -68,7 +70,7 @@ async def test_bound_manifest_block_closes_failed_allows_only_new_action(
     issued = fixture.db.row.routing_decision[RECEIPT_KEY]
     assert issued["status"] == "failed", "a confirmed source-bound pre-execution rejection must not remain UNKNOWN"
     assert issued["source_sha256"] == observation.source_sha256 == observation.to_payload()["source_sha256"]
-    assert all(check["status"] == "not_run" for check in observation.to_payload()["checks"])
+    assert all(read_map(check)["status"] == "not_run" for check in sequence(observation.to_payload()["checks"]))
     assert issued["action_key"] == "manifest-blocked" and issued["artifact_references"] == []
     assert set(fixture.artifacts._artifacts) == artifacts_before
     calls = len(executor.calls)

@@ -9,7 +9,10 @@ from typing import Any
 
 import pytest
 
-from agent_hub.capabilities.generated_project_service import GeneratedProjectService
+from agent_hub.capabilities.generated_project_service import (
+    GeneratedProjectService,
+    PythonMetadataPreparationApprovalRequired,
+)
 from agent_hub.skills.sandbox.python_dependency_protocol import PythonDependencyClosureFailure
 from agent_hub.skills.sandbox.python_metadata_plan_protocol import PythonMetadataPlan
 from tests.unit.capabilities.test_generated_project_service import USER
@@ -88,6 +91,7 @@ async def test_missing_metadata_requests_concrete_plan_before_capture(draft: Any
     with pytest.raises(Exception) as error:
         await service.prepare(TENANT, RUN, 'engineer', user_id=USER)
     assert type(error.value).__name__ == 'PythonMetadataPreparationApprovalRequired', repr(error.value.__context__)
+    assert isinstance(error.value, PythonMetadataPreparationApprovalRequired)
     assert error.value.approval_request.resource.startswith('workspace/current/project-metadata/python/')
     assert c.repo.row.routing_decision['python_metadata_preparation']['phase'] == 'planned'
     assert 'generated_project_preparation' not in c.repo.row.routing_decision
@@ -124,6 +128,7 @@ async def test_real_gateway_routes_concrete_metadata_approval_not_generic_tool(d
     c = metadata_case(draft)
     runtime = RuntimeCapabilityGateway(skill_store_dir=tmp_path / 'skills',
         project_workspace_dir=c.service.root, run_repository=c.repo)
+    assert runtime._project_verification is not None
     runtime._project_verification.generated._metadata_client = c.client
     runtime._project_verification.generated._dependency_inspector = c.closure
     policy = FakePolicyGateway(CapabilityStatus.WAITING_APPROVAL)

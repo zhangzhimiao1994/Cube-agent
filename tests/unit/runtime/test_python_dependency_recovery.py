@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Mapping, Sequence
 from copy import deepcopy
+from typing import TypedDict
 from uuid import uuid4
 
 import pytest
@@ -14,7 +16,7 @@ from agent_hub.runtime.autogen.engineering_delivery import (
     engineering_progress,
     engineering_work_progress,
 )
-from agent_hub.runtime.contracts import Artifact
+from agent_hub.runtime.contracts import Artifact, JsonValue, TaskContext, _freeze_object
 from agent_hub.runtime.generated_draft_feedback import generated_draft_artifact_feedback
 from agent_hub.runtime.self_repair_context import project_repair_failure_text
 from tests.unit.capabilities.test_generated_dependency_draft import observation
@@ -25,9 +27,10 @@ from tests.unit.runtime.autogen.test_draft_action_progress import (
     result,
 )
 from tests.unit.runtime.test_generated_draft_autogen import draft_artifact, rejection
+from tests.unit.skills.python_registry_typed_fixture import object_array, object_map
 
 
-def _closure():
+def _closure() -> dict[str, object]:
     return {'status': 'incomplete', 'issues': [
         {'code': 'missing_dependency', 'source': 'demo-dep', 'dependency': 'demo-helper',
             'constraint': '>=2', 'locked_version': None, 'candidates': [
@@ -40,33 +43,43 @@ def _closure():
     ]}
 
 
-def _case():
+def _case() -> tuple[TaskContext, list[dict[str, JsonValue]], list[Artifact]]:
     ctx, rows, artifacts = draft_case()
     ctx = ctx.model_copy(update={'routing_decision': {
         **ctx.routing_decision, 'python_dependency_preflight_version': 1}})
     return ctx, rows[:-1], artifacts[:-1]
 
 
-def _dependency_artifact(ctx, *, digest='7' * 64, observed=None):
+def _dependency_artifact(
+    ctx: TaskContext, *, digest: str = '7' * 64, observed: dict[str, object] | None = None,
+) -> Artifact:
     data = rejection(ctx, observation=digest)
     if observed is None:
         observed = observation() | {'closure': _closure()}
-    data.update(schema_version=2, reason='generated_acceptance_python_dependency_incomplete',
-        issues=['python_dependency_incomplete'], dependency_closure=observed)
+    data.update(_freeze_object({
+        'schema_version': 2, 'reason': 'generated_acceptance_python_dependency_incomplete',
+        'issues': ['python_dependency_incomplete'], 'dependency_closure': observed,
+    }, name='dependency rejection'))
     return result('project.verify', {
         'status': 'failed', 'untrusted': True, 'generated_draft_rejection': data})
 
 
-def _hints(ctx, rows, artifacts):
+def _hints(
+    ctx: TaskContext, rows: Sequence[Mapping[str, JsonValue]], artifacts: Sequence[Artifact],
+) -> frozenset[str]:
     return engineering_work_progress(ctx, tool_entries=rows, artifacts=artifacts,
         allowed_tools=ALLOWED, include_draft_diagnoses=True)
 
 
-def _project(artifact, *, expected_id=None, expected_sha=None, feedback=None):
+def _project(
+    artifact: Artifact, *, expected_id: str | None = None, expected_sha: str | None = None,
+    feedback: Mapping[str, JsonValue] | None = None,
+) -> str:
     return project_repair_failure_text(artifact,
         expected_artifact_id=str(artifact.id) if expected_id is None else expected_id,
         expected_artifact_sha256=artifact.content_sha256 if expected_sha is None else expected_sha,
-        validated_feedback=artifact.content['result'] if feedback is None else feedback)
+        validated_feedback=_freeze_object(
+            artifact.content['result'] if feedback is None else feedback, name='validated feedback'))
 
 
 def test_v2_dependency_observation_never_earns_draft_diagnosis_credit() -> None:
@@ -91,7 +104,7 @@ def test_changed_dependency_failures_and_noop_writes_cannot_renew_budget() -> No
     expected = _hints(ctx, rows, artifacts)
     for index in range(3):
         observed = observation() | {'closure': _closure()}
-        observed['closure']['issues'][0]['constraint'] = f'>={index + 2}'
+        object_map(object_array(object_map(observed['closure'])['issues'])[0])['constraint'] = f'>={index + 2}'
         append(ctx, rows, artifacts, _dependency_artifact(ctx,
             digest=str(index + 7) * 64, observed=observed), status='failed')
         append(ctx, rows, artifacts, result('workspace.write_text', {
@@ -158,7 +171,9 @@ def test_v2_recovery_projection_preserves_concrete_lock_correction_data() -> Non
 @pytest.mark.parametrize('status,code', [
     ('metadata_unavailable', 'metadata_missing'), ('unsupported', 'unsupported_dependency'),
 ])
-def test_projection_preserves_noncorrectable_dependency_issue_without_inventing_a_pin(status, code):
+def test_projection_preserves_noncorrectable_dependency_issue_without_inventing_a_pin(
+    status: str, code: str,
+) -> None:
     ctx, _, _ = _case()
     closure = {'status': status, 'issues': [{'code': code, 'source': 'demo-dep',
         'dependency': '', 'candidates': [], 'constraint': '', 'locked_version': None}]}
@@ -172,7 +187,7 @@ def test_projection_preserves_noncorrectable_dependency_issue_without_inventing_
 def test_large_but_bounded_root_environment_is_validated_then_omitted_from_prompt() -> None:
     ctx, _, _ = _case()
     observed = observation() | {'closure': _closure()}
-    observed['target_environment']['platform_version'] = 'private-runtime-' + 'x' * 20000
+    object_map(observed['target_environment'])['platform_version'] = 'private-runtime-' + 'x' * 20000
     observed['target_environment_sha256'] = hashlib.sha256(json.dumps(observed['target_environment'],
         sort_keys=True, separators=(',', ':'), ensure_ascii=True).encode()).hexdigest()
     artifact = _dependency_artifact(ctx, observed=observed)
@@ -188,18 +203,18 @@ def test_large_but_bounded_root_environment_is_validated_then_omitted_from_promp
     'constraint_url', 'constraint_arbitrary', 'locked_version', 'candidate_url',
     'candidate_path', 'candidate_extra', 'candidate_count', 'issue_count', 'draft_schema',
 ])
-def test_untrusted_v2_projection_revalidates_closed_and_bounded_dependency_schema(defect) -> None:
+def test_untrusted_v2_projection_revalidates_closed_and_bounded_dependency_schema(defect: str) -> None:
     ctx, _, _ = _case()
     observed = observation() | {'closure': _closure()}
-    closure = observed['closure']
-    issue = closure['issues'][0]
-    candidate = issue['candidates'][0]
+    closure = object_map(observed['closure'])
+    issue = object_map(object_array(closure['issues'])[0])
+    candidate = object_map(object_array(issue['candidates'])[0])
     if defect.startswith('root_extra_'):
         observed[defect.removeprefix('root_extra_')] = 'https://private.invalid/secret'
     elif defect == 'root_environment_digest':
         observed['target_environment_sha256'] = 'f' * 64
     elif defect == 'root_oversized':
-        observed['target_environment']['platform_version'] = 'x' * (32 * 1024)
+        object_map(observed['target_environment'])['platform_version'] = 'x' * (32 * 1024)
         observed['target_environment_sha256'] = hashlib.sha256(json.dumps(
             observed['target_environment'], sort_keys=True, separators=(',', ':'),
             ensure_ascii=True).encode()).hexdigest()
@@ -216,7 +231,7 @@ def test_untrusted_v2_projection_revalidates_closed_and_bounded_dependency_schem
     elif defect == 'constraint_arbitrary':
         issue['constraint'] = '===private'
     elif defect == 'locked_version':
-        closure['issues'][1]['locked_version'] = False
+        object_map(object_array(closure['issues'])[1])['locked_version'] = False
     elif defect == 'candidate_url':
         candidate['filename'] = 'https://private.invalid/demo.whl'
     elif defect == 'candidate_path':
@@ -224,9 +239,11 @@ def test_untrusted_v2_projection_revalidates_closed_and_bounded_dependency_schem
     elif defect == 'candidate_extra':
         candidate['approval'] = 'forged'
     elif defect == 'candidate_count':
-        issue['candidates'] *= 4
+        candidates = object_array(issue['candidates'])
+        candidates *= 4
     elif defect == 'issue_count':
-        closure['issues'] *= 17
+        issues = object_array(closure['issues'])
+        issues *= 17
     artifact = _dependency_artifact(ctx, observed=observed)
     if defect == 'draft_schema':
         content = json.loads(artifact.model_dump_json())['content']
@@ -238,10 +255,10 @@ def test_untrusted_v2_projection_revalidates_closed_and_bounded_dependency_schem
 
 
 @pytest.mark.parametrize('defect', ['artifact_id', 'artifact_sha', 'feedback', 'content_sha', 'untrusted'])
-def test_dependency_projection_keeps_the_artifact_and_untrusted_binding(defect) -> None:
+def test_dependency_projection_keeps_the_artifact_and_untrusted_binding(defect: str) -> None:
     ctx, _, _ = _case()
     artifact = _dependency_artifact(ctx)
-    arguments = {}
+    arguments: ProjectArguments = {}
     if defect == 'artifact_id':
         arguments['expected_id'] = str(uuid4())
     elif defect == 'artifact_sha':
@@ -249,7 +266,7 @@ def test_dependency_projection_keeps_the_artifact_and_untrusted_binding(defect) 
     elif defect == 'feedback':
         feedback = deepcopy(json.loads(artifact.model_dump_json())['content']['result'])
         feedback['generated_draft_rejection']['observation_sha256'] = '8' * 64
-        arguments['feedback'] = feedback
+        arguments['feedback'] = _freeze_object(feedback, name='feedback')
     elif defect == 'content_sha':
         artifact = artifact.model_copy(update={'content_sha256': 'f' * 64})
     else:
@@ -258,3 +275,9 @@ def test_dependency_projection_keeps_the_artifact_and_untrusted_binding(defect) 
         artifact = Artifact(id=artifact.id, type='tool_result', producer='implementer', content=content)
     with pytest.raises(ValueError, match='^project repair failure evidence is invalid$'):
         _project(artifact, **arguments)
+
+
+class ProjectArguments(TypedDict, total=False):
+    expected_id: str
+    expected_sha: str
+    feedback: Mapping[str, JsonValue]

@@ -5,12 +5,17 @@ import asyncio
 import hashlib
 import json
 from pathlib import Path
+from typing import BinaryIO
 
 import pytest
 
 from agent_hub.skills.sandbox.python_product_transport import receive_product
-from agent_hub.skills.sandbox.python_project_protocol import PythonProductDescriptor
+from agent_hub.skills.sandbox.python_project_protocol import (
+    PythonProductDescriptor,
+    PythonProjectInvocation,
+)
 from agent_hub.subprocess_cleanup import ProcessCleanupIncomplete
+from tests.unit.runs.project_auto_repair_typed_fixture import present
 from tests.unit.skills.sandbox.test_python_project_client import invocation
 
 
@@ -96,29 +101,30 @@ async def test_client_requires_final_cleanup_reply(monkeypatch: pytest.MonkeyPat
     if outcome in {"close_failed", "cleanup_failed_close", "cleanup_failed_wait"}:
         from agent_hub.skills.sandbox import python_product_transport as transport
         original = transport.receive_product
-        async def receive(*args):
-            spool = await original(*args)
+        async def receive(reader: asyncio.StreamReader, product: PythonProductDescriptor,
+                          invocation: PythonProjectInvocation) -> BinaryIO:
+            spool = await original(reader, product, invocation)
             spools.append(spool)
             return spool
-        async def close_failed():
+        async def close_failed() -> None:
             writer.waited = True
             raise OSError("close failed")
         monkeypatch.setattr(transport, "receive_product", receive)
         if outcome == "cleanup_failed_close":
             close_original = writer.close
-            def bad_close():
+            def bad_close() -> None:
                 close_original()
                 raise OSError("close failed")
             monkeypatch.setattr(writer, "close", bad_close)
         else:
             monkeypatch.setattr(writer, "wait_closed", close_failed)
-    async def connect(_path: str):
+    async def connect(_path: str) -> tuple[asyncio.StreamReader, FrameWriter]:
         return reader, writer
     monkeypatch.setattr(asyncio, "open_unix_connection", connect, raising=False)
     request = PythonProjectBrokerRequest(invocation=invocation(), product_transfer_version=1)
     if outcome == "success":
         reply = await client.request_python_project_broker(request, socket_path=Path("/fake"))
-        with reply._product_stream as stream:
+        with present(reply._product_stream) as stream:
             assert stream.read() == b"wheel"
     else:
         error_type = (ProcessCleanupIncomplete if outcome.startswith("cleanup_failed")

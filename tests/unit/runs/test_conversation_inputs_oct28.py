@@ -1,47 +1,43 @@
 """Focused component regressions: private history, real continuation storage, no runtime."""
 from __future__ import annotations
 
-import asyncio
 import json
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from types import SimpleNamespace
-from typing import Any, Self
+from typing import Unpack
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
 import pytest
 
 from agent_hub.auth.models import Role
+from agent_hub.db.models import RunRow
 from agent_hub.domain.runs import TaskMode
+from agent_hub.runs.conversation_inputs import ConversationInputs
 from agent_hub.runs.repository import RunConflict
-from agent_hub.runtime.artifacts import InMemoryArtifactRepository
 from agent_hub.runtime.continuation_artifacts import _encode, load_continuation, save_continuation
 from agent_hub.runtime.contracts import Artifact, RuntimeCheckpoint
+from tests.unit.runs.conversation_authenticated_input_typed_fixture import (
+    Case,
+    InputArgs,
+    InputChanges,
+    MemoryRowRepository,
+    NoDatabaseRepository,
+    RevocableArtifacts,
+    invoke_builder,
+    json_map,
+    mutable,
+    present,
+)
 
 VERSION = 'conversation_input_snapshot_version'
 STATE = 'conversation_input_snapshot'
 
 
-class Transaction:
-    def __init__(self, lock: asyncio.Lock) -> None:
-        self.lock = lock
-
-    async def __aenter__(self) -> Self:
-        return self
-
-    async def __aexit__(self, *args: object) -> None:
-        pass
-
-    def begin(self) -> asyncio.Lock:
-        return self.lock
-
-
-class MemoryRuns:
+class MemoryRuns(MemoryRowRepository):
     """Only the row-lock boundary is substituted; _record remains production code."""
     def __init__(self) -> None:
-        self.lock = asyncio.Lock()
-        self.row = SimpleNamespace(
+        row = RunRow(
             id=uuid4(), tenant_id=uuid4(), actor_id=uuid4(), actor_role='operator',
             mode='dispatch', request='如何使用当前项目？', status='running', version=1,
             created_at=datetime.now(UTC), worker_id='worker-a', worker_lease_token=uuid4(),
@@ -52,23 +48,17 @@ class MemoryRuns:
                 'sandbox_profile': 'read_only', 'permission_mode': 'read_only',
                 'execution_backend': 'systemd', 'requested_permissions': ['workspace.read']},
         )
-
-    async def run_transaction(self) -> Transaction:
-        return Transaction(self.lock)
-
-    async def get_for_update(self, session: object, run_id: object) -> Any:
-        return self.row
-
+        super().__init__(row)
 
 @pytest.fixture
-def case() -> tuple[MemoryRuns, InMemoryArtifactRepository, dict[str, Any]]:
+def case() -> Case:
     runs = MemoryRuns()
     row = runs.row
-    args = {'tenant_id': row.tenant_id, 'run_id': row.id, 'actor_id': row.actor_id,
-        'actor_role': Role.OPERATOR, 'mode': TaskMode.DISPATCH, 'worker_id': row.worker_id,
+    args: InputArgs = {'tenant_id': row.tenant_id, 'run_id': row.id, 'actor_id': row.actor_id,
+        'actor_role': Role.OPERATOR, 'mode': TaskMode.DISPATCH, 'worker_id': present(row.worker_id),
         'execution_token': row.worker_lease_token, 'current_request': row.request,
-        'routing_decision': json.loads(json.dumps(row.routing_decision)), 'checkpoint': None}
-    return runs, InMemoryArtifactRepository(), args
+        'routing_decision': json.loads(json.dumps(mutable(row.routing_decision))), 'checkpoint': None}
+    return runs, RevocableArtifacts(), args
 
 
 def history(text: str) -> Artifact:
@@ -76,21 +66,23 @@ def history(text: str) -> Artifact:
                     content={'text': text})
 
 
-def checkpoint(args: dict[str, Any]) -> RuntimeCheckpoint:
+def checkpoint(args: InputArgs) -> RuntimeCheckpoint:
     return RuntimeCheckpoint(id=uuid4(), tenant_id=args['tenant_id'], run_id=args['run_id'],
         mode=args['mode'], runtime_type='test_action', runtime_version='1', state={'resumed': True})
 
 
-async def invoke(case: tuple, builder: Any, **changes: Any) -> Any:
-    from agent_hub.runs.conversation_inputs import conversation_inputs
-
+async def invoke(
+    case: tuple[MemoryRowRepository | NoDatabaseRepository, RevocableArtifacts, InputArgs],
+    builder: Callable[[], Awaitable[object]], **changes: Unpack[InputChanges],
+) -> ConversationInputs:
     runs, artifacts, args = case
-    return await conversation_inputs(runs, artifacts, **{**args, **changes}, builder=builder)
+    merged: InputArgs = {**args, **changes}
+    return await invoke_builder(runs, artifacts, merged, builder)
 
 
 @pytest.mark.parametrize('mode', [TaskMode.DIRECT, TaskMode.DISPATCH, TaskMode.DISCUSS, TaskMode.HYBRID])
 async def test_readonly_history_stays_frozen_across_resume_and_next_run_is_fresh(
-    case: tuple, tmp_path: Path, mode: TaskMode,
+    case: Case, tmp_path: Path, mode: TaskMode,
 ) -> None:
     runs, artifacts, args = case
     runs.row.mode = mode.value
@@ -106,26 +98,26 @@ async def test_readonly_history_stays_frozen_across_resume_and_next_run_is_fresh
     original_route = json.loads(json.dumps(args['routing_decision']))
     first = await invoke(case, build)
     assert first.artifacts[0].content['text'] == 'original README'
-    assert first.snapshot == runs.row.routing_decision[STATE]
+    assert first.snapshot == mutable(runs.row.routing_decision)[STATE]
     assert args['routing_decision'] == original_route
-    assert set(first.snapshot) == {'schema_version', 'scope_sha256', 'reference'}
-    assert 'artifacts' not in first.snapshot and 'original README' not in str(first.snapshot)
+    assert set(present(first.snapshot)) == {'schema_version', 'scope_sha256', 'reference'}
+    assert 'artifacts' not in present(first.snapshot) and 'original README' not in str(first.snapshot)
     readme.write_text('changed README', encoding='utf-8')
     args['routing_decision'] = {**original_route, STATE: first.snapshot}
     runs.row.worker_id = 'worker-b'
     runs.row.worker_lease_token = uuid4()
-    args.update(worker_id=runs.row.worker_id, execution_token=runs.row.worker_lease_token,
-                checkpoint=checkpoint(args))
+    args.update({'worker_id': present(runs.row.worker_id), 'execution_token': runs.row.worker_lease_token,
+                 'checkpoint': checkpoint(args)})
     restored = await invoke(case, build)
     assert [a.to_payload() for a in restored.artifacts] == [a.to_payload() for a in first.artifacts]
     assert restored.snapshot == first.snapshot and calls == ['read']
     assert readme.read_text(encoding='utf-8') == 'changed README'
-    assert runs.row.routing_decision['requested_permissions'] == ['workspace.read']
+    assert mutable(runs.row.routing_decision)['requested_permissions'] == ['workspace.read']
     next_run = MemoryRuns()
     next_run.row.tenant_id, next_run.row.actor_id = args['tenant_id'], args['actor_id']
     next_run.row.mode = mode.value
-    next_args = {**args, 'run_id': next_run.row.id, 'checkpoint': None,
-                 'worker_id': next_run.row.worker_id, 'execution_token': next_run.row.worker_lease_token,
+    next_args: InputArgs = {**args, 'run_id': next_run.row.id, 'checkpoint': None,
+                 'worker_id': present(next_run.row.worker_id), 'execution_token': next_run.row.worker_lease_token,
                  'routing_decision': json.loads(json.dumps(next_run.row.routing_decision))}
     fresh = await invoke((next_run, artifacts, next_args), build)
     assert fresh.artifacts[0].content['text'] == 'changed README'
@@ -133,23 +125,23 @@ async def test_readonly_history_stays_frozen_across_resume_and_next_run_is_fresh
 
 
 @pytest.mark.parametrize('route', [{}, {'requested_permissions': []}, {'requested_permissions': None}])
-async def test_unmarked_legacy_uses_builder_without_database_access(case: tuple, route: dict) -> None:
+async def test_unmarked_legacy_uses_builder_without_database_access(case: Case, route: dict[str, object]) -> None:
     _, artifacts, args = case
     expected = (history('legacy'),)
 
     async def build() -> tuple[Artifact, ...]:
         return expected
 
-    result = await invoke((object(), artifacts, args), build, routing_decision=route)
+    result = await invoke((NoDatabaseRepository(), artifacts, args), build, routing_decision=route)
     assert result.artifacts is expected and result.snapshot is None
 
 
 @pytest.mark.parametrize('permissions', [None, [], ['workspace.write'], ['command.run']])
 async def test_marker_without_existing_read_permission_cannot_capture_history(
-    case: tuple, permissions: object,
+    case: Case, permissions: object,
 ) -> None:
     runs, artifacts, args = case
-    runs.row.routing_decision['requested_permissions'] = permissions
+    mutable(runs.row.routing_decision)['requested_permissions'] = permissions
     args['routing_decision']['requested_permissions'] = permissions
     calls = []
 
@@ -160,7 +152,7 @@ async def test_marker_without_existing_read_permission_cannot_capture_history(
     with pytest.raises(RunConflict):
         await invoke(case, build)
     assert calls == [] and not artifacts._artifacts
-    assert STATE not in runs.row.routing_decision
+    assert STATE not in mutable(runs.row.routing_decision)
 
 
 @pytest.mark.parametrize('defect', [
@@ -168,7 +160,7 @@ async def test_marker_without_existing_read_permission_cannot_capture_history(
     'conversation_id', 'project_id', 'workspace_session_id', 'sandbox_profile',
     'permission_mode', 'execution_backend', 'requested_permissions', 'marker_bool',
 ])
-async def test_invalid_current_scope_or_lease_never_reads_history(case: tuple, defect: str) -> None:
+async def test_invalid_current_scope_or_lease_never_reads_history(case: Case, defect: str) -> None:
     runs, artifacts, _ = case
     row = runs.row
     if defect in {'tenant', 'run', 'actor'}:
@@ -180,18 +172,18 @@ async def test_invalid_current_scope_or_lease_never_reads_history(case: tuple, d
     elif defect == 'token': row.worker_lease_token = uuid4()
     elif defect == 'expired': row.worker_lease_expires_at = datetime.now(UTC) - timedelta(seconds=1)
     elif defect == 'status': row.status = 'waiting_approval'
-    elif defect == 'marker_bool': row.routing_decision[VERSION] = True
-    else: row.routing_decision[defect] = ['workspace.read', 'workspace.write'] if defect == 'requested_permissions' else 'changed'
+    elif defect == 'marker_bool': mutable(row.routing_decision)[VERSION] = True
+    else: mutable(row.routing_decision)[defect] = ['workspace.read', 'workspace.write'] if defect == 'requested_permissions' else 'changed'
 
     async def forbidden() -> tuple[Artifact, ...]:
         pytest.fail('invalid identity/scope must not call history builder')
 
     with pytest.raises(RunConflict):
         await invoke(case, forbidden)
-    assert not artifacts._artifacts and STATE not in row.routing_decision
+    assert not artifacts._artifacts and STATE not in mutable(row.routing_decision)
 
 
-async def test_checkpoint_without_snapshot_cannot_rebuild_history(case: tuple) -> None:
+async def test_checkpoint_without_snapshot_cannot_rebuild_history(case: Case) -> None:
     async def forbidden() -> tuple[Artifact, ...]:
         pytest.fail('a checkpoint cannot acquire a new historical input set')
 
@@ -200,20 +192,20 @@ async def test_checkpoint_without_snapshot_cannot_rebuild_history(case: tuple) -
 
 
 @pytest.mark.parametrize('defect', ['duplicate_id', 'wrong_type', 'bad_hash', 'list'])
-async def test_invalid_builder_artifacts_are_not_captured(case: tuple, defect: str) -> None:
+async def test_invalid_builder_artifacts_are_not_captured(case: Case, defect: str) -> None:
     item = history('one')
-    values = {'duplicate_id': (item, item), 'wrong_type': (object(),),
+    values: dict[str, object] = {'duplicate_id': (item, item), 'wrong_type': (object(),),
               'bad_hash': (item.model_copy(update={'content_sha256': '0' * 64}),), 'list': [item]}
 
-    async def build() -> Any:
+    async def build() -> object:
         return values[defect]
 
     with pytest.raises(RunConflict):
         await invoke(case, build)
-    assert STATE not in case[0].row.routing_decision and not case[1]._artifacts
+    assert STATE not in mutable(case[0].row.routing_decision) and not case[1]._artifacts
 
 
-async def captured(case: tuple) -> Any:
+async def captured(case: Case) -> ConversationInputs:
     async def build() -> tuple[Artifact, ...]:
         return (history('PRIVATE_INPUT_CONTENT'),)
 
@@ -224,17 +216,17 @@ async def captured(case: tuple) -> Any:
     'scope_hash', 'extra_state', 'state_bool', 'reference_hash', 'root_scope', 'root_kind',
     'root_extra', 'duplicate', 'artifact_hash', 'artifact_missing_hash', 'artifact_extra', 'foreign_run',
 ])
-async def test_corrupted_metadata_or_private_body_never_falls_back_to_builder(case: tuple, defect: str) -> None:
+async def test_corrupted_metadata_or_private_body_never_falls_back_to_builder(case: Case, defect: str) -> None:
     runs, artifacts, args = case
     await captured(case)
-    state = runs.row.routing_decision[STATE]
+    state = mutable(mutable(runs.row.routing_decision)[STATE])
     if defect == 'scope_hash': state['scope_sha256'] = '0' * 64
     elif defect == 'extra_state': state['extra'] = True
     elif defect == 'state_bool': state['schema_version'] = True
-    elif defect == 'reference_hash': state['reference']['content_sha256'] = '0' * 64
+    elif defect == 'reference_hash': mutable(state['reference'])['content_sha256'] = '0' * 64
     else:
         body = json.loads(_encode(await load_continuation(artifacts,
-            tenant_id=args['tenant_id'], run_id=args['run_id'], reference=state['reference'])))
+            tenant_id=args['tenant_id'], run_id=args['run_id'], reference=json_map(state['reference']))))
         if defect == 'root_scope': body['scope']['actor_id'] = str(uuid4())
         elif defect == 'root_kind': body['kind'] = 'another_kind'
         elif defect == 'root_extra': body['extra'] = True
@@ -255,7 +247,7 @@ async def test_corrupted_metadata_or_private_body_never_falls_back_to_builder(ca
 
 
 @pytest.mark.parametrize('defect', ['actor', 'role', 'mode', 'request', 'project', 'permissions'])
-async def test_captured_scope_cannot_change_even_when_caller_matches_new_record(case: tuple, defect: str) -> None:
+async def test_captured_scope_cannot_change_even_when_caller_matches_new_record(case: Case, defect: str) -> None:
     runs, _, args = case
     await captured(case)
     if defect == 'actor':
@@ -269,7 +261,7 @@ async def test_captured_scope_cannot_change_even_when_caller_matches_new_record(
     else:
         key = 'project_id' if defect == 'project' else 'requested_permissions'
         value = 'project-b' if defect == 'project' else ['workspace.read', 'workspace.write']
-        runs.row.routing_decision[key] = args['routing_decision'][key] = value
+        mutable(runs.row.routing_decision)[key] = args['routing_decision'][key] = value
 
     async def forbidden() -> tuple[Artifact, ...]:
         pytest.fail('a captured scope cannot be rebound by rewriting caller and row')
@@ -278,20 +270,16 @@ async def test_captured_scope_cannot_change_even_when_caller_matches_new_record(
         await invoke(case, forbidden)
 
 
-async def test_valid_snapshot_load_handles_mappingproxy_codec_and_rechecks_lease(case: tuple) -> None:
+async def test_valid_snapshot_load_handles_mappingproxy_codec_and_rechecks_lease(case: Case) -> None:
     runs, artifacts, args = case
     result = await captured(case)
     body = await load_continuation(artifacts, tenant_id=args['tenant_id'], run_id=args['run_id'],
-                                   reference=result.snapshot['reference'])
+                                   reference=json_map(present(result.snapshot)['reference']))
     assert isinstance(body, Mapping) and not isinstance(body, dict)
-    original_get = artifacts.get_many
-
-    async def revoked(*a: Any, **kw: Any) -> Any:
-        loaded = await original_get(*a, **kw)
+    def revoked() -> None:
         runs.row.worker_lease_token = uuid4()
-        return loaded
 
-    artifacts.get_many = revoked
+    artifacts.after_get = revoked
 
     async def forbidden() -> tuple[Artifact, ...]:
         pytest.fail('restore cannot build history')
@@ -301,15 +289,12 @@ async def test_valid_snapshot_load_handles_mappingproxy_codec_and_rechecks_lease
 
 
 @pytest.mark.parametrize('when', ['builder', 'save'])
-async def test_lease_loss_before_cas_cannot_publish_snapshot(case: tuple, when: str) -> None:
+async def test_lease_loss_before_cas_cannot_publish_snapshot(case: Case, when: str) -> None:
     runs, artifacts, _ = case
-    original_put = artifacts.put
-
-    async def revoked_put(*a: Any, **kw: Any) -> None:
-        await original_put(*a, **kw)
+    def revoked_put() -> None:
         runs.row.worker_lease_token = uuid4()
 
-    if when == 'save': artifacts.put = revoked_put
+    if when == 'save': artifacts.after_put = revoked_put
 
     async def build() -> tuple[Artifact, ...]:
         if when == 'builder': runs.row.worker_lease_token = uuid4()
@@ -317,10 +302,10 @@ async def test_lease_loss_before_cas_cannot_publish_snapshot(case: tuple, when: 
 
     with pytest.raises(RunConflict):
         await invoke(case, build)
-    assert STATE not in runs.row.routing_decision
+    assert STATE not in mutable(runs.row.routing_decision)
 
 
-async def test_capture_race_cannot_replace_first_committed_history(case: tuple) -> None:
+async def test_capture_race_cannot_replace_first_committed_history(case: Case) -> None:
     async def winner() -> tuple[Artifact, ...]:
         return (history('winner'),)
 
@@ -338,14 +323,14 @@ async def test_capture_race_cannot_replace_first_committed_history(case: tuple) 
     assert restored.artifacts[0].content['text'] == 'winner'
 
 
-async def test_failed_read_leaves_no_reserved_state_and_retry_can_capture_empty_history(case: tuple) -> None:
+async def test_failed_read_leaves_no_reserved_state_and_retry_can_capture_empty_history(case: Case) -> None:
     async def failed() -> tuple[Artifact, ...]:
         raise ValueError('PRIVATE_INPUT_CONTENT')
 
     with pytest.raises(RunConflict) as failure:
         await invoke(case, failed)
     assert failure.value.__context__ is None and 'PRIVATE_INPUT_CONTENT' not in str(failure.value)
-    assert STATE not in case[0].row.routing_decision
+    assert STATE not in mutable(case[0].row.routing_decision)
 
     async def empty() -> tuple[Artifact, ...]:
         return ()

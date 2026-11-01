@@ -33,7 +33,14 @@ from agent_hub.runtime.contracts import (
 from agent_hub.runtime.direct_completion_journal import _response_payload
 from agent_hub.runtime.instruction_context import model_request_sha256
 from agent_hub.runtime.model_scope import ModelScopeTracker
+from tests.unit.capabilities.capability_lifecycle_typed_fixture import (
+    UnusedContextReader,
+    UnusedReleaser,
+    verified_direct_expiry_with_session_fixture,
+)
 from tests.unit.capabilities.test_python_generated_lifecycle import generated_session
+from tests.unit.runs.project_auto_repair_typed_fixture import json_map
+from tests.unit.runs.reviewed_report_revision_typed_fixture import read_map, string_value
 
 MODULE = 'agent_hub.capabilities.python_direct_expiry'
 
@@ -66,7 +73,7 @@ async def native_case(count: int = 1, *, content_reference: bool = False,
     journal = await save_continuation(repository,tenant_id=row.tenant_id,run_id=row.id,
         value={'position':0,'request_sha256':model_request_sha256(replace(model,timeout_seconds=1)),
                'response':_response_payload(completion)})
-    actions=[]
+    actions: list[dict[str, object]]=[]
     for index in range(11):
         arguments: dict[str, Any] = {} if index == 0 else {'path':f'src/f{index}.py','content':'# synthetic only\n'}
         if content_reference and index == 1:
@@ -89,7 +96,7 @@ async def native_case(count: int = 1, *, content_reference: bool = False,
     contracts = {k:v for k,v in row.routing_decision.items() if k.startswith('generated_project_')}
     preparation = {'schema_version':1,'scope':{},'contracts':contracts,'workspace_sha256':'a'*64}
     inspection = Artifact(id=uuid4(),type='tool_result',producer='main_agent',content={
-        'agent_id':'main_agent','tool_name':'project.inspect','call_id':actions[0]['request']['call_id'],
+        'agent_id':'main_agent','tool_name':'project.inspect','call_id':string_value(read_map(actions[0]['request'])['call_id']),
         'arguments_sha256':hashlib.sha256(b'{}').hexdigest(),'result':{}})
     frame = {'context':context.to_payload(),'models':[journal],'actions':actions,
              'pending':{'raw_sha256':hashlib.sha256(_encode(pending.to_payload())).hexdigest(),'request':pending.to_payload()},
@@ -98,11 +105,11 @@ async def native_case(count: int = 1, *, content_reference: bool = False,
     checkpoint = RuntimeCheckpoint(id=uuid4(),tenant_id=row.tenant_id,run_id=row.id,mode=TaskMode.DIRECT,
         runtime_type='direct_action',runtime_version='2',state={'phase':'concrete_action','completed':False,
             'approval_id':'approval_fixture','tool_name':'project.verify','reference':reference,
-            'context_sha256':_binding(_prepared_context(context,preparation),'primary'),
+            'context_sha256':_binding(_prepared_context(context,json_map(preparation)),'primary'),
             'elapsed_seconds':2.0,'timeout_seconds':context.timeout_seconds})
     events=[RunEvent(kind='tool.started',run_id=row.id,sequence=3,actor='main_agent',
-        tool_call_id=actions[0]['request']['call_id'],tool_name='project.inspect'),RunEvent(kind='tool.completed',run_id=row.id,sequence=4,actor='main_agent',
-        tool_call_id=actions[0]['request']['call_id'],tool_name='project.inspect',payload={'status':'succeeded'}),
+        tool_call_id=string_value(read_map(actions[0]['request'])['call_id']),tool_name='project.inspect'),RunEvent(kind='tool.completed',run_id=row.id,sequence=4,actor='main_agent',
+        tool_call_id=string_value(read_map(actions[0]['request'])['call_id']),tool_name='project.inspect',payload={'status':'succeeded'}),
         RunEvent(kind='artifact.created',run_id=row.id,sequence=5,actor='main_agent',artifact=inspection)]
     usages=[]
     tracker=ModelScopeTracker(run_id=row.id,tenant_id=row.tenant_id,logical_model='primary')
@@ -217,7 +224,9 @@ async def test_real_workspace_hash_with_segmented_content_is_decoded_without_too
 
 
 async def test_asyncpg_uuid_is_canonicalized_only_at_readonly_db_boundary() -> None:
-    from asyncpg.pgproto.pgproto import UUID as PgUUID
+    from tests.unit.capabilities.capability_lifecycle_typed_fixture import native_asyncpg_uuid_class
+
+    PgUUID = native_asyncpg_uuid_class()
 
     from agent_hub.capabilities.python_direct_expiry import direct_action_expiry_liveness
 
@@ -238,9 +247,9 @@ async def test_expiry_is_not_resume_and_does_not_reconstruct_excluded_instructio
     case = await native_case(guidance=True)
     frame = await load_continuation(case['repository'],tenant_id=case['record'].tenant_id,
         run_id=case['record'].id,reference=case['checkpoint'].state['reference'])
-    snapshot = TaskContext.from_payload(json.loads(_encode(frame['context'])))
+    snapshot = TaskContext.from_payload(json.loads(_encode(read_map(frame)['context'])))
     assert snapshot.instruction_context is None
-    assert _binding(_prepared_context(snapshot,frame['preparation']),'primary') != case['checkpoint'].state['context_sha256']
+    assert _binding(_prepared_context(snapshot,json_map(read_map(read_map(frame)['preparation']))),'primary') != case['checkpoint'].state['context_sha256']
     assert await direct_action_expiry_liveness(**case) is True
     assert case['checkpoint'].state['completed'] is False
 
@@ -293,7 +302,6 @@ async def test_private_native_frame_mutations_do_not_prove_liveness(defect: str)
     'checkpoint-state', 'checkpoint-scope', 'checkpoint-missing-hash', 'duplicate-checkpoint',
     'foreign-event', 'wrong-event-kind', 'foreign-usage', 'too-many-events'])
 async def test_scoped_readonly_dao_uses_native_hydration_and_fails_closed(defect: str | None) -> None:
-    from agent_hub.capabilities.python_direct_expiry import verified_direct_expiry
     from agent_hub.runs.artifacts import PostgresArtifactRepository
 
     case = await native_case(2)
@@ -373,7 +381,7 @@ async def test_scoped_readonly_dao_uses_native_hydration_and_fails_closed(defect
                 result = [artifacts[i] for i in identities if i in artifacts]
             return SimpleNamespace(all=lambda:result)
 
-    assert await verified_direct_expiry(Session(), row) is (defect is None)
+    assert await verified_direct_expiry_with_session_fixture(Session(), row) is (defect is None)
     if defect is None:
         from agent_hub.capabilities.python_project_lifecycle import PythonProjectTerminalHook
         from tests.unit.skills.sandbox.test_python_project_client import invocation
@@ -386,12 +394,12 @@ async def test_scoped_readonly_dao_uses_native_hydration_and_fails_closed(defect
             async def run_transaction(self) -> Any:
                 return session
 
-        class Reader:
+        class Reader(UnusedContextReader):
             async def python_expired_environment_invocation(self, *args: Any) -> Any:
                 assert session.open
                 return invocation()
 
-        class Root:
+        class Root(UnusedReleaser):
             async def release_expired(self, item: Any) -> bool:
                 assert session.open and item.install_allowed is False and item.source_kind == 'candidate'
                 calls.append(item.run_id)

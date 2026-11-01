@@ -1,19 +1,34 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import pytest
 
+from agent_hub.db.models import RunRow
 from agent_hub.domain.runs import RunStatus, TaskMode
+from agent_hub.runs.repository import RunRecord
 from agent_hub.runs.self_repair import (
+    SelfRepairDecision,
     SelfRepairPolicy,
     classify_terminal_run,
     project_repair_checkpoint_is_safe,
     project_repair_scope_sha256,
 )
 from agent_hub.runtime.contracts import EventKind, RunEvent, RuntimeCheckpoint
+from tests.unit.runs.project_auto_repair_typed_fixture import (
+    integer,
+    json_map,
+    mutable,
+    present,
+    registry,
+    string,
+)
+from tests.unit.runtime.repair_continuity_typed_fixture import (
+    AutoRepairRepository,
+    RecordChange,
+    SessionWitness,
+)
 
 
 def evidence() -> tuple[dict[str, object], RuntimeCheckpoint]:
@@ -32,7 +47,7 @@ def evidence() -> tuple[dict[str, object], RuntimeCheckpoint]:
     artifact_id = str(uuid4())
     checkpoint = RuntimeCheckpoint(
         id=uuid4(), run_id=uuid4(), tenant_id=uuid4(), mode=TaskMode.DISCUSS,
-        runtime_type='autogen', runtime_version='2', state={
+        runtime_type='autogen', runtime_version='2', state=json_map({
             'terminal': False, 'engineering_checkpoint_ack_version': 1,
             'remaining_timeout_seconds': 100,
             'remaining_absolute_timeout_seconds': 500,
@@ -41,7 +56,7 @@ def evidence() -> tuple[dict[str, object], RuntimeCheckpoint]:
             'model_ledger': [],
             'tool_ledger': [{'status': 'failed', 'artifact_id': artifact_id,
                              'artifact_sha256': 'a' * 64}],
-        },
+        }),
     )
     return route, checkpoint
 
@@ -53,11 +68,11 @@ def safe(route: dict[str, object], cp: RuntimeCheckpoint) -> bool:
 
 
 def changed(cp: RuntimeCheckpoint, **fields: object) -> RuntimeCheckpoint:
-    state = cp.to_payload()['state']
+    state = mutable(cp.to_payload()['state'])
     state.update(fields)
     return RuntimeCheckpoint(
         id=cp.id, run_id=cp.run_id, tenant_id=cp.tenant_id, mode=cp.mode,
-        runtime_type=cp.runtime_type, runtime_version=cp.runtime_version, state=state,
+        runtime_type=cp.runtime_type, runtime_version=cp.runtime_version, state=json_map(state),
     )
 
 
@@ -69,19 +84,19 @@ def test_known_project_failure_can_continue_from_existing_budget() -> None:
 
 @pytest.mark.parametrize('defect', ['', 'unknown', 'unaccounted', 'wrong_scope', 'disabled'])
 def test_initial_repair_retains_accounted_rejection_correction_chain(defect: str) -> None:
-    from tests.unit.runtime.autogen.test_model_tool_correction import pair
+    from tests.unit.runtime.autogen.project_repair_phase_typed_fixture import pair
     route, cp = evidence()
     route['engineering_tool_correction_version'] = 1
     rows = pair()
-    rows[0]['rejection'].update(run_id=str(cp.run_id), tenant_id=str(cp.tenant_id))
+    mutable(rows[0]['rejection']).update(run_id=str(cp.run_id), tenant_id=str(cp.tenant_id))
     if defect == 'unknown':
         rows[1]['status'] = 'running'
     elif defect == 'wrong_scope':
-        rows[0]['rejection']['run_id'] = str(uuid4())
+        mutable(rows[0]['rejection'])['run_id'] = str(uuid4())
     elif defect == 'disabled':
         route.pop('engineering_tool_correction_version')
-    registry = {**cp.state['artifact_registry'], rows[1]['artifact_id']: rows[1]['artifact_sha256']}
-    cp = changed(cp, model_ledger=rows, artifact_registry=registry,
+    artifact_registry = {**registry(cp.state['artifact_registry']), string(rows[1]['artifact_id']): rows[1]['artifact_sha256']}
+    cp = changed(cp, model_ledger=rows, artifact_registry=artifact_registry,
                  usage={'tokens': 0 if defect == 'unaccounted' else 100, 'cost_usd': '0.1'})
     assert safe(route, cp) is (not defect)
 
@@ -158,7 +173,7 @@ def test_project_policy_has_an_independent_kill_switch() -> None:
     assert SelfRepairPolicy(automatic_project_repairs=False).automatic_project_repairs is False
 
 
-def decision(cp: RuntimeCheckpoint, reason: str = 'project build failed'):
+def decision(cp: RuntimeCheckpoint, reason: str = 'project build failed') -> SelfRepairDecision:
     result = classify_terminal_run(
         status=RunStatus.FAILED, mode=cp.mode, routing_decision={},
         policy=SelfRepairPolicy(), events=[RunEvent(
@@ -172,7 +187,6 @@ def decision(cp: RuntimeCheckpoint, reason: str = 'project build failed'):
 
 @pytest.mark.asyncio
 async def test_service_promotes_only_current_new_project_with_stopped_worker() -> None:
-    from contextlib import asynccontextmanager
     from datetime import UTC, datetime
 
     from agent_hub.runs.repository import RunRecord
@@ -185,17 +199,7 @@ async def test_service_promotes_only_current_new_project_with_stopped_worker() -
         routing_decision=route,
     )
 
-    @asynccontextmanager
-    async def transaction():
-        class Session:
-            def begin(self):
-                return transaction()
-        yield Session()
-
-    repo = AsyncMock()
-    repo.get.return_value = record
-    repo.latest_checkpoint.return_value = cp
-    repo.run_transaction.side_effect = lambda: transaction()
+    repo = AutoRepairRepository(record, cp)
     service = object.__new__(RunService)
     service._repository = repo
     service._self_repair_policy = SelfRepairPolicy()
@@ -203,33 +207,37 @@ async def test_service_promotes_only_current_new_project_with_stopped_worker() -
     promoted = await service._safe_project_repair_decision(
         tenant_id=cp.tenant_id, run_id=cp.run_id, decision=original,
     )
+    assert promoted is not None
     assert promoted.requires_approval is False
     assert promoted.automatic_execution is True
     assert promoted.automatic_checkpoint_sha256 == cp.state_sha256
     proposal = promoted.to_proposal(run_id=cp.run_id)
-    assert proposal['automatic_checkpoint_sha256'] == cp.state_sha256
+    assert present(proposal)['automatic_checkpoint_sha256'] == cp.state_sha256
     assert promoted.with_source_sequence(3).automatic_checkpoint_sha256 == cp.state_sha256
 
-    for record_patch in (
+    record_patches: tuple[RecordChange, ...] = (
         {'worker_id': 'active'}, {'worker_heartbeat_at': datetime.now(UTC)},
         {'worker_lease_token': uuid4()}, {'worker_lease_expires_at': datetime.now(UTC)},
         {'status': RunStatus.RUNNING}, {'blocked_by_run_id': uuid4()},
         {'routing_decision': {}},
-    ):
-        repo.get.return_value = replace(record, **record_patch)
+    )
+    for record_patch in record_patches:
+        repo.record = replace(record, **record_patch)
         result = await service._safe_project_repair_decision(
             tenant_id=cp.tenant_id, run_id=cp.run_id, decision=original,
         )
+        assert result is not None
         if record_patch == {'routing_decision': {}}:
             assert result == original
         else:
             assert result.kind == 'repair.skipped'
             assert result.to_proposal(run_id=cp.run_id) is None
-    repo.get.return_value = record
+    repo.record = record
     service._self_repair_policy = SelfRepairPolicy(automatic_project_repairs=False)
     result = await service._safe_project_repair_decision(
         tenant_id=cp.tenant_id, run_id=cp.run_id, decision=original,
     )
+    assert result is not None
     assert result.kind == 'repair.skipped'
     assert result.skip_reason == 'project_auto_repair_disabled'
 
@@ -246,23 +254,25 @@ async def test_infrastructure_or_uncertain_failure_is_not_project_auto_repair(re
     _, cp = evidence()
     original = decision(cp, reason)
     service = object.__new__(RunService)
-    service._repository = AsyncMock()
-    from types import SimpleNamespace
-    service._repository.get.return_value = SimpleNamespace(
+    from datetime import UTC, datetime
+
+    service._repository = AutoRepairRepository(RunRecord(
+        id=cp.run_id, tenant_id=cp.tenant_id, actor_id=uuid4(), request='build',
+        mode=cp.mode, status=RunStatus.FAILED, version=4, created_at=datetime.now(UTC),
         routing_decision={'engineering_auto_repair_version': 1},
-    )
+    ), cp)
     service._self_repair_policy = SelfRepairPolicy()
     result = await service._safe_project_repair_decision(
         tenant_id=cp.tenant_id, run_id=cp.run_id, decision=original,
     )
+    assert result is not None
     assert result.kind == 'repair.skipped'
     assert result.to_proposal(run_id=cp.run_id) is None
-    service._repository.latest_checkpoint.assert_not_called()
+    service._repository.checkpoint_lookup.assert_not_called()
 
 
-def repository_fixture(seconds: int = 3600, tokens: int = 1000):
+def repository_fixture(seconds: int = 3600, tokens: int = 1000) -> tuple[AutoRepairRepository, RunRow, RuntimeCheckpoint, SessionWitness]:
     from datetime import UTC, datetime
-    from unittest.mock import Mock
 
     from agent_hub.db.models import RunRow
     from agent_hub.runs.repository import RunRepository
@@ -283,26 +293,8 @@ def repository_fixture(seconds: int = 3600, tokens: int = 1000):
         version=4, created_at=datetime.now(UTC), routing_decision=route,
     )
 
-    class Session:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *args):
-            return None
-
-        def begin(self):
-            return self
-
-    session = Session()
-    session.scalar = AsyncMock(return_value=row)
-    session.flush = AsyncMock()
-    session.add = Mock()
-    repo = object.__new__(RunRepository)
-    repo._session_factory = lambda: session
-    repo.latest_checkpoint = AsyncMock(return_value=cp)
-    repo.next_event_sequence = AsyncMock(return_value=5)
-    repo._recovery_blocked_after_checkpoint = AsyncMock(return_value=False)
-    return repo, row, cp, session
+    repo = AutoRepairRepository(RunRepository._record(row), cp, row=row)
+    return repo, row, cp, repo.witness
 
 
 @pytest.mark.asyncio
@@ -311,7 +303,7 @@ async def test_atomic_accept_preserves_permissions_budgets_checkpoint_and_user_r
     seconds: int, tokens: int,
 ) -> None:
     repo, row, cp, session = repository_fixture(seconds, tokens)
-    before = dict(row.routing_decision)
+    before = dict(present(row.routing_decision))
     before_checkpoint = cp.to_payload()
     result = await repo.accept_self_repair_and_enqueue(
         tenant_id=cp.tenant_id, run_id=cp.run_id, decision_token='token', version=4,
@@ -324,8 +316,8 @@ async def test_atomic_accept_preserves_permissions_budgets_checkpoint_and_user_r
     for key in ('sandbox_profile', 'requested_permissions', 'permission_mode',
                 'runtime_plan_token_budget',
                 'runtime_token_absolute_tokens', 'runtime_timeout_absolute_seconds'):
-        assert result.routing_decision.get(key) == before.get(key)
-    assert result.routing_decision['self_repair_recovery_baseline_sequence'] == 4
+        assert present(result.routing_decision).get(key) == before.get(key)
+    assert present(result.routing_decision)['self_repair_recovery_baseline_sequence'] == 4
     session.add.assert_called_once()
 
 
@@ -351,29 +343,31 @@ async def test_atomic_accept_refuses_changed_evidence_without_enqueue(change: st
     elif change in ('running', 'waiting_approval'):
         row.status = change
     elif change == 'checkpoint_missing':
-        repo.latest_checkpoint.return_value = None
+        repo.checkpoint_lookup.return_value = None
     elif change == 'checkpoint_changed':
-        repo.latest_checkpoint.return_value = changed(cp, remaining_timeout_seconds=99)
+        repo.checkpoint_lookup.return_value = changed(cp, remaining_timeout_seconds=99)
     elif change == 'unknown_ledger':
-        repo.latest_checkpoint.return_value = changed(cp, tool_ledger=[{'status': 'running'}])
+        repo.checkpoint_lookup.return_value = changed(cp, tool_ledger=[{'status': 'running'}])
     elif change == 'new_effect_after_checkpoint':
-        repo._recovery_blocked_after_checkpoint.return_value = True
+        repo.recovery_lookup.return_value = True
     elif change == 'permissions_changed':
-        row.routing_decision['sandbox_profile'] = 'full_access'
+        present(row.routing_decision)['sandbox_profile'] = 'full_access'
     elif change == 'caller_digest_changed':
         supplied_hash = 'b' * 64
     elif change == 'proposal_requires_approval':
-        row.routing_decision['repair_proposal']['requires_approval'] = True
+        mutable(present(row.routing_decision)['repair_proposal'])['requires_approval'] = True
     elif change == 'proposal_digest_changed':
-        row.routing_decision['repair_proposal']['automatic_checkpoint_sha256'] = 'b' * 64
+        mutable(present(row.routing_decision)['repair_proposal'])['automatic_checkpoint_sha256'] = 'b' * 64
     elif change == 'blocked_by_run_id':
         row.blocked_by_run_id = uuid4()
     elif change == 'requested_permissions_changed':
-        row.routing_decision['requested_permissions'].append('network.read')
+        permissions = present(row.routing_decision)['requested_permissions']
+        assert isinstance(permissions, list)
+        permissions.append('network.read')
     elif change == 'hard_limit_raised':
-        row.routing_decision['runtime_timeout_absolute_seconds'] += 1
+        present(row.routing_decision)['runtime_timeout_absolute_seconds'] = integer(present(row.routing_decision)['runtime_timeout_absolute_seconds']) + 1
     elif change == 'hard_limit_lowered':
-        row.routing_decision['runtime_token_absolute_tokens'] -= 1
+        present(row.routing_decision)['runtime_token_absolute_tokens'] = integer(present(row.routing_decision)['runtime_token_absolute_tokens']) - 1
     original_version = row.version
     with pytest.raises(RunConflict):
         await repo.accept_self_repair_and_enqueue(
@@ -387,7 +381,7 @@ async def test_atomic_accept_refuses_changed_evidence_without_enqueue(change: st
 def test_guarded_resume_cannot_drop_checkpoint_and_reset_budgets() -> None:
     from agent_hub.runs.service import _should_drop_incompatible_self_repair_checkpoint
 
-    route = {'source': 'self_repair', 'self_repair_accepted': True}
+    route: dict[str, object] = {'source': 'self_repair', 'self_repair_accepted': True}
     error = RuntimeError('runtime checkpoint is incompatible')
     assert _should_drop_incompatible_self_repair_checkpoint(error, route)
     route['engineering_auto_repair_version'] = 1

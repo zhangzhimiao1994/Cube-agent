@@ -16,6 +16,8 @@ from agent_hub.runtime.generated_draft_feedback import (
 )
 from agent_hub.runtime.generated_project_guidance import generated_project_guidance
 from tests.unit.capabilities.test_generated_dependency_draft import dependency_rejection
+from tests.unit.runs.project_auto_repair_typed_fixture import json_map
+from tests.unit.runs.reviewed_report_revision_typed_fixture import read_map
 from tests.unit.runtime.test_generated_draft_feedback import case
 
 
@@ -30,9 +32,9 @@ def test_selected_modes_receive_concrete_dependency_feedback_without_receipts(mo
         'project_id':'project','session_id':'session','proposer_actor':'main_agent'}.items():
         data[field] = value
     payload = dict(result.payload) | {'generated_draft_rejection':data}
-    result = replace(result, payload=payload)
+    result = replace(result, payload=json_map(payload))
     feedback = generated_draft_feedback(result, context=context, request=request)
-    assert feedback is not None and 'dependency_closure' in feedback['generated_draft_rejection']
+    assert feedback is not None and 'dependency_closure' in read_map(feedback['generated_draft_rejection'])
     assert set(feedback) == {'status','untrusted','generated_draft_rejection'}
     artifact = Artifact(id=uuid4(),type='tool_result',producer=request.actor,content={
         'result':feedback,'tool_name':'project.verify','arguments_sha256':hashlib.sha256(b'{}').hexdigest(),
@@ -43,11 +45,16 @@ def test_selected_modes_receive_concrete_dependency_feedback_without_receipts(mo
     assert generated_draft_feedback(result,context=legacy,request=request) is None
 
 
-def test_dependency_guidance_is_fresh_only_and_requires_an_executable_alternative() -> None:
+def test_dependency_guidance_is_fresh_only_and_requires_concrete_resolution() -> None:
     context, _, _ = case()
     legacy = generated_project_guidance(context)
     selected = context.model_copy(update={'routing_decision':dict(context.routing_decision) |
         {'python_dependency_preflight_version':1}})
     current = generated_project_guidance(selected)
     assert current.startswith(legacy)
-    assert 'dependency_closure' in current and 'supported alternative' in current
+    assert 'dependency_closure' in current and 'specific resolution action' in current
+    assert 'trusted dependency data through a real artifact_ref' in current
+    assert 'write actual exact pins and hashes to pyproject.toml and requirements.lock' in current
+    assert 'never invent hashes, preinstall global packages or replace a dependency with a fake module' in current
+    assert 'Publication, input supply and offline recipe installation retain their own concrete approvals' in current
+    assert 'An UNKNOWN operation is inspect-only; do not retry a download or extend the original budget/deadline' in current

@@ -4,7 +4,7 @@ from uuid import UUID
 
 import pytest
 from fastapi.testclient import TestClient
-from jsonschema import Draft202012Validator  # type: ignore[import-untyped]
+from jsonschema import Draft202012Validator
 from pydantic import ValidationError
 
 from agent_hub.api.routers.admin import CapabilityManifestItemResponse, InMemoryAdminResourceService

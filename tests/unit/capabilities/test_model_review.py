@@ -1,25 +1,42 @@
 """Tool-free service against the actual Gateway and guarded SDK MockTransport."""
 
 import asyncio
-import importlib
 import json
+from collections.abc import Mapping
 from dataclasses import replace
-from uuid import uuid4
+from typing import Unpack
+from uuid import UUID, uuid4
 
 import httpx
 import pytest
 
 from agent_hub.auth.models import Role
-from agent_hub.capabilities.review_contracts import freeze_review_action
+from agent_hub.capabilities import model_review
+from agent_hub.capabilities.review_contracts import (
+    ApprovalReviewConfig,
+    FrozenReviewAction,
+    freeze_review_action,
+)
 from agent_hub.capabilities.review_repository import (
     ReviewIntent,
     ReviewRepository,
+    _ReviewReservation,
     authorization_binding_sha256,
     review_config_sha256,
 )
 from agent_hub.capabilities.types import CapabilityRequest
-from agent_hub.models.run_admission_repository import DeploymentIdentity
+from agent_hub.models.physical_budget import _RunBudgetContext
+from agent_hub.models.run_admission_repository import DeploymentIdentity, _WorkerLease
+from tests.unit.capabilities.model_review_typed_fixture import (
+    ModelReviewModule,
+    ReviewContextSlot,
+    ReviewFinishArguments,
+    SnapshotArguments,
+    SnapshotChanges,
+)
+from tests.unit.models.physical_budget_typed_fixture import WireJson, wire_object
 from tests.unit.models.test_physical_budget import (
+    BudgetStore,
     budget_module,
     configured,
     gateway,
@@ -29,12 +46,12 @@ from tests.unit.models.test_physical_budget import (
 )
 
 
-def service_module():
-    return importlib.import_module("agent_hub.capabilities.model_review")
+def service_module() -> ModelReviewModule:
+    return model_review
 
 
-def snapshot(context, **changes):
-    values = {
+def snapshot(context: _RunBudgetContext, **changes: Unpack[SnapshotChanges]) -> FrozenReviewAction:
+    values: SnapshotArguments = {
         "role": Role.OPERATOR,
         "authorization_turn_id": context.evidence.turn_id,
         "authorization_sha256": authorization_binding_sha256(context.evidence),
@@ -63,21 +80,42 @@ def snapshot(context, **changes):
 class ReviewStore(ReviewRepository):
     """Service sequencing spy. Real ledger transactions are covered by PG composition."""
 
-    def __init__(self, budget):
+    def __init__(self, budget: BudgetStore) -> None:
         self.budget = budget
-        self.intent = None
-        self.finishes = []
+        self.intent: ReviewIntent | None = None
+        self.authorization_turn_id: UUID | None = None
+        self.finishes: list[ReviewFinishArguments] = []
         self.begins = 0
 
-    async def begin_intent(self, *, snapshot, config, reservation, review_id):
+    async def begin_intent(
+        self,
+        *,
+        snapshot: FrozenReviewAction,
+        config: ApprovalReviewConfig,
+        reservation: _ReviewReservation,
+        review_id: UUID,
+    ) -> ReviewIntent:
         self.begins += 1
         if self.intent is not None:
             return replace(self.intent, created=False)
         req, p = snapshot.request(), snapshot.to_payload()
+        turn = p["authorization_turn_id"]
+        assert isinstance(turn, str)
+        self.authorization_turn_id = UUID(turn)
+        authorization_sha, config_sha, policy_sha = (
+            p["authorization_sha256"],
+            p["config_sha256"],
+            p["policy_sha256"],
+        )
+        assert isinstance(authorization_sha, str)
+        assert isinstance(config_sha, str)
+        assert isinstance(policy_sha, str)
         a = await self.budget.reserve(
             tenant_id=req.tenant_id,
             run_id=req.run_id,
-            authorization_turn_id=p["authorization_turn_id"],
+            authorization_turn_id=self.authorization_turn_id,
+            lease=reservation.lease,
+            config_sha256=config_sha,
             purpose="review",
             attempt_id=uuid4(),
             request_sha256=reservation.request_sha256,
@@ -92,9 +130,9 @@ class ReviewStore(ReviewRepository):
             a.attempt_id,
             snapshot.action_digest,
             snapshot.effect_digest,
-            p["authorization_sha256"],
-            p["config_sha256"],
-            p["policy_sha256"],
+            authorization_sha,
+            config_sha,
+            policy_sha,
             "d" * 64,
             reservation.request_sha256,
             reservation.deployment,
@@ -107,21 +145,39 @@ class ReviewStore(ReviewRepository):
         )
         return self.intent
 
-    async def mark_issued(self, **a):
+    async def mark_issued(
+        self,
+        *,
+        tenant_id: UUID,
+        run_id: UUID,
+        review_id: UUID,
+        physical_identity: UUID,
+        lease: _WorkerLease,
+    ) -> bool:
+        assert self.intent is not None and self.authorization_turn_id is not None
         ok = await self.budget.mark_issued(
-            attempt_id=self.intent.attempt_id, physical_transport_id=a["physical_identity"]
+            attempt_id=self.intent.attempt_id,
+            physical_transport_id=physical_identity,
+            tenant_id=tenant_id,
+            run_id=run_id,
+            lease=lease,
+            authorization_turn_id=self.authorization_turn_id,
+            config_sha256=self.intent.config_sha256,
         )
-        self.intent = replace(
-            self.intent, status="issued", physical_identity=a["physical_identity"]
-        )
+        self.intent = replace(self.intent, status="issued", physical_identity=physical_identity)
         return ok
 
-    async def finish(self, **a):
+    async def finish(self, **a: Unpack[ReviewFinishArguments]) -> ReviewIntent:
+        assert self.intent is not None
         self.finishes.append(a)
         v, usage = a.get("verdict"), a.get("usage")
         settled = await self.budget.finish(
             attempt_id=a["attempt_id"],
             usage=usage,
+            tenant_id=a["tenant_id"],
+            run_id=a["run_id"],
+            lease=a["lease"],
+            deployment=a["actual_model_identity"],
             outcome="completed" if a["outcome"] in ("allow", "deny", "needs_human") else "unknown",
         )
         status = (
@@ -137,7 +193,7 @@ class ReviewStore(ReviewRepository):
         return self.intent
 
 
-def verdict(action, decision="allow"):
+def verdict(action: FrozenReviewAction, decision: str = "allow") -> str:
     return json.dumps(
         {
             "schema_version": 1,
@@ -152,10 +208,12 @@ def verdict(action, decision="allow"):
     )
 
 
-def test_review_schema_is_exact_six_keys_and_strict():
+def test_review_schema_is_exact_six_keys_and_strict() -> None:
     m = service_module()
     schema = m._review_schema().schema
     assert schema["additionalProperties"] is False
+    assert isinstance(schema["required"], tuple)
+    assert isinstance(schema["properties"], Mapping)
     assert (
         set(schema["required"])
         == set(schema["properties"])
@@ -164,14 +222,16 @@ def test_review_schema_is_exact_six_keys_and_strict():
 
 
 @pytest.mark.parametrize("decision", ["allow", "deny", "needs_human"])
-async def test_strict_review_is_tool_free_and_finished_before_return(decision):
+async def test_strict_review_is_tool_free_and_finished_before_return(decision: str) -> None:
     b, m = budget_module(), service_module()
     context, budget, primary, reviewer = configured()
     action = snapshot(context)
-    store, wires = ReviewStore(budget), []
+    store = ReviewStore(budget)
+    wires: list[dict[str, WireJson]] = []
 
-    def handle(req):
-        wires.append(json.loads(req.content))
+    def handle(req: httpx.Request) -> httpx.Response:
+        wires.append(wire_object(req.content))
+        assert store.intent is not None
         assert store.intent.status == "issued"
         return httpx.Response(200, json=response(verdict(action, decision)))
 
@@ -185,9 +245,14 @@ async def test_strict_review_is_tool_free_and_finished_before_return(decision):
     assert len(wires) == len(store.finishes) == 1
     assert budget.charged == 5
     assert not wires[0].get("tools") and "tool_choice" not in wires[0]
+    assert isinstance(wires[0]["messages"], list)
     assert len(wires[0]["messages"]) == 2
+    assert isinstance(wires[0]["messages"][1], dict)
     text = wires[0]["messages"][1]["content"]
+    assert isinstance(text, str)
     assert context.evidence.message in text and "complete exact content" in text
+    assert isinstance(wires[0]["response_format"], dict)
+    assert isinstance(wires[0]["response_format"]["json_schema"], dict)
     assert wires[0]["response_format"]["json_schema"]["strict"] is True
     public = json.dumps(result.public_summary())
     assert "Private explanation" not in public and context.evidence.message not in public
@@ -195,7 +260,7 @@ async def test_strict_review_is_tool_free_and_finished_before_return(decision):
 
 
 @pytest.mark.parametrize("case", ["secret", "untrusted", "oversize", "stale", "foreign_context"])
-async def test_unreviewable_input_has_zero_review_io(case):
+async def test_unreviewable_input_has_zero_review_io(case: str) -> None:
     b, m = budget_module(), service_module()
     context, budget, primary, reviewer = configured()
     action = snapshot(context)
@@ -211,21 +276,23 @@ async def test_unreviewable_input_has_zero_review_io(case):
     live = m._LiveReviewContext(
         context, materials_trusted=case != "untrusted", contains_secrets=case == "secret"
     )
+    candidate = ReviewContextSlot(live)
+    if case == "foreign_context":
+        candidate.inject({})
     with b._bind_run_budget(context):
-        result = await m.ModelApprovalReviewService(gw, store).review(
-            action, {} if case == "foreign_context" else live
-        )
+        result = await m.ModelApprovalReviewService(gw, store).review(action, candidate.value)
     assert result.status == "needs_human"
     assert store.begins == 0 and budget.calls == []
 
 
 @pytest.mark.parametrize("mode", ["missing", "malformed", "error", "protocol", "invalid_json"])
-async def test_unknown_receipts_never_allow_refund_or_second_protocol_rpc(mode):
+async def test_unknown_receipts_never_allow_refund_or_second_protocol_rpc(mode: str) -> None:
     b, m = budget_module(), service_module()
     context, budget, primary, reviewer = configured()
-    action, store, wires = snapshot(context), ReviewStore(budget), []
+    action, store = snapshot(context), ReviewStore(budget)
+    wires: list[httpx.Request] = []
 
-    def handle(req):
+    def handle(req: httpx.Request) -> httpx.Response:
         wires.append(req)
         if mode in ("error", "protocol"):
             return httpx.Response(
@@ -241,7 +308,9 @@ async def test_unknown_receipts_never_allow_refund_or_second_protocol_rpc(mode):
             "bad json" if mode == "invalid_json" else verdict(action), mode != "missing"
         )
         if mode == "malformed":
-            body["usage"]["total_tokens"] = 99
+            usage = body["usage"]
+            assert isinstance(usage, dict)
+            usage["total_tokens"] = 99
         return httpx.Response(200, json=body)
 
     gw, _ = gateway([primary, reviewer], handle)
@@ -253,12 +322,13 @@ async def test_unknown_receipts_never_allow_refund_or_second_protocol_rpc(mode):
     assert budget.charged == 10000 and len(store.finishes) == 1
 
 
-async def test_primary_and_review_share_balance_and_repeated_effect_never_sends():
+async def test_primary_and_review_share_balance_and_repeated_effect_never_sends() -> None:
     b, m = budget_module(), service_module()
     context, budget, primary, reviewer = configured()
-    action, store, wires = snapshot(context), ReviewStore(budget), []
+    action, store = snapshot(context), ReviewStore(budget)
+    wires: list[httpx.Request] = []
 
-    def handle(req):
+    def handle(req: httpx.Request) -> httpx.Response:
         wires.append(req)
         return httpx.Response(200, json=response(verdict(action)))
 
@@ -273,7 +343,7 @@ async def test_primary_and_review_share_balance_and_repeated_effect_never_sends(
     assert store.begins == 2
 
 
-async def test_distinct_compares_selected_actual_provider_model_not_alias_or_key():
+async def test_distinct_compares_selected_actual_provider_model_not_alias_or_key() -> None:
     b, m = budget_module(), service_module()
     acting = DeploymentIdentity("openai", "another-key", "openai/reviewer")
     context, budget, primary, reviewer = configured(acting=acting)
@@ -289,14 +359,15 @@ async def test_distinct_compares_selected_actual_provider_model_not_alias_or_key
     assert result.status == "needs_human" and store.begins == 0
 
 
-async def test_cancellation_is_propagated_and_issued_intent_is_unknown():
+async def test_cancellation_is_propagated_and_issued_intent_is_unknown() -> None:
     b, m = budget_module(), service_module()
     context, budget, primary, reviewer = configured()
     action, store, entered = snapshot(context), ReviewStore(budget), asyncio.Event()
 
-    async def handle(req):
+    async def handle(req: httpx.Request) -> httpx.Response:
         entered.set()
-        await asyncio.Future()
+        await asyncio.Future[httpx.Response]()
+        raise AssertionError("cancelled request unexpectedly resumed")
 
     gw, _ = gateway([primary, reviewer], handle)
     with b._bind_run_budget(context):
@@ -310,20 +381,23 @@ async def test_cancellation_is_propagated_and_issued_intent_is_unknown():
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
+    assert store.intent is not None
     assert store.intent.status == "unknown" and budget.charged == 10000
 
 
-async def test_original_deadline_timeout_is_unknown_and_never_reissues():
+async def test_original_deadline_timeout_is_unknown_and_never_reissues() -> None:
     import time
 
     b, m = budget_module(), service_module()
     context, budget, primary, reviewer = configured()
     context._deadline = time.monotonic() + 0.15
-    action, store, wires = snapshot(context), ReviewStore(budget), []
+    action, store = snapshot(context), ReviewStore(budget)
+    wires: list[httpx.Request] = []
 
-    async def handle(req):
+    async def handle(req: httpx.Request) -> httpx.Response:
         wires.append(req)
-        await asyncio.Future()
+        await asyncio.Future[httpx.Response]()
+        raise AssertionError("cancelled request unexpectedly resumed")
 
     gw, _ = gateway([primary, reviewer], handle)
     with b._bind_run_budget(context):
@@ -331,15 +405,16 @@ async def test_original_deadline_timeout_is_unknown_and_never_reissues():
             action, m._LiveReviewContext(context, materials_trusted=True, contains_secrets=False)
         )
     assert result.status != "allow" and len(wires) == 1 and budget.charged == 10000
+    assert store.intent is not None
     assert store.intent.status == "unknown"
 
 
-async def test_revoke_during_review_never_returns_late_allow():
+async def test_revoke_during_review_never_returns_late_allow() -> None:
     b, m = budget_module(), service_module()
     context, budget, primary, reviewer = configured()
     action, store = snapshot(context), ReviewStore(budget)
 
-    def handle(req):
+    def handle(req: httpx.Request) -> httpx.Response:
         context.revoke()
         return httpx.Response(200, json=response(verdict(action)))
 
@@ -351,7 +426,7 @@ async def test_revoke_during_review_never_returns_late_allow():
     assert result.status == "needs_human" and len(store.finishes) == 1
 
 
-async def test_distinct_rejects_same_actual_request_model_behind_different_deployments():
+async def test_distinct_rejects_same_actual_request_model_behind_different_deployments() -> None:
     b, m = budget_module(), service_module()
     initial, _, _, _ = configured()
     context, budget, primary, reviewer = configured(
@@ -359,9 +434,10 @@ async def test_distinct_rejects_same_actual_request_model_behind_different_deplo
     )
     primary = replace(primary, request_model="same-underlying-model")
     reviewer = replace(reviewer, request_model="same-underlying-model")
-    action, store, wires = snapshot(context), ReviewStore(budget), []
+    action, store = snapshot(context), ReviewStore(budget)
+    wires: list[httpx.Request] = []
 
-    def handle(req):
+    def handle(req: httpx.Request) -> httpx.Response:
         wires.append(req)
         return httpx.Response(200, json=response(verdict(action)))
 
@@ -377,13 +453,15 @@ async def test_distinct_rejects_same_actual_request_model_behind_different_deplo
 @pytest.mark.parametrize(
     "kind", ["lease_expired", "lease_replaced", "run_cancelled", "turn_replaced"]
 )
-async def test_post_issue_current_db_failure_cannot_return_new_allow(kind):
+async def test_post_issue_current_db_failure_cannot_return_new_allow(kind: str) -> None:
     b, m = budget_module(), service_module()
     context, budget, primary, reviewer = configured()
-    action, store, wires = snapshot(context), ReviewStore(budget), []
+    action, store = snapshot(context), ReviewStore(budget)
+    wires: list[httpx.Request] = []
 
-    def handle(req):
+    def handle(req: httpx.Request) -> httpx.Response:
         wires.append(req)
+        assert store.intent is not None
         assert store.intent.status == "issued"
         invalidate_current(budget, kind)
         return httpx.Response(200, json=response(verdict(action)))
@@ -394,18 +472,20 @@ async def test_post_issue_current_db_failure_cannot_return_new_allow(kind):
         result = await m.ModelApprovalReviewService(gw, store).review(action, live)
         repeated = await m.ModelApprovalReviewService(gw, store).review(action, live)
     assert result.status == repeated.status == "needs_human" and len(wires) == 1
+    assert store.intent is not None
     assert store.intent.status == "allow" and budget.charged == 5
     assert budget.current_reads and all(finishes == 1 for _, finishes in budget.current_reads)
 
 
-async def test_current_db_read_error_redacts_and_preserves_committed_accounting():
+async def test_current_db_read_error_redacts_and_preserves_committed_accounting() -> None:
     from sqlalchemy.exc import SQLAlchemyError
 
     b, m = budget_module(), service_module()
     context, budget, primary, reviewer = configured()
-    action, store, wires = snapshot(context), ReviewStore(budget), []
+    action, store = snapshot(context), ReviewStore(budget)
+    wires: list[httpx.Request] = []
 
-    def handle(req):
+    def handle(req: httpx.Request) -> httpx.Response:
         wires.append(req)
         budget.current_read_error = SQLAlchemyError("private lease database detail")
         return httpx.Response(200, json=response(verdict(action)))
@@ -417,23 +497,25 @@ async def test_current_db_read_error_redacts_and_preserves_committed_accounting(
         )
     assert result.status == "needs_human" and result.reason_code == "review_unavailable"
     assert "private lease database detail" not in json.dumps(result.public_summary())
+    assert store.intent is not None
     assert store.intent.status == "allow" and budget.charged == 5 and len(wires) == 1
 
 
 @pytest.mark.parametrize("interrupt", ["cancel", "revoke"])
-async def test_current_db_read_preserves_final_cancel_and_revoke_checks(interrupt):
+async def test_current_db_read_preserves_final_cancel_and_revoke_checks(interrupt: str) -> None:
     b, m = budget_module(), service_module()
     context, budget, primary, reviewer = configured()
-    action, store, wires = snapshot(context), ReviewStore(budget), []
+    action, store = snapshot(context), ReviewStore(budget)
+    wires: list[httpx.Request] = []
     entered, release = asyncio.Event(), asyncio.Event()
 
-    async def before_current_read():
+    async def before_current_read() -> None:
         entered.set()
         await release.wait()
 
     budget.before_current_read = before_current_read
 
-    def handle(req):
+    def handle(req: httpx.Request) -> httpx.Response:
         wires.append(req)
         return httpx.Response(200, json=response(verdict(action)))
 
@@ -447,6 +529,7 @@ async def test_current_db_read_preserves_final_cancel_and_revoke_checks(interrup
         )
         try:
             await asyncio.wait_for(entered.wait(), timeout=3)
+            assert store.intent is not None
             assert budget.charged == 5 and store.intent.status == "allow"
             if interrupt == "cancel":
                 task.cancel()

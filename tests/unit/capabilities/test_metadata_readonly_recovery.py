@@ -1,7 +1,6 @@
 """Actual owner/gateway propagation; metadata transports remain simulated."""
 from __future__ import annotations
 
-import importlib
 from typing import Any
 
 import pytest
@@ -15,10 +14,12 @@ from agent_hub.capabilities.generated_project_service import (
 from agent_hub.capabilities.runtime import RuntimeCapabilityGateway
 from agent_hub.harness.tool_gateway import HarnessToolGateway
 from agent_hub.harness.types import HarnessToolCallRequest
+from agent_hub.skills.sandbox import python_metadata_preparation_client as metadata_api
 from agent_hub.skills.sandbox.python_metadata_preparation_client import (
     PythonMetadataPreparationSandbox,
 )
 from agent_hub.skills.sandbox.python_project_profile import PythonProjectProfileSandbox
+from tests.unit.capabilities.capability_lifecycle_typed_fixture import set_failure_fields
 from tests.unit.capabilities.test_generated_metadata_preparation import metadata_case
 from tests.unit.capabilities.test_generated_project_service import USER
 from tests.unit.capabilities.test_generated_python_dependency_closure import (
@@ -54,6 +55,7 @@ async def test_finite_metadata_stage_survives_actual_authorization_gateway(
     monkeypatch.setattr(PythonProjectProfileSandbox, 'inspect', unavailable_profile)
     runtime = RuntimeCapabilityGateway(skill_store_dir=tmp_path / 'skills',
         project_workspace_dir=c.service.root, run_repository=c.repo)
+    assert runtime._project_verification is not None
     runtime._project_verification.generated._metadata_client = PythonMetadataPreparationSandbox()
     runtime._project_verification.generated._dependency_inspector = c.closure
     policy = FakePolicyGateway(CapabilityStatus.ALLOWED)
@@ -83,7 +85,7 @@ async def test_plain_error_cannot_impersonate_typed_metadata_failure(
 
 
 async def test_mutating_failure_keeps_consumed_intent_and_next_call_only_inspects(draft: Any) -> None:
-    api = importlib.import_module('agent_hub.skills.sandbox.python_metadata_preparation_client')
+    api = metadata_api
     c = metadata_case(draft)
     async def approved(*args: Any) -> bool:
         return True
@@ -110,13 +112,14 @@ async def test_mutating_failure_keeps_consumed_intent_and_next_call_only_inspect
 
 @pytest.mark.parametrize('spoof', ['attributes', 'subclass', 'mutated'])
 async def test_owner_revalidates_exact_typed_metadata_failure(draft: Any, spoof: str) -> None:
-    api = importlib.import_module('agent_hub.skills.sandbox.python_metadata_preparation_client')
+    api = metadata_api
     c = metadata_case(draft)
+    failure: Exception
     if spoof == 'attributes':
         failure = ValueError('/private/never-echo')
-        failure.phase, failure.code = 'profile', 'metadata_prepare_unavailable'  # type: ignore[attr-defined]
+        set_failure_fields(failure)
     elif spoof == 'subclass':
-        class Other(api.PythonMetadataPreparationFailure):
+        class Other(metadata_api.PythonMetadataPreparationFailure):
             pass
         failure = RuntimeError.__new__(Other)
         RuntimeError.__init__(failure, '/private/never-echo')

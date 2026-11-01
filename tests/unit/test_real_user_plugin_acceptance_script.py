@@ -10,7 +10,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
-from jsonschema import ValidationError, validate  # type: ignore[import-untyped]
+from jsonschema import ValidationError, validate
 
 SCRIPT_PATH = Path("scripts/real_user_plugin_acceptance.py")
 ADMIN_USER_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"

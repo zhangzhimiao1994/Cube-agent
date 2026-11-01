@@ -8,7 +8,7 @@ from unittest.mock import patch
 from uuid import UUID
 
 import pytest
-from jsonschema import Draft202012Validator  # type: ignore[import-untyped]
+from jsonschema import Draft202012Validator
 
 from agent_hub.auth.models import Role
 from agent_hub.capabilities.runtime import RuntimeCapabilityError, RuntimeCapabilityGateway
@@ -36,7 +36,9 @@ from tests.unit.runtime.crew.test_meaningful_workspace_progress import (
 
 
 def validator(schema: Mapping[str, JsonValue]) -> Draft202012Validator:
-    return Draft202012Validator(adapter._mutable_json(schema))
+    mutable = adapter._mutable_json(schema)
+    assert isinstance(mutable, Mapping)
+    return Draft202012Validator(mutable)
 
 
 @pytest.mark.parametrize("name", ("workspace.read", "workspace_read"))

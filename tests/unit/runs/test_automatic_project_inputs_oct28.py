@@ -3,32 +3,48 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import Coroutine, Mapping
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, cast
-from uuid import uuid4
+from typing import Never
+from uuid import UUID, uuid4
 
 import pytest
 
+from agent_hub.api.routers.admin import InMemoryAdminResourceService
 from agent_hub.auth.models import Role
 from agent_hub.capabilities.project_contracts import ManagedProjectInput
+from agent_hub.capabilities.project_verification import ProjectVerificationService
 from agent_hub.domain.runs import TaskMode
 from agent_hub.files.workspace import ProjectWorkspaceStore
+from agent_hub.harness.tool_gateway import HarnessToolGateway
 from agent_hub.runs.conversations import ConversationRecord
 from agent_hub.runs.project_inputs import OriginalProjectPreparer
 from agent_hub.runs.repository import RunRepository
 from agent_hub.runs.service import RunService
-from agent_hub.runtime.contracts import JsonValue, TaskContext
+from agent_hub.runs.workspace import PermissionMode
+from agent_hub.runtime.artifacts import ArtifactRepository
+from agent_hub.runtime.contracts import TaskContext
 from agent_hub.runtime.defaults import UnavailableRuntime
 from agent_hub.runtime.registry import RuntimeRegistry
-from tests.unit.runs.test_conversation_mode import (
-    ConversationMetadataRepository,
-    ConversationModeRepository,
+from agent_hub.skills.sandbox.project import ProjectInvocation, project_source_manifest
+from tests.unit.runs.automatic_conversation_input_typed_fixture import (
+    NoAuthorization,
+    SelectionRepository,
+    SubmissionOptions,
+    SubmissionRepository,
 )
+from tests.unit.runs.conversation_authenticated_input_typed_fixture import (
+    UnexpectedQueue,
+    json_map,
+    mutable,
+    present,
+    run,
+)
+from tests.unit.runs.project_auto_repair_typed_fixture import RepairRepository
+from tests.unit.runs.test_conversation_mode import ConversationMetadataRepository
 from tests.unit.runs.test_harness_decision import ACTOR_ID, TENANT_ID, RecordingQueue
-from tests.unit.runs.test_terminal_hooks import ExecutableFakeRepository, FakeTransaction
 
 VERSION = 'automatic_project_input_version'
 STATE = 'automatic_project_input_selection'
@@ -36,51 +52,45 @@ ACTUAL = ('请继续维护当前已经交付的 ticket_summary 项目，在同�
           '由你自己首先只新增 tests/test_ndjson_acceptance.py，通过真实失败再修实现并交付 ZIP。')
 
 
-def run[T](coroutine: Coroutine[Any, Any, T]) -> T:
-    try:
-        for _ in range(10000):
-            suspended = coroutine.send(None)
-            assert suspended is None, 'fixture must not schedule external IO'
-    except StopIteration as completed:
-        return cast(T, completed.value)
-    finally:
-        coroutine.close()
-    raise AssertionError('unbounded fixture coroutine')
-
-
 @pytest.fixture(autouse=True)
 def memory_threads(monkeypatch: pytest.MonkeyPatch) -> None:
-    async def immediate(function: Any, *args: Any, **kwargs: Any) -> Any:
+    async def immediate[**P, T](function: Callable[P, T], *args: P.args, **kwargs: P.kwargs) -> T:
         return function(*args, **kwargs)
     monkeypatch.setattr(asyncio, 'to_thread', immediate)
 
 
-def submission(request: str, **options: Any) -> Mapping[str, Any]:
+def submission(request: str, *, project_id: str | None = 'existing',
+    workspace_session_id: str | None = 'session-a', conversation_id: str | None = 'conv-maintain',
+    sandbox_profile: str | None = 'workspace_write', execution_backend: str = 'systemd',
+    permission_mode: PermissionMode | None = 'default',
+    requested_permissions: tuple[str, ...] = ('workspace.read', 'workspace.write', 'command.run'),
+    skip_evolution_proposal: bool = True, allow_scale_mode_upgrade: bool = False,
+    replace_workspace_files: bool = False, project_input: ManagedProjectInput | None = None,
+    conversation_artifact_repository: ArtifactRepository | None = None,
+    submission_actor_role: Role | None = Role.OPERATOR,
+) -> dict[str, object]:
     now = datetime.now(UTC)
     conversation = ConversationRecord(id=uuid4(), tenant_id=TENANT_ID, conversation_id='conv-maintain',
         title='Existing', project_id='existing', project_label='Existing', workspace_path='session-a',
         archived_at=None, created_at=now, updated_at=now)
-    repository = ConversationModeRepository(TaskMode.DIRECT)
+    repository = SubmissionRepository(TaskMode.DIRECT)
     class Preparer:
         async def __call__(self, context: TaskContext) -> TaskContext:
             raise AssertionError('submit must not prepare or execute')
         async def select_existing(self, context: TaskContext) -> TaskContext:
             raise AssertionError('submit must not read workspace')
-    snapshot_repository = options.pop('conversation_artifact_repository', None)
-    submission_role = options.pop('submission_actor_role', Role.OPERATOR)
-    service = RunService(cast(RunRepository, repository),
-        conversation_artifact_repository=snapshot_repository,
+    service = RunService(repository, conversation_artifact_repository=conversation_artifact_repository,
         runtime_registry=RuntimeRegistry((UnavailableRuntime(TaskMode.DIRECT),)), router=None,
         task_queue=RecordingQueue(), project_input_preparer=Preparer(),
         conversation_repository=ConversationMetadataRepository(conversation))
-    values = {'project_id': 'existing', 'workspace_session_id': 'session-a', 'conversation_id': 'conv-maintain',
-        'sandbox_profile': 'workspace_write', 'execution_backend': 'systemd', 'permission_mode': 'default',
-        'requested_permissions': ('workspace.read', 'workspace.write', 'command.run'),
-        'skip_evolution_proposal': True, 'allow_scale_mode_upgrade': False}
-    values.update(options)
-    run(service.submit(tenant_id=TENANT_ID, actor_id=ACTOR_ID, actor_role=submission_role,
-        message=request, mode=TaskMode.DIRECT, **values))
-    return cast(Mapping[str, Any], repository.created[-1]['routing_decision'])
+    run(service.submit(tenant_id=TENANT_ID, actor_id=ACTOR_ID, actor_role=submission_actor_role,
+        message=request, mode=TaskMode.DIRECT, project_id=project_id,
+        workspace_session_id=workspace_session_id, conversation_id=conversation_id,
+        sandbox_profile=sandbox_profile, execution_backend=execution_backend, permission_mode=permission_mode,
+        requested_permissions=requested_permissions, skip_evolution_proposal=skip_evolution_proposal,
+        allow_scale_mode_upgrade=allow_scale_mode_upgrade, replace_workspace_files=replace_workspace_files,
+        project_input=project_input))
+    return mutable(repository.created[-1]['routing_decision'])
 
 
 @pytest.mark.parametrize('message', [ACTUAL, '继续维护当前项目，新增NDJSON并交付ZIP',
@@ -107,26 +117,26 @@ def test_questions_quoted_negative_conditional_planning_never_preverify(message:
     {'execution_backend': 'docker'}, {'replace_workspace_files': True}, {'conversation_id': 'conv-missing'},
     {'project_input': ManagedProjectInput(('src',))},
 ])
-def test_ineligible_and_explicit_requests_do_not_acquire_automatic_marker(options: dict[str, Any]) -> None:
+def test_ineligible_and_explicit_requests_do_not_acquire_automatic_marker(options: SubmissionOptions) -> None:
     assert VERSION not in submission(ACTUAL, **options)
 
 
-def selector(tmp_path: Path, *, files: bool = True) -> tuple[Any, Any, TaskContext, Path]:
+def selector(tmp_path: Path, *, files: bool = True) -> tuple[OriginalProjectPreparer, RepairRepository, TaskContext, Path]:
     root = tmp_path / 'workspaces'
-    route = {'project_id': 'existing', 'workspace_session_id': 'session-a', 'conversation_id': 'conv-maintain',
+    route: dict[str, object] = {'project_id': 'existing', 'workspace_session_id': 'session-a', 'conversation_id': 'conv-maintain',
         'sandbox_profile': 'workspace_write', 'permission_mode': 'default', 'execution_backend': 'systemd',
         'requested_permissions': ['workspace.read', 'workspace.write', 'command.run'],
         'generated_project_contract_version': 1, VERSION: 1}
-    repository = ExecutableFakeRepository(routing_decision=route)
+    repository = SelectionRepository(routing_decision=route)
     repository.row.actor_role = 'operator'
     repository.row.request = ACTUAL
     token = uuid4()
-    run(repository.claim_for_execution(FakeTransaction(), repository.run_id, allow_running_recovery=False,
+    run(repository.claim_for_execution(run(repository.run_transaction()), repository.run_id, allow_running_recovery=False,
         worker_id='test-worker', worker_lease_token=token,
         worker_lease_expires_at=datetime.now(UTC) + timedelta(minutes=5)))
     context = TaskContext(run_id=repository.run_id, tenant_id=repository.row.tenant_id,
         actor_id=repository.row.actor_id, actor_role=Role.OPERATOR, mode=TaskMode.DISPATCH,
-        request=ACTUAL, execution_token=token, routing_decision=cast(Mapping[str, JsonValue], route))
+        request=ACTUAL, execution_token=token, routing_decision=json_map(route))
     store = ProjectWorkspaceStore(root)
     path = store.session_root(context.tenant_id, 'existing', 'session-a')
     path.mkdir(parents=True)
@@ -138,8 +148,9 @@ def selector(tmp_path: Path, *, files: bool = True) -> tuple[Any, Any, TaskConte
             'ACCEPTANCE.json': '{}', 'MANIFEST.in': 'include README.md\n',
             'src/settings.json': '{}', 'src/config.py': 'SETTING = 1\n'}.items():
             store.write_bytes(context.tenant_id, 'existing', 'session-a', name, text.encode(), 'text/plain')
-    preparer = OriginalProjectPreparer(root=root, repository=cast(RunRepository, repository),
-        authorizer=cast(Any, object()), verifier=cast(Any, object()))
+    preparer = OriginalProjectPreparer(root=root, repository=repository,
+        authorizer=NoAuthorization(),
+        verifier=ProjectVerificationService(root=root, repository=repository, executor=None))
     return preparer, repository, context, path
 
 
@@ -152,8 +163,8 @@ def test_real_store_auto_selects_exact_production_and_absent_new_test(tmp_path: 
                              'README.md', 'tests/test_ndjson_acceptance.py'}
     assert route['project_input_contract_version'] == 1
     assert 'generated_project_contract_version' not in route
-    assert repository.row.routing_decision[STATE]['kind'] == 'original'
-    assert repository.row.routing_decision[STATE]['source_sha256']
+    assert mutable(mutable(repository.row.routing_decision)[STATE])['kind'] == 'original'
+    assert mutable(mutable(repository.row.routing_decision)[STATE])['source_sha256']
     assert selected.token_budget == context.token_budget and selected.timeout_seconds == context.timeout_seconds
     assert selected.execution_token == context.execution_token and selected.artifacts == context.artifacts
     assert route['requested_permissions'] == context.routing_decision['requested_permissions']
@@ -166,12 +177,12 @@ def test_positive_selection_restore_without_rescanning(tmp_path: Path, monkeypat
     selected = run(preparer.select_existing(context))
     version = repository.row.version
     (path / 'later.py').write_text('changed after selection')
-    def forbidden(*args: Any, **kwargs: Any) -> Any:
+    def forbidden(*args: object, **kwargs: object) -> Never:
         raise AssertionError('recovery must not reselect')
     monkeypatch.setattr(ProjectWorkspaceStore, 'list_files', forbidden)
     restored = run(preparer.select_existing(selected))
     assert restored.routing_decision == selected.routing_decision and repository.row.version == version
-    assert repository.row.routing_decision[STATE]['kind'] == ('generated' if empty else 'original')
+    assert mutable(mutable(repository.row.routing_decision)[STATE])['kind'] == ('generated' if empty else 'original')
 
 
 @pytest.mark.parametrize('defect', ['actor', 'tenant', 'lease', 'expired', 'scope', 'cancelled', 'permissions'])
@@ -181,21 +192,21 @@ def test_invalid_current_identity_never_reads_source(tmp_path: Path, monkeypatch
     elif defect == 'tenant': repository.row.tenant_id = uuid4()
     elif defect == 'lease': repository.row.worker_lease_token = uuid4()
     elif defect == 'expired': repository.row.worker_lease_expires_at = datetime.now(UTC) - timedelta(seconds=1)
-    elif defect == 'scope': repository.row.routing_decision['workspace_session_id'] = 'other'
+    elif defect == 'scope': mutable(repository.row.routing_decision)['workspace_session_id'] = 'other'
     elif defect == 'cancelled': repository.row.status = 'cancelled'
-    else: repository.row.routing_decision['requested_permissions'] = ['workspace.read']
-    def forbidden(*args: Any, **kwargs: Any) -> Any:
+    else: mutable(repository.row.routing_decision)['requested_permissions'] = ['workspace.read']
+    def forbidden(*args: object, **kwargs: object) -> Never:
         raise AssertionError('unauthorized filesystem read')
     monkeypatch.setattr(ProjectWorkspaceStore, 'list_files', forbidden)
     with pytest.raises(RuntimeError):
         run(preparer.select_existing(context))
-    assert STATE not in repository.row.routing_decision
+    assert STATE not in mutable(repository.row.routing_decision)
 
 
 def test_old_unmarked_context_is_not_selected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     preparer, repository, context, _ = selector(tmp_path)
-    repository.row.routing_decision.pop(VERSION)
-    context = context.model_copy(update={'routing_decision': repository.row.routing_decision})
+    mutable(repository.row.routing_decision).pop(VERSION)
+    context = context.model_copy(update={'routing_decision': mutable(repository.row.routing_decision)})
     monkeypatch.setattr(ProjectWorkspaceStore, 'list_files', lambda *a, **k: pytest.fail('old run read'))
     assert run(preparer.select_existing(context)) is context
 
@@ -205,7 +216,7 @@ def test_larger_scope_is_selected_exactly_never_truncated_or_generated(tmp_path:
     for index in range(130):
         (path / 'src' / f'module_{index}.py').write_text('value = 1')
     selected = run(preparer.select_existing(context))
-    assert repository.row.routing_decision[STATE]['kind'] == 'original'
+    assert mutable(mutable(repository.row.routing_decision)[STATE])['kind'] == 'original'
     editable = ManagedProjectInput.from_payload(selected.routing_decision['project_input']).editable_paths
     assert len(editable) == 134 and 'src' not in editable
     assert all(f'src/module_{index}.py' in editable for index in range(130))
@@ -229,12 +240,12 @@ def test_generated_absent_test_path_is_unique_and_existing_tests_stay_protected(
 
 def test_interrupted_selection_is_not_restarted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     preparer, repository, context, _ = selector(tmp_path)
-    def interrupted(*args: Any, **kwargs: Any) -> Any:
+    def interrupted(*args: object, **kwargs: object) -> Never:
         raise OSError('read interrupted')
     monkeypatch.setattr(ProjectWorkspaceStore, 'list_files', interrupted)
     with pytest.raises(OSError):
         run(preparer.select_existing(context))
-    assert repository.row.routing_decision[STATE]['phase'] == 'selecting'
+    assert mutable(mutable(repository.row.routing_decision)[STATE])['phase'] == 'selecting'
     monkeypatch.setattr(ProjectWorkspaceStore, 'list_files', lambda *a, **k: pytest.fail('reselection'))
     with pytest.raises(RuntimeError):
         run(preparer.select_existing(context))
@@ -243,11 +254,11 @@ def test_interrupted_selection_is_not_restarted(tmp_path: Path, monkeypatch: pyt
 def test_source_change_during_selection_cannot_commit_original(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from agent_hub.runs import automatic_project_inputs as automatic
     preparer, repository, context, _ = selector(tmp_path)
-    original = automatic.project_source_manifest
+    original = project_source_manifest
     count = 0
-    async def changed(*args: Any, **kwargs: Any) -> Any:
+    async def changed(root: Path, invocation: ProjectInvocation) -> dict[str, str]:
         nonlocal count
-        result = await original(*args, **kwargs)
+        result = await original(root, invocation)
         count += 1
         if count == 2:
             result = {**result, 'README.md': 'a' * 64}
@@ -255,8 +266,8 @@ def test_source_change_during_selection_cannot_commit_original(tmp_path: Path, m
     monkeypatch.setattr(automatic, 'project_source_manifest', changed)
     with pytest.raises(RuntimeError):
         run(preparer.select_existing(context))
-    assert 'project_input' not in repository.row.routing_decision
-    assert repository.row.routing_decision[STATE]['phase'] == 'selecting'
+    assert 'project_input' not in mutable(repository.row.routing_decision)
+    assert mutable(mutable(repository.row.routing_decision)[STATE])['phase'] == 'selecting'
 
 
 def test_selected_source_cannot_be_recaptured_after_edit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -266,31 +277,34 @@ def test_selected_source_cannot_be_recaptured_after_edit(tmp_path: Path, monkeyp
     monkeypatch.setattr(asyncio, 'get_running_loop', lambda: SimpleNamespace(time=time.monotonic))
     with pytest.raises(RuntimeError, match='original project'):
         run(preparer(selected))
-    assert 'project_input_preparation' not in repository.row.routing_decision
+    assert 'project_input_preparation' not in mutable(repository.row.routing_decision)
     assert not (preparer.root / '.project-contracts').exists()
 
 
 async def test_actual_worker_selects_and_observes_original_before_model(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from agent_hub.domain.runs import RunStatus
-    from tests.unit.runs.test_original_project_preparation import setup
+    from tests.unit.runs.automatic_conversation_input_typed_fixture import (
+        preparation_fixture as setup,
+    )
     from tests.unit.runs.test_project_input_lifecycle import ObservingRuntime
     preparer, repository, _, _, calls, _, _ = await setup(tmp_path)
     monkeypatch.setattr('tests.unit.runs.test_terminal_hooks.TENANT_ID', repository.row.tenant_id)
-    route = repository.row.routing_decision
+    monkeypatch.setattr('tests.unit.runs.project_auto_repair_typed_fixture.TENANT_ID', repository.row.tenant_id)
+    route = mutable(repository.row.routing_decision)
     route.pop('project_input')
     route.pop('project_input_contract_version')
     route.update({VERSION: 1, 'generated_project_contract_version': 1,
                   'permission_mode': 'default', 'conversation_id': 'conv-maintain'})
     repository.row.request = '继续维护当前项目，修复并交付ZIP'
-    service = RunService(cast(RunRepository, repository), router=None, task_queue=cast(Any, object()),
+    service = RunService(repository, router=None, task_queue=UnexpectedQueue(),
         runtime_registry=RuntimeRegistry((ObservingRuntime(TaskMode.DISPATCH, calls),)),
         project_input_preparer=preparer, worker_id='test-worker')
     result = await service.execute(repository.run_id)
     assert result.status is RunStatus.COMPLETED
     assert calls == ['authorize', 'execute-original', 'model']
-    assert repository.row.routing_decision[STATE]['kind'] == 'original'
-    assert repository.row.routing_decision['project_input_preparation']['phase'] == 'observed'
-    assert 'generated_project_contract_version' not in repository.row.routing_decision
+    assert mutable(mutable(repository.row.routing_decision)[STATE])['kind'] == 'original'
+    assert mutable(mutable(repository.row.routing_decision)['project_input_preparation'])['phase'] == 'observed'
+    assert 'generated_project_contract_version' not in mutable(repository.row.routing_decision)
 
 
 @pytest.mark.parametrize('defect', [None, 'budget', 'permissions', 'lease_after_select', 'state_not_persisted'])
@@ -317,9 +331,9 @@ def test_service_selection_boundary_revalidates_real_record_and_no_authority_gro
             if defect == 'lease_after_select':
                 repository.row.worker_lease_token = uuid4()
             if defect == 'state_not_persisted':
-                repository.row.routing_decision.pop(STATE)
+                mutable(repository.row.routing_decision).pop(STATE)
             return result
-    service = RunService(cast(RunRepository, repository), router=None, task_queue=RecordingQueue(),
+    service = RunService(repository, router=None, task_queue=RecordingQueue(),
         runtime_registry=RuntimeRegistry((UnavailableRuntime(TaskMode.DISPATCH),)),
         project_input_preparer=Boundary(), worker_id='test-worker')
     if defect is None:
@@ -349,15 +363,15 @@ async def test_worker_automatic_original_pending_approval_keeps_selected_context
                 'schema_version': 1, 'contract_sha256': 'a' * 64,
                 'input_source_sha256': 'b' * 64, 'file_count': 11}}
             row = repository.row
-            row.routing_decision = {**row.routing_decision, 'project_input_preparation': state,
+            row.routing_decision = {**mutable(row.routing_decision), 'project_input_preparation': state,
                 'approval_kind': 'capability_tool', 'approval_id': 'approval_auto1',
                 'approval_checkpoint_required': False, 'approval_scope': (
                     f'capability-scope:v1:tenant={row.tenant_id}:user={row.actor_id}:run={row.id}:'
                     'capability=command:operation=run:resource=workspace/current/project-verification')}
             row.status = 'waiting_approval'
-            RunRepository.clear_worker_lease(cast(Any, row))
-            raise OriginalProjectApprovalPending('approval_auto1', cast(Mapping[str, JsonValue], state))
-    service = RunService(cast(RunRepository, repository), router=None, task_queue=RecordingQueue(),
+            RunRepository.clear_worker_lease(row)
+            raise OriginalProjectApprovalPending('approval_auto1', json_map(state))
+    service = RunService(repository, router=None, task_queue=RecordingQueue(),
         runtime_registry=RuntimeRegistry((ObservingRuntime(TaskMode.DISPATCH, calls),)),
         project_input_preparer=Waiting(), worker_id='test-worker')
     result = await service.execute(repository.run_id)
@@ -379,12 +393,12 @@ def test_non_action_existing_conversation_does_not_force_generated_delivery(mess
 def test_negative_selection_detects_external_files_without_reselect_or_capture(tmp_path: Path) -> None:
     preparer, repository, context, path = selector(tmp_path, files=False)
     selected = run(preparer.select_existing(context))
-    choice = dict(repository.row.routing_decision[STATE])
+    choice = dict(mutable(mutable(repository.row.routing_decision)[STATE]))
     (path / 'foreign.py').write_text('external = True')
     with pytest.raises(RuntimeError, match='automatic project'):
         run(preparer.select_existing(selected))
-    assert repository.row.routing_decision[STATE] == choice and choice['kind'] == 'generated'
-    assert 'project_input' not in repository.row.routing_decision
+    assert mutable(repository.row.routing_decision)[STATE] == choice and choice['kind'] == 'generated'
+    assert 'project_input' not in mutable(repository.row.routing_decision)
     assert not (preparer.root / '.project-contracts').exists()
 
 
@@ -425,35 +439,35 @@ def test_arbitrary_checkpoint_is_not_proof_of_negative_selection_ownership(tmp_p
     (path / 'foreign.py').write_text('external = True')
     with pytest.raises(RuntimeError, match='automatic project'):
         run(preparer.select_existing(selected))
-    assert repository.row.routing_decision[STATE]['kind'] == 'generated'
+    assert mutable(mutable(repository.row.routing_decision)[STATE])['kind'] == 'generated'
 
 
 @pytest.mark.parametrize('root_result', ['valid', 'absent', 'rejected'])
 def test_negative_drift_uses_existing_readonly_root_generated_validator(
-    tmp_path: Path, root_result: str,
+    tmp_path: Path, root_result: str, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     preparer, repository, context, path = selector(tmp_path, files=False)
     selected = run(preparer.select_existing(context))
     (path / 'owned.py').write_text('this run wrote a candidate')
-    repository.row.routing_decision['generated_project_preparation'] = {'opaque': 'root-validator-input'}
-    selected = selected.model_copy(update={'routing_decision': repository.row.routing_decision})
+    mutable(repository.row.routing_decision)['generated_project_preparation'] = {'opaque': 'root-validator-input'}
+    selected = selected.model_copy(update={'routing_decision': mutable(repository.row.routing_decision)})
     calls = []
     class RootGenerated:
-        async def load(self, tenant: Any, rid: Any, actor: Any, *, readonly: bool) -> Any:
+        async def load(self, tenant: UUID, rid: UUID, actor: str, *, readonly: bool) -> object:
             calls.append((tenant, rid, actor, readonly))
             if root_result == 'rejected':
                 raise RuntimeError('root validation rejected')
             return object() if root_result == 'valid' else None
-    preparer.verifier = SimpleNamespace(generated=RootGenerated())
+    monkeypatch.setattr(preparer.verifier.generated, 'load', RootGenerated().load)
     if root_result == 'valid':
         restored = run(preparer.select_existing(selected))
-        assert restored.routing_decision[STATE]['kind'] == 'generated'
+        assert json_map(restored.routing_decision[STATE])['kind'] == 'generated'
         assert 'project_input' not in restored.routing_decision
     else:
         with pytest.raises(RuntimeError):
             run(preparer.select_existing(selected))
     assert calls == [(context.tenant_id, context.run_id, 'main_agent', True)]
-    assert repository.row.routing_decision[STATE]['kind'] == 'generated'
+    assert mutable(mutable(repository.row.routing_decision)[STATE])['kind'] == 'generated'
 
 
 def test_nonempty_unsupported_project_is_durable_blocker_not_generated_rebuild(tmp_path: Path) -> None:
@@ -461,9 +475,9 @@ def test_nonempty_unsupported_project_is_durable_blocker_not_generated_rebuild(t
     (path / 'Cargo.toml').write_text('[package]\nname="example"')
     with pytest.raises(RuntimeError, match='automatic project'):
         run(preparer.select_existing(context))
-    assert repository.row.routing_decision[STATE]['kind'] == 'blocked'
-    assert repository.row.routing_decision[STATE]['reason'] == 'unsupported'
-    assert 'project_input' not in repository.row.routing_decision
+    assert mutable(mutable(repository.row.routing_decision)[STATE])['kind'] == 'blocked'
+    assert mutable(mutable(repository.row.routing_decision)[STATE])['reason'] == 'unsupported'
+    assert 'project_input' not in mutable(repository.row.routing_decision)
 
 
 
@@ -503,12 +517,13 @@ def test_app_binds_only_preparer_before_run_service() -> None:
     import ast
 
     from agent_hub import app
-    text = Path(app.__file__).read_text(encoding='utf-8')
+    text = Path(present(app.__file__)).read_text(encoding='utf-8')
     tree = ast.parse(text)
     calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute) and node.func.attr == 'bind_artifact_repository']
     assert len(calls) == 1
     call = calls[0]
+    assert isinstance(call.func, ast.Attribute)
     assert ast.unparse(call.func.value) == 'runtime_capability_stack.project_input_preparer'
     assert [ast.unparse(arg) for arg in call.args] == ['artifact_repository']
     assert call.lineno < text[:text.index('application.state.run_service = RunService(')].count('\n') + 1
@@ -529,28 +544,28 @@ def test_fresh_owned_read_submission_marks_snapshot_without_changing_authority()
     {'requested_permissions': ('workspace.write', 'command.run')},
     {'submission_actor_role': None},
 ])
-def test_snapshot_marker_requires_repository_owned_actor_and_read_permission(options: dict[str, Any]) -> None:
+def test_snapshot_marker_requires_repository_owned_actor_and_read_permission(options: SubmissionOptions) -> None:
     from agent_hub.runtime.artifacts import InMemoryArtifactRepository
-    selected = submission(ACTUAL, **{'conversation_artifact_repository': InMemoryArtifactRepository(), **options})
+    merged: SubmissionOptions = {'conversation_artifact_repository': InMemoryArtifactRepository(), **options}
+    selected = submission(ACTUAL, **merged)
     assert 'conversation_input_snapshot_version' not in selected
 
 
 def test_app_external_registry_still_injects_snapshot_repository(tmp_path: Path) -> None:
     from fastapi.testclient import TestClient
-    from tests.unit.test_action_capability_stack_wiring import _settings
 
     from agent_hub.app import create_app
     from agent_hub.runs.artifacts import PostgresArtifactRepository
+    from tests.unit.runs.automatic_conversation_input_typed_fixture import MetadataDatabase
+    from tests.unit.runs.automatic_conversation_input_typed_fixture import settings as _settings
     from tests.unit.test_app_wiring import (
-        FakeDatabase,
         FakeRedis,
-        InMemoryAdminResourceService,
         NoopDirectRuntime,
         StubAuthService,
         StubConfigService,
         StubRateLimiter,
     )
-    database = FakeDatabase()
+    database = MetadataDatabase()
     application = create_app(settings=_settings(tmp_path), database=database, redis_client=FakeRedis(),
         auth_service=StubAuthService(), rate_limiter=StubRateLimiter(), config_service=StubConfigService(),
         admin_resource_service=InMemoryAdminResourceService(), user_admin_service=object(),
@@ -565,35 +580,40 @@ def test_app_internal_registry_binds_metadata_only_to_real_preparer(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from fastapi.testclient import TestClient
-    from tests.unit.test_action_capability_stack_wiring import (
-        RuntimeAdapter,
-        _assert_isolated_stacks,
-        _capture_builds,
-        _settings,
-    )
 
     from agent_hub import app as app_module
     from agent_hub.capabilities.runtime import RuntimeCapabilityGateway
+    from tests.unit.runs.automatic_conversation_input_typed_fixture import (
+        RuntimeAdapter,
+    )
+    from tests.unit.runs.automatic_conversation_input_typed_fixture import (
+        capture_builds as _capture_builds,
+    )
+    from tests.unit.runs.automatic_conversation_input_typed_fixture import (
+        isolated_stacks as _assert_isolated_stacks,
+    )
+    from tests.unit.runs.automatic_conversation_input_typed_fixture import (
+        settings as _settings,
+    )
     from tests.unit.test_app_wiring import (
-        FakeDatabase,
         FakeRedis,
-        InMemoryAdminResourceService,
         StubAuthService,
         StubConfigService,
         StubRateLimiter,
     )
     original = RuntimeCapabilityGateway.original_project_preparer
-    def available_preparer(gateway: RuntimeCapabilityGateway, authorizer: Any) -> Any:
+    def available_preparer(gateway: RuntimeCapabilityGateway, authorizer: HarnessToolGateway) -> OriginalProjectPreparer | None:
         # Only enable construction on Windows; no executor is invoked.
         gateway._project_executor_configured = True
         return original(gateway, authorizer)
-    async def adapters(**kwargs: Any) -> RuntimeAdapter:
+    async def adapters(**kwargs: object) -> RuntimeAdapter:
         return RuntimeAdapter()
     monkeypatch.setattr(RuntimeCapabilityGateway, 'original_project_preparer', available_preparer)
     captured = _capture_builds(monkeypatch, app_module)
     monkeypatch.setattr(app_module, 'build_runtime_mcp_service', adapters)
     monkeypatch.setattr(app_module, 'build_runtime_plugin_service', adapters)
-    database, settings = FakeDatabase(), _settings(tmp_path)
+    from tests.unit.runs.automatic_conversation_input_typed_fixture import MetadataDatabase
+    database, settings = MetadataDatabase(), _settings(tmp_path)
     application = app_module.create_app(settings=settings, database=database, redis_client=FakeRedis(),
         auth_service=StubAuthService(), rate_limiter=StubRateLimiter(), config_service=StubConfigService(),
         admin_resource_service=InMemoryAdminResourceService(), user_admin_service=object())
@@ -611,21 +631,22 @@ def test_app_internal_registry_binds_metadata_only_to_real_preparer(
 def test_production_worker_bootstrap_shares_private_repository_without_durable_upgrade(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, preparer_available: bool,
 ) -> None:
-    from tests.unit.test_action_capability_stack_wiring import (
-        _assert_isolated_stacks,
-        _build_worker,
+    from agent_hub.capabilities.runtime import RuntimeCapabilityGateway
+    from tests.unit.runs.automatic_conversation_input_typed_fixture import (
+        build_worker as _build_worker,
+    )
+    from tests.unit.runs.automatic_conversation_input_typed_fixture import (
+        isolated_stacks as _assert_isolated_stacks,
     )
 
-    from agent_hub.capabilities.runtime import RuntimeCapabilityGateway
-
     original = RuntimeCapabilityGateway.original_project_preparer
-    def available_preparer(gateway: RuntimeCapabilityGateway, authorizer: Any) -> Any:
+    def available_preparer(gateway: RuntimeCapabilityGateway, authorizer: HarnessToolGateway) -> OriginalProjectPreparer | None:
         gateway._project_executor_configured = preparer_available
         return original(gateway, authorizer)
     monkeypatch.setattr(RuntimeCapabilityGateway, 'original_project_preparer', available_preparer)
     resources, captured, settings, database = _build_worker(tmp_path, monkeypatch)
     assert isinstance(resources.service, RunService)
-    bare, action = _assert_isolated_stacks(captured, settings, database.session_factory)
+    bare, action = _assert_isolated_stacks(captured, settings, database.session_factory, legacy_artifacts=True)
     repository = captured['artifacts'][0]
     assert resources.service._conversation_artifact_repository is repository
     assert resources.service._project_input_preparer is bare.project_input_preparer
@@ -636,8 +657,8 @@ def test_production_worker_bootstrap_shares_private_repository_without_durable_u
         assert action.project_input_preparer.artifact_repository is repository
     else:
         assert bare.project_input_preparer is None
-    assert bare.runtime_gateway._artifact_repository is None
-    assert bare.runtime_gateway._project_verification._durable is None
+    assert bare.runtime_gateway._artifact_repository is repository
+    assert present(bare.runtime_gateway._project_verification)._durable is None
 
 
 @pytest.mark.parametrize('python', [True, False])

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Self, cast
@@ -21,7 +22,7 @@ from agent_hub.runs.repository import (
     _is_self_repair_recovery_baseline_event_kind,
 )
 from agent_hub.runs.service import _execution_quiescence
-from agent_hub.runtime.contracts import EventKind, RunEvent, RuntimeCheckpoint
+from agent_hub.runtime.contracts import EventKind, JsonValue, RunEvent, RuntimeCheckpoint
 
 
 @dataclass(slots=True)
@@ -253,8 +254,10 @@ class _RecoveryBlockingRepository(RunRepository):
         tenant_id: UUID,
         run_id: UUID,
         event: RunEvent,
+        routing_decision: Mapping[str, JsonValue] | None = None,
     ) -> None:
         del session
+        assert routing_decision is None, 'blocking recovery fixture must not persist a new route'
         assert tenant_id == self.tenant_id
         assert run_id == self.run_id
         self.persisted_events.append(event)

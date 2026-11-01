@@ -14,7 +14,10 @@ from agent_hub.runs.service import RunService, TaskQueue
 from agent_hub.runtime.contracts import RuntimeCheckpoint, TaskContext
 from agent_hub.runtime.defaults import UnavailableRuntime
 from agent_hub.runtime.registry import RuntimeRegistry
-from tests.unit.runs.test_engineering_writer_policy import _CheckpointRepository
+from tests.unit.runs.snapshot_approval_types_fixture import (
+    CheckpointRepository as _CheckpointRepository,
+)
+from tests.unit.runs.snapshot_approval_types_fixture import untrusted_channel_submit
 from tests.unit.runs.test_harness_decision import (
     ACTOR_ID,
     TENANT_ID,
@@ -180,7 +183,7 @@ async def test_real_submit_persists_internal_submission_marker_without_selecting
     service = RunService(cast(RunRepository, repository),
         runtime_registry=RuntimeRegistry((UnavailableRuntime(TaskMode.DISPATCH),)),
         router=None, task_queue=RecordingQueue())
-    result = await service.submit(tenant_id=TENANT_ID, actor_id=ACTOR_ID, actor_role=Role.OPERATOR,
+    result = await untrusted_channel_submit(service, tenant_id=TENANT_ID, actor_id=ACTOR_ID, actor_role=Role.OPERATOR,
         message="Inspect the existing project without changing execution permissions.", mode=TaskMode.DISPATCH,
         project_id="admission-project", workspace_session_id="admission-session",
         sandbox_profile="workspace_write", requested_permissions=("workspace.read", "workspace.write", "command.run"),

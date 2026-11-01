@@ -3,14 +3,15 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
 from agent_hub.capabilities import defaults
 from agent_hub.capabilities.runtime import RuntimeCapabilityGateway
+from agent_hub.runs.project_inputs import OriginalProjectPreparer
 from agent_hub.skills.sandbox.python_project_protocol import PythonProjectBrokerResponse
+from tests.unit.runs.snapshot_approval_types_fixture import BoundMaintenanceHook
 from tests.unit.runs.test_original_project_preparation import setup
 from tests.unit.runs.test_python_original_preparation import configured
 
@@ -35,7 +36,9 @@ async def test_capacity_is_reclaimed_before_first_native_python_execution(
     async def capacity_checked(invocation: Any) -> PythonProjectBrokerResponse:
         if not available:
             raise OSError('python_project_environment_quota')
-        return await original(invocation)
+        response: object = await original(invocation)
+        assert isinstance(response, PythonProjectBrokerResponse)
+        return response
 
     # Bootstrap supplies this private service callback, never request/model data.
     preparer.capacity_maintenance = maintenance
@@ -98,13 +101,15 @@ async def test_default_stack_binds_the_same_trusted_maintenance_hook(
     async def maintain_capacity() -> int:
         return 0
 
-    hook = SimpleNamespace(maintain_capacity=maintain_capacity)
+    hook = BoundMaintenanceHook(maintain_capacity)
+    monkeypatch.setattr(hook, 'maintain_capacity', maintain_capacity)
     monkeypatch.setattr(defaults, 'build_python_project_terminal_hook', lambda *args: hook)
     monkeypatch.setattr(RuntimeCapabilityGateway, 'original_project_preparer',
                         lambda self, gateway: preparer)
     stack = defaults.build_runtime_capability_stack(tenant_id=context.tenant_id,
         run_repository=repository, skill_store_dir=tmp_path/'skills', workspace_root=None)
     assert stack.project_cache_cleanup_hook is hook
+    assert isinstance(stack.project_input_preparer, OriginalProjectPreparer)
     assert stack.project_input_preparer is preparer
     assert preparer.capacity_maintenance is maintain_capacity
 

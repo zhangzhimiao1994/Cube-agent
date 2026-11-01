@@ -5,7 +5,7 @@ import json
 from types import ModuleType
 
 import pytest
-from jsonschema import Draft202012Validator  # type: ignore[import-untyped]
+from jsonschema import Draft202012Validator
 
 from agent_hub.capabilities.tools.project_zip import project_zip_input_schema
 from agent_hub.capabilities.tools.workspace_read import (

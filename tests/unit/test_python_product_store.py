@@ -4,14 +4,22 @@ from __future__ import annotations
 import hashlib
 import io
 from pathlib import Path
+from typing import TypedDict, Unpack
 from uuid import UUID
 
 import pytest
 
-from agent_hub.files.generated import WHEEL_MIME_TYPE, GeneratedFileStore
+from agent_hub.files.generated import WHEEL_MIME_TYPE, GeneratedFileMetadata, GeneratedFileStore
 
 
-def store(store: GeneratedFileStore, data: bytes = b"wheel", **kw: object):
+class ProductMeasurements(TypedDict, total=False):
+    sha: str
+    size: int
+
+
+def store(
+    store: GeneratedFileStore, data: bytes = b"wheel", **kw: Unpack[ProductMeasurements]
+) -> GeneratedFileMetadata:
     return store.store_stream(UUID(int=1), UUID(int=2), UUID(int=3),
         "demo-1.0-py3-none-any.whl", WHEEL_MIME_TYPE, io.BytesIO(data),
         expected_sha256=kw.get("sha", hashlib.sha256(data).hexdigest()),
@@ -30,7 +38,9 @@ def test_exact_product_bytes_and_original_wheel_name(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize("kw", [{"sha": "0" * 64}, {"size": 4}, {"size": 6},
     {"size": True}, {"sha": "oops"}])
-def test_incomplete_or_corrupt_product_never_published(tmp_path: Path, kw: dict) -> None:
+def test_incomplete_or_corrupt_product_never_published(
+    tmp_path: Path, kw: ProductMeasurements
+) -> None:
     with pytest.raises(ValueError):
         store(GeneratedFileStore(tmp_path), **kw)
     assert not [p for p in tmp_path.rglob("*") if p.is_file()]

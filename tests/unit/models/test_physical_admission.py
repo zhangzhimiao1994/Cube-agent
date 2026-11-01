@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from typing import Literal, TypedDict, Unpack
 from uuid import UUID
 
 import httpx
@@ -18,6 +19,7 @@ from agent_hub.models.physical_admission import (
     _PhysicalReceipt,
 )
 from agent_hub.models.types import Deployment, TokenUsage
+from tests.unit.models.review_admission_contract_typed_fixture import present
 
 
 class Admission:
@@ -72,12 +74,22 @@ class RemainingAdmission(Admission):
         return permit
 
 
-def admission_scope(admission: Admission | None = None, **kwargs: object) -> _PhysicalAdmissionScope:
+class ScopeOptions(TypedDict, total=False):
+    request_sha256: str
+    purpose: Literal["primary", "review"]
+    deadline: float
+    max_attempts: int
+
+
+def admission_scope(admission: Admission | None = None, **kwargs: Unpack[ScopeOptions]) -> _PhysicalAdmissionScope:
+    arguments: ScopeOptions = {
+        "request_sha256": "a" * 64, "purpose": "review",
+        "deadline": asyncio.get_running_loop().time() + 10, **kwargs,
+    }
     return _PhysicalAdmissionScope(
-        admission or Admission(), **{
-            "request_sha256": "a" * 64, "purpose": "review",
-            "deadline": asyncio.get_running_loop().time() + 10, **kwargs,
-        },
+        admission or Admission(),
+        request_sha256=arguments["request_sha256"], purpose=arguments["purpose"],
+        deadline=arguments["deadline"], max_attempts=arguments.get("max_attempts", 1),
     )
 
 
@@ -232,7 +244,7 @@ async def test_direct_receipt_failure_clears_exception_context_and_retains_permi
         await call.finish("completed")
     assert caught.value.__context__ is None and caught.value.__cause__ is None
     assert scope.attempts[0].permit.attempt_id.int == 1
-    assert scope.attempts[0].receipt.usage == TokenUsage(2, 3, 5)
+    assert present(scope.attempts[0].receipt).usage == TokenUsage(2, 3, 5)
     assert not scope.attempts[0].delivered
 
 
@@ -253,7 +265,7 @@ async def test_monotonic_usage_and_duplicates_remain_known_across_empty_observat
 @pytest.mark.parametrize("outcome", ["completed", "error", "unknown"])
 @pytest.mark.parametrize("purpose", ["primary", "review"])
 async def test_delivered_unknown_reserves_new_primary_attempt_without_poisoning_pool(
-    outcome: str, purpose: str,
+    outcome: Literal["completed", "error", "unknown"], purpose: Literal["primary", "review"],
 ) -> None:
     admission = RemainingAdmission()
     scope = admission_scope(admission, purpose=purpose, max_attempts=3 if purpose == "primary" else 1)
@@ -267,7 +279,7 @@ async def test_delivered_unknown_reserves_new_primary_attempt_without_poisoning_
     await _GuardedTransport(httpx.MockTransport(handle), call).handle_async_request(
         httpx.Request("POST", "https://mock.example"))
     await call.finish(outcome)
-    old_receipt = scope.attempts[0].receipt
+    old_receipt = present(scope.attempts[0].receipt)
     second = _GuardedTransport(httpx.MockTransport(handle), physical_call(scope))
     if purpose == "review":
         with pytest.raises(_PhysicalAdmissionStopped):
@@ -298,9 +310,11 @@ async def test_resume_keeps_original_scope_counter_deadline_and_restores_binding
     with _bind_physical_admission(owner):
         with resume(scope):
             captured = physical._capture_physical_call(deployment=deployment, protocol="chat_completions", stream=False)
+            assert captured is not None
             assert captured.scope is scope
         scope.check()
         captured = physical._capture_physical_call(deployment=deployment, protocol="chat_completions", stream=False)
+        assert captured is not None
         assert captured.scope is owner
         assert scope.attempts == attempts and scope.deadline == deadline
     with resume(scope):
@@ -323,6 +337,7 @@ async def test_resume_cleanup_can_record_revoked_scope_but_cannot_send() -> None
     with resume(scope, check=False):
         captured = physical._capture_physical_call(deployment=Deployment(id="primary", logical_model="primary"),
                                                   protocol="chat_completions", stream=False)
+        assert captured is not None
         assert captured.scope is scope
         await call.finish("unknown")
         with pytest.raises(_PhysicalAdmissionStopped):

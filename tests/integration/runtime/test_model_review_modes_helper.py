@@ -13,27 +13,38 @@ import asyncio
 import hashlib
 import json
 import re
+from collections.abc import AsyncGenerator, Mapping, Sequence
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
-from types import SimpleNamespace
-from uuid import uuid4
+from typing import Protocol
+from uuid import UUID, uuid4
 
 import httpx
+from redis.asyncio import Redis
 
 from agent_hub.api.routers.runs import CreateRunRequest
 from agent_hub.auth.models import AuthenticatedPrincipal, Role
 from agent_hub.capabilities.defaults import build_runtime_capability_stack
 from agent_hub.capabilities.review_contracts import ApprovalReviewConfig
+from agent_hub.config.repository import ConfigRevision, ConfigStatus
 from agent_hub.config.schema import PlatformConfig
-from agent_hub.db.models import RunRow
+from agent_hub.config.service import ConfigService
+from agent_hub.db.models import RunAdmissionAttemptRow, RunRow
 from agent_hub.domain.runs import TaskMode
 from agent_hub.models.capacity import CapacityPool
 from agent_hub.models.litellm_client import LiteLLMClient
 from agent_hub.models.physical_admission import _call as physical_call
-from agent_hub.models.physical_budget import _run_budget
-from agent_hub.runs.authorization import _capture_authenticated_input, _persist_authenticated_input
-from agent_hub.runs.repository import RunRepository, _database_uuid
+from agent_hub.models.physical_budget import _BudgetAdmission, _run_budget, _RunBudgetContext
+from agent_hub.models.run_admission_repository import _ExecutionArguments
+from agent_hub.models.types import Deployment
+from agent_hub.runs.authorization import (
+    _AuthenticatedInput,
+    _capture_authenticated_input,
+    _persist_authenticated_input,
+)
+from agent_hub.runs.repository import RunRecord, RunRepository, _database_uuid
 from agent_hub.runs.workspace import workspace_selection
 from agent_hub.runtime.artifacts import InMemoryArtifactRepository
 from agent_hub.runtime.contracts import TaskContext
@@ -52,9 +63,28 @@ from agent_hub.runtime.review_assembly import (
     catalog_fingerprint,
     runtime_source_fingerprint,
 )
+from agent_hub.security.secrets import SecretService
+from tests.integration.models.run_admission_typed_fixture import Storage
 from tests.integration.models.test_run_admission import prepare
+from tests.integration.runtime.review_mode_import_closure_typed_fixture import (
+    LeaseBinding,
+    NativeCase,
+    NativeRuntime,
+    PoolCharge,
+    RuntimeArguments,
+    WireAttempt,
+    WireReceipt,
+)
+from tests.unit.harness.review_typed_fixture import present
+from tests.unit.runs.project_auto_repair_typed_fixture import (
+    integer,
+    json_map,
+    mapping,
+    sequence,
+    string,
+)
 
-FACTORIES = {
+FACTORIES: dict[TaskMode, type[NativeRuntime]] = {
     TaskMode.DIRECT: ConfigBackedDirectRuntime,
     TaskMode.DISPATCH: ConfigBackedDispatchRuntime,
     TaskMode.DISCUSS: ConfigBackedDiscussionRuntime,
@@ -63,7 +93,9 @@ FACTORIES = {
 FINAL_TEXT = "The bounded observations support the final answer."
 
 
-def submission_request(mode=TaskMode.DIRECT, *, pending=False):
+def submission_request(
+    mode: TaskMode = TaskMode.DIRECT, *, pending: bool = False
+) -> CreateRunRequest:
     """Validate the real public schema, keeping all actor-selected route fields."""
     return CreateRunRequest(
         message=(
@@ -88,7 +120,7 @@ def submission_request(mode=TaskMode.DIRECT, *, pending=False):
     )
 
 
-def submitted_input_scope(body):
+def submitted_input_scope(body: CreateRunRequest) -> dict[str, object]:
     """Mirror the authenticated create boundary's scope; selection is not a grant."""
     return {
         "schema_version": 1,
@@ -105,18 +137,25 @@ def submitted_input_scope(body):
     }
 
 
-def capture_submission_input(row, body):
+def capture_submission_input(row: RunRow, body: CreateRunRequest) -> _AuthenticatedInput:
     """Capture the fixture's original input at its persisted-principal boundary."""
     return _capture_authenticated_input(
         AuthenticatedPrincipal(
-            _database_uuid(row.actor_id), _database_uuid(row.tenant_id), Role(row.actor_role)
+            _database_uuid(present(row.actor_id)),
+            _database_uuid(row.tenant_id),
+            Role(present(row.actor_role)),
         ),
         body.message,
         submitted_input_scope(body),
     )
 
 
-def build_task_context(record, binding, body, route):
+def build_task_context(
+    record: RunRecord,
+    binding: LeaseBinding | _ExecutionArguments,
+    body: CreateRunRequest,
+    route: Mapping[str, object],
+) -> TaskContext:
     return TaskContext(
         run_id=record.id,
         tenant_id=record.tenant_id,
@@ -125,39 +164,47 @@ def build_task_context(record, binding, body, route):
         execution_token=binding["lease"].token,
         mode=body.mode,
         request=body.message,
-        routing_decision=route,
+        routing_decision=json_map(route),
         timeout_seconds=150,
         token_budget=1000000,
     )
 
 
-def schema_value(schema, root=None):
+def schema_value(schema: Mapping[str, object], root: Mapping[str, object] | None = None) -> object:
     """Generate an exact fixture for the actual request's output schema."""
     root = schema if root is None else root
     if "$ref" in schema:
         target = root
-        for part in schema["$ref"].removeprefix("#/").split("/"):
-            target = target[part]
+        for part in string(schema["$ref"]).removeprefix("#/").split("/"):
+            target = mapping(target[part])
         return schema_value(target, root)
     if "const" in schema:
         return schema["const"]
     if "enum" in schema:
         for preferred in ("done", "approve", "low"):
-            if preferred in schema["enum"]:
+            if preferred in sequence(schema["enum"]):
                 return preferred
-        return schema["enum"][0]
+        return sequence(schema["enum"])[0]
     for union in ("anyOf", "oneOf"):
         if union in schema:
-            return schema_value(next(s for s in schema[union] if s.get("type") != "null"), root)
+            return schema_value(
+                next(
+                    mapping(item)
+                    for item in sequence(schema[union])
+                    if mapping(item).get("type") != "null"
+                ),
+                root,
+            )
     kind = schema.get("type")
     if kind == "object" or "properties" in schema:
         return {
-            key: schema_value(schema["properties"][key], root) for key in schema.get("required", ())
+            key: schema_value(mapping(mapping(schema["properties"])[string(key)]), root)
+            for key in sequence(schema.get("required", ()))
         }
     if kind == "array":
         return [
-            schema_value(schema.get("items", {"type": "string"}), root)
-            for _ in range(schema.get("minItems", 0))
+            schema_value(mapping(schema.get("items", {"type": "string"})), root)
+            for _ in range(integer(schema.get("minItems", 0)))
         ]
     if kind == "boolean":
         return True
@@ -168,25 +215,29 @@ def schema_value(schema, root=None):
     return FINAL_TEXT
 
 
+class BodyOwner(Protocol):
+    bodies: list[ClosedBody]
+
+
 class ClosedBody(httpx.AsyncByteStream):
-    def __init__(self, content, owner):
+    def __init__(self, content: bytes, owner: BodyOwner) -> None:
         self.content, self.owner, self.closed = content, owner, False
         owner.bodies.append(self)
 
-    async def __aiter__(self):
+    async def __aiter__(self) -> AsyncGenerator[bytes, None]:
         yield self.content
 
-    async def aclose(self):
+    async def aclose(self) -> None:
         self.closed = True
 
 
 @dataclass
 class FixedWire:
-    calls: list = field(default_factory=list)
-    bodies: list = field(default_factory=list)
-    budgets: list = field(default_factory=list)
-    classes: set = field(default_factory=set)
-    attempts: dict = field(default_factory=dict)
+    calls: list[Mapping[str, object]] = field(default_factory=list)
+    bodies: list[ClosedBody] = field(default_factory=list)
+    budgets: list[_RunBudgetContext] = field(default_factory=list)
+    classes: set[str] = field(default_factory=set)
+    attempts: dict[UUID, WireAttempt] = field(default_factory=dict)
     selector_calls: int = 0
     participant_calls: int = 0
     reviewer_calls: int = 0
@@ -195,8 +246,10 @@ class FixedWire:
     entered: asyncio.Event = field(default_factory=asyncio.Event)
     release: asyncio.Event = field(default_factory=asyncio.Event)
 
-    def native_objects(self):
-        pending, seen, objects = [self.runtime], set(), []
+    def native_objects(self) -> list[object]:
+        pending: list[object] = [self.runtime]
+        seen: set[int] = set()
+        objects: list[object] = []
         while pending:
             item = pending.pop()
             if item is None or id(item) in seen:
@@ -211,13 +264,13 @@ class FixedWire:
                 pending.append(getattr(item, name, None))
         return objects
 
-    def text_for(self, payload):
-        messages = payload["messages"]
+    def text_for(self, payload: Mapping[str, object]) -> str:
+        messages = [mapping(item) for item in sequence(payload["messages"])]
         text = "\n".join(str(message.get("content", "")) for message in messages)
-        response_format = payload.get("response_format", {})
-        structured = response_format.get("json_schema", {})
+        response_format = mapping(payload.get("response_format", {}))
+        structured = mapping(response_format.get("json_schema", {}))
         schema = structured.get("schema")
-        if schema and set(schema.get("properties", {})) == {
+        if schema and set(mapping(mapping(schema).get("properties", {}))) == {
             "schema_version",
             "decision",
             "risk",
@@ -225,7 +278,7 @@ class FixedWire:
             "rationale",
             "action_digest",
         }:
-            material = json.loads(messages[-1]["content"])
+            material = mapping(json.loads(string(messages[-1]["content"])))
             self.reviewer_calls += 1
             assert not payload.get("tools")
             return json.dumps(
@@ -241,20 +294,20 @@ class FixedWire:
         # AutoGen's actual SelectorGroupChat formats its available participant list.
         candidates = re.findall(r"(?:from|among)\s+(\[[^\]\n]+\])", text, re.IGNORECASE)
         if candidates and ("select" in text.lower() or "role play" in text.lower()):
-            names = ast.literal_eval(candidates[-1])
+            names = sequence(ast.literal_eval(candidates[-1]))
             assert names and all(isinstance(name, str) for name in names)
             selected = names[self.selector_calls % len(names)]
             self.selector_calls += 1
-            return selected
+            return string(selected)
         if schema:
-            return json.dumps(schema_value(schema))
+            return json.dumps(schema_value(mapping(schema)))
         self.participant_calls += 1
         return ("[COMPLETE] " if self.participant_calls > 1 else "") + FINAL_TEXT
 
-    async def __call__(self, request):
-        payload = json.loads(request.content)
+    async def __call__(self, request: httpx.Request) -> httpx.Response:
+        payload = mapping(json.loads(request.content))
         self.calls.append(payload)
-        self.budgets.append(_run_budget.get())
+        self.budgets.append(present(_run_budget.get()))
         assert self.budgets[-1] is not None, "native primary escaped original pool"
         self.native_objects()
         call = physical_call.get()
@@ -262,14 +315,15 @@ class FixedWire:
         attempt = call.attempts[-1]
         meta = attempt.metadata
         assert payload["model"] == meta.provider_model.rsplit("/", 1)[-1]
+        admission = call.scope._admission
+        physical_identity: str | None = None
+        if meta.purpose == "primary":
+            assert isinstance(admission, _BudgetAdmission)
+            physical_identity = str(admission._attempts[attempt.permit.attempt_id].physical_id)
         self.attempts[attempt.permit.attempt_id] = {
             "request_sha256": meta.request_sha256,
             "purpose": meta.purpose,
-            "physical_transport_id": (
-                str(call.scope._admission._attempts[attempt.permit.attempt_id].physical_id)
-                if meta.purpose == "primary"
-                else None
-            ),
+            "physical_transport_id": physical_identity,
             "deployment": {
                 "provider_id": meta.provider_model.split("/", 1)[0],
                 "deployment_id": meta.deployment_id,
@@ -337,7 +391,7 @@ class FixedWire:
         )
 
 
-def fixture_platform():
+def fixture_platform() -> PlatformConfig:
     definition = {
         "provider": "openai",
         "model": "fixture-primary",
@@ -378,19 +432,27 @@ def fixture_platform():
     )
 
 
-class FixtureSecrets:
-    async def fingerprint(self, tenant_id, reference):
+class FixtureSecrets(SecretService):
+    def __init__(self) -> None:
+        pass
+
+    async def fingerprint(self, tenant_id: UUID, reference: object) -> str:
         value = await self.resolve(tenant_id, reference)
         return hashlib.sha256(f"{tenant_id}:{value}".encode()).hexdigest()
 
-    async def resolve(self, tenant_id, reference):
+    async def resolve(self, tenant_id: UUID, reference: object) -> str:
+        assert isinstance(reference, str)
         return {
             "fixture-primary-secret": "synthetic-primary-credential",
             "fixture-reviewer-secret": "synthetic-reviewer-credential",
         }[reference]
 
 
-def assert_wire_receipts(attempts, wire_attempts, pool):
+def assert_wire_receipts(
+    attempts: Sequence[RunAdmissionAttemptRow],
+    wire_attempts: Mapping[UUID, WireAttempt],
+    pool: PoolCharge,
+) -> None:
     """Compare each durable receipt to its actual guarded transport admission."""
     assert {row.attempt_id for row in attempts} == set(wire_attempts)
     total = 0
@@ -401,7 +463,7 @@ def assert_wire_receipts(attempts, wire_attempts, pool):
         assert row.deployment == sent["deployment"]
         assert row.state == "completed" and row.physical_transport_id is not None
         assert str(row.physical_transport_id) == sent["physical_transport_id"]
-        expected = {
+        expected: WireReceipt = {
             "outcome": "completed",
             "deployment": sent["deployment"],
             "attempt_id": str(row.attempt_id),
@@ -418,7 +480,15 @@ def assert_wire_receipts(attempts, wire_attempts, pool):
     assert total == pool.token_charged == len(wire_attempts) * 5
 
 
-async def build_case(storage, tmp_path, mode, redis_client, *, pending=False, body=None):
+async def build_case(
+    storage: Storage,
+    tmp_path: Path,
+    mode: TaskMode,
+    redis_client: Redis,
+    *,
+    pending: bool = False,
+    body: CreateRunRequest | None = None,
+) -> NativeCase:
     """Seed authenticated PG facts; use the real worker's original driver lease."""
     factory = storage[0]
     _, binding, _ = await prepare(storage, open_now=False)
@@ -432,16 +502,27 @@ async def build_case(storage, tmp_path, mode, redis_client, *, pending=False, bo
     )
     platform = fixture_platform()
 
-    class Configs:
-        async def get_current(self, tenant_id):
-            assert tenant_id == binding["tenant_id"]
-            return SimpleNamespace(version=1, document=platform.model_dump(mode="json"))
+    class Configs(ConfigService):
+        def __init__(self) -> None:
+            pass
 
-    capacities = []
+        async def get_current(self, tenant_id: UUID) -> ConfigRevision:
+            assert tenant_id == binding["tenant_id"]
+            return ConfigRevision(
+                uuid4(),
+                tenant_id,
+                1,
+                ConfigStatus.PUBLISHED,
+                platform.model_dump(mode="json"),
+                None,
+                datetime.now(UTC),
+            )
+
+    capacities: list[CapacityPool] = []
     namespace = "task7a:" + uuid4().hex + ":"
 
-    async def capacity(tenant_id, deployments):
-        async def fingerprint(reference):
+    async def capacity(tenant_id: UUID, deployments: Sequence[Deployment]) -> CapacityPool:
+        async def fingerprint(reference: str) -> str:
             return await FixtureSecrets().fingerprint(tenant_id, reference)
 
         controller = CapacityPool(
@@ -453,7 +534,7 @@ async def build_case(storage, tmp_path, mode, redis_client, *, pending=False, bo
         capacities.append(controller)
         return controller
 
-    async def current_config(tenant_id):
+    async def current_config(tenant_id: UUID) -> ApprovalReviewConfig:
         return config
 
     wire = FixedWire()
@@ -507,7 +588,7 @@ async def build_case(storage, tmp_path, mode, redis_client, *, pending=False, bo
     }
     message = body.message
     async with factory() as session, session.begin():
-        row = await session.get(RunRow, binding["run_id"])
+        row = present(await session.get(RunRow, binding["run_id"]))
         row.request, row.mode, row.routing_decision = message, mode.value, route
         evidence = capture_submission_input(row, body)
         await _persist_authenticated_input(session, row, evidence)
@@ -525,36 +606,37 @@ async def build_case(storage, tmp_path, mode, redis_client, *, pending=False, bo
         project_workspace_dir=tmp_path,
         artifact_repository=artifacts,
     )
-    runtime = FACTORIES[mode](
-        config_service=Configs(),
-        secret_service=FixtureSecrets(),
-        capacity_factory=capacity,
-        transport=transport,
-        capability_gateway=stack.runtime_gateway,
-        harness_tool_gateway=stack.harness_tool_gateway,
-        artifact_repository=artifacts,
-        **(
-            {
-                "action_capability_gateway": stack.runtime_gateway,
-                "action_harness_tool_gateway": stack.harness_tool_gateway,
-            }
-            if mode is TaskMode.DIRECT
-            else {}
-        ),
-    )
+    runtime_arguments: RuntimeArguments = {
+        "config_service": Configs(),
+        "secret_service": FixtureSecrets(),
+        "capacity_factory": capacity,
+        "transport": transport,
+        "capability_gateway": stack.runtime_gateway,
+        "harness_tool_gateway": stack.harness_tool_gateway,
+        "artifact_repository": artifacts,
+    }
+    runtime: NativeRuntime
+    if mode is TaskMode.DIRECT:
+        runtime = ConfigBackedDirectRuntime(
+            **runtime_arguments,
+            action_capability_gateway=stack.runtime_gateway,
+            action_harness_tool_gateway=stack.harness_tool_gateway,
+        )
+    else:
+        runtime = FACTORIES[mode](**runtime_arguments)
     wire.runtime = runtime
-    return SimpleNamespace(
-        factory=factory,
-        repository=repository,
-        broker=broker,
-        context=context,
-        binding=binding,
-        wire=wire,
-        runtime=runtime,
-        stack=stack,
-        capacities=capacities,
-        root=Path(tmp_path),
-        config=config,
-        redis=redis_client,
-        body=body,
+    return NativeCase(
+        factory,
+        repository,
+        broker,
+        context,
+        binding,
+        wire,
+        runtime,
+        stack,
+        capacities,
+        Path(tmp_path),
+        config,
+        redis_client,
+        body,
     )

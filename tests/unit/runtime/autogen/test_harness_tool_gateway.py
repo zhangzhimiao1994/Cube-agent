@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping
 from decimal import Decimal
-from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
@@ -24,8 +23,10 @@ from agent_hub.runtime.autogen.adapter import (
     _DiscussionDurability,
     _effective_tool_sandbox_profile,
     _tool_sandbox,
+    _ToolRecord,
 )
-from agent_hub.runtime.contracts import Artifact, EventKind, JsonValue, TaskContext
+from agent_hub.runtime.contracts import Artifact, EventKind, JsonValue, RunEvent, TaskContext
+from tests.unit.runtime.diagnostic_action_artifact_typed_fixture import mapping, number, present
 
 
 def test_workspace_tools_use_authorized_run_sandbox_in_autogen() -> None:
@@ -92,7 +93,7 @@ async def test_workspace_tool_routes_workspace_write_approval_envelope() -> None
 
     run_id = uuid4()
     harness = HarnessGateway()
-    records: list[Any] = []
+    records: list[_ToolRecord] = []
     tool = GatewayCapabilityTool(
         ReplayGateway(),
         tenant_id=uuid4(),
@@ -347,7 +348,7 @@ async def test_gateway_capability_tool_routes_through_harness_with_actor_identit
         finalize,
         run_id=ctx.run_id,
     )
-    records: list[Any] = []
+    records: list[_ToolRecord] = []
     tool = GatewayCapabilityTool(
         ReplayGateway(),
         tenant_id=ctx.tenant_id,
@@ -364,7 +365,7 @@ async def test_gateway_capability_tool_routes_through_harness_with_actor_identit
     result = await tool.run_json({"query": "evidence"}, CancellationToken(), call_id="call_1")
 
     assert result.result == {"items": ["source-a"]}
-    assert durability.artifacts[-1].content["result"]["items"] == ("source-a",)
+    assert mapping(durability.artifacts[-1].content["result"])["items"] == ("source-a",)
     assert len(harness_gateway.calls) == 1
     tenant_id, request, user_id, role = harness_gateway.calls[0]
     assert tenant_id == ctx.tenant_id
@@ -388,13 +389,13 @@ async def test_gateway_capability_tool_routes_through_harness_with_actor_identit
     assert started.payload["sandbox"] == "restricted"
     assert started.payload["argument_keys"] == ("query",)
     assert started.payload["argument_key_count"] == 1
-    assert started.payload["argument_bytes"] > 0
+    assert number(started.payload["argument_bytes"]) > 0
     assert "evidence" not in json.dumps(dict(started.payload))
     completed = records[1]
     assert completed.payload["schema_version"] == 1
     assert completed.payload["status"] == "succeeded"
-    assert completed.payload["result_bytes"] > 0
-    assert completed.payload["artifact_id"] == str(completed.artifact.id)
+    assert number(completed.payload["result_bytes"]) > 0
+    assert completed.payload["artifact_id"] == str(present(completed.artifact).id)
     assert "source-a" not in json.dumps(dict(completed.payload))
 
 
@@ -544,7 +545,7 @@ async def test_gateway_capability_tool_preserves_deterministic_harness_failure()
     def finalize(write_id: UUID) -> None:
         del write_id
 
-    records: list[Any] = []
+    records: list[_ToolRecord] = []
     run_id = uuid4()
     tool = GatewayCapabilityTool(
         ReplayGateway(),
@@ -660,7 +661,7 @@ async def test_gateway_capability_tool_reuses_existing_final_project_zip_after_f
         del write_id
 
     run_id = uuid4()
-    records: list[Any] = []
+    records: list[_ToolRecord] = []
     harness = FlakyZipHarnessGateway()
     tool = GatewayCapabilityTool(
         ReplayGateway(),
@@ -804,7 +805,7 @@ async def test_autogen_runtime_yields_tool_failure_before_runtime_failure() -> N
         actor_role=Role.OPERATOR,
     )
 
-    events: list[Any] = [event async for event in runtime.run(ctx)]
+    events: list[RunEvent] = [event async for event in runtime.run(ctx)]
 
     kinds = [event.kind for event in events]
     assert EventKind.TOOL_STARTED in kinds
@@ -939,7 +940,7 @@ async def test_autogen_runtime_uses_manifest_sandbox_for_plugin_tool_facade() ->
         routing_decision={"sandbox_profile": "restricted"},
     )
 
-    events: list[Any] = [event async for event in runtime.run(ctx)]
+    events: list[RunEvent] = [event async for event in runtime.run(ctx)]
 
     assert harness.calls
     assert harness.calls[0].sandbox == "remote_connector"

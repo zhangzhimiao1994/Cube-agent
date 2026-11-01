@@ -6,7 +6,7 @@ from typing import Any, cast
 from uuid import UUID
 
 import pytest
-from jsonschema import Draft202012Validator  # type: ignore[import-untyped]
+from jsonschema import Draft202012Validator
 
 from agent_hub.capabilities.runtime import RuntimeCapabilityGateway
 from agent_hub.runtime.autogen.adapter import GatewayCapabilityTool

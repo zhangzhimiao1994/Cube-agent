@@ -10,6 +10,10 @@ from uuid import UUID
 import pytest
 
 from agent_hub.domain.runs import RunStatus
+from tests.unit.capabilities.capability_lifecycle_typed_fixture import (
+    UnusedContextReader,
+    UnusedReleaser,
+)
 from tests.unit.skills.sandbox.test_python_project_client import invocation, reference
 
 
@@ -88,7 +92,7 @@ async def invoke(session: Session, *, refs: Any = None, callback_status: Any = N
         async def run_transaction(self) -> Any:
             return session
 
-    class Verifier:
+    class Verifier(UnusedContextReader):
         async def python_original_context(self, tenant: Any, run: Any) -> Any:
             assert session.open
             calls.append("context")
@@ -97,7 +101,7 @@ async def invoke(session: Session, *, refs: Any = None, callback_status: Any = N
                 environment_references=(reference(),) if refs is None else refs,
             )
 
-    class Executor:
+    class Executor(UnusedReleaser):
         async def release_completed(self, inv: Any, *, expected_environment: Any) -> Any:
             assert session.open
             assert inv.execution_id != invocation().execution_id
@@ -378,7 +382,7 @@ async def test_hook_uses_restarted_real_service_durable_refs_without_reexecution
         async def run_transaction(self) -> Any:
             return session
 
-    class Releaser:
+    class Releaser(UnusedReleaser):
         async def release_completed(self, item: Any, *, expected_environment: Any) -> Any:
             assert item.install_allowed is False
             assert item.execution_id not in {entry.execution_id for entry in native.calls}
@@ -434,11 +438,11 @@ async def test_retry_scan_reenters_db_gate_after_failure_and_marks_only_typed_su
         async def run_transaction(self) -> Any:
             return session
 
-    class Reader:
+    class Reader(UnusedContextReader):
         async def python_original_context(self, *args: Any) -> Any:
             return SimpleNamespace(invocation=invocation(), environment_references=(reference(),))
 
-    class Releaser:
+    class Releaser(UnusedReleaser):
         async def release_completed(self, inv: Any, *, expected_environment: Any) -> Any:
             attempts.append(inv.execution_id)
             if len(attempts) == 1:

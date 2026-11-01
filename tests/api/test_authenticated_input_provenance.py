@@ -1,16 +1,25 @@
 import json
-from types import SimpleNamespace
+from typing import Never
 from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import pytest
+from starlette.requests import Request
 
 from agent_hub.api.routers import runs
 from agent_hub.auth.models import AuthenticatedPrincipal, Role
+from agent_hub.runs.authorization import _AuthenticatedInput
+from tests.unit.runs.conversation_authenticated_input_typed_fixture import (
+    RouterCaptureService,
+    spy_method,
+)
+from tests.unit.runs.conversation_authenticated_input_typed_fixture import (
+    evidence as actual_evidence,
+)
 
 
 @pytest.mark.parametrize('queued', [False, True])
-async def test_api_captures_real_principal_and_validated_selection(monkeypatch, queued):
+async def test_api_captures_real_principal_and_validated_selection(monkeypatch: pytest.MonkeyPatch, queued: bool) -> None:
     user = AuthenticatedPrincipal(uuid4(), uuid4(), Role.OPERATOR)
     body = runs.CreateRunRequest.model_validate({
         'message': '  exact original 文本  ', 'mode': 'direct',
@@ -18,24 +27,24 @@ async def test_api_captures_real_principal_and_validated_selection(monkeypatch, 
         'permission_mode': 'read_only', 'direct_model': 'model-a',
         'authenticated_input': {'actor_role': 'super_admin'}, 'origin': 'human',
     })
-    received = []
+    received: list[_AuthenticatedInput] = []
     class Stop(Exception):
         pass
-    async def capture(**kwargs):
+    async def capture(**kwargs: object) -> Never:
         evidence = kwargs.get('authenticated_input')
         assert evidence is not None, 'authenticated API must mint private evidence'
-        received.append(evidence)
+        received.append(actual_evidence(evidence))
         raise Stop
-    service = SimpleNamespace(submit=capture, queue_message=capture)
+    service = RouterCaptureService(capture)
     monkeypatch.setattr(runs, '_stop_conversation_preview', AsyncMock())
     monkeypatch.setattr(runs, '_resolve_permission_selection', AsyncMock(return_value=body))
     monkeypatch.setattr(runs, '_default_execution_backend', AsyncMock(return_value='systemd'))
     with pytest.raises(Stop):
         if queued:
-            await runs.queue_conversation_message('conv-proof', body, SimpleNamespace(),
+            await runs.queue_conversation_message('conv-proof', body, Request({'type': 'http', 'headers': [], 'app': None}),
                                                   service, user, 'proof')
         else:
-            await runs.create_run(body, SimpleNamespace(), service, user, 'proof')
+            await runs.create_run(body, Request({'type': 'http', 'headers': [], 'app': None}), service, user, 'proof')
     evidence = received[0]
     assert (evidence.tenant_id, evidence.actor_id, evidence.actor_role) == (
         user.tenant_id, user.user_id, user.role)
@@ -50,21 +59,20 @@ async def test_api_captures_real_principal_and_validated_selection(monkeypatch, 
     assert 'authenticated_input' not in runs.SubmittedRunResponse.model_fields
 
 
-async def test_edit_mints_new_input_bound_to_actual_principal():
+async def test_edit_mints_new_input_bound_to_actual_principal() -> None:
     user = AuthenticatedPrincipal(uuid4(), uuid4(), Role.ADMIN)
     item_id = uuid4()
-    received = []
+    received: list[_AuthenticatedInput] = []
     class Stop(Exception):
         pass
-    async def edit(*args, **kwargs):
-        received.append(kwargs.get('authenticated_input'))
+    async def edit(*args: object, **kwargs: object) -> Never:
+        received.append(actual_evidence(kwargs.get('authenticated_input')))
         raise Stop
-    service = SimpleNamespace(edit_queued_message=edit,
-        queued_authenticated_input=AsyncMock(return_value=None))
+    service = RouterCaptureService(edit)
     with pytest.raises(Stop):
         await runs.edit_conversation_queue_item(item_id,
             runs.QueueItemEditRequest(version=3, message='  edited 文本  '),
-            SimpleNamespace(), service, user)
+            Request({'type': 'http', 'headers': [], 'app': None}), service, user)
     evidence = received[0]
     assert evidence is not None
     assert evidence.actor_id == user.user_id
@@ -74,16 +82,15 @@ async def test_edit_mints_new_input_bound_to_actual_principal():
 
 
 @pytest.mark.parametrize('queued', [False, True])
-def test_http_payload_cannot_supply_provenance_and_private_fields_are_not_returned(monkeypatch, queued):
+def test_http_payload_cannot_supply_provenance_and_private_fields_are_not_returned(monkeypatch: pytest.MonkeyPatch, queued: bool) -> None:
     from tests.api.test_runs_api import StubRunService, _client, bearer
     client, _service, user = _client()
-    received = []
+    received: list[_AuthenticatedInput] = []
     method = 'queue_message' if queued else 'submit'
-    original = getattr(StubRunService, method)
-    async def capture(self, *args, **kwargs):
-        received.append(kwargs.pop('authenticated_input'))
-        return await original(self, *args, **kwargs)
-    monkeypatch.setattr(StubRunService, method, capture)
+    if queued:
+        monkeypatch.setattr(StubRunService, method, spy_method(StubRunService.queue_message, received))
+    else:
+        monkeypatch.setattr(StubRunService, method, spy_method(StubRunService.submit, received))
     response = client.post('/api/v1/admin/conversations/conv-http/queue' if queued else '/api/v1/runs',
         headers={**bearer(), 'Idempotency-Key': 'private-http'}, json={
             'message': 'original private message', 'mode': 'direct',
@@ -98,7 +105,7 @@ def test_http_payload_cannot_supply_provenance_and_private_fields_are_not_return
         assert field not in response.json()
 
 
-async def test_edit_retains_only_the_genuine_persisted_submission_selection():
+async def test_edit_retains_only_the_genuine_persisted_submission_selection() -> None:
     from agent_hub.runs.authorization import _capture_authenticated_input
     user = AuthenticatedPrincipal(uuid4(), uuid4(), Role.OPERATOR)
     original = _capture_authenticated_input(user, 'original', {
@@ -106,17 +113,16 @@ async def test_edit_retains_only_the_genuine_persisted_submission_selection():
                       'requested_permissions': ['workspace.read'], 'mode': 'direct'},
         'resolved_selection': {'execution_backend': 'systemd'},
         'conversation_id': 'conv-proof'})
-    received = []
+    received: list[_AuthenticatedInput] = []
     class Stop(Exception):
         pass
-    async def edit(*args, **kwargs):
-        received.append(kwargs['authenticated_input'])
+    async def edit(*args: object, **kwargs: object) -> Never:
+        received.append(actual_evidence(kwargs['authenticated_input']))
         raise Stop
-    service = SimpleNamespace(edit_queued_message=edit,
-        queued_authenticated_input=AsyncMock(return_value=original))
+    service = RouterCaptureService(edit, original)
     with pytest.raises(Stop):
         await runs.edit_conversation_queue_item(uuid4(),
-            runs.QueueItemEditRequest(version=1, message='new'), SimpleNamespace(), service, user)
+            runs.QueueItemEditRequest(version=1, message='new'), Request({'type': 'http', 'headers': [], 'app': None}), service, user)
     scope = json.loads(received[0].input_scope)
     assert scope['selection']['project_id'] == 'project-a'
     assert scope['selection']['requested_permissions'] == ['workspace.read']

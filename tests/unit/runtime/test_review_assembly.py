@@ -1,60 +1,153 @@
 """Worker assembly proofs with real repository code and fixed HTTP only."""
 
+from __future__ import annotations
+
 import asyncio
 import hashlib
-import importlib
 import json
 import time
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextvars import ContextVar
-from dataclasses import replace
-from datetime import UTC, datetime, timedelta
-from types import SimpleNamespace
-from uuid import uuid4
+from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime, timedelta, tzinfo
+from pathlib import Path
+from types import MethodType, ModuleType
+from typing import TypedDict, Unpack
+from uuid import UUID, uuid4
 
 import httpx
 import pytest
+from sqlalchemy.engine.result import IteratorResult
+from sqlalchemy.sql import Select
 
 from agent_hub.auth.models import Role
 from agent_hub.capabilities.review_contracts import ApprovalReviewConfig
+from agent_hub.capabilities.review_repository import _CurrentReviewBinding
+from agent_hub.config.repository import ConfigRevision, ConfigStatus
 from agent_hub.config.schema import PlatformConfig
-from agent_hub.db.models import RunInputAuthorizationRow, RunRow
+from agent_hub.config.service import ConfigService
+from agent_hub.db.models import (
+    RunAdmissionPoolRow,
+    RunAuthenticatedInputRow,
+    RunInputAuthorizationRow,
+    RunRow,
+)
 from agent_hub.domain.runs import TaskMode
-from agent_hub.models.gateway import ModelGatewayError
+from agent_hub.models.capacity import CapacityPool
+from agent_hub.models.gateway import ModelGateway, ModelGatewayError
 from agent_hub.models.litellm_client import LiteLLMClient
 from agent_hub.models.physical_admission import _PhysicalAdmissionStopped
-from agent_hub.models.physical_budget import _run_budget
+from agent_hub.models.physical_budget import _run_budget, _RunBudgetContext
 from agent_hub.models.registry import NoCapableDeployment
 from agent_hub.models.run_admission_repository import AdmissionConflict, RunAdmissionRepository
+from agent_hub.models.types import Deployment
 from agent_hub.runs.repository import RunRepository
-from agent_hub.runtime.contracts import RunEvent
+from agent_hub.runtime import review_assembly
+from agent_hub.runtime.autogen.adapter import AutoGenDiscussionRuntime
+from agent_hub.runtime.contracts import ExecutionRuntime, JsonValue, RunEvent, TaskContext
+from agent_hub.runtime.hybrid import HybridRuntime
 from agent_hub.runtime.worker_execution import worker_runtime_events
+from agent_hub.security.secrets import SecretService
 from tests.unit.capabilities.test_concrete_model_review import FocusedDB
-from tests.unit.harness.test_review_dispatch import setup
-from tests.unit.models.test_gateway import CapacityStub, lease
-from tests.unit.models.test_physical_budget import logical_request, response
+from tests.unit.harness.review_typed_fixture import (
+    FixedCapacityPool,
+    StreamRuntimeStub,
+    UnusedConfigs,
+    UnusedGateway,
+    UnusedSecrets,
+    json_objects,
+    logical_request,
+    mutable,
+    present,
+    response,
+    result_rows,
+    unused_capacity,
+)
+from tests.unit.harness.test_review_dispatch import ExecuteCall, ReviewSetup, setup
 
 
-def assembly():
-    return importlib.import_module("agent_hub.runtime.review_assembly")
+def assembly() -> ModuleType:
+    return review_assembly
+
+
+class ConsumeKeywords(TypedDict):
+    tenant_id: UUID
+    run_id: UUID
+    review_id: UUID
+    current_binding: _CurrentReviewBinding
+
+
+async def await_cancel(callback: Callable[[], Awaitable[None]]) -> None:
+    await callback()
 
 
 class AssemblyDB(FocusedDB):
-    async def execute(self, statement):
-        if statement.column_descriptions[0].get("entity") is RunRow:
-            link = next(r for r in self.rows if type(r) is RunInputAuthorizationRow)
-            turn = next(
-                r
-                for r in self.rows
-                if getattr(r, "turn_id", None) == link.turn_id and hasattr(r, "message")
-            )
-            return SimpleNamespace(one_or_none=lambda: (self.run, link, turn))
-        return await super().execute(statement)
+    def execute_rows(self, statement: Select[tuple[object, ...]]) -> IteratorResult[tuple[object, ...]]:
+        if (statement.column_descriptions[0].get("entity") is RunRow
+                and len(statement.column_descriptions) == 3):
+            link = next(r for r in self.rows if isinstance(r, RunInputAuthorizationRow))
+            turn = next(r for r in self.rows if isinstance(r, RunAuthenticatedInputRow) and r.turn_id == link.turn_id)
+            return result_rows([(self.run, link, turn)])
+        return super().execute_rows(statement)
 
 
-async def fixture(tmp_path, *, mode=TaskMode.DIRECT, contracts=True, verified=True):
+@dataclass
+class AssemblyState:
+    config: ApprovalReviewConfig
+    platform: PlatformConfig
+    version: int = 7
+    calls: list[dict[str, object]] = field(default_factory=list)
+    review: bool = False
+
+
+class FixtureConfigs(ConfigService):
+    def __init__(self, state: AssemblyState, tenant: UUID) -> None:
+        self.state, self.tenant = state, tenant
+
+    async def get_current(self, tenant_id: UUID) -> ConfigRevision:
+        assert tenant_id == self.tenant
+        return ConfigRevision(uuid4(), tenant_id, self.state.version, ConfigStatus.PUBLISHED,
+            self.state.platform.model_dump(mode='json'), None, datetime.now(UTC))
+
+
+class FixtureSecrets(SecretService):
+    def __init__(self) -> None:
+        pass
+
+    async def resolve(self, tenant_id: UUID, reference: object) -> str:
+        return 'fixed-test-secret'
+
+    async def fingerprint(self, tenant_id: UUID, reference: object) -> str:
+        return 'fixed-test-fingerprint'
+
+
+@dataclass
+class AssemblyFixture:
+    s: ReviewSetup
+    db: AssemblyDB
+    broker: review_assembly.ReviewAssemblyBroker
+    state: AssemblyState
+    config_service: FixtureConfigs
+    secrets: FixtureSecrets
+    capacity: Callable[[UUID, Sequence[Deployment]], Awaitable[CapacityPool]]
+
+
+@dataclass
+class CancelState:
+    f: AssemblyFixture
+    actual: AutoGenDiscussionRuntime
+    started: asyncio.Event
+    release: asyncio.Event
+    completed: asyncio.Event
+    seen: list[tuple[asyncio.Task[object], _RunBudgetContext]]
+    key: tuple[UUID, UUID]
+
+
+async def fixture(tmp_path: Path, *, mode: TaskMode = TaskMode.DIRECT, contracts: bool = True, verified: bool = True) -> AssemblyFixture:
     s = setup(tmp_path)
-    a = assembly()
+    a = review_assembly
     db = AssemblyDB(s)
+    s.runs._session_factory = db
     # A first execution starts without a pool; the DAO, not the test, opens it.
     db.rows.remove(db.pool)
     db.run.created_at = datetime.now(UTC)
@@ -62,7 +155,7 @@ async def fixture(tmp_path, *, mode=TaskMode.DIRECT, contracts=True, verified=Tr
     s.runs.record = replace(s.runs.record, created_at=db.run.created_at, mode=mode)
     s.task = s.task.model_copy(update={"mode": mode, "token_budget": 123})
     actual_runs = RunRepository(db)
-    s.runs.load_authenticated_input = actual_runs.load_authenticated_input
+    pytest.MonkeyPatch().setattr(s.runs, "load_authenticated_input", actual_runs.load_authenticated_input)
     definition = {
         "provider": "openai",
         "model": "fixed",
@@ -83,41 +176,22 @@ async def fixture(tmp_path, *, mode=TaskMode.DIRECT, contracts=True, verified=Tr
             "agents": [],
         }
     )
-    state = SimpleNamespace(config=s.settings.config, platform=platform, version=7, calls=[])
+    state = AssemblyState(s.settings.config, platform)
 
-    class Configs:
-        async def get_current(self, tenant):
-            assert tenant == s.task.tenant_id
-            return SimpleNamespace(
-                version=state.version, document=state.platform.model_dump(mode="json")
-            )
-
-    class Secrets:
-        async def resolve(self, tenant, ref):
-            return "fixed-test-secret"
-
-        async def fingerprint(self, tenant, ref):
-            return "fixed-test-fingerprint"
-
-    async def config(tenant):
+    async def config(tenant: UUID) -> ApprovalReviewConfig:
         return state.config
 
-    async def capacity(tenant, deployments):
-        result = CapacityStub([])
+    async def capacity(tenant: UUID, deployments: Sequence[Deployment]) -> CapacityPool:
+        return FixedCapacityPool(deployments)
 
-        async def acquire(candidates, wait_timeout, *, estimated_tokens):
-            return lease(candidates[0].id, candidates[0].quota_scope_id)
-
-        result.acquire = acquire
-        return result
-
-    def handler(request):
-        payload = json.loads(request.content)
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = mutable(json.loads(request.content))
         state.calls.append(payload)
         assert _run_budget.get() is not None
         assert any(getattr(row, "original_token_grant", None) == 40000 for row in db.rows)
         if getattr(state, "review", False):
-            action = json.loads(payload["messages"][-1]["content"])
+            messages = json_objects(payload["messages"])
+            action = mutable(json.loads(str(messages[-1]["content"])))
             verdict = {
                 "schema_version": 1,
                 "decision": "allow",
@@ -130,11 +204,11 @@ async def fixture(tmp_path, *, mode=TaskMode.DIRECT, contracts=True, verified=Tr
         return httpx.Response(200, json=response())
 
     broker = a.ReviewAssemblyBroker(
-        config_service=Configs(),
+        config_service=FixtureConfigs(state, s.task.tenant_id),
         config_getter=config,
         run_repository=s.runs,
         session_factory=db,
-        secret_service=Secrets(),
+        secret_service=FixtureSecrets(),
         capacity_factory=capacity,
         transport=LiteLLMClient(_network_delegate_factory=lambda: httpx.MockTransport(handler)),
         billing_contracts=tuple(
@@ -167,43 +241,35 @@ async def fixture(tmp_path, *, mode=TaskMode.DIRECT, contracts=True, verified=Tr
     s.task = s.task.model_copy(update={"routing_decision": route})
     s.runs.record = replace(s.runs.record, routing_decision=route)
     db.run.routing_decision = route
-    return SimpleNamespace(
-        s=s,
-        db=db,
-        broker=broker,
-        state=state,
-        config_service=Configs(),
-        secrets=Secrets(),
-        capacity=capacity,
-    )
+    return AssemblyFixture(s, db, broker, state, FixtureConfigs(state, s.task.tenant_id), FixtureSecrets(), capacity)
 
 
-def test_broker_is_a_real_server_assembly():
-    assert callable(assembly().ReviewAssemblyBroker)
+def test_broker_is_a_real_server_assembly() -> None:
+    assert callable(review_assembly.ReviewAssemblyBroker)
 
 
 @pytest.mark.parametrize(
     "mode", [TaskMode.DIRECT, TaskMode.DISPATCH, TaskMode.DISCUSS, TaskMode.HYBRID]
 )
-async def test_worker_builds_pool_before_lazy_runtime_and_retains_until_close(tmp_path, mode):
-    a = assembly()
+async def test_worker_builds_pool_before_lazy_runtime_and_retains_until_close(tmp_path: Path, mode: TaskMode) -> None:
+    a = review_assembly
     f = await fixture(tmp_path, mode=mode)
     seen, child_scopes = [], []
 
-    class Runtime:
-        def run(self, context):
-            seen.append(_run_budget.get())  # synchronous/lazy creation boundary
+    class Runtime(StreamRuntimeStub):
+        def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
+            seen.append(present(_run_budget.get()))  # synchronous/lazy creation boundary
             assert a.current_review_platform(context.tenant_id) is not None
 
-            async def events():
+            async def events() -> AsyncIterator[RunEvent]:
                 from agent_hub.runtime.defaults import _gateway_for_config
 
-                budget = _run_budget.get()
+                budget = present(_run_budget.get())
                 assert budget is seen[0]
                 assert budget.lease.token == context.execution_token
                 assert budget._pool.original_token_grant == 40000  # soft 123 is not a hard grant
                 gateway, _, _ = await _gateway_for_config(
-                    a.current_review_platform(context.tenant_id),
+                    present(a.current_review_platform(context.tenant_id)),
                     tenant_id=context.tenant_id,
                     secret_service=f.secrets,
                     capacity_factory=f.capacity,
@@ -219,7 +285,7 @@ async def test_worker_builds_pool_before_lazy_runtime_and_retains_until_close(tm
                     )
                     assert _run_budget.get() is budget
 
-                    async def child():
+                    async def child() -> None:
                         child_scopes.append(_run_budget.get())
                         await gateway.complete(logical_request())
 
@@ -231,7 +297,7 @@ async def test_worker_builds_pool_before_lazy_runtime_and_retains_until_close(tm
                         payload={"phase": "completed"},
                     )
                 finally:
-                    seen.append(_run_budget.get())
+                    seen.append(present(_run_budget.get()))
                     await gateway.complete(logical_request())  # finalization is also charged
 
             return events()
@@ -249,25 +315,25 @@ async def test_worker_builds_pool_before_lazy_runtime_and_retains_until_close(tm
     assert not seen[0]._active
     assert len(f.state.calls) == 3
     pool = await RunAdmissionRepository(f.db).get_pool(f.s.task.tenant_id, f.s.task.run_id)
-    assert pool.token_charged == 15
-    assert pool.original_deadline == f.s.runs.record.created_at + timedelta(seconds=60)
+    assert present(pool).token_charged == 15
+    assert present(pool).original_deadline == f.s.runs.record.created_at + timedelta(seconds=60)
 
 
-async def test_same_run_reentry_and_unknown_never_refill_or_extend(tmp_path):
+async def test_same_run_reentry_and_unknown_never_refill_or_extend(tmp_path: Path) -> None:
     f = await fixture(tmp_path)
-    first = await f.broker.prepare(f.s.task, worker_id=f.s.budget.lease.worker_id)
-    pool_row = next(row for row in f.db.rows if hasattr(row, "original_deadline"))
+    first = present(await f.broker.prepare(f.s.task, worker_id=f.s.budget.lease.worker_id))
+    pool_row = next(row for row in f.db.rows if isinstance(row, RunAdmissionPoolRow))
     pool_row.token_charged = 18000  # retained UNKNOWN debit in the actual stored pool
-    deadline = first.budget._pool.original_deadline
-    second = await f.broker.prepare(
+    deadline = present(first).budget._pool.original_deadline
+    second = present(await f.broker.prepare(
         f.s.task.model_copy(update={"token_budget": 999999}), worker_id=f.s.budget.lease.worker_id
-    )
-    assert second.budget._pool.tokens_remaining == 22000
-    assert second.budget._pool.original_deadline == deadline
-    assert second.budget.deadline <= time.monotonic() + 60
+    ))
+    assert present(second).budget._pool.tokens_remaining == 22000
+    assert present(second).budget._pool.original_deadline == deadline
+    assert present(second).budget.deadline <= time.monotonic() + 60
 
 
-async def test_old_profile_is_never_upgraded_even_when_configuration_ready(tmp_path):
+async def test_old_profile_is_never_upgraded_even_when_configuration_ready(tmp_path: Path) -> None:
     f = await fixture(tmp_path)
     route = {
         key: value
@@ -289,7 +355,7 @@ async def test_old_profile_is_never_upgraded_even_when_configuration_ready(tmp_p
     "contracts,verified,reason",
     [(False, True, "provider_contract_missing"), (True, False, "current_mode_fence_unverified")],
 )
-async def test_declared_context_is_not_provider_contract(tmp_path, contracts, verified, reason):
+async def test_declared_context_is_not_provider_contract(tmp_path: Path, contracts: bool, verified: bool, reason: object) -> None:
     f = await fixture(tmp_path, contracts=contracts, verified=verified)
     readiness = await f.broker.readiness(f.s.task.tenant_id)
     assert readiness.status == "not_ready" and readiness.reason_code == reason
@@ -297,7 +363,7 @@ async def test_declared_context_is_not_provider_contract(tmp_path, contracts, ve
     assert not f.state.calls
 
 
-async def test_rules_default_produces_no_profile_or_pool(tmp_path):
+async def test_rules_default_produces_no_profile_or_pool(tmp_path: Path) -> None:
     f = await fixture(tmp_path)
     f.state.config = ApprovalReviewConfig()
     assert await f.broker.submission_profile(f.s.task.tenant_id, timeout_seconds=60) == {}
@@ -306,7 +372,7 @@ async def test_rules_default_produces_no_profile_or_pool(tmp_path):
 
 
 @pytest.mark.parametrize("change", ["worker", "role", "config", "catalog", "derived"])
-async def test_changed_worker_config_role_and_derived_run_fail_closed(tmp_path, change):
+async def test_changed_worker_config_role_and_derived_run_fail_closed(tmp_path: Path, change: str) -> None:
     f = await fixture(tmp_path)
     context = f.s.task
     if change == "worker":
@@ -328,17 +394,17 @@ async def test_changed_worker_config_role_and_derived_run_fail_closed(tmp_path, 
             }
         )
         f.s.runs.record = replace(f.s.runs.record, routing_decision=dict(context.routing_decision))
-    with pytest.raises(assembly().ReviewAssemblyUnavailable):
+    with pytest.raises(review_assembly.ReviewAssemblyUnavailable):
         await f.broker.prepare(context, worker_id=f.s.budget.lease.worker_id)
     assert not f.state.calls
 
 
-async def test_runtime_local_context_token_survives_yields_without_leaking(tmp_path):
+async def test_runtime_local_context_token_survives_yields_without_leaking(tmp_path: Path) -> None:
     f = await fixture(tmp_path)
     local = ContextVar("runtime_local", default="outside")
 
-    class Runtime:
-        async def run(self, context):
+    class Runtime(StreamRuntimeStub):
+        async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
             token = local.set("inside")
             try:
                 yield RunEvent(
@@ -362,7 +428,7 @@ async def test_runtime_local_context_token_survives_yields_without_leaking(tmp_p
 
 @pytest.mark.parametrize("mode", [TaskMode.DIRECT, TaskMode.DISPATCH])
 @pytest.mark.parametrize("advances", [0, 2])
-async def test_actual_adapter_stream_retains_one_consumer_task(tmp_path, mode, advances):
+async def test_actual_adapter_stream_retains_one_consumer_task(tmp_path: Path, mode: TaskMode, advances: int) -> None:
     from agent_hub.runtime.crew.adapter import CrewDispatchRuntime, CrewRunStream
     from agent_hub.runtime.crew.plan import AgentSpec, DispatchPlan, DispatchStep
     from agent_hub.runtime.defaults import _gateway_for_config
@@ -405,7 +471,7 @@ async def test_actual_adapter_stream_retains_one_consumer_task(tmp_path, mode, a
         owner = None
         for _ in range(advances):
             await anext(events)
-            owner = owner or actual._owner
+            owner = present(owner or actual._owner)
             assert actual._owner is owner and not owner.done()
             assert owner is not asyncio.current_task()
         assert _run_budget.get() is None
@@ -414,7 +480,7 @@ async def test_actual_adapter_stream_retains_one_consumer_task(tmp_path, mode, a
     assert not (asyncio.all_tasks() - before)
 
 
-async def test_worker_owner_cancellation_drains_same_task_finalizer_without_prefetch(tmp_path):
+async def test_worker_owner_cancellation_drains_same_task_finalizer_without_prefetch(tmp_path: Path) -> None:
     f = await fixture(tmp_path)
     entered, finalizing, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
     cancel_work = asyncio.Event()
@@ -422,14 +488,14 @@ async def test_worker_owner_cancellation_drains_same_task_finalizer_without_pref
     local = ContextVar("owner_local", default="outside")
     before = asyncio.all_tasks()
 
-    class Runtime:
-        async def cancel(self):
+    class Runtime(StreamRuntimeStub):
+        async def cancel(self) -> None:
             # Match ExecutionRuntime's work-cancellation protocol, not owner.cancel().
             cancel_work.set()
 
-        async def run(self, context):
+        async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
             token = local.set("inside")
-            owner, budget = asyncio.current_task(), _run_budget.get()
+            owner, budget = present(asyncio.current_task()), present(_run_budget.get())
             observed.append((owner, budget))
             try:
                 counts.append(1)
@@ -449,7 +515,7 @@ async def test_worker_owner_cancellation_drains_same_task_finalizer_without_pref
                 assert _run_budget.get() is budget and budget._active
                 local.reset(token)
 
-    async def driver():
+    async def driver() -> None:
         async with worker_runtime_events(
             Runtime(), f.s.task, worker_id=f.s.budget.lease.worker_id, review_broker=f.broker
         ) as events:
@@ -485,18 +551,18 @@ async def test_worker_owner_cancellation_drains_same_task_finalizer_without_pref
 
 
 @pytest.mark.parametrize("phase", ["construct", "advance", "finalize"])
-async def test_worker_scope_failure_closes_and_revokes_without_background_task(tmp_path, phase):
+async def test_worker_scope_failure_closes_and_revokes_without_background_task(tmp_path: Path, phase: str) -> None:
     f = await fixture(tmp_path)
     seen = []
     before = asyncio.all_tasks()
 
-    class Runtime:
-        def run(self, context):
-            seen.append(_run_budget.get())
+    class Runtime(StreamRuntimeStub):
+        def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
+            seen.append(present(_run_budget.get()))
             if phase == "construct":
                 raise ValueError("construct")
 
-            async def events():
+            async def events() -> AsyncIterator[RunEvent]:
                 try:
                     if phase == "advance":
                         raise ValueError("advance")
@@ -523,16 +589,16 @@ async def test_worker_scope_failure_closes_and_revokes_without_background_task(t
 
 
 @pytest.mark.parametrize("terminal", ["eof", "error"])
-async def test_natural_finalizer_survives_first_caller_cancel(tmp_path, terminal):
+async def test_natural_finalizer_survives_first_caller_cancel(tmp_path: Path, terminal: object) -> None:
     """Unmodified AsyncIterator contract: cancellation cannot infer its phase."""
     f = await fixture(tmp_path)
     started, release, completed = asyncio.Event(), asyncio.Event(), asyncio.Event()
     observed = []
     before = asyncio.all_tasks()
 
-    class Runtime:
-        async def run(self, context):
-            owner, budget = asyncio.current_task(), _run_budget.get()
+    class Runtime(StreamRuntimeStub):
+        async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
+            owner, budget = present(asyncio.current_task()), present(_run_budget.get())
             observed.append((owner, budget))
             try:
                 yield RunEvent(
@@ -547,7 +613,7 @@ async def test_natural_finalizer_survives_first_caller_cancel(tmp_path, terminal
                 assert budget._active
                 completed.set()
 
-    async def driver():
+    async def driver() -> None:
         async with worker_runtime_events(
             Runtime(), f.s.task, worker_id=f.s.budget.lease.worker_id, review_broker=f.broker
         ) as events:
@@ -576,7 +642,7 @@ async def test_natural_finalizer_survives_first_caller_cancel(tmp_path, terminal
 
 
 @pytest.mark.parametrize("mode", [TaskMode.DIRECT, TaskMode.DISCUSS, TaskMode.HYBRID])
-async def test_actual_direct_cancel_stops_http_but_drains_network_cleanup(tmp_path, mode):
+async def test_actual_direct_cancel_stops_http_but_drains_network_cleanup(tmp_path: Path, mode: TaskMode) -> None:
     from agent_hub.db.models import RunAdmissionAttemptRow
     from agent_hub.runtime.autogen.adapter import (
         AutoGenDiscussionRuntime,
@@ -593,8 +659,8 @@ async def test_actual_direct_cancel_stops_http_but_drains_network_cleanup(tmp_pa
     entered, cleanup, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
     budgets, cancel_calls = [], []
 
-    async def handler(request):
-        budgets.append(_run_budget.get())
+    async def handler(request: httpx.Request) -> httpx.Response:
+        budgets.append(present(_run_budget.get()))
         entered.set()
         try:
             await asyncio.Event().wait()
@@ -641,22 +707,23 @@ async def test_actual_direct_cancel_stops_http_but_drains_network_cleanup(tmp_pa
             total_timeout_seconds=10,
         ),
     )
-    runtime = {
+    runtimes: dict[TaskMode, ExecutionRuntime] = {
         TaskMode.DIRECT: direct,
         TaskMode.DISCUSS: discussion,
         TaskMode.HYBRID: HybridRuntime(dispatch, discussion, direct),
-    }[mode]
+    }
+    runtime = runtimes[mode]
     original_cancel = runtime.cancel
 
-    async def cancel():
+    async def cancel() -> None:
         cancel_calls.append(_run_budget.get())
         await original_cancel()
 
-    runtime.cancel = cancel  # Delegating spy; actual runtime/stream/cancel implementation remain.
+    pytest.MonkeyPatch().setattr(runtime, "cancel", cancel)  # Delegating spy; actual runtime/stream/cancel implementation remain.
     context = f.s.task.model_copy(update={"token_budget": 20000, "timeout_seconds": 10.0})
     before = asyncio.all_tasks()
 
-    async def driver():
+    async def driver() -> None:
         async with worker_runtime_events(
             runtime, context, worker_id=f.s.budget.lease.worker_id, review_broker=f.broker
         ) as events:
@@ -691,8 +758,8 @@ async def test_actual_direct_cancel_stops_http_but_drains_network_cleanup(tmp_pa
         attempts = [r for r in f.db.rows if type(r) is RunAdmissionAttemptRow]
         assert len(attempts) == 1 and attempts[0].state == "unknown"
         pool = await RunAdmissionRepository(f.db).get_pool(context.tenant_id, context.run_id)
-        assert pool.token_charged == 10000
-        assert pool.original_deadline == budgets[0]._pool.original_deadline
+        assert present(pool).token_charged == 10000
+        assert present(pool).original_deadline == budgets[0]._pool.original_deadline
         assert not (asyncio.all_tasks() - before)
     finally:
         release.set()
@@ -702,7 +769,7 @@ async def test_actual_direct_cancel_stops_http_but_drains_network_cleanup(tmp_pa
 
 
 @pytest.mark.parametrize("mode", ["discuss", "hybrid"])
-async def test_actual_cancel_protocol_does_not_cancel_finalizing_owner(tmp_path, mode):
+async def test_actual_cancel_protocol_does_not_cancel_finalizing_owner(tmp_path: Path, mode: str) -> None:
     """Actual cancel methods around a barrier probe, not a native adapter run."""
     from autogen_core import CancellationToken
 
@@ -718,7 +785,7 @@ async def test_actual_cancel_protocol_does_not_cancel_finalizing_owner(tmp_path,
 
     f = await fixture(tmp_path)
     discussion = AutoGenDiscussionRuntime(
-        object(),
+        UnusedGateway(),
         DiscussionPlan(
             participants=tuple(
                 DiscussionParticipant(name, name, "Reply", "primary")
@@ -728,9 +795,9 @@ async def test_actual_cancel_protocol_does_not_cancel_finalizing_owner(tmp_path,
         ),
     )
     discussion._cancel_token, discussion._cancel_event = CancellationToken(), asyncio.Event()
-    direct = DirectRuntime(object(), logical_model="primary")
+    direct = DirectRuntime(UnusedGateway(), logical_model="primary")
     dispatch = CrewDispatchRuntime(
-        object(),
+        UnusedGateway(),
         DispatchPlan(
             agents=(AgentSpec(id="writer", role="Writer", goal="Reply", logical_model="primary"),),
             steps=(DispatchStep(id="reply", agent="writer", task="Reply", final_synthesizer=True),),
@@ -741,14 +808,15 @@ async def test_actual_cancel_protocol_does_not_cancel_finalizing_owner(tmp_path,
     seen = []
     before = asyncio.all_tasks()
 
-    class Probe:
-        async def cancel(self):
+    class Probe(StreamRuntimeStub):
+        async def cancel(self) -> None:
             await actual.cancel()
 
-        async def run(self, context):
-            owner = asyncio.current_task()
+        async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
+            owner = present(asyncio.current_task())
             actual._active_task = discussion._active_task = owner
             if mode == "hybrid":
+                assert isinstance(actual, HybridRuntime)
                 actual._active_child = discussion
             seen.append(owner)
             try:
@@ -761,7 +829,7 @@ async def test_actual_cancel_protocol_does_not_cancel_finalizing_owner(tmp_path,
                 assert asyncio.current_task() is owner
                 completed.set()
 
-    async def driver():
+    async def driver() -> None:
         async with worker_runtime_events(
             Probe(), f.s.task, worker_id=f.s.budget.lease.worker_id, review_broker=f.broker
         ) as events:
@@ -786,7 +854,7 @@ async def test_actual_cancel_protocol_does_not_cancel_finalizing_owner(tmp_path,
         await asyncio.gather(task, return_exceptions=True)
 
 
-def _finalizer_cancel_runtime(mode):
+def _finalizer_cancel_runtime(mode: str) -> tuple[AutoGenDiscussionRuntime | HybridRuntime, AutoGenDiscussionRuntime]:
     from autogen_core import CancellationToken
 
     from agent_hub.runtime.autogen.adapter import (
@@ -800,7 +868,7 @@ def _finalizer_cancel_runtime(mode):
     from agent_hub.runtime.hybrid import HybridRuntime
 
     discussion = AutoGenDiscussionRuntime(
-        object(),
+        UnusedGateway(),
         DiscussionPlan(
             participants=tuple(
                 DiscussionParticipant(name, name, "Reply", "primary")
@@ -813,13 +881,13 @@ def _finalizer_cancel_runtime(mode):
     if mode == "discuss":
         return discussion, discussion
     dispatch = CrewDispatchRuntime(
-        object(),
+        UnusedGateway(),
         DispatchPlan(
             agents=(AgentSpec(id="writer", role="Writer", goal="Reply", logical_model="primary"),),
             steps=(DispatchStep(id="reply", agent="writer", task="Reply", final_synthesizer=True),),
         ),
     )
-    runtime = HybridRuntime(dispatch, discussion, DirectRuntime(object(), logical_model="primary"))
+    runtime = HybridRuntime(dispatch, discussion, DirectRuntime(UnusedGateway(), logical_model="primary"))
     runtime._active_child = discussion
     return runtime, discussion
 
@@ -827,7 +895,7 @@ def _finalizer_cancel_runtime(mode):
 @pytest.mark.parametrize("mode", ["discuss", "hybrid"])
 @pytest.mark.parametrize("terminal", ["eof", "error"])
 @pytest.mark.parametrize("entry", ["heartbeat", "owned", "run", "all", "adapter"])
-async def test_fresh_external_cancel_drains_exact_owner(tmp_path, mode, terminal, entry):
+async def test_fresh_external_cancel_drains_exact_owner(tmp_path: Path, mode: str, terminal: str, entry: str) -> None:
     """Independent cancellation must not inject into an already finalizing owner."""
     from contextvars import Context
 
@@ -839,33 +907,33 @@ async def test_fresh_external_cancel_drains_exact_owner(tmp_path, mode, terminal
     actual, discussion = _finalizer_cancel_runtime(mode)
     factory_type = ConfigBackedDiscussionRuntime if mode == "discuss" else ConfigBackedHybridRuntime
     factory = factory_type(
-        config_service=object(), secret_service=object(), capacity_factory=object()
+        config_service=UnusedConfigs(), secret_service=UnusedSecrets(), capacity_factory=unused_capacity
     )
-    key = (f.s.task.run_id, f.s.task.execution_token)
+    key = (f.s.task.run_id, present(f.s.task.execution_token))
     started, release, completed = asyncio.Event(), asyncio.Event(), asyncio.Event()
     model_entered, model_stopped = asyncio.Event(), asyncio.Event()
     observed, renewals, models = [], [], []
     before = asyncio.all_tasks()
 
-    async def model_work():
+    async def model_work() -> None:
         model_entered.set()
         try:
             await asyncio.Event().wait()
         finally:
             model_stopped.set()
 
-    class Probe:
+    class Probe(StreamRuntimeStub):
         # Actual factory lookup and actual adapter cancel; only the run body is a seam.
-        async def cancel_run_owned(self, run_id, execution_token):
+        async def cancel_run_owned(self, run_id: UUID, execution_token: UUID) -> None:
             await factory.cancel_run_owned(run_id, execution_token)
 
-        async def run(self, context):
-            owner, budget = asyncio.current_task(), _run_budget.get()
+        async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
+            owner, budget = present(asyncio.current_task()), present(_run_budget.get())
             actual._active_task = discussion._active_task = owner
             factory._active[key] = actual
             model = asyncio.create_task(model_work())
             models.append(model)
-            discussion._cancel_token.link_future(model)
+            present(discussion._cancel_token).link_future(model)
             observed.append((owner, budget))
             try:
                 await model_entered.wait()
@@ -884,26 +952,37 @@ async def test_fresh_external_cancel_drains_exact_owner(tmp_path, mode, terminal
                 finally:
                     factory._active.pop(key, None)
 
-    async def driver():
+    async def driver() -> None:
         async with worker_runtime_events(
             Probe(), f.s.task, worker_id=f.s.budget.lease.worker_id, review_broker=f.broker
         ) as events:
             async for _ in events:
                 assert _run_budget.get() is None
 
-    class Repository:
-        async def renew_active_worker_lease(self, **kwargs):
-            renewals.append(kwargs)
+    class Repository(RunRepository):
+        def __init__(self) -> None:
+            pass
+
+        async def renew_active_worker_lease(self, *, tenant_id: UUID, run_id: UUID,
+            worker_id: str, worker_lease_token: UUID, worker_lease_expires_at: datetime) -> bool:
+            renewals.append({"tenant_id": tenant_id, "run_id": run_id, "worker_id": worker_id,
+                "worker_lease_token": worker_lease_token, "worker_lease_expires_at": worker_lease_expires_at})
             return False
 
-    service = SimpleNamespace(
-        _repository=Repository(),
-        _worker_id=f.s.budget.lease.worker_id,
-        _worker_lease_heartbeat_interval_seconds=lambda: 0.001,
-        _worker_lease_expires_at=lambda: None,
-    )
+    class HeartbeatService(RunService):
+        def __init__(self) -> None:
+            self._repository = Repository()
+            self._worker_id = f.s.budget.lease.worker_id
 
-    async def external_cancel():
+        def _worker_lease_heartbeat_interval_seconds(self) -> float:
+            return 0.001
+
+        def _worker_lease_expires_at(self) -> datetime:
+            return datetime.now(UTC)
+
+    service = HeartbeatService()
+
+    async def external_cancel() -> None:
         assert _run_budget.get() is None
         if entry == "heartbeat":
             await RunService._heartbeat_worker_lease(
@@ -930,7 +1009,7 @@ async def test_fresh_external_cancel_drains_exact_owner(tmp_path, mode, terminal
         assert not _is_protected_stream_owner(models[0])
         await asyncio.wait_for(asyncio.create_task(external_cancel(), context=Context()), 3)
         await asyncio.wait_for(model_stopped.wait(), 3)
-        assert discussion._cancel_event.is_set() and discussion._cancel_token.is_cancelled()
+        assert present(discussion._cancel_event).is_set() and present(discussion._cancel_token).is_cancelled()
         assert owner.cancelling() == 0, "external cancel injected into finalizing fresh owner"
         assert _is_protected_stream_owner(owner)
         assert not task.done() and not owner.done() and not completed.is_set() and budget._active
@@ -958,7 +1037,7 @@ async def test_fresh_external_cancel_drains_exact_owner(tmp_path, mode, terminal
 
 
 @pytest.mark.parametrize("close_error", [False, True])
-async def test_fresh_owner_registration_lasts_through_aclose(tmp_path, close_error):
+async def test_fresh_owner_registration_lasts_through_aclose(tmp_path: Path, close_error: object) -> None:
     from contextvars import Context
 
     from agent_hub.runtime.streams import _is_protected_stream_owner
@@ -970,17 +1049,17 @@ async def test_fresh_owner_registration_lasts_through_aclose(tmp_path, close_err
     before = asyncio.all_tasks()
 
     class Stream:
-        def __aiter__(self):
+        def __aiter__(self) -> Stream:
             return self
 
-        async def __anext__(self):
+        async def __anext__(self) -> RunEvent:
             actual._active_task = asyncio.current_task()
-            seen.append((asyncio.current_task(), _run_budget.get()))
+            seen.append((present(asyncio.current_task()), present(_run_budget.get())))
             return RunEvent(
                 kind="runtime.probe", sequence=1, run_id=f.s.task.run_id, payload={"probe": True}
             )
 
-        async def aclose(self):
+        async def aclose(self) -> None:
             owner, budget = seen[0]
             started.set()
             await release.wait()
@@ -991,11 +1070,11 @@ async def test_fresh_owner_registration_lasts_through_aclose(tmp_path, close_err
             if close_error:
                 raise ValueError("close")
 
-    class Probe:
-        def run(self, context):
+    class Probe(StreamRuntimeStub):
+        def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
             return Stream()
 
-    async def driver():
+    async def driver() -> None:
         async with worker_runtime_events(
             Probe(), f.s.task, worker_id=f.s.budget.lease.worker_id, review_broker=f.broker
         ) as events:
@@ -1022,7 +1101,7 @@ async def test_fresh_owner_registration_lasts_through_aclose(tmp_path, close_err
         await asyncio.gather(task, return_exceptions=True)
 
 
-async def test_owned_external_cancel_does_not_cross_run_or_token(tmp_path):
+async def test_owned_external_cancel_does_not_cross_run_or_token(tmp_path: Path) -> None:
     from contextvars import Context
 
     from agent_hub.runs.service import _runtime_cancel_for_run
@@ -1030,34 +1109,35 @@ async def test_owned_external_cancel_does_not_cross_run_or_token(tmp_path):
     from agent_hub.runtime.streams import _is_protected_stream_owner
 
     factory = ConfigBackedDiscussionRuntime(
-        config_service=object(), secret_service=object(), capacity_factory=object()
+        config_service=UnusedConfigs(), secret_service=UnusedSecrets(), capacity_factory=unused_capacity
     )
-    states = []
+    states: list[CancelState] = []
     before = asyncio.all_tasks()
     for number in range(2):
         directory = tmp_path / str(number)
         directory.mkdir()
         f = await fixture(directory)
         actual, _ = _finalizer_cancel_runtime("discuss")
+        assert isinstance(actual, AutoGenDiscussionRuntime)
         states.append(
-            SimpleNamespace(
+            CancelState(
                 f=f,
                 actual=actual,
                 started=asyncio.Event(),
                 release=asyncio.Event(),
                 completed=asyncio.Event(),
                 seen=[],
-                key=(f.s.task.run_id, f.s.task.execution_token),
+                key=(f.s.task.run_id, present(f.s.task.execution_token)),
             )
         )
 
-    class Probe:
-        def __init__(self, state):
+    class Probe(StreamRuntimeStub):
+        def __init__(self, state: CancelState) -> None:
             self.state = state
 
-        async def run(self, context):
+        async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
             state = self.state
-            owner, budget = asyncio.current_task(), _run_budget.get()
+            owner, budget = present(asyncio.current_task()), present(_run_budget.get())
             state.actual._active_task = owner
             factory._active[state.key] = state.actual
             state.seen.append((owner, budget))
@@ -1074,7 +1154,7 @@ async def test_owned_external_cancel_does_not_cross_run_or_token(tmp_path):
                 finally:
                     factory._active.pop(state.key, None)
 
-    async def driver(state):
+    async def driver(state: CancelState) -> None:
         async with worker_runtime_events(
             Probe(state),
             state.f.s.task,
@@ -1095,28 +1175,28 @@ async def test_owned_external_cancel_does_not_cross_run_or_token(tmp_path):
         ):
             await asyncio.wait_for(
                 asyncio.create_task(
-                    _runtime_cancel_for_run(factory, *wrong_key)(), context=Context()
+                    await_cancel(_runtime_cancel_for_run(factory, *wrong_key)), context=Context()
                 ),
                 3,
             )
-        assert all(not s.actual._cancel_event.is_set() for s in states)
+        assert all(not present(s.actual._cancel_event).is_set() for s in states)
         assert all(s.seen[0][0].cancelling() == 0 and not s.seen[0][0].done() for s in states)
         await asyncio.wait_for(
-            asyncio.create_task(_runtime_cancel_for_run(factory, *first.key)(), context=Context()),
+            asyncio.create_task(await_cancel(_runtime_cancel_for_run(factory, *first.key)), context=Context()),
             3,
         )
-        assert first.actual._cancel_event.is_set() and not second.actual._cancel_event.is_set()
+        assert present(first.actual._cancel_event).is_set() and not present(second.actual._cancel_event).is_set()
         assert all(s.seen[0][0].cancelling() == 0 and s.seen[0][1]._active for s in states)
         first.release.set()
         await asyncio.wait_for(tasks[0], 3)
         assert first.completed.is_set() and not _is_protected_stream_owner(first.seen[0][0])
         assert not first.seen[0][1]._active
         assert not tasks[1].done() and _is_protected_stream_owner(second.seen[0][0])
-        assert second.seen[0][1]._active and not second.actual._cancel_event.is_set()
+        assert second.seen[0][1]._active and not present(second.actual._cancel_event).is_set()
         await _runtime_cancel_for_run(
             factory, *first.key
         )()  # Closed key cannot target the other run.
-        assert not second.actual._cancel_event.is_set()
+        assert not present(second.actual._cancel_event).is_set()
         second.release.set()
         await asyncio.wait_for(tasks[1], 3)
         assert second.completed.is_set() and not _is_protected_stream_owner(second.seen[0][0])
@@ -1128,7 +1208,7 @@ async def test_owned_external_cancel_does_not_cross_run_or_token(tmp_path):
         await asyncio.gather(*tasks, return_exceptions=True)
 
 
-async def test_fresh_owner_registration_does_not_protect_model_task(tmp_path):
+async def test_fresh_owner_registration_does_not_protect_model_task(tmp_path: Path) -> None:
     from contextvars import Context
 
     from agent_hub.runtime.streams import _is_protected_stream_owner
@@ -1140,16 +1220,16 @@ async def test_fresh_owner_registration_does_not_protect_model_task(tmp_path):
     seen, models = [], []
     before = asyncio.all_tasks()
 
-    async def model_work():
+    async def model_work() -> None:
         model_entered.set()
         try:
             await asyncio.Event().wait()
         finally:
             model_stopped.set()
 
-    class Probe:
-        async def run(self, context):
-            owner = asyncio.current_task()
+    class Probe(StreamRuntimeStub):
+        async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
+            owner = present(asyncio.current_task())
             actual._active_task = owner
             # No linked token: actual AutoGen.cancel must cancel this distinct Task.
             discussion._active_task = asyncio.create_task(model_work())
@@ -1165,7 +1245,7 @@ async def test_fresh_owner_registration_does_not_protect_model_task(tmp_path):
                 await release.wait()
                 completed.set()
 
-    async def driver():
+    async def driver() -> None:
         async with worker_runtime_events(
             Probe(), f.s.task, worker_id=f.s.budget.lease.worker_id, review_broker=f.broker
         ) as events:
@@ -1192,25 +1272,25 @@ async def test_fresh_owner_registration_does_not_protect_model_task(tmp_path):
         await asyncio.gather(task, *models, return_exceptions=True)
 
 
-async def test_worker_cancel_targets_original_owned_run_only(tmp_path):
+async def test_worker_cancel_targets_original_owned_run_only(tmp_path: Path) -> None:
     f = await fixture(tmp_path)
     entered, stop = asyncio.Event(), asyncio.Event()
     seen = []
 
-    class Runtime:
-        async def cancel(self):
+    class Runtime(StreamRuntimeStub):
+        async def cancel(self) -> None:
             raise AssertionError("shared factory cancel-all must not be called")
 
-        async def cancel_run_owned(self, run_id, execution_token):
+        async def cancel_run_owned(self, run_id: UUID, execution_token: UUID) -> None:
             seen.append((run_id, execution_token, _run_budget.get()))
             stop.set()
 
-        async def run(self, context):
+        async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
             entered.set()
             await stop.wait()
             yield RunEvent(kind="runtime.cancelled", sequence=1, run_id=context.run_id)
 
-    async def driver():
+    async def driver() -> None:
         async with worker_runtime_events(
             Runtime(), f.s.task, worker_id=f.s.budget.lease.worker_id, review_broker=f.broker
         ) as events:
@@ -1221,12 +1301,12 @@ async def test_worker_cancel_targets_original_owned_run_only(tmp_path):
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
-    assert len(seen) == 1 and seen[0][:2] == (f.s.task.run_id, f.s.task.execution_token)
-    assert not seen[0][2]._active and _run_budget.get() is None
+    assert len(seen) == 1 and seen[0][:2] == (f.s.task.run_id, present(f.s.task.execution_token))
+    assert not present(seen[0][2])._active and _run_budget.get() is None
 
 
 @pytest.mark.parametrize("mode", ["discuss", "hybrid"])
-async def test_legacy_cancel_keeps_unguarded_task_cancellation(mode):
+async def test_legacy_cancel_keeps_unguarded_task_cancellation(mode: str) -> None:
     from agent_hub.runtime.autogen.adapter import (
         AutoGenDiscussionRuntime,
         DiscussionParticipant,
@@ -1239,7 +1319,7 @@ async def test_legacy_cancel_keeps_unguarded_task_cancellation(mode):
     from agent_hub.runtime.streams import _is_protected_stream_owner
 
     discussion = AutoGenDiscussionRuntime(
-        object(),
+        UnusedGateway(),
         DiscussionPlan(
             participants=tuple(
                 DiscussionParticipant(name, name, "Reply", "primary")
@@ -1248,9 +1328,10 @@ async def test_legacy_cancel_keeps_unguarded_task_cancellation(mode):
             selector_model="primary",
         ),
     )
+    actual: AutoGenDiscussionRuntime | HybridRuntime
     if mode == "hybrid":
         dispatch = CrewDispatchRuntime(
-            object(),
+            UnusedGateway(),
             DispatchPlan(
                 agents=(
                     AgentSpec(id="writer", role="Writer", goal="Reply", logical_model="primary"),
@@ -1261,13 +1342,13 @@ async def test_legacy_cancel_keeps_unguarded_task_cancellation(mode):
             ),
         )
         actual = HybridRuntime(
-            dispatch, discussion, DirectRuntime(object(), logical_model="primary")
+            dispatch, discussion, DirectRuntime(UnusedGateway(), logical_model="primary")
         )
     else:
         actual = discussion
     entered = asyncio.Event()
 
-    async def waiting():
+    async def waiting() -> None:
         entered.set()
         await asyncio.Event().wait()
 
@@ -1285,7 +1366,7 @@ async def test_legacy_cancel_keeps_unguarded_task_cancellation(mode):
         await asyncio.gather(task, return_exceptions=True)
 
 
-async def test_legacy_none_worker_path_does_not_install_cancel_owner_or_budget(tmp_path):
+async def test_legacy_none_worker_path_does_not_install_cancel_owner_or_budget(tmp_path: Path) -> None:
     f = await fixture(tmp_path)
     context = f.s.task.model_copy(
         update={
@@ -1300,11 +1381,11 @@ async def test_legacy_none_worker_path_does_not_install_cancel_owner_or_budget(t
     caller = asyncio.current_task()
     before = asyncio.all_tasks()
 
-    class Runtime:
-        async def cancel(self):
+    class Runtime(StreamRuntimeStub):
+        async def cancel(self) -> None:
             raise AssertionError("legacy stream must keep its existing close path")
 
-        async def run(self, context):
+        async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
             try:
                 observed.append((asyncio.current_task(), _run_budget.get()))
                 yield RunEvent(
@@ -1325,8 +1406,8 @@ async def test_legacy_none_worker_path_does_not_install_cancel_owner_or_budget(t
     assert await RunAdmissionRepository(f.db).get_pool(context.tenant_id, context.run_id) is None
 
 
-def evidence_document(f):
-    a = assembly()
+def evidence_document(f: AssemblyFixture) -> dict[str, object]:
+    a = review_assembly
     return {
         "schema_version": 1,
         "valid_until": (datetime.now(UTC) + timedelta(hours=1)).isoformat(),
@@ -1350,8 +1431,8 @@ def evidence_document(f):
     }
 
 
-async def test_installable_server_evidence_loader_is_used_by_real_builder(tmp_path, monkeypatch):
-    a = assembly()
+async def test_installable_server_evidence_loader_is_used_by_real_builder(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    a = review_assembly
     f = await fixture(tmp_path, contracts=False)
     document = evidence_document(f)
     path = tmp_path / "installed-server-evidence.json"
@@ -1376,16 +1457,16 @@ async def test_installable_server_evidence_loader_is_used_by_real_builder(tmp_pa
 @pytest.mark.parametrize(
     "invalid", ["digest", "expired", "source", "checks", "duplicate", "unknown", "bool"]
 )
-async def test_server_evidence_rejects_stale_incomplete_or_modified_records(tmp_path, invalid):
-    a = assembly()
+async def test_server_evidence_rejects_stale_incomplete_or_modified_records(tmp_path: Path, invalid: object) -> None:
+    a = review_assembly
     f = await fixture(tmp_path)
     document = evidence_document(f)
     if invalid == "expired":
         document["valid_until"] = (datetime.now(UTC) - timedelta(seconds=1)).isoformat()
     elif invalid == "source":
-        document["worker_verification"]["source_sha256"] = "0" * 64
+        mutable(document["worker_verification"])["source_sha256"] = "0" * 64
     elif invalid == "checks":
-        document["worker_verification"]["checks"] = ["original_pool"]
+        mutable(document["worker_verification"])["checks"] = ["original_pool"]
     elif invalid == "unknown":
         document["ready"] = True
     elif invalid == "bool":
@@ -1400,8 +1481,8 @@ async def test_server_evidence_rejects_stale_incomplete_or_modified_records(tmp_
         a.load_server_review_evidence(path, expected_sha256=digest)
 
 
-async def test_unused_untrusted_catalog_deployment_does_not_block_trusted_subset(tmp_path):
-    a = assembly()
+async def test_unused_untrusted_catalog_deployment_does_not_block_trusted_subset(tmp_path: Path) -> None:
+    a = review_assembly
     f = await fixture(tmp_path)
     document = f.state.platform.model_dump(mode="json")
     document["models"]["untrusted"] = {
@@ -1426,8 +1507,8 @@ async def test_unused_untrusted_catalog_deployment_does_not_block_trusted_subset
     f.s.runs.record = replace(f.s.runs.record, routing_decision=route)
     f.db.run.routing_decision = route
 
-    class Runtime:
-        async def run(self, context):
+    class Runtime(StreamRuntimeStub):
+        async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
             from agent_hub.runtime.defaults import _deployments, _gateway_for_config
 
             actual = a.review_deployments(_deployments(f.state.platform))
@@ -1457,12 +1538,12 @@ async def test_unused_untrusted_catalog_deployment_does_not_block_trusted_subset
     assert not f.state.calls
 
 
-async def test_actual_stack_broker_reviewer_repository_and_backend_execute_once(tmp_path):
+async def test_actual_stack_broker_reviewer_repository_and_backend_execute_once(tmp_path: Path) -> None:
     from agent_hub.capabilities.defaults import build_runtime_capability_stack
     from agent_hub.db.models import RunReviewEventRow
     from agent_hub.files.workspace import ProjectWorkspaceStore
 
-    a = assembly()
+    a = review_assembly
     f = await fixture(tmp_path)
     f.state.review = True
     stack = a.assemble_review_capability_stack(
@@ -1476,16 +1557,19 @@ async def test_actual_stack_broker_reviewer_repository_and_backend_execute_once(
         project_workspace_dir=tmp_path,
     )
     profiled = stack.harness_tool_gateway
+    assert isinstance(profiled, a._ProfiledHarness)
     fresh = profiled._fresh
-    gate = fresh._review_gate
+    gate = present(fresh._review_gate)
     assert profiled._backend is fresh._backend is stack.runtime_gateway
-    assert gate.loader._preparation_reader.__self__ is stack.runtime_gateway
+    reader = gate.loader._preparation_reader
+    assert isinstance(reader, MethodType)
+    assert reader.__self__ is stack.runtime_gateway
     assert profiled._review_gate is None  # default/old profile takes the real None path
-    assert gate.repository is f.broker.review_repository
+    assert id(gate.repository) == id(f.broker.review_repository)
     results = []
 
-    class Runtime:
-        async def run(self, context):
+    class Runtime(StreamRuntimeStub):
+        async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
             results.append(
                 await profiled.invoke(
                     context.tenant_id,
@@ -1528,15 +1612,15 @@ async def test_actual_stack_broker_reviewer_repository_and_backend_execute_once(
 
 
 @pytest.mark.parametrize("change", ["config", "lease", "role", "closed", "deadline"])
-async def test_live_revocation_after_yield_prevents_next_physical_call(tmp_path, change):
+async def test_live_revocation_after_yield_prevents_next_physical_call(tmp_path: Path, change: str) -> None:
     from agent_hub.runtime.defaults import _gateway_for_config
 
     f = await fixture(tmp_path)
     budgets = []
 
-    class Runtime:
-        async def run(self, context):
-            budgets.append(_run_budget.get())
+    class Runtime(StreamRuntimeStub):
+        async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
+            budgets.append(present(_run_budget.get()))
             gateway, _, _ = await _gateway_for_config(
                 f.state.platform,
                 tenant_id=context.tenant_id,
@@ -1553,7 +1637,7 @@ async def test_live_revocation_after_yield_prevents_next_physical_call(tmp_path,
         Runtime(), f.s.task, worker_id=f.s.budget.lease.worker_id, review_broker=f.broker
     ) as events:
         await anext(events)
-        pool = next(row for row in f.db.rows if hasattr(row, "original_deadline"))
+        pool = next(row for row in f.db.rows if isinstance(row, RunAdmissionPoolRow))
         if change == "config":
             f.state.config = ApprovalReviewConfig()
         elif change == "lease":
@@ -1563,24 +1647,24 @@ async def test_live_revocation_after_yield_prevents_next_physical_call(tmp_path,
         elif change == "closed":
             pool.closed = True
         else:
-            pool.original_deadline = datetime.now(UTC) - timedelta(seconds=1)
+            present(pool).original_deadline = datetime.now(UTC) - timedelta(seconds=1)
         with pytest.raises(
-            (assembly().ReviewAssemblyUnavailable, AdmissionConflict, _PhysicalAdmissionStopped)
+            (review_assembly.ReviewAssemblyUnavailable, AdmissionConflict, _PhysicalAdmissionStopped)
         ):
             await anext(events)
     assert not f.state.calls
     assert not budgets[0]._active
 
 
-async def test_inherited_child_cannot_send_after_owner_stream_exits(tmp_path):
+async def test_inherited_child_cannot_send_after_owner_stream_exits(tmp_path: Path) -> None:
     from agent_hub.runtime.defaults import _gateway_for_config
 
     f = await fixture(tmp_path)
     release = asyncio.Event()
     pending = []
 
-    class Runtime:
-        async def run(self, context):
+    class Runtime(StreamRuntimeStub):
+        async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
             gateway, _, _ = await _gateway_for_config(
                 f.state.platform,
                 tenant_id=context.tenant_id,
@@ -1589,7 +1673,7 @@ async def test_inherited_child_cannot_send_after_owner_stream_exits(tmp_path):
                 transport=f.broker._transport,
             )
 
-            async def child():
+            async def child() -> None:
                 await release.wait()
                 await gateway.complete(logical_request())
 
@@ -1608,7 +1692,7 @@ async def test_inherited_child_cannot_send_after_owner_stream_exits(tmp_path):
     assert not f.state.calls
 
 
-async def test_request_and_app_state_dictionary_cannot_forge_readiness(tmp_path):
+async def test_request_and_app_state_dictionary_cannot_forge_readiness(tmp_path: Path) -> None:
     from fastapi import FastAPI
     from pydantic import ValidationError
     from starlette.requests import Request
@@ -1621,16 +1705,16 @@ async def test_request_and_app_state_dictionary_cannot_forge_readiness(tmp_path)
 
     f = await fixture(tmp_path)
     with pytest.raises(ValidationError):
-        SystemSettingsRequest(approval_review_readiness={"status": "ready", "reason_code": "ready"})
+        SystemSettingsRequest.model_validate({"approval_review_readiness": {"status": "ready", "reason_code": "ready"}})
     app = FastAPI()
     app.state.review_assembly_broker = {"status": "ready"}
     request = Request({"type": "http", "app": app})
     settings = SystemSettingsResponse(approval_review=f.state.config)
     projected = await _settings_with_review_runtime_status(settings, request, f.s.task.tenant_id)
-    assert projected.approval_review_readiness.status == "not_ready"
+    assert mutable(projected.model_dump()["approval_review_readiness"])["status"] == "not_ready"
     app.state.review_assembly_broker = f.broker
     projected = await _settings_with_review_runtime_status(settings, request, f.s.task.tenant_id)
-    assert projected.approval_review_readiness.status == "ready"
+    assert mutable(projected.model_dump()["approval_review_readiness"])["status"] == "ready"
     assert "_runtime_review_readiness" not in projected.model_dump()
 
 
@@ -1638,28 +1722,30 @@ async def test_request_and_app_state_dictionary_cannot_forge_readiness(tmp_path)
     "mode", [TaskMode.DIRECT, TaskMode.DISPATCH, TaskMode.DISCUSS, TaskMode.HYBRID]
 )
 async def test_actual_configbacked_factories_use_original_scope_for_all_leaves(
-    tmp_path, monkeypatch, mode
-):
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: TaskMode
+) -> None:
     """Real factories/driver/Gateway; native engine scheduling is a bounded seam."""
     import agent_hub.runtime.autogen.adapter as autogen
     from agent_hub.runtime import defaults
     from agent_hub.runtime.contracts import EventKind
 
     f = await fixture(tmp_path, mode=mode)
-    route = {**f.s.task.routing_decision, "requested_permissions": []}
+    route: dict[str, object] = {**f.s.task.routing_decision, "requested_permissions": []}
     f.s.task = f.s.task.model_copy(update={"routing_decision": route})
     f.s.runs.record = replace(f.s.runs.record, routing_decision=route)
     f.db.run.routing_decision = route
     seen = []
 
-    class Leaf:
-        def __init__(self, gateway, *args, **options):
+    class Leaf(StreamRuntimeStub):
+        def __init__(self, gateway: ModelGateway, *args: object, **options: object) -> None:
             self.mode = mode
             self.gateway = gateway
-            self.logical_model = options.get("logical_model", "primary")
+            logical_model = options.get("logical_model", "primary")
+            assert isinstance(logical_model, str)
+            self.logical_model = logical_model
 
-        async def run(self, context):
-            seen.append(_run_budget.get())
+        async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
+            seen.append(present(_run_budget.get()))
             await self.gateway.complete(logical_request(logical_model=self.logical_model))
             yield RunEvent(
                 kind=EventKind.RUNTIME_COMPLETED,
@@ -1668,20 +1754,20 @@ async def test_actual_configbacked_factories_use_original_scope_for_all_leaves(
                 reason="fixed-leaf",
             )
 
-        async def cancel(self):
+        async def cancel(self) -> None:
             pass
 
-    class Composite:
-        def __init__(self, *leaves, **options):
+    class Composite(StreamRuntimeStub):
+        def __init__(self, *leaves: ExecutionRuntime, **options: object) -> None:
             self.mode = mode
             self.leaves = leaves
 
-        async def run(self, context):
+        async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
             for child in self.leaves:
                 async for event in child.run(context):
                     yield event
 
-        async def cancel(self):
+        async def cancel(self) -> None:
             pass
 
     monkeypatch.setattr(defaults, "DirectRuntime", Leaf)
@@ -1708,20 +1794,20 @@ async def test_actual_configbacked_factories_use_original_scope_for_all_leaves(
     assert collected and seen and all(context is seen[0] for context in seen)
     assert len(f.state.calls) == (3 if mode is TaskMode.HYBRID else 1)
     pool = await RunAdmissionRepository(f.db).get_pool(f.s.task.tenant_id, f.s.task.run_id)
-    assert pool.token_charged == 5 * len(f.state.calls)
-    assert pool.original_token_grant == 40000
+    assert present(pool).token_charged == 5 * len(f.state.calls)
+    assert present(pool).original_token_grant == 40000
     assert not seen[0]._active
 
 
-async def test_nested_child_exit_revokes_escaped_work_without_revoking_original_run(tmp_path):
+async def test_nested_child_exit_revokes_escaped_work_without_revoking_original_run(tmp_path: Path) -> None:
     from agent_hub.runtime.defaults import _gateway_for_config
 
     f = await fixture(tmp_path)
     release = asyncio.Event()
     pending = []
 
-    class Parent:
-        async def run(self, context):
+    class Parent(StreamRuntimeStub):
+        async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
             gateway, _, _ = await _gateway_for_config(
                 f.state.platform,
                 tenant_id=context.tenant_id,
@@ -1730,9 +1816,9 @@ async def test_nested_child_exit_revokes_escaped_work_without_revoking_original_
                 transport=f.broker._transport,
             )
 
-            class Child:
-                async def run(self, child_context):
-                    async def escaped():
+            class Child(StreamRuntimeStub):
+                async def run(self, child_context: TaskContext) -> AsyncIterator[RunEvent]:
+                    async def escaped() -> None:
                         await release.wait()
                         await gateway.complete(logical_request())
 
@@ -1748,7 +1834,7 @@ async def test_nested_child_exit_revokes_escaped_work_without_revoking_original_
                 Child(), context, worker_id=f.s.budget.lease.worker_id
             ) as child:
                 await anext(child)
-            assert _run_budget.get()._active
+            assert present(_run_budget.get())._active
             release.set()
             with pytest.raises(_PhysicalAdmissionStopped):
                 await pending[0]
@@ -1764,9 +1850,9 @@ async def test_nested_child_exit_revokes_escaped_work_without_revoking_original_
     assert len(f.state.calls) == 1
 
 
-async def test_internal_derived_run_cannot_drop_parent_profile_to_escape_budget(tmp_path):
+async def test_internal_derived_run_cannot_drop_parent_profile_to_escape_budget(tmp_path: Path) -> None:
     f = await fixture(tmp_path)
-    assert assembly()._execution.get() is None  # independent worker, no inherited frame
+    assert review_assembly._execution.get() is None  # independent worker, no inherited frame
     parent = f.s.runs.record
     route = {
         key: value
@@ -1783,7 +1869,7 @@ async def test_internal_derived_run_cannot_drop_parent_profile_to_escape_budget(
         id=derived.run_id,
         tenant_id=derived.tenant_id,
         actor_id=derived.actor_id,
-        actor_role=derived.actor_role.value,
+        actor_role=present(derived.actor_role).value,
         request=derived.request,
         mode=derived.mode.value,
         status="running",
@@ -1795,15 +1881,15 @@ async def test_internal_derived_run_cannot_drop_parent_profile_to_escape_budget(
         worker_lease_expires_at=datetime.now(UTC) + timedelta(seconds=60),
     )
     f.db.add(row)
-    f.s.runs.get = RunRepository(f.db).get  # actual persisted current and parent reads
+    pytest.MonkeyPatch().setattr(f.s.runs, "get", RunRepository(f.db).get)  # actual persisted current and parent reads
 
-    class MustNotDelegate:
-        def run(self, context):
+    class MustNotDelegate(StreamRuntimeStub):
+        def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
             pytest.fail("derived worker must never enter an unbudgeted runtime")
 
-    async def rejected():
+    async def rejected() -> None:
         with pytest.raises(
-            assembly().ReviewAssemblyUnavailable, match="derived_run_pool_continuity_unsupported"
+            review_assembly.ReviewAssemblyUnavailable, match="derived_run_pool_continuity_unsupported"
         ):
             async with worker_runtime_events(
                 MustNotDelegate(), derived, worker_id="independent-worker", review_broker=f.broker
@@ -1817,7 +1903,7 @@ async def test_internal_derived_run_cannot_drop_parent_profile_to_escape_budget(
         id=intermediate_id,
         tenant_id=derived.tenant_id,
         actor_id=derived.actor_id,
-        actor_role=derived.actor_role.value,
+        actor_role=present(derived.actor_role).value,
         request=derived.request,
         mode=derived.mode.value,
         status="failed",
@@ -1832,7 +1918,7 @@ async def test_internal_derived_run_cannot_drop_parent_profile_to_escape_budget(
     # Existing non-review parent chains retain the legacy None path.
     f.db.run.routing_decision = {
         key: value
-        for key, value in f.db.run.routing_decision.items()
+        for key, value in present(f.db.run.routing_decision).items()
         if key != "approval_review_profile"
     }
     assert await f.broker.prepare(derived, worker_id="independent-worker") is None
@@ -1841,7 +1927,7 @@ async def test_internal_derived_run_cannot_drop_parent_profile_to_escape_budget(
     assert not f.state.calls
 
 
-async def test_readiness_requires_review_budget_for_actual_conservative_hold(tmp_path):
+async def test_readiness_requires_review_budget_for_actual_conservative_hold(tmp_path: Path) -> None:
     f = await fixture(tmp_path)
     f.state.config = replace(f.state.config, max_cost_usd_per_run="0.000001")
     readiness = await f.broker.readiness(f.s.task.tenant_id)
@@ -1863,8 +1949,8 @@ async def test_readiness_requires_review_budget_for_actual_conservative_hold(tmp
     ],
 )
 async def test_assembled_allow_revocation_fences_consume_and_dispatch(
-    tmp_path, monkeypatch, phase, revocation
-):
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phase: str, revocation: object
+) -> None:
     """Actual worker/gate/SDK/ledger; only the awaited race is controlled."""
     from agent_hub.capabilities.defaults import build_runtime_capability_stack
     from agent_hub.capabilities.review_context import _ConcreteReviewCall
@@ -1877,7 +1963,7 @@ async def test_assembled_allow_revocation_fences_consume_and_dispatch(
     )
     from agent_hub.files.workspace import ProjectWorkspaceStore
 
-    a = assembly()
+    a = review_assembly
     f = await fixture(tmp_path)
     f.state.review = True
     document = evidence_document(f)
@@ -1897,12 +1983,16 @@ async def test_assembled_allow_revocation_fences_consume_and_dispatch(
         project_workspace_dir=tmp_path,
     )
     assert f.s.gate.dispatch_check is None  # unchanged default for old/non-assembled gates
+    assert isinstance(stack.harness_tool_gateway, a._ProfiledHarness)
     gate = stack.harness_tool_gateway._fresh._review_gate
-    assert gate.dispatch_check.__self__ is f.broker
+    assert gate is not None
+    bound_check = gate.dispatch_check
+    assert isinstance(bound_check, MethodType)
+    assert bound_check.__self__ is f.broker
     executions = []
     execute = stack.runtime_gateway.execute
 
-    async def actual_execute(**kwargs):
+    async def actual_execute(**kwargs: Unpack[ExecuteCall]) -> Mapping[str, JsonValue]:
         executions.append(kwargs)
         return await execute(**kwargs)
 
@@ -1911,14 +2001,14 @@ async def test_assembled_allow_revocation_fences_consume_and_dispatch(
     original_receipt = []
     outcomes = []
 
-    async def pause():
+    async def pause() -> None:
         row = next(row for row in f.db.rows if type(row) is RunReviewIntentRow)
         assert row.status == "allow" and row.private_receipt is not None
         attempt = next(row for row in f.db.rows if type(row) is RunAdmissionAttemptRow)
         assert attempt.state == "completed" and attempt.receipt_sha256
         pool = next(row for row in f.db.rows if type(row) is RunAdmissionPoolRow)
         original_receipt.append(
-            (row.private_receipt, attempt.receipt_sha256, pool.original_deadline)
+            (row.private_receipt, attempt.receipt_sha256, present(pool).original_deadline)
         )
         paused.set()
         await resume.wait()
@@ -1926,38 +2016,40 @@ async def test_assembled_allow_revocation_fences_consume_and_dispatch(
     if phase == "before_consume":
         consume = f.broker.review_repository.consume_permit
 
-        async def before(**kwargs):
+        async def before(**kwargs: Unpack[ConsumeKeywords]) -> bool:
             await pause()
-            return await consume(**kwargs)
+            result = await consume(**kwargs)
+            assert isinstance(result, bool)
+            return result
 
         monkeypatch.setattr(f.broker.review_repository, "consume_permit", before)
     elif phase == "inside_consume":
-        consume = ReviewRepository.consume_permit
+        base_consume = ReviewRepository.consume_permit
 
-        async def inside(self, **kwargs):
-            result = await consume(self, **kwargs)
+        async def inside(self: ReviewRepository, **kwargs: Unpack[ConsumeKeywords]) -> bool:
+            result = await base_consume(self, **kwargs)
             assert result is True
             await pause()
             return result
 
         monkeypatch.setattr(ReviewRepository, "consume_permit", inside)
     elif phase == "during_dispatch":
-        callback = gate.dispatch_check
+        callback = present(gate.dispatch_check)
 
-        async def during_dispatch():
+        async def during_dispatch() -> None:
             # All original budget/compile/DAO checks pass. Revoke while awaiting
             # the callback's LAST catalog read; its sync evidence check must see it.
-            budget = a._execution.get().budget
+            budget = present(a._execution.get()).budget
             require = budget.require_current
             get_current = f.broker._configs.get_current
             armed = False
 
-            async def checked():
+            async def checked() -> None:
                 nonlocal armed
                 await require()
                 armed = True
 
-            async def current(tenant):
+            async def current(tenant: UUID) -> ConfigRevision | None:
                 value = await get_current(tenant)
                 if armed:
                     await pause()
@@ -1975,14 +2067,14 @@ async def test_assembled_allow_revocation_fences_consume_and_dispatch(
     else:
         dispatch = _ConcreteReviewCall.before_dispatch
 
-        async def before_dispatch(self):
+        async def before_dispatch(self: _ConcreteReviewCall) -> bool:
             await pause()
             return await dispatch(self)
 
         monkeypatch.setattr(_ConcreteReviewCall, "before_dispatch", before_dispatch)
 
-    class Runtime:
-        async def run(self, context):
+    class Runtime(StreamRuntimeStub):
+        async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
             for request in (
                 f.s.request,
                 replace(f.s.request, actor="repair_agent", idempotency_key="repeat"),
@@ -1999,7 +2091,7 @@ async def test_assembled_allow_revocation_fences_consume_and_dispatch(
                 kind="runtime.checked", sequence=1, run_id=context.run_id, payload={"checked": True}
             )
 
-    async def drive():
+    async def drive() -> list[RunEvent]:
         async with worker_runtime_events(
             Runtime(), f.s.task, worker_id=f.s.budget.lease.worker_id, review_broker=f.broker
         ) as events:
@@ -2012,12 +2104,14 @@ async def test_assembled_allow_revocation_fences_consume_and_dispatch(
         if revocation == "removed":
             path.unlink()
         elif revocation == "expired":
-            expiry = datetime.fromisoformat(document["valid_until"])
+            expiry_text = document["valid_until"]
+            assert isinstance(expiry_text, str)
+            expiry = datetime.fromisoformat(expiry_text)
 
             class Expired(datetime):
                 @classmethod
-                def now(cls, tz=None):
-                    return expiry + timedelta(seconds=1)
+                def now(cls, tz: tzinfo | None = None) -> Expired:
+                    return cls.fromisoformat((expiry + timedelta(seconds=1)).isoformat())
 
             monkeypatch.setattr(a, "datetime", Expired)
         elif revocation == "catalog":
@@ -2045,10 +2139,10 @@ async def test_assembled_allow_revocation_fences_consume_and_dispatch(
     assert (
         row.private_receipt,
         attempt.receipt_sha256,
-        pool.original_deadline,
+        present(pool).original_deadline,
     ) == original_receipt[0]
-    assert attempt.state == "completed" and pool.token_charged == 5
-    assert pool.review_count_charged == 1 and pool.original_token_grant == 40000
+    assert attempt.state == "completed" and present(pool).token_charged == 5
+    assert pool.review_count_charged == 1 and present(pool).original_token_grant == 40000
     consumed = sum(type(row) is RunReviewEventRow and row.kind == "consumed" for row in f.db.rows)
     assert consumed == (0 if phase == "before_consume" else 1)
 
@@ -2101,11 +2195,11 @@ async def test_assembled_allow_revocation_fences_consume_and_dispatch(
     ],
 )
 async def test_actual_proof_dependency_change_invalidates_installed_evidence(
-    tmp_path, monkeypatch, relative
-):
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, relative: str
+) -> None:
     from pathlib import Path
 
-    a = assembly()
+    a = review_assembly
     f = await fixture(tmp_path)
     original = a.runtime_source_fingerprint()
     document = evidence_document(f)
@@ -2117,7 +2211,7 @@ async def test_actual_proof_dependency_change_invalidates_installed_evidence(
     target = Path(a.__file__).resolve().parents[1] / relative
     read = Path.read_bytes
 
-    def changed(self):
+    def changed(self: Path) -> bytes:
         data = read(self)
         return data + b"\n# virtual dependency change\n" if self.resolve() == target else data
 

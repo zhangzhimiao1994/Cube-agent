@@ -7,7 +7,7 @@ import importlib
 import importlib.util
 from copy import deepcopy
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Literal
 
 import pytest
 
@@ -43,6 +43,7 @@ def case(*, existing: bool = True) -> Any:
             return plan
 
         async def prepare(self, invocation: Any, actual: Any) -> Any:
+            assert state is not None
             assert state['phase'] == 'executing' and state['execution_id'] == invocation.execution_id
             assert actual == plan
             events.append(('prepare', invocation.execution_id))
@@ -145,7 +146,7 @@ async def test_uncertain_dispatch_cold_recovery_only_inspects_same_execution() -
 
 
 @pytest.mark.parametrize('status', ['absent', 'in_progress', 'unknown'])
-async def test_unknown_never_downloads_or_resets_execution(status: str) -> None:
+async def test_unknown_never_downloads_or_resets_execution(status: Literal['absent', 'in_progress', 'unknown']) -> None:
     c = case()
     before = c.state()
     await c.state_io(expected=before, replace=before | {'phase': 'executing',

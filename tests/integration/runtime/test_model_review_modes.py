@@ -14,20 +14,21 @@ import json
 import os
 import shutil
 import tempfile
+from collections.abc import AsyncGenerator, AsyncIterator, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
-from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import pytest
 import pytest_asyncio
-from asyncpg.pgproto.pgproto import UUID as DriverUUID
 from redis.asyncio import Redis
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from agent_hub.auth.models import Role
 from agent_hub.capabilities.types import CapabilityRequest
+from agent_hub.db.base import Base
 from agent_hub.db.models import (
     RunAdmissionAttemptRow,
     RunAuthenticatedInputRow,
@@ -47,7 +48,7 @@ from agent_hub.runs.authorization import _persist_authenticated_input, _validate
 from agent_hub.runs.repository import RunRepository
 from agent_hub.runs.workspace import workspace_selection
 from agent_hub.runtime.autogen.adapter import AutoGenDiscussionRuntime
-from agent_hub.runtime.contracts import EventKind, RunEvent
+from agent_hub.runtime.contracts import EventKind, RunEvent, TaskContext
 from agent_hub.runtime.crew.adapter import CrewAIObjectFactory, CrewDispatchRuntime
 from agent_hub.runtime.defaults import TenantSecretResolver, _deployments
 from agent_hub.runtime.direct import DirectRuntime
@@ -56,8 +57,18 @@ from agent_hub.runtime.worker_execution import worker_runtime_events
 from tests.integration.capabilities.test_review_repository import (
     database_url as database_url,  # noqa: PLC0414 - dedicated URL identity fixture
 )
+from tests.integration.models.run_admission_typed_fixture import Storage
 from tests.integration.models.test_run_admission import (
     storage as storage,  # noqa: PLC0414 - actual PG transactions and identity checks
+)
+from tests.integration.runtime.review_mode_import_closure_typed_fixture import (
+    NativeCase,
+    TokenPool,
+    WireAttempt,
+    WireReceipt,
+)
+from tests.integration.runtime.review_mode_import_closure_typed_fixture import (
+    driver_uuid as DriverUUID,
 )
 from tests.integration.runtime.test_model_review_modes_helper import (
     FACTORIES,
@@ -73,6 +84,8 @@ from tests.integration.runtime.test_model_review_modes_helper import (
     submission_request,
     submitted_input_scope,
 )
+from tests.unit.harness.review_typed_fixture import StreamRuntimeStub, present
+from tests.unit.runs.project_auto_repair_typed_fixture import mapping
 
 pytestmark = [pytest.mark.integration, pytest.mark.asyncio(loop_scope="module")]
 
@@ -84,7 +97,7 @@ def owned_crewai_storage(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Non
 
 
 @pytest_asyncio.fixture(scope="module", loop_scope="module")
-async def own_redis():
+async def own_redis() -> AsyncGenerator[Redis, None]:
     """No TCP, production Redis, Docker, persistent data or external broker."""
     if os.name != "posix":
         raise RuntimeError(
@@ -156,7 +169,7 @@ async def own_redis():
                 assert process.returncode is not None
 
 
-async def collect(case):
+async def collect(case: NativeCase) -> list[RunEvent]:
     events = []
     async with worker_runtime_events(
         case.runtime,
@@ -169,13 +182,13 @@ async def collect(case):
     return events
 
 
-async def capacity_is_clean(case):
+async def capacity_is_clean(case: NativeCase) -> None:
     for capacity in case.capacities:
         for scope in ("fixture-primary", "fixture-reviewer"):
             assert await case.redis.zcard(capacity._keys(scope)["leases"]) == 0
 
 
-async def test_native_sources_are_bound_to_current_checkout():
+async def test_native_sources_are_bound_to_current_checkout() -> None:
     """Collector/source proof only, not proof of native execution."""
     root = Path(__file__).resolve().parents[3] / "src"
     classes = (
@@ -195,7 +208,7 @@ async def test_native_sources_are_bound_to_current_checkout():
     print(json.dumps(observed, sort_keys=True))
 
 
-async def test_protocol_responder_preserves_exact_reviewer_digest():
+async def test_protocol_responder_preserves_exact_reviewer_digest() -> None:
     """Protocol fixture only: no DB/native acceptance is claimed for this node."""
     digest = "a" * 64
     keys = ("schema_version", "decision", "risk", "reason_code", "rationale", "action_digest")
@@ -220,10 +233,10 @@ async def test_protocol_responder_preserves_exact_reviewer_digest():
     assert pending.requested_permissions == ("workspace.read", "command.run")
     scope = submitted_input_scope(pending)
     assert scope["conversation_id"] == pending.conversation_id
-    assert "message" not in scope["selection"]
+    assert "message" not in mapping(scope["selection"])
 
 
-async def test_protocol_fixture_capture_accepts_driver_uuid_without_changing_authority():
+async def test_protocol_fixture_capture_accepts_driver_uuid_without_changing_authority() -> None:
     """No PG: exercise actual asyncpg UUID, ORM row and strict sealed capture."""
     actor, tenant = uuid4(), uuid4()
     row = RunRow(
@@ -238,19 +251,22 @@ async def test_protocol_fixture_capture_accepts_driver_uuid_without_changing_aut
     lease = _WorkerLease("fixture-driver", uuid4())
     row.worker_id, row.worker_lease_token = lease.worker_id, DriverUUID(str(lease.token))
 
-    class RecordingSession:
+    class RecordingSession(AsyncSession):
         """Persistence protocol only, no SQL or native PG claim."""
 
-        def __init__(self):
-            self.rows = []
+        def __init__(self) -> None:
+            super().__init__()
+            self.rows: list[Base] = []
 
-        def add(self, item):
-            self.rows.append(item)
+        def add(self, instance: object, _warn: bool = True) -> None:
+            assert isinstance(instance, Base)
+            self.rows.append(instance)
 
-        async def flush(self):
+        async def flush(self, objects: Sequence[object] | None = None) -> None:
             pass
 
-        async def get(self, model, key):
+        async def get(self, entity: object, ident: object, **kwargs: object) -> None:
+            model, key = entity, ident
             assert model is RunInputAuthorizationRow and key == row.id
 
     assert isinstance(row.actor_id, UUID) and type(row.actor_id) is not UUID
@@ -293,28 +309,28 @@ async def test_protocol_fixture_capture_accepts_driver_uuid_without_changing_aut
     assert evidence.actor_role is Role.VIEWER  # No role upgrade hidden in normalization.
 
 
-async def test_protocol_fixture_credentials_match_actual_capacity_contract():
+async def test_protocol_fixture_credentials_match_actual_capacity_contract() -> None:
     """Exercise the real capacity credential registry before any Redis/PG setup."""
     tenant = uuid4()
     secrets = FixtureSecrets()
     deployments = _deployments(fixture_platform())
 
-    async def fingerprint(reference):
+    async def fingerprint(reference: str) -> str:
         return await secrets.fingerprint(tenant, reference)
 
     class RedisBoundary:
         calls = 0
 
-        async def eval(self, *args):
+        async def eval(self, *args: object) -> None:
             self.calls += 1
             raise OSError("protocol test stops at the Redis boundary")
 
     boundary = RedisBoundary()
     capacity = CapacityPool(boundary, deployments=deployments, fingerprint_resolver=fingerprint)
     registry = await capacity._resolved_credentials(deployments)
-    identities = {}
+    identities: dict[str, str] = {}
     for deployment in deployments:
-        value = registry.fingerprint_for(deployment.secret_ref)
+        value = present(registry.fingerprint_for(deployment.secret_ref))
         CredentialDescriptor(deployment.secret_ref, value)
         assert value == await secrets.fingerprint(tenant, deployment.secret_ref)
         previous = identities.setdefault(value, deployment.quota_scope_id)
@@ -341,9 +357,9 @@ async def test_protocol_fixture_credentials_match_actual_capacity_contract():
     assert boundary.calls == 0
 
 
-async def test_protocol_receipt_rejects_usage_drift_even_with_valid_digest():
+async def test_protocol_receipt_rejects_usage_drift_even_with_valid_digest() -> None:
     attempt_id, physical = uuid4(), uuid4()
-    sent = {
+    sent: WireAttempt = {
         "request_sha256": "a" * 64,
         "purpose": "primary",
         "physical_transport_id": str(physical),
@@ -359,14 +375,14 @@ async def test_protocol_receipt_rejects_usage_drift_even_with_valid_digest():
             "cost_usd": {"decimal": "0.000008"},
         },
     }
-    receipt = {
+    receipt: WireReceipt = {
         "outcome": "completed",
         "deployment": sent["deployment"],
         "attempt_id": str(attempt_id),
         "physical_transport_id": str(physical),
         "usage": sent["usage"],
     }
-    row = SimpleNamespace(
+    row = RunAdmissionAttemptRow(
         attempt_id=attempt_id,
         physical_transport_id=physical,
         state="completed",
@@ -378,7 +394,7 @@ async def test_protocol_receipt_rejects_usage_drift_even_with_valid_digest():
             json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest(),
     )
-    pool = SimpleNamespace(token_charged=5)
+    pool = TokenPool(token_charged=5)
     assert_wire_receipts([row], {attempt_id: sent}, pool)
     row.receipt = {**receipt, "usage": {**sent["usage"], "total_tokens": 999}}
     row.receipt_sha256 = hashlib.sha256(
@@ -392,13 +408,15 @@ async def test_protocol_receipt_rejects_usage_drift_even_with_valid_digest():
     "mode", [TaskMode.DIRECT, TaskMode.DISPATCH, TaskMode.DISCUSS, TaskMode.HYBRID]
 )
 async def test_actual_native_modes_share_original_pool_and_deliver_chat(
-    storage, own_redis, tmp_path, mode
-):
+    storage: Storage, own_redis: Redis, tmp_path: Path, mode: TaskMode
+) -> None:
     """Real native smoke: ordinary chat, zero reviewer; not model-required proof."""
     case = await build_case(storage, tmp_path, mode, own_redis)
     try:
-        evidence = await case.repository.load_authenticated_input(
-            case.context.tenant_id, case.context.run_id
+        evidence = present(
+            await case.repository.load_authenticated_input(
+                case.context.tenant_id, case.context.run_id
+            )
         )
         assert evidence.message == case.body.message
         assert json.loads(evidence.input_scope) == submitted_input_scope(case.body)
@@ -434,8 +452,10 @@ async def test_actual_native_modes_share_original_pool_and_deliver_chat(
         assert not case.wire.budgets[0]._active
         assert case.wire.reviewer_calls == 0
         assert all(body.closed for body in case.wire.bodies)
-        pool = await RunAdmissionRepository(case.factory).get_pool(
-            case.context.tenant_id, case.context.run_id
+        pool = present(
+            await RunAdmissionRepository(case.factory).get_pool(
+                case.context.tenant_id, case.context.run_id
+            )
         )
         assert pool.original_token_grant == 10000000
         assert pool.authorization_turn_id == evidence.turn_id
@@ -467,18 +487,20 @@ async def test_actual_native_modes_share_original_pool_and_deliver_chat(
         await capacity_is_clean(case)
     finally:
         case.wire.release.set()
-        await case.runtime.cancel_run_owned(case.context.run_id, case.context.execution_token)
+        await case.runtime.cancel_run_owned(
+            case.context.run_id, present(case.context.execution_token)
+        )
 
 
 async def test_standard_fresh_workspace_write_is_inbound_not_model_required(
-    storage, own_redis, tmp_path
-):
+    storage: Storage, own_redis: Redis, tmp_path: Path
+) -> None:
     """Persisted standard route documents the source blocker, without deleting conversation_id."""
     case = await build_case(storage, tmp_path, TaskMode.DIRECT, own_redis)
     context = case.context
     request = CapabilityRequest(
         tenant_id=context.tenant_id,
-        user_id=context.actor_id,
+        user_id=present(context.actor_id),
         run_id=context.run_id,
         agent_id="main_agent",
         capability="file",
@@ -488,17 +510,17 @@ async def test_standard_fresh_workspace_write_is_inbound_not_model_required(
         idempotency_key="native-write",
     )
     policy, inbound = await case.stack.policy_gateway._current_review_policy(
-        request, context.actor_role
+        request, present(context.actor_role)
     )
     assert context.routing_decision["conversation_id"]
     assert inbound is True
-    assert policy.evaluate(request, context.actor_role).route == "allowed"
+    assert policy.evaluate(request, present(context.actor_role)).route == "allowed"
     assert case.wire.reviewer_calls == 0 and not case.wire.calls
 
 
 async def test_actual_direct_cancel_retains_unknown_hold_and_releases_capacity(
-    storage, own_redis, tmp_path
-):
+    storage: Storage, own_redis: Redis, tmp_path: Path
+) -> None:
     """Representative actual adapter failure, not UNKNOWN reviewer recovery proof."""
     case = await build_case(storage, tmp_path, TaskMode.DIRECT, own_redis)
     case.wire.block_primary = True
@@ -508,8 +530,10 @@ async def test_actual_direct_cancel_retains_unknown_hold_and_releases_capacity(
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
-        pool = await RunAdmissionRepository(case.factory).get_pool(
-            case.context.tenant_id, case.context.run_id
+        pool = present(
+            await RunAdmissionRepository(case.factory).get_pool(
+                case.context.tenant_id, case.context.run_id
+            )
         )
         assert pool.token_charged == 131072 and pool.review_count_charged == 0
         async with case.factory() as session:
@@ -528,10 +552,14 @@ async def test_actual_direct_cancel_retains_unknown_hold_and_releases_capacity(
         if not task.done():
             task.cancel()
         await asyncio.gather(task, return_exceptions=True)
-        await case.runtime.cancel_run_owned(case.context.run_id, case.context.execution_token)
+        await case.runtime.cancel_run_owned(
+            case.context.run_id, present(case.context.execution_token)
+        )
 
 
-async def test_protocol_actual_guarded_sdk_wire_observer_matches_persisted_receipt(tmp_path):
+async def test_protocol_actual_guarded_sdk_wire_observer_matches_persisted_receipt(
+    tmp_path: Path,
+) -> None:
     """Real SDK/guard/DAO code, fixed HTTP and unit DB/capacity seams; no native claim."""
     import httpx
 
@@ -542,15 +570,15 @@ async def test_protocol_actual_guarded_sdk_wire_observer_matches_persisted_recei
         FixedWire,
         assert_wire_receipts,
     )
-    from tests.unit.models.test_physical_budget import logical_request
+    from tests.unit.harness.review_typed_fixture import logical_request
     from tests.unit.runtime.test_review_assembly import fixture
 
     f = await fixture(tmp_path)
     wire = FixedWire()
     transport = LiteLLMClient(_network_delegate_factory=lambda: httpx.MockTransport(wire))
 
-    class Runtime:
-        async def run(self, context):
+    class Runtime(StreamRuntimeStub):
+        async def run(self, context: TaskContext) -> AsyncIterator[RunEvent]:
             gateway, _, _ = await _gateway_for_config(
                 f.state.platform,
                 tenant_id=context.tenant_id,
@@ -568,6 +596,6 @@ async def test_protocol_actual_guarded_sdk_wire_observer_matches_persisted_recei
     ) as events:
         await anext(events)
     attempts = [row for row in f.db.rows if type(row) is RunAdmissionAttemptRow]
-    pool = await RunAdmissionRepository(f.db).get_pool(f.s.task.tenant_id, f.s.task.run_id)
+    pool = present(await RunAdmissionRepository(f.db).get_pool(f.s.task.tenant_id, f.s.task.run_id))
     assert_wire_receipts(attempts, wire.attempts, pool)
     assert len(wire.calls) == 1 and all(body.closed for body in wire.bodies)

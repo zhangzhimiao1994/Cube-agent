@@ -1,13 +1,33 @@
 """Approval behavior identity is distinct from the fresh private worker envelope."""
 
-import importlib
+from collections.abc import Iterator
 from datetime import timedelta
+from typing import Unpack
 from uuid import UUID
 
 import pytest
 
+from agent_hub.capabilities import python_resolution_preparation as preparation_module
+from agent_hub.capabilities.types import CapabilityRequest
+from agent_hub.runs.repository import RunRecord
+from agent_hub.skills.sandbox import python_dependency_index_store as index_files
+from agent_hub.skills.sandbox import python_registry_protocol as registry_protocol
+from agent_hub.skills.sandbox import python_resolution_protocol as resolution_protocol
+from agent_hub.skills.sandbox import python_resolution_store as resolution_store
+from agent_hub.skills.sandbox.python_resolution_protocol import (
+    ResolutionRequest,
+    ResolutionStatus,
+)
 from tests.unit.skills import test_python_registry_read as registry
 from tests.unit.skills import test_python_resolution_store as fixtures
+from tests.unit.skills.resolution_overlay_process_typed_fixture import (
+    DirectoryEntry,
+    ResolveArgs,
+    RootStoreCase,
+    SendArgs,
+    no_current,
+    present,
+)
 
 root_store = fixtures.root_store
 offline_network = registry.offline_network
@@ -16,11 +36,7 @@ from tests.unit.capabilities import test_python_resolution_preparation as author
 live = authority_tests.live
 
 
-def api():
-    return importlib.import_module("agent_hub.capabilities.python_resolution_preparation")
-
-
-def test_same_action_does_not_reask_just_because_approval_resumed_on_new_lease():
+def test_same_action_does_not_reask_just_because_approval_resumed_on_new_lease() -> None:
     first = fixtures.claim()
     second = first.model_copy(
         update={
@@ -30,15 +46,17 @@ def test_same_action_does_not_reask_just_because_approval_resumed_on_new_lease()
         }
     )
     needs = (registry.api()[0].DependencyNeed("demo>=1", "a" * 64),)
-    a = api().resolution_action(first, needs, registry.environment())
-    b = api().resolution_action(second, needs, registry.environment())
+    a = preparation_module.resolution_action(first, needs, registry.environment())
+    b = preparation_module.resolution_action(second, needs, registry.environment())
     assert a == b
     assert str(first.lease_token) not in a.model_dump_json()
     assert str(second.lease_token) not in b.model_dump_json()
 
 
-async def test_verified_data_rebinds_to_fresh_worker_without_extending_original_budget(root_store):
-    protocol, _ = fixtures.api()
+async def test_verified_data_rebinds_to_fresh_worker_without_extending_original_budget(
+    root_store: RootStoreCase,
+) -> None:
+    protocol = resolution_protocol
     descriptor, _ = await fixtures.data()
     original = fixtures.claim()
     from dataclasses import replace
@@ -72,18 +90,19 @@ async def test_verified_data_rebinds_to_fresh_worker_without_extending_original_
     assert before == {p: n.data for p, n in root_store.fs.nodes.items()}
 
 
-async def test_inspect_can_forward_exact_publication_plan_without_authorizing_it(monkeypatch):
-    from agent_hub.skills.sandbox.python_resolution_protocol import ResolutionStatus
+async def test_inspect_can_forward_exact_publication_plan_without_authorizing_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
 
-    preparation = api().PythonResolutionPreparation(current=lambda: None, approved=None)
+    preparation = preparation_module.PythonResolutionPreparation(current=no_current, approved=None)
     original = fixtures.claim()
     descriptor, _ = await fixtures.data()
-    plan = fixtures.api()[1].freeze_plan(
+    plan = resolution_store.freeze_plan(
         descriptor, original=original, current=original, overlay_sha256="c" * 64
     )
-    captured = []
+    captured: list[tuple[str, SendArgs]] = []
 
-    async def send(action, **kwargs):
+    async def send(action: str, **kwargs: Unpack[SendArgs]) -> ResolutionStatus:
         captured.append((action, kwargs))
         return ResolutionStatus(state="unknown", key=plan.resolution_key)
 
@@ -98,10 +117,12 @@ async def test_inspect_can_forward_exact_publication_plan_without_authorizing_it
     assert captured[0][1]["plan"] == plan
 
 
-async def test_legacy_unknown_publication_cannot_be_reissued_under_new_semantic_hash(root_store):
+async def test_legacy_unknown_publication_cannot_be_reissued_under_new_semantic_hash(
+    root_store: RootStoreCase,
+) -> None:
     from dataclasses import replace
 
-    protocol, _ = fixtures.api()
+    protocol = resolution_protocol
     descriptor, _ = await fixtures.data()
     original = fixtures.claim()
     original = original.model_copy(
@@ -117,7 +138,7 @@ async def test_legacy_unknown_publication_cannot_be_reissued_under_new_semantic_
     store.begin(key, original)
     store.complete(key, original, descriptor)
     plan = store.freeze(key, original)
-    legacy_sha = protocol.digest(
+    legacy_sha = registry_protocol.digest(
         {**plan.model_dump(mode="json"), "claim": plan.claim.effect_payload()}
     )
     assert legacy_sha != plan.sha256
@@ -132,14 +153,13 @@ async def test_legacy_unknown_publication_cannot_be_reissued_under_new_semantic_
     assert before == {p: n.data for p, n in root_store.fs.nodes.items()}
 
 
-async def test_cold_inspect_accepts_only_opaque_plan_hash(monkeypatch):
-    from agent_hub.skills.sandbox.python_resolution_protocol import ResolutionStatus
+async def test_cold_inspect_accepts_only_opaque_plan_hash(monkeypatch: pytest.MonkeyPatch) -> None:
 
-    preparation = api().PythonResolutionPreparation(current=lambda: None, approved=None)
+    preparation = preparation_module.PythonResolutionPreparation(current=no_current, approved=None)
     claim = fixtures.claim()
-    seen = []
+    seen: list[SendArgs] = []
 
-    async def send(action, **kwargs):
+    async def send(action: str, **kwargs: Unpack[SendArgs]) -> ResolutionStatus:
         seen.append(kwargs)
         return ResolutionStatus(state="unknown", key="a" * 64)
 
@@ -154,10 +174,12 @@ async def test_cold_inspect_accepts_only_opaque_plan_hash(monkeypatch):
     assert seen[0].get("plan") is None
 
 
-async def test_root_opaque_inspect_reloads_original_unknown_without_old_private_lease(root_store):
+async def test_root_opaque_inspect_reloads_original_unknown_without_old_private_lease(
+    root_store: RootStoreCase,
+) -> None:
     from dataclasses import replace
 
-    protocol, _ = fixtures.api()
+    protocol = resolution_protocol
     original = fixtures.claim()
     original = original.model_copy(
         update={
@@ -182,10 +204,12 @@ async def test_root_opaque_inspect_reloads_original_unknown_without_old_private_
 
 
 @pytest.mark.parametrize("change", ["actor", "tenant", "run", "source"])
-async def test_opaque_root_lookup_rejects_scope_or_source_splice(root_store, change):
+async def test_opaque_root_lookup_rejects_scope_or_source_splice(
+    root_store: RootStoreCase, change: str
+) -> None:
     from dataclasses import replace
 
-    protocol, _ = fixtures.api()
+    protocol = resolution_protocol
     original = fixtures.claim()
     original = original.model_copy(
         update={
@@ -222,38 +246,39 @@ async def test_opaque_root_lookup_rejects_scope_or_source_splice(root_store, cha
     assert before == {p: n.data for p, n in root_store.fs.nodes.items()}
 
 
-async def test_new_bound_worker_keeps_behavior_approval_but_unbound_row_cannot_adopt_it(live):
+async def test_new_bound_worker_keeps_behavior_approval_but_unbound_row_cannot_adopt_it(
+    live: authority_tests.Live,
+) -> None:
     from dataclasses import replace
 
     from agent_hub.capabilities.execution_authority import bind_execution_authority
-    from agent_hub.skills.sandbox.python_resolution_protocol import ResolutionStatus
 
     c = live
-    approved_actions = []
-    dispatched = []
+    approved_actions: list[CapabilityRequest] = []
+    dispatched: list[ResolutionRequest] = []
 
-    async def current():
+    async def current() -> RunRecord:
         return c.row
 
-    async def approved(request):
+    async def approved(request: CapabilityRequest) -> bool:
         approved_actions.append(request)
         return True
 
-    async def transport(request):
+    async def transport(request: ResolutionRequest) -> ResolutionStatus:
         dispatched.append(request)
         return ResolutionStatus(state="unknown", key=request.key)
 
-    preparation = api().PythonResolutionPreparation(
+    preparation = preparation_module.PythonResolutionPreparation(
         current=current, approved=approved, transport=transport
     )
-    args = {
+    args: ResolveArgs = {
         "needs": (registry.api()[0].DependencyNeed("demo", "a" * 64),),
         "environment": registry.environment(),
         "planning": c.planning,
     }
     with bind_execution_authority(c.context, worker_id="worker", actor="implementer"):
         await preparation.resolve(**args)
-    original = preparation._original
+    original = present(preparation._original)
     c.row = replace(c.row, worker_id="fresh_worker", worker_lease_token=UUID(int=999))
     with (
         bind_execution_authority(c.context, worker_id="worker", actor="implementer"),
@@ -265,14 +290,16 @@ async def test_new_bound_worker_keeps_behavior_approval_but_unbound_row_cannot_a
         await preparation.resolve(**args)
     assert len(dispatched) == 2 and dispatched[-1].claim.lease_token == UUID(int=999)
     assert all(action == approved_actions[0] for action in approved_actions)
-    assert preparation._original.original_deadline == original.original_deadline
-    assert preparation._original.monotonic_deadline <= original.monotonic_deadline
+    assert present(preparation._original).original_deadline == original.original_deadline
+    assert present(preparation._original).monotonic_deadline <= original.monotonic_deadline
 
 
-async def test_unknown_publication_cannot_escape_through_fresh_source_plan(root_store):
+async def test_unknown_publication_cannot_escape_through_fresh_source_plan(
+    root_store: RootStoreCase,
+) -> None:
     from dataclasses import replace
 
-    protocol, _ = fixtures.api()
+    protocol = resolution_protocol
     original = fixtures.claim()
     original = original.model_copy(
         update={
@@ -311,11 +338,13 @@ async def test_unknown_publication_cannot_escape_through_fresh_source_plan(root_
     assert store.publication_status(key, fresh, second) == "unknown"
 
 
-async def test_publication_keeps_original_monotonic_ceiling_on_fresh_lease(root_store):
+async def test_publication_keeps_original_monotonic_ceiling_on_fresh_lease(
+    root_store: RootStoreCase,
+) -> None:
     import time
     from dataclasses import replace
 
-    protocol, _ = fixtures.api()
+    protocol = resolution_protocol
     original = fixtures.claim()
     original = original.model_copy(
         update={
@@ -354,10 +383,12 @@ async def test_publication_keeps_original_monotonic_ceiling_on_fresh_lease(root_
         "orphan_result",
     ],
 )
-async def test_legacy_publication_history_stays_once_across_source(root_store, history):
+async def test_legacy_publication_history_stays_once_across_source(
+    root_store: RootStoreCase, history: str
+) -> None:
     from dataclasses import replace
 
-    protocol, _ = fixtures.api()
+    protocol = resolution_protocol
     original = fixtures.claim()
     original = original.model_copy(
         update={
@@ -386,7 +417,7 @@ async def test_legacy_publication_history_stays_once_across_source(root_store, h
             }
         )
     prior_plan = store.freeze(key, prior_claim)
-    legacy_sha = protocol.digest(
+    legacy_sha = registry_protocol.digest(
         {**prior_plan.model_dump(mode="json"), "claim": prior_plan.claim.effect_payload()}
     )
     store._create(
@@ -449,14 +480,14 @@ async def test_legacy_publication_history_stays_once_across_source(root_store, h
 
 @pytest.mark.parametrize("limit", ["deadline", "bytes"])
 async def test_legacy_history_enumeration_is_bounded_before_any_new_effect(
-    root_store, monkeypatch, limit
-):
+    root_store: RootStoreCase, monkeypatch: pytest.MonkeyPatch, limit: str
+) -> None:
     import time
     from contextlib import contextmanager
     from dataclasses import replace
     from types import SimpleNamespace
 
-    protocol, store_module = fixtures.api()
+    protocol = resolution_protocol
     original = fixtures.claim()
     original = original.model_copy(
         update={
@@ -472,21 +503,21 @@ async def test_legacy_history_enumeration_is_bounded_before_any_new_effect(
     store.begin(key, original)
     store.complete(key, original, descriptor)
     plan = store.freeze(key, original)
-    seen = []
+    seen: list[int] = []
     clock = [time.monotonic()]
     if limit == "deadline":
-        monkeypatch.setattr(store_module.files, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+        monkeypatch.setattr(index_files, "time", SimpleNamespace(monotonic=lambda: clock[0]))
 
     @contextmanager
-    def scandir(parent):
+    def scandir(parent: int) -> Iterator[Iterator[DirectoryEntry]]:
         assert root_store.fs.fds[parent][1] == root_store.supply.state_root.as_posix()
 
-        def entries():
-            for number in range(store_module.MAX_CONTROL):
+        def entries() -> Iterator[DirectoryEntry]:
+            for number in range(resolution_protocol.MAX_CONTROL):
                 seen.append(number)
                 if limit == "deadline" and number == 1:
                     clock[0] = original.monotonic_deadline + 1
-                yield SimpleNamespace(name=f"{number:012d}" + "x" * 220)
+                yield DirectoryEntry(name=f"{number:012d}" + "x" * 220)
 
         yield entries()
 
@@ -494,5 +525,5 @@ async def test_legacy_history_enumeration_is_bounded_before_any_new_effect(
     before = {p: n.data for p, n in root_store.fs.nodes.items()}
     with pytest.raises(ValueError, match="timeout" if limit == "deadline" else "history_limit"):
         store.publication_begin(key, original, plan)
-    assert len(seen) <= (2 if limit == "deadline" else store_module.MAX_CONTROL // 232 + 1)
+    assert len(seen) <= (2 if limit == "deadline" else resolution_protocol.MAX_CONTROL // 232 + 1)
     assert before == {p: n.data for p, n in root_store.fs.nodes.items()}

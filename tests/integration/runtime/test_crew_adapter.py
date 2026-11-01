@@ -70,6 +70,20 @@ TENANT_ID = UUID("00000000-0000-4000-8000-000000000022")
 class DelegatingArtifactRepository:
     delegate: InMemoryArtifactRepository
 
+    async def find_references(
+        self,
+        tenant_id: UUID,
+        run_id: UUID,
+        *,
+        type: str,
+        producer: str,
+        limit: int = 128,
+        after: UUID | None = None,
+    ) -> tuple[ArtifactReference, ...]:
+        return await self.delegate.find_references(
+            tenant_id, run_id, type=type, producer=producer, limit=limit, after=after
+        )
+
     async def reserve_write(
         self,
         tenant_id: UUID,
@@ -89,6 +103,22 @@ class DelegatingArtifactRepository:
         write_id: UUID,
     ) -> bool:
         return await self.delegate.abort_write(tenant_id, run_id, reference, write_id=write_id)
+
+
+class UnexpectedReferenceLookup:
+    """Failure-only fakes must never fabricate discoverable stored artifacts."""
+
+    async def find_references(
+        self,
+        tenant_id: UUID,
+        run_id: UUID,
+        *,
+        type: str,
+        producer: str,
+        limit: int = 128,
+        after: UUID | None = None,
+    ) -> tuple[ArtifactReference, ...]:
+        raise AssertionError("failure-only repository unexpectedly queried references")
 
 
 class FakeGateway:
@@ -3345,7 +3375,7 @@ async def test_cancelled_repository_hydration_never_replaces_checkpoint() -> Non
 
 
 async def test_failed_model_artifact_put_preserves_running_boundary_and_zero_usage() -> None:
-    class RejectingRepository:
+    class RejectingRepository(UnexpectedReferenceLookup):
         async def reserve_write(
             self,
             tenant_id: UUID,
@@ -3603,7 +3633,7 @@ def test_restored_model_artifact_rejects_oversized_tool_call_batch(
 async def test_repository_verification_failure_keeps_model_running_and_terminates(
     mode: str,
 ) -> None:
-    class UntrustedRepository:
+    class UntrustedRepository(UnexpectedReferenceLookup):
         def __init__(self) -> None:
             self.stored: Artifact | None = None
             self.write_id: UUID | None = None
@@ -3716,7 +3746,7 @@ async def test_candidate_checkpoint_failure_keeps_last_running_boundary() -> Non
 
 
 async def test_unexpected_repository_exception_still_delivers_terminal() -> None:
-    class ExplodingRepository:
+    class ExplodingRepository(UnexpectedReferenceLookup):
         async def reserve_write(
             self,
             tenant_id: UUID,
@@ -4166,7 +4196,7 @@ async def test_rollback_cancelled_error_is_reported_as_cleanup_failure(
     adapter_module = importlib.import_module("agent_hub.runtime.crew.adapter")
     monkeypatch.setattr(adapter_module, "_ARTIFACT_CLEANUP_DEADLINE_SECONDS", 0.05)
 
-    class CancelledRollbackRepository:
+    class CancelledRollbackRepository(UnexpectedReferenceLookup):
         def __init__(self) -> None:
             self.delegate = InMemoryArtifactRepository()
             self.started = asyncio.Event()
@@ -4234,7 +4264,7 @@ async def test_rollback_that_swallows_one_cancel_is_cancelled_again_and_collecte
         0.05,
     )
 
-    class SwallowOnceRepository:
+    class SwallowOnceRepository(UnexpectedReferenceLookup):
         def __init__(self) -> None:
             self.delegate = InMemoryArtifactRepository()
             self.started = asyncio.Event()
@@ -4315,7 +4345,7 @@ async def test_non_cooperative_rollback_is_detached_at_hard_deadline_and_runtime
         0.02,
     )
 
-    class NonCooperativeRepository:
+    class NonCooperativeRepository(UnexpectedReferenceLookup):
         def __init__(self) -> None:
             self.delegate = InMemoryArtifactRepository()
             self.started = asyncio.Event()
@@ -4410,7 +4440,7 @@ async def test_aborted_write_fence_rejects_a_put_that_finishes_after_cancel(
         0.05,
     )
 
-    class LatePutRepository:
+    class LatePutRepository(UnexpectedReferenceLookup):
         def __init__(self) -> None:
             self.delegate = InMemoryArtifactRepository()
             self.started = asyncio.Event()

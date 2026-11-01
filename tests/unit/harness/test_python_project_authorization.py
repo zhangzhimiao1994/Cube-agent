@@ -6,7 +6,7 @@ from uuid import UUID
 import pytest
 
 from agent_hub.auth.models import Role
-from agent_hub.capabilities.gateway import CapabilityStatus
+from agent_hub.capabilities.gateway import CapabilityResult, CapabilityStatus
 from agent_hub.capabilities.types import CapabilityRequest
 from agent_hub.harness.tool_gateway import HarnessToolGateway
 from agent_hub.harness.types import HarnessToolCallRequest
@@ -19,7 +19,7 @@ class RecipeBackend(FakeRuntimeCapabilityGateway):
     ) -> None:
         super().__init__()
         self.changes, self.error, self.node = changes or {}, error, node
-        self.resolutions = []
+        self.resolutions: list[CapabilityRequest] = []
 
     async def project_verification_authorization(
         self, request: CapabilityRequest
@@ -42,8 +42,17 @@ class RecipeBackend(FakeRuntimeCapabilityGateway):
         return CapabilityRequest.model_validate(fields | self.changes, strict=True)
 
 
-async def authorize(backend: Any) -> tuple[Any, FakePolicyGateway]:
-    policy = FakePolicyGateway(CapabilityStatus.ALLOWED)
+class RecordingStaticPolicy(FakePolicyGateway):
+    async def authorize_static(self, request: CapabilityRequest, *, role: Role) -> CapabilityResult:
+        return await super().invoke(request, role=role)
+
+    async def invoke(self, request: CapabilityRequest, *, role: Role) -> CapabilityResult:
+        self.requests.append((request, role))
+        raise AssertionError("static admission must not request concrete approval")
+
+
+async def authorize(backend: Any) -> tuple[Any, RecordingStaticPolicy]:
+    policy = RecordingStaticPolicy(CapabilityStatus.ALLOWED)
     gateway = HarnessToolGateway(backend, policy_gateway=policy)
     call = HarnessToolCallRequest(
         run_id=UUID(int=2),

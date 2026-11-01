@@ -8,6 +8,7 @@ from uuid import uuid4
 
 import pytest
 from sqlalchemy import event as sql_event
+from sqlalchemy.engine import Connection, ExecutionContext
 
 from agent_hub.db.models import RunCheckpointRow
 from agent_hub.runs.repository import _public_event_payload
@@ -16,6 +17,8 @@ from agent_hub.runtime.autogen.adapter import AutoGenDiscussionRuntime, _Discuss
 from agent_hub.runtime.contracts import EventKind, RunEvent, RuntimeCheckpoint, TaskContext
 from agent_hub.runtime.defaults import ConfigBackedDiscussionRuntime, _PlannedRuntime
 from agent_hub.runtime.engineering_admission import EngineeringAdmissionRuntime
+from tests.unit.runs.project_auto_repair_typed_fixture import mapping
+from tests.unit.runs.snapshot_approval_types_fixture import closable, number
 from tests.unit.runs.test_crew_report_publication_red_oct29 import persist_group, sql_repository
 from tests.unit.runtime.autogen.test_engineering_completion import (
     Capabilities,
@@ -110,7 +113,7 @@ async def test_restore_invalid_discussion_control_cannot_publish(
     case = native_case
     checkpoint = case.main_checkpoint
     invalid = changed_checkpoint(checkpoint, {"discussion_control": {
-        **checkpoint.state["discussion_control"], field: value,
+        **mapping(checkpoint.state["discussion_control"]), field: value,
     }})
     # The state gate alone permits this Mapping; actual restoration does not.
     case.runtime._validate_checkpoint(invalid, case.task)
@@ -164,7 +167,7 @@ async def test_actual_configured_chain_validates_only_its_live_execution() -> No
     class Configured(ConfigBackedDiscussionRuntime):
         builds = 0
 
-        async def _runtime_for(self, task: TaskContext):
+        async def _runtime_for(self, task: TaskContext) -> EngineeringAdmissionRuntime:
             self.builds += 1
             return child
 
@@ -176,7 +179,7 @@ async def test_actual_configured_chain_validates_only_its_live_execution() -> No
     }})
     saved: RuntimeCheckpoint | None = None
     seen_report = False
-    iterator = configured.run(task)
+    iterator = closable(configured.run(task))
     try:
         async for event in iterator:
             if event.artifact is not None and event.artifact.producer == OWNER:
@@ -217,7 +220,7 @@ async def test_real_repository_rolls_back_report_and_recovers_without_replay(nat
         class SaveFailed(RuntimeError):
             pass
 
-        def fail_checkpoint(connection, cursor, statement, parameters, execution_context, many):
+        def fail_checkpoint(connection: Connection, cursor: object, statement: str, parameters: object, execution_context: ExecutionContext, many: bool) -> None:
             if statement.startswith("INSERT INTO " + RunCheckpointRow.__tablename__):
                 raise SaveFailed("owned checkpoint insertion failure")
 
@@ -299,7 +302,7 @@ async def test_recovery_dedup_requires_exact_current_run_checkpoint_prefix(
     elif defect == "scope":
         prefix = (prefix[0].model_copy(update={"run_id": uuid4()}), *prefix[1:])
     else:
-        changed = changed_checkpoint(checkpoint, {"next_sequence": checkpoint.state["next_sequence"] + 1})
+        changed = changed_checkpoint(checkpoint, {"next_sequence": number(checkpoint.state["next_sequence"]) + 1})
         prefix = (*prefix[:-1], prefix[-1].model_copy(update={"checkpoint": changed}))
     with pytest.raises(RuntimeError, match="publication recovery"):
         _ = [group async for group in _delivery_publication_batches(

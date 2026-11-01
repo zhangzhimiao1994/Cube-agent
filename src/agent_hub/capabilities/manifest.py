@@ -4,7 +4,7 @@ import re
 from collections.abc import Mapping
 from typing import cast
 
-from jsonschema import (  # type: ignore[import-untyped]
+from jsonschema import (
     Draft3Validator,
     Draft4Validator,
     Draft6Validator,
@@ -12,9 +12,9 @@ from jsonschema import (  # type: ignore[import-untyped]
     Draft201909Validator,
     Draft202012Validator,
 )
-from jsonschema.protocols import Validator  # type: ignore[import-untyped]
-from jsonschema.validators import validator_for  # type: ignore[import-untyped]
+from jsonschema.protocols import Validator
 
+from agent_hub.plugins.schemas import known_schema_validator
 from agent_hub.runtime.contracts import JsonValue
 
 _SAFE_MANIFEST_NAME = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,127}$")
@@ -170,7 +170,7 @@ def _project_schema_at_depth(
         expected = _SCHEMA_DIALECTS.get(dialect_uri.removesuffix("#"))
         if expected is None:
             return None
-        selected: type[Validator] | None = validator_for(schema, default=None)
+        selected = known_schema_validator(schema)
         if selected is not expected:
             return None
         dialect = expected

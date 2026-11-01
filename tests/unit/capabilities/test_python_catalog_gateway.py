@@ -100,7 +100,9 @@ def assert_observation(case: CatalogCase, result: HarnessToolCallResult) -> Mapp
     assert result.truncated is False, 'the complete inspection envelope must survive the 64KB Harness boundary'
     assert result.payload['scope'] == {'tenant_id': str(case.db.run.tenant_id), 'run_id': str(case.db.run.id),
         'project_id': 'catalog-project', 'workspace_session_id': 'catalog-session'}
-    assert result.payload['environment']['readiness'] == 'not_probed'
+    environment = result.payload['environment']
+    assert isinstance(environment, Mapping)
+    assert environment['readiness'] == 'not_probed'
     profile = result.payload['python_build_profile']
     assert isinstance(profile, Mapping)
     assert profile['status'] == case.profile.status == 'configured_not_probed'
@@ -108,8 +110,11 @@ def assert_observation(case: CatalogCase, result: HarnessToolCallResult) -> Mapp
     assert profile['interpreter'] == case.profile.interpreter.model_dump(mode='json')
     assert profile['recipe'] == 'python_offline_wheel_v1' and profile['build_backend'] == 'setuptools.build_meta'
     assert profile['build_requirement_names'] == ('setuptools', 'wheel')
-    assert 'Not an installation receipt' in profile['catalog_usage']
+    usage = profile['catalog_usage']
+    assert isinstance(usage, str)
+    assert 'Not an installation receipt' in usage
     assert len(encoded(profile)) <= 8192
+    assert case.db.run.routing_decision is not None
     assert 'project_verification_receipt' not in case.db.run.routing_decision
     assert case.backend._project_delivery_receipts == {} and case.db.approvals == {}
     return profile
@@ -249,7 +254,9 @@ async def test_foreign_broker_scope_cannot_publish_pins_or_catalog(
     case = catalog_case(tmp_path, monkeypatch, foreign_broker_scope=foreign)
     result = await case.inspect()
     assert result.status == 'succeeded' and result.truncated is False
-    assert result.payload['python_build_profile']['status'] == 'unavailable'
-    assert 'catalog' not in result.payload['python_build_profile']
+    profile = result.payload['python_build_profile']
+    assert isinstance(profile, Mapping)
+    assert profile['status'] == 'unavailable'
+    assert 'catalog' not in profile
     assert case.profile.catalog_sha256 not in repr(result.payload)
     assert len(case.broker_calls) == 1

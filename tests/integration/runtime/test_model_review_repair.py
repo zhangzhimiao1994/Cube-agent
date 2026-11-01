@@ -5,22 +5,29 @@ Redis fixture when native selectors are deliberately executed. Offline selectors
 start neither; they are not PG/native acceptance. No SSH/migrations/real provider.
 """
 
+from __future__ import annotations
+
 import asyncio
 import hashlib
 import importlib.util
 import json
 import shutil
 import sys
-from collections.abc import Mapping
-from dataclasses import replace
-from datetime import UTC, datetime, timedelta
+from collections.abc import AsyncGenerator, Callable, Mapping
+from contextvars import ContextVar
+from dataclasses import dataclass, replace
+from datetime import UTC, datetime, timedelta, tzinfo
 from pathlib import Path
-from types import SimpleNamespace
-from uuid import uuid4
+from typing import NotRequired, Protocol, TypedDict, Unpack
+from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from agent_hub.capabilities.approvals import PluginApprovalIdentity
+from agent_hub.capabilities.types import CapabilityRequest
+from agent_hub.db.base import Base
 from agent_hub.db.models import (
     RunAdmissionAttemptRow,
     RunOutboxRow,
@@ -30,23 +37,40 @@ from agent_hub.db.models import (
 )
 from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.files.workspace import ProjectWorkspaceStore
-from agent_hub.models.run_admission_repository import RunAdmissionRepository, _WorkerLease
+from agent_hub.models.run_admission_repository import (
+    RunAdmissionRepository,
+    _WorkerLease,
+)
 from agent_hub.runs.artifacts import PostgresArtifactRepository
+from agent_hub.runs.repository import RunRecord, RunRepository
 from agent_hub.runs.self_repair import project_repair_checkpoint_is_safe
+from agent_hub.runs.toolchain_supply import ToolchainSupplyAuthority
 from agent_hub.runtime import review_assembly
 from agent_hub.runtime.artifacts import InMemoryArtifactRepository
 from agent_hub.runtime.autogen import project_repair_phase
-from agent_hub.runtime.contracts import EventKind, RunEvent, _mutable_json
+from agent_hub.runtime.autogen.adapter import DiscussionParticipant
+from agent_hub.runtime.contracts import (
+    EventKind,
+    JsonValue,
+    RunEvent,
+    RuntimeCheckpoint,
+    TaskContext,
+    _mutable_json,
+)
 from agent_hub.runtime.review_assembly import ReviewAssemblyUnavailable
 from agent_hub.runtime.worker_execution import worker_runtime_events
 from tests.integration.capabilities.test_review_repository import (
     database_url as database_url,  # noqa: PLC0414 - explicit dedicated PG fixture
 )
+from tests.integration.models.run_admission_typed_fixture import Storage
 from tests.integration.models.test_run_admission import storage as storage  # noqa: PLC0414
 from tests.integration.runtime._model_review_repair_fixture import (
     ORIGINAL,
     PATCHED,
     TARGET,
+    AcceptedCase,
+    RedisCards,
+    RepairComponents,
     RepairWire,
     capacity_clean,
     components,
@@ -54,24 +78,84 @@ from tests.integration.runtime._model_review_repair_fixture import (
     projected_worker,
     projection_case,
 )
-from tests.integration.runtime.test_model_review_modes import (
-    own_redis as own_redis,  # noqa: PLC0414
-)
-from tests.unit.runtime.test_review_assembly import evidence_document
-from tests.unit.runtime.test_review_assembly import fixture as offline_assembly
-from tests.unit.runtime.test_review_repair_continuity import (
+from tests.integration.runtime._model_review_repair_typed_fixture import (
+    RepairDB,
     claim,
     pool_values,
     productive_checkpoint,
     repair_fixture,
     service_runtime_context,
 )
+from tests.integration.runtime.test_model_review_modes import (
+    own_redis as own_redis,  # noqa: PLC0414
+)
+from tests.unit.harness.review_typed_fixture import StreamRuntimeStub, present
+from tests.unit.runs.project_auto_repair_typed_fixture import (
+    UnexpectedTaskQueue,
+    integer,
+    json_map,
+    ledger,
+    mapping,
+    mutable,
+    mutable_json,
+    sequence,
+    string,
+)
+from tests.unit.runtime.test_review_assembly import evidence_document
+from tests.unit.runtime.test_review_assembly import fixture as offline_assembly
+
+
+class BeginApprovalArguments(TypedDict):
+    approval_id: str
+    approval_fingerprint: str
+    approval_scope: NotRequired[str | None]
+    actor_id: NotRequired[UUID | None]
+    plugin_identity: NotRequired[PluginApprovalIdentity | None]
+    toolchain_authority: NotRequired[ToolchainSupplyAuthority | None]
+    go_recipe_authority: NotRequired[ToolchainSupplyAuthority | None]
+    expected_go_recipe: NotRequired[Mapping[str, object] | None]
+    approval_request: NotRequired[CapabilityRequest | None]
+
+
+class PoolMetadata(Protocol):
+    @property
+    def original_token_grant(self) -> int: ...
+    @property
+    def original_deadline(self) -> datetime: ...
+
+
+@dataclass
+class MetadataPool:
+    original_token_grant: int
+    original_deadline: datetime
+
+
+class WorkerArguments(TypedDict, total=False):
+    worker_id: str
+    run_repository: RunRepository
+    review_broker: review_assembly.ReviewAssemblyBroker
+
+
+class ParticipantArguments(TypedDict):
+    id: str
+    role: str
+    goal: str
+    logical_model: str
+    allowed_tools: tuple[str, ...]
+
+
+async def latest_local_checkpoint(
+    repository: RunRepository, db: RepairDB, tenant: UUID, run: UUID
+) -> RuntimeCheckpoint | None:
+    async with db() as session:
+        return await repository.latest_checkpoint(session, tenant_id=tenant, run_id=run)
+
 
 pytestmark = [pytest.mark.integration, pytest.mark.asyncio(loop_scope="module")]
 
 
 @pytest.fixture(scope="session")
-def migrated_database():
+def migrated_database() -> None:
     """Override integration's auto-migration for this module only.
 
     The PG selectors use storage's explicit identity/URL guards and require the
@@ -79,20 +163,26 @@ def migrated_database():
     """
 
 
-async def rows(factory, model, run):
+async def rows[T: Base](
+    factory: async_sessionmaker[AsyncSession], model: type[T], run: UUID
+) -> list[T]:
     async with factory() as session:
-        return list((await session.scalars(select(model).where(model.run_id == run))).all())
+        return list(
+            (await session.scalars(select(model).where(model.__table__.c.run_id == run))).all()
+        )
 
 
-def _metadata_hash(value):
+def _metadata_hash(value: object) -> str:
     return hashlib.sha256(
         json.dumps(
-            _mutable_json(value), sort_keys=True, separators=(",", ":"), allow_nan=False
+            mutable_json(value), sort_keys=True, separators=(",", ":"), allow_nan=False
         ).encode()
     ).hexdigest()
 
 
-def _recovery_restore_metadata(saved, loaded, phase, scope):
+def _recovery_restore_metadata(
+    saved: RuntimeCheckpoint | None, loaded: RuntimeCheckpoint | None, phase: object, scope: object
+) -> dict[str, object]:
     assert saved is not None and loaded is not None and isinstance(phase, Mapping)
     assert (saved.id, saved.run_id, saved.tenant_id, saved.mode) == (
         loaded.id,
@@ -110,11 +200,11 @@ def _recovery_restore_metadata(saved, loaded, phase, scope):
         "loaded_checkpoint_sha256": loaded.state_sha256,
         "prepared_phase_sha256": _metadata_hash(phase),
         "phase_source_checkpoint_sha256": phase["source_checkpoint_sha256"],
-        "source_scope_sha256": phase["source_scope_sha256"],
+        "source_scope_sha256": mapping(phase)["source_scope_sha256"],
     }
 
 
-def _recovery_pool_metadata(pool, lease):
+def _recovery_pool_metadata(pool: PoolMetadata, lease: _WorkerLease) -> dict[str, object]:
     return {
         "token_grant": pool.original_token_grant,
         "deadline_sha256": _metadata_hash(pool.original_deadline.astimezone(UTC).isoformat()),
@@ -123,13 +213,18 @@ def _recovery_pool_metadata(pool, lease):
 
 
 async def _record_recovery_metadata(
-    f, repair, request, record_property, *, retry_calls=(None, None)
-):
+    f: AcceptedCase,
+    repair: RepairComponents,
+    request: pytest.FixtureRequest,
+    record_property: Callable[[str, object], None],
+    *,
+    retry_calls: tuple[int | None, int | None] = (None, None),
+) -> None:
     """Record actual asserted objects only; native PASS/cleanup belongs to collector."""
     contexts = f.wire.contexts
     assert len(contexts) == 2 and all(context.run_id == f.record.id for context in contexts)
     assert contexts[0].execution_token != contexts[1].execution_token
-    after = await RunAdmissionRepository(f.factory).get_pool(f.user.tenant_id, f.record.id)
+    after = present(await RunAdmissionRepository(f.factory).get_pool(f.user.tenant_id, f.record.id))
     assert (
         (after.tenant_id, after.run_id, after.authorization_turn_id)
         == (f.before.tenant_id, f.before.run_id, f.before.authorization_turn_id)
@@ -165,7 +260,9 @@ async def _record_recovery_metadata(
             assert item.physical_transport_id == observed["physical_id"]
         leases.append(lease)
     assert after.token_charged == sum(
-        item.token_hold if item.state == "unknown" else item.receipt["usage"]["total_tokens"]
+        item.token_hold
+        if item.state == "unknown"
+        else integer(mapping(mapping(item.receipt)["usage"])["total_tokens"])
         for item in attempts
     )
     intents = await rows(f.factory, RunReviewIntentRow, f.record.id)
@@ -190,7 +287,7 @@ async def _record_recovery_metadata(
     # Canonical SOURCE scope, not the current waiting-approval DTO with its new
     # approval ID/fingerprint/locator. The phase was prepared inside the real
     # worker proof and its exact checkpoint must have been committed below.
-    scope_after = checkpoint.state[project_repair_phase.PHASE_KEY]["source_scope_sha256"]
+    scope_after = mapping(checkpoint.state[project_repair_phase.PHASE_KEY])["source_scope_sha256"]
     assert scope_after == f.scope_before
     async with f.factory() as session:
         durable = await f.repository.latest_checkpoint(
@@ -259,12 +356,12 @@ async def _record_recovery_metadata(
     "defect", [None, "checkpoint", "checkpoint_identity", "phase_source", "scope", "missing_phase"]
 )
 async def test_recovery_metadata_restore_binds_actual_checkpoint_and_prepared_phase_without_pg(
-    tmp_path, defect
-):
+    tmp_path: Path, defect: str | None
+) -> None:
     f = await repair_fixture(tmp_path)
     context = await claim(f)
-    prepared = project_repair_phase.prepare(
-        context, f.cp, f.cp.state["model_ledger"], f.cp.state["tool_ledger"]
+    prepared: dict[str, JsonValue] | None = project_repair_phase.prepare(
+        context, f.cp, ledger(f.cp.state["model_ledger"]), ledger(f.cp.state["tool_ledger"])
     )
     loaded = f.cp
     if defect == "checkpoint":
@@ -272,12 +369,12 @@ async def test_recovery_metadata_restore_binds_actual_checkpoint_and_prepared_ph
     elif defect == "checkpoint_identity":
         loaded = f.cp.model_copy(update={"run_id": uuid4()})
     elif defect == "phase_source":
-        prepared["source_checkpoint_sha256"] = "f" * 64
+        present(prepared)["source_checkpoint_sha256"] = "f" * 64
     elif defect == "scope":
-        prepared["source_scope_sha256"] = "f" * 64
+        present(prepared)["source_scope_sha256"] = "f" * 64
     elif defect == "missing_phase":
         prepared = None
-    scope = context.routing_decision["repair_proposal"]["automatic_scope_sha256"]
+    scope = mapping(mapping(context.routing_decision)["repair_proposal"])["automatic_scope_sha256"]
     if defect is not None:
         with pytest.raises(AssertionError):
             _recovery_restore_metadata(f.cp, loaded, prepared, scope)
@@ -297,10 +394,10 @@ async def test_recovery_metadata_restore_binds_actual_checkpoint_and_prepared_ph
 
 
 @pytest.mark.parametrize("change", ["token", "owner", "deadline"])
-async def test_recovery_metadata_hashes_bind_lease_deadline_without_exposing_them(change):
-    pool = SimpleNamespace(
-        original_token_grant=1000, original_deadline=datetime(2026, 1, 1, tzinfo=UTC)
-    )
+async def test_recovery_metadata_hashes_bind_lease_deadline_without_exposing_them(
+    change: str,
+) -> None:
+    pool = MetadataPool(1000, datetime(2026, 1, 1, tzinfo=UTC))
     lease = _WorkerLease("local-protocol-owner", uuid4())
     before = _recovery_pool_metadata(pool, lease)
     if change == "deadline":
@@ -322,10 +419,9 @@ async def test_recovery_metadata_hashes_bind_lease_deadline_without_exposing_the
     "delay_after_begin", [False, True], ids=["ordinary", "committed-before-return"]
 )
 async def test_actual_service_repair_manual_approval_drains_real_checkpoint_without_pg(
-    tmp_path, monkeypatch, delay_after_begin
-):
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, delay_after_begin: bool
+) -> None:
     """Actual accept/worker/adapter/Root pause and service drain; local SQL seam only."""
-    from sqlalchemy.sql.dml import Insert
 
     from agent_hub.db import models
     from agent_hub.runs.approval_checkpoint import checkpoint_waits_for_approval
@@ -333,7 +429,7 @@ async def test_actual_service_repair_manual_approval_drains_real_checkpoint_with
     from agent_hub.runs.service import RunService
     from agent_hub.runtime.registry import RuntimeRegistry
     from agent_hub.runtime.repair_projection import _Projection
-    from tests.unit.runs.test_project_auto_repair import decision
+    from tests.integration.runtime._model_review_repair_typed_fixture import decision
 
     f = await repair_fixture(
         tmp_path,
@@ -346,72 +442,14 @@ async def test_actual_service_repair_manual_approval_drains_real_checkpoint_with
             "permission_mode": "default",
         },
     )
-    original_pool = await RunAdmissionRepository(f.db).get_pool(f.cp.tenant_id, f.cp.run_id)
+    original_pool = present(
+        await RunAdmissionRepository(f.db).get_pool(f.cp.tenant_id, f.cp.run_id)
+    )
     held = next(row for row in f.db.rows if type(row) is models.RunAdmissionAttemptRow)
     original_hold = (held.attempt_id, held.state, held.token_hold, held.receipt_sha256)
-    scalar, execute = f.db.scalar, f.db.execute
-    tables = {
-        cls.__tablename__: cls
-        for cls in (
-            models.RunEventRow,
-            models.RunCheckpointRow,
-            models.RunArtifactRow,
-            models.RunUsageRow,
-            models.RunApprovalRow,
-        )
-    }
+    from tests.integration.runtime._model_review_repair_fixture import local_service_sql
 
-    def inserted(statement):
-        cls = tables[statement.table.name]
-        params = statement.compile().params
-        keys = (
-            ("run_id", "sequence")
-            if cls in (models.RunEventRow, models.RunCheckpointRow)
-            else ("id",)
-        )
-        if any(
-            type(row) is cls and all(getattr(row, key) == params[key] for key in keys)
-            for row in f.db.rows
-        ):
-            return None
-        row = cls(**params)
-        f.db.add(row)
-        return row.id
-
-    async def local_scalar(statement):
-        if isinstance(statement, Insert):
-            return inserted(statement)
-        if getattr(statement.column_descriptions[0]["expr"], "name", None) == "count":
-            table = statement.get_final_froms()[0].name
-            return sum(type(row).__tablename__ == table for row in f.db.rows)
-        return await scalar(statement)
-
-    async def local_execute(statement):
-        if isinstance(statement, Insert):
-            identity = inserted(statement)
-            return SimpleNamespace(scalar_one_or_none=lambda: identity)
-        if getattr(statement.column_descriptions[0]["expr"], "name", None) == "count":
-            artifacts = [row for row in f.db.rows if type(row) is models.RuntimeArtifactRow]
-            return SimpleNamespace(
-                one=lambda: (len(artifacts), sum(row.byte_size for row in artifacts))
-            )
-        return await execute(statement)
-
-    async def local_get(cls, identity, **kwargs):
-        values = identity if isinstance(identity, tuple) else (identity,)
-        keys = [column.key for column in cls.__mapper__.primary_key]
-        return next(
-            (
-                row
-                for row in f.db.rows
-                if type(row) is cls
-                and all(getattr(row, key) == value for key, value in zip(keys, values, strict=True))
-            ),
-            None,
-        )
-
-    f.db.scalar, f.db.execute = local_scalar, local_execute
-    f.db.get = local_get
+    local_service_sql(f.db)
     f.db.rows[:] = [
         row for row in f.db.rows if type(row) not in (models.RunEventRow, models.RunCheckpointRow)
     ]
@@ -423,7 +461,6 @@ async def test_actual_service_repair_manual_approval_drains_real_checkpoint_with
     root = ProjectWorkspaceStore(tmp_path).session_root(f.cp.tenant_id, "demo", "session")
     root.mkdir(parents=True, exist_ok=True)
     (root / TARGET).write_text(ORIGINAL, encoding="utf-8")
-    f.f.broker._a2_tenant = f.cp.tenant_id
     wire = RepairWire(unknown_review=True, authorization_message=f.original_task.request)
     common = (
         tmp_path,
@@ -436,19 +473,20 @@ async def test_actual_service_repair_manual_approval_drains_real_checkpoint_with
         f.f.capacity,
         wire,
     )
-    initial = await components(*common)
+    initial = await components(*common, tenant_id=f.cp.tenant_id)
     initial.runtime.prime_unknown = False
     async with worker_runtime_events(
         initial.runtime, f.original_task, worker_id=f.db.run.worker_id, review_broker=f.f.broker
     ) as stream:
         async for event in stream:
-            sequence = await f.runs.next_event_sequence(f.db, f.cp.run_id)
-            await f.runs.persist_event(
-                f.db,
-                tenant_id=f.cp.tenant_id,
-                run_id=f.cp.run_id,
-                event=event.model_copy(update={"sequence": sequence}),
-            )
+            async with f.db() as session:
+                sequence = await f.runs.next_event_sequence(session, f.cp.run_id)
+                await f.runs.persist_event(
+                    session,
+                    tenant_id=f.cp.tenant_id,
+                    run_id=f.cp.run_id,
+                    event=event.model_copy(update={"sequence": sequence}),
+                )
     checkpoint = initial.runtime.last_checkpoint
     assert checkpoint is not None, [
         (row.kind, row.payload.get("reason"))
@@ -466,7 +504,9 @@ async def test_actual_service_repair_manual_approval_drains_real_checkpoint_with
         "soft": checkpoint.state.get("remaining_timeout_seconds"),
         "absolute": checkpoint.state.get("remaining_absolute_timeout_seconds"),
         "ceiling": f.db.run.routing_decision.get("runtime_timeout_absolute_seconds"),
-        "tool_status": [row.get("status") for row in checkpoint.state.get("tool_ledger", ())],
+        "tool_status": [
+            row.get("status") for row in ledger(checkpoint.state.get("tool_ledger", ()))
+        ],
     }
     proposal = replace(
         decision(checkpoint),
@@ -476,7 +516,7 @@ async def test_actual_service_repair_manual_approval_drains_real_checkpoint_with
         automatic_scope_sha256=project_repair_scope_sha256(f.db.run.routing_decision),
     )
     f.db.run.routing_decision = {
-        **f.db.run.routing_decision,
+        **mapping(f.db.run.routing_decision),
         "approval_kind": "self_repair",
         "decision_token": "local-real-checkpoint",
         "repair_proposal": proposal.to_proposal(run_id=f.cp.run_id),
@@ -490,12 +530,14 @@ async def test_actual_service_repair_manual_approval_drains_real_checkpoint_with
         decision_token="local-real-checkpoint",
         automatic_checkpoint_sha256=checkpoint.state_sha256,
     )
-    repair = await components(*common)
+    repair = await components(*common, tenant_id=f.cp.tenant_id)
     begin_approval = f.runs.begin_capability_approval
     waiting_call_counts = []
 
-    async def observed_begin(*args, **kwargs):
-        record = await begin_approval(*args, **kwargs)
+    async def observed_begin(
+        tenant_id: UUID, run_id: UUID, **kwargs: Unpack[BeginApprovalArguments]
+    ) -> RunRecord:
+        record = await begin_approval(tenant_id, run_id, **kwargs)
         waiting_call_counts.append(len(wire.calls))
         if delay_after_begin:
             await asyncio.sleep(
@@ -507,20 +549,20 @@ async def test_actual_service_repair_manual_approval_drains_real_checkpoint_with
     refreshed_statuses = []
     refresh = _Projection.refresh
 
-    async def observe_refresh(self):
+    async def observe_refresh(self: _Projection) -> None:
         refreshed_statuses.append(f.db.run.status)
         await refresh(self)
 
     monkeypatch.setattr(_Projection, "refresh", observe_refresh)
 
-    async def trusted_window():
+    async def trusted_window() -> int:
         return 131072
 
     service = RunService(
         f.runs,
         runtime_registry=RuntimeRegistry((repair.runtime,)),
         router=None,
-        task_queue=SimpleNamespace(),
+        task_queue=UnexpectedTaskQueue(),
         worker_id="local-repair-drain",
         runtime_timeout_seconds=60,
         runtime_token_budget=40000,
@@ -528,7 +570,7 @@ async def test_actual_service_repair_manual_approval_drains_real_checkpoint_with
         main_agent_context_window_getter=trusted_window,
     )
     result = await asyncio.wait_for(service.execute(f.cp.run_id), timeout=15)
-    approval_id = f.db.run.routing_decision.get("approval_id")
+    approval_id = mapping(f.db.run.routing_decision).get("approval_id")
     assert approval_id, {
         "events": [
             (row.kind, row.payload.get("tool_name"), row.payload.get("reason"))
@@ -539,13 +581,13 @@ async def test_actual_service_repair_manual_approval_drains_real_checkpoint_with
         "reviews": len(wire.reviews),
     }
     assert result.status is RunStatus.WAITING_APPROVAL
-    saved = await f.runs.latest_checkpoint(f.db, tenant_id=f.cp.tenant_id, run_id=f.cp.run_id)
-    assert checkpoint_waits_for_approval(saved, approval_id)
+    saved = await latest_local_checkpoint(f.runs, f.db, f.cp.tenant_id, f.cp.run_id)
+    assert checkpoint_waits_for_approval(saved, string(approval_id))
     assert set(refreshed_statuses) == {"running"}
     assert waiting_call_counts == [len(wire.calls)], "waiting may not start any new model calls"
-    assert repair.root_entries == repair.root_effects == []
+    assert (repair.root_entries, repair.root_effects) == ([], [])
     assert (root / TARGET).read_text(encoding="utf-8") == ORIGINAL
-    after_pool = await RunAdmissionRepository(f.db).get_pool(f.cp.tenant_id, f.cp.run_id)
+    after_pool = present(await RunAdmissionRepository(f.db).get_pool(f.cp.tenant_id, f.cp.run_id))
     assert (
         after_pool.authorization_turn_id,
         after_pool.original_token_grant,
@@ -558,46 +600,77 @@ async def test_actual_service_repair_manual_approval_drains_real_checkpoint_with
     assert (held.attempt_id, held.state, held.token_hold, held.receipt_sha256) == original_hold
 
 
-async def accepted_case(storage, tmp_path, redis_client, *, unknown_review=False):
+async def accepted_case(
+    storage: Storage, tmp_path: Path, redis_client: RedisCards, *, unknown_review: bool = False
+) -> AcceptedCase:
     f = await pg_case(storage, tmp_path, redis_client, unknown_review=unknown_review)
-    f.source_sha = review_assembly.runtime_source_fingerprint()
-    f.root_before_sha = hashlib.sha256((f.root / TARGET).read_bytes()).hexdigest()
+    source_sha = review_assembly.runtime_source_fingerprint()
+    root_before_sha = hashlib.sha256((f.root / TARGET).read_bytes()).hexdigest()
     initial = await f.service("a2-original-worker")
     result = await asyncio.wait_for(initial.service.execute(f.record.id), timeout=75)
     assert result.status is RunStatus.QUEUED, (
         "known stopped failure must really classify/auto-accept"
     )
     accepted = await f.repository.get(f.user.tenant_id, f.record.id)
-    assert accepted.routing_decision["source"] == "self_repair"
-    assert accepted.routing_decision["self_repair_source_run_id"] == str(f.record.id)
+    assert mapping(accepted.routing_decision)["source"] == "self_repair"
+    assert mapping(accepted.routing_decision)["self_repair_source_run_id"] == str(f.record.id)
     outbox = await rows(f.factory, RunOutboxRow, f.record.id)
     assert any(":self-repair:" in item.idempotency_key for item in outbox)
     assert len(f.wire.unknown_ids) == 1
-    assert initial.root_entries == initial.root_effects == []
+    assert (initial.root_entries, initial.root_effects) == ([], [])
     attempts = await rows(f.factory, RunAdmissionAttemptRow, f.record.id)
     unknown = next(item for item in attempts if item.attempt_id in f.wire.unknown_ids)
     assert unknown.state == "unknown" and unknown.token_hold > 0
-    f.before = await RunAdmissionRepository(f.factory).get_pool(f.user.tenant_id, f.record.id)
-    f.unknown = (unknown.attempt_id, unknown.token_hold, unknown.receipt_sha256)
-    f.unknown_state_before = unknown.state
-    f.scope_before = project_repair_phase.authority_digest(accepted.routing_decision)
-    assert f.scope_before == accepted.routing_decision["repair_proposal"]["automatic_scope_sha256"]
+    before = present(
+        await RunAdmissionRepository(f.factory).get_pool(f.user.tenant_id, f.record.id)
+    )
+    unknown_observation = (unknown.attempt_id, unknown.token_hold, unknown.receipt_sha256)
+    unknown_state_before = unknown.state
+    scope_before = project_repair_phase.authority_digest(mapping(accepted.routing_decision))
+    assert (
+        scope_before
+        == mapping(mapping(accepted.routing_decision)["repair_proposal"])["automatic_scope_sha256"]
+    )
     async with f.factory() as session:
-        f.saved_checkpoint = await f.repository.latest_checkpoint(
+        saved_checkpoint = await f.repository.latest_checkpoint(
             session, tenant_id=f.user.tenant_id, run_id=f.record.id
         )
-    assert f.saved_checkpoint is not None
+    assert saved_checkpoint is not None
     assert (
-        f.saved_checkpoint.state_sha256
-        == accepted.routing_decision["repair_proposal"]["automatic_checkpoint_sha256"]
+        saved_checkpoint.state_sha256
+        == mapping(mapping(accepted.routing_decision)["repair_proposal"])[
+            "automatic_checkpoint_sha256"
+        ]
     )
-    f.initial = initial
-    return f
+    return AcceptedCase(
+        f.factory,
+        f.user,
+        f.repository,
+        f.wire,
+        f.record,
+        f.root,
+        f.evidence,
+        f.capacities,
+        f.redis_client,
+        f.service,
+        source_sha,
+        root_before_sha,
+        before,
+        unknown_observation,
+        unknown_state_before,
+        scope_before,
+        saved_checkpoint,
+        initial,
+    )
 
 
 async def test_discuss_service_repair_new_diagnosis_review_and_single_root_effect(
-    storage, own_redis, tmp_path, request, record_property
-):
+    storage: Storage,
+    own_redis: RedisCards,
+    tmp_path: Path,
+    request: pytest.FixtureRequest,
+    record_property: Callable[[str, object], None],
+) -> None:
     f = await accepted_case(storage, tmp_path, own_redis)
     assert (f.root / TARGET).read_text(encoding="utf-8") == ORIGINAL
     repair = await f.service("a2-repair-worker")  # cold actual adapter, same durable DAO facts
@@ -636,14 +709,16 @@ async def test_discuss_service_repair_new_diagnosis_review_and_single_root_effec
     for item in attempts:
         assert item.request_sha256 == f.wire.sent[item.attempt_id]["request_sha256"]
         assert item.physical_transport_id == f.wire.sent[item.attempt_id]["physical_id"]
-    after = await RunAdmissionRepository(f.factory).get_pool(f.user.tenant_id, f.record.id)
+    after = present(await RunAdmissionRepository(f.factory).get_pool(f.user.tenant_id, f.record.id))
     assert (after.authorization_turn_id, after.original_token_grant, after.original_deadline) == (
         f.before.authorization_turn_id,
         f.before.original_token_grant,
         f.before.original_deadline,
     )
     assert after.token_charged == sum(
-        item.token_hold if item.state == "unknown" else item.receipt["usage"]["total_tokens"]
+        item.token_hold
+        if item.state == "unknown"
+        else integer(mapping(mapping(item.receipt)["usage"])["total_tokens"])
         for item in attempts
     )
     assert f.wire.bodies and all(body.closed for body in f.wire.bodies)
@@ -652,8 +727,12 @@ async def test_discuss_service_repair_new_diagnosis_review_and_single_root_effec
 
 
 async def test_discuss_repair_unknown_review_never_executes_or_replays(
-    storage, own_redis, tmp_path, request, record_property
-):
+    storage: Storage,
+    own_redis: RedisCards,
+    tmp_path: Path,
+    request: pytest.FixtureRequest,
+    record_property: Callable[[str, object], None],
+) -> None:
     f = await accepted_case(storage, tmp_path, own_redis, unknown_review=True)
     repair = await f.service("a2-repair-worker")
     result = await asyncio.wait_for(repair.service.execute(f.record.id), timeout=75)
@@ -661,7 +740,7 @@ async def test_discuss_repair_unknown_review_never_executes_or_replays(
     assert result.status is RunStatus.FAILED
     assert f.wire.diagnosed and len(f.wire.reviews) == 1
     assert (f.root / TARGET).read_text(encoding="utf-8") == ORIGINAL
-    assert repair.root_entries == repair.root_effects == []
+    assert (repair.root_entries, repair.root_effects) == ([], [])
     intents = await rows(f.factory, RunReviewIntentRow, f.record.id)
     assert len(intents) == 1 and intents[0].status == "unknown" and not intents[0].consumed
     before = len(f.wire.calls)
@@ -672,17 +751,17 @@ async def test_discuss_repair_unknown_review_never_executes_or_replays(
     attempts = await rows(f.factory, RunAdmissionAttemptRow, f.record.id)
     assert len([item for item in attempts if item.purpose == "review"]) == 1
     assert len([item for item in attempts if item.state == "unknown"]) == 2
-    assert retry.root_entries == retry.root_effects == []
+    assert (retry.root_entries, retry.root_effects) == ([], [])
     await capacity_clean(f)
     await _record_recovery_metadata(
         f, repair, request, record_property, retry_calls=(before, len(f.wire.calls))
     )
 
 
-async def test_discuss_sdk_stopped_checkpoint_protocol_without_pg(tmp_path):
+async def test_discuss_sdk_stopped_checkpoint_protocol_without_pg(tmp_path: Path) -> None:
     """Actual adapter/SDK/Root diagnostic only; no claim of PG/service coverage."""
     f = await offline_assembly(tmp_path, mode=TaskMode.DISCUSS)
-    route = {
+    route: dict[str, object] = {
         **f.s.task.routing_decision,
         "engineering_auto_repair_version": 1,
         "engineering_delivery_contract_version": 1,
@@ -695,7 +774,6 @@ async def test_discuss_sdk_stopped_checkpoint_protocol_without_pg(tmp_path):
     root = ProjectWorkspaceStore(tmp_path).session_root(f.s.task.tenant_id, "demo", "session")
     root.mkdir(parents=True, exist_ok=True)
     (root / TARGET).write_text(ORIGINAL, encoding="utf-8")
-    f.broker._a2_tenant = f.s.task.tenant_id
     case = await components(
         tmp_path,
         f.s.runs,
@@ -706,6 +784,7 @@ async def test_discuss_sdk_stopped_checkpoint_protocol_without_pg(tmp_path):
         f.secrets,
         f.capacity,
         RepairWire(),
+        tenant_id=f.s.task.tenant_id,
     )
     events = []
     async with worker_runtime_events(
@@ -717,7 +796,7 @@ async def test_discuss_sdk_stopped_checkpoint_protocol_without_pg(tmp_path):
     checkpoint = case.runtime.last_checkpoint
     assert checkpoint is not None, (
         "runtime fault must occur after a real ACKed observation boundary; "
-        f"events={[(event.kind.value, event.reason) for event in events]}; "
+        f"events={[(str(event.kind), event.reason) for event in events]}; "
         f"calls={len(case.wire.calls)}; tools={case.wire.tool_calls}"
     )
     assert project_repair_checkpoint_is_safe(
@@ -737,38 +816,45 @@ async def test_discuss_sdk_stopped_checkpoint_protocol_without_pg(tmp_path):
         if type(row) is RunAdmissionAttemptRow and row.attempt_id in case.wire.unknown_ids
     )
     assert unknown.state == "unknown" and unknown.token_hold > 0
-    assert case.root_entries == case.root_effects == []
+    assert (case.root_entries, case.root_effects) == ([], [])
     assert (root / TARGET).read_text(encoding="utf-8") == ORIGINAL
 
 
-async def test_service_window_projection_preserves_actual_repair_phase_without_pg(tmp_path):
+async def test_service_window_projection_preserves_actual_repair_phase_without_pg(
+    tmp_path: Path,
+) -> None:
     """A2's next production gate, after A1 has admitted the actual service projection."""
     f = await repair_fixture(tmp_path)
     original = await claim(f)
     context = await service_runtime_context(f, original, window=10000)
     assert await f.f.broker.prepare(context, worker_id="repair-worker") is not None
-    checkpoint = context.checkpoint
+    checkpoint = present(context.checkpoint)
     assert project_repair_phase.prepare(
-        original, checkpoint, checkpoint.state["model_ledger"], checkpoint.state["tool_ledger"]
+        original,
+        checkpoint,
+        ledger(checkpoint.state["model_ledger"]),
+        ledger(checkpoint.state["tool_ledger"]),
     )
 
-    async def check(actual):
+    async def check(actual: TaskContext) -> object:
         return prepare_projection_phase(actual, checkpoint)
 
     assert await projected_worker(f, context, check)
 
 
 async def test_projected_phase_keeps_original_scope_through_productive_and_cold_resume_without_pg(
-    tmp_path,
-):
+    tmp_path: Path,
+) -> None:
     f = await repair_fixture(tmp_path)
     original = await claim(f)
     runtime = await service_runtime_context(f, original, window=10000)
-    expected = original.routing_decision["repair_proposal"]["automatic_scope_sha256"]
+    expected = mapping(mapping(original.routing_decision)["repair_proposal"])[
+        "automatic_scope_sha256"
+    ]
     assert project_repair_phase.authority_digest(original.routing_decision) == expected
     assert project_repair_phase.authority_digest(runtime.routing_decision) != expected
 
-    async def work(actual):
+    async def work(actual: TaskContext) -> tuple[RuntimeCheckpoint, object]:
         checkpoint = await productive_checkpoint(f, actual)
         artifacts = tuple(
             PostgresArtifactRepository._hydrate(row)
@@ -779,7 +865,7 @@ async def test_projected_phase_keeps_original_scope_through_productive_and_cold_
 
     checkpoint, before = await projected_worker(f, runtime, work)
     phase = checkpoint.state[project_repair_phase.PHASE_KEY]
-    assert phase["source_scope_sha256"] == expected
+    assert mapping(phase)["source_scope_sha256"] == expected
     artifacts = tuple(
         PostgresArtifactRepository._hydrate(row)
         for row in f.db.rows
@@ -795,18 +881,18 @@ async def test_projected_phase_keeps_original_scope_through_productive_and_cold_
         version=f.db.run.version,
         checkpoint_sha256=checkpoint.state_sha256,
     )
-    assert "main_agent_context_window_tokens" not in continued.routing_decision
+    assert "main_agent_context_window_tokens" not in mapping(continued.routing_decision)
     cold = await service_runtime_context(f, await claim(f), window=20000)
     assert cold.execution_token != original.execution_token
     assert await f.f.broker.prepare(cold, worker_id="repair-worker") is not None
 
-    async def restored(actual):
+    async def restored(actual: TaskContext) -> object:
         return project_repair_phase.validate(
             phase,
             context=actual,
-            models=checkpoint.state["model_ledger"],
-            tools=checkpoint.state["tool_ledger"],
-            tool_prefix=checkpoint.state["engineering_tool_prefix"],
+            models=ledger(checkpoint.state["model_ledger"]),
+            tools=ledger(checkpoint.state["tool_ledger"]),
+            tool_prefix=integer(checkpoint.state["engineering_tool_prefix"]),
             state=checkpoint.state,
             artifacts=artifacts,
         )["source_scope_sha256"]
@@ -816,7 +902,9 @@ async def test_projected_phase_keeps_original_scope_through_productive_and_cold_
 
 
 @pytest.mark.parametrize("value", [None, True, 0, -1, "10000", 10000.0, 10000001])
-async def test_invalid_runtime_window_cannot_match_original_phase_scope_without_pg(tmp_path, value):
+async def test_invalid_runtime_window_cannot_match_original_phase_scope_without_pg(
+    tmp_path: Path, value: object
+) -> None:
     f = await repair_fixture(tmp_path)
     context = await claim(f)
     context = context.model_copy(
@@ -829,7 +917,7 @@ async def test_invalid_runtime_window_cannot_match_original_phase_scope_without_
     )
     with pytest.raises(ValueError, match="project repair phase is invalid"):
         project_repair_phase.prepare(
-            context, f.cp, f.cp.state["model_ledger"], f.cp.state["tool_ledger"]
+            context, f.cp, ledger(f.cp.state["model_ledger"]), ledger(f.cp.state["tool_ledger"])
         )
 
 
@@ -848,8 +936,8 @@ async def test_invalid_runtime_window_cannot_match_original_phase_scope_without_
     ],
 )
 async def test_window_candidate_does_not_hide_any_other_phase_authority_without_pg(
-    tmp_path, key, value
-):
+    tmp_path: Path, key: str, value: object
+) -> None:
     f = await repair_fixture(tmp_path)
     context = await service_runtime_context(f, await claim(f))
     context = context.model_copy(
@@ -857,13 +945,15 @@ async def test_window_candidate_does_not_hide_any_other_phase_authority_without_
     )
     with pytest.raises(ValueError, match="project repair phase is invalid"):
         project_repair_phase.prepare(
-            context, f.cp, f.cp.state["model_ledger"], f.cp.state["tool_ledger"]
+            context, f.cp, ledger(f.cp.state["model_ledger"]), ledger(f.cp.state["tool_ledger"])
         )
 
 
 @pytest.mark.parametrize("key", ["main_agent_context_window_tokens", "context_window_tokens"])
 @pytest.mark.parametrize("change", ["unchanged", "changed", "removed"])
-async def test_original_persisted_window_scope_is_never_dropped_without_pg(tmp_path, key, change):
+async def test_original_persisted_window_scope_is_never_dropped_without_pg(
+    tmp_path: Path, key: str, change: str
+) -> None:
     f = await repair_fixture(tmp_path, route_extras={key: 8000})
     context = await service_runtime_context(f, await claim(f))
     route = dict(context.routing_decision)
@@ -874,22 +964,24 @@ async def test_original_persisted_window_scope_is_never_dropped_without_pg(tmp_p
     context = context.model_copy(update={"routing_decision": route})
     if change == "unchanged":
         assert project_repair_phase.prepare(
-            context, f.cp, f.cp.state["model_ledger"], f.cp.state["tool_ledger"]
+            context, f.cp, ledger(f.cp.state["model_ledger"]), ledger(f.cp.state["tool_ledger"])
         )
     else:
         with pytest.raises(ValueError, match="project repair phase is invalid"):
             project_repair_phase.prepare(
-                context, f.cp, f.cp.state["model_ledger"], f.cp.state["tool_ledger"]
+                context, f.cp, ledger(f.cp.state["model_ledger"]), ledger(f.cp.state["tool_ledger"])
             )
 
 
-async def test_persisted_reader_cannot_adopt_runtime_only_window_candidate_without_pg(tmp_path):
+async def test_persisted_reader_cannot_adopt_runtime_only_window_candidate_without_pg(
+    tmp_path: Path,
+) -> None:
     f = await repair_fixture(tmp_path)
     runtime = await service_runtime_context(f, await claim(f))
     assert await f.f.broker.prepare(runtime, worker_id="repair-worker") is not None
     # The read-only DAO deliberately has no worker token in its persisted context.
     f.db.run.routing_decision = {
-        **f.db.run.routing_decision,
+        **mapping(f.db.run.routing_decision),
         "main_agent_context_window_tokens": 10000,
     }
     assert await f.runs.load_same_run_repair_continuity(runtime.tenant_id, runtime.run_id) is None
@@ -899,8 +991,8 @@ async def test_persisted_reader_cannot_adopt_runtime_only_window_candidate_witho
 
 @pytest.mark.parametrize("defect", ["profile", "role", "source", "phase_scope", "prefix"])
 async def test_projected_phase_retains_profile_role_source_and_prefix_fences_without_pg(
-    tmp_path, defect
-):
+    tmp_path: Path, defect: str | None
+) -> None:
     from agent_hub.auth.models import Role
 
     f = await repair_fixture(tmp_path)
@@ -912,21 +1004,22 @@ async def test_projected_phase_retains_profile_role_source_and_prefix_fences_wit
             )
         return
     if defect in {"profile", "source"}:
-        route = _mutable_json(context.routing_decision)
+        route = mutable(mutable_json(context.routing_decision))
         if defect == "profile":
-            route["approval_review_profile"]["timeout_seconds"] += 1
+            profile = mutable(route["approval_review_profile"])
+            profile["timeout_seconds"] = integer(profile["timeout_seconds"]) + 1
         else:
             route["source"] = "other"
         with pytest.raises(ValueError, match="project repair phase is invalid"):
             project_repair_phase.prepare(
                 context.model_copy(update={"routing_decision": route}),
                 f.cp,
-                f.cp.state["model_ledger"],
-                f.cp.state["tool_ledger"],
+                ledger(f.cp.state["model_ledger"]),
+                ledger(f.cp.state["tool_ledger"]),
             )
         return
 
-    async def check(actual):
+    async def check(actual: TaskContext) -> None:
         phase = prepare_projection_phase(actual, f.cp)
         if defect == "phase_scope":
             phase["source_scope_sha256"] = project_repair_phase.authority_digest(
@@ -938,9 +1031,9 @@ async def test_projected_phase_retains_profile_role_source_and_prefix_fences_wit
             project_repair_phase.validate(
                 phase,
                 context=actual,
-                models=f.cp.state["model_ledger"],
-                tools=f.cp.state["tool_ledger"],
-                tool_prefix=len(f.cp.state["tool_ledger"]),
+                models=ledger(f.cp.state["model_ledger"]),
+                tools=ledger(f.cp.state["tool_ledger"]),
+                tool_prefix=len(ledger(f.cp.state["tool_ledger"])),
                 state=f.cp.state,
             )
 
@@ -951,8 +1044,8 @@ async def test_projected_phase_retains_profile_role_source_and_prefix_fences_wit
     "relative", ["runtime/autogen/project_repair_phase.py", "runtime/repair_projection.py"]
 )
 async def test_phase_copy_source_change_invalidates_runtime_evidence_without_pg(
-    tmp_path, monkeypatch, relative
-):
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, relative: str
+) -> None:
     """Mutate actual copied bytes, then exercise the real fingerprint/evidence fences."""
     source = Path(review_assembly.__file__).resolve().parents[1]
     original_phase = (source / relative).read_bytes()
@@ -968,7 +1061,7 @@ async def test_phase_copy_source_change_invalidates_runtime_evidence_without_pg(
     assert before == review_assembly.runtime_source_fingerprint()
     f = await offline_assembly(tmp_path / "fixture")
     document = evidence_document(f)
-    document["worker_verification"]["source_sha256"] = before
+    mutable(document["worker_verification"])["source_sha256"] = before
     evidence = tmp_path / "installed-evidence.json"
     body = json.dumps(document).encode()
     evidence.write_bytes(body)
@@ -1002,14 +1095,16 @@ async def test_phase_copy_source_change_invalidates_runtime_evidence_without_pg(
 
 
 @pytest.mark.parametrize("legacy", [False, True], ids=["model_profile", "legacy"])
-async def test_private_projection_worker_strip_window_and_cold_resume_without_pg(tmp_path, legacy):
+async def test_private_projection_worker_strip_window_and_cold_resume_without_pg(
+    tmp_path: Path, legacy: bool
+) -> None:
     from agent_hub.models.physical_budget import _run_budget
 
     f = await projection_case(tmp_path, legacy=legacy)
     contexts, checkpoints = [], []
 
-    class Runtime:
-        async def run(self, actual):
+    class Runtime(StreamRuntimeStub):
+        async def run(self, actual: TaskContext) -> AsyncGenerator[RunEvent, None]:
             contexts.append(actual)
             assert not f.private.keys() & actual.routing_decision.keys()
             assert actual.routing_decision["main_agent_context_window_tokens"] == 10000
@@ -1017,12 +1112,14 @@ async def test_private_projection_worker_strip_window_and_cold_resume_without_pg
             if legacy:
                 assert budget is None and "approval_review_profile" not in actual.routing_decision
             else:
-                await budget.require_current()
+                await present(budget).require_current()
             checkpoint = await productive_checkpoint(f, actual)
             checkpoints.append(checkpoint)
             phase = checkpoint.state[project_repair_phase.PHASE_KEY]
-            expected = f.db.run.routing_decision["repair_proposal"]["automatic_scope_sha256"]
-            assert phase["source_scope_sha256"] == expected
+            expected = mapping(mapping(f.db.run.routing_decision)["repair_proposal"])[
+                "automatic_scope_sha256"
+            ]
+            assert mapping(phase)["source_scope_sha256"] == expected
             artifacts = tuple(
                 PostgresArtifactRepository._hydrate(row)
                 for row in f.db.rows
@@ -1033,7 +1130,7 @@ async def test_private_projection_worker_strip_window_and_cold_resume_without_pg
                 kind="runtime.started", sequence=1, run_id=actual.run_id, payload={"phase": "probe"}
             )
 
-    kwargs = {"worker_id": "repair-worker"}
+    kwargs: WorkerArguments = {"worker_id": "repair-worker"}
     if legacy:
         kwargs["run_repository"] = f.runs
     else:
@@ -1052,8 +1149,8 @@ async def test_private_projection_worker_strip_window_and_cold_resume_without_pg
     )
     cold = await service_runtime_context(f, await claim(f), window=10000)
 
-    class Cold:
-        async def run(self, actual):
+    class Cold(StreamRuntimeStub):
+        async def run(self, actual: TaskContext) -> AsyncGenerator[RunEvent, None]:
             assert actual.execution_token != contexts[0].execution_token
             artifacts = tuple(
                 PostgresArtifactRepository._hydrate(row)
@@ -1063,8 +1160,8 @@ async def test_private_projection_worker_strip_window_and_cold_resume_without_pg
             project_repair_phase.validate(
                 checkpoint.state[project_repair_phase.PHASE_KEY],
                 context=actual,
-                models=checkpoint.state["model_ledger"],
-                tools=checkpoint.state["tool_ledger"],
+                models=ledger(checkpoint.state["model_ledger"]),
+                tools=ledger(checkpoint.state["tool_ledger"]),
                 tool_prefix=2,
                 state=checkpoint.state,
                 artifacts=artifacts,
@@ -1080,25 +1177,32 @@ async def test_private_projection_worker_strip_window_and_cold_resume_without_pg
     assert not f.f.state.calls
 
 
-def prepare_projection_phase(context, checkpoint):
+def prepare_projection_phase(
+    context: TaskContext, checkpoint: RuntimeCheckpoint
+) -> dict[str, JsonValue]:
     return project_repair_phase.prepare(
-        context, checkpoint, checkpoint.state["model_ledger"], checkpoint.state["tool_ledger"]
+        context,
+        checkpoint,
+        ledger(checkpoint.state["model_ledger"]),
+        ledger(checkpoint.state["tool_ledger"]),
     )
 
 
 @pytest.mark.parametrize(
     "defect", ["lease", "role", "child", "permission", "profile", "token", "time", "unknown"]
 )
-async def test_private_projection_exact_task_binding_rejects_mutations_without_pg(tmp_path, defect):
+async def test_private_projection_exact_task_binding_rejects_mutations_without_pg(
+    tmp_path: Path, defect: str | None
+) -> None:
     from agent_hub.auth.models import Role
 
     f = await projection_case(tmp_path)
 
-    class Runtime:
-        async def run(self, actual):
+    class Runtime(StreamRuntimeStub):
+        async def run(self, actual: TaskContext) -> AsyncGenerator[RunEvent, None]:
             assert prepare_projection_phase(actual, f.cp)
-            updates = {}
-            route = _mutable_json(actual.routing_decision)
+            updates: dict[str, object] = {}
+            route = mutable(mutable_json(actual.routing_decision))
             if defect == "lease":
                 updates["execution_token"] = uuid4()
             elif defect == "role":
@@ -1108,11 +1212,16 @@ async def test_private_projection_exact_task_binding_rejects_mutations_without_p
             elif defect == "permission":
                 route["requested_permissions"] = ["*"]
             elif defect == "profile":
-                route["approval_review_profile"]["timeout_seconds"] += 1
+                profile = mutable(route["approval_review_profile"])
+                profile["timeout_seconds"] = integer(profile["timeout_seconds"]) + 1
             elif defect == "token":
-                route["runtime_token_absolute_tokens"] += 1
+                route["runtime_token_absolute_tokens"] = (
+                    integer(route["runtime_token_absolute_tokens"]) + 1
+                )
             elif defect == "time":
-                route["runtime_timeout_absolute_seconds"] += 1
+                route["runtime_timeout_absolute_seconds"] = (
+                    integer(route["runtime_timeout_absolute_seconds"]) + 1
+                )
             else:
                 route["unknown_authority"] = "new"
             updates["routing_decision"] = route
@@ -1135,13 +1244,13 @@ async def test_private_projection_exact_task_binding_rejects_mutations_without_p
 @pytest.mark.parametrize("legacy", [False, True], ids=["model_profile", "legacy"])
 @pytest.mark.parametrize("defect", ["receipt", "locator", "authority", "owner", "expiry", "actor"])
 async def test_private_projection_refresh_rejects_persisted_drift_without_pg(
-    tmp_path, legacy, defect
-):
+    tmp_path: Path, legacy: bool, defect: str | None
+) -> None:
     f = await projection_case(tmp_path, legacy=legacy)
     reached = []
 
-    class Runtime:
-        async def run(self, actual):
+    class Runtime(StreamRuntimeStub):
+        async def run(self, actual: TaskContext) -> AsyncGenerator[RunEvent, None]:
             assert prepare_projection_phase(actual, f.cp)
             yield RunEvent(
                 kind="runtime.started", sequence=1, run_id=actual.run_id, payload={"phase": "probe"}
@@ -1149,7 +1258,7 @@ async def test_private_projection_refresh_rejects_persisted_drift_without_pg(
             reached.append("stale work")
             prepare_projection_phase(actual, f.cp)
 
-    kwargs = {"worker_id": "repair-worker", "run_repository": f.runs}
+    kwargs: WorkerArguments = {"worker_id": "repair-worker", "run_repository": f.runs}
     if not legacy:
         kwargs["review_broker"] = f.f.broker
     async with worker_runtime_events(Runtime(), f.context, **kwargs) as stream:
@@ -1160,7 +1269,7 @@ async def test_private_projection_refresh_rejects_persisted_drift_without_pg(
                 "locator": "approval_checkpoint_worker_token",
                 "authority": "unknown_authority",
             }[defect]
-            f.db.run.routing_decision = {**f.db.run.routing_decision, key: "changed"}
+            f.db.run.routing_decision = {**mapping(f.db.run.routing_decision), key: "changed"}
         elif defect == "owner":
             f.db.run.worker_lease_token = uuid4()
         elif defect == "expiry":
@@ -1175,15 +1284,15 @@ async def test_private_projection_refresh_rejects_persisted_drift_without_pg(
 
 @pytest.mark.parametrize("legacy", [False, True], ids=["model_profile", "legacy"])
 async def test_private_projection_cannot_escape_owner_or_child_task_binding_without_pg(
-    tmp_path, legacy
-):
+    tmp_path: Path, legacy: bool
+) -> None:
     from agent_hub.capabilities.execution_authority import bind_execution_authority
 
     f = await projection_case(tmp_path, legacy=legacy)
     release, escaped = asyncio.Event(), []
 
-    class Runtime:
-        async def run(self, actual):
+    class Runtime(StreamRuntimeStub):
+        async def run(self, actual: TaskContext) -> AsyncGenerator[RunEvent, None]:
             assert prepare_projection_phase(actual, f.cp)
             child = actual.model_copy(
                 update={"run_id": uuid4(), "checkpoint": None, "execution_token": uuid4()}
@@ -1199,7 +1308,7 @@ async def test_private_projection_cannot_escape_owner_or_child_task_binding_with
             ):
                 prepare_projection_phase(actual, f.cp)
 
-            async def late():
+            async def late() -> None:
                 await release.wait()
                 with pytest.raises(ValueError, match="project repair phase is invalid"):
                     prepare_projection_phase(actual, f.cp)
@@ -1209,7 +1318,7 @@ async def test_private_projection_cannot_escape_owner_or_child_task_binding_with
                 kind="runtime.started", sequence=1, run_id=actual.run_id, payload={"phase": "probe"}
             )
 
-    kwargs = {"worker_id": "repair-worker", "run_repository": f.runs}
+    kwargs: WorkerArguments = {"worker_id": "repair-worker", "run_repository": f.runs}
     if not legacy:
         kwargs["review_broker"] = f.f.broker
     try:
@@ -1221,14 +1330,16 @@ async def test_private_projection_cannot_escape_owner_or_child_task_binding_with
     assert pool_values(f.db) == f.before
 
 
-async def test_private_projection_json_and_unsealed_objects_cannot_forge_proof_without_pg(tmp_path):
+async def test_private_projection_json_and_unsealed_objects_cannot_forge_proof_without_pg(
+    tmp_path: Path,
+) -> None:
     from agent_hub.runtime import repair_projection
     from agent_hub.runtime.contracts import TaskContext
 
     f = await projection_case(tmp_path)
 
-    class Runtime:
-        async def run(self, actual):
+    class Runtime(StreamRuntimeStub):
+        async def run(self, actual: TaskContext) -> AsyncGenerator[RunEvent, None]:
             public = TaskContext.from_payload(actual.to_payload())
             assert public.execution_token is None
             with pytest.raises(ValueError, match="project repair phase is invalid"):
@@ -1238,17 +1349,19 @@ async def test_private_projection_json_and_unsealed_objects_cannot_forge_proof_w
                 prepare_projection_phase(
                     actual.model_copy(update={"routing_decision": route}), f.cp
                 )
-            current = repair_projection._CURRENT.get()
+            current = present(repair_projection._CURRENT.get())
             for fake in (
                 {"scope": current.proof.scope, "approved": True},
                 replace(current, proof=replace(current.proof, seal=object())),
             ):
-                token = repair_projection._CURRENT.set(fake)
-                try:
+                with pytest.MonkeyPatch.context() as patch:
+                    patch.setattr(
+                        repair_projection,
+                        "_CURRENT",
+                        ContextVar("injected_projection", default=fake),
+                    )
                     with pytest.raises(ValueError, match="project repair phase is invalid"):
                         prepare_projection_phase(actual, f.cp)
-                finally:
-                    repair_projection._CURRENT.reset(token)
             assert prepare_projection_phase(actual, f.cp)
             yield RunEvent(
                 kind="runtime.started", sequence=1, run_id=actual.run_id, payload={"phase": "probe"}
@@ -1262,20 +1375,20 @@ async def test_private_projection_json_and_unsealed_objects_cannot_forge_proof_w
 
 
 async def test_private_projection_cached_lease_expiry_rejects_without_refresh_without_pg(
-    tmp_path, monkeypatch
-):
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     from agent_hub.runtime import repair_projection
 
     f = await projection_case(tmp_path)
 
-    class Runtime:
-        async def run(self, actual):
+    class Runtime(StreamRuntimeStub):
+        async def run(self, actual: TaskContext) -> AsyncGenerator[RunEvent, None]:
             assert prepare_projection_phase(actual, f.cp)
 
             class Expired(datetime):
                 @classmethod
-                def now(cls, tz=None):
-                    return datetime.now(UTC) + timedelta(hours=1)
+                def now(cls, tz: tzinfo | None = None) -> Expired:
+                    return cls.fromisoformat((datetime.now(UTC) + timedelta(hours=1)).isoformat())
 
             with monkeypatch.context() as patch:
                 patch.setattr(repair_projection, "datetime", Expired)
@@ -1294,13 +1407,13 @@ async def test_private_projection_cached_lease_expiry_rejects_without_refresh_wi
 
 @pytest.mark.parametrize("legacy", [False, True], ids=["model_profile", "legacy"])
 async def test_private_projection_refreshes_same_lease_but_not_original_pool_without_pg(
-    tmp_path, legacy
-):
+    tmp_path: Path, legacy: bool
+) -> None:
     f = await projection_case(tmp_path, legacy=legacy)
     reached = []
 
-    class Runtime:
-        async def run(self, actual):
+    class Runtime(StreamRuntimeStub):
+        async def run(self, actual: TaskContext) -> AsyncGenerator[RunEvent, None]:
             assert prepare_projection_phase(actual, f.cp)
             yield RunEvent(
                 kind="runtime.started", sequence=1, run_id=actual.run_id, payload={"phase": "probe"}
@@ -1316,12 +1429,14 @@ async def test_private_projection_refreshes_same_lease_but_not_original_pool_wit
             with pytest.raises(ValueError, match="project repair phase is invalid"):
                 prepare_projection_phase(actual, f.cp)
 
-    kwargs = {"worker_id": "repair-worker", "run_repository": f.runs}
+    kwargs: WorkerArguments = {"worker_id": "repair-worker", "run_repository": f.runs}
     if not legacy:
         kwargs["review_broker"] = f.f.broker
     async with worker_runtime_events(Runtime(), f.context, **kwargs) as stream:
         await anext(stream)
-        f.db.run.worker_lease_expires_at += timedelta(seconds=60)
+        f.db.run.worker_lease_expires_at = present(f.db.run.worker_lease_expires_at) + timedelta(
+            seconds=60
+        )
         await anext(stream)
         f.db.run.status = "completed"  # terminal consumer update must permit natural cleanup
         with pytest.raises(StopAsyncIteration):
@@ -1330,31 +1445,31 @@ async def test_private_projection_refreshes_same_lease_but_not_original_pool_wit
 
 
 async def test_private_projection_does_not_downgrade_configuration_or_unknown_fences_without_pg(
-    tmp_path,
-):
+    tmp_path: Path,
+) -> None:
     from agent_hub.models.physical_budget import _run_budget
 
     f = await projection_case(tmp_path)
     reached = []
 
-    class Runtime:
-        async def run(self, actual):
+    class Runtime(StreamRuntimeStub):
+        async def run(self, actual: TaskContext) -> AsyncGenerator[RunEvent, None]:
             checkpoint = await productive_checkpoint(f, actual)
-            state = checkpoint.to_payload()["state"]
-            state["tool_ledger"][-1]["status"] = "unknown"
+            state = mutable(checkpoint.to_payload()["state"])
+            mutable(sequence(state["tool_ledger"])[-1])["status"] = "unknown"
             with pytest.raises(ValueError, match="project repair phase is invalid"):
                 project_repair_phase.validate(
                     state[project_repair_phase.PHASE_KEY],
                     context=actual,
-                    models=state["model_ledger"],
-                    tools=state["tool_ledger"],
+                    models=ledger(state["model_ledger"]),
+                    tools=ledger(state["tool_ledger"]),
                     tool_prefix=2,
-                    state=state,
+                    state=json_map(state),
                 )
             yield RunEvent(
                 kind="runtime.started", sequence=1, run_id=actual.run_id, payload={"phase": "probe"}
             )
-            await _run_budget.get().require_current()
+            await present(_run_budget.get()).require_current()
             reached.append("downgraded work")
 
     async with worker_runtime_events(
@@ -1369,14 +1484,16 @@ async def test_private_projection_does_not_downgrade_configuration_or_unknown_fe
     assert (unknown.state, unknown.token_hold) == ("unknown", 18000)
 
 
-async def test_private_projection_legacy_service_adapter_passes_repository_without_pg(tmp_path):
+async def test_private_projection_legacy_service_adapter_passes_repository_without_pg(
+    tmp_path: Path,
+) -> None:
     from agent_hub.runs.service import _adaptive_runtime_events
 
     f = await projection_case(tmp_path, legacy=True)
     reached = []
 
-    class Runtime:
-        async def run(self, actual):
+    class Runtime(StreamRuntimeStub):
+        async def run(self, actual: TaskContext) -> AsyncGenerator[RunEvent, None]:
             assert prepare_projection_phase(actual, f.cp)
             reached.append(True)
             yield RunEvent(
@@ -1398,16 +1515,16 @@ async def test_private_projection_legacy_service_adapter_passes_repository_witho
 
 @pytest.mark.parametrize("change", ["lease", "role", "owner_closed"])
 async def test_private_projection_window_only_cannot_fallback_after_failure_without_pg(
-    tmp_path, change
-):
+    tmp_path: Path, change: str
+) -> None:
     from agent_hub.auth.models import Role
 
     f = await repair_fixture(tmp_path)
     context = await service_runtime_context(f, await claim(f))
     saved = []
 
-    class Runtime:
-        async def run(self, actual):
+    class Runtime(StreamRuntimeStub):
+        async def run(self, actual: TaskContext) -> AsyncGenerator[RunEvent, None]:
             assert prepare_projection_phase(actual, f.cp)
             saved.append(actual)
             if change != "owner_closed":
@@ -1433,12 +1550,12 @@ async def test_private_projection_window_only_cannot_fallback_after_failure_with
 
 
 async def test_private_projection_legacy_without_trusted_repository_fails_closed_without_pg(
-    tmp_path,
-):
+    tmp_path: Path,
+) -> None:
     f = await projection_case(tmp_path, legacy=True)
 
-    class Runtime:
-        async def run(self, actual):
+    class Runtime(StreamRuntimeStub):
+        async def run(self, actual: TaskContext) -> AsyncGenerator[RunEvent, None]:
             prepare_projection_phase(actual, f.cp)
             yield RunEvent(
                 kind="runtime.started", sequence=1, run_id=actual.run_id, payload={"phase": "probe"}
@@ -1450,19 +1567,21 @@ async def test_private_projection_legacy_without_trusted_repository_fails_closed
 
 
 @pytest.mark.parametrize("legacy", [False, True], ids=["model_profile", "legacy"])
-async def test_private_projection_nested_worker_cannot_borrow_parent_without_pg(tmp_path, legacy):
+async def test_private_projection_nested_worker_cannot_borrow_parent_without_pg(
+    tmp_path: Path, legacy: bool
+) -> None:
     f = await projection_case(tmp_path, legacy=legacy)
     child_seen = []
 
-    class Parent:
-        async def run(self, actual):
+    class Parent(StreamRuntimeStub):
+        async def run(self, actual: TaskContext) -> AsyncGenerator[RunEvent, None]:
             assert prepare_projection_phase(actual, f.cp)
             child = actual.model_copy(
                 update={"run_id": uuid4(), "checkpoint": None, "execution_token": uuid4()}
             )
 
-            class Child:
-                async def run(self, own):
+            class Child(StreamRuntimeStub):
+                async def run(self, own: TaskContext) -> AsyncGenerator[RunEvent, None]:
                     child_seen.append(True)
                     with pytest.raises(ValueError, match="project repair phase is invalid"):
                         prepare_projection_phase(actual, f.cp)
@@ -1494,7 +1613,7 @@ async def test_private_projection_nested_worker_cannot_borrow_parent_without_pg(
                 payload={"phase": "parent-probe"},
             )
 
-    kwargs = {"worker_id": "repair-worker", "run_repository": f.runs}
+    kwargs: WorkerArguments = {"worker_id": "repair-worker", "run_repository": f.runs}
     if not legacy:
         kwargs["review_broker"] = f.f.broker
     async with worker_runtime_events(Parent(), f.context, **kwargs) as stream:
@@ -1510,8 +1629,8 @@ async def test_private_projection_nested_worker_cannot_borrow_parent_without_pg(
     ids=["allow", "unknown", "missing-inspect", "missing-conversation"],
 )
 async def test_native_initial_service_classifies_and_accepts_actual_stopped_boundary_without_pg(
-    tmp_path, monkeypatch, unknown_review, omission
-):
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, unknown_review: bool, omission: str | None
+) -> None:
     """Catch a participant/route that cannot reach native claim's engineering ACK."""
     from agent_hub.api.routers.runs import CreateRunRequest
     from agent_hub.db import models
@@ -1524,8 +1643,9 @@ async def test_native_initial_service_classifies_and_accepts_actual_stopped_boun
         initial_route,
         local_service_sql,
     )
-    from tests.integration.runtime.test_model_review_modes_helper import capture_submission_input
-    from tests.unit.runtime.test_review_repair_continuity import RepairDB
+    from tests.integration.runtime._model_review_repair_typed_fixture import (
+        capture_submission_input,
+    )
 
     f = await offline_assembly(tmp_path, mode=TaskMode.DISCUSS)
     db = RepairDB(f.s)
@@ -1568,7 +1688,8 @@ async def test_native_initial_service_classifies_and_accepts_actual_stopped_boun
         )
     ]
     local_service_sql(db)
-    await _persist_authenticated_input(db, db.run, capture_submission_input(db.run, body))
+    async with db() as session:
+        await _persist_authenticated_input(session, db.run, capture_submission_input(db.run, body))
     repository = RunRepository(db)
     prior_broker = f.broker
     f.broker = review_assembly.ReviewAssemblyBroker(
@@ -1582,7 +1703,6 @@ async def test_native_initial_service_classifies_and_accepts_actual_stopped_boun
         billing_contracts=prior_broker._contracts,
         verification=prior_broker._verification,
     )
-    f.broker._a2_tenant = db.run.tenant_id
     root = ProjectWorkspaceStore(tmp_path).session_root(db.run.tenant_id, "demo", "session")
     root.mkdir(parents=True, exist_ok=True)
     (root / TARGET).write_text(ORIGINAL, encoding="utf-8")
@@ -1597,6 +1717,7 @@ async def test_native_initial_service_classifies_and_accepts_actual_stopped_boun
         f.secrets,
         f.capacity,
         wire,
+        tenant_id=db.run.tenant_id,
     )
 
     if omission == "inspect":
@@ -1604,7 +1725,7 @@ async def test_native_initial_service_classifies_and_accepts_actual_stopped_boun
 
         participant = fixture_module.DiscussionParticipant
 
-        def without_inspect(**kwargs):
+        def without_inspect(**kwargs: Unpack[ParticipantArguments]) -> DiscussionParticipant:
             if kwargs["id"] == "implementer":
                 kwargs["allowed_tools"] = tuple(
                     name for name in kwargs["allowed_tools"] if name != "project.inspect"
@@ -1613,14 +1734,14 @@ async def test_native_initial_service_classifies_and_accepts_actual_stopped_boun
 
         monkeypatch.setattr(fixture_module, "DiscussionParticipant", without_inspect)
 
-    async def trusted_main_window():
+    async def trusted_main_window() -> int:
         return 10000  # actual fixed local primary catalog; native catalog is 131072
 
     service = RunService(
         repository,
         runtime_registry=RuntimeRegistry((case.runtime,)),
         router=None,
-        task_queue=SimpleNamespace(),
+        task_queue=UnexpectedTaskQueue(),
         worker_id="a2-local-initial",
         runtime_timeout_seconds=120,
         runtime_token_budget=1000000,
@@ -1637,7 +1758,7 @@ async def test_native_initial_service_classifies_and_accepts_actual_stopped_boun
     if omission == "inspect":
         assert result.status is RunStatus.FAILED
         assert case.runtime.last_checkpoint is None and not wire.tool_calls and not wire.reviews
-        assert case.root_entries == case.root_effects == []
+        assert (case.root_entries, case.root_effects) == ([], [])
         assert any(
             str(event.kind) == "repair.skipped"
             and event.payload.get("skip_reason") == "project_repair_checkpoint_not_resumable"
@@ -1648,7 +1769,7 @@ async def test_native_initial_service_classifies_and_accepts_actual_stopped_boun
     assert case.runtime.last_checkpoint is not None
     assert wire.tool_calls == [("initial", "project.inspect", {})]
     assert len(wire.unknown_ids) == 1
-    assert case.root_entries == case.root_effects == []
+    assert (case.root_entries, case.root_effects) == ([], [])
     assert (root / TARGET).read_text(encoding="utf-8") == ORIGINAL
     assert db.run.routing_decision["source"] == "self_repair"
     assert db.run.routing_decision["self_repair_source_run_id"] == str(db.run.id)
@@ -1681,8 +1802,10 @@ async def test_native_initial_service_classifies_and_accepts_actual_stopped_boun
         unknown.state,
     )
     original_lease = wire.contexts[0].execution_token
-    original_scope = db.run.routing_decision["repair_proposal"]["automatic_scope_sha256"]
-    saved = await repository.latest_checkpoint(db, tenant_id=db.run.tenant_id, run_id=db.run.id)
+    original_scope = mapping(mapping(db.run.routing_decision)["repair_proposal"])[
+        "automatic_scope_sha256"
+    ]
+    saved = await latest_local_checkpoint(repository, db, db.run.tenant_id, db.run.id)
     assert saved is not None and saved.state_sha256 == case.runtime.last_checkpoint.state_sha256
     repair = await components(
         tmp_path,
@@ -1694,12 +1817,13 @@ async def test_native_initial_service_classifies_and_accepts_actual_stopped_boun
         f.secrets,
         f.capacity,
         wire,
+        tenant_id=db.run.tenant_id,
     )
     resumed = RunService(
         repository,
         runtime_registry=RuntimeRegistry((repair.runtime,)),
         router=None,
-        task_queue=SimpleNamespace(),
+        task_queue=UnexpectedTaskQueue(),
         worker_id="a2-local-restored",
         runtime_timeout_seconds=120,
         runtime_token_budget=1000000,
@@ -1709,15 +1833,17 @@ async def test_native_initial_service_classifies_and_accepts_actual_stopped_boun
     result = await asyncio.wait_for(resumed.execute(db.run.id), timeout=30)
     assert len(wire.contexts) == 2 and wire.contexts[1].execution_token != original_lease
     assert wire.contexts[1].run_id == wire.contexts[0].run_id == db.run.id
-    assert repair.runtime.loaded_checkpoint.state_sha256 == saved.state_sha256
+    assert present(repair.runtime.loaded_checkpoint).state_sha256 == saved.state_sha256
     assert (
-        repair.runtime.phase_checkpoint.state[project_repair_phase.PHASE_KEY]["source_scope_sha256"]
+        mapping(present(repair.runtime.phase_checkpoint).state[project_repair_phase.PHASE_KEY])[
+            "source_scope_sha256"
+        ]
         == original_scope
     )
     if omission == "conversation":
         assert result.status is RunStatus.FAILED
         assert wire.diagnosed and not wire.reviews
-        assert repair.root_entries == repair.root_effects == []
+        assert (repair.root_entries, repair.root_effects) == ([], [])
         assert (root / TARGET).read_text(encoding="utf-8") == ORIGINAL
         assert (
             unknown.attempt_id,
@@ -1761,7 +1887,7 @@ async def test_native_initial_service_classifies_and_accepts_actual_stopped_boun
     if unknown_review:
         assert result.status is RunStatus.FAILED
         assert intents[0].status == "unknown" and not intents[0].consumed
-        assert repair.root_entries == repair.root_effects == []
+        assert (repair.root_entries, repair.root_effects) == ([], [])
         assert (root / TARGET).read_text(encoding="utf-8") == ORIGINAL
         before_retry = len(wire.calls)
         await resumed.execute(db.run.id)

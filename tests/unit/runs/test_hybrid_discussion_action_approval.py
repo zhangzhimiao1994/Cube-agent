@@ -5,7 +5,6 @@ import asyncio
 from collections.abc import Mapping
 from contextlib import aclosing
 from copy import deepcopy
-from typing import Any
 from uuid import uuid4
 
 import pytest
@@ -14,8 +13,10 @@ import pytest_asyncio
 from agent_hub.domain.runs import TaskMode
 from agent_hub.runs.approval_checkpoint import checkpoint_waits_for_approval
 from agent_hub.runtime.autogen.adapter import AutoGenDiscussionRuntime
-from agent_hub.runtime.contracts import Artifact, RuntimeCheckpoint
+from agent_hub.runtime.contracts import Artifact, RuntimeCheckpoint, TaskContext
 from agent_hub.runtime.hybrid import HybridPlan, HybridRuntime, HybridUpgrade
+from tests.unit.runs.conversation_authenticated_input_typed_fixture import mutable
+from tests.unit.runs.snapshot_approval_types_fixture import closable, json_state, mutable_list
 from tests.unit.runtime.autogen.test_capability_approval_resume import (
     APPROVAL,
     RealDiscussionApproval,
@@ -24,10 +25,10 @@ from tests.unit.runtime.test_hybrid import MultiArtifactRuntime, UnusedRuntime
 
 
 def _child(checkpoint: RuntimeCheckpoint) -> RuntimeCheckpoint:
-    return RuntimeCheckpoint.from_payload(checkpoint.to_payload()['state']['child_checkpoint'])
+    return RuntimeCheckpoint.from_payload(mutable(checkpoint.to_payload()['state'])['child_checkpoint'])
 
 
-async def _real_waiting_case() -> tuple[RealDiscussionApproval, Any, RuntimeCheckpoint]:
+async def _real_waiting_case() -> tuple[RealDiscussionApproval, TaskContext, RuntimeCheckpoint]:
     case = RealDiscussionApproval()
     parent = case.context.model_copy(update={
         'mode': TaskMode.HYBRID,
@@ -39,7 +40,7 @@ async def _real_waiting_case() -> tuple[RealDiscussionApproval, Any, RuntimeChec
     hybrid = HybridRuntime(dispatch, case.runner, UnusedRuntime(TaskMode.DIRECT, 'unused'),
                            artifact_repository=case.runner._repository)
     saved = None
-    async with asyncio.timeout(5), aclosing(hybrid.run(parent)) as stream:
+    async with asyncio.timeout(5), aclosing(closable(hybrid.run(parent))) as stream:
         async for event in stream:
             checkpoint = event.checkpoint
             if (checkpoint is None or checkpoint.state.get('next_stage') != 1
@@ -87,9 +88,9 @@ async def test_real_hybrid_cold_resume_executes_only_pending_action_without_repl
     )
     await resumed.restore_checkpoint(saved)
     completed = None
-    async with asyncio.timeout(5), aclosing(resumed.run(parent.model_copy(
+    async with asyncio.timeout(5), aclosing(closable(resumed.run(parent.model_copy(
         update={'checkpoint': saved},
-    ))) as stream:
+    )))) as stream:
         async for event in stream:
             if (event.checkpoint is None or event.checkpoint.state.get('next_stage') != 1
                     or not isinstance(event.checkpoint.state.get('child_checkpoint'), Mapping)):
@@ -120,7 +121,8 @@ def test_rehashed_nondefault_or_unbound_waiting_checkpoint_is_rejected(
     waiting_checkpoint: RuntimeCheckpoint, defect: str,
 ) -> None:
     payload = deepcopy(waiting_checkpoint.to_payload())
-    state, child = payload['state'], payload['state']['child_checkpoint']
+    state = mutable(payload['state'])
+    child = mutable(state['child_checkpoint'])
     if defect == 'wrong_plan':
         state['plan_digest'] = HybridPlan(HybridUpgrade.DIRECT_TO_DISPATCH).digest
     elif defect == 'upgraded_plan':
@@ -150,19 +152,19 @@ def test_rehashed_nondefault_or_unbound_waiting_checkpoint_is_rejected(
     elif defect == 'child_mode':
         child['mode'] = 'direct'
     elif defect == 'child_terminal':
-        child['state']['terminal'] = True
+        mutable(child['state'])['terminal'] = True
     elif defect == 'direct':
         child['runtime_type'], child['mode'] = 'direct_action', 'direct'
     elif defect == 'nested':
         state['child_checkpoint'] = waiting_checkpoint.to_payload()
     elif defect == 'wrong_approval':
-        child['state']['tool_ledger'][-1]['approval_id'] = 'approval_foreign'
+        mutable(mutable_list(mutable(child['state'])['tool_ledger'])[-1])['approval_id'] = 'approval_foreign'
     elif defect == 'waiting_not_last':
-        child['state']['tool_ledger'].append(dict(child['state']['tool_ledger'][-2]))
+        mutable_list(mutable(child['state'])['tool_ledger']).append(dict(mutable(mutable_list(mutable(child['state'])['tool_ledger'])[-2])))
     elif defect == 'unknown':
-        child['state']['tool_ledger'][-2]['status'] = 'running'
+        mutable(mutable_list(mutable(child['state'])['tool_ledger'])[-2])['status'] = 'running'
     elif defect == 'wrong_key':
-        child['state']['tool_ledger'][-1]['idempotency_key'] = 'f' * 64
+        mutable(mutable_list(mutable(child['state'])['tool_ledger'])[-1])['idempotency_key'] = 'f' * 64
     if defect == 'missing_child_hash':
         child.pop('state_sha256')
     elif defect == 'child_hash':
@@ -184,8 +186,8 @@ def test_legacy_crew_receipt_behavior_is_unchanged(version: str, stage: int) -> 
     outer = RuntimeCheckpoint(
         id=uuid4(), runtime_type='hybrid', runtime_version=version,
         run_id=child.run_id, tenant_id=child.tenant_id, mode=TaskMode.HYBRID,
-        state={'terminal': False, 'next_stage': stage,
+        state=json_state({'terminal': False, 'next_stage': stage,
                'plan_digest': HybridPlan(HybridUpgrade.DISCUSS_DISPATCH_DISCUSS).digest,
-               'child_checkpoint': child.to_payload()},
+               'child_checkpoint': child.to_payload()}),
     )
     assert checkpoint_waits_for_approval(outer, APPROVAL)

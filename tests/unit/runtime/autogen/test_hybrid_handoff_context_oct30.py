@@ -1,14 +1,16 @@
 """Actual first selector/participant calls fit a large Hybrid handoff, offline."""
+
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from decimal import Decimal
-from typing import Any, cast
+from typing import TypedDict, Unpack
 from uuid import uuid4
 
 import httpx
 import pytest
-from autogen_core.models import AssistantMessage, SystemMessage, UserMessage
+from autogen_core.models import AssistantMessage, LLMMessage, SystemMessage, UserMessage
 from openai import AsyncOpenAI
 
 from agent_hub.auth.models import Role
@@ -19,7 +21,7 @@ from agent_hub.models.gateway import (
     ModelContextWindowExceeded,
     ModelGateway,
 )
-from agent_hub.models.litellm_client import LiteLLMClient, OpenAIClientFactory
+from agent_hub.models.litellm_client import LiteLLMClient
 from agent_hub.models.registry import ModelRegistry
 from agent_hub.models.types import (
     ModelCapability,
@@ -38,102 +40,246 @@ from agent_hub.runtime.autogen.adapter import (
 )
 from agent_hub.runtime.autogen.context_budget import fit_request_history
 from agent_hub.runtime.autogen.termination import DiscussionUsage
-from agent_hub.runtime.contracts import Artifact, EventKind, RuntimeCheckpoint, TaskContext
+from agent_hub.runtime.contracts import (
+    Artifact,
+    EventKind,
+    JsonValue,
+    RuntimeCheckpoint,
+    TaskContext,
+)
 from tests.unit.models.test_gateway import CapacityStub, SecretStub, deployment, lease
 from tests.unit.runtime.autogen.test_tool_correction_client import Journal
 from tests.unit.runtime.crew.test_meaningful_workspace_progress import offline_only  # noqa: F401
+from tests.unit.runtime.diagnostic_action_artifact_typed_fixture import (
+    SDKClient,
+    mapping,
+    mutable,
+    sequence,
+    string,
+)
 
-REQUEST = "Review the current native delivery. KEEP_USER_SCOPE_AND_PROTECTED_FILES. Do not run tools."
+REQUEST = (
+    "Review the current native delivery. KEEP_USER_SCOPE_AND_PROTECTED_FILES. Do not run tools."
+)
 WINDOW = 65_536
 
 
+class CheckpointOptions(TypedDict):
+    next_sequence: int
+    terminal: bool
+    reason: str | None
+    artifacts: tuple[Artifact, ...]
+    usage: DiscussionUsage
+    model_ledger: tuple[dict[str, JsonValue], ...]
+    tool_ledger: tuple[dict[str, JsonValue], ...]
+    engineering_tool_prefix: int
+    approval_batch: Mapping[str, JsonValue] | None
+
+
 def task(*, hybrid: bool = True) -> TaskContext:
-    artifacts = tuple(Artifact(id=uuid4(), type="tool_result", producer="implementer", content={
-        "status": "succeeded", "sections": ("证" * 1000, "据" * 1000), "slot": index,
-    }) for index in range(35))
-    artifacts += (
-        Artifact(id=uuid4(), type="tool_result", producer="tester", content={
-            "tool_name": "project.verify", "result": {"verification": {
-                "schema_version": 1, "status": "passed", "source_sha256": "a" * 64,
-                "checks": ({"phase": "test", "status": "passed"},),
-            }},
-        }),
-        Artifact(id=uuid4(), type="tool_result", producer="implementer", content={
-            "tool_name": "workspace.bundle", "result": {"presentation": "final_attachment",
-                "verification_source_sha256": "a" * 64, "file": {"filename": "CURRENT_NATIVE_DELIVERY.zip"}},
-        }),
-        Artifact(id=uuid4(), type="text", producer="final_synthesizer", content={
-            "text": "CURRENT_ROLE_CONCLUSION: the verified snapshot is bundled, with original evidence retained.",
-        }),
+    artifacts = tuple(
+        Artifact(
+            id=uuid4(),
+            type="tool_result",
+            producer="implementer",
+            content={
+                "status": "succeeded",
+                "sections": ("证" * 1000, "据" * 1000),
+                "slot": index,
+            },
+        )
+        for index in range(35)
     )
-    return TaskContext(run_id=uuid4(), tenant_id=uuid4(), actor_id=uuid4(), actor_role=Role.OPERATOR,
-        mode=TaskMode.DISCUSS, request=REQUEST, artifacts=artifacts, token_budget=500_000,
-        timeout_seconds=30, routing_decision={"engineering_hybrid_report_version": 1} if hybrid else {})
+    artifacts += (
+        Artifact(
+            id=uuid4(),
+            type="tool_result",
+            producer="tester",
+            content={
+                "tool_name": "project.verify",
+                "result": {
+                    "verification": {
+                        "schema_version": 1,
+                        "status": "passed",
+                        "source_sha256": "a" * 64,
+                        "checks": ({"phase": "test", "status": "passed"},),
+                    }
+                },
+            },
+        ),
+        Artifact(
+            id=uuid4(),
+            type="tool_result",
+            producer="implementer",
+            content={
+                "tool_name": "workspace.bundle",
+                "result": {
+                    "presentation": "final_attachment",
+                    "verification_source_sha256": "a" * 64,
+                    "file": {"filename": "CURRENT_NATIVE_DELIVERY.zip"},
+                },
+            },
+        ),
+        Artifact(
+            id=uuid4(),
+            type="text",
+            producer="final_synthesizer",
+            content={
+                "text": "CURRENT_ROLE_CONCLUSION: the verified snapshot is bundled, with original evidence retained.",
+            },
+        ),
+    )
+    return TaskContext(
+        run_id=uuid4(),
+        tenant_id=uuid4(),
+        actor_id=uuid4(),
+        actor_role=Role.OPERATOR,
+        mode=TaskMode.DISCUSS,
+        request=REQUEST,
+        artifacts=artifacts,
+        token_budget=500_000,
+        timeout_seconds=30,
+        routing_decision={"engineering_hybrid_report_version": 1} if hybrid else {},
+    )
 
 
 def plan() -> DiscussionPlan:
-    return DiscussionPlan(participants=(
-        DiscussionParticipant(id="analyst", role="Analyst", goal="Review the existing delivery", logical_model="analyst"),
-        DiscussionParticipant(id="reviewer", role="Reviewer", goal="Check the conclusions", logical_model="reviewer"),
-    ), selector_model="selector", selector_max_output_tokens=512, max_turns=4,
-        token_budget=500_000, wall_time_seconds=30, cost_budget_usd=Decimal(1))
+    return DiscussionPlan(
+        participants=(
+            DiscussionParticipant(
+                id="analyst",
+                role="Analyst",
+                goal="Review the existing delivery",
+                logical_model="analyst",
+            ),
+            DiscussionParticipant(
+                id="reviewer",
+                role="Reviewer",
+                goal="Check the conclusions",
+                logical_model="reviewer",
+            ),
+        ),
+        selector_model="selector",
+        selector_max_output_tokens=512,
+        max_turns=4,
+        token_budget=500_000,
+        wall_time_seconds=30,
+        cost_budget_usd=Decimal(1),
+    )
 
 
 @pytest.mark.parametrize("hybrid", [True, False])
 async def test_actual_first_turn_selector_and_participant_keep_full_evidence_outside_the_prompt(
-    hybrid: bool, monkeypatch: pytest.MonkeyPatch,
+    hybrid: bool,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     context = task(hybrid=hybrid)
     original = AutoGenDiscussionRuntime._task_text(context)
-    assert ConservativeTokenEstimator().estimate_input(ModelRequest(
-        logical_model="selector", messages=(ModelMessage("user", original),),
-    )) > WINDOW
+    assert (
+        ConservativeTokenEstimator().estimate_input(
+            ModelRequest(
+                logical_model="selector",
+                messages=(ModelMessage("user", original),),
+            )
+        )
+        > WINDOW
+    )
     original_hashes = tuple(item.content_sha256 for item in context.artifacts)
-    wire: list[dict[str, Any]] = []
+    wire: list[dict[str, object]] = []
     clients: list[AsyncOpenAI] = []
 
     def handle(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
         wire.append(body)
         assert len(wire) <= 4
-        text = "analyst" if body["model"] == "mock-selector" else "[COMPLETE] Native evidence review is complete."
-        return httpx.Response(200, json={
-            "id": f"offline-{len(wire)}", "object": "chat.completion", "created": 1, "model": body["model"],
-            "choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": text}}],
-            "usage": {"prompt_tokens": 10, "completion_tokens": 1, "total_tokens": 11},
-        })
+        text = (
+            "analyst"
+            if body["model"] == "mock-selector"
+            else "[COMPLETE] Native evidence review is complete."
+        )
+        return httpx.Response(
+            200,
+            json={
+                "id": f"offline-{len(wire)}",
+                "object": "chat.completion",
+                "created": 1,
+                "model": body["model"],
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": "stop",
+                        "message": {"role": "assistant", "content": text},
+                    }
+                ],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 1, "total_tokens": 11},
+            },
+        )
 
-    def factory(*, api_key: str, base_url: str, max_retries: int) -> AsyncOpenAI:
+    def factory(*, api_key: str, base_url: str, max_retries: int) -> SDKClient:
         assert max_retries == 0
-        client = AsyncOpenAI(api_key=api_key, base_url=base_url, max_retries=0,
-                             http_client=httpx.AsyncClient(transport=httpx.MockTransport(handle)))
+        client = AsyncOpenAI(
+            api_key=api_key,
+            base_url=base_url,
+            max_retries=0,
+            http_client=httpx.AsyncClient(transport=httpx.MockTransport(handle)),
+        )
         clients.append(client)
-        return client
+        return SDKClient(client)
 
-    deployments = [deployment(name, logical_model=name, capabilities=frozenset({ModelCapability.TEXT}),
-        request_model=f"mock-{name}", api_base="https://offline.example/v1", context_window_tokens=WINDOW)
-        for name in ("selector", "analyst", "reviewer")]
-    capacity = CapacityStub([lease(name) for name in ("selector", "analyst", "selector", "reviewer")])
+    deployments = [
+        deployment(
+            name,
+            logical_model=name,
+            capabilities=frozenset({ModelCapability.TEXT}),
+            request_model=f"mock-{name}",
+            api_base="https://offline.example/v1",
+            context_window_tokens=WINDOW,
+        )
+        for name in ("selector", "analyst", "reviewer")
+    ]
+    capacity = CapacityStub(
+        [lease(name) for name in ("selector", "analyst", "selector", "reviewer")]
+    )
     await capacity.initialize()
-    gateway = ModelGateway(ModelRegistry(deployments), capacity, SecretStub([]),
-                           LiteLLMClient(client_factory=cast(OpenAIClientFactory, factory)))
+    gateway = ModelGateway(
+        ModelRegistry(deployments), capacity, SecretStub([]), LiteLLMClient(client_factory=factory)
+    )
     runtime = AutoGenDiscussionRuntime(gateway, plan())
     snapshots: list[RuntimeCheckpoint] = []
     raw_selector: list[ModelRequest] = []
     checkpoint_builder = runtime._checkpoint
     projection = runtime._fit_handoff_request
 
-    def capture(*args: Any, **kwargs: Any) -> RuntimeCheckpoint:
-        checkpoint = checkpoint_builder(*args, **kwargs)
+    def capture(context: TaskContext, **kwargs: Unpack[CheckpointOptions]) -> RuntimeCheckpoint:
+        checkpoint = checkpoint_builder(context, **kwargs)
         snapshots.append(checkpoint)
         return checkpoint
 
     monkeypatch.setattr(runtime, "_checkpoint", capture)
 
-    def capture_projection(request: ModelRequest, *args: Any, **kwargs: Any) -> ModelRequest:
+    def capture_projection(
+        request: ModelRequest,
+        context: TaskContext,
+        transcript: tuple[Artifact, ...] = (),
+        *,
+        tool_names: Mapping[str, str] | None = None,
+        durability: _DiscussionDurability | None = None,
+        owned_task_positions: tuple[int, ...] = (),
+        actor: str | None = None,
+        owned_task: str | None = None,
+    ) -> ModelRequest:
         if request.logical_model == "selector":
             raw_selector.append(request)
-        return projection(request, *args, **kwargs)
+        return projection(
+            request,
+            context,
+            transcript,
+            tool_names=tool_names,
+            durability=durability,
+            owned_task_positions=owned_task_positions,
+            actor=actor,
+            owned_task=owned_task,
+        )
 
     monkeypatch.setattr(runtime, "_fit_handoff_request", capture_projection)
     try:
@@ -149,32 +295,55 @@ async def test_actual_first_turn_selector_and_participant_keep_full_evidence_out
             assert "CURRENT_ROLE_CONCLUSION" in view
             for artifact in context.artifacts:
                 assert str(artifact.id) in view and artifact.content_sha256 in view
-        assert tuple(item.recompute_content_sha256() for item in context.artifacts) == original_hashes
+        assert (
+            tuple(item.recompute_content_sha256() for item in context.artifacts) == original_hashes
+        )
         saved = await runtime.save_checkpoint()
         assert saved.state["handoff_context_projection_version"] == 1
         for status in ("running", "succeeded", "terminal", "legacy_unknown"):
-            checkpoint = saved if status == "terminal" else next(
-                item for item in snapshots if len(item.state["model_ledger"]) == 1
-                and item.state["model_ledger"][0]["status"] == ("running" if status == "legacy_unknown" else status)
+            checkpoint = (
+                saved
+                if status == "terminal"
+                else next(
+                    item
+                    for item in snapshots
+                    if len(sequence(item.state["model_ledger"])) == 1
+                    and mapping(sequence(item.state["model_ledger"])[0])["status"]
+                    == ("running" if status == "legacy_unknown" else status)
+                )
             )
             if status == "legacy_unknown":
                 payload = checkpoint.to_payload()
-                payload["state"].pop("handoff_context_projection_version")
-                payload["state"]["model_ledger"][0]["request_hash"] = _DiscussionDurability.request_hash(raw_selector[0])
+                mutable(payload["state"]).pop("handoff_context_projection_version")
+                mutable(sequence(mutable(payload["state"])["model_ledger"])[0])["request_hash"] = (
+                    _DiscussionDurability.request_hash(raw_selector[0])
+                )
                 payload["state_sha256"] = ""
                 checkpoint = RuntimeCheckpoint.from_payload(payload)
             before = checkpoint.to_payload()
             probe = BoundedModel()
-            restored = AutoGenDiscussionRuntime(cast(Any, probe), plan(), artifact_repository=runtime._repository)
+            restored = AutoGenDiscussionRuntime(
+                probe, plan(), artifact_repository=runtime._repository
+            )
             await restored.restore_checkpoint(checkpoint)
-            replay = [event async for event in restored.run(context.model_copy(update={"checkpoint": checkpoint}))]
+            replay = [
+                event
+                async for event in restored.run(
+                    context.model_copy(update={"checkpoint": checkpoint})
+                )
+            ]
             if status in {"running", "legacy_unknown"}:
                 assert replay[-1].kind is EventKind.RUNTIME_FAILED and not probe.requests
                 assert "uncertain" in (replay[-1].reason or ""), (status, replay[-1].reason)
             else:
                 assert replay[-1].kind is EventKind.RUNTIME_COMPLETED
-                assert [request.logical_model for request in probe.requests] == ([] if status == "terminal" else ["analyst"])
-                assert (await restored.save_checkpoint()).state["usage"]["tokens"] == saved.state["usage"]["tokens"]
+                assert [request.logical_model for request in probe.requests] == (
+                    [] if status == "terminal" else ["analyst"]
+                )
+                assert (
+                    mapping((await restored.save_checkpoint()).state["usage"])["tokens"]
+                    == mapping(saved.state["usage"])["tokens"]
+                )
             assert checkpoint.to_payload() == before
     finally:
         for client in clients:
@@ -194,17 +363,26 @@ class BoundedModel:
     async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
         assert self.estimate_input_tokens(request) < WINDOW
         self.requests.append(request)
-        return GatewayCompletion(response=ModelResponse(text="[COMPLETE] Reviewed.", usage=TokenUsage(10, 1, 11)),
-            logical_model=request.logical_model, deployment_id=request.logical_model,
-            provider_id="offline", provider_model="offline/model", cost_usd=Decimal(0))
+        return GatewayCompletion(
+            response=ModelResponse(text="[COMPLETE] Reviewed.", usage=TokenUsage(10, 1, 11)),
+            logical_model=request.logical_model,
+            deployment_id=request.logical_model,
+            provider_id="offline",
+            provider_model="offline/model",
+            cost_usd=Decimal(0),
+        )
 
 
 def test_handoff_projection_does_not_preempt_existing_complete_history_fitting() -> None:
     context = task().model_copy(update={"artifacts": task().artifacts[:1]})
-    messages = [ModelMessage("system", "KEEP_SYSTEM_POLICY"),
-                ModelMessage("user", AutoGenDiscussionRuntime._task_text(context))]
+    messages = [
+        ModelMessage("system", "KEEP_SYSTEM_POLICY"),
+        ModelMessage("user", AutoGenDiscussionRuntime._task_text(context)),
+    ]
     for index in range(10):
-        messages.extend((ModelMessage("assistant", "历史" * 6000), ModelMessage("user", f"turn-{index}")))
+        messages.extend(
+            (ModelMessage("assistant", "历史" * 6000), ModelMessage("user", f"turn-{index}"))
+        )
     messages.append(ModelMessage("user", "KEEP_LATEST_TASK"))
     request = ModelRequest(logical_model="analyst", messages=tuple(messages))
     estimator = ConservativeTokenEstimator()
@@ -219,31 +397,53 @@ def test_handoff_projection_does_not_preempt_existing_complete_history_fitting()
         def estimate_input_tokens(self, request: ModelRequest) -> int:
             return estimator.estimate_input(request)
 
-    runtime = AutoGenDiscussionRuntime(cast(Any, Estimates()), plan())
-    fitted = runtime._fit_handoff_request(request, context, owned_task_positions=(1,), actor="analyst")
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
+            raise AssertionError("history fitting must not call a model")
+
+    runtime = AutoGenDiscussionRuntime(Estimates(), plan())
+    fitted = runtime._fit_handoff_request(
+        request, context, owned_task_positions=(1,), actor="analyst"
+    )
     assert fitted == expected
 
 
 def test_unowned_echoes_and_tool_or_compaction_receipts_are_never_task_carriers() -> None:
     context = task()
     original = AutoGenDiscussionRuntime._task_text(context)
-    request = ModelRequest(logical_model="analyst", messages=(
-        ModelMessage("assistant", original),
-        ModelMessage("user", "UNTRUSTED_CAPABILITY_RESULTS_JSON=" + original),
-        ModelMessage("user", "COMPRESSED_ENGINEERING_HISTORY_JSON=" + original),
-        ModelMessage("user", original),  # Framework source is not 'user': excluded by the supplied positions.
-    ))
-    runtime = AutoGenDiscussionRuntime(cast(Any, BoundedModel()), plan())
-    assert runtime._fit_handoff_request(request, context, owned_task_positions=(0, 1, 2), actor="analyst") is request
-    selector = ModelRequest(logical_model="selector", messages=(ModelMessage("user", "Quoted text: " + original),))
-    assert runtime._fit_handoff_request(selector, context, owned_task_positions=(0,), actor="__selector__") is selector
+    request = ModelRequest(
+        logical_model="analyst",
+        messages=(
+            ModelMessage("assistant", original),
+            ModelMessage("user", "UNTRUSTED_CAPABILITY_RESULTS_JSON=" + original),
+            ModelMessage("user", "COMPRESSED_ENGINEERING_HISTORY_JSON=" + original),
+            ModelMessage(
+                "user", original
+            ),  # Framework source is not 'user': excluded by the supplied positions.
+        ),
+    )
+    runtime = AutoGenDiscussionRuntime(BoundedModel(), plan())
+    assert (
+        runtime._fit_handoff_request(
+            request, context, owned_task_positions=(0, 1, 2), actor="analyst"
+        )
+        is request
+    )
+    selector = ModelRequest(
+        logical_model="selector", messages=(ModelMessage("user", "Quoted text: " + original),)
+    )
+    assert (
+        runtime._fit_handoff_request(
+            selector, context, owned_task_positions=(0,), actor="__selector__"
+        )
+        is selector
+    )
 
 
 def test_ambiguous_duplicate_owned_tasks_fail_closed_without_rewriting_either() -> None:
     context = task()
     original = AutoGenDiscussionRuntime._task_text(context)
     request = ModelRequest(logical_model="analyst", messages=(ModelMessage("user", original),) * 2)
-    runtime = AutoGenDiscussionRuntime(cast(Any, BoundedModel()), plan())
+    runtime = AutoGenDiscussionRuntime(BoundedModel(), plan())
     with pytest.raises(ModelContextWindowExceeded):
         runtime._fit_handoff_request(request, context, owned_task_positions=(0, 1), actor="analyst")
     assert all(message.content == original for message in request.messages)
@@ -251,9 +451,18 @@ def test_ambiguous_duplicate_owned_tasks_fail_closed_without_rewriting_either() 
 
 async def test_user_instructions_alone_too_large_are_not_sliced_or_paid() -> None:
     instructions = "不可删改的用户指令" * 1000
-    context = TaskContext(run_id=uuid4(), tenant_id=uuid4(), actor_id=uuid4(), actor_role=Role.OPERATOR,
-        mode=TaskMode.DISCUSS, request=instructions, artifacts=(), token_budget=500_000,
-        timeout_seconds=30, routing_decision={})
+    context = TaskContext(
+        run_id=uuid4(),
+        tenant_id=uuid4(),
+        actor_id=uuid4(),
+        actor_role=Role.OPERATOR,
+        mode=TaskMode.DISCUSS,
+        request=instructions,
+        artifacts=(),
+        token_budget=500_000,
+        timeout_seconds=30,
+        routing_decision={},
+    )
     assert len(context.request.encode("utf-8")) <= 65_536
 
     class SmallWindowModel(BoundedModel):
@@ -266,40 +475,78 @@ async def test_user_instructions_alone_too_large_are_not_sliced_or_paid() -> Non
             return 4096
 
     model = SmallWindowModel()
-    assert model.estimate_input_tokens(ModelRequest(
-        logical_model="selector", messages=(ModelMessage("user", context.request),),
-    )) > 4096
-    runtime = AutoGenDiscussionRuntime(cast(Any, model), plan())
+    assert (
+        model.estimate_input_tokens(
+            ModelRequest(
+                logical_model="selector",
+                messages=(ModelMessage("user", context.request),),
+            )
+        )
+        > 4096
+    )
+    runtime = AutoGenDiscussionRuntime(model, plan())
     events = [event async for event in runtime.run(context)]
     assert events[-1].kind is EventKind.RUNTIME_FAILED
     assert "context window" in (events[-1].reason or "")
-    assert model.admissions and all(request.logical_model == "selector" for request in model.admissions)
-    assert all(any(isinstance(message.content, str) and instructions in message.content
-                   for message in request.messages) for request in model.admissions)
+    assert model.admissions and all(
+        request.logical_model == "selector" for request in model.admissions
+    )
+    assert all(
+        any(
+            isinstance(message.content, str) and instructions in message.content
+            for message in request.messages
+        )
+        for request in model.admissions
+    )
     assert not model.requests and context.request == instructions
 
 
 async def test_joint_artifact_and_history_fitted_slot_restores_known_or_unknown_exactly() -> None:
     context = task(hybrid=False)
     original = AutoGenDiscussionRuntime._task_text(context)
-    messages: list[Any] = [SystemMessage(content="KEEP_SYSTEM_POLICY"), UserMessage(content=original, source="user")]
+    messages: list[LLMMessage] = [
+        SystemMessage(content="KEEP_SYSTEM_POLICY"),
+        UserMessage(content=original, source="user"),
+    ]
     for index in range(10):
-        messages.extend((AssistantMessage(content="历史" * 6000, source="analyst"),
-                         UserMessage(content=f"turn-{index}", source="user")))
+        messages.extend(
+            (
+                AssistantMessage(content="历史" * 6000, source="analyst"),
+                UserMessage(content=f"turn-{index}", source="user"),
+            )
+        )
     messages.append(UserMessage(content="KEEP_LATEST_TASK", source="user"))
     journal, usage = Journal(), DiscussionUsage()
     model = BoundedModel()
-    runtime = AutoGenDiscussionRuntime(cast(Any, model), plan())
+    runtime = AutoGenDiscussionRuntime(model, plan())
 
-    def build(model_rows: Any = ()) -> GatewayChatCompletionClient:
+    def build(model_rows: tuple[dict[str, JsonValue], ...] = ()) -> GatewayChatCompletionClient:
         durable = journal.durability(models=model_rows)
 
-        def project(request: ModelRequest, names: Any, positions: tuple[int, ...], actor: str | None) -> ModelRequest:
-            return runtime._fit_handoff_request(request, context, tool_names=names, durability=durable,
-                owned_task_positions=positions, actor=actor)
+        def project(
+            request: ModelRequest,
+            names: Mapping[str, str],
+            positions: tuple[int, ...],
+            actor: str | None,
+        ) -> ModelRequest:
+            return runtime._fit_handoff_request(
+                request,
+                context,
+                tool_names=names,
+                durability=durable,
+                owned_task_positions=positions,
+                actor=actor,
+            )
 
-        return GatewayChatCompletionClient(cast(Any, model), "analyst", usage, durability=durable,
-            actor="analyst", engineering_context_compaction=True, input_projection=project)
+        return GatewayChatCompletionClient(
+            model,
+            "analyst",
+            usage,
+            durability=durable,
+            actor="analyst",
+            engineering_context_compaction=True,
+            input_projection=project,
+        )
 
     await build().create(messages)
     assert len(model.requests) == 1 and usage.tokens == 11
@@ -324,13 +571,19 @@ async def test_joint_artifact_and_history_fitted_slot_restores_known_or_unknown_
 def test_known_engineering_selector_wrapper_can_project_the_owned_task() -> None:
     context = task(hybrid=False)
     original = AutoGenDiscussionRuntime._task_text(context)
-    prompt = ("Select the next speaker from ['analyst', 'reviewer']. Roles:\nreviewers\nHistory:\n"
-              + "user: " + original + "\n\n\nReturn only one speaker name.")
+    prompt = (
+        "Select the next speaker from ['analyst', 'reviewer']. Roles:\nreviewers\nHistory:\n"
+        + "user: "
+        + original
+        + "\n\n\nReturn only one speaker name."
+    )
     request = ModelRequest(logical_model="selector", messages=(ModelMessage("user", prompt),))
     model = BoundedModel()
-    runtime = AutoGenDiscussionRuntime(cast(Any, model), plan())
-    fitted = runtime._fit_handoff_request(request, context, owned_task_positions=(0,), actor="__selector__")
+    runtime = AutoGenDiscussionRuntime(model, plan())
+    fitted = runtime._fit_handoff_request(
+        request, context, owned_task_positions=(0,), actor="__selector__"
+    )
     assert model.estimate_input_tokens(fitted) < WINDOW
-    assert cast(str, fitted.messages[0].content).startswith("Select the next speaker from ")
-    assert cast(str, fitted.messages[0].content).endswith("Return only one speaker name.")
-    assert "CURRENT_NATIVE_DELIVERY.zip" in cast(str, fitted.messages[0].content)
+    assert string(fitted.messages[0].content).startswith("Select the next speaker from ")
+    assert string(fitted.messages[0].content).endswith("Return only one speaker name.")
+    assert "CURRENT_NATIVE_DELIVERY.zip" in string(fitted.messages[0].content)

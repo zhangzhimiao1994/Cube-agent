@@ -175,7 +175,7 @@ def test_v5_cancel_retains_its_typed_response_after_branch_lazy_imports(
 
 def test_v7_cancel_keeps_scope_and_typed_failure(monkeypatch: pytest.MonkeyPatch) -> None:
     from agent_hub.skills.sandbox import toolchain_protocol
-    from tests.unit.skills.sandbox.test_toolchain_protocol import invocation
+    from tests.unit.remaining_test_contract_typed_fixture import invocation
 
     request = toolchain_protocol.ToolchainRequest(
         action="plan_project_toolchain", invocation=invocation(toolchain_protocol))

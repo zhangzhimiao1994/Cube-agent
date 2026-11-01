@@ -1,26 +1,55 @@
 """Offline Root-store contract; OS-only shim keeps native ownership out of synthetic claims."""
 
-import importlib
 import json
 import time
+from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from typing import Never
 from uuid import UUID
 
 import pytest
 
-from tests.unit.capabilities.test_python_dependency_resolution import resolve
+from agent_hub.capabilities.python_dependency_closure import PythonWheelMetadata
+from agent_hub.capabilities.python_dependency_resolution import resolve_dependencies
+from agent_hub.skills.sandbox.broker import BrokerPolicy
+from agent_hub.skills.sandbox.project import ProjectInvocation
+from agent_hub.skills.sandbox.python_input_fetch import WheelDownload
+from agent_hub.skills.sandbox.python_input_supply_catalog import RootSupplyConfig
+from agent_hub.skills.sandbox.python_project_backend import RootConfig
+from agent_hub.skills.sandbox.python_registry_protocol import (
+    DependencyNeed,
+    ResolutionDescriptor,
+    digest,
+)
+from agent_hub.skills.sandbox.python_resolution_protocol import (
+    ResolutionClaim,
+    ResolutionRequest,
+    ResolutionStatus,
+)
 from tests.unit.skills import test_python_registry_read as registry
+from tests.unit.skills.python_resolution_store_typed_fixture import (
+    FcntlModule,
+    MemoryWriter,
+    ResolutionFileSystem,
+    ResolutionProtocolAPI,
+    RootStoreCase,
+    StoreAPI,
+    WorkerCase,
+)
 
 offline_network = registry.offline_network
 
 
-def api():
-    return importlib.import_module(
-        "agent_hub.skills.sandbox.python_resolution_protocol"
-    ), importlib.import_module("agent_hub.skills.sandbox.python_resolution_store")
+def api() -> tuple[ResolutionProtocolAPI, StoreAPI]:
+    from agent_hub.skills.sandbox import python_resolution_protocol, python_resolution_store
+
+    protocol: ResolutionProtocolAPI = python_resolution_protocol
+    store: StoreAPI = python_resolution_store
+    return protocol, store
 
 
-def claim():
+def claim() -> ResolutionClaim:
     p, _ = api()
     from agent_hub.skills.sandbox.project import ProjectInvocation
     from agent_hub.skills.sandbox.python_metadata_plan_protocol import (
@@ -68,14 +97,23 @@ def claim():
     )
 
 
-async def data():
+async def data() -> tuple[ResolutionDescriptor, dict[str, bytes]]:
     wire = registry.Wire()
     row, raw = wire.release("demo")
-    result = await resolve(wire, {row["filename"]: raw}, ["demo>=1"])
+    bodies = {row["filename"]: raw}
+
+    async def content(download: WheelDownload) -> bytes:
+        return bodies[download.filename]
+
+    result = await resolve_dependencies(
+        (DependencyNeed("demo>=1", "a" * 64),), scope=registry.scope(),
+        environment=registry.environment(), reader=registry.reader(wire),
+        wheel_reader=content, budget=registry.budget(),
+    )
     return result, {row["filename"]: raw}
 
 
-async def test_descriptor_wire_decoder_is_exact_and_never_a_receipt():
+async def test_descriptor_wire_decoder_is_exact_and_never_a_receipt() -> None:
     p, _ = api()
     descriptor, _ = await data()
     assert p.decode_descriptor(descriptor.to_payload()) == descriptor
@@ -88,10 +126,10 @@ async def test_descriptor_wire_decoder_is_exact_and_never_a_receipt():
 @pytest.mark.parametrize(
     "change", ["expired", "nan", "new_token", "other_actor", "permission", "base"]
 )
-def test_original_claim_rejects_extension_or_identity_drift(change):
+def test_original_claim_rejects_extension_or_identity_drift(change: str) -> None:
     p, _ = api()
     first = claim()
-    changes = {
+    changes: dict[str, dict[str, object]] = {
         "expired": {"original_deadline": datetime.now(UTC) - timedelta(seconds=1)},
         "nan": {"monotonic_deadline": float("nan")},
         "new_token": {"lease_token": UUID(int=9)},
@@ -118,7 +156,7 @@ def test_original_claim_rejects_extension_or_identity_drift(change):
         newer.require_continuity(first)
 
 
-async def test_run_overlay_uses_verified_descriptor_and_refuses_catalog_collision():
+async def test_run_overlay_uses_verified_descriptor_and_refuses_catalog_collision() -> None:
     _, s = api()
     from pathlib import Path
 
@@ -138,7 +176,7 @@ async def test_run_overlay_uses_verified_descriptor_and_refuses_catalog_collisio
         s.overlay_supply(conflict, descriptor)
 
 
-async def test_freeze_changes_source_without_reissuing_data_or_deadline():
+async def test_freeze_changes_source_without_reissuing_data_or_deadline() -> None:
     _, s = api()
     descriptor, _ = await data()
     original = claim()
@@ -167,17 +205,19 @@ async def test_freeze_changes_source_without_reissuing_data_or_deadline():
     )
 
 
-async def test_unknown_claim_is_inspect_only_even_after_new_source(monkeypatch):
+async def test_unknown_claim_is_inspect_only_even_after_new_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     p, s = api()
     # This test replaces only the privileged FD boundary; state machine/serialization execute.
-    files = {}
+    files: dict[str, str] = {}
 
-    def create(name, value, deadline):
+    def create(name: str, value: object, deadline: float) -> None:
         if name in files:
             raise FileExistsError(name)
         files[name] = json.dumps(value)
 
-    def read(name, deadline):
+    def read(name: str, deadline: float) -> object:
         if name not in files:
             raise FileNotFoundError(name)
         return json.loads(files[name])
@@ -196,7 +236,7 @@ async def test_unknown_claim_is_inspect_only_even_after_new_source(monkeypatch):
     assert len(files) == 1
 
 
-async def test_transport_ids_and_heartbeat_do_not_mint_a_different_action():
+async def test_transport_ids_and_heartbeat_do_not_mint_a_different_action() -> None:
     _, s = api()
     descriptor, _ = await data()
     original = claim()
@@ -217,7 +257,7 @@ async def test_transport_ids_and_heartbeat_do_not_mint_a_different_action():
     assert first.sha256 == second.sha256
 
 
-def test_new_monotonic_cap_must_not_extend_original():
+def test_new_monotonic_cap_must_not_extend_original() -> None:
     api()
     original = claim()
     with pytest.raises(ValueError):
@@ -226,14 +266,16 @@ def test_new_monotonic_cap_must_not_extend_original():
         ).require_continuity(original)
 
 
-async def test_stale_source_publication_cannot_use_data_rebind(monkeypatch):
+async def test_stale_source_publication_cannot_use_data_rebind(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     p, s = api()
     descriptor, _ = await data()
     original = claim()
-    files = {}
+    files: dict[str, object] = {}
     store = s.ResolutionStore.__new__(s.ResolutionStore)
 
-    def create(name, value, deadline):
+    def create(name: str, value: object, deadline: float) -> None:
         if name in files:
             raise FileExistsError
         files[name] = json.loads(json.dumps(value))
@@ -260,38 +302,24 @@ async def test_stale_source_publication_cannot_use_data_rebind(monkeypatch):
 
 
 @pytest.fixture
-def root_store(monkeypatch):
+def root_store(monkeypatch: pytest.MonkeyPatch) -> Iterator[RootStoreCase]:
     import sys
     from pathlib import Path
-    from types import ModuleType, SimpleNamespace
+    from types import SimpleNamespace
 
     from agent_hub.skills.sandbox import project_contract_broker as contracts
     from agent_hub.skills.sandbox import python_dependency_index_store as indexes
     from agent_hub.skills.sandbox import python_input_supply_catalog as catalog
     from agent_hub.skills.sandbox import python_input_supply_worker as supply_worker
-    from tests.unit.skills.test_python_dependency_index_store import FileSystem
 
     _, s = api()
-    fs = FileSystem()
-    fs.O_WRONLY = 1
-    import posixpath
-    from contextlib import contextmanager
-
-    @contextmanager
-    def scandir(parent):
-        directory = fs.fds[parent][1]
-        fs.events.append(("scandir", directory))
-        yield (SimpleNamespace(name=posixpath.basename(path))
-               for path in tuple(fs.nodes) if posixpath.dirname(path) == directory)
-
-    fs.scandir = scandir
+    fs = ResolutionFileSystem()
     for module in (s, indexes, catalog, supply_worker, contracts):
         monkeypatch.setattr(module, "os", fs)
     monkeypatch.setattr(indexes, "sys", SimpleNamespace(platform="linux"))
     monkeypatch.setattr(s, "sys", SimpleNamespace(platform="linux"))
     monkeypatch.setattr(supply_worker, "sys", SimpleNamespace(platform="linux"))
-    lock = ModuleType("fcntl")
-    lock.LOCK_SH, lock.LOCK_EX, lock.LOCK_NB, lock.flock = 1, 2, 4, fs.flock
+    lock = FcntlModule(fs)
     monkeypatch.setitem(sys.modules, "fcntl", lock)
     entry, raw = registry.wheel("base")
     from agent_hub.skills.sandbox.python_input_fetch import WheelDownload
@@ -300,13 +328,15 @@ def root_store(monkeypatch):
         entry["filename"], "base", "1.0", entry["digests"]["sha256"], entry["size"], entry["url"]
     )
     supply = catalog.RootSupplyConfig(Path("/private/state"), (base,), 64 * 1024**2, 0, 30)
-    result = SimpleNamespace(fs=fs, supply=supply, store=s.ResolutionStore(supply), base_raw=raw)
+    result = RootStoreCase(fs=fs, supply=supply, store=s.ResolutionStore(supply), base_raw=raw)
     yield result
     assert fs.fds == {}
     assert not fs.locks
 
 
-async def test_real_once_serialization_and_wheel_cache_survive_new_source(root_store):
+async def test_real_once_serialization_and_wheel_cache_survive_new_source(
+    root_store: RootStoreCase,
+) -> None:
     p, _ = api()
     descriptor, bodies = await data()
     first = claim()
@@ -360,7 +390,9 @@ async def test_real_once_serialization_and_wheel_cache_survive_new_source(root_s
 
 
 @pytest.mark.parametrize("attack", ["symlink", "owner", "mode", "hardlink", "changed_bytes"])
-async def test_root_receipt_tampering_is_rejected_before_overlay(root_store, attack):
+async def test_root_receipt_tampering_is_rejected_before_overlay(
+    root_store: RootStoreCase, attack: str,
+) -> None:
     import stat
 
     p, _ = api()
@@ -389,14 +421,13 @@ async def test_root_receipt_tampering_is_rejected_before_overlay(root_store, att
 
 
 @pytest.fixture
-def worker_case(root_store, monkeypatch):
+def worker_case(root_store: RootStoreCase, monkeypatch: pytest.MonkeyPatch) -> WorkerCase:
     import stat
     from contextlib import contextmanager
     from types import SimpleNamespace
 
+    from agent_hub.skills.sandbox import python_resolution_worker as worker
     from tests.unit.skills.test_python_dependency_index_store import root_configuration
-
-    worker = importlib.import_module("agent_hub.skills.sandbox.python_resolution_worker")
     p, _ = api()
     root = root_configuration()
     env = registry.environment() | {
@@ -410,7 +441,7 @@ def worker_case(root_store, monkeypatch):
     original = claim()
     planning = original.planning.model_copy(
         update={
-            "expected_root_config_sha256": p.digest(root.to_payload()),
+            "expected_root_config_sha256": digest(root.to_payload()),
             "expected_catalog_sha256": root_store.supply.digest,
         }
     )
@@ -421,7 +452,7 @@ def worker_case(root_store, monkeypatch):
         requirements=(("demo>=1", "a" * 64),),
         environment=env,
     )
-    case = SimpleNamespace(
+    case = WorkerCase(
         worker=worker,
         request=request,
         root=root,
@@ -433,18 +464,22 @@ def worker_case(root_store, monkeypatch):
         fail=None,
         fs=root_store.fs,
         store=root_store.store,
+        policy=BrokerPolicy(),
     )
 
-    async def source(*args):
+    async def source(*args: object) -> None:
         case.events.append("source")
         if case.fail == "source":
             raise ValueError("source changed")
 
-    def controls(*args):
+    def controls(*args: object) -> None:
         if case.fail == "controls":
             raise ValueError("controls changed")
 
-    async def fetch(entries, invocation, policy, root, supply, deadline):
+    async def fetch(
+        entries: tuple[WheelDownload, ...], invocation: ProjectInvocation,
+        policy: BrokerPolicy, root: RootConfig, supply: RootSupplyConfig, deadline: float,
+    ) -> dict[str, bytes]:
         assert not case.locked
         assert deadline <= original.monotonic_deadline
         case.events.append("fetch")
@@ -453,11 +488,13 @@ def worker_case(root_store, monkeypatch):
         return {e.filename: case.bodies[e.filename] for e in entries}
 
     @contextmanager
-    def native_claim(*args, **kwargs):
+    def native_claim(
+        *args: object, **kwargs: object,
+    ) -> Iterator[tuple[int, list[tuple[int, str, int, tuple[int, ...]]]]]:
         yield 90, []
 
     @contextmanager
-    def admission(*args):
+    def admission(*args: object) -> Iterator[None]:
         assert not case.locked
         case.locked = True
         try:
@@ -465,7 +502,9 @@ def worker_case(root_store, monkeypatch):
         finally:
             case.locked = False
 
-    def publish(cache, claim_path, entry, raw, *, deadline):
+    def publish(
+        cache: Path, claim_path: Path, entry: WheelDownload, raw: bytes, *, deadline: float,
+    ) -> None:
         assert case.locked
         case.events.append("publish")
         from agent_hub.skills.sandbox.python_dependency_metadata import (
@@ -497,16 +536,18 @@ def worker_case(root_store, monkeypatch):
     return case
 
 
-async def test_actual_root_resolver_freeze_publication_and_complete_overlay_index(worker_case):
+async def test_actual_root_resolver_freeze_publication_and_complete_overlay_index(
+    worker_case: WorkerCase,
+) -> None:
     c = worker_case
     resolved = await c.worker.execute_resolution(
-        c.request, policy=None, root=c.root, supply=c.supply
+        c.request, policy=c.policy, root=c.root, supply=c.supply
     )
     assert resolved.state == "resolved"
     assert len(c.wire.requests) == 4 and c.events.count("fetch") == 2
     frozen = await c.worker.execute_resolution(
         c.request.model_copy(update={"action": "freeze_python_resolution"}),
-        policy=None,
+        policy=c.policy,
         root=c.root,
         supply=c.supply,
     )
@@ -514,7 +555,7 @@ async def test_actual_root_resolver_freeze_publication_and_complete_overlay_inde
     request = c.request.model_copy(
         update={"action": "publish_python_resolution", "expected_plan_sha256": frozen.plan.sha256}
     )
-    response = await c.worker.execute_resolution(request, policy=None, root=c.root, supply=c.supply)
+    response = await c.worker.execute_resolution(request, policy=c.policy, root=c.root, supply=c.supply)
     assert response.state == "published" and c.events.count("publish") == 2
     from agent_hub.skills.sandbox import python_dependency_index_store as indexes
 
@@ -524,7 +565,7 @@ async def test_actual_root_resolver_freeze_publication_and_complete_overlay_inde
     assert {m.wheel.name for m in actual.records} == {"base", "demo", "helper"}
     inspected = await c.worker.execute_resolution(
         request.model_copy(update={"action": "inspect_python_resolution"}),
-        policy=None,
+        policy=c.policy,
         root=c.root,
         supply=c.supply,
     )
@@ -533,37 +574,41 @@ async def test_actual_root_resolver_freeze_publication_and_complete_overlay_inde
 
 
 @pytest.mark.parametrize("fault", ["source", "controls", "download"])
-async def test_root_changed_inputs_and_unknown_never_publish_or_refetch(worker_case, fault):
+async def test_root_changed_inputs_and_unknown_never_publish_or_refetch(
+    worker_case: WorkerCase, fault: str,
+) -> None:
     c = worker_case
     c.fail = fault
     with pytest.raises(ValueError):
-        await c.worker.execute_resolution(c.request, policy=None, root=c.root, supply=c.supply)
+        await c.worker.execute_resolution(c.request, policy=c.policy, root=c.root, supply=c.supply)
     assert "publish" not in c.events
     if fault == "download":
         c.fail = None
         inspected = await c.worker.execute_resolution(
             c.request.model_copy(update={"action": "inspect_python_resolution"}),
-            policy=None,
+            policy=c.policy,
             root=c.root,
             supply=c.supply,
         )
         assert inspected.state == "unknown"
         reads = len(c.wire.requests)
         with pytest.raises(ValueError, match="consumed"):
-            await c.worker.execute_resolution(c.request, policy=None, root=c.root, supply=c.supply)
+            await c.worker.execute_resolution(c.request, policy=c.policy, root=c.root, supply=c.supply)
         assert len(c.wire.requests) == reads
 
 
-async def test_fetch_caller_cancel_drains_exact_child_before_return(worker_case, monkeypatch):
+async def test_fetch_caller_cancel_drains_exact_child_before_return(
+    worker_case: WorkerCase, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     import asyncio
 
     c = worker_case
     entered, closed = asyncio.Event(), asyncio.Event()
 
-    async def waiting(*args):
+    async def waiting(*args: object) -> Never:
         entered.set()
         try:
-            await asyncio.Future()
+            await asyncio.Future[Never]()
         finally:
             await asyncio.sleep(0)
             closed.set()
@@ -577,7 +622,7 @@ async def test_fetch_caller_cancel_drains_exact_child_before_return(worker_case,
     )
     before = set(asyncio.all_tasks())
     task = asyncio.create_task(
-        c.worker._fetch(e, c.request, None, c.root, c.supply, c.request.claim.deadline)
+        c.worker._fetch(e, c.request, c.policy, c.root, c.supply, c.request.claim.deadline)
     )
     await entered.wait()
     task.cancel()
@@ -587,13 +632,15 @@ async def test_fetch_caller_cancel_drains_exact_child_before_return(worker_case,
     assert set(asyncio.all_tasks()) == before
 
 
-async def test_v11_dispatch_is_reachable_through_existing_root_peer_broker(monkeypatch):
+async def test_v11_dispatch_is_reachable_through_existing_root_peer_broker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     import asyncio
     import struct
-    from types import SimpleNamespace
 
-    broker = importlib.import_module("agent_hub.skills.sandbox.broker")
-    worker = importlib.import_module("agent_hub.skills.sandbox.python_resolution_worker")
+    from agent_hub.skills.sandbox import broker
+    from agent_hub.skills.sandbox import python_resolution_worker as worker
+    from agent_hub.skills.sandbox.project import ProjectExecutionBroker
     p, _ = api()
     request = p.ResolutionRequest(
         action="inspect_python_resolution",
@@ -601,41 +648,26 @@ async def test_v11_dispatch_is_reachable_through_existing_root_peer_broker(monke
         requirements=(("demo", "a" * 64),),
         environment=registry.environment(),
     )
-    called = []
+    called: list[int] = []
 
-    async def handle(project, request, *, peer_uid):
+    async def handle(
+        project: ProjectExecutionBroker, request: ResolutionRequest, *, peer_uid: int,
+    ) -> ResolutionStatus:
         called.append(peer_uid)
         return p.ResolutionStatus(state="unknown", key=request.key)
 
     monkeypatch.setattr(worker, "handle_resolution", handle)
     monkeypatch.setattr(broker, "_peer_uid", lambda writer: 10001)
 
-    class Writer:
-        def __init__(self):
-            self.data = bytearray()
-            self.closed = False
-
-        def write(self, data):
-            self.data.extend(data)
-
-        async def drain(self):
-            pass
-
-        def close(self):
-            self.closed = True
-
-        async def wait_closed(self):
-            pass
-
-    writer = Writer()
     reader = asyncio.StreamReader()
+    writer = MemoryWriter(reader)
     raw = request.model_dump_json().encode()
     reader.feed_data(struct.pack("!I", len(raw)) + raw)
     reader.feed_eof()
     await broker._serve_client(
         reader,
         writer,
-        SimpleNamespace(_policy=SimpleNamespace(allowed_uid=10001), _project_broker=object()),
+        broker.SkillBroker(BrokerPolicy(allowed_uid=10001)),
     )
     assert called == [10001]
     assert json.loads(writer.data[4:])["key"] == request.key and writer.closed
@@ -643,18 +675,20 @@ async def test_v11_dispatch_is_reachable_through_existing_root_peer_broker(monke
 
 
 
-def test_publication_validator_preserves_original_absolute_deadline(monkeypatch):
-    publisher = importlib.import_module("agent_hub.skills.sandbox.python_input_publish")
-    fetch = importlib.import_module("agent_hub.skills.sandbox.python_input_fetch")
+def test_publication_validator_preserves_original_absolute_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agent_hub.skills.sandbox import python_input_fetch as fetch
+    from agent_hub.skills.sandbox import python_input_publish as publisher
     row, raw = registry.wheel("bounded")
     e = fetch.WheelDownload(
         row["filename"], "bounded", "1.0", row["digests"]["sha256"], len(raw), row["url"]
     )
     deadline = time.monotonic() + 1
-    observed = []
+    observed: list[float | None] = []
     original = fetch.validate_wheel_bytes
 
-    def validate(entry, data, *, deadline=None):
+    def validate(entry: WheelDownload, data: bytes, *, deadline: float | None = None) -> None:
         observed.append(deadline)
         original(entry, data, deadline=deadline)
 
@@ -663,13 +697,19 @@ def test_publication_validator_preserves_original_absolute_deadline(monkeypatch)
     assert observed == [deadline]
 
 
-async def test_complete_index_extraction_preserves_original_deadline(worker_case, monkeypatch):
+async def test_complete_index_extraction_preserves_original_deadline(
+    worker_case: WorkerCase, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     c = worker_case
-    indexes = importlib.import_module("agent_hub.skills.sandbox.python_dependency_index_store")
-    observed = []
-    original = indexes.extract_python_wheel_metadata
+    from agent_hub.skills.sandbox import python_dependency_index_store as indexes
+    from agent_hub.skills.sandbox.python_dependency_metadata import extract_python_wheel_metadata
 
-    def extract(entry, raw, *, deadline=None):
+    observed: list[float | None] = []
+    original = extract_python_wheel_metadata
+
+    def extract(
+        entry: WheelDownload, raw: bytes, *, deadline: float | None = None,
+    ) -> PythonWheelMetadata:
         observed.append(deadline)
         return original(entry, raw, deadline=deadline)
 
@@ -679,7 +719,9 @@ async def test_complete_index_extraction_preserves_original_deadline(worker_case
     assert observed and all(value == deadline for value in observed)
 
 
-async def test_failed_fetch_drain_preserves_unknown_instead_of_quiet(worker_case, monkeypatch):
+async def test_failed_fetch_drain_preserves_unknown_instead_of_quiet(
+    worker_case: WorkerCase, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     import asyncio
 
     from agent_hub.subprocess_cleanup import ProcessCleanupIncomplete
@@ -687,10 +729,10 @@ async def test_failed_fetch_drain_preserves_unknown_instead_of_quiet(worker_case
     c = worker_case
     entered = asyncio.Event()
 
-    async def broken(*args):
+    async def broken(*args: object) -> Never:
         entered.set()
         try:
-            await asyncio.Future()
+            await asyncio.Future[Never]()
         finally:
             raise ProcessCleanupIncomplete("input_supply_cleanup_incomplete")
 
@@ -702,7 +744,7 @@ async def test_failed_fetch_drain_preserves_unknown_instead_of_quiet(worker_case
         row["filename"], "test", "1.0", row["digests"]["sha256"], len(raw), row["url"]
     )
     task = asyncio.create_task(
-        c.worker._fetch(e, c.request, None, c.root, c.supply, c.request.claim.deadline)
+        c.worker._fetch(e, c.request, c.policy, c.root, c.supply, c.request.claim.deadline)
     )
     await entered.wait()
     task.cancel()
@@ -710,14 +752,15 @@ async def test_failed_fetch_drain_preserves_unknown_instead_of_quiet(worker_case
         await task
 
 
-async def test_sdk_cancel_invokes_existing_exact_project_termination(monkeypatch):
+async def test_sdk_cancel_invokes_existing_exact_project_termination(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     import asyncio
     from types import SimpleNamespace
 
     from agent_hub.skills.sandbox import project
     from agent_hub.skills.sandbox import python_metadata_preparation_client as peer
-
-    worker = importlib.import_module("agent_hub.skills.sandbox.python_resolution_worker")
+    from agent_hub.skills.sandbox import python_resolution_worker as worker
     p, _ = api()
     request = p.ResolutionRequest(
         action="inspect_python_resolution",
@@ -726,27 +769,14 @@ async def test_sdk_cancel_invokes_existing_exact_project_termination(monkeypatch
         environment=registry.environment(),
     )
     entered = asyncio.Event()
-    terminated = []
-
-    class Writer:
-        def write(self, data):
-            pass
-
-        async def drain(self):
-            entered.set()
-
-        def close(self):
-            pass
-
-        async def wait_closed(self):
-            pass
+    terminated: list[str] = []
 
     reader = asyncio.StreamReader()
 
-    async def connect(*args):
-        return reader, Writer()
+    async def connect(*args: object) -> tuple[asyncio.StreamReader, MemoryWriter]:
+        return reader, MemoryWriter(reader, on_drain=entered.set)
 
-    async def terminate(self, key):
+    async def terminate(self: project.ProjectSystemdSandbox, key: str) -> None:
         terminated.append(key)
 
     monkeypatch.setattr(project, "_systemd_supported", lambda: True)

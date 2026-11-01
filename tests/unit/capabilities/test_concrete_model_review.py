@@ -1,12 +1,14 @@
 """Private context contracts and actual storage seam, without PG claims."""
 
+from __future__ import annotations
+
 import asyncio
 import os
-from contextlib import asynccontextmanager
+from collections.abc import Callable
 from dataclasses import asdict, replace
-from datetime import UTC, datetime
 from decimal import Decimal
-from types import SimpleNamespace
+from pathlib import Path
+from typing import Literal
 from uuid import uuid4
 
 import pytest
@@ -18,8 +20,8 @@ from agent_hub.capabilities.execution_authority import (
     bind_execution_authority,
 )
 from agent_hub.capabilities.gateway import CapabilityResult, CapabilityStatus
-from agent_hub.capabilities.model_review import ModelReviewOutcome
-from agent_hub.capabilities.review_contracts import ModelReviewVerdict
+from agent_hub.capabilities.model_review import ModelReviewOutcome, _LiveReviewContext
+from agent_hub.capabilities.review_contracts import FrozenReviewAction, ModelReviewVerdict
 from agent_hub.capabilities.review_repository import ReviewRepository, _ReviewReservation
 from agent_hub.db.models import (
     RunAdmissionPoolRow,
@@ -34,41 +36,47 @@ from agent_hub.harness.tool_gateway import _capability_request
 from agent_hub.models.physical_budget import _bind_run_budget
 from agent_hub.models.run_admission_repository import DeploymentIdentity, UsageObservation
 from agent_hub.runs.repository import RunRepository
-from tests.unit.harness.test_review_dispatch import setup
+from agent_hub.runtime.contracts import TaskContext
+from tests.unit.harness.review_typed_fixture import (
+    ConcreteRepositoryAdapter,
+    ReviewMemoryDB,
+    present,
+)
+from tests.unit.harness.test_review_dispatch import ReviewSetup, setup
 
 
-async def test_loader_reads_real_worker_and_root(tmp_path):
+async def test_loader_reads_real_worker_and_root(tmp_path: Path) -> None:
     s = setup(tmp_path)
-    request = _capability_request(s.task.tenant_id, s.task.actor_id, s.request)
+    request = _capability_request(s.task.tenant_id, present(s.task.actor_id), s.request)
     with (
         bind_execution_authority(s.task, worker_id=s.budget.lease.worker_id),
         _bind_run_budget(s.budget),
     ):
-        policy, inbound = await s.policy._current_review_policy(request, s.task.actor_role)
+        policy, inbound = await s.policy._current_review_policy(request, present(s.task.actor_role))
         assert not inbound
-        assert policy.evaluate(request, s.task.actor_role).route == "model_required"
+        assert policy.evaluate(request, present(s.task.actor_role)).route == "model_required"
         snapshot, live, fence = await s.loader.load(
-            request, s.task.actor_role, policy, tool_name=s.request.tool_name
+            request, present(s.task.actor_role), policy, tool_name=s.request.tool_name
         )
         assert snapshot.request() == request
         assert live.budget is s.budget
         assert fence.context is not s.task
 
 
-async def test_effect_ignores_actor_key_and_run_while_action_binds_them(tmp_path):
+async def test_effect_ignores_actor_key_and_run_while_action_binds_them(tmp_path: Path) -> None:
     s = setup(tmp_path)
-    request = _capability_request(s.task.tenant_id, s.task.actor_id, s.request)
+    request = _capability_request(s.task.tenant_id, present(s.task.actor_id), s.request)
     with (
         bind_execution_authority(s.task, worker_id=s.budget.lease.worker_id),
         _bind_run_budget(s.budget),
     ):
-        policy, _ = await s.policy._current_review_policy(request, s.task.actor_role)
+        policy, _ = await s.policy._current_review_policy(request, present(s.task.actor_role))
         first, _, _ = await s.loader.load(
-            request, s.task.actor_role, policy, tool_name=s.request.tool_name
+            request, present(s.task.actor_role), policy, tool_name=s.request.tool_name
         )
         other = request.model_copy(update={"agent_id": "other", "idempotency_key": "other"})
         second, _, _ = await s.loader.load(
-            other, s.task.actor_role, policy, tool_name=s.request.tool_name
+            other, present(s.task.actor_role), policy, tool_name=s.request.tool_name
         )
         effect = first.to_payload()["normalized_effect"]
         assert (
@@ -80,39 +88,39 @@ async def test_effect_ignores_actor_key_and_run_while_action_binds_them(tmp_path
         assert first.action_digest != second.action_digest
 
 
-async def test_file_effect_uses_actual_platform_case_semantics(tmp_path):
+async def test_file_effect_uses_actual_platform_case_semantics(tmp_path: Path) -> None:
     s = setup(tmp_path)
-    request = _capability_request(s.task.tenant_id, s.task.actor_id, s.request)
+    request = _capability_request(s.task.tenant_id, present(s.task.actor_id), s.request)
     other = request.model_copy(update={"arguments": {**request.arguments, "path": "HELLO.txt"}})
     with (
         bind_execution_authority(s.task, worker_id=s.budget.lease.worker_id),
         _bind_run_budget(s.budget),
     ):
-        policy, _ = await s.policy._current_review_policy(request, s.task.actor_role)
+        policy, _ = await s.policy._current_review_policy(request, present(s.task.actor_role))
         first, _, _ = await s.loader.load(
-            request, s.task.actor_role, policy, tool_name=s.request.tool_name
+            request, present(s.task.actor_role), policy, tool_name=s.request.tool_name
         )
         second, _, _ = await s.loader.load(
-            other, s.task.actor_role, policy, tool_name=s.request.tool_name
+            other, present(s.task.actor_role), policy, tool_name=s.request.tool_name
         )
         assert (first.effect_digest == second.effect_digest) == (
             os.path.normcase("HELLO.txt") == "hello.txt"
         )
 
 
-async def test_accessor_is_independent_and_inherited_binding_revokes(tmp_path):
+async def test_accessor_is_independent_and_inherited_binding_revokes(tmp_path: Path) -> None:
     s = setup(tmp_path)
     started, release = asyncio.Event(), asyncio.Event()
 
-    def read():
+    def read() -> tuple[TaskContext, str]:
         return _trusted_review_context(
             tenant_id=s.task.tenant_id,
             run_id=s.task.run_id,
-            user_id=s.task.actor_id,
-            role=s.task.actor_role,
+            user_id=present(s.task.actor_id),
+            role=present(s.task.actor_role),
         )
 
-    async def child():
+    async def child() -> None:
         started.set()
         await release.wait()
         with pytest.raises(ExecutionAuthorityError):
@@ -127,7 +135,7 @@ async def test_accessor_is_independent_and_inherited_binding_revokes(tmp_path):
             _trusted_review_context(
                 tenant_id=s.task.tenant_id,
                 run_id=s.task.run_id,
-                user_id=s.task.actor_id,
+                user_id=present(s.task.actor_id),
                 role=Role.ADMIN,
             )
         pending = asyncio.create_task(child())
@@ -136,29 +144,29 @@ async def test_accessor_is_independent_and_inherited_binding_revokes(tmp_path):
     await pending
 
 
-def test_public_capability_result_has_no_private_review_fields():
+def test_public_capability_result_has_no_private_review_fields() -> None:
     result = CapabilityResult(CapabilityStatus.ALLOWED, uuid4())
     assert set(asdict(result)) == {"status", "run_id", "approval_id", "reason", "review"}
     assert result.review is None
 
 
-class FocusedDB:
+class FocusedDB(ReviewMemoryDB):
     """ORM/query boundary double. Production ledger, fence and receipts run unchanged.
 
     Serializes transactions locally; this does NOT test PG locks/SQL/schema.
     """
 
-    def __init__(self, s):
-        self.s, self.rows, self.active = s, [], False
-        self.lock = asyncio.Lock()
+    def __init__(self, s: ReviewSetup) -> None:
+        super().__init__()
+        self.s = s
         route = {
-            **s.runs.record.routing_decision,
+            **present(s.runs.record.routing_decision),
             "runtime_token_absolute_tokens": 40000,
             "runtime_plan_token_budget": 40000,
         }
         s.runs.record = replace(s.runs.record, routing_decision=route)
         s.task = s.task.model_copy(update={"routing_decision": route})
-        e, pool = s.budget.evidence, s.budget._pool
+        e, pool = s.budget.evidence, present(s.budget._pool)
         self.run = RunRow(
             id=s.task.run_id,
             tenant_id=s.task.tenant_id,
@@ -198,67 +206,17 @@ class FocusedDB:
         )
         self.add(self.pool)
 
-    def __call__(self):
-        return self
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *args):
-        pass
-
-    @asynccontextmanager
-    async def begin(self):
-        async with self.lock:
-            self.active = True
-            try:
-                yield
-            finally:
-                self.active = False
-
-    def in_transaction(self):
-        return self.active
-
-    def add(self, row):
-        if isinstance(row, RunReviewEventRow):
-            row.sequence = len(self.rows)
-        self.rows.append(row)
-
-    async def flush(self):
-        pass
-
-    def select(self, statement):
-        entity = statement.column_descriptions[0]["entity"]
-        rows = [row for row in self.rows if type(row) is entity]
-        for condition in statement._where_criteria:
-            # These production calls use equality predicates only.
-            name, value = condition.left.key, condition.right.value
-            rows = [row for row in rows if getattr(row, name) == value]
-        return rows
-
-    async def scalar(self, statement):
-        rows = self.select(statement)
-        return rows[0] if rows else None
-
-    async def scalars(self, statement):
-        return SimpleNamespace(all=lambda: self.select(statement))
-
-    async def execute(self, statement):
-        if statement.column_descriptions[0].get("entity") is RunInputAuthorizationRow:
-            link = next(r for r in self.rows if type(r) is RunInputAuthorizationRow)
-            turn = next(r for r in self.rows if type(r) is RunAuthenticatedInputRow)
-            return SimpleNamespace(one_or_none=lambda: (link, turn))
-        assert "clock_timestamp" in str(statement)
-        return SimpleNamespace(scalar_one=lambda: datetime.now(UTC))
 
 
 class FixedLedgerReview:
     """Fixed verdict seam using the ACTUAL repositories for all durable changes."""
 
-    def __init__(self, repo, status="allow"):
-        self.repo, self.status, self.calls, self.hook = repo, status, 0, None
+    def __init__(self, repo: ReviewRepository, status: Literal['allow', 'deny', 'unknown'] = 'allow') -> None:
+        self.repo, self.status, self.calls = repo, status, 0
+        self.hook: Callable[[], None] | None = None
 
-    async def review(self, snapshot, live):
+    async def review(self, snapshot: FrozenReviewAction, live_context: _LiveReviewContext) -> ModelReviewOutcome:
+        live = live_context
         self.calls += 1
         req = snapshot.request()
         model = DeploymentIdentity("fixed", "review", "fixed-model")
@@ -273,7 +231,7 @@ class FixedLedgerReview:
         physical = uuid4()
         assert await self.repo.mark_issued(
             tenant_id=req.tenant_id,
-            run_id=req.run_id,
+            run_id=present(req.run_id),
             review_id=item.review_id,
             physical_identity=physical,
             lease=lease,
@@ -292,7 +250,7 @@ class FixedLedgerReview:
         )
         committed = await self.repo.finish(
             tenant_id=req.tenant_id,
-            run_id=req.run_id,
+            run_id=present(req.run_id),
             review_id=item.review_id,
             attempt_id=item.attempt_id,
             request_sha256="e" * 64,
@@ -307,54 +265,53 @@ class FixedLedgerReview:
             self.hook()
         return ModelReviewOutcome(
             committed.status,
-            committed.risk,
-            committed.reason_code,
+            present(committed.risk),
+            present(committed.reason_code),
             committed.action_digest,
             committed.effect_digest,
             review_id=committed.review_id,
         )
 
 
-async def test_fixed_ledger_seam_commits_verifiable_allow(tmp_path):
+async def test_fixed_ledger_seam_commits_verifiable_allow(tmp_path: Path) -> None:
     s = setup(tmp_path)
     db = FocusedDB(s)
     repo = ReviewRepository(db)
     fixed = FixedLedgerReview(repo)
-    request = _capability_request(s.task.tenant_id, s.task.actor_id, s.request)
+    request = _capability_request(s.task.tenant_id, present(s.task.actor_id), s.request)
     with (
         bind_execution_authority(s.task, worker_id=s.budget.lease.worker_id),
         _bind_run_budget(s.budget),
     ):
-        policy, _ = await s.policy._current_review_policy(request, s.task.actor_role)
+        policy, _ = await s.policy._current_review_policy(request, present(s.task.actor_role))
         snapshot, live, _ = await s.loader.load(
-            request, s.task.actor_role, policy, tool_name=s.request.tool_name
+            request, present(s.task.actor_role), policy, tool_name=s.request.tool_name
         )
         outcome = await fixed.review(snapshot, live)
         assert outcome.status == "allow"
-        assert (
-            await repo.get(s.task.tenant_id, s.task.run_id, outcome.review_id)
-        ).status == "allow"
+        observed = await repo.get(s.task.tenant_id, s.task.run_id, present(outcome.review_id))
+        assert present(observed).status == "allow"
 
 
 @pytest.mark.parametrize("status", ["allow", "deny", "unknown"])
-async def test_actual_repository_one_use_is_wired_to_real_backend(tmp_path, status):
+async def test_actual_repository_one_use_is_wired_to_real_backend(tmp_path: Path, status: Literal["allow", "deny", "unknown"]) -> None:
     s = setup(tmp_path)
     db = FocusedDB(s)
     repo = ReviewRepository(db)
     fixed = FixedLedgerReview(repo, status)
-    s.gate.repository, s.gate.service = repo, fixed
+    s.gate.repository, s.gate.service = ConcreteRepositoryAdapter(repo), fixed
     with (
         bind_execution_authority(s.task, worker_id=s.budget.lease.worker_id),
         _bind_run_budget(s.budget),
     ):
         first = await s.harness.invoke(
-            s.task.tenant_id, s.request, user_id=s.task.actor_id, role=s.task.actor_role
+            s.task.tenant_id, s.request, user_id=present(s.task.actor_id), role=present(s.task.actor_role)
         )
         second = await s.harness.invoke(
             s.task.tenant_id,
             replace(s.request, actor="repair_agent", idempotency_key="second"),
-            user_id=s.task.actor_id,
-            role=s.task.actor_role,
+            user_id=present(s.task.actor_id),
+            role=present(s.task.actor_role),
         )
     assert first.status == ("succeeded" if status == "allow" else "failed"), first
     assert second.status == "failed"
@@ -371,14 +328,14 @@ async def test_actual_repository_one_use_is_wired_to_real_backend(tmp_path, stat
 
 
 @pytest.mark.parametrize("change", ["lease", "role", "auth", "receipt"])
-async def test_actual_repository_rejects_current_db_fence_or_bad_receipt(tmp_path, change):
+async def test_actual_repository_rejects_current_db_fence_or_bad_receipt(tmp_path: Path, change: str) -> None:
     s = setup(tmp_path)
     db = FocusedDB(s)
     repo = ReviewRepository(db)
     fixed = FixedLedgerReview(repo)
-    s.gate.repository, s.gate.service = repo, fixed
+    s.gate.repository, s.gate.service = ConcreteRepositoryAdapter(repo), fixed
 
-    def mutate():
+    def mutate() -> None:
         if change == "lease":
             db.run.worker_lease_token = uuid4()
         elif change == "role":
@@ -394,7 +351,7 @@ async def test_actual_repository_rejects_current_db_fence_or_bad_receipt(tmp_pat
         _bind_run_budget(s.budget),
     ):
         result = await s.harness.invoke(
-            s.task.tenant_id, s.request, user_id=s.task.actor_id, role=s.task.actor_role
+            s.task.tenant_id, s.request, user_id=present(s.task.actor_id), role=present(s.task.actor_role)
         )
     assert result.status == "failed"
     assert fixed.calls == 1
@@ -406,14 +363,14 @@ async def test_actual_repository_rejects_current_db_fence_or_bad_receipt(tmp_pat
     "action,expected", [("capability_tool.auto_review", False), ("capability_tool", True)]
 )
 async def test_fresh_exact_permission_distinguishes_human_from_legacy_model_upsert(
-    tmp_path, action, expected
-):
+    tmp_path: Path, action: str, expected: bool
+) -> None:
     from agent_hub.capabilities.approvals import fingerprint_capability_request
     from agent_hub.capabilities.defaults import _has_exact_human_approval
 
     s = setup(tmp_path)
     db = FocusedDB(s)
-    request = _capability_request(s.task.tenant_id, s.task.actor_id, s.request)
+    request = _capability_request(s.task.tenant_id, present(s.task.actor_id), s.request)
     db.add(
         RunApprovalRow(
             tenant_id=request.tenant_id,

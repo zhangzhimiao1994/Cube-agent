@@ -16,6 +16,7 @@ from agent_hub.models.types import ModelCapability, ModelRequest
 from agent_hub.runtime.contracts import EventKind
 from agent_hub.runtime.provider_continuation import InMemoryProviderContinuationRepository
 from tests.unit.models.test_gateway import CapacityStub, SecretStub, deployment, lease
+from tests.unit.runs.project_auto_repair_typed_fixture import mapping
 from tests.unit.runtime.crew.test_adapter_failure_reason import _workspace_delivery_sequence_context
 from tests.unit.runtime.crew.test_meaningful_workspace_progress import Observations
 from tests.unit.runtime.crew.test_native_tool_continuation import subject
@@ -123,7 +124,7 @@ async def test_native_chat_rejects_whole_batch_and_finishes_real_bundle(finish: 
         assert "PRIVATE_REJECTED_PREFIX" not in correction
         assert any(message.get("tool_call_id") == "write-once" for message in wire[2]["messages"])
         checkpoint = await runtime.save_checkpoint()
-        assert checkpoint.state["usage"]["tokens"] == 85
+        assert mapping(checkpoint.state["usage"])["tokens"] == 85
         assert len(capacity.records) == len(capacity.releases) == 5
         assert "PRIVATE_REJECTED_PREFIX" not in json.dumps(checkpoint.to_payload())
         assert "PRIVATE_REJECTED_PREFIX" not in json.dumps([event.to_payload() for event in events])

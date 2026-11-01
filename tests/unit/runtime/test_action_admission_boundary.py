@@ -15,6 +15,7 @@ from agent_hub.runtime.engineering_admission import (
     admission_checkpoint_valid,
     with_engineering_admission,
 )
+from tests.unit.runs.project_auto_repair_typed_fixture import present
 from tests.unit.runs.test_repository_approval_upserts import ApprovalProjectionSession
 from tests.unit.runtime.test_action_admission_helper import (
     NoExecutionBackend,
@@ -87,7 +88,7 @@ async def test_actual_configured_planning_factory_rejects_missing_concrete_wirin
 ) -> None:
     db = ApprovalProjectionSession()
     ctx = task(db, mode, 'default')
-    db.run.routing_decision.update(engineering_action_admission_version=1,
+    present(db.run.routing_decision).update(engineering_action_admission_version=1,
         engineering_delivery_contract_version=1, engineering_action_version=1)
     ctx = ctx.model_copy(update={'routing_decision': db.run.routing_decision})
     # Planning does not gain a workspace delivery obligation or require an engineering ACK.

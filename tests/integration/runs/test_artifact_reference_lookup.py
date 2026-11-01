@@ -1,5 +1,6 @@
 """Prepared real-PG lookup selector; local collection is NOT PG verification."""
 
+from typing import TypedDict
 from uuid import UUID, uuid4
 
 import pytest
@@ -15,8 +16,14 @@ from tests.integration.runs.test_runtime_artifact_repository import (
 from tests.integration.runs.test_runtime_artifact_repository import (
     store as store,  # noqa: PLC0414 - existing guarded real-PG fixture
 )
+from tests.unit.runs.project_auto_repair_typed_fixture import json_map
 
 pytestmark = pytest.mark.integration
+
+
+class LookupQuery(TypedDict):
+    type: str
+    producer: str
 
 
 async def test_find_references_real_pg_scope_keyset_and_immutable_read(
@@ -27,7 +34,7 @@ async def test_find_references_real_pg_scope_keyset_and_immutable_read(
             id=UUID(int=index),
             type="python_resolution_checkpoint",
             producer="python_resolution",
-            content={"needs": ["PRIVATE_BODY_SENTINEL"], "index": index},
+            content=json_map({"needs": ["PRIVATE_BODY_SENTINEL"], "index": index}),
         )
         for index in range(1, 131)
     ]
@@ -74,7 +81,7 @@ async def test_find_references_real_pg_scope_keyset_and_immutable_read(
 
     before = await snapshot()
     reader = repository(store.database)  # a fresh repository/worker, no memory index
-    query = {"type": "python_resolution_checkpoint", "producer": "python_resolution"}
+    query: LookupQuery = {"type": "python_resolution_checkpoint", "producer": "python_resolution"}
     first = await reader.find_references(store.tenant_id, store.run_id, **query)
     second = await reader.find_references(
         store.tenant_id, store.run_id, after=first[-1].id, **query

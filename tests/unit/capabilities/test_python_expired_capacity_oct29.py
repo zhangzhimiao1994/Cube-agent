@@ -14,6 +14,10 @@ from uuid import UUID
 import pytest
 
 from agent_hub.capabilities.python_project_lifecycle import PythonProjectTerminalHook
+from tests.unit.capabilities.capability_lifecycle_typed_fixture import (
+    UnusedContextReader,
+    UnusedReleaser,
+)
 from tests.unit.capabilities.test_python_project_service import configured
 from tests.unit.skills.sandbox.test_python_project_client import invocation
 
@@ -71,13 +75,13 @@ async def test_maintenance_holds_original_run_lock_through_rpc_without_rewriting
         async def run_transaction(self) -> Any:
             return session
 
-    class Reader:
+    class Reader(UnusedContextReader):
         async def python_expired_environment_invocation(self, tenant: UUID, run: UUID) -> Any:
             assert session.open and (tenant,run)==(session.row.tenant_id,session.row.id)
             calls.append('readonly')
             return invocation().model_copy(update={'source_kind':'original','install_allowed':False})
 
-    class Executor:
+    class Executor(UnusedReleaser):
         async def release_expired(self, item: Any) -> bool:
             assert session.open and item.run_id==session.row.id and item.install_allowed is False
             calls.append('rpc')
@@ -123,14 +127,14 @@ async def test_generated_expiry_uses_locked_native_proof_and_metadata_only_selec
         async def run_transaction(self) -> Any:
             return session
 
-    class Reader:
+    class Reader(UnusedContextReader):
         async def python_expired_environment_invocation(self, tenant: UUID, run: UUID) -> Any:
             assert session.open
             calls.append('metadata')
             return invocation().model_copy(update={'install_allowed':False,'source_kind':'candidate',
                 **({'run_id':UUID(int=9)} if defect == 'scope' else {})})
 
-    class Executor:
+    class Executor(UnusedReleaser):
         async def release_expired(self, item: Any) -> bool:
             assert session.open and item.source_kind == 'candidate'
             calls.append('root-fenced-rpc')
@@ -167,14 +171,14 @@ async def exercise(session: Session, *, response: object = True,
         async def run_transaction(self) -> Any:
             return session
 
-    class Reader:
+    class Reader(UnusedContextReader):
         async def python_expired_environment_invocation(self, tenant: UUID, run: UUID) -> Any:
             assert session.open
             calls.append('readonly')
             return invocation().model_copy(update={
                 'source_kind':'original','install_allowed':False, **(change or {})})
 
-    class Executor:
+    class Executor(UnusedReleaser):
         async def release_expired(self, item: Any) -> Any:
             assert session.open
             calls.append('rpc')
@@ -368,11 +372,11 @@ async def test_prepare_callback_waits_for_inflight_periodic_maintenance() -> Non
         async def run_transaction(self) -> Any:
             return session
 
-    class Reader:
+    class Reader(UnusedContextReader):
         async def python_expired_environment_invocation(self, tenant: UUID, run: UUID) -> Any:
             return invocation().model_copy(update={'source_kind':'original','install_allowed':False})
 
-    class Executor:
+    class Executor(UnusedReleaser):
         async def release_expired(self, item: Any) -> bool:
             started.set()
             await finish.wait()
@@ -442,7 +446,7 @@ async def test_real_client_cancel_drain_finishes_before_db_lock_is_released(
         async def run_transaction(self) -> Any:
             return session
 
-    class Reader:
+    class Reader(UnusedContextReader):
         async def python_expired_environment_invocation(self, tenant: UUID, run: UUID) -> Any:
             return invocation().model_copy(update={'source_kind':'original','install_allowed':False})
 

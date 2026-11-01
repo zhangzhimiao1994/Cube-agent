@@ -1,15 +1,22 @@
 """Private review storage contracts; no database or provider calls."""
 
 import hashlib
-import importlib
 import json
-from dataclasses import replace
+from collections.abc import Coroutine, Generator, Sequence
 from decimal import Decimal
+from typing import Unpack
 from uuid import UUID, uuid4
 
 import pytest
+from sqlalchemy import Select, event
+from sqlalchemy.engine import Result
+from sqlalchemy.engine.result import IteratorResult, SimpleResultMetaData
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.orm import ORMExecuteState
+from sqlalchemy.util import await_only
 
 from agent_hub.auth.models import AuthenticatedPrincipal, Role
+from agent_hub.capabilities import review_repository
 from agent_hub.capabilities.review_contracts import (
     ApprovalReviewConfig,
     FrozenReviewAction,
@@ -17,15 +24,24 @@ from agent_hub.capabilities.review_contracts import (
     freeze_review_action,
 )
 from agent_hub.capabilities.types import CapabilityRequest
+from agent_hub.db.base import Base
 from agent_hub.models.run_admission_repository import DeploymentIdentity, _WorkerLease
-from agent_hub.runs.authorization import _capture_authenticated_input
+from agent_hub.runs.authorization import _AuthenticatedInput, _capture_authenticated_input
+from tests.unit.capabilities.review_repository_api_typed_fixture import (
+    ActionArguments,
+    freeze_untrusted_usage,
+    mapping,
+    observation,
+    present,
+    reclassify,
+    replaced_evidence,
+    text,
+    untrusted_reservation,
+    untrusted_usage,
+)
 
 
-def module():
-    return importlib.import_module("agent_hub.capabilities.review_repository")
-
-
-def evidence():
+def evidence() -> _AuthenticatedInput:
     return _capture_authenticated_input(
         AuthenticatedPrincipal(tenant_id=UUID(int=1), user_id=UUID(int=2), role=Role.OPERATOR),
         "private user text",
@@ -33,16 +49,16 @@ def evidence():
     )
 
 
-def config():
+def config() -> ApprovalReviewConfig:
     return ApprovalReviewConfig(
         engine="rules_then_model", reviewer_logical_model="reviewer", max_cost_usd_per_run="1.00"
     )
 
 
-def action(**changes):
-    m = module()
+def action(**changes: Unpack[ActionArguments]) -> FrozenReviewAction:
+    m = review_repository
     e = evidence()
-    payload = {
+    payload: ActionArguments = {
         "role": e.actor_role,
         "authorization_turn_id": e.turn_id,
         "authorization_sha256": m.authorization_binding_sha256(e),
@@ -66,8 +82,8 @@ def action(**changes):
     return freeze_review_action(req, **payload)
 
 
-def test_authorization_hash_exact_schema_and_each_security_field():
-    m = module()
+def test_authorization_hash_exact_schema_and_each_security_field() -> None:
+    m = review_repository
     e = evidence()
     expected = {
         "schema_version": 1,
@@ -89,10 +105,10 @@ def test_authorization_hash_exact_schema_and_each_security_field():
         ("actor_role", Role.ADMIN),
         ("turn_id", uuid4()),
     ]:
-        assert m.authorization_binding_sha256(replace(e, **{key: value})) != digest
+        assert m.authorization_binding_sha256(replaced_evidence(e, key, value)) != digest
     for key in ["message_sha256", "scope_sha256", "_seal"]:
         with pytest.raises(ValueError, match="^invalid review binding$"):
-            m.authorization_binding_sha256(replace(e, **{key: object()}))
+            m.authorization_binding_sha256(replaced_evidence(e, key, object()))
 
 
 @pytest.mark.parametrize(
@@ -110,8 +126,8 @@ def test_authorization_hash_exact_schema_and_each_security_field():
         "noncanonical",
     ],
 )
-def test_action_revalidation_rejects_forged_or_unbounded_snapshot(change):
-    m = module()
+def test_action_revalidation_rejects_forged_or_unbounded_snapshot(change: str) -> None:
+    m = review_repository
     original = action()
     payload = json.loads(original._payload_bytes)
     digest, effect = original.action_digest, original.effect_digest
@@ -147,8 +163,8 @@ def test_action_revalidation_rejects_forged_or_unbounded_snapshot(change):
     assert "private-value" not in str(caught.value)
 
 
-def test_action_roundtrip_and_config_hash_revalidation():
-    m = module()
+def test_action_roundtrip_and_config_hash_revalidation() -> None:
+    m = review_repository
     frozen = action()
     assert m._validated_action(frozen) == frozen
     assert len(m.review_config_sha256(config())) == 64
@@ -170,8 +186,8 @@ def test_action_roundtrip_and_config_hash_revalidation():
         {"reason_code": "private-value"},
     ],
 )
-def test_revalidates_manually_forged_verdict(changes):
-    m = module()
+def test_revalidates_manually_forged_verdict(changes: dict[str, object]) -> None:
+    m = review_repository
     a = action()
     v = ModelReviewVerdict(
         1, "allow", "low", "authorized_action", "Private reasoning.", a.action_digest
@@ -192,19 +208,21 @@ def test_revalidates_manually_forged_verdict(changes):
         (["deny", "needs_human", "deny", "cancelled", "deny"], True),
     ],
 )
-def test_breaker_errors_never_reset_explicit_denial_streak(history, blocked):
-    assert module()._breaker_open(history, config()) is blocked
+def test_breaker_errors_never_reset_explicit_denial_streak(
+    history: list[str], blocked: bool
+) -> None:
+    assert review_repository._breaker_open(history, config()) is blocked
 
 
-def test_breaker_window_counts_only_conclusive_reviews():
+def test_breaker_window_counts_only_conclusive_reviews() -> None:
     c = ApprovalReviewConfig(
         denial_breaker_consecutive=3, denial_breaker_denials=4, denial_breaker_window=6
     )
-    assert module()._breaker_open(["deny", "deny", "allow", "deny", "deny", "allow"], c)
-    assert module()._breaker_open(
+    assert review_repository._breaker_open(["deny", "deny", "allow", "deny", "deny", "allow"], c)
+    assert review_repository._breaker_open(
         ["deny", "deny", "allow", "deny", "deny", "allow"] + ["timeout"] * 100, c
     )
-    assert not module()._breaker_open(
+    assert not review_repository._breaker_open(
         ["deny", "deny", "allow", "deny", "deny", "allow", "allow"], c
     )
 
@@ -220,8 +238,8 @@ def test_breaker_window_counts_only_conclusive_reviews():
         {"lease": object()},
     ],
 )
-def test_reservation_revalidates_private_identity_and_holds(changes):
-    values = {
+def test_reservation_revalidates_private_identity_and_holds(changes: dict[str, object]) -> None:
+    values: dict[str, object] = {
         "request_sha256": "e" * 64,
         "deployment": DeploymentIdentity("synthetic", "review", "model"),
         "token_hold": 20,
@@ -230,11 +248,11 @@ def test_reservation_revalidates_private_identity_and_holds(changes):
     }
     values.update(changes)
     with pytest.raises(ValueError, match="^invalid review binding$"):
-        module()._ReviewReservation(**values)
+        untrusted_reservation(values)
 
 
-def test_private_binding_repr_never_exports_action_or_lease():
-    m = module()
+def test_private_binding_repr_never_exports_action_or_lease() -> None:
+    m = review_repository
     lease = _WorkerLease("worker", uuid4())
     r = m._ReviewReservation(
         "e" * 64, DeploymentIdentity("synthetic", "review", "model"), 20, Decimal("0.1"), lease
@@ -246,11 +264,11 @@ def test_private_binding_repr_never_exports_action_or_lease():
         assert value not in text
 
 
-def test_begin_requires_active_caller_transaction_and_never_opens_one():
+def test_begin_requires_active_caller_transaction_and_never_opens_one() -> None:
     from sqlalchemy.ext.asyncio import AsyncSession
 
-    m = module()
-    repo = m.ReviewRepository(None)
+    m = review_repository
+    repo = m.ReviewRepository(async_sessionmaker())
     session = AsyncSession()
     operation = repo._begin_intent_in_session(
         session,
@@ -265,6 +283,7 @@ def test_begin_requires_active_caller_transaction_and_never_opens_one():
         ),
         review_id=uuid4(),
     )
+    assert isinstance(operation, Coroutine)
     try:
         with pytest.raises(m.ReviewConflict, match="^review state conflict$"):
             operation.send(None)
@@ -286,8 +305,10 @@ def test_begin_requires_active_caller_transaction_and_never_opens_one():
         "needs_human",
     ],
 )
-def test_accounting_mapping_never_refunds_unproven_unknown(outcome):
-    m = module()
+def test_accounting_mapping_never_refunds_unproven_unknown(
+    outcome: review_repository.ReviewOutcome,
+) -> None:
+    m = review_repository
     # Valid usage alone cannot prove a successful unknown model response.
     assert m._accounting_outcome(outcome) == (
         "not_issued"
@@ -298,8 +319,8 @@ def test_accounting_mapping_never_refunds_unproven_unknown(outcome):
     )
 
 
-def test_private_begin_arguments_are_isolated_before_first_database_await():
-    m = module()
+def test_private_begin_arguments_are_isolated_before_first_database_await() -> None:
+    m = review_repository
     original = config()
     reservation = m._ReviewReservation(
         "e" * 64,
@@ -329,11 +350,11 @@ def test_private_begin_arguments_are_isolated_before_first_database_await():
     ],
 )
 def test_finish_usage_mutation_between_review_and_budget_receipts_is_inert(
-    initial,
-    expected_status,
-    charged,
-    closed,
-):
+    initial: tuple[int, int | None, int | None, Decimal | None],
+    expected_status: str,
+    charged: int,
+    closed: bool,
+) -> None:
     """DB boundary double; BOTH production repositories perform real settlement."""
     from agent_hub.db.models import (
         RunAdmissionAttemptRow,
@@ -344,7 +365,7 @@ def test_finish_usage_mutation_between_review_and_budget_receipts_is_inert(
     )
     from agent_hub.models.run_admission_repository import UsageObservation
 
-    m = module()
+    m = review_repository
     a = action()
     p, req = a.to_payload(), a.request()
     review, physical = uuid4(), uuid4()
@@ -359,7 +380,7 @@ def test_finish_usage_mutation_between_review_and_budget_receipts_is_inert(
         review_id=review,
         tenant_id=req.tenant_id,
         run_id=req.run_id,
-        authorization_turn_id=UUID(p["authorization_turn_id"]),
+        authorization_turn_id=UUID(text(p["authorization_turn_id"])),
         attempt_id=attempt_id,
         action_digest=a.action_digest,
         effect_digest=a.effect_digest,
@@ -408,39 +429,46 @@ def test_finish_usage_mutation_between_review_and_budget_receipts_is_inert(
     )
 
     class Pause:
-        def __await__(self):
+        def __await__(self) -> Generator[str, None, None]:
             yield "budget-settlement-await"
 
-    class SessionBoundary:
-        def __init__(self):
+    class SessionBoundary(AsyncSession):
+        def __init__(self) -> None:
+            super().__init__()
             self.run_reads = 0
-            self.events = []
+            self.events: list[Base] = []
+            event.listen(self.sync_session, "do_orm_execute", self.execute_boundary, retval=True)
 
-        def in_transaction(self):
+        def in_transaction(self) -> bool:
             return True
 
-        async def scalar(self, statement):
+        def execute_boundary(self, state: ORMExecuteState) -> Result[tuple[Base]]:
+            statement = state.statement
+            assert isinstance(statement, Select)
             entity = statement.column_descriptions[0]["entity"]
             if entity is RunRow:
                 self.run_reads += 1
                 if self.run_reads == 2:
-                    await Pause()
-                return RunRow(id=req.run_id, tenant_id=req.tenant_id)
-            return {
-                RunAdmissionPoolRow: pool,
-                RunReviewEffectRow: effect,
-                RunReviewIntentRow: row,
-                RunAdmissionAttemptRow: attempt,
-            }[entity]
+                    await_only(Pause())
+                value: Base = RunRow(id=req.run_id, tenant_id=req.tenant_id)
+            else:
+                value = {
+                    RunAdmissionPoolRow: pool,
+                    RunReviewEffectRow: effect,
+                    RunReviewIntentRow: row,
+                    RunAdmissionAttemptRow: attempt,
+                }[entity]
+            return IteratorResult(SimpleResultMetaData(["value"]), iter([(value,)]))
 
-        def add(self, event):
-            self.events.append(event)
+        def add(self, instance: object, _warn: bool = True) -> None:
+            assert isinstance(instance, Base)
+            self.events.append(instance)
 
-        async def flush(self):
+        async def flush(self, objects: Sequence[object] | None = None) -> None:
             pass
 
     session = SessionBoundary()
-    repo = m.ReviewRepository(None)
+    repo = m.ReviewRepository(async_sessionmaker())
     operation = repo._finish_in_session(
         session,
         tenant_id=req.tenant_id,
@@ -455,6 +483,7 @@ def test_finish_usage_mutation_between_review_and_budget_receipts_is_inert(
         usage=usage,
         verdict=verdict,
     )
+    assert isinstance(operation, Coroutine)
     try:
         assert operation.send(None) == "budget-settlement-await"
         object.__setattr__(usage, "prompt_tokens", 2)
@@ -464,11 +493,11 @@ def test_finish_usage_mutation_between_review_and_budget_receipts_is_inert(
         with pytest.raises(StopIteration) as completed:
             operation.send(None)
         assert completed.value.value.status == expected_status
-        review_receipt = json.loads(row.private_receipt)
-        assert attempt.receipt["usage"] == review_receipt["evidence"]["usage"]
+        review_receipt = json.loads(present(row.private_receipt))
+        assert mapping(present(attempt.receipt))["usage"] == review_receipt["evidence"]["usage"]
         assert pool.token_charged == charged
         assert pool.closed is closed
-        assert attempt.receipt["usage"]["total_tokens"] == initial[2]
+        assert mapping(mapping(present(attempt.receipt))["usage"])["total_tokens"] == initial[2]
         repo._terminal_proof(row, attempt)
     finally:
         operation.close()
@@ -484,11 +513,13 @@ def test_finish_usage_mutation_between_review_and_budget_receipts_is_inert(
         ([], {}, object(), None),
     ],
 )
-def test_finish_freezes_malformed_usage_without_zero_or_lost_observation(usage_values):
-    from agent_hub.models.run_admission_repository import UsageObservation, _observation
+def test_finish_freezes_malformed_usage_without_zero_or_lost_observation(
+    usage_values: tuple[object, object, object, object],
+) -> None:
+    from agent_hub.models.run_admission_repository import _observation
 
-    m = module()
-    usage = UsageObservation(*usage_values)
+    m = review_repository
+    usage = untrusted_usage(usage_values)
     expected = _observation(usage)
     frozen, _, _, _ = m._freeze_finish_arguments(
         usage,
@@ -504,10 +535,10 @@ def test_finish_freezes_malformed_usage_without_zero_or_lost_observation(usage_v
     assert frozen is not usage
 
 
-def test_finish_freezes_model_lease_and_verdict_without_retaining_aliases():
+def test_finish_freezes_model_lease_and_verdict_without_retaining_aliases() -> None:
     from agent_hub.models.run_admission_repository import UsageObservation
 
-    m = module()
+    m = review_repository
     lease = _WorkerLease("worker", uuid4())
     token = lease.token
     identity = DeploymentIdentity("synthetic", "review", "model")
@@ -522,14 +553,16 @@ def test_finish_freezes_model_lease_and_verdict_without_retaining_aliases():
     object.__setattr__(verdict, "risk", "high")
     assert owned_lease.token == token
     assert owned_model.model_id == "model"
+    assert owned_verdict is not None
+    assert u is not None
     assert owned_verdict.risk == "low"
     assert (u.prompt_tokens, u.completion_tokens, u.total_tokens) == (2, 3, 5)
 
 
-def test_finish_freezes_opaque_invalid_type_without_retaining_caller_object():
-    from agent_hub.models.run_admission_repository import UsageObservation, _observation
+def test_finish_freezes_opaque_invalid_type_without_retaining_caller_object() -> None:
+    from agent_hub.models.run_admission_repository import _observation
 
-    m = module()
+    m = review_repository
 
     class BadUsage:
         pass
@@ -538,21 +571,20 @@ def test_finish_freezes_opaque_invalid_type_without_retaining_caller_object():
         pass
 
     field = BadUsage()
-    original = UsageObservation(field, None, None, None)
+    original = untrusted_usage((field, None, None, None))
     frozen, _, _, _ = m._freeze_finish_arguments(
         original,
         _WorkerLease("worker", uuid4()),
         DeploymentIdentity("synthetic", "review", "model"),
         None,
     )
-    field.__class__ = OtherUsage
-    assert _observation(frozen)["prompt_tokens"] == {"invalid_type": "BadUsage"}
+    reclassify(field, OtherUsage)
+    assert present(_observation(frozen))["prompt_tokens"] == {"invalid_type": "BadUsage"}
     invalid = BadUsage()
-    frozen, _, _, _ = m._freeze_finish_arguments(
+    opaque, _, _, _ = freeze_untrusted_usage(
         invalid,
         _WorkerLease("worker", uuid4()),
         DeploymentIdentity("synthetic", "review", "model"),
-        None,
     )
-    invalid.__class__ = OtherUsage
-    assert _observation(frozen) == {"invalid_type": "BadUsage"}
+    reclassify(invalid, OtherUsage)
+    assert observation(opaque) == {"invalid_type": "BadUsage"}

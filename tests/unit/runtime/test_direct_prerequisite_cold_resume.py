@@ -19,6 +19,7 @@ from agent_hub.models.types import ModelRequest
 from agent_hub.runs.project_verification_receipts import RECEIPT_KEY
 from agent_hub.runtime import direct
 from agent_hub.runtime.action_direct import ActionApprovedDirectRuntime
+from agent_hub.runtime.adaptive_budget import deadline_from_routing
 from agent_hub.runtime.contracts import Artifact, EventKind, RunEvent, RuntimeCheckpoint
 from agent_hub.runtime.worker_execution import worker_runtime_events
 from agent_hub.skills.sandbox.base import SkillResult
@@ -27,7 +28,8 @@ from tests.unit.capabilities.test_project_prerequisites import raw_report
 from tests.unit.capabilities.test_project_verification import Executor
 from tests.unit.capabilities.test_scoped_read import project_path
 from tests.unit.capabilities.test_verification_cold_recovery import Fixture
-from tests.unit.runtime.test_action_direct_cold_verification import Policy as ApprovalPolicy
+from tests.unit.runs.reviewed_report_revision_typed_fixture import read_map
+from tests.unit.runtime.direct_catalog_diagnostic_typed_fixture import Policy as ApprovalPolicy
 from tests.unit.runtime.test_direct_project_verification import Model, batch, diagnostic_read_batch
 
 INVALID_MANIFEST = '{"scripts":{"build":"node -v","test":'
@@ -95,7 +97,7 @@ async def test_source_bound_manifest_repair_survives_read_approval_on_a_cold_wor
     deadlines: list[Any] = []
     token_observations: list[tuple[int, int, int]] = []
     read_windows: list[tuple[Any, ...]] = []
-    create_deadline = direct.deadline_from_routing
+    create_deadline = deadline_from_routing
     token_limit = direct._workspace_delivery_token_limit
 
     def capture_deadline(*args: Any, **kwargs: Any) -> Any:
@@ -194,7 +196,7 @@ async def test_source_bound_manifest_repair_survives_read_approval_on_a_cold_wor
     assert results[-1].failure_reason == 'capability requires approval'
     blocked = next(result for result in results if result.tool_name == 'project.verify')
     assert blocked.status == 'failed'
-    assert blocked.payload['verification_blocked']['source_sha256'] == failed['source_sha256']
+    assert read_map(blocked.payload['verification_blocked'])['source_sha256'] == failed['source_sha256']
     assert 'execution_diagnostic' not in blocked.payload and 'verification' not in blocked.payload
     assert [name for name, _, _ in executions] == [
         'workspace.write_text', 'workspace.write_text', 'workspace.write_text', 'project.verify',

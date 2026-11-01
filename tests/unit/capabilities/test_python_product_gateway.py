@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import tempfile
 import zipfile
 from pathlib import Path
 from uuid import uuid4
@@ -14,6 +13,7 @@ from agent_hub.capabilities.python_product_delivery import consume_response, per
 from agent_hub.capabilities.runtime import RuntimeCapabilityGateway
 from agent_hub.files.generated import GeneratedFileStore
 from agent_hub.files.workspace import ProjectWorkspaceStore
+from agent_hub.runtime.contracts import JsonValue
 from agent_hub.skills.sandbox.base import SkillResult
 from agent_hub.skills.sandbox.python_project_protocol import PythonProjectBrokerResponse
 from tests.unit.skills.sandbox.test_python_product_transport import descriptor
@@ -31,14 +31,14 @@ async def test_exact_source_and_measured_product_share_one_downloadable_zip(
     source = hashlib.sha256(json.dumps(fingerprints, sort_keys=True,
         separators=(",", ":"), ensure_ascii=True).encode("ascii")).hexdigest()
     product = descriptor().model_copy(update={"source_sha256": source})
-    report = {"status": "passed", "execution_id": inv.execution_id,
+    report: dict[str, JsonValue] = {"status": "passed", "execution_id": inv.execution_id,
         "source_sha256": source, "recipe_sha256": inv.recipe_sha256,
         "wheel": {"filename": product.filename, "sha256": product.sha256, "size": product.size}}
     response = PythonProjectBrokerResponse(action="run_python_project", execution_id=inv.execution_id,
         ok=True, product=product,
         result=SkillResult(exit_code=0, stdout=json.dumps(report), stderr="", timed_out=False))
     files = GeneratedFileStore(tmp_path / "artifacts")
-    spool = tempfile.TemporaryFile(mode="w+b")  # noqa: SIM115 - consume_response owns it.
+    spool = (tmp_path / "product-spool.bin").open("w+b")  # consume_response owns it.
     spool.write(b"wheel")
     spool.seek(0)
     response._product_stream = spool

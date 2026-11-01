@@ -20,6 +20,7 @@ from agent_hub.runtime.artifacts import (
     ArtifactRepositoryError,
 )
 from agent_hub.runtime.contracts import Artifact, JsonValue
+from tests.unit.runs.snapshot_approval_types_fixture import inject_field, untrusted_reference_query
 
 
 def make_repository(factory: object, **limits: Any) -> ArtifactRepository:
@@ -433,7 +434,7 @@ async def test_find_references_invalid_query_opens_no_postgres_session(
         field: value,
     }
     with pytest.raises(ArtifactRepositoryError):
-        await make_repository(factory, max_batch_size=2).find_references(**query)
+        await untrusted_reference_query(make_repository(factory, max_batch_size=2), query)
     factory.assert_not_called()
 
 
@@ -473,7 +474,8 @@ async def test_find_references_rejects_corrupt_reference_columns_without_private
     result = MagicMock()
     artifact = Artifact(id=uuid4(), type="checkpoint", producer="owner", content={"value": "safe"})
     row = lookup_row(uuid4(), uuid4(), artifact)
-    row.id, row.content_sha256 = identity, digest
+    inject_field(row, 'id', identity)
+    inject_field(row, 'content_sha256', digest)
     result.all.return_value = [row]
     session.scalars.return_value = result
     with pytest.raises(ArtifactRepositoryError, match="unavailable") as captured:

@@ -9,6 +9,11 @@ from agent_hub.runtime.artifacts import (
     InMemoryArtifactRepository,
 )
 from agent_hub.runtime.contracts import Artifact
+from tests.unit.runtime.diagnostic_action_artifact_typed_fixture import (
+    FindQuery,
+    find_untrusted,
+    json_map,
+)
 
 TENANT_ID = UUID("00000000-0000-4000-8000-000000000031")
 RUN_ID = UUID("00000000-0000-4000-8000-000000000032")
@@ -222,7 +227,7 @@ async def test_find_references_filters_scope_and_labels_without_exposing_or_chan
         id=uuid4(),
         type="python_resolution_checkpoint",
         producer="python_resolution",
-        content={"needs": ["PRIVATE_BODY_SENTINEL"], "environment": "safe-data"},
+        content=json_map({"needs": ["PRIVATE_BODY_SENTINEL"], "environment": "safe-data"}),
     )
     await repository.put(TENANT_ID, RUN_ID, stored)
     for tenant, run, kind, producer in (
@@ -318,7 +323,7 @@ async def test_find_references_rejects_invalid_query_without_mutating_storage(
     await repository.put(TENANT_ID, RUN_ID, stored)
     query = {"type": stored.type, "producer": stored.producer, "limit": 2, field: value}
     with pytest.raises(ArtifactRepositoryError, match="query"):
-        await repository.find_references(TENANT_ID, RUN_ID, **query)
+        await find_untrusted(repository, TENANT_ID, RUN_ID, query)
     refs = (ArtifactReference(id=stored.id, sha256=stored.content_sha256),)
     assert await repository.get_many(TENANT_ID, RUN_ID, refs) == (stored,)
 
@@ -329,12 +334,12 @@ async def test_find_references_tracks_actual_put_and_abort_without_creating_a_wr
     ref = ArtifactReference(id=stored.id, sha256=stored.content_sha256)
     write_id = uuid4()
     await repository.reserve_write(TENANT_ID, RUN_ID, ref, write_id=write_id)
-    query = {"type": stored.type, "producer": stored.producer, "limit": 2}
-    assert await repository.find_references(TENANT_ID, RUN_ID, **query) == ()
+    query: FindQuery = {"type": stored.type, "producer": stored.producer, "limit": 2}
+    assert await find_untrusted(repository, TENANT_ID, RUN_ID, query) == ()
     await repository.put(TENANT_ID, RUN_ID, stored, write_id=write_id)
-    assert await repository.find_references(TENANT_ID, RUN_ID, **query) == (ref,)
+    assert await find_untrusted(repository, TENANT_ID, RUN_ID, query) == (ref,)
     assert await repository.abort_write(TENANT_ID, RUN_ID, ref, write_id=write_id)
-    assert await repository.find_references(TENANT_ID, RUN_ID, **query) == ()
+    assert await find_untrusted(repository, TENANT_ID, RUN_ID, query) == ()
     with pytest.raises(ArtifactRepositoryError, match="unavailable"):
         await repository.put(TENANT_ID, RUN_ID, stored, write_id=write_id)
 

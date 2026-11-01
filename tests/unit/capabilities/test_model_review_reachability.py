@@ -5,10 +5,12 @@ Fixed reviewer and focused ORM DB only: no provider, PG or product-readiness cla
 
 import asyncio
 import copy
-from contextvars import copy_context
+from collections.abc import Mapping
+from contextvars import Context, copy_context
 from dataclasses import replace
-from types import SimpleNamespace
-from uuid import uuid4
+from pathlib import Path
+from typing import Literal, Unpack
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -18,6 +20,7 @@ from agent_hub.capabilities import review_context as review_module
 from agent_hub.capabilities.execution_authority import bind_execution_authority
 from agent_hub.capabilities.permission_modes import submission_capability_allowed
 from agent_hub.capabilities.policy import CapabilityRule
+from agent_hub.capabilities.project_contracts import ProjectCheckContract
 from agent_hub.capabilities.review_repository import ReviewRepository, review_config_sha256
 from agent_hub.capabilities.runtime import RuntimeCapabilityError
 from agent_hub.capabilities.types import CapabilityRequest, PolicyEffect
@@ -27,13 +30,33 @@ from agent_hub.files.workspace import ProjectWorkspaceStore
 from agent_hub.models.physical_budget import _bind_run_budget
 from agent_hub.models.run_admission_repository import RunAdmissionRepository
 from agent_hub.runs.authorization import _capture_authenticated_input
+from agent_hub.runtime.contracts import JsonValue
+from tests.unit.capabilities.review_reachability_typed_fixture import (
+    ConsumeArguments,
+    PermissionMode,
+    ReachabilitySetup,
+    SandboxProfile,
+    forged_dispatch,
+    permission_sequence,
+    reachability_setup,
+)
 from tests.unit.capabilities.test_concrete_model_review import FixedLedgerReview, FocusedDB
-from tests.unit.harness.test_review_dispatch import _point_directory_alias, invoke, setup
+from tests.unit.harness.review_typed_fixture import (
+    ConcreteRepositoryAdapter,
+    FixedPolicyRules,
+    present,
+)
+from tests.unit.harness.test_review_dispatch import (
+    ExecuteCall,
+    _point_directory_alias,
+    invoke,
+    setup,
+)
 
 
-def full_scope(tmp_path, *, preauthorized=False, mode="auto_review", profile="workspace_write"):
-    s = setup(tmp_path)
-    permissions = ("workspace.read", "command.run")
+def full_scope(tmp_path: Path, *, preauthorized: bool=False, mode: PermissionMode="auto_review", profile: SandboxProfile="workspace_write") -> ReachabilitySetup:
+    s = reachability_setup(setup(tmp_path))
+    permissions: tuple[str, ...] = ("workspace.read", "command.run")
     if preauthorized:
         permissions = ("workspace.read", "workspace.write", "command.run")
     if profile == "read_only":
@@ -52,7 +75,7 @@ def full_scope(tmp_path, *, preauthorized=False, mode="auto_review", profile="wo
         execution_backend="systemd",
         runtime_timeout_seconds=60,
     )
-    route = {
+    route: dict[str, object] = {
         **s.task.routing_decision,
         "conversation_id": body.conversation_id,
         "project_id": body.project_id,
@@ -70,7 +93,7 @@ def full_scope(tmp_path, *, preauthorized=False, mode="auto_review", profile="wo
     }
     evidence = _capture_authenticated_input(
         AuthenticatedPrincipal(
-            tenant_id=s.task.tenant_id, user_id=s.task.actor_id, role=s.task.actor_role
+            tenant_id=s.task.tenant_id, user_id=present(s.task.actor_id), role=present(s.task.actor_role)
         ),
         body.message,
         {
@@ -91,7 +114,7 @@ def full_scope(tmp_path, *, preauthorized=False, mode="auto_review", profile="wo
     old = s.budget
     s.budget = type(old)(
         repository=old.repository,
-        pool=replace(old._pool, authorization_turn_id=evidence.turn_id),
+        pool=replace(present(old._pool), authorization_turn_id=evidence.turn_id),
         evidence=evidence,
         lease=old.lease,
         config=old.config,
@@ -105,16 +128,16 @@ def full_scope(tmp_path, *, preauthorized=False, mode="auto_review", profile="wo
     s.budget.repository = RunAdmissionRepository(s.db)
     s.ledger = ReviewRepository(s.db)
     s.fixed = FixedLedgerReview(s.ledger)
-    s.gate.repository, s.gate.service = s.ledger, s.fixed
+    s.gate.repository, s.gate.service = ConcreteRepositoryAdapter(s.ledger), s.fixed
     s.body = body
     return s
 
 
-def action(s):
+def action(s: ReachabilitySetup) -> CapabilityRequest:
     return CapabilityRequest(
         tenant_id=s.task.tenant_id,
         run_id=s.task.run_id,
-        user_id=s.task.actor_id,
+        user_id=present(s.task.actor_id),
         agent_id="main_agent",
         capability="file",
         operation="write",
@@ -124,13 +147,13 @@ def action(s):
     )
 
 
-async def test_unpreauthorized_auto_review_executes_reviewed_owned_action(tmp_path):
+async def test_unpreauthorized_auto_review_executes_reviewed_owned_action(tmp_path: Path) -> None:
     s = full_scope(tmp_path)
-    original_route = dict(s.runs.record.routing_decision)
+    original_route = dict(present(s.runs.record.routing_decision))
     s.runs.broad = True  # Old broad grants cannot substitute for the specific review.
     assert not await submission_capability_allowed(s.runs, action(s), role=Role.OPERATOR)
 
-    def mutate_caller():
+    def mutate_caller() -> None:
         object.__setattr__(s.request, "arguments", {"path": "wrong.txt", "content": "wrong"})
 
     s.fixed.hook = mutate_caller
@@ -146,14 +169,13 @@ async def test_unpreauthorized_auto_review_executes_reviewed_owned_action(tmp_pa
     target = store.session_root(s.task.tenant_id, "demo", "session") / "hello.txt"
     assert target.read_text(encoding="utf-8") == "original content"
     assert not s.runs.waits
-    assert dict(s.runs.record.routing_decision) == original_route
+    assert dict(present(s.runs.record.routing_decision)) == original_route
     assert s.db.run.routing_decision == original_route
 
 
-async def test_unpreauthorized_explicit_ask_waits_without_review(tmp_path):
+async def test_unpreauthorized_explicit_ask_waits_without_review(tmp_path: Path) -> None:
     s = full_scope(tmp_path)
-    s.policy._plugin_policy_rules = SimpleNamespace(
-        capability_policy_rules=lambda _: (
+    s.policy._plugin_policy_rules = FixedPolicyRules((
             CapabilityRule(
                 s.task.tenant_id,
                 Role.OPERATOR,
@@ -172,7 +194,7 @@ async def test_unpreauthorized_explicit_ask_waits_without_review(tmp_path):
 
 
 @pytest.mark.parametrize("mode", ["default", "auto_review"])
-async def test_full_preauthorization_executes_without_review_or_wait(tmp_path, mode):
+async def test_full_preauthorization_executes_without_review_or_wait(tmp_path: Path, mode: PermissionMode) -> None:
     s = full_scope(tmp_path, preauthorized=True, mode=mode)
     assert await submission_capability_allowed(s.runs, action(s), role=Role.OPERATOR)
     result = await invoke(s)
@@ -181,7 +203,7 @@ async def test_full_preauthorization_executes_without_review_or_wait(tmp_path, m
     assert not [row for row in s.db.rows if type(row) is RunReviewIntentRow]
 
 
-async def test_direct_backend_without_specific_authority_still_rejects_missing_write(tmp_path):
+async def test_direct_backend_without_specific_authority_still_rejects_missing_write(tmp_path: Path) -> None:
     s = full_scope(tmp_path)
     with pytest.raises(RuntimeCapabilityError, match="workspace write is not authorized"):
         await s.backend.execute(
@@ -209,14 +231,19 @@ async def test_direct_backend_without_specific_authority_still_rejects_missing_w
         "status",
     ],
 )
-async def test_hard_barriers_never_reach_reviewer_or_backend(tmp_path, barrier):
-    profile = barrier if barrier in {"read_only", "restricted", "none"} else "workspace_write"
+async def test_hard_barriers_never_reach_reviewer_or_backend(tmp_path: Path, barrier: str) -> None:
+    profile: SandboxProfile = "workspace_write"
+    if barrier == "read_only":
+        profile = "read_only"
+    elif barrier == "restricted":
+        profile = "restricted"
+    elif barrier == "none":
+        profile = "none"
     s = full_scope(
         tmp_path, profile=profile, mode="read_only" if barrier == "read_only" else "auto_review"
     )
     if barrier == "deny":
-        s.policy._plugin_policy_rules = SimpleNamespace(
-            capability_policy_rules=lambda _: (
+        s.policy._plugin_policy_rules = FixedPolicyRules((
                 CapabilityRule(
                     s.task.tenant_id,
                     Role.OPERATOR,
@@ -229,20 +256,21 @@ async def test_hard_barriers_never_reach_reviewer_or_backend(tmp_path, barrier):
             )
         )
     elif barrier in {"actor", "role", "tenant", "status"}:
-        field, value = {
-            "actor": ("actor_id", uuid4()),
-            "role": ("actor_role", Role.ADMIN),
-            "tenant": ("tenant_id", uuid4()),
-            "status": ("status", RunStatus.CANCELLED),
-        }[barrier]
-        s.runs.record = replace(s.runs.record, **{field: value})
+        if barrier == "actor":
+            s.runs.record = replace(s.runs.record, actor_id=uuid4())
+        elif barrier == "role":
+            s.runs.record = replace(s.runs.record, actor_role=Role.ADMIN)
+        elif barrier == "tenant":
+            s.runs.record = replace(s.runs.record, tenant_id=uuid4())
+        else:
+            s.runs.record = replace(s.runs.record, status=RunStatus.CANCELLED)
     result = await invoke(s)
     assert result.status == "failed"
     assert s.fixed.calls == 0 and not s.calls and not s.runs.waits
 
 
 @pytest.mark.parametrize("path", ["credentials.json", "node_modules/output.txt"])
-async def test_unpreauthorized_sensitive_target_stays_human_only(tmp_path, path):
+async def test_unpreauthorized_sensitive_target_stays_human_only(tmp_path: Path, path: str) -> None:
     s = full_scope(tmp_path)
     s.request = replace(s.request, arguments={"path": path, "content": "original content"})
     result = await invoke(s)
@@ -251,23 +279,23 @@ async def test_unpreauthorized_sensitive_target_stays_human_only(tmp_path, path)
     assert s.fixed.calls == 0 and not s.calls
 
 
-def consumed(s):
+def consumed(s: ReachabilitySetup) -> None:
     intents = [row for row in s.db.rows if type(row) is RunReviewIntentRow]
     assert len(intents) == 1 and intents[0].consumed
 
 
-def no_owned_write(s, tmp_path):
+def no_owned_write(s: ReachabilitySetup, tmp_path: Path) -> None:
     root = ProjectWorkspaceStore(tmp_path).session_root(s.task.tenant_id, "demo", "session")
     assert not (root / "hello.txt").exists()
     assert not (root / "second.txt").exists()
 
 
 @pytest.mark.parametrize("attack", ["second_file", "content", "backend", "child", "copy", "bool"])
-async def test_consumed_authority_cannot_be_transferred_or_forged(tmp_path, attack):
+async def test_consumed_authority_cannot_be_transferred_or_forged(tmp_path: Path, attack: str) -> None:
     s = full_scope(tmp_path)
     original = s.backend.execute
 
-    async def intercept(**kwargs):
+    async def intercept(**kwargs: Unpack[ExecuteCall]) -> Mapping[str, JsonValue]:
         if attack == "second_file":
             kwargs["arguments"] = {"path": "second.txt", "content": "original content"}
         elif attack == "content":
@@ -286,39 +314,36 @@ async def test_consumed_authority_cannot_be_transferred_or_forged(tmp_path, atta
             return await asyncio.create_task(original(**kwargs))
         elif attack in {"copy", "bool"}:
             binding = review_module._WRITE_DISPATCH.get()
-            token = review_module._WRITE_DISPATCH.set(
+            with forged_dispatch(
                 True if attack == "bool" else copy.copy(binding)
-            )
-            try:
+            ):
                 return await original(**kwargs)
-            finally:
-                review_module._WRITE_DISPATCH.reset(token)
         return await original(**kwargs)
 
-    s.backend.execute = intercept
+    pytest.MonkeyPatch().setattr(s.backend, "execute", intercept)
     result = await invoke(s)
     assert result.status == "failed", result
     consumed(s)
     assert s.fixed.calls == 1 and not s.runs.waits
     no_owned_write(s, tmp_path)
-    assert "workspace.write" not in s.runs.record.routing_decision["requested_permissions"]
+    assert "workspace.write" not in permission_sequence(present(s.runs.record.routing_decision)["requested_permissions"])
 
 
-async def test_one_dispatch_cannot_execute_twice_or_survive_context_exit(tmp_path):
+async def test_one_dispatch_cannot_execute_twice_or_survive_context_exit(tmp_path: Path) -> None:
     s = full_scope(tmp_path)
     original = s.backend.execute
-    captured = []
+    captured: list[tuple[Context, ExecuteCall]] = []
     rejected = []
 
-    async def intercept(**kwargs):
-        captured.append((copy_context(), dict(kwargs)))
+    async def intercept(**kwargs: Unpack[ExecuteCall]) -> Mapping[str, JsonValue]:
+        captured.append((copy_context(), {**kwargs}))
         result = await original(**kwargs)
         with pytest.raises(RuntimeCapabilityError):
             await original(**kwargs)
         rejected.append(True)
         return result
 
-    s.backend.execute = intercept
+    pytest.MonkeyPatch().setattr(s.backend, "execute", intercept)
     result = await invoke(s)
     assert result.status == "succeeded", result
     assert rejected == [True] and s.fixed.calls == 1
@@ -351,17 +376,17 @@ async def test_one_dispatch_cannot_execute_twice_or_survive_context_exit(tmp_pat
         "config",
     ],
 )
-async def test_after_consume_invalidation_never_writes_or_reissues(tmp_path, change):
+async def test_after_consume_invalidation_never_writes_or_reissues(tmp_path: Path, change: str) -> None:
     s = full_scope(tmp_path)
     consume = s.ledger.consume_permit
 
-    async def consume_then_invalidate(**kwargs):
+    async def consume_then_invalidate(**kwargs: Unpack[ConsumeArguments]) -> bool:
         result = await consume(**kwargs)
         assert result
         if change == "root":
             root = tmp_path / "changed-root"
             root.mkdir()
-            s.backend._project_verification.root = root
+            present(s.backend._project_verification).root = root
         elif change == "role":
             s.runs.record = replace(s.runs.record, actor_role=Role.ADMIN)
             s.db.run.actor_role = Role.ADMIN.value
@@ -376,8 +401,7 @@ async def test_after_consume_invalidation_never_writes_or_reissues(tmp_path, cha
             s.db.pool.closed = True
         elif change in {"deny", "human_ask"}:
             effect = PolicyEffect.DENY if change == "deny" else PolicyEffect.REQUIRE_APPROVAL
-            s.policy._plugin_policy_rules = SimpleNamespace(
-                capability_policy_rules=lambda _: (
+            s.policy._plugin_policy_rules = FixedPolicyRules((
                     CapabilityRule(
                         s.task.tenant_id,
                         Role.OPERATOR,
@@ -393,7 +417,7 @@ async def test_after_consume_invalidation_never_writes_or_reissues(tmp_path, cha
             s.settings.config = replace(s.settings.config, max_reviews_per_run=1)
         return result
 
-    s.ledger.consume_permit = consume_then_invalidate
+    pytest.MonkeyPatch().setattr(s.ledger, "consume_permit", consume_then_invalidate)
     result = await invoke(s)
     assert result.status == "failed", result
     consumed(s)
@@ -401,19 +425,19 @@ async def test_after_consume_invalidation_never_writes_or_reissues(tmp_path, cha
     no_owned_write(s, tmp_path)
 
 
-async def test_backend_contract_await_root_change_cannot_use_consumed_authority(tmp_path):
+async def test_backend_contract_await_root_change_cannot_use_consumed_authority(tmp_path: Path) -> None:
     s = full_scope(tmp_path)
     original = s.backend._original_project_contract
 
-    async def change_root(*args):
-        result = await original(*args)
+    async def change_root(tenant: UUID, run: UUID) -> ProjectCheckContract | None:
+        result = await original(tenant, run)
         await asyncio.sleep(0)
         root = tmp_path / "changed-root"
         root.mkdir()
-        s.backend._project_verification.root = root
+        present(s.backend._project_verification).root = root
         return result
 
-    s.backend._original_project_contract = change_root
+    pytest.MonkeyPatch().setattr(s.backend, "_original_project_contract", change_root)
     result = await invoke(s)
     assert result.status == "failed", result
     consumed(s)
@@ -422,10 +446,10 @@ async def test_backend_contract_await_root_change_cannot_use_consumed_authority(
 
 
 @pytest.mark.parametrize("boundary", ["profile", "rules", "no_gate", "contract"])
-async def test_pending_escalation_never_enables_old_or_unsupported_paths(tmp_path, boundary):
+async def test_pending_escalation_never_enables_old_or_unsupported_paths(tmp_path: Path, boundary: str) -> None:
     s = full_scope(tmp_path)
     if boundary in {"profile", "contract"}:
-        route = dict(s.runs.record.routing_decision)
+        route = dict(present(s.runs.record.routing_decision))
         if boundary == "profile":
             route.pop("approval_review_profile")
         else:
@@ -442,7 +466,7 @@ async def test_pending_escalation_never_enables_old_or_unsupported_paths(tmp_pat
     no_owned_write(s, tmp_path)
 
 
-async def test_pending_static_discovery_never_issues_review_wait_or_write(tmp_path):
+async def test_pending_static_discovery_never_issues_review_wait_or_write(tmp_path: Path) -> None:
     s = full_scope(tmp_path)
     with (
         bind_execution_authority(s.task, worker_id=s.budget.lease.worker_id),
@@ -451,23 +475,23 @@ async def test_pending_static_discovery_never_issues_review_wait_or_write(tmp_pa
         result = await s.harness.authorize(
             s.task.tenant_id,
             s.request,
-            user_id=s.task.actor_id,
-            role=s.task.actor_role,
+            user_id=present(s.task.actor_id),
+            role=present(s.task.actor_role),
         )
         assert result.status == "succeeded"
     assert s.fixed.calls == 0 and not s.calls and not s.runs.waits
 
 
-async def test_cancel_after_consume_never_writes_or_refunds(tmp_path):
+async def test_cancel_after_consume_never_writes_or_refunds(tmp_path: Path) -> None:
     s = full_scope(tmp_path)
     consume = s.ledger.consume_permit
 
-    async def consume_then_cancel(**kwargs):
+    async def consume_then_cancel(**kwargs: Unpack[ConsumeArguments]) -> bool:
         assert await consume(**kwargs)
-        asyncio.current_task().cancel()
+        present(asyncio.current_task()).cancel()
         return True
 
-    s.ledger.consume_permit = consume_then_cancel
+    pytest.MonkeyPatch().setattr(s.ledger, "consume_permit", consume_then_cancel)
     task = asyncio.create_task(invoke(s))
     with pytest.raises(asyncio.CancelledError):
         await task
@@ -476,7 +500,7 @@ async def test_cancel_after_consume_never_writes_or_refunds(tmp_path):
     no_owned_write(s, tmp_path)
 
 
-async def test_current_exact_human_can_override_model_deny_without_new_model_call(tmp_path):
+async def test_current_exact_human_can_override_model_deny_without_new_model_call(tmp_path: Path) -> None:
     s = full_scope(tmp_path)
     s.fixed.status = "deny"
     with (
@@ -486,8 +510,8 @@ async def test_current_exact_human_can_override_model_deny_without_new_model_cal
         first = await s.harness.invoke(
             s.task.tenant_id,
             s.request,
-            user_id=s.task.actor_id,
-            role=s.task.actor_role,
+            user_id=present(s.task.actor_id),
+            role=present(s.task.actor_role),
         )
         assert first.status == "failed"
         assert s.fixed.calls == 1 and not s.calls
@@ -496,15 +520,15 @@ async def test_current_exact_human_can_override_model_deny_without_new_model_cal
         result = await s.harness.invoke(
             s.task.tenant_id,
             second,
-            user_id=s.task.actor_id,
-            role=s.task.actor_role,
+            user_id=present(s.task.actor_id),
+            role=present(s.task.actor_role),
         )
     assert result.status == "succeeded", result
     assert s.fixed.calls == 1 and len(s.calls) == 1 and not s.runs.waits
 
 
 @pytest.mark.parametrize("status", ["allow", "deny", "unknown"])
-async def test_pending_effect_occupancy_survives_key_changes(tmp_path, status):
+async def test_pending_effect_occupancy_survives_key_changes(tmp_path: Path, status: Literal["allow", "deny", "unknown"]) -> None:
     s = full_scope(tmp_path)
     s.fixed.status = status
     with (
@@ -514,14 +538,14 @@ async def test_pending_effect_occupancy_survives_key_changes(tmp_path, status):
         first = await s.harness.invoke(
             s.task.tenant_id,
             s.request,
-            user_id=s.task.actor_id,
-            role=s.task.actor_role,
+            user_id=present(s.task.actor_id),
+            role=present(s.task.actor_role),
         )
         second = await s.harness.invoke(
             s.task.tenant_id,
             replace(s.request, idempotency_key="same-effect-new-key"),
-            user_id=s.task.actor_id,
-            role=s.task.actor_role,
+            user_id=present(s.task.actor_id),
+            role=present(s.task.actor_role),
         )
     assert first.status == ("succeeded" if status == "allow" else "failed")
     assert second.status == "failed" and s.fixed.calls == 1
@@ -531,16 +555,16 @@ async def test_pending_effect_occupancy_survives_key_changes(tmp_path, status):
 
 
 @pytest.mark.parametrize("change", ["path", "content"])
-async def test_private_backend_write_entry_also_requires_exact_action(tmp_path, change):
+async def test_private_backend_write_entry_also_requires_exact_action(tmp_path: Path, change: str) -> None:
     s = full_scope(tmp_path)
     original = s.backend._execute_workspace_write_text
 
-    async def tamper(tenant, run, arguments, *, _dispatch=None):
+    async def tamper(tenant: UUID, run: UUID, arguments: Mapping[str, JsonValue], *, _dispatch: review_module._WriteDispatch | None=None) -> Mapping[str, JsonValue]:
         changed = dict(arguments)
         changed[change] = "second.txt" if change == "path" else "not reviewed"
         return await original(tenant, run, changed, _dispatch=_dispatch)
 
-    s.backend._execute_workspace_write_text = tamper
+    pytest.MonkeyPatch().setattr(s.backend, "_execute_workspace_write_text", tamper)
     result = await invoke(s)
     assert result.status == "failed", result
     consumed(s)
@@ -549,10 +573,10 @@ async def test_private_backend_write_entry_also_requires_exact_action(tmp_path, 
 
 @pytest.mark.parametrize("destination", ["other", "credentials", "node_modules"])
 async def test_backend_final_callback_cannot_retarget_manifest_invisible_alias(
-    tmp_path, destination
-):
+    tmp_path: Path, destination: str
+) -> None:
     s = full_scope(tmp_path)
-    store = s.backend._project_workspace_store
+    store = present(s.backend._project_workspace_store)
     for directory in ("public", "other", "credentials", "node_modules"):
         store.write_bytes(
             tenant_id=s.task.tenant_id,
@@ -578,7 +602,7 @@ async def test_backend_final_callback_cannot_retarget_manifest_invisible_alias(
     )
     checks = []
 
-    async def dispatch_check():
+    async def dispatch_check() -> None:
         checks.append(True)
         if len(checks) == 2:
             await asyncio.sleep(0)
@@ -601,7 +625,7 @@ async def test_backend_final_callback_cannot_retarget_manifest_invisible_alias(
         assert (root / directory / "target.txt").read_bytes() == b"before"
 
 
-async def test_default_pending_waits_then_only_exact_human_can_dispatch(tmp_path):
+async def test_default_pending_waits_then_only_exact_human_can_dispatch(tmp_path: Path) -> None:
     s = full_scope(tmp_path, mode="default")
     with (
         bind_execution_authority(s.task, worker_id=s.budget.lease.worker_id),
@@ -610,8 +634,8 @@ async def test_default_pending_waits_then_only_exact_human_can_dispatch(tmp_path
         first = await s.harness.invoke(
             s.task.tenant_id,
             s.request,
-            user_id=s.task.actor_id,
-            role=s.task.actor_role,
+            user_id=present(s.task.actor_id),
+            role=present(s.task.actor_role),
         )
         assert first.status == "failed"
         assert len(s.runs.waits) == 1 and s.fixed.calls == 0 and not s.calls
@@ -619,22 +643,21 @@ async def test_default_pending_waits_then_only_exact_human_can_dispatch(tmp_path
         result = await s.harness.invoke(
             s.task.tenant_id,
             s.request,
-            user_id=s.task.actor_id,
-            role=s.task.actor_role,
+            user_id=present(s.task.actor_id),
+            role=present(s.task.actor_role),
         )
     assert result.status == "succeeded", result
     assert len(s.calls) == 1 and s.fixed.calls == 0 and len(s.runs.waits) == 1
     assert not [row for row in s.db.rows if type(row) is RunReviewIntentRow]
-    assert "workspace.write" not in s.runs.record.routing_decision["requested_permissions"]
+    assert "workspace.write" not in permission_sequence(present(s.runs.record.routing_decision)["requested_permissions"])
 
 
 @pytest.mark.parametrize("preauthorized", [False, True])
 async def test_explicit_model_eligible_ask_cannot_override_default_manual_choice(
-    tmp_path, preauthorized
-):
+    tmp_path: Path, preauthorized: bool
+) -> None:
     s = full_scope(tmp_path, mode="default", preauthorized=preauthorized)
-    s.policy._plugin_policy_rules = SimpleNamespace(
-        capability_policy_rules=lambda _: (
+    s.policy._plugin_policy_rules = FixedPolicyRules((
             CapabilityRule(
                 s.task.tenant_id,
                 Role.OPERATOR,
@@ -652,7 +675,7 @@ async def test_explicit_model_eligible_ask_cannot_override_default_manual_choice
     assert len(s.runs.waits) == 1 and s.fixed.calls == 0 and not s.calls
 
 
-async def test_loader_cannot_review_manual_choice_even_with_eligible_policy(tmp_path):
+async def test_loader_cannot_review_manual_choice_even_with_eligible_policy(tmp_path: Path) -> None:
     from agent_hub.capabilities.defaults import default_capability_policy
 
     s = full_scope(tmp_path, mode="default")
@@ -664,55 +687,55 @@ async def test_loader_cannot_review_manual_choice_even_with_eligible_policy(tmp_
         _bind_run_budget(s.budget),
         pytest.raises(ValueError),
     ):
-        await s.loader.load(action(s), s.task.actor_role, policy, tool_name="workspace.write_text")
+        await s.loader.load(action(s), present(s.task.actor_role), policy, tool_name="workspace.write_text")
     assert s.fixed.calls == 0 and not s.calls
 
 
 @pytest.mark.parametrize("field", ["path", "content"])
-async def test_private_write_scope_await_cannot_change_owned_execution_bytes(tmp_path, field):
+async def test_private_write_scope_await_cannot_change_owned_execution_bytes(tmp_path: Path, field: str) -> None:
     s = full_scope(tmp_path)
     entry = s.backend._execute_workspace_write_text
     scope = s.backend._project_workspace_scope
     held = []
 
-    async def mutable_entry(tenant, run, arguments, *, _dispatch=None):
+    async def mutable_entry(tenant: UUID, run: UUID, arguments: Mapping[str, JsonValue], *, _dispatch: review_module._WriteDispatch | None=None) -> Mapping[str, JsonValue]:
         mutable = dict(arguments)
         held.append((mutable, _dispatch))
         return await entry(tenant, run, mutable, _dispatch=_dispatch)
 
-    async def mutate_during_scope(*args, **kwargs):
-        result = await scope(*args, **kwargs)
+    async def mutate_during_scope(tenant: UUID, run: UUID, *, write_required: bool = True) -> tuple[str, str]:
+        result = await scope(tenant, run, write_required=write_required)
         await asyncio.sleep(0)
         held[0][0][field] = "second.txt" if field == "path" else "not reviewed"
         return result
 
-    s.backend._execute_workspace_write_text = mutable_entry
-    s.backend._project_workspace_scope = mutate_during_scope
+    pytest.MonkeyPatch().setattr(s.backend, "_execute_workspace_write_text", mutable_entry)
+    pytest.MonkeyPatch().setattr(s.backend, "_project_workspace_scope", mutate_during_scope)
     result = await invoke(s)
     assert result.status == "succeeded", result
     assert s.fixed.calls == len(s.calls) == len(held) == 1
     consumed(s)
     mutable, dispatch = held[0]
+    dispatch = present(dispatch)
     assert mutable[field] == ("second.txt" if field == "path" else "not reviewed")
     assert dispatch.claimed and dispatch.started and not dispatch.active
     root = ProjectWorkspaceStore(tmp_path).session_root(s.task.tenant_id, "demo", "session")
     assert (root / "hello.txt").read_bytes() == b"original content"
     assert not (root / "second.txt").exists()
     assert not s.runs.waits
-    assert s.runs.record.routing_decision["requested_permissions"] == [
+    assert present(s.runs.record.routing_decision)["requested_permissions"] == [
         "workspace.read",
         "command.run",
     ]
 
 
-async def test_default_exact_human_calculator_uses_no_write_authority(tmp_path):
+async def test_default_exact_human_calculator_uses_no_write_authority(tmp_path: Path) -> None:
     s = full_scope(tmp_path, mode="default")
     s.request = replace(
         s.request, tool_name="calculator.evaluate", arguments={"expression": "1+1"}, sandbox="none"
     )
     s.runs.exact = True
-    s.policy._plugin_policy_rules = SimpleNamespace(
-        capability_policy_rules=lambda _: (
+    s.policy._plugin_policy_rules = FixedPolicyRules((
             CapabilityRule(
                 s.task.tenant_id,
                 Role.OPERATOR,
@@ -727,11 +750,11 @@ async def test_default_exact_human_calculator_uses_no_write_authority(tmp_path):
     execute = s.backend.execute
     seen = []
 
-    async def inspect_authority(**kwargs):
+    async def inspect_authority(**kwargs: Unpack[ExecuteCall]) -> Mapping[str, JsonValue]:
         seen.append(review_module._WRITE_DISPATCH.get())
         return await execute(**kwargs)
 
-    s.backend.execute = inspect_authority
+    pytest.MonkeyPatch().setattr(s.backend, "execute", inspect_authority)
     result = await invoke(s)
     assert result.status == "succeeded", result
     assert result.payload["value"] == "2"
@@ -742,15 +765,14 @@ async def test_default_exact_human_calculator_uses_no_write_authority(tmp_path):
 
 
 @pytest.mark.parametrize("barrier", ["deny", "no_exact"])
-async def test_calculator_exact_path_still_requires_current_consent_and_policy(tmp_path, barrier):
+async def test_calculator_exact_path_still_requires_current_consent_and_policy(tmp_path: Path, barrier: str) -> None:
     s = full_scope(tmp_path, mode="default")
     s.request = replace(
         s.request, tool_name="calculator.evaluate", arguments={"expression": "1+1"}, sandbox="none"
     )
     s.runs.exact = barrier != "no_exact"
     effect = PolicyEffect.DENY if barrier == "deny" else PolicyEffect.REQUIRE_APPROVAL
-    s.policy._plugin_policy_rules = SimpleNamespace(
-        capability_policy_rules=lambda _: (
+    s.policy._plugin_policy_rules = FixedPolicyRules((
             CapabilityRule(
                 s.task.tenant_id,
                 Role.OPERATOR,

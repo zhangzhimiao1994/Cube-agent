@@ -1,14 +1,17 @@
 """Real registry/wheel parsing in memory; production authorization remains unwired."""
 
 import hashlib
-import importlib
 import io
 import time
 import zipfile
+from collections.abc import Mapping, Sequence
 from dataclasses import replace
+from typing import Never
 
 import pytest
 
+from agent_hub.skills.sandbox.python_input_fetch import WheelDownload
+from agent_hub.skills.sandbox.python_registry_protocol import ResolutionBudget, ResolutionDescriptor
 from tests.unit.skills import test_python_registry_read as registry_tests
 from tests.unit.skills.test_python_registry_read import (
     Wire,
@@ -22,11 +25,14 @@ from tests.unit.skills.test_python_registry_read import (
 offline_network = registry_tests.offline_network
 
 
-async def resolve(wire, bodies, needs, *, env=None, allowance=None):
+async def resolve(
+    wire: Wire, bodies: Mapping[str, bytes], needs: Sequence[str], *,
+    env: dict[str, str] | None = None, allowance: ResolutionBudget | None = None,
+) -> ResolutionDescriptor:
     p, _ = api()
-    r = importlib.import_module("agent_hub.capabilities.python_dependency_resolution")
+    from agent_hub.capabilities import python_dependency_resolution as r
 
-    async def content(download):
+    async def content(download: WheelDownload) -> bytes:
         return bodies[download.filename]
 
     return await r.resolve_dependencies(
@@ -39,7 +45,7 @@ async def resolve(wire, bodies, needs, *, env=None, allowance=None):
     )
 
 
-async def test_actual_wheel_metadata_not_json_builds_transitive_descriptor():
+async def test_actual_wheel_metadata_not_json_builds_transitive_descriptor() -> None:
     wire, bodies = Wire(), {}
     for name, deps in [("demo", ("helper>=1",)), ("helper", ())]:
         row, body = wire.release(name, deps=deps)
@@ -54,7 +60,7 @@ async def test_actual_wheel_metadata_not_json_builds_transitive_descriptor():
     assert replace(result, scope=replace(scope(), source_sha256="4" * 64)).sha256 != result.sha256
 
 
-async def test_markers_extras_and_cycles_use_exact_target_environment():
+async def test_markers_extras_and_cycles_use_exact_target_environment() -> None:
     wire, bodies = Wire(), {}
     for name, deps in [
         ("demo", ('helper; extra == "feature"', 'windows-only; sys_platform == "win32"')),
@@ -68,7 +74,7 @@ async def test_markers_extras_and_cycles_use_exact_target_environment():
     assert len(wire.requests) == 4
 
 
-async def test_conflicting_selected_version_is_a_precise_blocker():
+async def test_conflicting_selected_version_is_a_precise_blocker() -> None:
     wire, bodies = Wire(), {}
     for name, deps in [("demo", ("helper>=2",)), ("helper", ())]:
         row, body = wire.release(name, deps=deps)
@@ -77,14 +83,14 @@ async def test_conflicting_selected_version_is_a_precise_blocker():
         await resolve(wire, bodies, ["demo", "helper==1.0"])
 
 
-async def test_hash_mismatched_wheel_cannot_freeze_descriptor():
+async def test_hash_mismatched_wheel_cannot_freeze_descriptor() -> None:
     wire = Wire()
     row, body = wire.release("demo")
     with pytest.raises(ValueError):
         await resolve(wire, {row["filename"]: body + b"tampered"}, ["demo"])
 
 
-async def test_seventeen_packages_do_not_require_a_new_grant_or_reset_deadline():
+async def test_seventeen_packages_do_not_require_a_new_grant_or_reset_deadline() -> None:
     wire, bodies = Wire(), {}
     for i in range(17):
         row, body = wire.release(f"dep-{i}")
@@ -99,7 +105,7 @@ async def test_seventeen_packages_do_not_require_a_new_grant_or_reset_deadline()
         )
 
 
-async def test_missing_environment_never_uses_host_defaults():
+async def test_missing_environment_never_uses_host_defaults() -> None:
     wire = Wire()
     row, body = wire.release("demo")
     env = environment()
@@ -117,7 +123,7 @@ async def test_missing_environment_never_uses_host_defaults():
         ("platform_python_implementation", "PyPy"),
     ],
 )
-async def test_inconsistent_target_identity_fails_before_registry(field, value):
+async def test_inconsistent_target_identity_fails_before_registry(field: str, value: str) -> None:
     wire = Wire()
     row, body = wire.release("demo")
     env = environment()
@@ -127,7 +133,7 @@ async def test_inconsistent_target_identity_fails_before_registry(field, value):
     assert wire.requests == []
 
 
-async def test_edge_and_total_wheel_budgets_fail_without_unbounded_recovery():
+async def test_edge_and_total_wheel_budgets_fail_without_unbounded_recovery() -> None:
     wire, bodies = Wire(), {}
     for name, deps in [("demo", ("helper",)), ("helper", ())]:
         row, body = wire.release(name, deps=deps)
@@ -138,15 +144,15 @@ async def test_edge_and_total_wheel_budgets_fail_without_unbounded_recovery():
         await resolve(wire, bodies, ["demo"], allowance=budget(max_wheel_bytes=32))
 
 
-async def test_cancellation_propagates_from_controlled_wheel_input():
+async def test_cancellation_propagates_from_controlled_wheel_input() -> None:
     import asyncio
 
     p, _ = api()
-    r = importlib.import_module("agent_hub.capabilities.python_dependency_resolution")
+    from agent_hub.capabilities import python_dependency_resolution as r
     wire = Wire()
     wire.release("demo")
 
-    async def cancelled(download):
+    async def cancelled(download: WheelDownload) -> Never:
         raise asyncio.CancelledError()
 
     with pytest.raises(asyncio.CancelledError):
@@ -160,12 +166,12 @@ async def test_cancellation_propagates_from_controlled_wheel_input():
         )
 
 
-async def test_real_compressed_archive_stops_at_original_deadline(monkeypatch):
+async def test_real_compressed_archive_stops_at_original_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
     """A small valid archive must stop mid-inflate, not finish 192 MiB after expiry."""
     import json
 
     p, _ = api()
-    r = importlib.import_module("agent_hub.capabilities.python_dependency_resolution")
+    from agent_hub.capabilities import python_dependency_resolution as r
     packed = io.BytesIO()
     with zipfile.ZipFile(packed, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         archive.writestr(
@@ -188,18 +194,18 @@ async def test_real_compressed_archive_stops_at_original_deadline(monkeypatch):
     read = zipfile.ZipExtFile.read
     inflated = 0
 
-    def counted(stream, *args, **kwargs):
+    def counted(stream: zipfile.ZipExtFile, n: int | None = -1) -> bytes:
         nonlocal inflated
-        result = read(stream, *args, **kwargs)
+        result = read(stream, n)
         if stream.name == "demo/payload.bin":
             inflated += len(result)
         return result
 
     monkeypatch.setattr(zipfile.ZipExtFile, "read", counted)
-    entered_remaining = None
+    entered_remaining: float | None = None
     allowance = p.ResolutionBudget(p.ResolutionLimits(), time.monotonic() + 0.03)
 
-    async def content(download):
+    async def content(download: WheelDownload) -> bytes:
         nonlocal entered_remaining
         entered_remaining = allowance.deadline - time.monotonic()
         return raw
@@ -222,7 +228,7 @@ async def test_real_compressed_archive_stops_at_original_deadline(monkeypatch):
     assert elapsed < 0.18, "archive parser retained CPU well beyond original deadline"
 
 
-def test_optional_deadlines_preserve_ordinary_bytes_and_legacy_calls():
+def test_optional_deadlines_preserve_ordinary_bytes_and_legacy_calls() -> None:
     from agent_hub.skills.sandbox.python_dependency_metadata import extract_python_wheel_metadata
     from agent_hub.skills.sandbox.python_input_fetch import WheelDownload, validate_wheel_bytes
     from tests.unit.skills.test_python_registry_read import wheel

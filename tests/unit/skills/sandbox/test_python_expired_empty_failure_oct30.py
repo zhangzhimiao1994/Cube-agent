@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,6 +14,7 @@ import pytest
 
 from agent_hub.skills.sandbox import python_project_cache as cache_api
 from agent_hub.skills.sandbox.project_contract_broker import _encoded
+from agent_hub.skills.sandbox.python_project_protocol import PythonFailedReservationSnapshot
 from tests.unit.skills.sandbox.test_python_project_cache import (
     failed_outcome,
     failed_reservation,
@@ -22,7 +24,7 @@ from tests.unit.skills.sandbox.test_python_project_cache import (
 )
 
 
-def snapshot(*, project: str = 'billing') -> Any:
+def snapshot(*, project: str = 'billing') -> PythonFailedReservationSnapshot:
     from agent_hub.skills.sandbox.python_project_protocol import PythonFailedReservationSnapshot
     reservation = failed_reservation()
     reservation['scope']['project_id'] = project
@@ -49,6 +51,8 @@ def retirement() -> dict[str, Any]:
 def test_root_reserve_rejects_retired_owner_before_any_allocation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    backend_os: object = vars(cache_api)["os"]
+    assert backend_os is os
     # Logical transition only: this does not claim Windows IO is native Linux proof.
     marker = retirement()
     name = "retired-" + hashlib.sha256(_encoded(marker["owner"])).hexdigest() + ".json"
@@ -68,7 +72,7 @@ def test_root_reserve_rejects_retired_owner_before_any_allocation(
     def no_allocate(*args: Any, **kwargs: Any) -> None:
         raise AssertionError("Root allocated a retired owner after its failed pair was removed")
 
-    monkeypatch.setattr(cache_api.os, "mkdir", no_allocate)
+    monkeypatch.setattr(os, "mkdir", no_allocate)
     with (pytest.raises(cache_api.PythonProjectCacheError, match="cache_incomplete"),
           cache.reserve(invocation(), next_bytes=100, deadline=10**20)):
         pytest.fail("retired scope was treated as a fresh installation")
@@ -102,6 +106,7 @@ def test_snapshot_archive_is_deterministic_and_commit_never_accepts_a_grant() ->
             project_id=value.scope.project_id, session_id=value.scope.session_id)
         request = PythonFailedMaintenanceRequest(invocation=item, phase='commit', snapshot=value,
             archive_id=archive.id, archive_sha256=archive.content_sha256)
+        assert request.snapshot is not None
         assert request.snapshot.archive().to_payload() == archive.to_payload()
         from agent_hub.skills.sandbox import python_project_backend as backend
         from agent_hub.skills.sandbox.python_project_client import _validated_request
@@ -153,6 +158,7 @@ async def test_unit_admission_keeps_quiet_and_explicit_no_job(
 ) -> None:
     from agent_hub.skills.sandbox import project
     from agent_hub.skills.sandbox.base import SkillResult
+    from agent_hub.skills.sandbox.broker import BrokerPolicy
     from agent_hub.skills.sandbox.project import _Execution
     from agent_hub.skills.sandbox.python_project_broker import _admit_unit
     seen: list[str] = []
@@ -169,12 +175,13 @@ async def test_unit_admission_keeps_quiet_and_explicit_no_job(
     properties.update(change)
     monkeypatch.setattr(project, '_CGROUP_ROOT', tmp_path)
 
-    class Broker:
-        policy = SimpleNamespace(systemctl='/usr/bin/systemctl')
+    class Broker(project.ProjectExecutionBroker):
+        def __init__(self) -> None:
+            super().__init__(BrokerPolicy(systemctl='/usr/bin/systemctl'))
         # Keep the production quiet predicate; this is not a native Linux proof.
         _unit_quiet = staticmethod(project.ProjectExecutionBroker._unit_quiet)
 
-        async def _helper(self, command: Any, timeout: float) -> Any:
+        async def _helper(self, command: tuple[str, ...], timeout: float) -> SkillResult:
             seen.extend(command)
             return SkillResult(exit_code=0, stdout='\n'.join(f'{k}={v}' for k, v in properties.items()),
                                stderr='', timed_out=False)
@@ -208,7 +215,7 @@ def cache_boundary(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
 
     info = SimpleNamespace(**{name: 1 for name in (
         'st_dev', 'st_ino', 'st_mode', 'st_uid', 'st_gid', 'st_nlink', 'st_size', 'st_mtime_ns', 'st_ctime_ns')})
-    original_fstat, original_stat = cache_api.os.fstat, cache_api.os.stat
+    original_fstat, original_stat = os.fstat, os.stat
     monkeypatch.setattr(cache, '_locked', locked)
     monkeypatch.setattr(cache, '_catalog', lambda *args: set(active))
     charged: list[int] = []
@@ -223,11 +230,11 @@ def cache_boundary(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
     monkeypatch.setattr(cache_api, '_read', lambda fd, name, pins: (root_controls if fd == 1 else controls)[name])
     monkeypatch.setattr(cache_api, '_names', lambda fd, *args: (
         set(active) | set(root_controls) | {'cache.lock'} if fd == 1 else set(controls)))
-    monkeypatch.setattr(cache_api.os, 'fstat', lambda fd: info if fd == 2 else original_fstat(fd))
-    monkeypatch.setattr(cache_api.os, 'stat', lambda *args, **kwargs: (
+    monkeypatch.setattr(os, 'fstat', lambda fd: info if fd == 2 else original_fstat(fd))
+    monkeypatch.setattr(os, 'stat', lambda *args, **kwargs: (
         info if kwargs.get('dir_fd') == 2 else original_stat(*args, **kwargs)))
     monkeypatch.setattr(cache_api, '_same', lambda *args: None)
-    monkeypatch.setattr(cache_api.os, 'fsync', lambda *args: None)
+    monkeypatch.setattr(os, 'fsync', lambda *args: None)
 
     def write(fd: int, name: str, marker: Any) -> None:
         assert fd == 1 and name not in root_controls
@@ -245,8 +252,8 @@ def cache_boundary(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
         active.remove(name)
 
     monkeypatch.setattr(cache_api, '_write', write)
-    monkeypatch.setattr(cache_api.os, 'unlink', unlink)
-    monkeypatch.setattr(cache_api.os, 'rmdir', rmdir)
+    monkeypatch.setattr(os, 'unlink', unlink)
+    monkeypatch.setattr(os, 'rmdir', rmdir)
     return SimpleNamespace(cache=cache, item=item, controls=controls, root_controls=root_controls,
         active=active, mutations=mutations, charged=charged, snapshot=value)
 
@@ -296,7 +303,7 @@ def test_root_inspect_commit_keeps_exact_receipts_and_fences_before_removal(
     elif defect == 'unlink-failure':
         def failed_unlink(*args: Any, **kwargs: Any) -> None:
             raise OSError('fixture deletion failure')
-        monkeypatch.setattr(cache_api.os, 'unlink', failed_unlink)
+        monkeypatch.setattr(os, 'unlink', failed_unlink)
     if defect is None:
         assert case.cache.maintain_failed(case.item, deadline=10**20, quiescence_check=guard, expected=value) is True
         assert case.mutations == ['retirement', 'failed.json', 'reservation.json', 'rmdir']

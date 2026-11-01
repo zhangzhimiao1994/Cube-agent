@@ -1,12 +1,13 @@
 """Task7D native PG read projection only; inert synthetic ledger rows, no permits."""
 
 import os
+from collections.abc import AsyncIterator, Sequence
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from uuid import UUID, uuid4
 
 import pytest
-from sqlalchemy import delete, event, select
+from sqlalchemy import Table, delete, event, select
 from sqlalchemy.engine import make_url
 
 from agent_hub.auth.models import AuthenticatedPrincipal, Role
@@ -23,15 +24,16 @@ from agent_hub.db.models import (
     RunReviewIntentRow,
     RunRow,
 )
-from agent_hub.db.session import build_database
+from agent_hub.db.session import Database, build_database
 from agent_hub.runs.authorization import _capture_authenticated_input, _persist_authenticated_input
 from agent_hub.runs.repository import RunNotFound, RunRepository
+from tests.unit.remaining_test_contract_typed_fixture import HistoryCase
 
 PRIVATE = "synthetic-private-action-rationale-lease-never-public"
 
 
 @pytest.fixture(scope="session")
-def database_url():
+def database_url() -> str:
     value = os.environ.get("AGENT_HUB_TEST_DATABASE_URL")
     assert value, "explicit dedicated test database binding required"
     url = make_url(value)
@@ -43,8 +45,8 @@ def database_url():
     return value
 
 
-async def snapshot(db, run_ids):
-    evidence = []
+async def snapshot(db: Database, run_ids: Sequence[UUID]) -> list[list[tuple[object, ...]]]:
+    evidence: list[list[tuple[object, ...]]] = []
     async with db.session_factory() as session:
         for table in (
             RunAdmissionAttemptRow,
@@ -57,11 +59,13 @@ async def snapshot(db, run_ids):
             RunReviewEventRow,
             RunReviewIntentRow,
         ):
+            metadata = table.__table__
+            assert isinstance(metadata, Table)
             rows = (
                 await session.execute(
-                    select(*table.__table__.columns)
+                    select(*metadata.columns)
                     .where(table.run_id.in_(run_ids))
-                    .order_by(*table.__table__.primary_key.columns)
+                    .order_by(*metadata.primary_key.columns)
                 )
             ).all()
             evidence.append([tuple(row) for row in rows])
@@ -81,9 +85,7 @@ async def snapshot(db, run_ids):
 
 
 @pytest.fixture
-async def pg_history(database_url):
-    from types import SimpleNamespace
-
+async def pg_history(database_url: str) -> AsyncIterator[HistoryCase]:
     db = build_database(database_url)
     tenant, actor = uuid4(), uuid4()
     main, other_actor, other_tenant, legacy = [uuid4() for _ in range(4)]
@@ -193,15 +195,16 @@ async def pg_history(database_url):
                     )
                 await session.flush()
         before = await snapshot(db, runs)
-        statements = []
+        statements: list[str] = []
 
-        def record(conn, cursor, statement, params, context, many):
+        def record(conn: object, cursor: object, statement: str, params: object,
+                   context: object, many: bool) -> None:
             statements.append(statement)
             assert statement.lstrip().upper().startswith("SELECT"), "history attempted a write"
 
         event.listen(db.engine.sync_engine, "before_cursor_execute", record)
         try:
-            yield SimpleNamespace(
+            yield HistoryCase(
                 db=db,
                 tenant=tenant,
                 actor=actor,
@@ -226,10 +229,11 @@ async def pg_history(database_url):
         await db.dispose()
 
 
-async def test_pg_history_keyset_over_200_and_same_timestamp_order(pg_history):
+async def test_pg_history_keyset_over_200_and_same_timestamp_order(pg_history: HistoryCase) -> None:
     p = pg_history
     repo = RunRepository(p.db.session_factory)
-    seen, cursor = [], None
+    seen: list[str] = []
+    cursor: UUID | None = None
     for _ in range(10):
         page = await repo.model_reviews(p.tenant, p.main, actor_id=p.actor, limit=50, cursor=cursor)
         seen.extend(item.id for item in page.items)
@@ -242,7 +246,7 @@ async def test_pg_history_keyset_over_200_and_same_timestamp_order(pg_history):
     assert len(page.items) == 200 and page.next_cursor == p.ids[199]
 
 
-async def test_pg_history_cross_scope_cursor_and_actor_cannot_read(pg_history):
+async def test_pg_history_cross_scope_cursor_and_actor_cannot_read(pg_history: HistoryCase) -> None:
     p = pg_history
     repo = RunRepository(p.db.session_factory)
     for tenant, actor, run in [
@@ -258,7 +262,7 @@ async def test_pg_history_cross_scope_cursor_and_actor_cannot_read(pg_history):
             await repo.model_reviews(p.tenant, p.main, actor_id=p.actor, cursor=cursor)
 
 
-async def test_pg_history_private_projection_and_legacy_zero_authority_writes(pg_history):
+async def test_pg_history_private_projection_and_legacy_zero_authority_writes(pg_history: HistoryCase) -> None:
     from dataclasses import asdict
 
     p = pg_history

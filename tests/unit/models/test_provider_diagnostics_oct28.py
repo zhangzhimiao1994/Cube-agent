@@ -2,21 +2,34 @@
 from __future__ import annotations
 
 import copy
-import importlib
 import importlib.util
 import json
 from dataclasses import FrozenInstanceError
-from typing import Any
 
 import httpx
 import pytest
-from openai import AsyncOpenAI, BadRequestError
+from openai import BadRequestError
+
+from agent_hub.models import provider_diagnostics
+from agent_hub.models.gateway import ModelGateway
+from agent_hub.models.types import ModelRequest
+from tests.unit.models.provider_capacity_typed_fixture import (
+    DiagnosticsAPI,
+    HTTPHandler,
+    at,
+    mock_client,
+    mutable,
+    present,
+    set_field,
+)
+from tests.unit.models.provider_capacity_typed_fixture import rows as object_rows
+from tests.unit.models.test_gateway import CapacityStub, SecretStub
 
 
-def api() -> Any:
+def api() -> DiagnosticsAPI:
     name = "agent_hub.models.provider_diagnostics"
     assert importlib.util.find_spec(name) is not None, "finite provider diagnostics missing"
-    return importlib.import_module(name)
+    return provider_diagnostics
 
 
 def payload() -> dict[str, object]:
@@ -54,7 +67,7 @@ def test_final_shape_counts_do_not_retain_request_contents() -> None:
     assert shape.output_tokens == 321
     assert "PRIVATE" not in json.dumps(value)
     with pytest.raises(FrozenInstanceError):
-        shape.output_tokens = 999
+        set_field(shape, "output_tokens", 999)
 
 
 @pytest.mark.parametrize("body,category,parameter,source,state", [
@@ -74,8 +87,8 @@ def test_only_structured_allowlisted_classes_survive(
     shape = a.make_request_shape(payload(), "chat_completions", send_ordinal=1)
     diagnostic = a.capture_error(bad(body), shape)
     assert diagnostic is not None
-    value = diagnostic.to_payload()
-    rejection = value["rejections"][0]
+    value = present(diagnostic).to_payload()
+    rejection = object_rows(value["rejections"])[0]
     assert rejection["status_code"] == 400
     assert rejection["exception_family"] == "sdk_bad_request"
     assert (rejection["rejection_class"], rejection["parameter_family"], rejection["classification_source"],
@@ -89,7 +102,7 @@ def test_unknown_or_hostile_exception_is_not_claimed_as_provider_evidence() -> N
 
     class Hostile(Exception):
         @property
-        def body(self):
+        def body(self) -> object:
             pytest.fail("untrusted exception property accessed")
 
     assert a.capture_error(Hostile("PRIVATE"), None) is None
@@ -105,18 +118,18 @@ def test_arbitrary_exception_cannot_spoof_an_issued_diagnostic_by_public_attribu
     a = api()
     issued = a.capture_error(bad({"code": "context_length_exceeded"}), None)
     foreign = RuntimeError("PRIVATE")
-    foreign.provider_diagnostic = issued
+    set_field(foreign, "provider_diagnostic", issued)
     assert a.get_provider_diagnostic(foreign) is None
     assert a.capture_error(foreign, None) is None
 
 
 def test_diagnostic_cross_fields_cannot_claim_protocol_or_signature_not_observed() -> None:
     a = api()
-    value = a.capture_error(bad({"code": "context_length_exceeded"}),
-                            a.make_request_shape(payload(), "chat_completions", send_ordinal=1)).to_payload()
+    value = present(a.capture_error(bad({"code": "context_length_exceeded"}),
+                            a.make_request_shape(payload(), "chat_completions", send_ordinal=1))).to_payload()
     for key, replacement in (("protocol", "responses"), ("classification_source", "exact_signature")):
         changed = copy.deepcopy(value)
-        target = changed["rejections"][0]["request_shape"] if key == "protocol" else changed["rejections"][0]
+        target = mutable(at(changed, "rejections", 0, "request_shape")) if key == "protocol" else object_rows(changed["rejections"])[0]
         target[key] = replacement
         with pytest.raises(ValueError):
             a.ProviderDiagnostic.from_payload(changed)
@@ -126,15 +139,16 @@ def test_strict_payload_rejects_extra_text_unknown_enums_and_mutated_frozen_valu
     a = api()
     diagnostic = a.capture_error(bad({"code": "unsupported_parameter"}),
                                  a.make_request_shape(payload(), "chat_completions", send_ordinal=1))
-    value = diagnostic.to_payload()
-    for path, key, item in [([], "message", "PRIVATE"), (["rejections", 0], "body", "PRIVATE"),
+    value = present(diagnostic).to_payload()
+    mutations: list[tuple[list[str | int], str, object]] = [([], "message", "PRIVATE"), (["rejections", 0], "body", "PRIVATE"),
                             (["rejections", 0], "rejection_class", "PRIVATE"),
-                            (["rejections", 0, "request_shape"], "output_tokens", True)]:
+                            (["rejections", 0, "request_shape"], "output_tokens", True)]
+    for path, key, item in mutations:
         changed = copy.deepcopy(value)
-        node = changed
+        node: object = changed
         for part in path:
-            node = node[part]
-        node[key] = item
+            node = at(node, part)
+        mutable(node)[key] = item
         with pytest.raises(ValueError):
             a.ProviderDiagnostic.from_payload(changed)
 
@@ -144,9 +158,9 @@ def test_direct_http_error_has_bounded_json_without_message_echo() -> None:
     response = httpx.Response(400, json={"error": {"code": "invalid_json_schema", "param": "response_format",
                                                   "message": "PRIVATE_PROMPT PRIVATE_API_KEY"}})
     diagnostic = a.capture_response(response, a.make_request_shape(payload(), "chat_completions", send_ordinal=1))
-    assert diagnostic.to_payload()["rejections"][0]["rejection_class"] == "structured_output"
-    assert "PRIVATE" not in json.dumps(diagnostic.to_payload())
-    assert a.capture_response(httpx.Response(400, content=b"x" * 20000), None).to_payload()["rejections"][0]["body_state"] == "oversized"
+    assert at(present(diagnostic).to_payload(), "rejections", 0, "rejection_class") == "structured_output"
+    assert "PRIVATE" not in json.dumps(present(diagnostic).to_payload())
+    assert at(present(a.capture_response(httpx.Response(400, content=b"x" * 20000), None)).to_payload(), "rejections", 0, "body_state") == "oversized"
 
 
 def test_receipt_contract_keeps_legacy_shape_and_strictly_versions_diagnostics() -> None:
@@ -157,7 +171,7 @@ def test_receipt_contract_keeps_legacy_shape_and_strictly_versions_diagnostics()
     attempt = GatewayFailureAttempt(1, "primary", "primary", "provider", "provider/model", "transport_error", 400)
     receipt = GatewayFailureReceipt("00000000-0000-0000-0000-000000000001", "primary", False, True, ("primary",), (attempt,))
     legacy = receipt.to_payload()
-    assert legacy["schema_version"] == 1 and "provider_diagnostic" not in legacy["attempts"][0]
+    assert legacy["schema_version"] == 1 and "provider_diagnostic" not in object_rows(legacy["attempts"])[0]
     diagnostic = a.capture_error(bad({"code": "context_length_exceeded"}),
                                  a.make_request_shape(payload(), "chat_completions", send_ordinal=1))
     receipt = replace(receipt, attempts=(replace(attempt, provider_diagnostic=diagnostic),))
@@ -170,18 +184,17 @@ def test_receipt_contract_keeps_legacy_shape_and_strictly_versions_diagnostics()
         if mutation == "downgrade":
             broken["schema_version"] = 1
         elif mutation == "raw":
-            broken["attempts"][0]["provider_diagnostic"]["message"] = "PRIVATE"
+            mutable(at(broken, "attempts", 0, "provider_diagnostic"))["message"] = "PRIVATE"
         else:
             broken["schema_version"] = True
         with pytest.raises(ValueError):
             GatewayFailureReceipt.from_payload(broken)
 
 
-def gateway_fixture(protocol: str, handle: Any) -> tuple[Any, Any, Any, Any]:
+def gateway_fixture(protocol: str, handle: HTTPHandler) -> tuple[ModelGateway, ModelRequest, CapacityStub, SecretStub]:
     from dataclasses import replace
 
     from agent_hub.models.gateway import ModelGateway
-    from agent_hub.models.litellm_client import LiteLLMClient
     from agent_hub.models.registry import ModelRegistry
     from agent_hub.models.types import ModelCapability
     from tests.contracts.test_required_tool_transport import deployment, request
@@ -196,13 +209,7 @@ def gateway_fixture(protocol: str, handle: Any) -> tuple[Any, Any, Any, Any]:
     capacity = CapacityStub([lease("primary"), lease("backup")])
     secret = SecretStub(capacity.events)
 
-    def sdk(**kwargs: Any) -> AsyncOpenAI:
-        return AsyncOpenAI(**kwargs, http_client=httpx.AsyncClient(transport=httpx.MockTransport(handle), trust_env=False))
-
-    def http(**kwargs: Any) -> httpx.AsyncClient:
-        return httpx.AsyncClient(**kwargs, transport=httpx.MockTransport(handle), trust_env=False)
-
-    client = LiteLLMClient(client_factory=sdk, http_client_factory=http)
+    client = mock_client(handle)
     gateway = ModelGateway(ModelRegistry([selected, backup]), capacity, secret, client,
                            fallbacks={"primary": "backup"})
     req = request("responses" if protocol == "responses" else "chat_completions", max_output_tokens=321)
@@ -215,10 +222,10 @@ def gateway_fixture(protocol: str, handle: Any) -> tuple[Any, Any, Any, Any]:
 async def test_real_gateway_failure_retains_class_final_shape_and_no_extra_requests(protocol: str) -> None:
     from agent_hub.models.failure_receipt import GatewayFailureReceipt, get_gateway_failure_receipt
     from agent_hub.models.litellm_client import ModelTransportError, safe_model_client_error
-    wire = []
+    wire: list[dict[str, object]] = []
 
     def handle(req: httpx.Request) -> httpx.Response:
-        wire.append(json.loads(req.content))
+        wire.append(mutable(json.loads(req.content)))
         return httpx.Response(400, json={"error": {"code": "invalid_json_schema", "param": "response_format",
                                                    "message": "PRIVATE_PROMPT PRIVATE_REASONING PRIVATE_API_KEY"}})
 
@@ -232,9 +239,9 @@ async def test_real_gateway_failure_retains_class_final_shape_and_no_extra_reque
     assert receipt is not None
     value = receipt.to_payload()
     assert value["schema_version"] == 2
-    rejection = value["attempts"][0]["provider_diagnostic"]["rejections"][-1]
+    rejection = object_rows(at(value, "attempts", 0, "provider_diagnostic", "rejections"))[-1]
     assert rejection["rejection_class"] == "structured_output"
-    shape = rejection["request_shape"]
+    shape = mutable(rejection["request_shape"])
     assert shape["protocol"] == ("chat_completions" if protocol == "stream" else protocol)
     token_field = {"chat_completions": "max_completion_tokens", "stream": "max_completion_tokens",
                    "responses": "max_output_tokens", "messages": "max_tokens"}[protocol]
@@ -254,10 +261,10 @@ async def test_existing_negotiation_keeps_both_actual_shapes_without_third_send(
 
     from agent_hub.models.failure_receipt import get_gateway_failure_receipt
     from agent_hub.models.litellm_client import ModelTransportError
-    wire = []
+    wire: list[dict[str, object]] = []
 
     def handle(req: httpx.Request) -> httpx.Response:
-        wire.append(json.loads(req.content))
+        wire.append(mutable(json.loads(req.content)))
         if len(wire) == 1:
             if negotiation == "tool_choice":
                 message = "The tool_choice parameter does not support being set to required or object in thinking mode"
@@ -273,12 +280,12 @@ async def test_existing_negotiation_keeps_both_actual_shapes_without_third_send(
         await gateway.complete_with_context(req)
     receipt = get_gateway_failure_receipt(caught.value)
     assert receipt is not None and len(wire) == 2
-    rows = receipt.to_payload()["attempts"][0]["provider_diagnostic"]["rejections"]
-    assert [r["request_shape"]["send_ordinal"] for r in rows] == [1, 2]
+    rows = object_rows(at(receipt.to_payload(), "attempts", 0, "provider_diagnostic", "rejections"))
+    assert [mutable(r["request_shape"])["send_ordinal"] for r in rows] == [1, 2]
     if negotiation == "tool_choice":
-        assert [r["request_shape"]["tool_choice"] for r in rows] == ["named", "auto"]
+        assert [mutable(r["request_shape"])["tool_choice"] for r in rows] == ["named", "auto"]
     else:
-        assert [r["request_shape"]["output_token_parameter"] for r in rows] == ["max_completion_tokens", "max_tokens"]
+        assert [mutable(r["request_shape"])["output_token_parameter"] for r in rows] == ["max_completion_tokens", "max_tokens"]
     assert rows[-1]["rejection_class"] == "unknown"
 
 
@@ -287,7 +294,7 @@ async def test_capture_failure_preserves_the_original_400_and_does_not_retry(
     monkeypatch: pytest.MonkeyPatch, capture_failure: str,
 ) -> None:
     from agent_hub.models.litellm_client import ModelTransportError
-    wire = []
+    wire: list[str] = []
 
     def handle(req: httpx.Request) -> httpx.Response:
         wire.append(req.url.path)

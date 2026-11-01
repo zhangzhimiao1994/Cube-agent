@@ -1,25 +1,35 @@
 """Synthetic dedicated PG only; storage, never provider/tool execution."""
 
+from __future__ import annotations
+
 import asyncio
 import json
 import os
+from collections.abc import AsyncGenerator
 from dataclasses import dataclass, replace
-from datetime import timedelta
+from datetime import datetime, timedelta
 from decimal import Decimal
+from typing import Literal, Unpack
 from uuid import UUID, uuid4
 
 import pytest
+from alembic.operations import Operations
 from sqlalchemy import delete, func, select
-from sqlalchemy.engine import make_url
+from sqlalchemy.engine import Connection, Dialect, make_url
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.sql.type_api import TypeEngine
 
 from agent_hub.auth.models import AuthenticatedPrincipal, Role
 from agent_hub.capabilities.review_contracts import (
     ApprovalReviewConfig,
+    FrozenReviewAction,
     ModelReviewVerdict,
     freeze_review_action,
 )
 from agent_hub.capabilities.review_repository import (
     ReviewConflict,
+    ReviewIntent,
+    ReviewOutcome,
     ReviewRepository,
     _CurrentReviewBinding,
     _ReviewReservation,
@@ -45,13 +55,24 @@ from agent_hub.models.run_admission_repository import (
     _WorkerLease,
 )
 from agent_hub.runs.authorization import (
+    _AuthenticatedInput,
     _capture_authenticated_input,
     _persist_authenticated_input,
 )
+from tests.integration.runtime.review_mode_import_closure_typed_fixture import (
+    BeginArguments,
+    BeginChanges,
+    FinishArguments,
+    MigrationModule,
+    ReceiptChanges,
+    SnapshotChanges,
+)
+from tests.unit.harness.review_typed_fixture import present
+from tests.unit.runs.project_auto_repair_typed_fixture import mapping
 
 
 @pytest.fixture(scope="session")
-def database_url():
+def database_url() -> str:
     value = os.environ.get("AGENT_HUB_TEST_DATABASE_URL")
     assert value, "explicit dedicated test database binding required"
     url = make_url(value)
@@ -65,14 +86,14 @@ def database_url():
 
 @dataclass
 class Context:
-    factory: object
+    factory: async_sessionmaker[AsyncSession]
     tenant: UUID
     run: UUID
-    evidence: object
+    evidence: _AuthenticatedInput
     config: ApprovalReviewConfig
     reservation: _ReviewReservation
 
-    def snapshot(self, **changes):
+    def snapshot(self, **changes: Unpack[SnapshotChanges]) -> FrozenReviewAction:
         req_changes = changes.pop("request", {})
         req = CapabilityRequest(
             tenant_id=self.tenant,
@@ -85,26 +106,27 @@ class Context:
             arguments={"text": "private-content"},
             idempotency_key="key-a",
         ).model_copy(update=req_changes)
-        values = {
-            "role": Role.OPERATOR,
-            "authorization_turn_id": self.evidence.turn_id,
-            "authorization_sha256": authorization_binding_sha256(self.evidence),
-            "config_sha256": review_config_sha256(self.config),
-            "policy_sha256": "c" * 64,
-            "source_binding": {"root": "private-source"},
-            "normalized_effect": {"file": "private-file"},
-        }
-        values.update(changes)
-        return freeze_review_action(req, **values)
+        return freeze_review_action(
+            req,
+            role=changes.get("role", Role.OPERATOR),
+            authorization_turn_id=changes.get("authorization_turn_id", self.evidence.turn_id),
+            authorization_sha256=changes.get(
+                "authorization_sha256", authorization_binding_sha256(self.evidence)
+            ),
+            config_sha256=changes.get("config_sha256", review_config_sha256(self.config)),
+            policy_sha256=changes.get("policy_sha256", "c" * 64),
+            source_binding=changes.get("source_binding", {"root": "private-source"}),
+            normalized_effect=changes.get("normalized_effect", {"file": "private-file"}),
+        )
 
-    def repo(self):
+    def repo(self) -> ReviewRepository:
         return ReviewRepository(self.factory)
 
-    def binding(self):
+    def binding(self) -> _CurrentReviewBinding:
         return _CurrentReviewBinding(self.snapshot(), self.config, self.reservation.lease)
 
-    async def begin(self, **changes):
-        values = {
+    async def begin(self, **changes: Unpack[BeginChanges]) -> ReviewIntent:
+        values: BeginArguments = {
             "snapshot": self.snapshot(),
             "config": self.config,
             "reservation": self.reservation,
@@ -113,7 +135,7 @@ class Context:
         values.update(changes)
         return await self.repo().begin_intent(**values)
 
-    async def issue(self, intent, physical=None):
+    async def issue(self, intent: ReviewIntent, physical: UUID | None = None) -> bool:
         return await self.repo().mark_issued(
             tenant_id=self.tenant,
             run_id=self.run,
@@ -122,7 +144,13 @@ class Context:
             lease=self.reservation.lease,
         )
 
-    def receipt(self, intent, outcome="allow", usage="known", **changes):
+    def receipt(
+        self,
+        intent: ReviewIntent,
+        outcome: ReviewOutcome = "allow",
+        usage: UsageObservation | Literal["known"] | None = "known",
+        **changes: Unpack[ReceiptChanges],
+    ) -> FinishArguments:
         verdict = (
             None
             if outcome not in ("allow", "deny", "needs_human")
@@ -135,7 +163,7 @@ class Context:
                 intent.action_digest,
             )
         )
-        values = {
+        values: FinishArguments = {
             "tenant_id": self.tenant,
             "run_id": self.run,
             "review_id": intent.review_id,
@@ -147,22 +175,22 @@ class Context:
             "outcome": outcome,
             "verdict": verdict,
             "usage": UsageObservation(2, 3, 5, Decimal("0.01")) if usage == "known" else usage,
+            **changes,
         }
-        values.update(changes)
         return values
 
-    async def issued(self, **changes):
+    async def issued(self, **changes: Unpack[BeginChanges]) -> ReviewIntent:
         intent = await self.begin(**changes)
         await self.issue(intent)
-        return await self.repo().get(self.tenant, self.run, intent.review_id)
+        return present(await self.repo().get(self.tenant, self.run, intent.review_id))
 
-    async def allow(self):
+    async def allow(self) -> ReviewIntent:
         intent = await self.issued()
         return await self.repo().finish(**self.receipt(intent))
 
 
 @pytest.fixture
-async def ctx(database_url):
+async def ctx(database_url: str) -> AsyncGenerator[Context, None]:
     db = build_database(database_url)
     tenant, run = uuid4(), uuid4()
     e = _capture_authenticated_input(
@@ -179,6 +207,7 @@ async def ctx(database_url):
     lease = _WorkerLease("synthetic-worker", uuid4())
     async with db.session_factory() as session, session.begin():
         now = await session.scalar(select(func.clock_timestamp()))
+        assert isinstance(now, datetime)
         row = RunRow(
             id=run,
             tenant_id=tenant,
@@ -237,10 +266,12 @@ async def ctx(database_url):
         await db.dispose()
 
 
-async def counts(ctx):
+async def counts(ctx: Context) -> list[int]:
     async with ctx.factory() as s:
         return [
-            await s.scalar(select(func.count()).select_from(row).where(row.run_id == ctx.run))
+            present(
+                await s.scalar(select(func.count()).select_from(row).where(row.run_id == ctx.run))
+            )
             for row in (
                 RunReviewIntentRow,
                 RunReviewEffectRow,
@@ -251,7 +282,9 @@ async def counts(ctx):
         ]
 
 
-async def test_begin_atomic_rollback_same_effect_and_ordinary_approval_untouched(ctx):
+async def test_begin_atomic_rollback_same_effect_and_ordinary_approval_untouched(
+    ctx: Context,
+) -> None:
     with pytest.raises(RuntimeError, match="abort"):
         async with ctx.factory() as s, s.begin():
             await ctx.repo()._begin_intent_in_session(
@@ -263,7 +296,7 @@ async def test_begin_atomic_rollback_same_effect_and_ordinary_approval_untouched
             )
             raise RuntimeError("abort")
     assert await counts(ctx) == [0, 0, 0, 0, 0]
-    pool = await RunAdmissionRepository(ctx.factory).get_pool(ctx.tenant, ctx.run)
+    pool = present(await RunAdmissionRepository(ctx.factory).get_pool(ctx.tenant, ctx.run))
     assert (pool.token_charged, pool.review_count_charged) == (0, 0)
     a, b = await asyncio.gather(
         ctx.begin(),
@@ -274,11 +307,11 @@ async def test_begin_atomic_rollback_same_effect_and_ordinary_approval_untouched
     assert sorted([a.created, b.created]) == [False, True]
     assert a.review_id == b.review_id
     assert await counts(ctx) == [1, 1, 1, 1, 0]
-    pool = await RunAdmissionRepository(ctx.factory).get_pool(ctx.tenant, ctx.run)
+    pool = present(await RunAdmissionRepository(ctx.factory).get_pool(ctx.tenant, ctx.run))
     assert (pool.token_charged, pool.review_count_charged) == (30, 1)
 
 
-async def test_begin_plus_issue_and_finish_caller_rollback(ctx):
+async def test_begin_plus_issue_and_finish_caller_rollback(ctx: Context) -> None:
     review_id, physical = uuid4(), uuid4()
     with pytest.raises(RuntimeError, match="abort"):
         async with ctx.factory() as s, s.begin():
@@ -304,14 +337,14 @@ async def test_begin_plus_issue_and_finish_caller_rollback(ctx):
         async with ctx.factory() as s, s.begin():
             await ctx.repo()._finish_in_session(s, **ctx.receipt(intent))
             raise RuntimeError("abort")
-    assert (await ctx.repo().get(ctx.tenant, ctx.run, intent.review_id)).status == "issued"
+    assert present(await ctx.repo().get(ctx.tenant, ctx.run, intent.review_id)).status == "issued"
     attempt = await RunAdmissionRepository(ctx.factory).get_attempt(
         ctx.tenant, ctx.run, intent.attempt_id
     )
-    assert attempt.state == "issued"
+    assert present(attempt).state == "issued"
 
 
-async def test_duplicate_issue_exactly_once_identity_conflict(ctx):
+async def test_duplicate_issue_exactly_once_identity_conflict(ctx: Context) -> None:
     intent = await ctx.begin()
     physical = uuid4()
     values = await asyncio.gather(ctx.issue(intent, physical), ctx.issue(intent, physical))
@@ -321,7 +354,7 @@ async def test_duplicate_issue_exactly_once_identity_conflict(ctx):
     assert await counts(ctx) == [1, 1, 2, 1, 0]
 
 
-async def test_strict_allow_known_accounting_private_summary_and_one_use_race(ctx):
+async def test_strict_allow_known_accounting_private_summary_and_one_use_race(ctx: Context) -> None:
     intent = await ctx.allow()
     assert intent.status == "allow"
     public = intent.public_summary()
@@ -353,7 +386,7 @@ async def test_strict_allow_known_accounting_private_summary_and_one_use_race(ct
         str(ctx.reservation.lease.token),
     ]:
         assert secret not in dumped
-    pool = await RunAdmissionRepository(ctx.factory).get_pool(ctx.tenant, ctx.run)
+    pool = present(await RunAdmissionRepository(ctx.factory).get_pool(ctx.tenant, ctx.run))
     assert (pool.token_charged, pool.review_cost_charged) == (5, Decimal("0.01"))
     values = await asyncio.gather(
         *[
@@ -380,7 +413,9 @@ async def test_strict_allow_known_accounting_private_summary_and_one_use_race(ct
     "outcome",
     ["allow", "deny", "needs_human", "timeout", "unavailable", "invalid_response", "unknown"],
 )
-async def test_unknown_billing_never_mints_allow_or_fabricates_deny(ctx, outcome):
+async def test_unknown_billing_never_mints_allow_or_fabricates_deny(
+    ctx: Context, outcome: ReviewOutcome
+) -> None:
     intent = await ctx.issued()
     result = await ctx.repo().finish(**ctx.receipt(intent, outcome=outcome, usage=None))
     assert result.status == ("unknown" if outcome == "allow" else outcome)
@@ -390,13 +425,13 @@ async def test_unknown_billing_never_mints_allow_or_fabricates_deny(ctx, outcome
         review_id=intent.review_id,
         current_binding=ctx.binding(),
     )
-    pool = await RunAdmissionRepository(ctx.factory).get_pool(ctx.tenant, ctx.run)
+    pool = present(await RunAdmissionRepository(ctx.factory).get_pool(ctx.tenant, ctx.run))
     assert (pool.token_charged, pool.review_cost_charged) == (30, Decimal("0.2"))
     assert (await ctx.begin()).review_id == intent.review_id
     assert await counts(ctx) == [1, 1, 3, 1, 0]
 
 
-async def test_unknown_cold_recovery_no_refill_reissue_or_late_allow(ctx):
+async def test_unknown_cold_recovery_no_refill_reissue_or_late_allow(ctx: Context) -> None:
     intent = await ctx.issued()
     result = await ctx.repo().recover_issued(ctx.tenant, ctx.run, intent.review_id)
     assert result.status == "unknown"
@@ -407,11 +442,11 @@ async def test_unknown_cold_recovery_no_refill_reissue_or_late_allow(ctx):
         await ctx.repo().finish(**ctx.receipt(intent))
     assert not await ctx.issue(intent, intent.physical_identity)
     assert (await ctx.begin()).created is False
-    pool = await RunAdmissionRepository(ctx.factory).get_pool(ctx.tenant, ctx.run)
+    pool = present(await RunAdmissionRepository(ctx.factory).get_pool(ctx.tenant, ctx.run))
     assert pool.token_charged == 30
 
 
-async def test_terminal_exact_repeat_and_conflicting_replacement(ctx):
+async def test_terminal_exact_repeat_and_conflicting_replacement(ctx: Context) -> None:
     intent = await ctx.issued()
     receipt = ctx.receipt(intent, outcome="deny")
     first = await ctx.repo().finish(**receipt)
@@ -420,18 +455,20 @@ async def test_terminal_exact_repeat_and_conflicting_replacement(ctx):
         await ctx.repo().finish(**ctx.receipt(intent))
     assert await counts(ctx) == [1, 1, 3, 1, 0]
     assert (
-        await ctx.repo().lookup_effect(
-            ctx.tenant, ctx.run, ctx.evidence.turn_id, intent.effect_digest
+        present(
+            await ctx.repo().lookup_effect(
+                ctx.tenant, ctx.run, ctx.evidence.turn_id, intent.effect_digest
+            )
         )
     ).status == "deny"
 
 
-async def test_prepared_cancel_releases_hold_preserves_effect_and_history(ctx):
+async def test_prepared_cancel_releases_hold_preserves_effect_and_history(ctx: Context) -> None:
     intent = await ctx.begin()
     result = await ctx.repo().finish(**ctx.receipt(intent, outcome="cancelled", usage=None))
     assert result.status == "cancelled"
     assert (await ctx.begin()).created is False
-    pool = await RunAdmissionRepository(ctx.factory).get_pool(ctx.tenant, ctx.run)
+    pool = present(await RunAdmissionRepository(ctx.factory).get_pool(ctx.tenant, ctx.run))
     assert (pool.token_charged, pool.review_count_charged) == (0, 0)
     with pytest.raises(ReviewConflict):
         await ctx.issue(intent)
@@ -456,13 +493,14 @@ async def test_prepared_cancel_releases_hold_preserves_effect_and_history(ctx):
         "binding_lease",
     ],
 )
-async def test_changed_current_security_binding_cannot_consume(ctx, change):
+async def test_changed_current_security_binding_cannot_consume(ctx: Context, change: str) -> None:
     intent = await ctx.allow()
     binding = ctx.binding()
     async with ctx.factory() as s, s.begin():
-        row = await s.get(RunRow, ctx.run)
-        pool = await s.get(RunAdmissionPoolRow, ctx.run)
+        row = present(await s.get(RunRow, ctx.run))
+        pool = present(await s.get(RunAdmissionPoolRow, ctx.run))
         now = await s.scalar(select(func.clock_timestamp()))
+        assert isinstance(now, datetime)
         if change == "role":
             row.actor_role = "admin"
         if change == "turn":
@@ -499,14 +537,16 @@ async def test_changed_current_security_binding_cannot_consume(ctx, change):
     assert not await ctx.repo().consume_permit(
         tenant_id=ctx.tenant, run_id=ctx.run, review_id=intent.review_id, current_binding=binding
     )
-    assert not (await ctx.repo().get(ctx.tenant, ctx.run, intent.review_id)).consumed
+    assert not present(await ctx.repo().get(ctx.tenant, ctx.run, intent.review_id)).consumed
 
 
 @pytest.mark.parametrize(
     "change",
     ["action_digest", "high_allow", "model", "request", "attempt", "physical", "missing_verdict"],
 )
-async def test_forged_terminal_identity_or_verdict_fails_without_settlement(ctx, change):
+async def test_forged_terminal_identity_or_verdict_fails_without_settlement(
+    ctx: Context, change: str
+) -> None:
     intent = await ctx.issued()
     receipt = ctx.receipt(intent)
     if change in ("action_digest", "high_allow"):
@@ -528,9 +568,9 @@ async def test_forged_terminal_identity_or_verdict_fails_without_settlement(ctx,
         receipt["verdict"] = None
     with pytest.raises((ValueError, ReviewConflict)):
         await ctx.repo().finish(**receipt)
-    assert (await ctx.repo().get(ctx.tenant, ctx.run, intent.review_id)).status == "issued"
+    assert present(await ctx.repo().get(ctx.tenant, ctx.run, intent.review_id)).status == "issued"
     assert (
-        await RunAdmissionRepository(ctx.factory).get_pool(ctx.tenant, ctx.run)
+        present(await RunAdmissionRepository(ctx.factory).get_pool(ctx.tenant, ctx.run))
     ).token_charged == 30
 
 
@@ -547,7 +587,9 @@ async def test_forged_terminal_identity_or_verdict_fails_without_settlement(ctx,
         "no_pool",
     ],
 )
-async def test_missing_or_cross_provenance_begin_fails_before_paid_reservation(ctx, change):
+async def test_missing_or_cross_provenance_begin_fails_before_paid_reservation(
+    ctx: Context, change: str
+) -> None:
     a = ctx.snapshot()
     if change == "cross_run":
         a = ctx.snapshot(request={"run_id": uuid4()})
@@ -575,8 +617,10 @@ async def test_missing_or_cross_provenance_begin_fails_before_paid_reservation(c
     assert await counts(ctx) == [0, 0, 0, 0, 0]
 
 
-async def test_breaker_shared_instances_neutral_errors_and_same_effect_no_extra_count(ctx):
-    outcomes = ["deny", "timeout", "deny", "invalid_response", "deny"]
+async def test_breaker_shared_instances_neutral_errors_and_same_effect_no_extra_count(
+    ctx: Context,
+) -> None:
+    outcomes: list[ReviewOutcome] = ["deny", "timeout", "deny", "invalid_response", "deny"]
     for i, outcome in enumerate(outcomes):
         intent = await ctx.issued(snapshot=ctx.snapshot(normalized_effect={"target": i}))
         await ctx.repo().finish(**ctx.receipt(intent, outcome=outcome, usage=None))
@@ -597,7 +641,9 @@ async def test_breaker_shared_instances_neutral_errors_and_same_effect_no_extra_
     "usage",
     [UsageObservation(20, 20, 40, Decimal("0.01")), UsageObservation(2, 3, 5, Decimal("0.3"))],
 )
-async def test_overbound_allow_closes_pool_and_cannot_consume(ctx, usage):
+async def test_overbound_allow_closes_pool_and_cannot_consume(
+    ctx: Context, usage: UsageObservation
+) -> None:
     intent = await ctx.issued()
     result = await ctx.repo().finish(**ctx.receipt(intent, usage=usage))
     assert result.status == "unknown"
@@ -607,11 +653,11 @@ async def test_overbound_allow_closes_pool_and_cannot_consume(ctx, usage):
         review_id=intent.review_id,
         current_binding=ctx.binding(),
     )
-    pool = await RunAdmissionRepository(ctx.factory).get_pool(ctx.tenant, ctx.run)
+    pool = present(await RunAdmissionRepository(ctx.factory).get_pool(ctx.tenant, ctx.run))
     assert pool.closed and pool.token_charged == 30
 
 
-async def test_populated_downgrade_refuses_and_model_migration_parity(ctx):
+async def test_populated_downgrade_refuses_and_model_migration_parity(ctx: Context) -> None:
     import importlib.util
     from pathlib import Path
 
@@ -623,13 +669,16 @@ async def test_populated_downgrade_refuses_and_model_migration_parity(ctx):
 
     path = Path(__file__).resolve().parents[3] / "alembic/versions/0036_review_ledger.py"
     spec = importlib.util.spec_from_file_location("review_migration", path)
+    assert spec is not None
     mod = importlib.util.module_from_spec(spec)
+    assert spec is not None and spec.loader is not None
     spec.loader.exec_module(mod)
+    assert isinstance(mod, MigrationModule)
     await ctx.begin()
     async with ctx.factory() as s:
         conn = await s.connection()
 
-        def verify(sync):
+        def verify(sync: Connection) -> None:
             inspector = inspect(sync)
             for name in (
                 "agent_hub_review_intents",
@@ -657,14 +706,17 @@ async def test_populated_downgrade_refuses_and_model_migration_parity(ctx):
     assert await counts(ctx) == [1, 1, 1, 1, 0]
 
 
-def _column_parity_signature(sql_type, nullable, *, dialect):
+def _column_parity_signature(
+    sql_type: TypeEngine[object], nullable: bool | None, *, dialect: Dialect
+) -> tuple[str, object, bool | None]:
     # Compare actual PostgreSQL DDL, not generic display aliases (DATETIME vs
     # reflected TIMESTAMP). Preserve length/precision/scale and explicitly
     # retain timezone and nullability; complete column dictionaries stay exact.
     return sql_type.compile(dialect=dialect), getattr(sql_type, "timezone", None), nullable
 
 
-def _downgrade(mod, operations):
+def _downgrade(mod: MigrationModule, operations: Operations) -> None:
+    assert isinstance(mod, MigrationModule)
     # Exercise actual migration, not a copied guard SQL.
     previous = mod.op
     try:
@@ -675,15 +727,17 @@ def _downgrade(mod, operations):
 
 
 @pytest.mark.parametrize("outcome", ["unknown", "timeout", "unavailable", "invalid_response"])
-async def test_error_usage_observation_never_refunds_unproven_issue(ctx, outcome):
+async def test_error_usage_observation_never_refunds_unproven_issue(
+    ctx: Context, outcome: ReviewOutcome
+) -> None:
     intent = await ctx.issued()
     result = await ctx.repo().finish(**ctx.receipt(intent, outcome=outcome))
     assert result.status == outcome
-    pool = await RunAdmissionRepository(ctx.factory).get_pool(ctx.tenant, ctx.run)
+    pool = present(await RunAdmissionRepository(ctx.factory).get_pool(ctx.tenant, ctx.run))
     assert (pool.token_charged, pool.review_cost_charged) == (30, Decimal("0.2"))
 
 
-async def test_begin_freezes_configuration_and_reservation_before_lock_wait(ctx):
+async def test_begin_freezes_configuration_and_reservation_before_lock_wait(ctx: Context) -> None:
     from sqlalchemy import text
 
     c = replace(ctx.config)
@@ -740,11 +794,11 @@ async def test_begin_freezes_configuration_and_reservation_before_lock_wait(ctx)
     ],
 )
 async def test_finish_freezes_external_inputs_across_real_settlement_await(
-    ctx,
-    monkeypatch,
-    target,
-    checkpoint,
-):
+    ctx: Context,
+    monkeypatch: pytest.MonkeyPatch,
+    target: str,
+    checkpoint: int,
+) -> None:
     intent = await ctx.issued()
     repo = ctx.repo()
     receipt = ctx.receipt(intent)
@@ -757,9 +811,11 @@ async def test_finish_freezes_external_inputs_across_real_settlement_await(
     locked = repo._budget._locked
     reads = 0
 
-    async def pausing_locked(*args, **kwargs):
+    async def pausing_locked(
+        session: AsyncSession, tenant_id: UUID, run_id: UUID
+    ) -> tuple[RunRow, RunAdmissionPoolRow | None]:
         nonlocal reads
-        rows = await locked(*args, **kwargs)
+        rows = await locked(session, tenant_id, run_id)
         reads += 1
         if reads == checkpoint:
             reached.set()
@@ -782,14 +838,14 @@ async def test_finish_freezes_external_inputs_across_real_settlement_await(
         release.set()
         result = await asyncio.wait_for(pending, timeout=5)
         assert result.status == "allow"
-        assert (await repo.get(ctx.tenant, ctx.run, intent.review_id)).status == "allow"
+        assert present(await repo.get(ctx.tenant, ctx.run, intent.review_id)).status == "allow"
         async with ctx.factory() as s:
-            row = await s.get(RunReviewIntentRow, intent.review_id)
-            attempt = await s.get(RunAdmissionAttemptRow, intent.attempt_id)
-            observed = json.loads(row.private_receipt)["evidence"]["usage"]
-            assert attempt.receipt["usage"] == observed
+            row = present(await s.get(RunReviewIntentRow, intent.review_id))
+            attempt = present(await s.get(RunAdmissionAttemptRow, intent.attempt_id))
+            observed = json.loads(present(row.private_receipt))["evidence"]["usage"]
+            assert mapping(attempt.receipt)["usage"] == observed
             assert observed["total_tokens"] == 5
-        pool = await RunAdmissionRepository(ctx.factory).get_pool(ctx.tenant, ctx.run)
+        pool = present(await RunAdmissionRepository(ctx.factory).get_pool(ctx.tenant, ctx.run))
         assert (pool.token_charged, pool.review_cost_charged) == (5, Decimal("0.01"))
         assert await repo.consume_permit(
             tenant_id=ctx.tenant,

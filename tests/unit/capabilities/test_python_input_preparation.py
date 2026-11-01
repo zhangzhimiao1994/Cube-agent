@@ -232,7 +232,9 @@ async def test_supply_public_history_survives_recipe_observed(helper: Any, dao: 
 
 
 async def test_real_postgres_uuid_type_keeps_supply_approval_details(helper: Any, dao: Any) -> None:
-    from asyncpg.pgproto.pgproto import UUID as DatabaseUUID
+    from tests.unit.capabilities.capability_lifecycle_typed_fixture import native_asyncpg_uuid_class
+
+    DatabaseUUID = native_asyncpg_uuid_class()
 
     from agent_hub.runs.repository import _public_plugin_approval_events
 

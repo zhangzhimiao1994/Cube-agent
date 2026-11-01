@@ -37,7 +37,7 @@ from agent_hub.runtime.contracts import TaskContext
 from agent_hub.subprocess_cleanup import ProcessCleanupIncomplete
 from tests.unit.capabilities import test_python_generated_service as generated_helpers
 from tests.unit.capabilities import test_python_project_service as original_helpers
-from tests.unit.capabilities.test_python_verification_recovery import caches
+from tests.unit.remaining_test_contract_typed_fixture import caches
 from tests.unit.runs.test_project_verification_receipts import Database
 
 

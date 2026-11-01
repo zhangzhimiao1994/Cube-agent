@@ -224,7 +224,7 @@ def test_context_exception_has_fixed_default() -> None:
 
 def schema_heavy_request(*, native: bool) -> ModelRequest:
     tool = ToolDefinition("project_write", "Required project writer", {
-        "type": "object", "required": ["content"], "additionalProperties": False,
+        "type": "object", "required": ("content",), "additionalProperties": False,
         "properties": {"content": {"type": "string", "description": "schema field " * 6000}},
     })
     return replace(request(required=frozenset({ModelCapability.TEXT, ModelCapability.TOOL_CALLING})),

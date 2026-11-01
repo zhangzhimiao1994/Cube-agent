@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from typing import Never
 from uuid import uuid4
 
 import pytest
@@ -16,6 +17,7 @@ from agent_hub.runtime.failure_reason import (
     safe_runtime_failure_diagnostic,
     safe_runtime_failure_reason,
 )
+from tests.unit.runs.reviewed_report_revision_typed_fixture import string_value
 
 BASE = "direct final report is invalid"
 SHAPES = ["completion_missing", "tool_calls", "empty_text", "json_only", "binding_invalid", "unknown"]
@@ -27,7 +29,7 @@ def report_reason(shape: str, prefix: str = "") -> str:
 
 @pytest.mark.parametrize("shape", SHAPES)
 @pytest.mark.parametrize("prefix", ["", "hybrid direct failed: "])
-def test_report_shape_is_finite_and_never_a_generic_empty_response(shape, prefix):
+def test_report_shape_is_finite_and_never_a_generic_empty_response(shape: str, prefix: str) -> None:
     reason = report_reason(shape, prefix)
     diagnostic = safe_runtime_failure_diagnostic(RuntimeError(reason))
     assert diagnostic["error_stage"] == "delivery_report"
@@ -35,7 +37,7 @@ def test_report_shape_is_finite_and_never_a_generic_empty_response(shape, prefix
     assert diagnostic["error_code"] == "delivery_report." + shape
     assert diagnostic["retryable"] is False
     assert diagnostic["error_summary"] == report_reason(shape)
-    assert "压缩输入" not in diagnostic["suggested_action"]
+    assert "压缩输入" not in string_value(diagnostic["suggested_action"])
     if prefix:
         assert diagnostic["hybrid_child_mode"] == "direct"
     else:
@@ -46,7 +48,7 @@ def test_report_shape_is_finite_and_never_a_generic_empty_response(shape, prefix
 @pytest.mark.parametrize("shape", SHAPES)
 @pytest.mark.parametrize("prefix", ["", "hybrid direct failed: "])
 @pytest.mark.parametrize("requires_approval", [True, False])
-def test_report_failure_records_only_skipped_without_retry_or_approval(shape, prefix, requires_approval):
+def test_report_failure_records_only_skipped_without_retry_or_approval(shape: str, prefix: str, requires_approval: bool) -> None:
     run_id = uuid4()
     reason = report_reason(shape, prefix)
     diagnostic = runtime_failure_diagnostic_from_reason(reason)
@@ -85,7 +87,7 @@ def test_report_failure_records_only_skipped_without_retry_or_approval(shape, pr
     " (reason=json_only; Authorization: Bearer sk-private-key)",
     " (reason=json_only) private_provider_text",
 ])
-def test_report_suffix_only_projects_finite_allowlisted_fields(prefix, suffix):
+def test_report_suffix_only_projects_finite_allowlisted_fields(prefix: str, suffix: str) -> None:
     raw = prefix + BASE + suffix
     accepted = suffix == "(reason=json_only)"
     shape = "json_only" if accepted else "unknown"
@@ -100,7 +102,7 @@ def test_report_suffix_only_projects_finite_allowlisted_fields(prefix, suffix):
     assert "sk-private-key" not in json.dumps(diagnostic)
 
 
-def test_report_native_reason_cannot_be_replaced_by_retry_hint_payload():
+def test_report_native_reason_cannot_be_replaced_by_retry_hint_payload() -> None:
     run_id = uuid4()
     event = RunEvent(kind=EventKind.RUNTIME_FAILED, sequence=1, run_id=run_id,
         reason=report_reason("json_only"), payload={
@@ -117,7 +119,7 @@ def test_report_native_reason_cannot_be_replaced_by_retry_hint_payload():
 
 
 @pytest.mark.parametrize("uncertainty", ["payload", "model", "tool"])
-def test_unknown_outcome_wins_over_report_format_and_never_replays(uncertainty):
+def test_unknown_outcome_wins_over_report_format_and_never_replays(uncertainty: str) -> None:
     run_id = uuid4()
     events = [RunEvent(kind=EventKind.RUNTIME_FAILED, sequence=2, run_id=run_id,
                       reason=report_reason("json_only"))]
@@ -144,7 +146,7 @@ def test_unknown_outcome_wins_over_report_format_and_never_replays(uncertainty):
     ("model gateway failed: model transport failed (status=502)",
      "model_provider", "model.provider_unavailable", "capacity_pressure"),
 ])
-def test_nonreport_failure_keeps_existing_classification(reason, stage, code, category):
+def test_nonreport_failure_keeps_existing_classification(reason: str, stage: str, code: str, category: str) -> None:
     diagnostic = runtime_failure_diagnostic_from_reason(reason)
     assert diagnostic["error_stage"] == stage and diagnostic["error_code"] == code
     run_id = uuid4()
@@ -155,14 +157,14 @@ def test_nonreport_failure_keeps_existing_classification(reason, stage, code, ca
     assert decision is not None and decision.failure_category == category
 
 
-def test_transport_exception_is_not_inferred_as_received_report_from_its_text():
+def test_transport_exception_is_not_inferred_as_received_report_from_its_text() -> None:
     diagnostic = safe_runtime_failure_diagnostic(ModelTransportError(report_reason("json_only")))
     assert diagnostic["error_code"] != "delivery_report.json_only"
     assert diagnostic["error_stage"] == "model_provider"
 
 
 @pytest.mark.parametrize("requires_approval", [True, False])
-async def test_record_only_report_never_enters_service_enqueue_or_checkpoint_recovery(requires_approval):
+async def test_record_only_report_never_enters_service_enqueue_or_checkpoint_recovery(requires_approval: bool) -> None:
     run_id = uuid4()
     event = RunEvent(kind=EventKind.RUNTIME_FAILED, sequence=1, run_id=run_id,
                      reason=report_reason("json_only"))
@@ -171,11 +173,11 @@ async def test_record_only_report_never_enters_service_enqueue_or_checkpoint_rec
     assert decision is not None
     # The real service must return before it reads repository/checkpoint state,
     # creates an approval, accepts a repair, or enqueues another run.
-    class NoExecution:
-        def __getattr__(self, name):
+    class NoExecution(RunService):
+        def __getattribute__(self, name: str) -> Never:
             pytest.fail("report diagnostic attempted service work: " + name)
 
-    service = NoExecution()
+    service = object.__new__(NoExecution)
     assert await RunService._safe_project_repair_decision(
         service, tenant_id=uuid4(), run_id=run_id, decision=decision) == decision
     assert await RunService._safe_auto_accept_self_repair_if_allowed(

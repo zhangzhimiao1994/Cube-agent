@@ -12,7 +12,15 @@ from uuid import UUID
 import pytest
 
 from agent_hub.auth.models import Role
+from agent_hub.capabilities import review_contracts as review_api
 from agent_hub.capabilities.types import CapabilityRequest
+from tests.unit.models.review_admission_contract_typed_fixture import (
+    attempt_assignment,
+    object_array,
+    object_map,
+    raw_freeze,
+    string,
+)
 
 
 def contracts() -> ModuleType:
@@ -56,8 +64,8 @@ def request(**changes: object) -> CapabilityRequest:
     return CapabilityRequest.model_validate(payload)
 
 
-def freeze(req: CapabilityRequest | None = None, **changes: object):
-    bindings = {
+def freeze(req: CapabilityRequest | None = None, /, **changes: object) -> review_api.FrozenReviewAction:
+    bindings: dict[str, object] = {
         "role": Role.OPERATOR,
         "authorization_turn_id": TURN,
         "authorization_sha256": "b" * 64,
@@ -67,7 +75,8 @@ def freeze(req: CapabilityRequest | None = None, **changes: object):
         "normalized_effect": {"operation": "write", "target": "private-target"},
     }
     bindings.update(changes)
-    return contracts().freeze_review_action(req if req is not None else request(), **bindings)
+    assert contracts() is review_api
+    return raw_freeze(req if req is not None else request(), **bindings)
 
 
 def verdict_payload(**changes: object) -> dict[str, object]:
@@ -84,10 +93,11 @@ def verdict_payload(**changes: object) -> dict[str, object]:
 
 
 @pytest.mark.parametrize("payload", [None, {}, MappingProxyType({})])
-def test_legacy_configs_default_to_rules_without_io(payload, monkeypatch):
-    module = contracts()
+def test_legacy_configs_default_to_rules_without_io(payload: object, monkeypatch: pytest.MonkeyPatch) -> None:
+    module = review_api
+    assert contracts() is module
 
-    def forbidden(*args, **kwargs):
+    def forbidden(*args: object, **kwargs: object) -> None:
         raise AssertionError("codec attempted I/O")
 
     with monkeypatch.context() as patch:
@@ -103,13 +113,13 @@ def test_legacy_configs_default_to_rules_without_io(payload, monkeypatch):
         config.to_payload()["engine"] = "rules_then_model"
         assert config.engine == "rules"
     with pytest.raises(FrozenInstanceError):
-        config.engine = "rules_then_model"
+        attempt_assignment(config, "engine", "rules_then_model")
 
 
 @pytest.mark.parametrize("payload", [[], "rules", 0, False, {1: "private-value"}])
-def test_config_requires_object(payload):
+def test_config_requires_object(payload: object) -> None:
     with pytest.raises(ValueError):
-        contracts().ApprovalReviewConfig.from_payload(payload)
+        review_api.ApprovalReviewConfig.from_payload(payload)
 
 
 @pytest.mark.parametrize(
@@ -168,13 +178,13 @@ def test_config_requires_object(payload):
         {"fallback": "private-value"},
     ],
 )
-def test_reject_invalid_config_without_echoing_input(changes):
+def test_reject_invalid_config_without_echoing_input(changes: dict[str, object]) -> None:
     with pytest.raises(ValueError) as error:
-        contracts().ApprovalReviewConfig.from_payload(changes)
+        review_api.ApprovalReviewConfig.from_payload(changes)
     assert "private-value" not in str(error.value)
 
 
-def test_model_config_accepts_storage_bounds_without_enabling_provider():
+def test_model_config_accepts_storage_bounds_without_enabling_provider() -> None:
     payload = {
         "engine": "rules_then_model",
         "reviewer_logical_model": "0" + "a" * 127,
@@ -188,27 +198,27 @@ def test_model_config_accepts_storage_bounds_without_enabling_provider():
         "denial_breaker_denials": 1,
         "denial_breaker_window": 1,
     }
-    config = contracts().ApprovalReviewConfig.from_payload(payload)
+    config = review_api.ApprovalReviewConfig.from_payload(payload)
     assert config.to_payload() == {**DEFAULTS, **payload}
 
 
-def test_snapshot_isolates_all_nested_inputs_and_returns_fresh_copies():
+def test_snapshot_isolates_all_nested_inputs_and_returns_fresh_copies() -> None:
     req = request()
     source = {"entry": [{"text": "original"}]}
     effect = {"target": ["original"]}
     action = freeze(req, source_binding=source, normalized_effect=effect)
     before = action.to_payload()
     digest = action.action_digest
-    req.arguments["nested"][0]["text"] = "mutated"
+    object_map(object_array(req.arguments["nested"])[0])["text"] = "mutated"
     source["entry"][0]["text"] = "mutated"
     effect["target"].append("mutated")
     reconstructed = action.request()
     assert reconstructed == request()
     assert reconstructed is not req
-    reconstructed.arguments["nested"].append("mutated")
+    object_array(reconstructed.arguments["nested"]).append("mutated")
     payload = action.to_payload()
-    payload["request"]["arguments"]["nested"].append("mutated")
-    payload["source_binding"]["entry"].clear()
+    object_array(object_map(object_map(payload["request"])["arguments"])["nested"]).append("mutated")
+    object_array(object_map(payload["source_binding"])["entry"]).clear()
     assert action.to_payload() == before
     assert action.action_digest == digest
     assert action.request() == request()
@@ -216,10 +226,10 @@ def test_snapshot_isolates_all_nested_inputs_and_returns_fresh_copies():
     assert "private-source" not in repr(action)
     assert "private-target" not in repr(action)
     with pytest.raises(FrozenInstanceError):
-        action.action_digest = "e" * 64
+        attempt_assignment(action, "action_digest", "e" * 64)
 
 
-def test_immutable_mapping_and_tuple_inputs_are_json_snapshotted():
+def test_immutable_mapping_and_tuple_inputs_are_json_snapshotted() -> None:
     req = request()
     req.arguments["immutable"] = MappingProxyType({"tuple": (1, True, None, "中文")})
     action = freeze(
@@ -231,12 +241,12 @@ def test_immutable_mapping_and_tuple_inputs_are_json_snapshotted():
     assert action.to_payload()["normalized_effect"] == {"target": ["中文"]}
 
 
-def test_canonical_digest_is_bound_to_utf8_compact_sorted_payload():
+def test_canonical_digest_is_bound_to_utf8_compact_sorted_payload() -> None:
     action = freeze(normalized_effect={"z": "中文", "a": [1, False]})
     payload = action.to_payload()
     assert payload["role"] == "operator"
     assert payload["authorization_turn_id"] == str(TURN)
-    assert payload["request"]["tool_origin"] == "plugin"
+    assert object_map(payload["request"])["tool_origin"] == "plugin"
     unsigned = {k: v for k, v in payload.items() if k not in {"action_digest", "effect_digest"}}
     encoded = json.dumps(
         unsigned, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False
@@ -258,7 +268,7 @@ def test_canonical_digest_is_bound_to_utf8_compact_sorted_payload():
         {"normalized_effect": {"operation": "delete", "target": "private-target"}},
     ],
 )
-def test_action_digest_binds_every_review_context(changes):
+def test_action_digest_binds_every_review_context(changes: dict[str, object]) -> None:
     assert freeze(**changes).action_digest != freeze().action_digest
 
 
@@ -275,7 +285,7 @@ def test_action_digest_binds_every_review_context(changes):
         {"operation": "read"},
     ],
 )
-def test_action_binds_every_request_field_but_effect_uses_server_normalization(changes):
+def test_action_binds_every_request_field_but_effect_uses_server_normalization(changes: dict[str, object]) -> None:
     original = freeze()
     changed = freeze(request(**changes))
     assert changed.action_digest != original.action_digest
@@ -283,11 +293,11 @@ def test_action_binds_every_request_field_but_effect_uses_server_normalization(c
 
 
 @pytest.mark.parametrize("field", ["tenant_id", "user_id"])
-def test_effect_is_tenant_and_user_bound(field):
+def test_effect_is_tenant_and_user_bound(field: str) -> None:
     assert freeze(request(**{field: UUID(int=99)})).effect_digest != freeze().effect_digest
 
 
-def test_effect_binds_original_authorization_and_normalized_effect():
+def test_effect_binds_original_authorization_and_normalized_effect() -> None:
     original = freeze()
     assert freeze(authorization_turn_id=UUID(int=99)).effect_digest != original.effect_digest
     assert freeze(normalized_effect={"target": "elsewhere"}).effect_digest != original.effect_digest
@@ -295,7 +305,7 @@ def test_effect_binds_original_authorization_and_normalized_effect():
 
 
 class PrivateObject:
-    def __repr__(self):
+    def __repr__(self) -> str:
         return "private-value-never-echo"
 
 
@@ -312,7 +322,7 @@ class PrivateObject:
     ],
 )
 @pytest.mark.parametrize("location", ["arguments", "source_binding", "normalized_effect"])
-def test_reject_non_json_without_echoing_private_values(bad, location):
+def test_reject_non_json_without_echoing_private_values(bad: object, location: str) -> None:
     req = request()
     bindings = {}
     if location == "arguments":
@@ -336,13 +346,13 @@ def test_reject_non_json_without_echoing_private_values(bad, location):
         {"normalized_effect": []},
     ],
 )
-def test_snapshot_requires_typed_context_and_sha256(changes):
+def test_snapshot_requires_typed_context_and_sha256(changes: dict[str, object]) -> None:
     with pytest.raises(ValueError):
         freeze(**changes)
 
 
-def test_snapshot_rejects_cycles_without_echoing_values():
-    cycle = {"secret": "private-value-never-echo"}
+def test_snapshot_rejects_cycles_without_echoing_values() -> None:
+    cycle: dict[str, object] = {"secret": "private-value-never-echo"}
     cycle["cycle"] = cycle
     with pytest.raises(ValueError) as error:
         freeze(source_binding=cycle)
@@ -353,17 +363,17 @@ def test_snapshot_rejects_cycles_without_echoing_values():
     "decision,risk",
     [("allow", "low"), ("allow", "medium"), ("deny", "high"), ("needs_human", "unknown")],
 )
-def test_verdict_roundtrip_keeps_private_rationale_out_of_repr(decision, risk):
+def test_verdict_roundtrip_keeps_private_rationale_out_of_repr(decision: str, risk: str) -> None:
     payload = verdict_payload(decision=decision, risk=risk)
-    verdict = contracts().parse_model_review(json.dumps(payload), expected_action_digest=DIGEST)
+    verdict = review_api.parse_model_review(json.dumps(payload), expected_action_digest=DIGEST)
     assert verdict.to_payload() == payload
     assert verdict.decision == decision
     assert verdict.rationale == payload["rationale"]
-    assert payload["rationale"] not in repr(verdict)
+    assert string(payload["rationale"]) not in repr(verdict)
     verdict.to_payload()["decision"] = "deny"
     assert verdict.decision == decision
     with pytest.raises(FrozenInstanceError):
-        verdict.decision = "deny"
+        attempt_assignment(verdict, "decision", "deny")
 
 
 @pytest.mark.parametrize(
@@ -378,8 +388,8 @@ def test_verdict_roundtrip_keeps_private_rationale_out_of_repr(decision, risk):
         "policy_requires_human",
     ],
 )
-def test_verdict_accepts_only_documented_reason_vocabulary(reason):
-    verdict = contracts().parse_model_review(
+def test_verdict_accepts_only_documented_reason_vocabulary(reason: str) -> None:
+    verdict = review_api.parse_model_review(
         json.dumps(verdict_payload(decision="deny", reason_code=reason)),
         expected_action_digest=DIGEST,
     )
@@ -427,9 +437,9 @@ def test_verdict_accepts_only_documented_reason_vocabulary(reason):
         {"rationale": "https://user:private-value-never-echo@example.test"},
     ],
 )
-def test_verdict_rejects_invalid_and_secret_fields_without_echoing(changes):
+def test_verdict_rejects_invalid_and_secret_fields_without_echoing(changes: dict[str, object]) -> None:
     with pytest.raises(ValueError) as error:
-        contracts().parse_model_review(
+        review_api.parse_model_review(
             json.dumps(verdict_payload(**changes)), expected_action_digest=DIGEST
         )
     assert "private-value-never-echo" not in str(error.value)
@@ -438,11 +448,11 @@ def test_verdict_rejects_invalid_and_secret_fields_without_echoing(changes):
 
 @pytest.mark.parametrize("key", ["api_key", "password", "client_secret"])
 @pytest.mark.parametrize("quote", ['"', "'"])
-def test_verdict_rejects_quoted_credential_keys_without_echoing(key, quote):
+def test_verdict_rejects_quoted_credential_keys_without_echoing(key: str, quote: str) -> None:
     secret = "synthetic-review-secret"
     rationale = "{" + quote + key + quote + ": " + quote + secret + quote + "}"
     with pytest.raises(ValueError) as error:
-        contracts().parse_model_review(
+        review_api.parse_model_review(
             json.dumps(verdict_payload(rationale=rationale)), expected_action_digest=DIGEST
         )
     assert secret not in str(error.value)
@@ -460,16 +470,17 @@ def test_verdict_rejects_quoted_credential_keys_without_echoing(key, quote):
         '{"summary": "credential fields omitted"}',
     ],
 )
-def test_verdict_accepts_credential_field_mentions_without_assignment(rationale):
-    verdict = contracts().parse_model_review(
+def test_verdict_accepts_credential_field_mentions_without_assignment(rationale: str) -> None:
+    verdict = review_api.parse_model_review(
         json.dumps(verdict_payload(rationale=rationale)), expected_action_digest=DIGEST
     )
     assert verdict.rationale == rationale
 
 
 @pytest.mark.parametrize("field", list(verdict_payload()))
-def test_verdict_rejects_missing_and_duplicate_fields(field):
-    module = contracts()
+def test_verdict_rejects_missing_and_duplicate_fields(field: str) -> None:
+    module = review_api
+    assert contracts() is module
     payload = verdict_payload()
     del payload[field]
     with pytest.raises(ValueError):
@@ -483,15 +494,16 @@ def test_verdict_rejects_missing_and_duplicate_fields(field):
 
 
 @pytest.mark.parametrize("wrapper", ["```json\n{}\n```", "{} trailing", "{}{}", "[{}]"])
-def test_verdict_rejects_non_object_or_wrapped_output(wrapper):
+def test_verdict_rejects_non_object_or_wrapped_output(wrapper: str) -> None:
     with pytest.raises(ValueError):
-        contracts().parse_model_review(
+        review_api.parse_model_review(
             wrapper.replace("{}", json.dumps(verdict_payload())), expected_action_digest=DIGEST
         )
 
 
-def test_verdict_enforces_utf8_byte_limit_and_rationale_character_limit():
-    module = contracts()
+def test_verdict_enforces_utf8_byte_limit_and_rationale_character_limit() -> None:
+    module = review_api
+    assert contracts() is module
     valid = json.dumps(verdict_payload(rationale="中" * 240), ensure_ascii=False)
     assert module.parse_model_review(valid, expected_action_digest=DIGEST).rationale == "中" * 240
     exact_limit = valid + " " * (8192 - len(valid.encode("utf-8")))
