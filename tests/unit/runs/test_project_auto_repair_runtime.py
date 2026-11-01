@@ -444,6 +444,24 @@ class BoundaryFailure:
                        reason='project repair boundary failure')
 
 
+def _assert_boundary_queued(result: SubmittedRun, repo: ContinuationRepository) -> None:
+    checkpoint = repo._checkpoint
+    state = {} if checkpoint is None else checkpoint.state
+    assert result.status is RunStatus.QUEUED, {
+        'status': result.status,
+        'continuation_errors': tuple(repo.continuation_errors),
+        'events': tuple((event.kind, event.reason) for event in repo.event_log[-8:]),
+        'terminal': state.get('terminal'),
+        'remaining_timeout_seconds': state.get('remaining_timeout_seconds'),
+        'remaining_absolute_timeout_seconds': state.get('remaining_absolute_timeout_seconds'),
+        'models': tuple(mapping(row).get('status') for row in sequence(state.get('model_ledger', ()))),
+        'tools': tuple((mapping(row).get('name'), mapping(row).get('status'))
+                       for row in sequence(state.get('tool_ledger', ()))),
+        'writes': repo.journey.write_count,
+        'verifications': repo.journey.verify_count,
+    }
+
+
 @pytest.mark.asyncio
 async def test_real_runtime_service_repository_continue_without_replaying_old_effects() -> None:
     journey = ProjectJourney()
@@ -1335,9 +1353,9 @@ async def _active_approval_fixture(journey: ApprovalProjectJourney | None = None
     repo = ContinuationRepository(journey)
     runtime = BoundaryFailure(journey)
     service = RunService(repo, runtime_registry=RuntimeRegistry((runtime,)), router=None, task_queue=UnexpectedTaskQueue())
-    assert (await service.execute(repo.run_id)).status is RunStatus.QUEUED
+    _assert_boundary_queued(await service.execute(repo.run_id), repo)
     runtime.second_fault = 'after_write'
-    assert (await service.execute(repo.run_id)).status is RunStatus.QUEUED
+    _assert_boundary_queued(await service.execute(repo.run_id), repo)
     source = repo.checkpoint
     journey.context = journey.context.model_copy(update={
         'checkpoint': source, 'routing_decision': dict(present(mapping(repo.row.routing_decision)))})
@@ -1855,9 +1873,9 @@ async def test_episode_transaction_refuses_replay_or_changed_authority(defect: s
     repo = ContinuationRepository(journey)
     runtime = BoundaryFailure(journey)
     service = RunService(repo, runtime_registry=RuntimeRegistry((runtime,)), router=None, task_queue=UnexpectedTaskQueue())
-    assert (await service.execute(repo.run_id)).status is RunStatus.QUEUED
+    _assert_boundary_queued(await service.execute(repo.run_id), repo)
     runtime.second_fault = 'after_write'
-    assert (await service.execute(repo.run_id)).status is RunStatus.QUEUED
+    _assert_boundary_queued(await service.execute(repo.run_id), repo)
     repo.row.status = RunStatus.FAILED.value
     route = dict(present(mapping(repo.row.routing_decision)))
     if defect != 'consumed':
@@ -1954,16 +1972,17 @@ async def test_sqlite_transaction_uses_real_private_write_ownership_and_sql_pred
 
     journey = ProjectJourney()
     fake = ContinuationRepository(journey)
-    journey.strict_soft = True
+    # This checks SQL ownership predicates, not subsecond scheduler admission.
+    # The dedicated strict-soft recovery test keeps the real 0.25s boundary.
     runtime = BoundaryFailure(journey)
     service = RunService(fake, runtime_registry=RuntimeRegistry((runtime,)), router=None, task_queue=UnexpectedTaskQueue())
-    assert (await service.execute(fake.run_id)).status is RunStatus.QUEUED
+    _assert_boundary_queued(await service.execute(fake.run_id), fake)
     runtime.second_fault = 'after_write'
-    await service.execute(fake.run_id)
+    _assert_boundary_queued(await service.execute(fake.run_id), fake)
     route = dict(present(mapping(fake.row.routing_decision)))
     if late_bundle:
         runtime.second_fault = 'after_bundle'
-        assert (await service.execute(fake.run_id)).status is RunStatus.QUEUED
+        _assert_boundary_queued(await service.execute(fake.run_id), fake)
     else:
         route.pop('self_repair_episode_progress')
     checkpoint = fake.checkpoint
