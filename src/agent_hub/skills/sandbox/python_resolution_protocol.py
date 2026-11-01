@@ -161,13 +161,19 @@ class ResolutionClaim(_Strict):
         return self
 
     @property
+    def task_deadline(self) -> float:
+        """Immutable task budget; this alone never establishes live lease authority."""
+        now = datetime.now(UTC)
+        remaining = (self.original_deadline - now).total_seconds()
+        value = min(self.monotonic_deadline, time.monotonic() + remaining)
+        need(value > time.monotonic(), "resolution_deadline")
+        return value
+
+    @property
     def deadline(self) -> float:
         now = datetime.now(UTC)
-        remaining = min(
-            (self.lease_expires_at - now).total_seconds(),
-            (self.original_deadline - now).total_seconds(),
-        )
-        value = min(self.monotonic_deadline, time.monotonic() + remaining)
+        value = min(self.task_deadline,
+            time.monotonic() + (self.lease_expires_at - now).total_seconds())
         need(value > time.monotonic(), "resolution_deadline")
         return value
 
@@ -260,7 +266,7 @@ class ResolutionPlan(_Strict):
 
 
 class ResolutionStatus(_Strict):
-    state: Literal["absent", "unknown", "resolved", "frozen", "published"]
+    state: Literal["absent", "unknown", "resolved", "frozen", "published", "lease_renewed"]
     key: str = Field(pattern="^[a-f0-9]{64}$")
     descriptor: dict[str, object] | None = None
     plan: ResolutionPlan | None = None
@@ -273,6 +279,7 @@ class ResolutionRequest(_Strict):
         "freeze_python_resolution",
         "publish_python_resolution",
         "inspect_python_resolution",
+        "renew_python_resolution",
     ]
     claim: ResolutionClaim
     requirements: tuple[tuple[str, str], ...]

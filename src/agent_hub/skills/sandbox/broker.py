@@ -699,6 +699,7 @@ async def _serve_client(
             or isinstance(envelope.get('action'), str) and envelope['action'] in {
                 'resolve_python_inputs', 'freeze_python_resolution',
                 'publish_python_resolution', 'inspect_python_resolution',
+                'renew_python_resolution',
             }
         ):
             is_resolution = True

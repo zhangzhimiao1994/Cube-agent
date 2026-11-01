@@ -2,14 +2,19 @@
 
 import asyncio
 import importlib
+import re
+import stat
+import sys
 from contextvars import ContextVar
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 
 import pytest
 
 from agent_hub.skills.sandbox.base import SkillResult
 from agent_hub.skills.sandbox.project import ProjectExecutionBroker
+from agent_hub.skills.sandbox.python_resolution_protocol import ResolutionRequest, ResolutionStatus
+from agent_hub.skills.sandbox.python_resolution_store import ResolutionLeaseWitness
 from agent_hub.subprocess_cleanup import ProcessCleanupIncomplete
 from tests.unit.skills import test_python_registry_fetch as fetch_tests
 
@@ -33,9 +38,38 @@ async def process_case(network_case, monkeypatch):
         def chmod(self, *args, **kwargs):
             pass
 
+        def is_absolute(self):
+            return PurePosixPath(self.as_posix()).is_absolute()
+
     c.stage = Stage(
         c.root.stage_root / (c.request.claim.planning.invocation.execution_id + "-abcdefgh")
     )
+    # Model the actual private stage, not a replacement witness implementation.
+    # Permanent supply-state IO retains the existing simulator's stricter guards.
+    stage_path = c.stage.as_posix()
+    for path in (*reversed(PurePosixPath(stage_path).parents), PurePosixPath(stage_path)):
+        if path.as_posix() not in c.fs.nodes:
+            c.fs.add(path.as_posix(), stat.S_IFDIR | 0o700)
+    original_flock, original_unlink = c.fs.flock, c.fs.unlink
+
+    def flock(fd, flags):
+        if c.fs.fds[fd][1] != stage_path:
+            return original_flock(fd, flags)
+        assert flags in {5, 6}
+        c.fs.locks[fd] = flags & 3
+
+    def unlink(name, *, dir_fd):
+        if c.fs.fds[dir_fd][1] != stage_path:
+            return original_unlink(name, dir_fd=dir_fd)
+        assert re.fullmatch(r"[.]resolution-lease-[a-f0-9]{32}", name)
+        assert c.fs.locks.get(dir_fd) == 2
+        node = c.fs.nodes.pop(c.fs.path(name, dir_fd))
+        node.nlink -= 1
+        node.ctime += 1
+
+    monkeypatch.setattr(sys.modules["fcntl"], "flock", flock)
+    monkeypatch.setattr(c.fs, "unlink", unlink)
+    c.fs.supports_dir_fd = c.fs.supports_dir_fd | {unlink}
 
     async def admit(manager, job):
         c.root_events.append(("admit", job.unit))
@@ -87,7 +121,8 @@ async def process_case(network_case, monkeypatch):
         try:
             try:
                 status = await c.worker.execute_resolution(
-                    c.staged, policy=c.policy, root=c.root, supply=c.supply
+                    c.staged, policy=c.policy, root=c.root, supply=c.supply,
+                    lease_witness=ResolutionLeaseWitness(c.stage, c.staged),
                 )
                 return SkillResult(
                     exit_code=0, stdout=status.model_dump_json(), stderr="", timed_out=False
@@ -119,9 +154,34 @@ async def process_case(network_case, monkeypatch):
     return c
 
 
+async def handle_bounded(c: SimpleNamespace, request: ResolutionRequest | None = None) -> ResolutionStatus:
+    result = await asyncio.wait_for(c.worker.handle_resolution(c.manager,
+        c.request if request is None else request, peer_uid=c.policy.allowed_uid), 30)
+    assert isinstance(result, ResolutionStatus)
+    return result
+
+
+async def require_entered(task: asyncio.Task[ResolutionStatus], entered: asyncio.Event) -> None:
+    waiter = asyncio.create_task(entered.wait())
+    try:
+        await asyncio.wait({task, waiter}, timeout=2, return_when=asyncio.FIRST_COMPLETED)
+        if not entered.is_set():
+            if task.done():
+                result = await task
+                raise AssertionError("fetch never entered; early broker result: " + result.state)
+            raise AssertionError("fetch entry wait exceeded 2 seconds")
+    except BaseException:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        raise
+    finally:
+        waiter.cancel()
+        await asyncio.gather(waiter, return_exceptions=True)
+
+
 async def test_readonly_af_unix_broker_delegates_writes_to_exact_root_unit(process_case):
     c = process_case
-    status = await c.worker.handle_resolution(c.manager, c.request, peer_uid=c.policy.allowed_uid)
+    status = await handle_bounded(c)
     assert status.state == "resolved"
     assert any(p[0] == "root-spawn" for p in c.root_events) and not c.root_dns
     assert len([p for p in c.root_events if p[0] == "kill"]) == 2
@@ -161,19 +221,11 @@ async def test_actual_controller_resolver_fetch_preserves_uncertain_cleanup(
         )
     before = set(asyncio.all_tasks())
     task = asyncio.create_task(
-        c.worker.handle_resolution(c.manager, request, peer_uid=c.policy.allowed_uid)
+        handle_bounded(c, request)
     )
     if failure == "cancel":
-        waiter = asyncio.create_task(c.entered.wait())
-        try:
-            await asyncio.wait({task, waiter}, timeout=1, return_when=asyncio.FIRST_COMPLETED)
-            if not c.entered.is_set():
-                await task
-                raise AssertionError("native execution never entered fetch")
-            task.cancel()
-        finally:
-            waiter.cancel()
-            await asyncio.gather(waiter, return_exceptions=True)
+        await require_entered(task, c.entered)
+        task.cancel()
     result = await task
     job = c.manager.executions[request.claim.planning.invocation.execution_id]
     assert result.state == "unknown" and job.finished.is_set()
@@ -207,13 +259,11 @@ async def test_existing_execution_registry_owns_v11_and_rejects_duplicate_id(
 
     monkeypatch.setattr(c.worker, "fetch_catalog_wheels", hold)
     first = asyncio.create_task(
-        c.worker.handle_resolution(c.manager, c.request, peer_uid=c.policy.allowed_uid)
+        handle_bounded(c)
     )
-    await asyncio.wait_for(entered.wait(), 1)
+    await require_entered(first, entered)
     try:
-        second = await c.worker.handle_resolution(
-            c.manager, c.request, peer_uid=c.policy.allowed_uid
-        )
+        second = await handle_bounded(c)
         assert second.state == "unknown"
         assert len([r for r in c.root_events if r[0] == "root-spawn"]) == 1
     finally:
@@ -236,7 +286,7 @@ async def test_uncertain_native_drain_keeps_slot_and_returns_inspect_only(
         )
 
     monkeypatch.setattr(api, "run_subprocess_with_limits", exit3)
-    result = await c.worker.handle_resolution(c.manager, c.request, peer_uid=c.policy.allowed_uid)
+    result = await handle_bounded(c)
     job = c.manager.executions[c.request.invocation.execution_id]
     assert result.state == "unknown" and job.finished.is_set() and not job.quiet
     assert job.slot_acquired and c.manager.slots.locked()

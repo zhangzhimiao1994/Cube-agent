@@ -7,6 +7,7 @@ import json
 import os
 import sys
 import tempfile
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -34,7 +35,12 @@ from agent_hub.skills.sandbox.python_metadata_preparation_worker import error_co
 from agent_hub.skills.sandbox.python_project_backend import read_root_configuration
 from agent_hub.skills.sandbox.python_project_broker import PythonRootExecution, _admit_unit
 from agent_hub.skills.sandbox.python_project_profile import PythonProjectProfileScope
-from agent_hub.skills.sandbox.python_resolution_protocol import ResolutionRequest, ResolutionStatus
+from agent_hub.skills.sandbox.python_resolution_protocol import (
+    ResolutionClaim,
+    ResolutionRequest,
+    ResolutionStatus,
+)
+from agent_hub.skills.sandbox.python_resolution_store import ResolutionLeaseWitness
 from agent_hub.subprocess_cleanup import ProcessCleanupIncomplete
 
 if TYPE_CHECKING:
@@ -47,8 +53,66 @@ class _MetadataPreparationExecution(_Execution):
     """Identify live v10 work without attributing another protocol's unit to it."""
 
 
+@dataclass
 class _ResolutionPreparationExecution(_Execution):
     """v11 uses the same constrained Root/write and non-Root fetch lifetime."""
+
+    original_request: ResolutionRequest | None = None
+    current_claim: ResolutionClaim | None = None
+    lease_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    witness: ResolutionLeaseWitness | None = None
+    lease_closed: bool = False
+    lease_timeout: asyncio.Timeout | None = None
+    task_bound: float | None = None
+
+    def __post_init__(self) -> None:
+        if self.original_request is not None:
+            self.current_claim = self.original_request.claim
+
+
+async def _renew_resolution(
+    broker: ProjectExecutionBroker, request: ResolutionRequest,
+) -> ResolutionStatus:
+    """Update one already-live job, never admission, slots, intent or execution."""
+    denied = ResolutionStatus(state="unknown", key=request.key)
+    job = broker.executions.get(request.invocation.execution_id)
+    if type(job) is not _ResolutionPreparationExecution:
+        return denied
+    async with job.lease_lock:
+        original, previous = job.original_request, job.current_claim
+        if (original is None or previous is None or job.lease_closed
+            or job.finished.is_set() or job.task is None or job.task.done()
+            or job.task.cancelling()
+            or broker.executions.get(request.invocation.execution_id) is not job
+            or request.invocation.execution_id in broker._cancelled_ids):
+            return denied
+        # The renewal action is the only normalized field. Even planning transport
+        # IDs and timeouts must equal the admitted immutable request exactly.
+        if request.model_copy(update={"action": original.action, "claim": original.claim}) != original:
+            return denied
+        ResolutionLeaseWitness.require_renewal(previous, request.claim)
+        if request.claim.planning != original.claim.planning:
+            return denied
+        timer = job.lease_timeout
+        if timer is not None:
+            # Rescheduling the existing timeout verifies that its original owner
+            # scope is still entered; a finished/expiring scope cannot restart.
+            if timer.expired() or job.task_bound is None:
+                return denied
+            when = timer.when()
+            if when is None or asyncio.get_running_loop().time() >= when:
+                return denied
+            timer.reschedule(when)
+        if job.stage is not None:
+            if job.witness is None:
+                return denied
+            job.witness.renew(previous, request.claim)
+        if timer is not None:
+            assert job.task_bound is not None
+            ResolutionLeaseWitness.require_renewal(previous, request.claim)
+            timer.reschedule(min(job.task_bound, request.claim.deadline))
+        job.current_claim = request.claim
+        return ResolutionStatus(state="lease_renewed", key=original.key)
 
 
 def build_metadata_preparation_root_command(
@@ -123,13 +187,20 @@ async def _handle_preparation(
         except (ValueError, TypeError, AttributeError, RecursionError):
             return failure("metadata_prepare_request_invalid")
         invocation = ProjectInvocation.model_validate(vars(request.invocation), strict=True)
+        if isinstance(request, ResolutionRequest) and request.action == "renew_python_resolution":
+            return await _renew_resolution(broker, request)
+        if isinstance(request, ResolutionRequest):
+            _ = request.claim.deadline
         key = invocation.execution_id
         if key in broker.executions or key in broker._cancelled_ids or broker._retained(key):
             return failure("metadata_prepare_consumed")
         configuration, supply = read_root_configuration(), read_supply_configuration()
         validate_configuration(broker.policy, configuration, supply)
-        execution_type = _ResolutionPreparationExecution if resolution else _MetadataPreparationExecution
-        job = execution_type(invocation, asyncio.current_task())
+        if isinstance(request, ResolutionRequest):
+            _ = request.claim.deadline
+        job: _Execution = (_ResolutionPreparationExecution(invocation, asyncio.current_task(),
+            original_request=request) if isinstance(request, ResolutionRequest)
+            else _MetadataPreparationExecution(invocation, asyncio.current_task()))
         helper = PythonRootExecution(invocation, job.task)
         broker.executions[key] = job
         stopping: asyncio.Task[None] | None = None
@@ -161,6 +232,9 @@ async def _handle_preparation(
 
         async def finish() -> None:
             try:
+                if isinstance(job, _ResolutionPreparationExecution):
+                    async with job.lease_lock:
+                        job.lease_closed = True
                 await stop_units()
                 if native_uncertain:
                     raise ProcessCleanupIncomplete("metadata_prepare_cleanup_incomplete")
@@ -182,17 +256,34 @@ async def _handle_preparation(
         try:
             deadline = asyncio.get_running_loop().time() + invocation.timeout_seconds
             if isinstance(request, ResolutionRequest):
-                deadline = min(deadline, request.claim.deadline)
-            async with asyncio.timeout_at(deadline):
+                deadline = min(deadline, request.claim.task_deadline)
+            async with asyncio.timeout_at(deadline), asyncio.timeout(None) as lease_timeout:
+                if isinstance(job, _ResolutionPreparationExecution):
+                    async with job.lease_lock:
+                        assert job.current_claim is not None
+                        job.task_bound = deadline
+                        job.lease_timeout = lease_timeout
+                        lease_timeout.reschedule(min(deadline, job.current_claim.deadline))
                 await broker.slots.acquire()
                 job.slot_acquired = True
                 await _admit_unit(broker, helper)
                 await _admit_unit(broker, job)
                 _private_project_runtime(configuration.stage_root)
-                job.stage = Path(tempfile.mkdtemp(prefix=key + "-", dir=configuration.stage_root))
-                job.stage.chmod(0o700)
-                broker._metadata(job, "STAGED")
-                _write_request(job.stage, request)
+                if isinstance(job, _ResolutionPreparationExecution):
+                    async with job.lease_lock:
+                        assert job.current_claim is not None and job.original_request is not None
+                        _ = job.current_claim.deadline
+                        job.stage = Path(tempfile.mkdtemp(prefix=key + "-", dir=configuration.stage_root))
+                        job.stage.chmod(0o700)
+                        broker._metadata(job, "STAGED")
+                        _write_request(job.stage, request)
+                        job.witness = ResolutionLeaseWitness(job.stage, job.original_request)
+                        job.witness.initialize(job.current_claim)
+                else:
+                    job.stage = Path(tempfile.mkdtemp(prefix=key + "-", dir=configuration.stage_root))
+                    job.stage.chmod(0o700)
+                    broker._metadata(job, "STAGED")
+                    _write_request(job.stage, request)
                 command = build_metadata_preparation_root_command(invocation, broker.policy,
                     configuration=configuration, supply=supply, stage=job.stage)
                 if resolution:

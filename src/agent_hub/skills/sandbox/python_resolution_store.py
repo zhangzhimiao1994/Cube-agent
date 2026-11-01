@@ -3,14 +3,20 @@
 from __future__ import annotations
 
 import os
+import secrets
 import sys
 import time
 from contextlib import ExitStack
 from dataclasses import replace
+from pathlib import Path
 from typing import Literal, cast
 
 from agent_hub.skills.sandbox import python_dependency_index_store as files
-from agent_hub.skills.sandbox.python_input_supply_catalog import RootSupplyConfig
+from agent_hub.skills.sandbox.python_input_supply_catalog import (
+    RootSupplyConfig,
+    _directory,
+    _stamp,
+)
 from agent_hub.skills.sandbox.python_input_supply_worker import _once
 from agent_hub.skills.sandbox.python_registry_protocol import (
     ResolutionDescriptor,
@@ -22,12 +28,140 @@ from agent_hub.skills.sandbox.python_resolution_protocol import (
     MAX_CONTROL,
     ResolutionClaim,
     ResolutionPlan,
+    ResolutionRequest,
     ResolutionStatus,
     decode,
     decode_descriptor,
     encoded,
     resolution_key,
 )
+
+_LEASE_READ_SECONDS = 0.25
+
+
+class ResolutionLeaseWitness:
+    """Root-private, replaceable lease evidence; permanent once records never change."""
+
+    name = "resolution-lease.json"
+
+    def __init__(self, stage: Path, original: ResolutionRequest) -> None:
+        need(stage.is_absolute() and ".." not in stage.parts, "resolution_scope_changed")
+        self.stage = stage
+        self.original = ResolutionRequest.model_validate(original, strict=True)
+        self._stage_identity: tuple[int, ...] | None = None
+        self._seen: ResolutionClaim | None = None
+
+    @staticmethod
+    def require_renewal(previous: ResolutionClaim, current: ResolutionClaim) -> None:
+        # In particular, DB renew success must never revive an expired Root witness.
+        _ = previous.deadline
+        current.require_continuity(previous)
+        need(current.planning == previous.planning, "resolution_scope_changed")
+        need(current.original_deadline == previous.original_deadline, "resolution_deadline")
+
+    def _claim(self, current: ResolutionClaim) -> None:
+        current.require_continuity(self.original.claim)
+        need(current.planning == self.original.claim.planning, "resolution_scope_changed")
+        if self._seen is not None:
+            need(current.monotonic_deadline <= self._seen.monotonic_deadline
+                and current.lease_expires_at >= self._seen.lease_expires_at,
+                "resolution_scope_changed")
+
+    def _parent(self, stack: ExitStack, *, exclusive: bool, deadline: float
+        ) -> tuple[int, list[tuple[int, str, int, tuple[int, ...]]]]:
+        files._native()
+        pins: list[tuple[int, str, int, tuple[int, ...]]] = []
+        parent = _directory(self.stage, stack, pins)
+        files._private_state(parent)
+        # Private stage cannot be replaced or mounted over while this object lives.
+        identity = _stamp(os.fstat(parent))[:5]
+        need(self._stage_identity in {None, identity}, "resolution_scope_changed")
+        need(all(os.fstat(p).st_dev == os.fstat(c).st_dev for p, _, c, _ in pins),
+            "resolution_scope_changed")
+        self._stage_identity = identity
+        files._directories(pins, deadline)
+        files._lock(parent, exclusive=exclusive, deadline=deadline)
+        files._directories(pins, deadline)
+        return parent, pins
+
+    def _read(self, parent: int, stack: ExitStack, deadline: float
+        ) -> tuple[ResolutionClaim, files._FilePin]:
+        raw, pin = files._read_file(parent, self.name, MAX_CONTROL, stack, deadline)
+        value = decode(raw)
+        need(type(value) is dict, "resolution_scope_changed")
+        item = cast(dict[str, object], value)
+        need(set(item) == {"schema_version", "request_sha256", "key", "claim"}
+            and type(item["schema_version"]) is int and item["schema_version"] == 1
+            and item["request_sha256"] == digest(self.original.model_dump(mode="json"))
+            and item["key"] == self.original.key, "resolution_scope_changed")
+        current = ResolutionClaim.model_validate_json(encoded(item["claim"]), strict=True)
+        self._claim(current)
+        pin.check()
+        return current, pin
+
+    def _write(self, current: ResolutionClaim, previous: ResolutionClaim | None) -> None:
+        if sys.platform != "linux":
+            raise ValueError("resolution_unavailable")
+        self._claim(current)
+        deadline = current.deadline if previous is None else min(previous.deadline, current.deadline)
+        raw = encoded({"schema_version": 1, "request_sha256": digest(self.original.model_dump(mode="json")),
+            "key": self.original.key, "claim": current.model_dump(mode="json")})
+        need(0 < len(raw) <= MAX_CONTROL)
+        with ExitStack() as stack:
+            parent, pins = self._parent(stack, exclusive=True, deadline=deadline)
+            old_pin: files._FilePin | None = None
+            if previous is not None:
+                stored, old_pin = self._read(parent, stack, deadline)
+                need(stored == previous, "resolution_scope_changed")
+            temp = ".resolution-lease-" + secrets.token_hex(16)
+            fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                0o600, dir_fd=parent)
+            stack.callback(os.close, fd)
+            os.fchmod(fd, 0o600)
+            offset = 0
+            while offset < len(raw):
+                files._directories(pins, deadline)
+                count = os.write(fd, raw[offset:offset + 65536])
+                need(count > 0)
+                offset += count
+            os.fsync(fd)
+            identity = _stamp(os.fstat(fd))
+            need(identity == _stamp(os.stat(temp, dir_fd=parent, follow_symlinks=False)))
+            files._directories(pins, deadline)
+            if previous is None:
+                os.link(temp, self.name, src_dir_fd=parent, dst_dir_fd=parent, follow_symlinks=False)
+                os.unlink(temp, dir_fd=parent)
+            else:
+                assert old_pin is not None
+                old_pin.check()
+                self.require_renewal(previous, current)
+                os.replace(temp, self.name, src_dir_fd=parent, dst_dir_fd=parent)
+            os.fsync(parent)
+            files._directories(pins, deadline)
+            checked, pin = self._read(parent, stack, deadline)
+            need(checked == current and os.fstat(pin.descriptor).st_ino == os.fstat(fd).st_ino,
+                "resolution_scope_changed")
+            self._seen = current
+
+    def initialize(self, current: ResolutionClaim | None = None) -> None:
+        self._write(self.original.claim if current is None else current, None)
+
+    def renew(self, previous: ResolutionClaim, current: ResolutionClaim) -> None:
+        self.require_renewal(previous, current)
+        self._write(current, previous)
+
+    def current(self) -> ResolutionClaim:
+        # An old request lease may have expired before a genuine renewed witness
+        # is read. Bound IO independently so flock cannot stall its watchdog for
+        # the full task budget; this does not extend either lease or task time.
+        deadline = min(self.original.claim.task_deadline, time.monotonic() + _LEASE_READ_SECONDS)
+        with ExitStack() as stack:
+            parent, pins = self._parent(stack, exclusive=False, deadline=deadline)
+            current, pin = self._read(parent, stack, deadline)
+            files._directories(pins, deadline)
+            pin.check()
+            self._seen = current
+            return current
 
 
 def overlay_supply(base: RootSupplyConfig, descriptor: ResolutionDescriptor) -> RootSupplyConfig:

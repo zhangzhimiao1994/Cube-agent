@@ -245,8 +245,26 @@ class PythonResolutionPreparation:
             transport = request_resolution
         else:
             transport = self.transport
-        async with asyncio.timeout_at(current.deadline):
-            response = await transport(request)
+        from agent_hub.skills.sandbox.python_resolution_worker import _await_resolution_with_renewal
+
+        async def refresh() -> ResolutionClaim:
+            # Stay in the original authority-owning task. Refreshing routing
+            # never permits adopting another worker, token or approval scope.
+            fresh = await self._claim(planning)
+            fresh.require_continuity(current)
+            need(fresh.planning == planning, "resolution_source_changed")
+            if action in {"resolve_python_inputs", "publish_python_resolution"}:
+                assert self.approved is not None
+                if await self.approved(action_request) is not True:
+                    raise ResolutionApprovalRequired(action_request)
+                fresh = await self._claim(planning)
+                fresh.require_continuity(current)
+                need(fresh.planning == planning, "resolution_source_changed")
+            return fresh.model_copy(update={"planning": transport_planning})
+
+        async with asyncio.timeout_at(current.task_deadline):
+            response = await _await_resolution_with_renewal(request,
+                operation=transport(request), refresh=refresh, renew=transport)
             need(
                 type(response) is ResolutionStatus and response.key == request.key,
                 "resolution_response_invalid",

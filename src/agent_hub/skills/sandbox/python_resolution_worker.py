@@ -6,6 +6,7 @@ import asyncio
 import shutil
 import sys
 import time
+from collections.abc import Awaitable, Callable
 from contextlib import ExitStack
 from dataclasses import replace
 from typing import TYPE_CHECKING
@@ -41,12 +42,17 @@ from agent_hub.skills.sandbox.python_registry_protocol import (
 )
 from agent_hub.skills.sandbox.python_resolution_protocol import (
     MAX_CONTROL,
+    ResolutionClaim,
     ResolutionRequest,
     ResolutionStatus,
     decode,
     decode_descriptor,
 )
-from agent_hub.skills.sandbox.python_resolution_store import ResolutionStore, overlay_supply
+from agent_hub.skills.sandbox.python_resolution_store import (
+    ResolutionLeaseWitness,
+    ResolutionStore,
+    overlay_supply,
+)
 from agent_hub.subprocess_cleanup import ProcessCleanupIncomplete
 
 if TYPE_CHECKING:
@@ -60,8 +66,16 @@ async def _context(
     root: RootConfig,
     supply: RootSupplyConfig,
     deadline: float,
+    *,
+    current_claim: Callable[[], ResolutionClaim] | None = None,
 ) -> None:
-    need(time.monotonic() < min(deadline, request.claim.deadline), "resolution_deadline")
+    def check_lease() -> None:
+        live = request.claim if current_claim is None else current_claim()
+        live.require_continuity(request.claim)
+        need(live.planning == request.claim.planning, "resolution_scope_changed")
+        need(time.monotonic() < min(deadline, live.deadline), "resolution_deadline")
+
+    check_lease()
     need(
         digest(read_root_configuration().to_payload())
         == digest(root.to_payload())
@@ -81,7 +95,7 @@ async def _context(
         and "linux_" + env["platform_machine"] == root.interpreter.platform,
         "resolution_environment_changed",
     )
-    need(time.monotonic() < min(deadline, request.claim.deadline), "resolution_deadline")
+    check_lease()
     need(
         digest(read_root_configuration().to_payload())
         == request.claim.planning.expected_root_config_sha256
@@ -121,7 +135,20 @@ async def _fetch(
 
 
 async def execute_resolution(
-    request: ResolutionRequest, *, policy: BrokerPolicy, root: RootConfig, supply: RootSupplyConfig
+    request: ResolutionRequest, *, policy: BrokerPolicy, root: RootConfig, supply: RootSupplyConfig,
+    lease_witness: ResolutionLeaseWitness | None = None,
+) -> ResolutionStatus:
+    if lease_witness is None:
+        # Non-renewing callers retain the original short lease bound.
+        return await _execute_resolution(request, policy=policy, root=root, supply=supply)
+    return await _await_resolution_with_root_lease(request,
+        operation=_execute_resolution(request, policy=policy, root=root, supply=supply,
+            current_claim=lease_witness.current), current=lease_witness.current)
+
+
+async def _execute_resolution(
+    request: ResolutionRequest, *, policy: BrokerPolicy, root: RootConfig, supply: RootSupplyConfig,
+    current_claim: Callable[[], ResolutionClaim] | None = None,
 ) -> ResolutionStatus:
     """Root peer validation is done by handle_resolution; all persisted data is re-read.
 
@@ -132,8 +159,19 @@ async def execute_resolution(
     index_store._native()
     request = ResolutionRequest.model_validate(request, strict=True)
     root, supply = replace(root), replace(supply)
-    deadline = request.claim.deadline
-    await _context(request, policy, root, supply, deadline)
+    deadline = request.claim.deadline if current_claim is None else request.claim.task_deadline
+
+    def active() -> ResolutionRequest:
+        nonlocal request
+        if current_claim is not None:
+            current = current_claim()
+            current.require_continuity(request.claim)
+            need(current.planning == request.claim.planning, "resolution_scope_changed")
+            request = request.model_copy(update={"claim": current})
+        return request
+
+    live_claim = None if current_claim is None else lambda: active().claim
+    await _context(active(), policy, root, supply, deadline, current_claim=live_claim)
     store = ResolutionStore(supply)
     status = store.inspect(request.key, request.claim)
     if request.action == "inspect_python_resolution":
@@ -160,9 +198,9 @@ async def execute_resolution(
         # A durable intent exists before even the first registry read. Every error
         # leaves UNKNOWN; a new execution id or changed source cannot replay it.
         async def content(entry: WheelDownload) -> bytes:
-            await _context(request, policy, root, supply, deadline)
+            await _context(active(), policy, root, supply, deadline, current_claim=live_claim)
             raw = await _fetch(entry, request, policy, root, supply, deadline)
-            await _context(request, policy, root, supply, deadline)
+            await _context(active(), policy, root, supply, deadline, current_claim=live_claim)
             extract_python_wheel_metadata(entry, raw, deadline=deadline)
             store.put_wheel(request.key, entry.sha256, raw, deadline=deadline)
             return raw
@@ -175,9 +213,9 @@ async def execute_resolution(
             wheel_reader=content,
             budget=ResolutionBudget(limits, deadline),
         )
-        await _context(request, policy, root, supply, deadline)
-        store.complete(request.key, request.claim, descriptor)
-        return store.inspect(request.key, request.claim)
+        await _context(active(), policy, root, supply, deadline, current_claim=live_claim)
+        store.complete(request.key, active().claim, descriptor)
+        return store.inspect(request.key, active().claim)
     need(status.state == "resolved" and status.descriptor is not None, "resolution_inspect_only")
     descriptor = decode_descriptor(status.descriptor)
     if request.action == "freeze_python_resolution":
@@ -186,7 +224,7 @@ async def execute_resolution(
         from agent_hub.skills.sandbox.python_resolution_overlay import record_frozen_plan
 
         record_frozen_plan(supply,plan,deadline=min(deadline,plan.claim.monotonic_deadline))
-        await _context(request, policy, root, supply, deadline)
+        await _context(active(), policy, root, supply, deadline, current_claim=live_claim)
         return ResolutionStatus(
             state="frozen", key=request.key, descriptor=descriptor.to_payload(), plan=plan
         )
@@ -198,7 +236,7 @@ async def execute_resolution(
         effective.digest == plan.overlay_sha256 and plan.descriptor_sha256 == descriptor.sha256,
         "resolution_plan_changed",
     )
-    await _context(request, policy, root, supply, deadline)
+    await _context(active(), policy, root, supply, deadline, current_claim=live_claim)
     store.publication_begin(request.key, request.claim, plan)
     # Reuse metadata's Root700 claim scratch and the shared stage admission. No
     # temporary wheel/cache pathname is model-controlled.
@@ -224,9 +262,9 @@ async def execute_resolution(
                     raw,
                     deadline=deadline,
                 )
-        await _context(request, policy, root, supply, deadline)
+        await _context(active(), policy, root, supply, deadline, current_claim=live_claim)
         index = index_store.publish_dependency_metadata_index(root, effective, deadline=deadline)
-        await _context(request, policy, root, supply, deadline)
+        await _context(active(), policy, root, supply, deadline, current_claim=live_claim)
         for pin in pins + stage_pins:
             pin.check()
         store.publication_finish(request.key, request.claim, plan, index.sha256)
@@ -243,6 +281,129 @@ async def handle_resolution(
     return await handle_resolution_preparation(broker, request, peer_uid=peer_uid)
 
 
+async def _await_resolution_with_root_lease(
+    request: ResolutionRequest,
+    *,
+    operation: Awaitable[ResolutionStatus],
+    current: Callable[[], ResolutionClaim],
+) -> ResolutionStatus:
+    """Root independently drains an operation when its private witness expires."""
+    seen = request.claim
+
+    def checked() -> ResolutionClaim:
+        nonlocal seen
+        claim = current()
+        claim.require_continuity(seen)
+        need(claim.planning == request.claim.planning
+             and claim.lease_expires_at >= seen.lease_expires_at, "resolution_scope_changed")
+        seen = claim
+        return claim
+
+    async def watch() -> None:
+        while True:
+            claim = checked()
+            remaining = claim.deadline - time.monotonic()
+            await asyncio.sleep(min(0.25, max(0.001, remaining / 3)))
+
+    work = asyncio.ensure_future(operation)
+    monitor: asyncio.Task[None] | None = None
+    try:
+        checked()  # Read latest Root-owned evidence before executing the operation.
+        monitor = asyncio.create_task(watch())
+        async with asyncio.timeout_at(request.claim.task_deadline):
+            await asyncio.wait((work, monitor), return_when=asyncio.FIRST_COMPLETED)
+            if monitor.done():
+                # A failure already observed by Root remains terminal even if
+                # work completes in the same event-loop turn or the file heals.
+                await monitor
+            if work.done():
+                result = await work
+                checked()
+                need(type(result) is ResolutionStatus and result.key == request.key,
+                     "resolution_response_invalid")
+                return result
+            await monitor
+            raise ValueError("resolution_authority_unavailable")
+    finally:
+        work.cancel()
+        if monitor is not None:
+            monitor.cancel()
+
+        async def drain() -> None:
+            tasks = (work,) if monitor is None else (work, monitor)
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for result in results:
+                if isinstance(result, ProcessCleanupIncomplete):
+                    raise result
+
+        await _uninterrupted(drain())
+
+
+async def _await_resolution_with_renewal(
+    request: ResolutionRequest,
+    *,
+    operation: Awaitable[ResolutionStatus],
+    refresh: Callable[[], Awaitable[ResolutionClaim]],
+    renew: Callable[[ResolutionRequest], Awaitable[ResolutionStatus]],
+) -> ResolutionStatus:
+    """Continue one operation only while its original owner keeps proving authority.
+
+    Renewals do not create an execution, extend the original task budget, replace
+    the token or make an UNKNOWN operation retryable. A stalled authority read is
+    bounded by the *previous* lease, even if it would eventually return a new one.
+    """
+    active = request.claim
+
+    work = asyncio.ensure_future(operation)
+
+    async def completed() -> ResolutionStatus:
+        result = await work
+        need(type(result) is ResolutionStatus and result.key == request.key,
+             "resolution_response_invalid")
+        return result
+
+    try:
+        _ = active.deadline
+        async with asyncio.timeout_at(request.claim.task_deadline):
+            while True:
+                lease_deadline = active.deadline
+                remaining = lease_deadline - time.monotonic()
+                # Authority checks run in the original owner task. Only the
+                # already-authorized immutable IPC operation runs in a child.
+                await asyncio.wait((work,), timeout=min(5.0, max(0.001, remaining / 3)))
+                if work.done():
+                    return await completed()
+                async with asyncio.timeout_at(lease_deadline):
+                    current = await refresh()
+                    current.require_continuity(active)
+                    need(current.planning == active.planning, "resolution_source_changed")
+                    renewal = request.model_copy(update={"action": "renew_python_resolution", "claim": current})
+                    try:
+                        response = await renew(renewal)
+                    except (OSError, ValueError, TimeoutError):
+                        if work.done():
+                            return await completed()
+                        raise
+                    if work.done():
+                        # The original operation, not the late renewal, owns
+                        # the result. The preparer still revalidates authority.
+                        return await completed()
+                    need(type(response) is ResolutionStatus and response.key == request.key
+                         and response.state == "lease_renewed" and response.descriptor is None
+                         and response.plan is None, "resolution_renewal_unavailable")
+                    active = current
+    finally:
+        work.cancel()
+
+        async def drain() -> None:
+            results = await asyncio.gather(work, return_exceptions=True)
+            for result in results:
+                if isinstance(result, ProcessCleanupIncomplete):
+                    raise result
+
+        await _uninterrupted(drain())
+
+
 async def request_resolution(request: ResolutionRequest) -> ResolutionStatus:
     """SDK authenticates the Root peer. A response is data, never an install receipt."""
     from agent_hub.skills.sandbox.broker import BROKER_SOCKET_PATH, _read_frame, _write_frame
@@ -257,7 +418,10 @@ async def request_resolution(request: ResolutionRequest) -> ResolutionStatus:
     decode(raw)
     writer = None
     try:
-        async with asyncio.timeout_at(request.claim.deadline):
+        deadline = (request.claim.deadline if request.action == "renew_python_resolution"
+                    else request.claim.task_deadline)
+        _ = request.claim.deadline  # The first send still requires a currently live lease.
+        async with asyncio.timeout_at(deadline):
             reader, writer = await asyncio.open_unix_connection(BROKER_SOCKET_PATH.as_posix())
             _root_peer(writer)
             await _write_frame(writer, raw)
@@ -328,7 +492,8 @@ def main() -> int:
             for pin in pins:
                 pin.check()
         status = asyncio.run(
-            execute_resolution(request, policy=load_broker_policy(), root=root, supply=supply)
+            execute_resolution(request, policy=load_broker_policy(), root=root, supply=supply,
+                lease_witness=ResolutionLeaseWitness(args.stage, request))
         )
         need(status.key == request.key, "resolution_response_invalid")
         print(status.model_dump_json(), flush=True)

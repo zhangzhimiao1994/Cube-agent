@@ -288,6 +288,7 @@ def root_store(monkeypatch):
     for module in (s, indexes, catalog, supply_worker, contracts):
         monkeypatch.setattr(module, "os", fs)
     monkeypatch.setattr(indexes, "sys", SimpleNamespace(platform="linux"))
+    monkeypatch.setattr(s, "sys", SimpleNamespace(platform="linux"))
     monkeypatch.setattr(supply_worker, "sys", SimpleNamespace(platform="linux"))
     lock = ModuleType("fcntl")
     lock.LOCK_SH, lock.LOCK_EX, lock.LOCK_NB, lock.flock = 1, 2, 4, fs.flock
@@ -711,6 +712,7 @@ async def test_failed_fetch_drain_preserves_unknown_instead_of_quiet(worker_case
 
 async def test_sdk_cancel_invokes_existing_exact_project_termination(monkeypatch):
     import asyncio
+    from types import SimpleNamespace
 
     from agent_hub.skills.sandbox import project
     from agent_hub.skills.sandbox import python_metadata_preparation_client as peer
@@ -748,11 +750,17 @@ async def test_sdk_cancel_invokes_existing_exact_project_termination(monkeypatch
         terminated.append(key)
 
     monkeypatch.setattr(project, "_systemd_supported", lambda: True)
+    monkeypatch.setattr(worker, "sys", SimpleNamespace(platform="linux"))
     monkeypatch.setattr(asyncio, "open_unix_connection", connect, raising=False)
     monkeypatch.setattr(peer, "_root_peer", lambda writer: None)
     monkeypatch.setattr(project.ProjectSystemdSandbox, "terminate", terminate)
     task = asyncio.create_task(worker.request_resolution(request))
-    await entered.wait()
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=2)
+    except BaseException:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        raise
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
