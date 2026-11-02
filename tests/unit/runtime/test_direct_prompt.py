@@ -1,5 +1,6 @@
 import asyncio
 import errno
+import hashlib
 import json
 import logging
 import zipfile
@@ -1262,7 +1263,24 @@ async def test_direct_project_delivery_generates_and_writes_multiple_model_batch
     second_request = cast(ModelRequest, gateway.requests[1])
     rendered = "\n".join(cast(str, message.content) for message in second_request.messages)
     assert "continue with source and tests" in rendered
-    assert "package.json" not in cast(str, second_request.messages[-1].content)
+    progress_text = second_request.messages[-1].content
+    assert isinstance(progress_text, str)
+    progress, _end = json.JSONDecoder().raw_decode(progress_text.split("Progress: ", 1)[1])
+    content_sha256 = hashlib.sha256(b'{"scripts":{"test":"node --test"}}').hexdigest()
+    manifest_sha256 = hashlib.sha256(
+        json.dumps({"package.json": content_sha256}, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    assert progress == {
+        "written_file_count": 1,
+        "written_files": {
+            "file_count": 1,
+            "sha256": manifest_sha256,
+            "entries_complete": True,
+            "entries": [{"path": "package.json", "sha256": content_sha256}],
+        },
+        "continuation": "continue with source and tests",
+    }
+    assert "not passing verification or authority" in progress_text
     assert '{"scripts":{"test":"node --test"}}' not in rendered
     completed = next(event for event in events if event.kind is EventKind.RUNTIME_COMPLETED)
     assert completed.payload["workspace_delivery"]
