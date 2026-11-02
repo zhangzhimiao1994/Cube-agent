@@ -310,6 +310,7 @@ _VERIFICATION_GATE_FAILURE_CODES = {
     "project verification blocked by execution prerequisites": "blocked_prerequisites",
     "project execution report is invalid": "malformed_report",
     "project execution outcome is not confirmed": "outcome_unconfirmed",
+    "generated_acceptance_resolution_inspect_only": "resolution_inspect_only",
     "tool execution failed": "tool_failed",
 }
 _VERIFICATION_PROCESS_FAILURE_REASONS = frozenset({
@@ -329,6 +330,7 @@ _VERIFICATION_BACKEND_REASONS = (frozenset(get_args(PythonProjectBrokerError))
     "generated_python_project_unavailable", "generated_acceptance_scope_changed",
     "generated_acceptance_state_invalid", "generated_acceptance_persistence_unavailable",
     "generated_acceptance_unknown_no_recapture", "generated_acceptance_unavailable_or_changed",
+    "generated_acceptance_resolution_inspect_only",
     "generated_acceptance_manifest_required", "generated_acceptance_scaffold_incomplete",
     "generated_acceptance_python_declaration_invalid", "generated_acceptance_node_declaration_invalid",
     "generated_acceptance_test_execution_invalid", "generated_acceptance_test_evidence_missing",

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import math
 import re
 from collections.abc import Awaitable, Callable, Mapping
@@ -65,6 +66,14 @@ _SHA = re.compile(r'[a-f0-9]{64}')
 _BASE = {'schema_version', 'phase', 'user_id', 'request_sha256', 'proposer_actor', 'stack',
          'manifest_sha256', 'manifest_raw_sha256'}
 _CAPTURED = {'reference', 'acceptance_sha256'}
+_LOGGER = logging.getLogger(__name__)
+_PREPARATION_ERROR_KINDS = frozenset({
+    'ValueError', 'TypeError', 'RuntimeError', 'OSError', 'TimeoutError', 'AttributeError',
+    'RecursionError', 'NameError', 'ImportError', 'FileNotFoundError', 'PermissionError',
+    'ValidationError', 'InvalidSnapshot', 'ExecutionAuthorityError',
+    'InvalidResolutionAuthorization', '_PhysicalAdmissionStopped', 'AdmissionConflict',
+    'PythonProjectRecipeError',
+})
 
 
 class GeneratedProjectError(RuntimeError):
@@ -890,6 +899,7 @@ class GeneratedProjectService:
             raise GeneratedProjectError('generated_acceptance_unavailable_or_changed') from None
 
     async def prepare(self, tenant: UUID, run: UUID, actor: str, *, user_id: UUID) -> GeneratedProjectContext | None:
+        phase = 'authority'
         try:
             tenant, run = _uuid(tenant), _uuid(run)
             record = await self._record(tenant, run)
@@ -902,11 +912,13 @@ class GeneratedProjectService:
                 return await self.load(tenant, run, actor)
             _need(type(actor) is str and re.fullmatch(r'[a-z0-9][a-z0-9_.-]{0,127}', actor) is not None)
             invocation = authority.invocation
+            phase = 'draft_observation'
             observation = await self._draft_observation(invocation)
             raw, files = observation
             if raw is None:
                 await self._reject_draft(authority, actor, observation,
                     'generated_acceptance_manifest_required', ('manifest_missing',))
+            phase = 'acceptance_manifest'
             try:
                 manifest = parse_acceptance_manifest(raw)
             except ValueError:
@@ -919,6 +931,7 @@ class GeneratedProjectService:
             parts = (str(tenant), 'projects', authority.project_id, 'sessions', authority.session_id)
             dependency: Mapping[str, JsonValue] | None = None
             if manifest.stack == 'node':
+                phase = 'node_declaration'
                 from agent_hub.capabilities.project_inspection import _parse_node
                 data = await asyncio.to_thread(_read_no_links, self.root, (*parts, 'package.json'), max_bytes=1024**2)
                 _need(files['package.json'] in {hashlib.sha256(tag + data).hexdigest() for tag in (b'f\0', b'x\0')})
@@ -933,6 +946,7 @@ class GeneratedProjectService:
                     await self._reject_draft(authority, actor, observation,
                         'generated_acceptance_node_declaration_invalid', ('node_declaration_invalid',))
             if manifest.stack == 'python':
+                phase = 'python_controls'
                 from agent_hub.capabilities.python_project_recipe import (
                     parse_python_project_declaration,
                 )
@@ -942,7 +956,9 @@ class GeneratedProjectService:
                     _need(files[name] in {hashlib.sha256(tag + data).hexdigest() for tag in (b'f\0', b'x\0')})
                     controls.append(data)
                 if _dependency_selected(route):
+                    phase = 'dependency_resolution_read'
                     await self._resolve_dependency_draft(authority, actor, observation, (controls[0], controls[1]))
+                phase = 'python_declaration'
                 try:
                     parse_python_project_declaration(*controls, max_control_bytes=256 * 1024, max_requirements=128)
                 except (ValueError, TypeError):
@@ -950,8 +966,10 @@ class GeneratedProjectService:
                         'generated_acceptance_python_declaration_invalid', ('python_declaration_invalid',))
                 if _dependency_selected(route):
                     if (authority.tenant_id, authority.run_id, actor) in self._resolution_flows:
+                        phase = 'dependency_resolution_publish'
                         await self._resolve_dependency_draft(authority, actor, observation,
                             (controls[0], controls[1]), publish=True)
+                    phase = 'dependency_preflight'
                     dependency = await self._dependency_draft_preflight(authority, actor, observation,
                         (controls[0], controls[1]))
             state_body: dict[str, JsonValue] = {'schema_version': 1, 'phase': 'capturing',
@@ -967,12 +985,14 @@ class GeneratedProjectService:
                 await asyncio.to_thread(self._controls_absent, invocation)
                 _need(await self._draft_observation(invocation) == observation)
 
+            phase = 'baseline_reservation'
             await self._cas(authority, None, state,
                 before_reservation=before_reservation if dependency is not None else None)
             metadata: dict[str, JsonValue] = {'schema_version': 1, 'purpose': 'generated_acceptance',
                 'capture_phase': 'post_model', 'user_id': str(authority.user_id),
                 'request_sha256': authority.request_sha256, 'manifest_sha256': hashlib.sha256(raw).hexdigest()}
             store = ProjectBaselineStore(self.root)
+            phase = 'baseline_capture'
             reference = await store.capture_generated_once(invocation, editable_paths=manifest.editable_paths, metadata=metadata)
             if dependency is not None:
                 _need(reference.input_source_sha256 == dependency['source_sha256'])
@@ -983,13 +1003,20 @@ class GeneratedProjectService:
                 project_id=authority.project_id, session_id=authority.session_id, request_sha256=authority.request_sha256,
                 proposer_actor=actor, manifest_raw=raw, reference=reference, source_files=stored.source_files,
                 contract=stored.contract)
+            phase = 'envelope_persistence'
             await asyncio.to_thread(self._write_envelope, invocation, envelope)
             await self._cas(authority, state, {**state, 'phase': 'captured', 'reference': cast(JsonValue, reference.to_payload()),
                                              'acceptance_sha256': envelope.sha256})
+            phase = 'captured_load'
             return await self.load(tenant, run, actor)
         except GeneratedProjectError:
             raise
         except Exception as error:  # noqa: BLE001 - uncertain captures remain consumed; never expose source/path data.
+            from agent_hub.capabilities.python_input_preparation import InspectOnlyError
+
+            if (type(error) is InspectOnlyError and len(error.args) == 1
+                    and type(error.args[0]) is str and error.args[0] == 'resolution_inspect_only'):
+                raise GeneratedProjectError('generated_acceptance_resolution_inspect_only') from None
             if type(error) is PythonMetadataPreparationFailure:
                 try:
                     public_code = PythonMetadataPreparationFailure(phase=error.phase, code=error.code).public_code
@@ -997,6 +1024,12 @@ class GeneratedProjectService:
                     pass
                 else:
                     raise GeneratedProjectError(public_code) from None
+            kind = type(error).__name__
+            _LOGGER.warning(
+                'generated_project_prepare_failed stage=%s error_kind=%s run_id=%s',
+                phase, kind if kind in _PREPARATION_ERROR_KINDS else 'Exception',
+                run if type(run) is UUID else None,
+            )
             raise GeneratedProjectError('generated_acceptance_unavailable_or_changed') from None
 
     async def update(self, context: GeneratedProjectContext, replacement: Mapping[str, JsonValue]) -> GeneratedProjectContext:

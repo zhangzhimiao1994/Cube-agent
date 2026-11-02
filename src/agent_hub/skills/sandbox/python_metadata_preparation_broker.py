@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import sys
 import tempfile
@@ -47,6 +48,9 @@ if TYPE_CHECKING:
     from agent_hub.skills.sandbox.broker import BrokerPolicy
     from agent_hub.skills.sandbox.python_input_supply_catalog import RootSupplyConfig
     from agent_hub.skills.sandbox.python_project_backend import RootConfig
+
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class _MetadataPreparationExecution(_Execution):
@@ -167,8 +171,19 @@ async def _handle_preparation(
     broker: ProjectExecutionBroker, request: PythonMetadataPreparationRequest | ResolutionRequest, *, peer_uid: int,
 ) -> PythonMetadataPreparationResponse | ResolutionStatus:
     resolution = type(request) is ResolutionRequest
+    phase = "request"
+    action: str | None = None
+    correlation_key: str | None = None
+    exit_code: int | None = None
+    timed_out: bool | None = None
 
     def failure(code: MetadataPreparationError) -> PythonMetadataPreparationResponse | ResolutionStatus:
+        _LOGGER.warning(
+            "python_preparation_failed action=%s phase=%s key=%s code=%s exit_code=%s timed_out=%s",
+            action, phase, correlation_key, code, exit_code, timed_out,
+            extra={"action": action, "phase": phase, "key": correlation_key, "code": code,
+                   "exit_code": exit_code, "timed_out": timed_out},
+        )
         if isinstance(request, ResolutionRequest):
             return ResolutionStatus(state="unknown", key=request.key)
         return PythonMetadataPreparationResponse(action=request.action,
@@ -187,17 +202,23 @@ async def _handle_preparation(
         except (ValueError, TypeError, AttributeError, RecursionError):
             return failure("metadata_prepare_request_invalid")
         invocation = ProjectInvocation.model_validate(vars(request.invocation), strict=True)
+        action = request.action
+        if isinstance(request, ResolutionRequest):
+            correlation_key = request.key
         if isinstance(request, ResolutionRequest) and request.action == "renew_python_resolution":
             return await _renew_resolution(broker, request)
         if isinstance(request, ResolutionRequest):
             _ = request.claim.deadline
         key = invocation.execution_id
+        phase = "admission"
         if key in broker.executions or key in broker._cancelled_ids or broker._retained(key):
             return failure("metadata_prepare_consumed")
+        phase = "configuration"
         configuration, supply = read_root_configuration(), read_supply_configuration()
         validate_configuration(broker.policy, configuration, supply)
         if isinstance(request, ResolutionRequest):
             _ = request.claim.deadline
+        phase = "admission"
         job: _Execution = (_ResolutionPreparationExecution(invocation, asyncio.current_task(),
             original_request=request) if isinstance(request, ResolutionRequest)
             else _MetadataPreparationExecution(invocation, asyncio.current_task()))
@@ -268,6 +289,7 @@ async def _handle_preparation(
                 job.slot_acquired = True
                 await _admit_unit(broker, helper)
                 await _admit_unit(broker, job)
+                phase = "stage"
                 _private_project_runtime(configuration.stage_root)
                 if isinstance(job, _ResolutionPreparationExecution):
                     async with job.lease_lock:
@@ -294,16 +316,20 @@ async def _handle_preparation(
                 remaining = deadline - asyncio.get_running_loop().time()
                 if remaining <= 0:
                     raise TimeoutError
+                phase = "execution"
                 helper.launched = job.launched = True
                 broker._metadata(job, "RUNNING")
                 result = await run_subprocess_with_limits(command, _Limits(remaining, 2_000_000),
                     stdin_payload=b"", process_started=lambda process: setattr(helper, "process", process),
                     on_forced_terminate=stop_units)
+                if result.exit_code != 0 or result.timed_out:
+                    exit_code, timed_out = result.exit_code, result.timed_out
                 if result.exit_code == 3:
                     native_uncertain = True
                     raise ProcessCleanupIncomplete("metadata_prepare_cleanup_incomplete")
                 if result.exit_code != 0 or result.timed_out:
                     return failure("metadata_prepare_unavailable")
+                phase = "response"
                 payload = json.loads(result.stdout, object_pairs_hook=_object)
                 if isinstance(request, ResolutionRequest):
                     resolution_response = ResolutionStatus.model_validate_json(_encoded(payload), strict=True)
@@ -314,7 +340,9 @@ async def _handle_preparation(
                 response.require_for(request)
                 return _inspection_state(broker, request, response)
         finally:
+            previous_phase, phase = phase, "cleanup"
             await _uninterrupted(finish())
+            phase = previous_phase
     except ProcessCleanupIncomplete:
         return failure("metadata_prepare_cleanup_incomplete")
     except (ValueError, RuntimeError, OSError, TimeoutError, TypeError, AttributeError) as error:

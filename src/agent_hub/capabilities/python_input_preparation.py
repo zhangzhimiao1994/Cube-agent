@@ -8,7 +8,7 @@ import json
 import re
 import tomllib
 from collections.abc import Awaitable, Callable, Mapping
-from typing import TYPE_CHECKING, Protocol, cast, get_args
+from typing import TYPE_CHECKING, NoReturn, Protocol, cast, get_args
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from agent_hub.auth.models import Role
@@ -482,6 +482,22 @@ class DynamicResolutionJournal:
         return data
 
 
+class InspectOnlyError(ValueError):
+    """A checked resolution response permits inspection only, never replay."""
+
+    def __init__(self) -> None:
+        super().__init__('resolution_inspect_only')
+
+
+def _inspect_only(status: ResolutionStatus) -> NoReturn:
+    from agent_hub.skills.sandbox.python_resolution_protocol import ResolutionStatus
+
+    if type(status) is not ResolutionStatus:
+        raise ValueError('resolution_response_invalid')
+    ResolutionStatus.model_validate_json(status.model_dump_json(warnings='error'), strict=True)
+    raise InspectOnlyError()
+
+
 class DynamicPythonResolutionFlow:
     """Original data survives draft edits; fresh authority always comes from Root.
 
@@ -563,7 +579,7 @@ class DynamicPythonResolutionFlow:
             if self.resolution_key is not None and inspected.key != self.resolution_key:
                 raise ValueError('resolution_data_changed')
             if inspected.state not in {'frozen', 'published'}:
-                raise ValueError('resolution_inspect_only')
+                _inspect_only(inspected)
             self.pending_sha256 = None
         status = await self.client.inspect(needs=self.needs, environment=environment, planning=planning)
         if self.resolution_key is not None and status.key != self.resolution_key:
@@ -574,7 +590,7 @@ class DynamicPythonResolutionFlow:
             # UNKNOWN and any pending publication above never reach this branch.
             status = await self.client.resolve(needs=self.needs, environment=environment, planning=planning)
         if status.state != 'resolved' or status.descriptor is None:
-            raise ValueError('resolution_inspect_only')
+            _inspect_only(status)
         descriptor = decode_descriptor(status.descriptor)
         if descriptor.needs != self.needs or dict(descriptor.environment) != environment:
             raise ValueError('resolution_data_changed')
@@ -603,7 +619,7 @@ class DynamicPythonResolutionFlow:
                 # same exact grant is safe; UNKNOWN below is never replayed.
                 status = await self.client.publish(self.pending, needs=self.needs, environment=environment)
             if status.state != 'published' or status.plan != self.pending:
-                raise ValueError('resolution_inspect_only')
+                _inspect_only(status)
             self.pending = None
             self.pending_sha256 = None
             await self._save(status.key, None)
@@ -611,7 +627,7 @@ class DynamicPythonResolutionFlow:
         await self.resolve_data(needs=needs, environment=environment, planning=planning)
         status = await self.client.freeze(needs=self.needs, environment=environment, planning=planning)
         if status.state != 'frozen' or status.plan is None:
-            raise ValueError('resolution_inspect_only')
+            _inspect_only(status)
         self.pending = status.plan
         self.pending_sha256 = self.pending.sha256
         await self._save(status.key, self.pending.sha256)
@@ -623,10 +639,10 @@ class DynamicPythonResolutionFlow:
             await self._save(observed.key, None)
             return observed
         if observed.state != 'frozen':
-            raise ValueError('resolution_inspect_only')
+            _inspect_only(observed)
         result = await self.client.publish(self.pending, needs=self.needs, environment=environment)
         if result.state != 'published' or result.plan != self.pending:
-            raise ValueError('resolution_inspect_only')
+            _inspect_only(result)
         self.pending = None
         self.pending_sha256 = None
         await self._save(result.key, None)

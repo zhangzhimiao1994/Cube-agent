@@ -148,6 +148,7 @@ _VERIFICATION_CODES = frozenset({
     "backend_unsupported", "source_changed", "blocked_prerequisites", "malformed_report",
     "outcome_unconfirmed", "tool_failed", "failed", "invalid_response", "truncated_response",
     "not_passed", "timeout", "execution_failed",
+    "resolution_inspect_only",
 })
 _VERIFICATION_LITERALS = {code.replace("_", " "): code for code in _VERIFICATION_CODES}
 _VERIFICATION_BACKENDS = ((_VERIFICATION_CODES - {
@@ -161,6 +162,7 @@ _VERIFICATION_BACKENDS = ((_VERIFICATION_CODES - {
     "generated_python_project_unavailable", "generated_acceptance_scope_changed",
     "generated_acceptance_state_invalid", "generated_acceptance_persistence_unavailable",
     "generated_acceptance_unknown_no_recapture", "generated_acceptance_unavailable_or_changed",
+    "generated_acceptance_resolution_inspect_only",
     "generated_acceptance_manifest_required", "generated_acceptance_scaffold_incomplete",
     "generated_acceptance_python_declaration_invalid", "generated_acceptance_node_declaration_invalid",
     "generated_acceptance_test_execution_invalid", "generated_acceptance_test_evidence_missing",
@@ -429,6 +431,8 @@ def runtime_failure_diagnostic_from_reason(
         category = "permission" if permission else "backend" if backend is not None else (
             "unknown" if code == "failed" else code)
         action = (
+            "依赖准备的结果尚未确认；先核对执行记录和环境状态，避免重复操作。"
+            if code == "resolution_inspect_only" or backend == "generated_acceptance_resolution_inspect_only" else
             "核查当前身份与项目权限；当前具体动作仍走原 capability 审批路径，"
             "不得全局放宽权限、自动重试或重放旧 FAILED。"
             if permission else
