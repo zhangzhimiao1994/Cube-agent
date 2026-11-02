@@ -401,6 +401,29 @@ def _workspace_source_digest(known_files: Mapping[str, str], context: TaskContex
     ).encode("utf-8")).hexdigest()
 
 
+def _written_file_manifest(known_files: Mapping[str, str], *, token_allowance: int) -> Mapping[str, JsonValue] | None:
+    """A bounded acknowledgement, never file contents or a verification receipt."""
+    encoded = json.dumps(known_files, ensure_ascii=True, sort_keys=True, separators=(',', ':'))
+    entries: list[JsonValue] = []
+    result: dict[str, JsonValue] = {
+        'file_count': len(known_files), 'sha256': hashlib.sha256(encoded.encode()).hexdigest(),
+        'entries_complete': False, 'entries': (),
+    }
+    if _estimate_text_tokens(json.dumps(result, ensure_ascii=True, separators=(',', ':'))) > token_allowance:
+        return None
+    # Recent writes are most useful when a large project's full index cannot fit.
+    # The full-map digest/count always distinguish this subset from a complete list.
+    for path in reversed(tuple(known_files)):
+        entry: JsonValue = {'path': path, 'sha256': known_files[path]}
+        candidate = {**result, 'entries': (*entries, entry)}
+        if _estimate_text_tokens(json.dumps(candidate, ensure_ascii=True, separators=(',', ':'))) > token_allowance:
+            break
+        entries.append(entry)
+    result['entries_complete'] = len(entries) == len(known_files)
+    result['entries'] = tuple(entries)
+    return result
+
+
 def _verification_trace_diagnostic(diagnostic: Mapping[str, JsonValue]) -> Mapping[str, JsonValue]:
     # Only metadata from the existing redacted diagnostic crosses into public trace evidence.
     safe: dict[str, JsonValue] = {}
@@ -1870,6 +1893,9 @@ class DirectRuntime:
                 idempotency_key=f"direct-write-{context.run_id.hex}-{write_sha256[:16]}",
                 deadline=deadline,
             )
+            # Reassignment alone retains first-insertion order; acknowledge the
+            # most recently successful writes when the next manifest is partial.
+            known_files.pop(path, None)
             known_files[path] = content_sha256
         if not changed:
             _raise_execution_error("workspace batch made no progress")
@@ -2446,6 +2472,7 @@ class DirectRuntime:
         base_messages = request.messages
         seen_reads: set[tuple[str, str]] = set()
         seen_catalog_queries: set[str] = set()
+        no_progress_sources: set[str] = set()
         read_attempt = 0
         while True:
             if verification_trace is not None:
@@ -2494,12 +2521,13 @@ class DirectRuntime:
                     raise _WorkspacePrerequisiteBlocked(prerequisite_feedback)
             changed_files = sum(known_files.get(path) != hashlib.sha256(content.encode("utf-8")).hexdigest()
                                 for path, content in batch.files.items())
-            completion_only = (batch.complete and not batch.files and not batch.read_paths
-                               and batch.python_catalog is None and bool(known_files) and verification_enabled
+            if validation_failures and not changed_files and batch.complete:
+                _raise_execution_error("workspace batch is invalid")
+            completion_only = (batch.complete and not changed_files and not batch.read_paths
+                               and batch.python_catalog is None and bool(known_files)
                                and not validation_failures)
             try:
-                if not completion_only and (changed_files or not original_policy
-                                           and not batch.read_paths and catalog_read is None):
+                if changed_files:
                     await self._write_workspace_batch(
                         context, batch, known_files=known_files, deadline=deadline,
                     )
@@ -2521,22 +2549,36 @@ class DirectRuntime:
                     path: content for path, content in batch.files.items()
                     if known_files.get(path) == hashlib.sha256(content.encode("utf-8")).hexdigest()
                 })
+            no_progress_feedback = False
             if validation_code is not None:
                 validation_failures[validation_code] = validation_failures.get(validation_code, 0) + 1
                 if validation_failures[validation_code] >= 2:
                     _raise_execution_error("incremental workspace delivery failed")
             else:
-                validation_failures.clear()
+                if changed_files:
+                    validation_failures.clear()
                 gain = (0 if catalog_read is not None or completion_only else changed_files if diagnostic_reads else
-                        changed_files + read_gain if scoped_reads else max(1, len(batch.files)))
+                        changed_files + read_gain if scoped_reads else changed_files)
                 if (gain == 0 and catalog_read is None and (not diagnostic_reads or read_gain == 0)
                         and not new_missing_observation and not completion_only):
-                    _raise_execution_error("workspace batch made no progress")
+                    source_digest = _workspace_source_digest(known_files, context)
+                    repeated = source_digest in no_progress_sources
+                    _LOGGER.warning(
+                        'direct_workspace_no_progress run_id=%s phase=batch_progress '
+                        'known_file_count=%s batch_file_count=%s changed_file_count=%s '
+                        'read_gain=%s complete=%s failed_source=%s correction_exhausted=%s',
+                        context.run_id, len(known_files), len(batch.files), changed_files,
+                        read_gain, batch.complete, source_digest in failed_source_digests, repeated,
+                    )
+                    if repeated:
+                        _raise_execution_error("workspace batch made no progress")
+                    no_progress_sources.add(source_digest)
+                    no_progress_feedback = True
                 progress_units += gain
                 completed_batches += int(gain > 0 and catalog_read is None
                                          and (not diagnostic_reads or changed_files > 0))
             # Observations can inform repair within the saved window, never earn another one.
-            if (not completion_only and catalog_read is None
+            if (not no_progress_feedback and not completion_only and catalog_read is None
                     and (not diagnostic_reads or validation_code is None and changed_files > 0)
                     and (not new_missing_observation or changed_files > 0 or read_gain > 0)):
                 active_token_limit = _workspace_delivery_token_limit(
@@ -2558,6 +2600,9 @@ class DirectRuntime:
                 if verification_enabled:
                     source_digest = _workspace_source_digest(known_files, context)
                     if source_digest in failed_source_digests:
+                        _LOGGER.warning('direct_workspace_no_progress run_id=%s phase=verification_source '
+                                        'known_file_count=%s batch_file_count=%s changed_file_count=%s',
+                                        context.run_id, len(known_files), len(batch.files), changed_files)
                         _raise_execution_error("workspace verification repair made no progress")
                     verification_attempt += 1
                 try:
@@ -2691,11 +2736,15 @@ class DirectRuntime:
 
             remaining_run_tokens = active_token_limit - consumed_tokens
             remaining_seconds = deadline - asyncio.get_running_loop().time()
+            written_manifest = _written_file_manifest(known_files,
+                token_allowance=_effective_context_token_budget(context) // 32)
             progress_payload = json.dumps(
                 {
                     "written_file_count": len(known_files),
+                    **({"written_files": written_manifest} if written_manifest is not None else {}),
                     "continuation": batch.continuation,
-                    **({"validation_error": validation_code} if validation_code is not None else {}),
+                    **({"validation_error": "no_progress"} if no_progress_feedback else {}),
+                    **({"validation_error": next(iter(validation_failures))} if validation_failures else {}),
                 },
                 ensure_ascii=False,
                 allow_nan=False,
@@ -2774,6 +2823,14 @@ class DirectRuntime:
                 '"complete":true,"continuation":""},"summary":"delivery summary"}. '
                 'Keep complete and continuation inside workspace_batch. For unfinished work use '
                 'complete=false and a nonempty continuation. Preserve frozen controls and prior valid files.'
+                ' The written_files manifest acknowledges stored bytes, not passing verification or authority. '
+                'Its entries may be a recent subset when entries_complete=false; omitted files still exist.'
+                + (' The prior batch made no progress: its files/reads were already acknowledged. '
+                   'Correct that in this same task: write the remaining or corrected required files, or '
+                   'submit complete=true when ready for actual project.verify. Do not repeat unchanged '
+                   'reads or files as progress. This one correction grants no permissions or additional '
+                   'time/tokens and cannot replay failed verification or UNKNOWN actions.'
+                   if no_progress_feedback else '')
             ))
             read_messages: tuple[ModelMessage, ...] = ()
             if reads:

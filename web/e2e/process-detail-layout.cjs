@@ -8,7 +8,8 @@ const { chromium, expect } = require('@playwright/test');
 let browser;
 const css = fs.readFileSync(path.join(__dirname, '../src/styles.css'), 'utf8');
 before(async () => {
-  browser = await chromium.launch({ headless: true, chromiumSandbox: true,
+  // This fixed local HTML/CSS fixture follows the CI browser policy on hosted runners.
+  browser = await chromium.launch({ headless: true, chromiumSandbox: process.env.CI !== 'true',
     ...(process.platform === 'win32' ? { channel: 'msedge' } : {}) });
 });
 after(async () => { if (browser) await browser.close(); });

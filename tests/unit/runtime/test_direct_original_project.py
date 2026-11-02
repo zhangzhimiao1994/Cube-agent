@@ -207,12 +207,13 @@ async def test_invalid_read_paths_never_reach_gateway(tmp_path: Path, paths: obj
 async def test_repeated_unchanged_read_stops_without_verifying_or_earning_infinite_rounds(tmp_path: Path) -> None:
     configured = await fixture(tmp_path)
     read = batch(reads=['src/detail.js'])
-    model = Model(read, read, batch(files={'src/index.js': 'fake completion'}, complete=True))
+    model = Model(read, read, read, batch(files={'src/index.js': 'fake completion'}, complete=True))
     runtime, _, _ = configured.runtime(model)
     with pytest.raises(direct.RuntimeExecutionError, match='no progress'):
         _ = [event async for event in runtime.run(configured.context)]
-    assert len(model.requests) == 2
-    assert [name for name, _ in configured.backend.calls] == ['read_context', 'read_context']
+    assert len(model.requests) == 3
+    assert [name for name, _ in configured.backend.calls] == ['read_context'] * 3
+    assert any('"validation_error":"no_progress"' in str(m.content) for m in model.requests[-1].messages)
 
 
 async def test_distinct_paths_can_be_read_in_successive_rounds_and_original_failure_survives(tmp_path: Path) -> None:
@@ -277,12 +278,12 @@ async def test_changed_hash_gains_once_but_returning_to_seen_hash_does_not_loop(
                 path.write_text(initial, encoding='utf-8')
             return await super().complete_with_context(request)
 
-    model = ChangingModel(read, read, read, 'unreachable')
+    model = ChangingModel(read, read, read, read, 'unreachable')
     runtime, _, _ = configured.runtime(model)
     with pytest.raises(direct.RuntimeExecutionError, match='no progress'):
         _ = [event async for event in runtime.run(configured.context)]
-    assert len(model.requests) == 3
-    assert [name for name, _ in configured.backend.calls] == ['read_context'] * 3
+    assert len(model.requests) == 4
+    assert [name for name, _ in configured.backend.calls] == ['read_context'] * 4
 
 
 async def test_gateway_read_denial_cannot_turn_into_prose_completion(tmp_path: Path) -> None:

@@ -70,15 +70,16 @@ async def test_missing_read_continues_same_delivery_with_explicit_negative_obser
     assert sum(e.kind is EventKind.MODEL_COMPLETED for e in events) == 3
 
 
-async def test_repeated_missing_observation_cannot_buy_another_model_round(tmp_path: Path) -> None:
+async def test_repeated_missing_observation_has_one_correction_then_stops(tmp_path: Path) -> None:
     context, verified, bundle = await evidence(tmp_path)
     harness = MissingHarness(context, verified, bundle)
-    model = Model(response(read_batch()), response(read_batch()), response(batch()))
+    model = Model(response(read_batch()), response(read_batch()), response(read_batch()), response(batch()))
     runtime = DirectRuntime(model, logical_model='fixture', capability_gateway=harness,
         harness_tool_gateway=cast(Any, harness))
     with pytest.raises(RuntimeExecutionError, match='no progress'):
         _ = [e async for e in runtime.run(context)]
-    assert len(model.requests) == 2
+    assert len(model.requests) == 3
+    assert any('"validation_error":"no_progress"' in str(m.content) for m in model.requests[-1].messages)
     assert 'workspace.write_text' not in harness.calls and 'workspace.bundle' not in harness.calls
 
 

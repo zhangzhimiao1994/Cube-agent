@@ -360,14 +360,15 @@ async def test_generated_inspect_timeout_drains_without_model_or_write(tmp_path:
     assert harness.stopped.is_set() and not model.requests and harness.calls == ['project.inspect']
 
 
-async def test_unchanged_generated_read_does_not_buy_another_model_round(tmp_path: Path) -> None:
+async def test_unchanged_generated_read_has_one_correction_then_stops(tmp_path: Path) -> None:
     context, verified, bundle = await evidence(tmp_path)
     harness = Harness(context, verified, bundle)
     read = json.dumps({'workspace_batch': {'files': {}, 'read_paths': ['src/app.py'],
         'complete': False, 'continuation': 'Inspect implementation.'}})
-    model = Model(response(read), response(read), response(batch()))
+    model = Model(response(read), response(read), response(read), response(batch()))
     runtime = DirectRuntime(model, logical_model='fixture', capability_gateway=harness,
         harness_tool_gateway=cast(Any, harness))
     with pytest.raises(RuntimeExecutionError, match='no progress'):
         _ = [event async for event in runtime.run(context)]
-    assert len(model.requests) == 2 and harness.calls == ['project.inspect', 'read_context', 'read_context']
+    assert len(model.requests) == 3 and harness.calls == ['project.inspect', *(['read_context'] * 3)]
+    assert any('"validation_error":"no_progress"' in str(m.content) for m in model.requests[-1].messages)

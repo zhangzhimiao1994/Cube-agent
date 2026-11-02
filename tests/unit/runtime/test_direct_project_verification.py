@@ -352,7 +352,7 @@ async def test_direct_diagnostic_repeated_read_does_not_extend_soft_budget(
     ctx = diagnostic_context()
     read = diagnostic_read_batch()
     repeated = diagnostic_read_batch(summary="New summary is not new evidence.") if changed_summary else read
-    model = Model(batch({"main.py": BROKEN}), read, repeated, batch({"main.py": FIXED}))
+    model = Model(batch({"main.py": BROKEN}), read, repeated, repeated, batch({"main.py": FIXED}))
     runtime, backend, shared, _ = runner(tmp_path, ctx, model)
     deadlines = capture_delivery_deadline(monkeypatch)
     invoke = shared.invoke
@@ -368,13 +368,14 @@ async def test_direct_diagnostic_repeated_read_does_not_extend_soft_budget(
     monkeypatch.setattr(shared, "invoke", record_read)
     with pytest.raises(RuntimeExecutionError, match="no progress"):
         _ = [event async for event in runtime.run(ctx)]
-    assert len(deadlines) == 1 and len(read_budgets) == 2
+    assert len(deadlines) == 1 and len(read_budgets) == 3
     budget = deadlines[0]
     assert (budget.deadline, budget.absolute_deadline, budget.progress_units) == read_budgets[-1]
     assert budget.deadline < budget.absolute_deadline
-    assert [request.tool_name for request in shared.requests] == ["project.verify", "read_context", "read_context"]
-    assert shared.results[1].payload == shared.results[2].payload
-    assert len(model.requests) == 3 and len(model.texts) == 1
+    assert [request.tool_name for request in shared.requests] == ["project.verify", *(["read_context"] * 3)]
+    assert shared.results[1].payload == shared.results[2].payload == shared.results[3].payload
+    assert len(model.requests) == 4 and len(model.texts) == 1
+    assert any('"validation_error":"no_progress"' in str(m.content) for m in model.requests[-1].messages)
     assert backend.calls.count("project.verify") == 1 and "workspace.bundle" not in backend.calls
     assert (backend.root / "main.py").read_text() == BROKEN
 
