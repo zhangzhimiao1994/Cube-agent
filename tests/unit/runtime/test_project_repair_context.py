@@ -108,11 +108,24 @@ def test_failure_projection_does_not_forge_evidence(defect: str) -> None:
             validated_feedback=json_map(feedback))
 
 
-def test_draft_projection_preserves_actual_issue_and_observation_not_private_identity() -> None:
-    draft = GeneratedDraftRejection(tenant_id=str(uuid4()), user_id=str(uuid4()), run_id=str(uuid4()),
+@pytest.mark.parametrize('pins,package,version', [
+    (False, 'click', '8.1.8'), (True, 'click', '8.1.8'), (True, 'flask', '3.1.2'),
+])
+def test_draft_projection_preserves_actual_issue_and_observation_not_private_identity(
+    pins: bool, package: str, version: str,
+) -> None:
+    from dataclasses import replace
+
+    draft_value = GeneratedDraftRejection(tenant_id=str(uuid4()), user_id=str(uuid4()), run_id=str(uuid4()),
         project_id="private-project", session_id="private-session", request_sha256="a" * 64,
         proposer_actor="implementer", observation_sha256="c" * 64,
-        reason="generated_acceptance_manifest_required", issues=("manifest_missing",)).to_payload()
+        reason="generated_acceptance_manifest_required", issues=("manifest_missing",))
+    if pins:
+        draft_value = replace(draft_value, schema_version=3, reason='generated_acceptance_python_declaration_invalid',
+                        issues=('python_lock_hashes_required',), dependency_pins=({
+                            'name': package, 'version': version, 'filename': f'{package}-{version}-py3-none-any.whl',
+                            'sha256': 'd' * 64, 'size_bytes': 100},))
+    draft = draft_value.to_payload()
     artifact = Artifact(id=uuid4(), type="tool_result", producer="implementer", content={
         "tool_name": "project.verify", "result": {
             "status": "failed", "untrusted": True, "generated_draft_rejection": json_map(draft),
@@ -121,7 +134,10 @@ def test_draft_projection_preserves_actual_issue_and_observation_not_private_ide
     text = repair_context.project_repair_failure_text(artifact,
         expected_artifact_id=str(artifact.id), expected_artifact_sha256=artifact.content_sha256,
         validated_feedback=json_map(read_map(artifact.content["result"])))
-    assert "generated_acceptance_manifest_required" in text and "manifest_missing" in text
+    assert ("python_lock_hashes_required" if pins else "manifest_missing") in text
+    if pins:
+        assert '"dependency_pins"' in text and 'd' * 64 in text
+        assert f'{package}-{version}-py3-none-any.whl' in text
     assert "c" * 64 in text and '"execution_started":false' in text
     assert string_value(draft["user_id"]) not in text and "private-project" not in text
 

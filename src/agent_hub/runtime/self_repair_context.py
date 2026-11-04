@@ -59,6 +59,7 @@ def project_repair_failure_text(
     if not isinstance(tool, str) or re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", tool) is None:
         raise ValueError("project repair failure evidence is invalid")
     diagnostic: dict[str, JsonValue] = {}
+    reference_pins: JsonValue = None
     if "generated_draft_rejection" in validated_feedback:
         from agent_hub.capabilities.generated_project_draft import validated_generated_draft_payload
 
@@ -75,6 +76,15 @@ def project_repair_failure_text(
             assert isinstance(closure, Mapping)
             projected_draft["schema_version"] = 2
             projected_draft["dependency_closure"] = {"schema_version": 1, **closure}
+        elif draft['schema_version'] == 3:
+            projected_draft['schema_version'] = 3
+            pins = draft['dependency_pins']
+            assert isinstance(pins, tuple | list)
+            rows: list[JsonValue] = []
+            for row in pins:
+                assert isinstance(row, Mapping)
+                rows.append(dict(row))
+            reference_pins = tuple(rows)
         diagnostic["generated_draft_rejection"] = projected_draft
     else:
         diagnostic = {key: validated_feedback[key] for key in (
@@ -96,6 +106,17 @@ def project_repair_failure_text(
         return value
 
     projected = project(diagnostic)
+    if reference_pins is not None:
+        # The validated five-field wheel DTO is reference metadata, not a free-form
+        # diagnostic stream. Preserve valid names such as flask-3.1.2 unchanged.
+        assert isinstance(projected, Mapping)
+        projected_diagnostic = dict(projected)
+        projected_draft_data = projected_diagnostic['generated_draft_rejection']
+        assert isinstance(projected_draft_data, Mapping)
+        projected_diagnostic['generated_draft_rejection'] = {
+            **projected_draft_data, 'dependency_pins': reference_pins,
+        }
+        projected = projected_diagnostic
     return "UNTRUSTED_PROJECT_REPAIR_FEEDBACK_JSON=" + json.dumps({
         "schema_version": 1, "untrusted": True, "status": "failed", "tool_name": tool,
         "artifact_id": expected_artifact_id, "artifact_sha256": expected_artifact_sha256,

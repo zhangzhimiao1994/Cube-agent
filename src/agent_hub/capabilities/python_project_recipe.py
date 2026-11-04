@@ -38,6 +38,32 @@ def _need(value: object, code: _CODE = 'python_project_recipe_invalid') -> None:
         raise PythonProjectRecipeError(code)
 
 
+def python_declaration_issue(lock: bytes, error: ValueError | TypeError) -> str:
+    """Finite repair data from our parser; never expose arbitrary exception text."""
+    fallback = 'python_declaration_invalid'
+    if (type(error) is not PythonProjectRecipeError or error.args != (error.code,)
+            or error.code not in {'python_project_lock_invalid', 'python_project_declaration_limit'}):
+        return fallback
+    if not lock:
+        return 'python_lock_empty'
+    if error.code != 'python_project_lock_invalid':
+        return fallback
+    try:
+        _validate_hashed_requirements(lock.decode('utf-8').replace('\r\n', '\n').replace('\r', '\n'))
+    except EnvironmentBuildError as cause:
+        if type(cause) is not EnvironmentBuildError or len(cause.args) != 1:
+            return fallback
+        return {
+            'remote or editable requirements are forbidden': 'python_lock_external_source_forbidden',
+            'Python lock file is empty': 'python_lock_empty',
+            'Python requirements must use fixed versions': 'python_lock_fixed_versions_required',
+            'every Python requirement must include a SHA256 hash': 'python_lock_hashes_required',
+        }.get(cause.args[0], fallback) if type(cause.args[0]) is str else fallback
+    except UnicodeError:
+        return fallback
+    return fallback
+
+
 def _name(value: str) -> str:
     _need(type(value) is str and _NAME.fullmatch(value) is not None)
     return re.sub(r'[-_.]+', '-', value).lower()

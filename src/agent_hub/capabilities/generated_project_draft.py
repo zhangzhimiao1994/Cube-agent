@@ -18,7 +18,9 @@ _ISSUES = {
         'manifest_invalid', 'protected_editable_paths', 'protected_test_files'}),
     'generated_acceptance_scaffold_incomplete': frozenset({'scaffold_incomplete'}),
     'generated_acceptance_node_declaration_invalid': frozenset({'node_declaration_invalid'}),
-    'generated_acceptance_python_declaration_invalid': frozenset({'python_declaration_invalid'}),
+    'generated_acceptance_python_declaration_invalid': frozenset({
+        'python_declaration_invalid', 'python_lock_empty', 'python_lock_hashes_required',
+        'python_lock_fixed_versions_required', 'python_lock_external_source_forbidden'}),
     'generated_acceptance_python_dependency_incomplete': frozenset({'python_dependency_incomplete'}),
 }
 _KEYS = frozenset({'schema_version', 'kind', 'phase', 'execution_started', 'tenant_id', 'user_id',
@@ -47,13 +49,38 @@ def dependency_observation_payload(value: object, *, complete: bool = False) -> 
     return observed.model_dump(mode='json')
 
 
+def dependency_pins_payload(value: object) -> list[dict[str, JsonValue]]:
+    """Reference facts only: no Root claim, action plan, URL or execution authority."""
+    from agent_hub.skills.sandbox.python_project_profile import PythonProjectProfileWheel
+
+    if type(value) not in (tuple, list):
+        raise ValueError(_ERROR)
+    selected = cast(list[object] | tuple[object, ...], value)
+    if not 1 <= len(selected) <= 128:
+        raise ValueError(_ERROR)
+    raw = bytearray()
+    encoder = json.JSONEncoder(default=dict, ensure_ascii=True, allow_nan=False,
+                               sort_keys=True, separators=(',', ':'))
+    for chunk in encoder.iterencode(selected):
+        if len(raw) + len(chunk) > 32 * 1024:
+            raise ValueError(_ERROR)
+        raw.extend(chunk.encode('ascii'))
+    rows = json.loads(raw)
+    result = [cast(dict[str, JsonValue], PythonProjectProfileWheel.model_validate_json(
+        json.dumps(row, allow_nan=False), strict=True).model_dump(mode='json')) for row in rows]
+    names = [cast(str, row['name']) for row in result]
+    if len(set(names)) != len(names):
+        raise ValueError(_ERROR)
+    return sorted(result, key=lambda row: str(row['name']))
+
+
 def _checked(value: object) -> Mapping[str, JsonValue]:
     if not isinstance(value, Mapping) or 'schema_version' not in value:
         raise ValueError(_ERROR)
     version = value.get('schema_version')
-    if type(version) is not int or version not in (1, 2):
+    if type(version) is not int or version not in (1, 2, 3):
         raise ValueError(_ERROR)
-    keys = _KEYS | {'dependency_closure'} if version == 2 else _KEYS
+    keys = _KEYS | ({'dependency_closure'} if version == 2 else {'dependency_pins'} if version == 3 else set())
     if len(value) != len(keys) or set(value) != keys:
         raise ValueError(_ERROR)
     item = dict(value)
@@ -80,6 +107,10 @@ def _checked(value: object) -> Mapping[str, JsonValue]:
         if reason != dependency_reason:
             raise ValueError(_ERROR)
         item['dependency_closure'] = dependency_observation_payload(item['dependency_closure'])
+    elif version == 3:
+        if reason != 'generated_acceptance_python_declaration_invalid':
+            raise ValueError(_ERROR)
+        item['dependency_pins'] = dependency_pins_payload(item['dependency_pins'])
     elif reason == dependency_reason:
         raise ValueError(_ERROR)
     return _freeze_object(cast(Mapping[str, JsonValue], item), name='generated draft rejection')
@@ -110,12 +141,17 @@ class GeneratedDraftRejection:
     phase: str = 'before_capture'
     execution_started: bool = False
     dependency_closure: Mapping[str, JsonValue] | None = None
+    dependency_pins: tuple[Mapping[str, JsonValue], ...] | None = None
 
     def __post_init__(self) -> None:
         payload = self.to_payload()
         if self.dependency_closure is not None:
             object.__setattr__(self, 'dependency_closure', _freeze_object(
                 cast(Mapping[str, JsonValue], payload['dependency_closure']), name='dependency observation'))
+        if self.dependency_pins is not None:
+            object.__setattr__(self, 'dependency_pins', tuple(_freeze_object(
+                cast(Mapping[str, JsonValue], row), name='dependency pin')
+                for row in cast(list[object], payload['dependency_pins'])))
 
     def to_payload(self) -> dict[str, object]:
         # Revalidate even frozen instances: object.__setattr__ must not forge evidence.
@@ -132,6 +168,8 @@ class GeneratedDraftRejection:
             }
             if self.dependency_closure is not None:
                 item['dependency_closure'] = dependency_observation_payload(self.dependency_closure)
+            if self.dependency_pins is not None:
+                item['dependency_pins'] = dependency_pins_payload(self.dependency_pins)
             _checked(item)
             return item
         except (ValueError, TypeError, KeyError, AttributeError, RecursionError, OverflowError):
