@@ -121,8 +121,7 @@ async def test_specific_approval_retains_nonrounded_deadline_across_repeated_res
     proposal = case.policy.requests[-1]
     deadline = proposal.arguments['original_deadline']
     assert isinstance(deadline, str)
-    assert deadline == (row.created_at + timedelta(seconds=3599.865685)).isoformat()
-    assert deadline != (row.created_at + timedelta(seconds=3600)).isoformat()
+    assert deadline == (row.created_at + timedelta(seconds=3600)).isoformat()
     journal = case.service._resolution_journal
     assert journal is not None
     saved = await journal.read_artifacts(case.context.tenant_id, case.context.run_id,
@@ -160,6 +159,30 @@ async def test_specific_approval_retains_nonrounded_deadline_across_repeated_res
             scope = artifact.content['scope']
             assert isinstance(scope, Mapping)
             assert scope['original_deadline'] == deadline
+
+
+@pytest.mark.parametrize('mode', [TaskMode.DIRECT, TaskMode.DISPATCH, TaskMode.DISCUSS, TaskMode.HYBRID])
+async def test_late_service_first_resolution_keeps_original_run_cutoff(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dao: object, mode: TaskMode,
+) -> None:
+    case = await configured(tmp_path, monkeypatch, dao, mode=mode)
+    claims = capture_claims(monkeypatch)
+    row = case.dao.run
+    assert isinstance(row, RunRow) and row.routing_decision is not None
+    row.created_at = datetime.now(UTC) - timedelta(seconds=2000)
+    row.routing_decision = {**row.routing_decision, 'runtime_timeout_seconds': 3600}
+    case.context = case.context.model_copy(update={
+        'timeout_seconds': 25.0, 'routing_decision': row.routing_decision})
+    started = time.monotonic()
+    waiting = await invoke_worker(case, 'resolution-worker')
+    assert waiting.failure_reason == 'capability requires approval', waiting
+    expected = row.created_at + timedelta(seconds=3600)
+    assert case.policy.requests[-1].arguments['original_deadline'] == expected.isoformat()
+    assert claims and all(claim.original_deadline == expected for claim in claims)
+    assert all(claim.monotonic_deadline <= started + 30 for claim in claims)
+    assert case.calls.count('resolve_python_inputs') == 0
+    assert case.calls.count('publish_python_resolution') == 0
+    assert 'generated_project_preparation' not in row.routing_decision
 
 
 @pytest.mark.parametrize('defect', ['naive', 'expired', 'extended'])

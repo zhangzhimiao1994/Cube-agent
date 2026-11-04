@@ -146,9 +146,10 @@ class PythonResolutionPreparation:
         )
         need(hashlib.sha256(record.request.encode()).hexdigest() == scope.request_sha256)
         if self._original is None:
-            # Conservatively include queue time. This cannot restart the run's budget.
-            maximum = min(float(context.timeout_seconds), float(live.timeout_seconds))
-            original_deadline = self._original_deadline or record.created_at + timedelta(seconds=maximum)
+            # The route retains the original total; context timeout is remaining
+            # time and tightens the monotonic deadline below from the current time.
+            original_deadline = self._original_deadline or record.created_at + timedelta(
+                seconds=live.timeout_seconds)
         else:
             original_deadline = self._original.original_deadline
         # Registered data can retain an earlier exact cutoff across workers. It

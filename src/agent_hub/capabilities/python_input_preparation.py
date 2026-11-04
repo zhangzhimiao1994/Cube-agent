@@ -489,6 +489,13 @@ class InspectOnlyError(ValueError):
         super().__init__('resolution_inspect_only')
 
 
+class ResolutionDeclarationChangedError(ValueError):
+    """Checked existing resolution data cannot satisfy the current declaration."""
+
+    def __init__(self) -> None:
+        super().__init__('resolution_declaration_changed')
+
+
 def _inspect_only(status: ResolutionStatus) -> NoReturn:
     from agent_hub.skills.sandbox.python_resolution_protocol import ResolutionStatus
 
@@ -564,7 +571,7 @@ class DynamicPythonResolutionFlow:
                 parsed = requirement(entry.requirement)
                 wheel = wheels.get(canonicalize_name(parsed.name))
                 if wheel is None or Version(wheel.version) not in parsed.specifier:
-                    raise ValueError('resolution_declaration_changed')
+                    raise ResolutionDeclarationChangedError()
         return environment
 
     async def resolve_data(self, *, needs: tuple[DependencyNeed, ...], environment: dict[str, str],
