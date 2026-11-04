@@ -21,6 +21,7 @@ from agent_hub.capabilities.generated_project_draft import (
     GeneratedDraftRejection,
     dependency_observation_payload,
     dependency_pins_payload,
+    python_declaration_issues,
 )
 from agent_hub.capabilities.project_acceptance import (
     GeneratedAcceptanceEnvelope,
@@ -459,6 +460,7 @@ class GeneratedProjectService:
     async def _reject_draft(
         self, authority: GeneratedAuthority, actor: str, observation: tuple[bytes | None, dict[str, str]],
         reason: str, issues: tuple[str, ...], *, dependency: Mapping[str, JsonValue] | None = None,
+        missing_files: tuple[str, ...] | None = None,
     ) -> NoReturn:
         invocation = authority.invocation
         await asyncio.to_thread(self._controls_absent, invocation)
@@ -481,8 +483,8 @@ class GeneratedProjectService:
             project_id=authority.project_id, session_id=authority.session_id,
             request_sha256=authority.request_sha256, proposer_actor=actor,
             observation_sha256=observation_sha, reason=reason, issues=issues,
-            schema_version=3 if pins is not None else 2 if dependency is not None else 1,
-            dependency_closure=dependency, dependency_pins=pins))
+            schema_version=4 if missing_files is not None else 3 if pins is not None else 2 if dependency is not None else 1,
+            dependency_closure=dependency, dependency_pins=pins, missing_files=missing_files))
 
     def configure_resolution_artifacts(self, artifacts: ArtifactRepository) -> None:
         from agent_hub.capabilities.python_input_preparation import DynamicResolutionJournal
@@ -940,9 +942,10 @@ class GeneratedProjectService:
                 await self._reject_draft(authority, actor, observation,
                     'generated_acceptance_manifest_invalid', _manifest_issues(raw))
             required = {'package.json'} if manifest.stack == 'node' else {'pyproject.toml', 'requirements.lock'}
-            if not {*manifest.test_files, *required, _MANIFEST} <= files.keys():
+            missing_files = tuple(sorted({*manifest.test_files, *required, _MANIFEST} - files.keys()))
+            if missing_files:
                 await self._reject_draft(authority, actor, observation,
-                    'generated_acceptance_scaffold_incomplete', ('scaffold_incomplete',))
+                    'generated_acceptance_scaffold_incomplete', ('scaffold_incomplete',), missing_files=missing_files)
             parts = (str(tenant), 'projects', authority.project_id, 'sessions', authority.session_id)
             dependency: Mapping[str, JsonValue] | None = None
             if manifest.stack == 'node':
@@ -980,7 +983,7 @@ class GeneratedProjectService:
                 except (ValueError, TypeError) as error:
                     await self._reject_draft(authority, actor, observation,
                         'generated_acceptance_python_declaration_invalid',
-                        (python_declaration_issue(controls[1], error),))
+                        python_declaration_issues(python_declaration_issue(controls[1], error)))
                 if _dependency_selected(route):
                     if (authority.tenant_id, authority.run_id, actor) in self._resolution_flows:
                         phase = 'dependency_resolution_publish'

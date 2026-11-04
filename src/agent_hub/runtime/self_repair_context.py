@@ -59,7 +59,7 @@ def project_repair_failure_text(
     if not isinstance(tool, str) or re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", tool) is None:
         raise ValueError("project repair failure evidence is invalid")
     diagnostic: dict[str, JsonValue] = {}
-    reference_pins: JsonValue = None
+    reference_metadata: dict[str, JsonValue] = {}
     if "generated_draft_rejection" in validated_feedback:
         from agent_hub.capabilities.generated_project_draft import validated_generated_draft_payload
 
@@ -84,7 +84,10 @@ def project_repair_failure_text(
             for row in pins:
                 assert isinstance(row, Mapping)
                 rows.append(dict(row))
-            reference_pins = tuple(rows)
+            reference_metadata['dependency_pins'] = tuple(rows)
+        elif draft['schema_version'] == 4:
+            projected_draft['schema_version'] = 4
+            reference_metadata['missing_files'] = draft['missing_files']
         diagnostic["generated_draft_rejection"] = projected_draft
     else:
         diagnostic = {key: validated_feedback[key] for key in (
@@ -106,15 +109,15 @@ def project_repair_failure_text(
         return value
 
     projected = project(diagnostic)
-    if reference_pins is not None:
-        # The validated five-field wheel DTO is reference metadata, not a free-form
-        # diagnostic stream. Preserve valid names such as flask-3.1.2 unchanged.
+    if reference_metadata:
+        # Validated wheel/path DTOs are reference metadata, not free-form diagnostic
+        # streams. Preserve valid names such as flask-3.1.2 and test_flask_app.py.
         assert isinstance(projected, Mapping)
         projected_diagnostic = dict(projected)
         projected_draft_data = projected_diagnostic['generated_draft_rejection']
         assert isinstance(projected_draft_data, Mapping)
         projected_diagnostic['generated_draft_rejection'] = {
-            **projected_draft_data, 'dependency_pins': reference_pins,
+            **projected_draft_data, **reference_metadata,
         }
         projected = projected_diagnostic
     return "UNTRUSTED_PROJECT_REPAIR_FEEDBACK_JSON=" + json.dumps({

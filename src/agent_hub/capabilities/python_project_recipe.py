@@ -25,11 +25,21 @@ _MODULE = re.compile(r'[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*')
 _SHA = re.compile(r'[a-f0-9]{64}')
 _CODE = Literal['python_project_recipe_invalid', 'python_project_recipe_unsupported',
     'python_project_lock_invalid', 'python_project_declaration_limit']
+_DIAGNOSTIC = Literal['python_lock_declaration_mismatch', 'python_requires_python_unsupported',
+    'python_pyproject_toml_invalid']
+_DIAGNOSTIC_CODES: dict[_DIAGNOSTIC, _CODE] = {
+    'python_lock_declaration_mismatch': 'python_project_lock_invalid',
+    'python_requires_python_unsupported': 'python_project_recipe_unsupported',
+    'python_pyproject_toml_invalid': 'python_project_recipe_invalid',
+}
 
 
 class PythonProjectRecipeError(ValueError):
-    def __init__(self, code: _CODE) -> None:
+    def __init__(self, code: _CODE, *, diagnostic: _DIAGNOSTIC | None = None) -> None:
+        if diagnostic is not None and (type(diagnostic) is not str or _DIAGNOSTIC_CODES.get(diagnostic) != code):
+            raise ValueError('invalid Python declaration diagnostic')
         self.code = code
+        self.diagnostic = diagnostic
         super().__init__(code)
 
 
@@ -41,8 +51,13 @@ def _need(value: object, code: _CODE = 'python_project_recipe_invalid') -> None:
 def python_declaration_issue(lock: bytes, error: ValueError | TypeError) -> str:
     """Finite repair data from our parser; never expose arbitrary exception text."""
     fallback = 'python_declaration_invalid'
-    if (type(error) is not PythonProjectRecipeError or error.args != (error.code,)
-            or error.code not in {'python_project_lock_invalid', 'python_project_declaration_limit'}):
+    if type(error) is not PythonProjectRecipeError or error.args != (error.code,):
+        return fallback
+    if error.diagnostic is not None:
+        if type(error.diagnostic) is str and _DIAGNOSTIC_CODES.get(error.diagnostic) == error.code:
+            return error.diagnostic
+        return fallback
+    if error.code not in {'python_project_lock_invalid', 'python_project_declaration_limit'}:
         return fallback
     if not lock:
         return 'python_lock_empty'
@@ -97,7 +112,7 @@ def _python_constraint(value: str) -> str:
         return '>=3.12,<3.13'
     if re.fullmatch(r'[ \t]*==[ \t]*3\.12\.\*[ \t]*', value):
         return '==3.12.*'
-    raise PythonProjectRecipeError('python_project_recipe_unsupported')
+    raise PythonProjectRecipeError('python_project_recipe_unsupported', diagnostic='python_requires_python_unsupported')
 
 
 @dataclass(frozen=True, slots=True)
@@ -219,7 +234,7 @@ def parse_python_project_declaration(
     try:
         project_data = tomllib.loads(manifest.decode('utf-8-sig'))
     except (UnicodeError, tomllib.TOMLDecodeError):
-        raise PythonProjectRecipeError('python_project_recipe_invalid') from None
+        raise PythonProjectRecipeError('python_project_recipe_invalid', diagnostic='python_pyproject_toml_invalid') from None
     except RecursionError:
         raise PythonProjectRecipeError('python_project_declaration_limit') from None
     locked: dict[str, PythonLockedRequirement] = {}
@@ -252,8 +267,9 @@ def parse_python_project_declaration(
     runtime_pins = _pins(project.get('dependencies', []))
     build_pins = _pins(build.get('requires'))
     _need({'setuptools', 'wheel'} <= set(build_pins), 'python_project_recipe_unsupported')
-    _need(all(name in locked and locked[name].version == version
-        for pins in (runtime_pins, build_pins) for name, version in pins.items()), 'python_project_lock_invalid')
+    if not all(name in locked and locked[name].version == version
+               for pins in (runtime_pins, build_pins) for name, version in pins.items()):
+        raise PythonProjectRecipeError('python_project_lock_invalid', diagnostic='python_lock_declaration_mismatch')
     _need(type(project.get('name')) is str and type(project.get('version')) is str
         and type(project.get('requires-python')) is str and type(selection.get('import-module')) is str)
     return PythonProjectDeclaration(
