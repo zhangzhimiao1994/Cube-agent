@@ -232,6 +232,8 @@ class ModelScopeTracker:
         if diagnostic is not None:
             payload["transport_entered_count"] = diagnostic.transport_entered_count
             payload["failure_attempt_count"] = diagnostic.failure_attempt_count
+            if diagnostic.transport_failure is not None:
+                payload["first_incomplete_transport_kind"] = diagnostic.transport_failure.kind.value
         return payload
 
     def begin(self) -> int:

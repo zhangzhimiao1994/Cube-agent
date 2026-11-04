@@ -63,6 +63,12 @@ from agent_hub.models.physical_admission import (
 )
 from agent_hub.models.provider_diagnostics import ProviderDiagnostic, get_provider_diagnostic
 from agent_hub.models.registry import ModelRegistry, NoCapableDeployment
+from agent_hub.models.transport_diagnostics import (
+    TransportFailureDiagnostic,
+    _is_issued_transport_diagnostic,
+    get_transport_diagnostic,
+    preserve_transport_diagnostic,
+)
 from agent_hub.models.types import (
     Deployment,
     ModelRequest,
@@ -157,6 +163,7 @@ class GatewayScopeDiagnostic:
     transport_entered_count: int
     failure_attempt_count: int
     capacity_backend: CapacityBackendDiagnostic | None = field(default=None, repr=False, compare=False)
+    transport_failure: TransportFailureDiagnostic | None = field(default=None, repr=False, compare=False)
     _issuer: object | None = field(default=None, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
@@ -167,7 +174,9 @@ class GatewayScopeDiagnostic:
                 or not 0 <= self.failure_attempt_count <= self.transport_entered_count
                 or self.failure_attempt_count > MAX_GATEWAY_FAILURE_ATTEMPTS
                 or (self.capacity_backend is not None
-                    and not _is_issued_capacity_diagnostic(self.capacity_backend))):
+                    and not _is_issued_capacity_diagnostic(self.capacity_backend))
+                or (self.transport_failure is not None
+                    and not _is_issued_transport_diagnostic(self.transport_failure))):
             raise ValueError("invalid gateway scope diagnostic")
 
 
@@ -351,6 +360,15 @@ class _SafeTransportFailure:
     error: ModelTransportError | ModelGatewayError | ModelResponseCancelled | _PhysicalAdmissionStopped
 
 
+def _redacted_transport_error(
+    error: ModelTransportError, *, error_type: type[ModelTransportError] = ModelTransportError,
+) -> ModelTransportError:
+    result = error_type("model transport failed", status_code=error.status_code,
+                        diagnostic=get_provider_diagnostic(error))
+    preserve_transport_diagnostic(result, error)
+    return result
+
+
 @dataclass(slots=True)
 class _GatewayFailureHistory:
     call_id: str = field(default_factory=lambda: str(uuid4()))
@@ -360,6 +378,7 @@ class _GatewayFailureHistory:
     history_complete: bool = True
     first_incomplete: tuple[ScopeIncompletePhase, ScopeIncompleteReason] | None = None
     capacity_backend: CapacityBackendDiagnostic | None = None
+    transport_failure: TransportFailureDiagnostic | None = None
 
     def mark_incomplete(self, phase: ScopeIncompletePhase, reason: ScopeIncompleteReason) -> None:
         self.history_complete = False
@@ -372,6 +391,7 @@ class _GatewayFailureHistory:
         diagnostic = GatewayScopeDiagnostic(
             *self.first_incomplete, self.entered_count, len(self.attempts),
             capacity_backend=self.capacity_backend,
+            transport_failure=self.transport_failure,
         )
         object.__setattr__(diagnostic, "_issuer", _SCOPE_DIAGNOSTIC_ISSUER)
         return diagnostic
@@ -430,6 +450,7 @@ class _GatewayFailureTracking:
         self, outcome: Literal["empty_response", "transport_error"],
         status_code: int | None, usage: TokenUsage | None = None,
         provider_diagnostic: ProviderDiagnostic | None = None,
+        transport_failure: TransportFailureDiagnostic | None = None,
     ) -> None:
         if self.ordinal == 0 or self.recorded or self.ordinal > MAX_GATEWAY_FAILURE_ATTEMPTS:
             self.history.mark_incomplete(ScopeIncompletePhase.RECORDER,
@@ -443,6 +464,8 @@ class _GatewayFailureTracking:
             self.history.mark_incomplete(ScopeIncompletePhase.RECORDER,
                                          ScopeIncompleteReason.INVALID_USAGE)
         elif outcome == "transport_error" and status_code is None:
+            if self.history.first_incomplete is None and _is_issued_transport_diagnostic(transport_failure):
+                self.history.transport_failure = transport_failure
             self.history.mark_incomplete(ScopeIncompletePhase.TRANSPORT,
                                          ScopeIncompleteReason.MISSING_STATUS)
         try:
@@ -1664,11 +1687,7 @@ class ModelGateway:
                 except ModelTransportError as error:
                     stream_primary_error = error
                     status_code = error.status_code
-                    primary_error = ModelTransportError(
-                        "model transport failed",
-                        status_code=error.status_code,
-                        diagnostic=get_provider_diagnostic(error),
-                    )
+                    primary_error = _redacted_transport_error(error)
                     error.__traceback__ = None
                     error.__context__ = None
                     error.__cause__ = None
@@ -1683,10 +1702,7 @@ class ModelGateway:
                     if isinstance(safe_error, ModelTransportError) and not isinstance(
                         safe_error, ModelResponseError,
                     ):
-                        safe_error = ModelTransportError(
-                            "model transport failed", status_code=safe_error.status_code,
-                            diagnostic=get_provider_diagnostic(safe_error),
-                        )
+                        safe_error = _redacted_transport_error(safe_error)
                     stream_primary_error = safe_error
                     _LOGGER.error(
                         "model_stream_unexpected_failure deployment_id=%s error_type=%s",
@@ -1700,10 +1716,7 @@ class ModelGateway:
                         primary_error = safe_error
                     elif isinstance(safe_error, ModelTransportError):
                         status_code = safe_error.status_code
-                        primary_error = ModelTransportError(
-                            "model transport failed", status_code=status_code,
-                            diagnostic=get_provider_diagnostic(safe_error),
-                        )
+                        primary_error = _redacted_transport_error(safe_error)
                     else:
                         primary_error = ModelGatewayError("model client internal failure")
                 finally:
@@ -1717,7 +1730,8 @@ class ModelGateway:
             if should_record:
                 if failure_tracking is not None and isinstance(primary_error, ModelTransportError) and not isinstance(primary_error, ModelResponseError):
                     failure_tracking.record("transport_error", primary_error.status_code,
-                                            provider_diagnostic=get_provider_diagnostic(primary_error))
+                                            provider_diagnostic=get_provider_diagnostic(primary_error),
+                                            transport_failure=get_transport_diagnostic(primary_error))
                 if transport_started is None:  # pragma: no cover - invariant
                     raise ModelGatewayError("model transport timing unavailable")
                 latency = max(0.0, self._monotonic() - transport_started)
@@ -2175,7 +2189,8 @@ class ModelGateway:
         except ModelTransportError as error:
             if failure_tracking is not None:
                 failure_tracking.record("transport_error", error.status_code,
-                                        provider_diagnostic=get_provider_diagnostic(error))
+                                        provider_diagnostic=get_provider_diagnostic(error),
+                                        transport_failure=get_transport_diagnostic(error))
             _LOGGER.warning(
                 "model_transport_failed deployment_id=%s status_code=%s error_type=%s",
                 deployment.id,
@@ -2185,8 +2200,7 @@ class ModelGateway:
             error_type = (ModelNegotiationExhausted if type(error) is ModelNegotiationExhausted
                           else ModelTransportError)
             outcome = _SafeTransportFailure(
-                error_type("model transport failed", status_code=error.status_code,
-                           diagnostic=get_provider_diagnostic(error))
+                _redacted_transport_error(error, error_type=error_type)
             )
             error.__traceback__ = None
             del error
@@ -2195,10 +2209,7 @@ class ModelGateway:
             if isinstance(safe_error, ModelTransportError) and not isinstance(
                 safe_error, ModelResponseError,
             ):
-                safe_error = ModelTransportError(
-                    "model transport failed", status_code=safe_error.status_code,
-                    diagnostic=get_provider_diagnostic(safe_error),
-                )
+                safe_error = _redacted_transport_error(safe_error)
             _LOGGER.error(
                 "model_transport_unexpected_failure deployment_id=%s error_type=%s",
                 deployment.id,
@@ -2214,10 +2225,10 @@ class ModelGateway:
             elif isinstance(safe_error, ModelTransportError):
                 if failure_tracking is not None:
                     failure_tracking.record("transport_error", safe_error.status_code,
-                                            provider_diagnostic=get_provider_diagnostic(safe_error))
+                                            provider_diagnostic=get_provider_diagnostic(safe_error),
+                                            transport_failure=get_transport_diagnostic(safe_error))
                 outcome = _SafeTransportFailure(
-                    ModelTransportError("model transport failed", status_code=safe_error.status_code,
-                                        diagnostic=get_provider_diagnostic(safe_error))
+                    _redacted_transport_error(safe_error)
                 )
             else:
                 if failure_tracking is not None:

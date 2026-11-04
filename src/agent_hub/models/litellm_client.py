@@ -39,6 +39,11 @@ from agent_hub.models.responses import (
     parse_response,
     response_create_kwargs,
 )
+from agent_hub.models.transport_diagnostics import (
+    _capture_transport_diagnostic,
+    _exception_cause,
+    preserve_transport_diagnostic,
+)
 from agent_hub.models.types import (
     Deployment,
     JsonScalar,
@@ -701,18 +706,20 @@ def safe_model_client_error(
             # Preserve the trusted control class, not the SDK traceback/body.
             return _PhysicalAdmissionStopped()
         seen.add(id(cause))
-        cause = cause.__cause__
+        cause = _exception_cause(cause)
     diagnostic = _capture_provider_diagnostic(error, request_shape, prior_diagnostic)
     if type(error) is ModelNegotiatedClientError:
         return ModelNegotiatedClientError("model client internal failure")
     if isinstance(error, ModelResponseError):
-        return _safe_response_error(error)
+        safe_response = _safe_response_error(error)
+        preserve_transport_diagnostic(safe_response, error)
+        return safe_response
     if isinstance(error, APIResponseValidationError):
         return ModelResponseError("model response rejected", status_code=error.status_code)
     if (
         isinstance(error, APIConnectionError)
-        and error.__cause__ is not None
-        and not isinstance(error.__cause__, _NETWORK_ERRORS)
+        and _exception_cause(error) is not None
+        and not isinstance(_exception_cause(error), _NETWORK_ERRORS)
     ):
         return ModelClientError("model client internal failure")
     details: list[str] = []
@@ -734,11 +741,13 @@ def safe_model_client_error(
     if safe_status is not None and not 100 <= safe_status <= 599:
         safe_status = None
     error_type = ModelNegotiationExhausted if type(error) is ModelNegotiationExhausted else ModelTransportError
-    return error_type(
+    safe_error = error_type(
         f"model transport failed for deployment {deployment_id!r}{suffix}",
         status_code=safe_status,
         diagnostic=diagnostic,
     )
+    _capture_transport_diagnostic(safe_error, error)
+    return safe_error
 
 
 async def _close_ignoring_failures(client: _OpenAIClient | None) -> bool:
