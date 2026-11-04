@@ -539,6 +539,7 @@ class GeneratedProjectService:
         from agent_hub.capabilities.execution_authority import _trusted_review_context
         from agent_hub.capabilities.python_input_preparation import (
             DynamicPythonResolutionFlow,
+            ResolutionDeclarationChangedError,
             dynamic_python_needs,
             validate_dynamic_python_controls,
         )
@@ -592,10 +593,11 @@ class GeneratedProjectService:
         assert root_config_sha256 is not None
         source = _fingerprint(observation[1])
         scope = metadata_scope(latest, actor=actor, live=True)
-        context, _ = _trusted_review_context(tenant_id=authority.tenant_id, run_id=authority.run_id,
+        _trusted_review_context(tenant_id=authority.tenant_id, run_id=authority.run_id,
             user_id=authority.user_id, role=authority.role, current_record=latest)
-        original_deadline = latest.created_at + timedelta(
-            seconds=min(context.timeout_seconds, authority.timeout_seconds))
+        # The live context carries remaining time. Charge elapsed time once;
+        # the resolution client separately enforces that remaining-time cap.
+        original_deadline = latest.created_at + timedelta(seconds=authority.timeout_seconds)
         journal_scope = {**scope.model_dump(mode='json'), 'root_sha256': root_config_sha256,
             'catalog_sha256': base.profile.catalog_sha256}
         journal = self._resolution_journal
@@ -698,6 +700,12 @@ class GeneratedProjectService:
                 await flow.prepare(needs=needs, environment=environment, planning=planning)
             else:
                 await flow.resolve_data(needs=needs, environment=environment, planning=planning)
+        except ResolutionDeclarationChangedError as error:
+            if (type(error) is not ResolutionDeclarationChangedError or len(error.args) != 1
+                    or type(error.args[0]) is not str or error.args[0] != 'resolution_declaration_changed'):
+                raise
+            await self._reject_draft(authority, actor, observation,
+                'generated_acceptance_python_declaration_invalid', ('python_declaration_invalid',))
         except ResolutionApprovalRequired as error:
             # Reuse the existing concrete project.verify approval projection.
             # The request retains the distinct resolution/publication namespace.
