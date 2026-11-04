@@ -151,7 +151,7 @@ async def test_invalid_python_recipe_can_be_repaired_before_freeze(tmp_path: Pat
         write_file(service.root, f'{project_path()}/{name}', body)
     with pytest.raises(GeneratedProjectDraftRejected, match='generated_acceptance_python_declaration_invalid') as caught:
         await service.prepare(TENANT, RUN, 'engineer', user_id=USER)
-    assert caught.value.rejection.issues == ('python_declaration_invalid',)
+    assert caught.value.rejection.issues == ('python_lock_fixed_versions_required',)
     assert repo.updates == 0
 
 

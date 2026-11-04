@@ -97,7 +97,7 @@ def _feedback(
     rejection = validated_generated_draft_payload(payload['generated_draft_rejection'])
     if rejection is None:
         return None
-    if rejection['schema_version'] == 2 and (
+    if rejection['schema_version'] in (2, 3) and (
         type(route.get('python_dependency_preflight_version')) is not int
         or route['python_dependency_preflight_version'] != 1
     ):

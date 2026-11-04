@@ -20,6 +20,7 @@ from agent_hub.auth.models import Role
 from agent_hub.capabilities.generated_project_draft import (
     GeneratedDraftRejection,
     dependency_observation_payload,
+    dependency_pins_payload,
 )
 from agent_hub.capabilities.project_acceptance import (
     GeneratedAcceptanceEnvelope,
@@ -470,12 +471,18 @@ class GeneratedProjectService:
         observation_sha = hashlib.sha256(_encoded({'schema_version': 1,
             'manifest': {'missing': True} if raw is None else {'sha256': hashlib.sha256(raw).hexdigest()},
             'source_files': files})).hexdigest()
+        pins = None
+        if reason == 'generated_acceptance_python_declaration_invalid':
+            flow = self._resolution_flows.get((authority.tenant_id, authority.run_id, actor))
+            if flow is not None and flow.descriptor is not None:
+                pins = tuple(dependency_pins_payload(flow.public_data()['pins']))
         raise GeneratedProjectDraftRejected(GeneratedDraftRejection(
             tenant_id=str(authority.tenant_id), user_id=str(authority.user_id), run_id=str(authority.run_id),
             project_id=authority.project_id, session_id=authority.session_id,
             request_sha256=authority.request_sha256, proposer_actor=actor,
             observation_sha256=observation_sha, reason=reason, issues=issues,
-            schema_version=2 if dependency is not None else 1, dependency_closure=dependency))
+            schema_version=3 if pins is not None else 2 if dependency is not None else 1,
+            dependency_closure=dependency, dependency_pins=pins))
 
     def configure_resolution_artifacts(self, artifacts: ArtifactRepository) -> None:
         from agent_hub.capabilities.python_input_preparation import DynamicResolutionJournal
@@ -957,6 +964,7 @@ class GeneratedProjectService:
                 phase = 'python_controls'
                 from agent_hub.capabilities.python_project_recipe import (
                     parse_python_project_declaration,
+                    python_declaration_issue,
                 )
                 controls: list[bytes] = []
                 for name in ('pyproject.toml', 'requirements.lock'):
@@ -969,9 +977,10 @@ class GeneratedProjectService:
                 phase = 'python_declaration'
                 try:
                     parse_python_project_declaration(*controls, max_control_bytes=256 * 1024, max_requirements=128)
-                except (ValueError, TypeError):
+                except (ValueError, TypeError) as error:
                     await self._reject_draft(authority, actor, observation,
-                        'generated_acceptance_python_declaration_invalid', ('python_declaration_invalid',))
+                        'generated_acceptance_python_declaration_invalid',
+                        (python_declaration_issue(controls[1], error),))
                 if _dependency_selected(route):
                     if (authority.tenant_id, authority.run_id, actor) in self._resolution_flows:
                         phase = 'dependency_resolution_publish'

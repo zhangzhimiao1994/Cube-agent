@@ -57,6 +57,12 @@ async def test_changed_requirement_gets_bound_draft_feedback_without_second_reso
           pytest.raises(GeneratedProjectDraftRejected) as original):
         await service.prepare(context.tenant_id, context.run_id, 'engineer', user_id=present(context.actor_id))
     assert original.value.rejection.reason == 'generated_acceptance_python_declaration_invalid'
+    repaired_data = original.value.rejection.to_payload()
+    assert repaired_data['schema_version'] == 3
+    pins = repaired_data['dependency_pins']
+    assert isinstance(pins, list) and len(pins) == 4
+    assert {pin['name'] for pin in pins} == {'demo-dep', 'demo-helper', 'setuptools', 'wheel'}
+    assert all(set(pin) == {'name', 'version', 'filename', 'sha256', 'size_bytes'} for pin in pins)
     assert calls.count('resolve_python_inputs') == 1 and state.descriptor is not None
     journal = present(service._resolution_journal)
     checkpoints = await journal.read_artifacts(context.tenant_id, context.run_id,

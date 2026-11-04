@@ -143,13 +143,13 @@ async def test_empty_lock_draft_is_corrected_from_catalog_before_capture_and_ver
             assert failure.failure_reason == "generated project draft requires correction"
             data = cast(Mapping[str, JsonValue], failure.payload["generated_draft_rejection"])
             assert data["reason"] == "generated_acceptance_python_declaration_invalid"
-            assert data["issues"] == ("python_declaration_invalid",)
+            assert data["issues"] == ("python_lock_empty",)
             assert data["execution_started"] is False and data["phase"] == "before_capture"
             assert data["run_id"] == str(RUN) and data["tenant_id"] == str(TENANT)
             assert data["project_id"] == "project-a" and data["session_id"] == "session-a"
             prompt = "\n".join(cast(str, m.content) for m in request.messages)
             assert "UNTRUSTED_GENERATED_DRAFT_JSON" in prompt
-            assert "python_declaration_invalid" in prompt
+            assert "python_lock_empty" in prompt
             assert "no acceptance was frozen" in prompt
             inspection = next(r for r in results if r.tool_name == "project.inspect")
             profile = cast(Mapping[str, Any], inspection.payload["python_build_profile"])
