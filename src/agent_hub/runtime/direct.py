@@ -2448,6 +2448,7 @@ class DirectRuntime:
         verification_trace = _WorkspaceVerificationTrace(context=context) if verification_enabled else None
         verification_attempt = 0
         verification_failure: HarnessToolCallResult | None = None
+        verification_failure_source: str | None = None
         draft_feedback: Mapping[str, JsonValue] | None = None
         prerequisite_feedback: Mapping[str, JsonValue] | None = None
         prerequisite_repair_consumed = False
@@ -2475,6 +2476,7 @@ class DirectRuntime:
         seen_reads: set[tuple[str, str]] = set()
         seen_catalog_queries: set[str] = set()
         no_progress_sources: set[str] = set()
+        failed_completion_corrections: set[str] = set()
         read_attempt = 0
         while True:
             if verification_trace is not None:
@@ -2551,6 +2553,20 @@ class DirectRuntime:
                     path: content for path, content in batch.files.items()
                     if known_files.get(path) == hashlib.sha256(content.encode("utf-8")).hexdigest()
                 })
+            failed_completion = False
+            if batch.complete and validation_code is None and verification_enabled:
+                source_digest = _workspace_source_digest(known_files, context)
+                if source_digest in failed_source_digests:
+                    _LOGGER.warning('direct_workspace_no_progress run_id=%s phase=verification_source '
+                                    'known_file_count=%s batch_file_count=%s changed_file_count=%s',
+                                    context.run_id, len(known_files), len(batch.files), changed_files)
+                    if (verification_failure is None or verification_failure_source != source_digest
+                            or source_digest in failed_completion_corrections):
+                        _raise_execution_error("workspace verification repair made no progress")
+                    # A known failed check permits diagnosis, never another execution of
+                    # identical source. Keep its receipt and the original budget/window.
+                    failed_completion_corrections.add(source_digest)
+                    failed_completion = True
             no_progress_feedback = False
             if validation_code is not None:
                 validation_failures[validation_code] = validation_failures.get(validation_code, 0) + 1
@@ -2559,10 +2575,10 @@ class DirectRuntime:
             else:
                 if changed_files:
                     validation_failures.clear()
-                gain = (0 if catalog_read is not None or completion_only else changed_files if diagnostic_reads else
+                gain = (0 if failed_completion or catalog_read is not None or completion_only else changed_files if diagnostic_reads else
                         changed_files + read_gain if scoped_reads else changed_files)
                 if (gain == 0 and catalog_read is None and (not diagnostic_reads or read_gain == 0)
-                        and not new_missing_observation and not completion_only):
+                        and not new_missing_observation and not completion_only and not failed_completion):
                     source_digest = _workspace_source_digest(known_files, context)
                     repeated = source_digest in no_progress_sources
                     _LOGGER.warning(
@@ -2580,7 +2596,7 @@ class DirectRuntime:
                 completed_batches += int(gain > 0 and catalog_read is None
                                          and (not diagnostic_reads or changed_files > 0))
             # Observations can inform repair within the saved window, never earn another one.
-            if (not no_progress_feedback and not completion_only and catalog_read is None
+            if (not failed_completion and not no_progress_feedback and not completion_only and catalog_read is None
                     and (not diagnostic_reads or validation_code is None and changed_files > 0)
                     and (not new_missing_observation or changed_files > 0 or read_gain > 0)):
                 active_token_limit = _workspace_delivery_token_limit(
@@ -2596,16 +2612,10 @@ class DirectRuntime:
                 now=asyncio.get_running_loop().time(),
             )
             deadline = delivery_deadline.deadline
-            if batch.summary and validation_code is None:
+            if batch.summary and validation_code is None and not failed_completion:
                 summaries.append(batch.summary)
-            if batch.complete and validation_code is None:
+            if batch.complete and validation_code is None and not failed_completion:
                 if verification_enabled:
-                    source_digest = _workspace_source_digest(known_files, context)
-                    if source_digest in failed_source_digests:
-                        _LOGGER.warning('direct_workspace_no_progress run_id=%s phase=verification_source '
-                                        'known_file_count=%s batch_file_count=%s changed_file_count=%s',
-                                        context.run_id, len(known_files), len(batch.files), changed_files)
-                        _raise_execution_error("workspace verification repair made no progress")
                     verification_attempt += 1
                 try:
                     delivery = await self._finish_workspace_delivery(
@@ -2623,6 +2633,7 @@ class DirectRuntime:
                     rejected_draft_observations.add(fingerprint)
                     failed_source_digests.add(_workspace_source_digest(known_files, context))
                     verification_failure = None
+                    verification_failure_source = None
                     error.__traceback__ = None
                     error.__context__ = None
                     error.__cause__ = None
@@ -2636,6 +2647,7 @@ class DirectRuntime:
                     prerequisite_repair_consumed = True
                     draft_feedback = None
                     verification_failure = None
+                    verification_failure_source = None
                     failed_source_digests.add(_workspace_source_digest(known_files, context))
                     error.__traceback__ = None
                     error.__context__ = None
@@ -2644,7 +2656,8 @@ class DirectRuntime:
                     draft_feedback = None
                     prerequisite_feedback = None
                     verification_failure = error.result
-                    failed_source_digests.add(_workspace_source_digest(known_files, context))
+                    verification_failure_source = _workspace_source_digest(known_files, context)
+                    failed_source_digests.add(verification_failure_source)
                     error.__traceback__ = None
                     error.__context__ = None
                     error.__cause__ = None
@@ -2816,6 +2829,13 @@ class DirectRuntime:
                        "safe relative paths, complete=false and nonempty continuation. Reads do not "
                        "renew the remaining budget or grant authority; never repeat unchanged reads."
                        if diagnostic_reads else "")
+                    + ("\nThe current acknowledged source is a previously failed source. A complete=true "
+                       "response cannot finish this task. Diagnose the failed check and return changed file "
+                       "contents in the allowed implementation paths; preserve protected tests and controls. "
+                       "Do not repeat verification of this source or merely revise a summary. Another complete "
+                       "response for the same failed source will stop. This correction grants no tools, "
+                       "permissions, extra time/tokens or UNKNOWN replay."
+                       if failed_completion else "")
                     + "\nProgress: " + progress_payload
                 ))
             elif protected_feedback:

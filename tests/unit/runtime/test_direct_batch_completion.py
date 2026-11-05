@@ -104,7 +104,7 @@ async def test_failed_verify_then_repeated_empty_never_reverifies_or_bundles(tmp
         _ = [event async for event in runtime.run(context)]
     assert harness.calls == ['project.inspect', 'workspace.write_text', 'workspace.write_text',
         'project.verify']
-    assert len(model.requests) == 2
+    assert len(model.requests) == 3
 
 
 @pytest.mark.parametrize('terminal', [
