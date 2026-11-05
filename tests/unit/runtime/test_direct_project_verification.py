@@ -735,11 +735,12 @@ async def test_direct_repair_cycle_stops_before_replaying_failed_content(tmp_pat
 
 async def test_direct_manifest_only_repair_is_not_source_progress(tmp_path: Path) -> None:
     ctx = context()
-    model = Model(batch({"main.py": BROKEN}), batch({"DELIVERY_MANIFEST.json": "{}"}))
+    model = Model(batch({"main.py": BROKEN}), batch({"DELIVERY_MANIFEST.json": "{}"}),
+                  batch({"main.py": BROKEN}))
     runtime, backend, shared, _ = runner(tmp_path, ctx, model)
     with pytest.raises(RuntimeExecutionError, match="no progress"):
         _ = [event async for event in runtime.run(ctx)]
-    assert len(model.requests) == 2 and len(shared.requests) == 1
+    assert len(model.requests) == 3 and len(shared.requests) == 1
     assert "workspace.bundle" not in backend.calls
 
 
@@ -811,11 +812,12 @@ async def test_direct_verification_policy_blocks_repair_and_bundle(
 
 
 async def test_direct_unchanged_repair_stops_without_reverification_or_bundle(tmp_path: Path) -> None:
-    ctx, model = context(), Model(batch({"main.py": BROKEN}), batch({"main.py": BROKEN}))
+    ctx, model = context(), Model(batch({"main.py": BROKEN}), batch({"main.py": BROKEN}),
+                                 batch({"main.py": BROKEN}))
     runtime, backend, shared, _ = runner(tmp_path, ctx, model)
     with pytest.raises(RuntimeExecutionError, match="no progress"):
         _ = [event async for event in runtime.run(ctx)]
-    assert len(model.requests) == 2 and len(shared.requests) == 1
+    assert len(model.requests) == 3 and len(shared.requests) == 1
     assert "workspace.bundle" not in backend.calls
 
 

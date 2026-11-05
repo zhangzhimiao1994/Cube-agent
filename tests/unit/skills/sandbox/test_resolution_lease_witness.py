@@ -20,6 +20,7 @@ import pytest
 from agent_hub.skills.sandbox import python_dependency_index_store as file_api
 from agent_hub.skills.sandbox import python_input_supply_catalog as catalog_api
 from agent_hub.skills.sandbox import python_metadata_preparation_broker as broker_api
+from agent_hub.skills.sandbox import python_resolution_protocol as protocol_api
 from agent_hub.skills.sandbox import python_resolution_store as store_api
 from agent_hub.skills.sandbox.broker import BrokerPolicy
 from agent_hub.skills.sandbox.project import ProjectExecutionBroker, ProjectInvocation, _Execution
@@ -305,15 +306,49 @@ def witness(first: ResolutionRequest) -> store_api.ResolutionLeaseWitness:
     return store_api.ResolutionLeaseWitness(cast(Path, PurePosixPath("/private/stage")), first)
 
 
-def test_private_witness_crosses_old_lease_without_changing_request_or_intent(filesystem: RootFS) -> None:
+@dataclass
+class WitnessClock:
+    utc: datetime
+    ticks: float
+
+    def now(self, timezone: object) -> datetime:
+        assert timezone is UTC
+        return self.utc
+
+    def monotonic(self) -> float:
+        return self.ticks
+
+    def advance(self, seconds: float) -> None:
+        assert seconds >= 0
+        self.utc += timedelta(seconds=seconds)
+        self.ticks += seconds
+
+
+def witness_clock(monkeypatch: pytest.MonkeyPatch, original: ResolutionClaim) -> WitnessClock:
+    # request() fixes the original task at 120s. Anchor both clocks to that
+    # unchanged claim; only explicit advance(), never scheduler delay, ages it.
+    clock = WitnessClock(original.original_deadline - timedelta(seconds=120),
+                         original.monotonic_deadline - 120)
+    local_time = SimpleNamespace(monotonic=clock.monotonic, sleep=clock.advance)
+    monkeypatch.setattr(protocol_api, "datetime", SimpleNamespace(now=clock.now))
+    monkeypatch.setattr(protocol_api, "time", local_time)
+    monkeypatch.setattr(store_api, "time", local_time)
+    monkeypatch.setattr(file_api, "time", local_time)
+    return clock
+
+
+def test_private_witness_crosses_old_lease_without_changing_request_or_intent(
+    filesystem: RootFS, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     first = request()
+    clock = witness_clock(monkeypatch, first.claim)
     first = first.model_copy(update={"claim": first.claim.model_copy(update={
-        "lease_expires_at": datetime.now(UTC) + timedelta(seconds=0.3)})})
+        "lease_expires_at": clock.now(UTC) + timedelta(seconds=0.3)})})
     item = witness(first)
     item.initialize()
     current = renewed(first.claim)
     item.renew(first.claim, current)
-    time.sleep(0.35)
+    clock.advance(0.35)
     with pytest.raises(ValueError, match="resolution_deadline"):
         _ = first.claim.deadline
     assert item.current() == current
@@ -370,13 +405,16 @@ def test_no_renewal_or_expired_renewal_fails_closed(filesystem: RootFS) -> None:
     assert filesystem.nodes["/private/stage/resolution-lease.json"].data == raw
 
 
-def test_disconnected_owner_cannot_keep_witness_live(filesystem: RootFS) -> None:
+def test_disconnected_owner_cannot_keep_witness_live(
+    filesystem: RootFS, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     first = request()
+    clock = witness_clock(monkeypatch, first.claim)
     first = first.model_copy(update={"claim": first.claim.model_copy(update={
-        "lease_expires_at": datetime.now(UTC) + timedelta(seconds=0.3)})})
+        "lease_expires_at": clock.now(UTC) + timedelta(seconds=0.3)})})
     item = witness(first)
     item.initialize()
-    time.sleep(0.35)
+    clock.advance(0.35)
     with pytest.raises(ValueError, match="resolution_deadline"):
         item.current()
     with pytest.raises(ValueError, match="resolution_deadline"):
