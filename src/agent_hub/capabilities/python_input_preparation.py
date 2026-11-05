@@ -701,4 +701,4 @@ def validate_dynamic_python_controls(manifest: bytes, lock: bytes, descriptor: o
         if closure.status != 'complete':
             raise ValueError('resolution_declaration_changed')
     except ValueError:
-        raise ValueError('resolution_declaration_changed') from None
+        raise ResolutionDeclarationChangedError() from None

@@ -424,11 +424,11 @@ async def test_actual_manifest_lock_closure_must_match_verified_data_before_fres
     lock = prep.dynamic_python_pins(descriptor.to_payload()).encode()
     prep.validate_dynamic_python_controls(manifest_bytes, lock, descriptor.to_payload())
     entry = descriptor.wheels[0].candidate.download
-    with pytest.raises(ValueError, match="resolution_declaration_changed"):
+    with pytest.raises(prep.ResolutionDeclarationChangedError, match="resolution_declaration_changed"):
         prep.validate_dynamic_python_controls(manifest_bytes,
             lock.replace(entry.sha256.encode(), b"f" * 64), descriptor.to_payload())
     missing = b"".join(line + b"\n" for line in lock.splitlines() if not line.startswith(b"demo-helper=="))
-    with pytest.raises(ValueError, match="resolution_declaration_changed"):
+    with pytest.raises(prep.ResolutionDeclarationChangedError, match="resolution_declaration_changed"):
         prep.validate_dynamic_python_controls(manifest_bytes, missing, descriptor.to_payload())
 
 

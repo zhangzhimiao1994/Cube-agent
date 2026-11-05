@@ -5,6 +5,7 @@ from typing import Unpack
 
 import pytest
 
+from agent_hub.capabilities import python_input_preparation as prep
 from agent_hub.capabilities.execution_authority import bind_execution_authority
 from agent_hub.capabilities.generated_project_service import (
     GeneratedProjectDraftRejected,
@@ -15,6 +16,7 @@ from agent_hub.capabilities.python_input_preparation import (
     DynamicPythonResolutionFlow,
     ResolutionDeclarationChangedError,
 )
+from agent_hub.capabilities.python_project_recipe import parse_python_project_declaration
 from agent_hub.skills.sandbox import python_resolution_worker as wire
 from agent_hub.skills.sandbox.python_resolution_protocol import ResolutionRequest, ResolutionStatus
 from tests.unit.capabilities.dynamic_resolution_typed_fixture import ResolveArgs, RootState, present
@@ -102,6 +104,73 @@ async def test_changed_requirement_gets_bound_draft_feedback_without_second_reso
     assert calls.count('resolve_python_inputs') == 1
     assert 'freeze_python_resolution' not in calls and 'publish_python_resolution' not in calls
     assert repo.updates == 0 and not (service.root / '.project-contracts').exists()
+
+
+@pytest.mark.parametrize('cold', [False, True], ids=['warm', 'restored-service'])
+async def test_real_publish_control_mismatch_is_draft_feedback_before_any_effect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cold: bool,
+) -> None:
+    service, repo, context, _ = generated_dynamic_case(tmp_path, monkeypatch)
+    descriptor = await descriptor_with_build_inputs()
+    state = RootState()
+    calls: list[str] = []
+
+    async def transport(request: ResolutionRequest) -> ResolutionStatus:
+        calls.append(request.action)
+        if request.action == 'inspect_python_resolution':
+            return ResolutionStatus(state='resolved' if state.descriptor else 'absent', key=request.key,
+                descriptor=state.descriptor.to_payload() if state.descriptor else None)
+        assert request.action == 'resolve_python_inputs' and state.descriptor is None
+        state.origin = request.claim
+        state.descriptor = replace(descriptor, scope=request.claim.resolution_scope(), needs=request.needs)
+        return ResolutionStatus(state='resolved', key=request.key, descriptor=state.descriptor.to_payload())
+
+    async def approved(*args: object) -> bool:
+        return True  # Offline approval-store fixture; no external authority or process.
+
+    repo.is_capability_approval_scope_approved = approved
+    monkeypatch.setattr(wire, 'request_resolution', transport)
+    worker = present(repo.row.worker_id)
+    with (bind_execution_authority(context, worker_id=worker, actor='engineer'),
+          pytest.raises(GeneratedProjectDraftRejected)):
+        await service.prepare(context.tenant_id, context.run_id, 'engineer', user_id=present(context.actor_id))
+    resolved = present(state.descriptor)
+    assert calls.count('resolve_python_inputs') == 1
+    journal = present(service._resolution_journal)
+    checkpoints = await journal.read_artifacts(context.tenant_id, context.run_id,
+        artifact_type='python_resolution_checkpoint', producer='python_resolution')
+    assert checkpoints
+    work = service.root / project_path()
+    manifest = work / 'pyproject.toml'
+    manifest.write_bytes(manifest.read_bytes().replace(b'demo-dep>=1', b'demo-dep==1.0'))
+    lock = prep.dynamic_python_pins(resolved.to_payload()).encode()
+    checksum = resolved.wheels[0].candidate.download.sha256.encode()
+    assert checksum in lock
+    lock = lock.replace(checksum, b'f' * 64)
+    (work / 'requirements.lock').write_bytes(lock)
+    # A real, syntactically valid declaration reaches the actual publication
+    # validator. No typed exception or validator result is injected here.
+    parse_python_project_declaration(manifest.read_bytes(), lock,
+        max_control_bytes=256 * 1024, max_requirements=128)
+    if cold:
+        service = GeneratedProjectService(root=service.root, repository=repo,
+            dependency_inspector=service._dependency_inspector, metadata_client=service._metadata_client)
+        service.configure_resolution_artifacts(journal.artifacts)
+    with (bind_execution_authority(context, worker_id=worker, actor='engineer'),
+          pytest.raises(GeneratedProjectDraftRejected) as caught):
+        await service.prepare(context.tenant_id, context.run_id, 'engineer', user_id=present(context.actor_id))
+    rejection = caught.value.rejection
+    assert rejection.reason == 'generated_acceptance_python_declaration_invalid'
+    assert rejection.issues == ('python_declaration_invalid',)
+    assert rejection.execution_started is False and rejection.phase == 'before_capture'
+    assert (rejection.tenant_id, rejection.run_id, rejection.user_id, rejection.proposer_actor) == (
+        str(context.tenant_id), str(context.run_id), str(context.actor_id), 'engineer')
+    assert calls.count('resolve_python_inputs') == 1
+    assert 'freeze_python_resolution' not in calls and 'publish_python_resolution' not in calls
+    assert repo.updates == 0 and not (service.root / '.project-contracts').exists()
+    assert 'generated_project_preparation' not in present(repo.row.routing_decision)
+    assert await journal.read_artifacts(context.tenant_id, context.run_id,
+        artifact_type='python_resolution_checkpoint', producer='python_resolution') == checkpoints
 
 
 @pytest.mark.parametrize('kind', ['plain', 'subclass', 'mutated'])
