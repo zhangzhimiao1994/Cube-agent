@@ -6490,7 +6490,11 @@ function RunsPageForActor() {
     return resolvePermissionSelection(permissionMode, sandboxProfile, supportedPermissionModes);
   }
   const [executionBackend, setExecutionBackend] = useState<ExecutionBackendId>("systemd");
-  const [runWorkspacePath, setRunWorkspacePath] = useState("");
+  const [runWorkspaceSelection, setRunWorkspaceSelection] = useState<{ conversationId: string; path: string } | null>(null);
+  const runWorkspacePath = runWorkspaceSelection?.conversationId === conversationId ? runWorkspaceSelection.path : "";
+  function setRunWorkspacePath(path: string) {
+    setRunWorkspaceSelection(path ? { conversationId, path } : null);
+  }
   const [projectInputAuthorization, setProjectInputAuthorization] = useState<{
     scopeKey: string;
     paths: string;
@@ -6744,10 +6748,12 @@ function RunsPageForActor() {
     : null;
   const capabilityPending = capabilityDecision?.status === "pending";
   const capabilityHistory = useRunCapabilityApprovals(capabilityApproval ? capabilityApprovalRun : undefined);
-  const activeWorkspaceProjectId =
-    activeConversation.data?.project_id?.trim() || listedConversationMetadata?.project_id?.trim() || projectId.trim() || "default";
-  const activeWorkspaceSessionId =
-    activeConversation.data?.workspace_path?.trim() || listedConversationMetadata?.workspace_path?.trim() || activeConversationId;
+  // A URL identifies a conversation, not its workspace. Never query a fallback
+  // project/session while its metadata is loading, or combine partial scopes.
+  const activeWorkspaceMetadata = [activeConversation.data, listedConversationMetadata].find((item) =>
+    item?.conversation_id === activeConversationId && item.project_id?.trim() && item.workspace_path?.trim());
+  const activeWorkspaceProjectId = activeWorkspaceMetadata?.project_id?.trim() || projectId.trim() || "default";
+  const activeWorkspaceSessionId = activeWorkspaceMetadata?.workspace_path?.trim() || activeConversationId;
   const selectedRunWorkspaceSessionId = runWorkspacePath.trim() || activeWorkspaceSessionId;
   const projectInputScopeKey = JSON.stringify([
     projectId, activeWorkspaceProjectId, activeWorkspaceSessionId,
@@ -6768,7 +6774,7 @@ function RunsPageForActor() {
   const activeWorkspaceFiles = useQuery({
     queryKey: ["workspace-files", activeWorkspaceProjectId, visibleWorkspaceSessionId],
     queryFn: () => api.workspaceFiles(activeWorkspaceProjectId, visibleWorkspaceSessionId),
-    enabled: Boolean(visibleWorkspaceSessionId),
+    enabled: Boolean(activeWorkspaceMetadata && visibleWorkspaceSessionId),
     refetchInterval: 1500,
     refetchIntervalInBackground: true,
   });
