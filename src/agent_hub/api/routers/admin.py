@@ -161,7 +161,8 @@ from agent_hub.runs.repository import (
     RunRepository,
 )
 from agent_hub.runs.self_repair import repair_proposal_projection
-from agent_hub.runtime.contracts import JsonValue
+from agent_hub.runtime import direct_delivery_report
+from agent_hub.runtime.contracts import Artifact, JsonValue
 from agent_hub.runtime.failure_reason import (
     is_legacy_generic_failure_reason,
     runtime_failure_diagnostic_from_reason,
@@ -17590,13 +17591,96 @@ def _is_sensitive_event_detail_key(key: str) -> bool:
     return any(sensitive in lowered for sensitive in _SENSITIVE_EVENT_DETAIL_KEYS)
 
 
-def _direct_delivery_summary(artifact: Mapping[str, object]) -> str | None:
+def _direct_report_text(
+    artifact: Mapping[str, object], *, run_id: UUID | None
+) -> str | None:
+    """Recognize Direct's bound report, including the repository's public projection.
+
+    Public reads deliberately remove delivery_report_binding. Their separate
+    public digest validates the remaining envelope; it is not the private digest.
+    Both forms come from trusted runtime storage, never from a client assertion.
+    """
+    payload = dict(artifact)
+    public_sha = payload.pop('public_content_sha256', None)
+    redacted = payload.pop('content_redacted', None)
+    content = payload.get('content')
+    if not isinstance(content, dict):
+        return None
+    private = 'delivery_report_binding' in content
+    original_sha = payload.get('content_sha256')
+    if (type(original_sha) is not str
+            or re.fullmatch('[a-f0-9]{64}', original_sha) is None):
+        return None
+    if not private:
+        if (redacted is not True or type(public_sha) is not str
+                or re.fullmatch('[a-f0-9]{64}', public_sha) is None
+                or public_sha == original_sha):
+            return None
+        payload['content_sha256'] = public_sha
+    elif public_sha is not None or redacted is not None:
+        return None
+    try:
+        validated = Artifact.from_payload(payload)
+        provenance = validated.provenance
+        text = validated.content.get('text')
+        delivery = validated.content.get('workspace_delivery')
+        if (provenance is None or type(text) is not str or _artifact_text(content) is None
+                or not isinstance(delivery, Mapping)):
+            return None
+        preview = re.sub(r'\s+', ' ', text.strip())
+        if len(preview) > 240:
+            preview = preview[:239].rstrip() + '…'
+        verification = delivery.get('verification')
+        if (content.get('summary') != preview or not isinstance(verification, Mapping)
+                or verification.get('status') != 'passed'
+                or type(delivery.get('artifact_id')) is not str):
+            return None
+        if private:
+            binding = validated.content.get('delivery_report_binding')
+            if not isinstance(binding, Mapping):
+                return None
+            for key in ('tenant_id', 'run_id'):
+                identity = binding.get(key)
+                if type(identity) is not str or str(UUID(identity)) != identity:
+                    return None
+            if run_id is not None and binding['run_id'] != str(run_id):
+                return None
+            expected = {
+                'version': 1,
+                'delivery_sha256': direct_delivery_report.digest(delivery),
+                'verification_sha256': direct_delivery_report.digest(verification),
+                'text_sha256': hashlib.sha256(text.encode()).hexdigest(),
+                'logical_model': provenance.logical_model,
+                'deployment': provenance.deployment_id,
+                'provider': provenance.provider_id,
+                'upstream_model': provenance.provider_model,
+            }
+            if (set(binding) != {*expected, 'tenant_id', 'run_id',
+                                 'request_sha256', 'user_request_sha256'}
+                    or any(type(binding[key]) is not type(value) or binding[key] != value
+                           for key, value in expected.items())):
+                return None
+            for key in ('request_sha256', 'user_request_sha256'):
+                value = binding[key]
+                if type(value) is not str or re.fullmatch('[a-f0-9]{64}', value) is None:
+                    return None
+    except (TypeError, ValueError, RecursionError):
+        return None
+    return _artifact_text(content)
+
+
+def _direct_delivery_summary(
+    artifact: Mapping[str, object], *, run_id: UUID | None = None
+) -> str | None:
     content = artifact.get('content')
     common = {'artifact_origin', 'summary'}
     if (artifact.get('type') != 'tool_result' or artifact.get('producer') != 'main'
-            or not isinstance(content, dict) or not common <= content.keys()
-            or content.get('artifact_origin') not in (
-                'incremental_workspace_delivery', 'model_workspace_bundle')):
+            or not isinstance(content, dict) or not common <= content.keys()):
+        return None
+    origins = {'incremental_workspace_delivery', 'model_workspace_bundle'}
+    if 'text' in content:
+        origins.add('verified_hybrid_final_report')
+    if type(content.get('artifact_origin')) is not str or content['artifact_origin'] not in origins:
         return None
     if (content.keys() == common | {'workspace_bundle'}
             and content['artifact_origin'] == 'model_workspace_bundle'):
@@ -17616,7 +17700,12 @@ def _direct_delivery_summary(artifact: Mapping[str, object]) -> str | None:
             return None
         return _artifact_text({'text': envelope['summary']})
     required = common | {'workspace_delivery'}
-    if not required <= content.keys() <= required | {'generated_event_layout'}:
+    report = 'text' in content
+    allowed = required | {'generated_event_layout'}
+    if report:
+        required = required | {'text'}
+        allowed = allowed | {'text', 'delivery_report_binding'}
+    if not required <= content.keys() <= allowed:
         return None
     delivery = content['workspace_delivery']
     if not isinstance(delivery, Mapping) or delivery.get('presentation') != 'final_attachment':
@@ -17632,6 +17721,8 @@ def _direct_delivery_summary(artifact: Mapping[str, object]) -> str | None:
         validate_generated_filename(file['filename'], 'application/zip')
     except (TypeError, ValueError):
         return None
+    if report:
+        return _direct_report_text(artifact, run_id=run_id)
     # Never extract text from the tool envelope, file content, manifests or logs.
     return _artifact_text({'text': content['summary']})
 
@@ -17644,14 +17735,14 @@ def _admin_run_artifact(
     producer = artifact.get("producer")
     content = artifact.get("content")
     title = producer if type(producer) is str and producer else artifact_id
-    text = _artifact_text(content) or _direct_delivery_summary(artifact)
+    text = _artifact_text(content) or _direct_delivery_summary(artifact, run_id=run_id)
     file_metadata = _artifact_file_metadata(artifact, run_id=run_id)
     filename = file_metadata.get("filename")
     mime_type = file_metadata.get("mime_type")
     size_bytes = file_metadata.get("size_bytes")
     sha256 = file_metadata.get("sha256")
     download_url = file_metadata.get("download_url")
-    presentation = _artifact_presentation(artifact, file_metadata=file_metadata)
+    presentation = _artifact_presentation(artifact, file_metadata=file_metadata, run_id=run_id)
     return RunArtifactResponse(
         id=artifact_id if type(artifact_id) is str and artifact_id else "artifact",
         kind=artifact_type if type(artifact_type) is str and artifact_type else "artifact",
@@ -17684,9 +17775,10 @@ def _admin_run_artifacts(
 
 
 def _artifact_presentation(
-    artifact: Mapping[str, object], *, file_metadata: Mapping[str, str | int]
+    artifact: Mapping[str, object], *, file_metadata: Mapping[str, str | int],
+    run_id: UUID | None = None,
 ) -> str | None:
-    if _direct_delivery_summary(artifact) is not None:
+    if _direct_delivery_summary(artifact, run_id=run_id) is not None:
         return "final_attachment" if file_metadata else "final_answer"
     content = artifact.get("content")
     containers: list[Mapping[str, object]] = []

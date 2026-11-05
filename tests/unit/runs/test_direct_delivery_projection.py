@@ -18,9 +18,16 @@ from agent_hub.harness.types import HarnessToolCallRequest, HarnessToolCallResul
 from agent_hub.models.gateway import GatewayCompletion
 from agent_hub.models.types import ModelRequest, ModelResponse, TokenUsage
 from agent_hub.runs.repository import _public_artifact_payload
+from agent_hub.runtime import direct_delivery_report
 from agent_hub.runtime.action_direct import ActionApprovedDirectRuntime
 from agent_hub.runtime.artifacts import InMemoryArtifactRepository
-from agent_hub.runtime.contracts import EventKind, JsonValue, TaskContext
+from agent_hub.runtime.contracts import (
+    Artifact,
+    EventKind,
+    GatewayProvenance,
+    JsonValue,
+    TaskContext,
+)
 from agent_hub.runtime.direct import DirectRuntime
 
 SUMMARY = 'Implemented the utility. Use npm test. Checks passed; offline limits remain. See project.zip.'
@@ -101,6 +108,123 @@ def test_existing_natural_reply_and_sensitive_text_policy_are_unchanged() -> Non
         artifact: dict[str, object] = {'id': str(uuid4()), 'type': 'text', 'producer': 'main',
                                       'content': {'text': text}}
         assert _admin_run_artifact(artifact, run_id=uuid4()).text == expected
+
+
+def reported_delivery() -> tuple[dict[str, Any], UUID]:
+    """Real Direct final-report shape, including its private runtime binding."""
+    run_id, tenant_id = uuid4(), uuid4()
+    raw = delivery()
+    content = raw['content']
+    text = ('已交付项目与 ZIP。\n\n| 阶段 | 结果 |\n| --- | --- |\n| test | passed |\n\n'
+            + '使用方法见 README；未验证部署。' * 20)
+    preview = ' '.join(text.split())
+    content.update(text=text, summary=preview[:239].rstrip() + '…')
+    result = content['workspace_delivery']
+    result['verification'] = {'status': 'passed', 'checks': [{'phase': 'test', 'status': 'passed'}]}
+    content['delivery_report_binding'] = {
+        'version': 1, 'tenant_id': str(tenant_id), 'run_id': str(run_id),
+        'user_request_sha256': '1' * 64, 'request_sha256': '2' * 64,
+        'delivery_sha256': direct_delivery_report.digest(result),
+        'verification_sha256': direct_delivery_report.digest(result['verification']),
+        'text_sha256': hashlib.sha256(text.encode()).hexdigest(),
+        'logical_model': 'fixed', 'deployment': 'fixed', 'provider': 'fixed', 'upstream_model': 'fixed/offline',
+    }
+    artifact = Artifact(id=UUID(raw['id']), type='tool_result', producer='main', content=content,
+                        provenance=GatewayProvenance(logical_model='fixed', deployment_id='fixed',
+                                                     provider_id='fixed', provider_model='fixed/offline'))
+    return artifact.to_payload(), run_id
+
+
+@pytest.mark.parametrize('public', [False, True])
+@pytest.mark.parametrize('layout', [False, True])
+@pytest.mark.parametrize('origin', ['incremental_workspace_delivery', 'model_workspace_bundle',
+                                  'verified_hybrid_final_report'])
+def test_verified_direct_report_is_final_attachment_before_and_after_public_redaction(
+    public: bool, layout: bool, origin: str,
+) -> None:
+    artifact, run_id = reported_delivery()
+    artifact['content']['artifact_origin'] = origin
+    if layout:
+        artifact['content']['generated_event_layout'] = {'schema_version': 1, 'model_call_count': 2}
+    artifact = Artifact.from_payload({**artifact, 'content_sha256': ''}).to_payload()
+    report_content = artifact['content']
+    assert isinstance(report_content, dict) and isinstance(report_content.get('text'), str)
+    expected = report_content['text']
+    if public:
+        artifact = _public_artifact_payload(artifact)
+        public_content = artifact['content']
+        assert isinstance(public_content, dict)
+        assert 'delivery_report_binding' not in public_content
+        assert artifact['content_redacted'] is True
+    before = deepcopy(artifact)
+    response = _admin_run_artifact(artifact, run_id=run_id)
+    assert response.text == expected
+    assert response.presentation == 'final_attachment'
+    assert response.kind == 'tool_result' and response.title == 'main'
+    assert response.filename == 'project.zip' and response.sha256 == 'a' * 64
+    assert response.download_url is not None
+    assert artifact == before
+
+
+@pytest.mark.parametrize('defect', ['untrusted', 'binding_text', 'binding_delivery', 'binding_version',
+                                  'binding_run', 'public_hash', 'public_missing_hash', 'public_tampered',
+                                  'public_not_redacted', 'extra_logs', 'extra_result', 'preview',
+                                  'producer', 'missing_delivery', 'private_text', 'unknown_origin',
+                                  'hybrid_unbound', 'verification', 'binding_provenance'])
+def test_untrusted_or_noncanonical_direct_reports_are_not_promoted(defect: str) -> None:
+    artifact, run_id = reported_delivery()
+    if defect.startswith('public_'):
+        artifact = _public_artifact_payload(artifact)
+        if defect == 'public_hash':
+            artifact['public_content_sha256'] = '0' * 64
+        elif defect == 'public_missing_hash':
+            artifact.pop('public_content_sha256')
+        elif defect == 'public_tampered':
+            public_content = artifact['content']
+            assert isinstance(public_content, dict)
+            text = public_content['text']
+            assert isinstance(text, str)
+            public_content['text'] = text + ' Different body.'
+        else:
+            artifact['content_redacted'] = False
+    elif defect == 'untrusted':
+        artifact.pop('provenance')
+    elif defect == 'binding_run':
+        run_id = uuid4()
+    elif defect.startswith('binding_'):
+        binding = artifact['content']['delivery_report_binding']
+        binding[{'binding_text': 'text_sha256', 'binding_delivery': 'delivery_sha256',
+                 'binding_version': 'version', 'binding_provenance': 'deployment'}[defect]] = (
+                     2 if defect == 'binding_version' else 'f' * 64)
+        artifact = Artifact.from_payload({**artifact, 'content_sha256': ''}).to_payload()
+    else:
+        if defect == 'extra_logs':
+            artifact['content']['logs'] = 'PRIVATE_LOG'
+        elif defect == 'extra_result':
+            artifact['content']['result'] = {'stdout': 'PRIVATE_LOG'}
+        elif defect == 'preview':
+            artifact['content']['summary'] = 'Unrelated summary'
+        elif defect == 'producer':
+            artifact['producer'] = 'project.inspect'
+        elif defect == 'missing_delivery':
+            artifact['content'].pop('workspace_delivery')
+        elif defect == 'private_text':
+            artifact['content']['text'] = 'password=PRIVATE_SECRET'
+        elif defect == 'unknown_origin':
+            artifact['content']['artifact_origin'] = 'model_response'
+        elif defect == 'hybrid_unbound':
+            artifact['content']['artifact_origin'] = 'verified_hybrid_final_report'
+            artifact['content'].pop('text')
+            artifact['content'].pop('delivery_report_binding')
+        elif defect == 'verification':
+            result = artifact['content']['workspace_delivery']
+            result['verification']['status'] = 'failed'
+            binding = artifact['content']['delivery_report_binding']
+            binding['delivery_sha256'] = direct_delivery_report.digest(result)
+            binding['verification_sha256'] = direct_delivery_report.digest(result['verification'])
+        artifact = Artifact.from_payload({**artifact, 'content_sha256': ''}).to_payload()
+    response = _admin_run_artifact(artifact, run_id=run_id)
+    assert response.presentation not in {'final_attachment', 'final_answer'}
 
 
 class FixedModel:
