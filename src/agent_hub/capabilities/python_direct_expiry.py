@@ -25,7 +25,13 @@ from agent_hub.db.models import (
     RuntimeArtifactRow,
     RunUsageRow,
 )
+from agent_hub.domain.runs import TaskMode
 from agent_hub.runs.artifacts import PostgresArtifactRepository
+from agent_hub.runs.project_verification_receipts import (
+    RECEIPT_KEY,
+    VerificationRecord,
+    _scope_digest,
+)
 from agent_hub.runtime.action_checkpoint import action_checkpoint_valid
 from agent_hub.runtime.action_continuation import read_action_continuation
 from agent_hub.runtime.action_direct import _prepared_context
@@ -142,6 +148,24 @@ async def direct_action_expiry_liveness(
         pending_request = cast(Mapping[str, JsonValue], pending['request'])
         _need(pending_request['tool_name'] == 'project.verify'
               and pending_request['call_id'] not in actions)
+        receipt = route.get(RECEIPT_KEY)
+        if isinstance(receipt, Mapping) and receipt.get('status') == 'running':
+            # An issuance index is not a tool-start receipt. It may outlive this
+            # failed action, but only the same pending action and prepared scope
+            # can explain it. Never synthesize a lease, receipt, or resume grant.
+            issued = VerificationRecord.from_payload(receipt)
+            authority = issued.authority
+            _need(issued.action_key == pending_request['idempotency_key']
+                  and (authority.tenant_id, authority.run_id, authority.actor_id,
+                       authority.actor_role, authority.request_sha256, authority.mode,
+                       authority.actor) ==
+                  (record.tenant_id, record.id, record.actor_id, record.actor_role,
+                   hashlib.sha256(record.request.encode()).hexdigest(), TaskMode.DIRECT,
+                   pending_request['actor'])
+                  and _encode(authority.stable_scope()) == _encode(preparation['scope'])
+                  and authority.scope_sha256
+                  == _scope_digest(prepared.routing_decision, tenant, run)
+                  == _scope_digest(route, tenant, run))
 
         starts: dict[tuple[str, str], RunEvent] = {}
         completed: list[RunEvent] = []

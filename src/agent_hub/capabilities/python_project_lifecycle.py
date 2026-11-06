@@ -673,7 +673,7 @@ class PythonProjectTerminalHook:
             state: Mapping[str, object] | None
             if generated:
                 state = _generated_preparation(route)
-                if state is None or row.mode != 'direct' or _uncertain(route):
+                if state is None or row.mode != 'direct':
                     return False
             else:
                 original_state = route.get('project_input_preparation')
@@ -714,6 +714,18 @@ class PythonProjectTerminalHook:
                 from agent_hub.capabilities.python_direct_expiry import verified_direct_expiry
 
                 if not await verified_direct_expiry(session, row):
+                    return False
+                # The complete proof binds a running issuance index to this
+                # exact pending verify and its native prepared authority. Only
+                # this status is non-authorizing historical metadata; every
+                # other UNKNOWN/running value still vetoes release. Root must
+                # independently fence retained runtimes, units and stages.
+                check_route = route
+                receipt = route.get('project_verification_receipt')
+                if isinstance(receipt, Mapping) and receipt.get('status') == 'running':
+                    check_route = {**route, 'project_verification_receipt': {
+                        **receipt, 'status': 'expiry_liveness_proven'}}
+                if _uncertain(check_route):
                     return False
             project, workspace = authorized_workspace_scope(row, tenant_id=tenant, run_id=run)
             item = await self.verifier.python_expired_environment_invocation(tenant, run)

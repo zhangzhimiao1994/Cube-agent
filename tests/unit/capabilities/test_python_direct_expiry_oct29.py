@@ -46,7 +46,7 @@ MODULE = 'agent_hub.capabilities.python_direct_expiry'
 
 
 async def native_case(count: int = 1, *, content_reference: bool = False,
-                      guidance: bool = False) -> dict[str, Any]:
+                      guidance: bool = False, running_receipt: bool = False) -> dict[str, Any]:
     row = generated_session().row
     row.status = 'failed'
     row.actor_id, row.actor_role, row.request, row.mode = UUID(int=3), Role.OPERATOR, 'synthetic task', 'direct'
@@ -95,6 +95,20 @@ async def native_case(count: int = 1, *, content_reference: bool = False,
         approval_required=True,sandbox='workspace_write',idempotency_key='pending_verify')
     contracts = {k:v for k,v in row.routing_decision.items() if k.startswith('generated_project_')}
     preparation = {'schema_version':1,'scope':{},'contracts':contracts,'workspace_sha256':'a'*64}
+    receipt = None
+    if running_receipt:
+        from agent_hub.runs.project_verification_receipts import (
+            VerificationAuthority,
+            VerificationRecord,
+        )
+
+        authority = VerificationAuthority.from_context(
+            context.model_copy(update={'execution_token': UUID(int=9)}),
+            worker_id='historical_worker', actor='main_agent')
+        preparation['scope'] = authority.stable_scope()
+        receipt = VerificationRecord(generation=1, status='running', authority=authority,
+            action_key=pending.idempotency_key, execution_id='generated_python_verify',
+            source_sha256='b'*64).to_payload()
     inspection = Artifact(id=uuid4(),type='tool_result',producer='main_agent',content={
         'agent_id':'main_agent','tool_name':'project.inspect','call_id':string_value(read_map(actions[0]['request'])['call_id']),
         'arguments_sha256':hashlib.sha256(b'{}').hexdigest(),'result':{}})
@@ -133,6 +147,9 @@ async def native_case(count: int = 1, *, content_reference: bool = False,
     events.extend((RunEvent(kind='artifact.created',run_id=row.id,sequence=seq,actor='main_agent',artifact=artifact),
         RunEvent(kind='model.failure_receipt',run_id=row.id,sequence=seq+1,payload={'artifact_id':str(artifact.id),'actor':'main_agent'}),
         RunEvent(kind='runtime.failed',run_id=row.id,sequence=seq+2,reason='synthetic_known_failure')))
+    if receipt is not None:
+        # Issued after the approval checkpoint: no forged receipt in its snapshot.
+        row.routing_decision['project_verification_receipt'] = receipt
     return {'record':row,'checkpoint':checkpoint,'checkpoint_sequence':9,'repository':repository,
             'events':tuple(sorted(events,key=lambda e:e.sequence)),'usage':tuple(usages)}
 
@@ -300,12 +317,18 @@ async def test_private_native_frame_mutations_do_not_prove_liveness(defect: str)
 
 @pytest.mark.parametrize('defect', [None, 'foreign-artifact', 'artifact-sha', 'artifact-bytes',
     'checkpoint-state', 'checkpoint-scope', 'checkpoint-missing-hash', 'duplicate-checkpoint',
-    'foreign-event', 'wrong-event-kind', 'foreign-usage', 'too-many-events'])
+    'foreign-event', 'wrong-event-kind', 'foreign-usage', 'too-many-events', 'stale-receipt',
+    'stale-receipt-other-unknown', 'stale-receipt-status-unknown', 'stale-receipt-root-refusal'])
 async def test_scoped_readonly_dao_uses_native_hydration_and_fails_closed(defect: str | None) -> None:
     from agent_hub.runs.artifacts import PostgresArtifactRepository
 
-    case = await native_case(2)
+    stale_receipt = defect is not None and defect.startswith('stale-receipt')
+    case = await native_case(2, running_receipt=stale_receipt)
     row, cp = case['record'], case['checkpoint']
+    if defect == 'stale-receipt-other-unknown':
+        row.routing_decision['other_execution'] = {'status':'UNKNOWN'}
+    elif defect == 'stale-receipt-status-unknown':
+        row.routing_decision['project_verification_receipt']['status'] = 'unknown'
     checkpoints = [SimpleNamespace(tenant_id=row.tenant_id,run_id=row.id,id=cp.id,
         mode=cp.mode.value,runtime_type=cp.runtime_type,runtime_version=cp.runtime_version,
         state=cp.to_payload()['state'],state_sha256=cp.state_sha256,payload=cp.to_payload(),sequence=9)]
@@ -381,12 +404,15 @@ async def test_scoped_readonly_dao_uses_native_hydration_and_fails_closed(defect
                 result = [artifacts[i] for i in identities if i in artifacts]
             return SimpleNamespace(all=lambda:result)
 
-    assert await verified_direct_expiry_with_session_fixture(Session(), row) is (defect is None)
-    if defect is None:
+    assert await verified_direct_expiry_with_session_fixture(Session(), row) is (defect is None or stale_receipt)
+    if defect is None or stale_receipt:
+        import copy
+
         from agent_hub.capabilities.python_project_lifecycle import PythonProjectTerminalHook
         from tests.unit.skills.sandbox.test_python_project_client import invocation
 
         row.updated_at = datetime.now(UTC) - timedelta(days=2)
+        before = copy.deepcopy(vars(row))
         session = Session()
         calls = []
 
@@ -403,7 +429,60 @@ async def test_scoped_readonly_dao_uses_native_hydration_and_fails_closed(defect
             async def release_expired(self, item: Any) -> bool:
                 assert session.open and item.install_allowed is False and item.source_kind == 'candidate'
                 calls.append(item.run_id)
-                return True
+                return defect != 'stale-receipt-root-refusal'
 
-        assert await PythonProjectTerminalHook(Repository(), Reader(), Root()).maintain_capacity() == 1
-        assert calls == [row.id]
+        assert await PythonProjectTerminalHook(Repository(), Reader(), Root()).maintain_capacity() == int(
+            defect in (None, 'stale-receipt'))
+        assert calls == ([] if defect in ('stale-receipt-other-unknown', 'stale-receipt-status-unknown') else [row.id])
+        assert vars(row) == before
+
+
+@pytest.mark.parametrize('defect', [
+    'action-key', 'tenant', 'run', 'actor', 'role', 'actor-name', 'request', 'mode',
+    'scope', 'source-format', 'execution-format', 'generation', 'extra', 'artifacts',
+    'preparation-scope', 'pending-started',
+])
+async def test_running_receipt_must_bind_exact_pending_verify_and_preparation(defect: str) -> None:
+    import json
+
+    from agent_hub.capabilities.python_direct_expiry import direct_action_expiry_liveness
+    from agent_hub.runtime.continuation_artifacts import load_continuation
+
+    case = await native_case(running_receipt=True)
+    row = case['record']
+    receipt = row.routing_decision['project_verification_receipt']
+    authority = receipt['authority']
+    if defect == 'action-key':
+        receipt['action_key'] = 'different_verify'
+    elif defect in ('tenant', 'run', 'actor'):
+        authority[{'tenant':'tenant_id', 'run':'run_id', 'actor':'actor_id'}[defect]] = str(uuid4())
+    elif defect in ('role', 'actor-name', 'request', 'mode', 'scope'):
+        key, value = {'role':('actor_role','viewer'), 'actor-name':('actor','other_agent'),
+            'request':('request_sha256','0'*64), 'mode':('mode','dispatch'),
+            'scope':('scope_sha256','0'*64)}[defect]
+        authority[key] = value
+    elif defect == 'source-format':
+        receipt['source_sha256'] = 'UNKNOWN'
+    elif defect == 'execution-format':
+        receipt['execution_id'] = '../foreign'
+    elif defect == 'generation':
+        receipt['generation'] = True
+    elif defect == 'extra':
+        receipt['unrecognized'] = 'value'
+    elif defect == 'artifacts':
+        receipt['artifact_references'] = [{'id':str(uuid4()),'sha256':'a'*64}]
+    elif defect == 'pending-started':
+        case['events'] += (RunEvent(kind='tool.started',run_id=row.id,sequence=20,
+            actor='main_agent',tool_call_id='pending_verify',tool_name='project.verify'),)
+    else:
+        cp = case['checkpoint']
+        frame = json.loads(_encode(await load_continuation(case['repository'],
+            tenant_id=row.tenant_id,run_id=row.id,reference=cp.state['reference'])))
+        frame['preparation']['scope']['actor'] = 'other_agent'
+        reference = await save_continuation(case['repository'],tenant_id=row.tenant_id,
+            run_id=row.id,value=frame)
+        payload = cp.to_payload()
+        payload['state']['reference'] = reference
+        payload.pop('state_sha256')
+        case['checkpoint'] = RuntimeCheckpoint.from_payload(payload)
+    assert await direct_action_expiry_liveness(**case) is False

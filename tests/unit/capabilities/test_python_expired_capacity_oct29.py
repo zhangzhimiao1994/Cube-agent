@@ -142,6 +142,7 @@ async def test_generated_expiry_uses_locked_native_proof_and_metadata_only_selec
 
     assert await PythonProjectTerminalHook(Repository(), Reader(), Executor()).maintain_capacity() == int(defect is None)
     expected = {'native-proof':['native-proof'], 'scope':['native-proof','metadata'],
+        'unknown':['native-proof'],
         'root-refusal':['native-proof','metadata','root-fenced-rpc'],
         None:['native-proof','metadata','root-fenced-rpc']}.get(defect, [])
     assert calls == expected
