@@ -308,13 +308,64 @@ class PythonResolutionPreparation:
         needs: tuple[DependencyNeed, ...],
         environment: dict[str, str],
     ) -> ResolutionStatus:
-        return await self._send(
-            "publish_python_resolution",
-            needs=needs,
-            environment=environment,
-            planning=plan.claim.planning,
-            plan=plan,
+        plan = ResolutionPlan.model_validate(plan, strict=True)
+        need(plan.resolution_key == resolution_key(plan.claim, needs, environment),
+             "resolution_scope_changed")
+        transport_losses = (
+            ConnectionError, ConnectionAbortedError, ConnectionRefusedError,
+            ConnectionResetError, BrokenPipeError, EOFError, asyncio.IncompleteReadError,
         )
+        try:
+            return await self._send(
+                "publish_python_resolution",
+                needs=needs,
+                environment=environment,
+                planning=plan.claim.planning,
+                plan=plan,
+            )
+        except (ConnectionError, EOFError) as error:
+            # Only known transport losses permit a read, never another effect.
+            # Unknown subclasses, timeouts, cancellation, authority/approval,
+            # physical-budget stops and incomplete cleanup propagate unchanged.
+            if type(error) not in transport_losses:
+                raise
+            async with asyncio.timeout_at(plan.claim.task_deadline) as timeout:
+                current = await self._claim(plan.claim.planning)
+                current.require_continuity(plan.claim)
+                timeout.reschedule(current.task_deadline)
+                action = resolution_action(current, needs, environment, plan=plan)
+                if self.approved is None or await self.approved(action) is not True:
+                    raise ResolutionApprovalRequired(action) from error
+                fresh = await self._claim(plan.claim.planning)
+                fresh.require_continuity(current)
+                timeout.reschedule(fresh.task_deadline)
+                try:
+                    status = await self.inspect(
+                        needs=needs, environment=environment, planning=plan.claim.planning,
+                        plan=plan, expected_plan_sha256=plan.sha256,
+                    )
+                except (ConnectionError, EOFError) as inspect_error:
+                    if type(inspect_error) not in transport_losses:
+                        raise
+                    raise error
+                status = ResolutionStatus.model_validate(status, strict=True)
+                need(status.key == plan.resolution_key, "resolution_response_invalid")
+                if status.state != "published":
+                    raise
+                need(status.plan is None or status.plan.sha256 == plan.sha256,
+                     "resolution_response_invalid")
+                inspected = await self._claim(plan.claim.planning)
+                inspected.require_continuity(fresh)
+                timeout.reschedule(inspected.task_deadline)
+                # Inspect is data-only. Recheck the concrete publication grant
+                # before letting its receipt complete the original operation.
+                if await self.approved(action) is not True:
+                    raise ResolutionApprovalRequired(action) from error
+                final = await self._claim(plan.claim.planning)
+                final.require_continuity(inspected)
+                # Opaque Root inspections intentionally omit plan bytes; only
+                # the exact validated, requested plan can fill that field.
+                return ResolutionStatus(state="published", key=plan.resolution_key, plan=plan)
 
     async def inspect(
         self,

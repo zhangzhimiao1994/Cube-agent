@@ -75,7 +75,33 @@ _PREPARATION_ERROR_KINDS = frozenset({
     'ValidationError', 'InvalidSnapshot', 'ExecutionAuthorityError',
     'InvalidResolutionAuthorization', '_PhysicalAdmissionStopped', 'AdmissionConflict',
     'PythonProjectRecipeError',
+    'KeyError', 'AssertionError', 'IndexError', 'EOFError', 'ConnectionError',
+    'BrokenPipeError', 'ArtifactRepositoryError', 'PydanticSerializationError',
+    'ConnectionResetError', 'ConnectionAbortedError', 'ConnectionRefusedError',
+    'IncompleteReadError', 'ProcessCleanupIncomplete',
 })
+
+
+def _preparation_error_site(error: BaseException) -> str:
+    """Application module/line only; never exception text, source or foreign paths."""
+    root = Path(__file__).parent.parent
+    site = 'unavailable'
+    frame = error.__traceback__
+    for _ in range(128):
+        if frame is None:
+            break
+        try:
+            relative = Path(frame.tb_frame.f_code.co_filename).relative_to(root)
+        except ValueError:
+            pass
+        else:
+            module = relative.as_posix()
+            if (relative.suffix == '.py' and '..' not in relative.parts
+                    and re.fullmatch(r'[A-Za-z0-9_./]+', module)
+                    and 0 < frame.tb_lineno <= 1_000_000):
+                site = f'{module}:{frame.tb_lineno}'
+        frame = frame.tb_next
+    return site
 
 
 class GeneratedProjectError(RuntimeError):
@@ -1046,9 +1072,10 @@ class GeneratedProjectService:
                     raise GeneratedProjectError(public_code) from None
             kind = type(error).__name__
             _LOGGER.warning(
-                'generated_project_prepare_failed stage=%s error_kind=%s run_id=%s',
+                'generated_project_prepare_failed stage=%s error_kind=%s run_id=%s error_site=%s',
                 phase, kind if kind in _PREPARATION_ERROR_KINDS else 'Exception',
                 run if type(run) is UUID else None,
+                _preparation_error_site(error),
             )
             raise GeneratedProjectError('generated_acceptance_unavailable_or_changed') from None
 
