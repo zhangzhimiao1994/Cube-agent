@@ -172,6 +172,11 @@ def runtime_source_fingerprint() -> str:
         "skills/sandbox/python_dependency_inspection.py",
         "runtime/artifacts.py",
         "runs/artifacts.py",
+        # Project selection and expiry cleanup determine which execution or
+        # release is admitted; changes must revoke the old qualification too.
+        "runs/automatic_project_inputs.py",
+        "capabilities/python_project_service.py",
+        "capabilities/python_project_lifecycle.py",
     )
     digest = hashlib.sha256()
     for name in sorted(files):

@@ -2198,6 +2198,9 @@ async def test_assembled_allow_revocation_fences_consume_and_dispatch(
         "skills/sandbox/python_dependency_inspection.py",
         "runtime/artifacts.py",
         "runs/artifacts.py",
+        "runs/automatic_project_inputs.py",
+        "capabilities/python_project_service.py",
+        "capabilities/python_project_lifecycle.py",
     ],
 )
 async def test_actual_proof_dependency_change_invalidates_installed_evidence(

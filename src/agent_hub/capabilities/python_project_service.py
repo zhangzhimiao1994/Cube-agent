@@ -269,6 +269,64 @@ def validate_python_original_observation(
         ) from None
 
 
+def _validate_expired_original_observation(
+    state: Mapping[str, JsonValue], invocation: PythonProjectInvocation,
+) -> None:
+    """Validate historical selection metadata, never a live recipe or grant."""
+    _need(set(state) == {'schema_version', 'phase', 'reference', 'python_recipe',
+                        'execution_id', 'observation', 'observation_sha256'}
+          and type(state['schema_version']) is int and state['schema_version'] == 2
+          and state['phase'] == 'observed'
+          and state['reference'] == invocation.original_reference.model_dump(mode='json'))
+    ProjectBaselineReference.from_payload(state['reference'])
+    marker = {'schema_version': 1, 'recipe_sha256': invocation.recipe_sha256,
+              'environment_input_sha256': invocation.environment_input_sha256}
+    stored_marker = state['python_recipe']
+    _need(isinstance(stored_marker, Mapping) and type(stored_marker.get('schema_version')) is int
+          and stored_marker == marker)
+    observation = _freeze_object(state['observation'], name='expired original observation')
+    _need(type(state['observation_sha256']) is str
+          and hashlib.sha256(_encoded(observation)).hexdigest() == state['observation_sha256'])
+    failed = observation.get('status') == 'failed'
+    _need(set(observation) == {'schema_version', 'status', 'verification', 'original_check_contract',
+                              'python_recipe', 'environment_reference', 'execution_id'}
+          | ({'execution_diagnostic'} if failed else set())
+          and type(observation['schema_version']) is int and observation['schema_version'] == 2
+          and observation['status'] in {'passed', 'failed'}
+          and observation['execution_id'] == state['execution_id']
+          and observation['python_recipe'] == marker)
+    observed_marker = observation['python_recipe']
+    _need(isinstance(observed_marker, Mapping) and type(observed_marker.get('schema_version')) is int)
+    binding = observation['original_check_contract']
+    _need(isinstance(binding, Mapping))
+    assert isinstance(binding, Mapping)
+    protected = binding.get('protected_sha256')
+    _need(type(protected) is str and re.fullmatch('[a-f0-9]{64}', protected) is not None
+          and type(binding.get('schema_version')) is int
+          and binding == {'schema_version': 1, 'contract_sha256': protected, 'protected_sha256': protected})
+    # Only a recorded issued environment is eligible in this legacy branch.
+    # Root still selects and remeasures the live READY and its reservation TTL.
+    reference = PythonEnvironmentReference.model_validate_json(
+        _encoded(observation['environment_reference']), strict=True)
+    _need(_reference_matches(invocation, reference))
+    if failed:
+        report = PythonProjectFailure(cast(Mapping[str, JsonValue], observation['verification']), reference).to_payload()
+        _need(report['original_check_contract'] == protected)
+        diagnostic = observation['execution_diagnostic']
+        _validate_original_diagnostic(diagnostic, retain_tail=True)
+        assert isinstance(diagnostic, Mapping)
+        checks = cast(tuple[Mapping[str, JsonValue], ...], report['checks'])
+        _need(checks[-1]['execution_diagnostic'] == {
+            key: value for key, value in diagnostic.items() if key not in {'stdout', 'stderr'}})
+    else:
+        report = PythonProjectReport(cast(Mapping[str, JsonValue], observation['verification']),
+            reference, invocation.original_reference.input_source_sha256).to_payload()
+    _need(report['source_sha256'] == invocation.original_reference.input_source_sha256
+          and report['execution_id'] == state['execution_id']
+          and report['recipe_sha256'] == invocation.recipe_sha256
+          and report['environment_input_sha256'] == invocation.environment_input_sha256)
+
+
 class PythonProjectExecutor(Protocol):
     async def probe(
         self, invocation: PythonProjectProbeInvocation
@@ -779,11 +837,13 @@ class PythonProjectService:
                 value = route.get('project_input_preparation')
                 if value is None:
                     return None
-                _need(isinstance(value, Mapping) and set(value) == {
-                    'schema_version', 'phase', 'reference', 'python_recipe', 'execution_id'})
+                _need(isinstance(value, Mapping))
                 assert isinstance(value, Mapping)
+                observed = value.get('phase') == 'observed'
+                _need(set(value) == {'schema_version', 'phase', 'reference', 'python_recipe', 'execution_id'}
+                      | ({'observation', 'observation_sha256'} if observed else set()))
                 _need(type(value['schema_version']) is int and value['schema_version'] == 2
-                      and value['phase'] == 'executing'
+                      and value['phase'] in {'executing', 'observed'}
                       and type(value['execution_id']) is str
                       and re.fullmatch(r'[a-z0-9][a-z0-9_-]{0,127}', value['execution_id']) is not None
                       and type(route.get('project_input_contract_version')) is int
@@ -798,12 +858,15 @@ class PythonProjectService:
                 'schema_version', 'recipe_sha256', 'environment_input_sha256'})
             assert isinstance(marker, Mapping)
             _need(type(marker['schema_version']) is int and marker['schema_version'] == 1)
-            return PythonProjectInvocation.model_validate(base.model_dump() | {
+            result = PythonProjectInvocation.model_validate(base.model_dump() | {
                 'execution_id': 'python_release_expired_' + uuid4().hex,
                 'install_allowed': False, 'timeout_seconds': 30, 'source_kind': source_kind,
                 'original_reference': reference.to_payload(), 'recipe_sha256': marker['recipe_sha256'],
                 'environment_input_sha256': marker['environment_input_sha256'],
             }, strict=True)
+            if source_kind == 'original' and state['phase'] == 'observed':
+                _validate_expired_original_observation(state, result)
+            return result
         except ProjectVerificationError:
             raise
         except Exception:  # noqa: BLE001 - no raw persisted metadata/path reaches diagnostics.

@@ -25,7 +25,10 @@ from agent_hub.capabilities.project_verification import (
     ProjectVerificationError,
     ProjectVerificationService,
 )
-from agent_hub.capabilities.python_project_service import PythonOriginalContext
+from agent_hub.capabilities.python_project_service import (
+    PythonOriginalContext,
+    _validate_expired_original_observation,
+)
 from agent_hub.capabilities.scoped_read import authorized_workspace_scope
 from agent_hub.db.models import (
     ProviderContinuationRow,
@@ -35,13 +38,14 @@ from agent_hub.db.models import (
     RunOutboxRow,
     RunRow,
     RuntimeArtifactRow,
+    RuntimeArtifactWriteRow,
     RunUsageRow,
 )
 from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.runs.artifacts import PostgresArtifactRepository
 from agent_hub.runs.repository import RunRepository, _database_uuid
 from agent_hub.runtime.artifacts import ArtifactReference, ArtifactRepository
-from agent_hub.runtime.contracts import Artifact, RuntimeCheckpoint
+from agent_hub.runtime.contracts import Artifact, JsonValue, RuntimeCheckpoint, _freeze_object
 from agent_hub.skills.sandbox.python_project_client import PythonProjectSystemdSandbox
 from agent_hub.skills.sandbox.python_project_protocol import (
     PythonEnvironmentReference,
@@ -733,6 +737,79 @@ class PythonProjectTerminalHook:
             # No run transition, marker, version, request or flag is backfilled.
             return released
 
+    async def _release_expired_terminal_observed(
+        self, tenant: UUID, run: UUID, cutoff: datetime,
+    ) -> bool:
+        """Legacy observed READY only; no opt-in backfill or run-state transition."""
+        async with (
+            asyncio.timeout(_CAPACITY_TIMEOUT_SECONDS),
+            await self.repository.run_transaction() as session,
+            session.begin(),
+        ):
+            row = await session.scalar(select(RunRow).where(
+                RunRow.tenant_id == tenant, RunRow.id == run).with_for_update())
+            if (row is None or (row.tenant_id, row.id, row.status) != (tenant, run, 'failed')
+                    or type(row.version) is not int or row.version < 0
+                    or not isinstance(row.updated_at, datetime) or row.updated_at.tzinfo is None
+                    or row.updated_at > cutoff or row.blocked_by_run_id is not None
+                    or any(value is not None for value in (row.worker_id, row.worker_lease_token,
+                        row.worker_lease_expires_at, row.worker_heartbeat_at))):
+                return False
+            route = row.routing_decision
+            if (type(route) is not dict or _uncertain(route) or _RELEASE_MARKER in route
+                    or route.get('source') == 'self_repair'
+                    or any(not isinstance(key, str) or key.startswith('self_repair_') for key in route)
+                    or {'generated_project_contract_version', 'generated_project_preparation'} & route.keys()
+                    or route.get('approval_kind') is not None or route.get('decision_token') is not None):
+                return False
+            state = route.get('project_input_preparation')
+            if (not isinstance(state, Mapping) or type(state.get('schema_version')) is not int
+                    or state['schema_version'] != 2 or state.get('phase') != 'observed'):
+                return False
+            before = _freeze_object(route, name='expired observed owner')
+            version = row.version
+            for query in (
+                select(ProviderContinuationRow.id).where(ProviderContinuationRow.tenant_id == tenant,
+                    ProviderContinuationRow.run_id == run),
+                select(RunApprovalRow.id).where(RunApprovalRow.tenant_id == tenant, RunApprovalRow.run_id == run,
+                    RunApprovalRow.status.not_in(('approved', 'rejected', 'expired'))),
+                select(RunOutboxRow.id).where(RunOutboxRow.tenant_id == tenant, RunOutboxRow.run_id == run,
+                    RunOutboxRow.delivered.is_(False)),
+                select(RuntimeArtifactWriteRow.write_id).where(RuntimeArtifactWriteRow.tenant_id == tenant,
+                    RuntimeArtifactWriteRow.run_id == run, RuntimeArtifactWriteRow.status == 'reserved'),
+            ):
+                if await session.scalar(query.limit(1)) is not None:
+                    return False
+            # Only the existing exact hybrid3 -> crew11 receipt reconciliation
+            # can explain a nonterminal historical checkpoint here. Direct action
+            # waits and every other unproved checkpoint remain retained.
+            latest = await session.scalar(select(RunCheckpointRow).where(
+                RunCheckpointRow.tenant_id == tenant, RunCheckpointRow.run_id == run,
+            ).order_by(RunCheckpointRow.sequence.desc()).limit(1))
+            if latest is not None and (row.mode != 'hybrid'
+                    or (latest.runtime_type, latest.runtime_version, latest.mode) != ('hybrid', '3', 'hybrid')
+                    or type(latest.state) is not dict
+                    or not await _verified_failed_history(session, latest.state, tenant, run)):
+                return False
+            project, workspace = authorized_workspace_scope(row, tenant_id=tenant, run_id=run)
+            item = await self.verifier.python_expired_environment_invocation(tenant, run)
+            if item is None:
+                return False
+            item = PythonProjectInvocation.model_validate(item.model_dump(), strict=True)
+            if (item.install_allowed is not False or item.source_kind != 'original'
+                    or (item.tenant_id, item.run_id, item.project_id, item.session_id)
+                    != (tenant, run, project, workspace)):
+                return False
+            _validate_expired_original_observation(cast(Mapping[str, JsonValue], state), item)
+            if row.version != version or _freeze_object(row.routing_decision, name='expired observed recheck') != before:
+                return False
+            # DB owner lock is held through native admission, Root TTL/READY
+            # measurement, and retained/unit/stage fences. A refusal stays false.
+            released = await self.executor.release_expired(item)
+            if type(released) is not bool:
+                raise ValueError('invalid Python expired observed cleanup response')
+            return released
+
     async def maintain_capacity(self) -> int:
         """Bounded internal maintenance; DB locks remain held through each RPC.
 
@@ -750,6 +827,8 @@ class PythonProjectTerminalHook:
                 RunRow.status == RunStatus.FAILED.value, RunRow.updated_at <= cutoff,
                 or_(RunRow.routing_decision.contains({
                         'project_input_preparation': {'schema_version': 2, 'phase': 'executing'}}),
+                    RunRow.routing_decision.contains({
+                        'project_input_preparation': {'schema_version': 2, 'phase': 'observed'}}),
                     and_(RunRow.mode == 'direct', RunRow.routing_decision.contains({
                         'generated_project_contract_version': 1, 'generated_project_preparation': {
                             'schema_version': 1, 'phase': 'python_ready', 'stack': 'python'}}))),
@@ -759,14 +838,18 @@ class PythonProjectTerminalHook:
             async with await self.repository.run_transaction() as session:
                 rows = (await session.scalars(query)).all()
                 candidates = tuple(
-                    (_database_uuid(row.tenant_id), _database_uuid(row.id)) for row in rows
+                    (_database_uuid(row.tenant_id), _database_uuid(row.id),
+                     isinstance((row.routing_decision or {}).get('project_input_preparation'), Mapping)
+                     and cast(Mapping[str, object], (row.routing_decision or {})['project_input_preparation'])
+                         .get('phase') == 'observed') for row in rows
                 )
             if not candidates:
                 self._capacity_cursor = None
             released = 0
-            for tenant, run in candidates:
+            for tenant, run, observed in candidates:
                 try:
-                    released += int(await self._release_expired_pre_model(tenant, run, cutoff))
+                    released += int(await (self._release_expired_terminal_observed(tenant, run, cutoff)
+                        if observed else self._release_expired_pre_model(tenant, run, cutoff)))
                 except Exception:  # noqa: BLE001 - UNKNOWN is not false/absent and never grants deletion.
                     _LOGGER.warning('python_expired_environment_maintenance_blocked run_id=%s', run)
                 self._capacity_cursor = run

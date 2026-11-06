@@ -37,15 +37,43 @@ def _need(value: object) -> None:
 
 
 def maintenance_intent(request: str) -> bool:
-    """Conservative leading imperative only; quoted/data/planning text cannot select."""
+    """A leading command, optionally after a bounded existing-scope context."""
     text = _v2_intent_text(request).strip()
     first = re.split(r'[。；;\n!?！？]', text, maxsplit=1)[0].strip()
     if not first or re.search(r'[？?]|仅规划|只规划|先规划|只做计划|仅做计划|仅讨论|只讨论|先讨论|仅分析|只分析|只给方案|仅给方案|暂不执行|不要执行|禁止执行|planning only|\b(?:if|unless|maybe|perhaps|would|could|should)\b|如果|假如|倘若|如需', text[:len(first) + 1], re.IGNORECASE):
         return False
-    return re.match(
+    command = (
         r'^(?:(?:请你?|麻烦|帮我|帮忙|现在|这次|继续|先)\s*|(?:please|kindly|now|continue to)\s+)*'
         r'(?:维护|修复|修改|修补|更新|调整|增加|新增|添加|加一个|加上|实现|支持|创建|编写|构建|开发|制作|搭建|'
-        r'(?:fix|repair|modify|update|maintain|add|implement|support|build|create|develop|generate)\b)', first, re.IGNORECASE) is not None
+        r'(?:fix|repair|modify|update|maintain|add|implement|support|build|create|develop|generate)\b)'
+    )
+    if re.match(command, first, re.IGNORECASE) is not None:
+        return True
+    # Consume only a grammatical leading scope, never arbitrary prose before an
+    # action keyword. Labels are bounded identifiers, not selectors or authority;
+    # the caller still binds the persisted conversation and eligible permissions.
+    context = re.match(
+        r'^(?:(?:请你?|麻烦|现在|这次|先)\s*)*'
+        r'(?:(?:在|针对|对于|沿用|继续)\s*'
+        r'(?:(?:当前|现有|既有|原有|同一|已有|这个|该|已经交付的|普通用户的|用户的)\s*)+'
+        r'(?:[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}\s*)?(?:项目|工作区)'
+        r'(?:\s*(?:和|及|与)(?:(?:当前|同一)\s*)?会话)?(?:中|内)?'
+        r'|(?:in|for|within|using)\s+(?:the\s+)?(?:current|existing|same|retained)\s+'
+        r'(?:[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}\s+)?(?:project|workspace)'
+        r'(?:\s+and\s+(?:the\s+)?(?:conversation|session))?)', first, re.IGNORECASE,
+    )
+    if context is None or context.end() > 160:
+        return False
+    if re.search(
+        r'如何|怎么|为什么|是否|能否|(?:不要|禁止|不得|无需|不必|暂不|请勿)\s*(?:修改|修复|修补|维护|更新|执行|动)|'
+        r'\b(?:do\s+not|don.t|never|must\s+not|explain|analyse|analyze|why|whether)\b',
+        first, re.IGNORECASE,
+    ):
+        return False
+    following = first[context.end():].lstrip(' \t,，:：')
+    # "Only repair" narrows the action. "Only analyse/plan" cannot match a command.
+    following = re.sub(r'^(?:(?:请你?|先|只|仅)\s*)+', '', following)
+    return re.match(command, following, re.IGNORECASE) is not None
 
 
 def eligible(route: Mapping[str, object]) -> bool:
