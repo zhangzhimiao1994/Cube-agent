@@ -241,7 +241,7 @@ def capture_stopped_stages(
     seen_roots: set[Path] = set()
     with ExitStack() as stack:
         pins = []
-        for group, root in (("stage", configuration.stage_root), ("runtime", policy.runtime_root)):
+        for group, root in (("stage", configuration.stage_root), ("runtime", policy.project_runtime_root)):
             _check(deadline)
             if root in seen_roots:
                 continue

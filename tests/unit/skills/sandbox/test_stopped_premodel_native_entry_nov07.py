@@ -4,8 +4,11 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import socket
+import stat
 import sys
 import time
+from collections.abc import Iterator
 from dataclasses import replace
 from pathlib import Path
 from uuid import uuid4
@@ -26,6 +29,40 @@ from tests.unit.skills.sandbox.test_python_project_cache import invocation, read
 pytestmark = pytest.mark.skipif(
     sys.platform != "linux" or not hasattr(os, "geteuid"), reason="actual Linux Root required",
 )
+
+
+@pytest.fixture
+def app_socket_root(tmp_path: Path) -> Iterator[Path]:
+    """Match the deployed socket directory, not a root-owned stage substitute."""
+    if os.geteuid() != 0:
+        pytest.skip("actual Root required")
+    path = tmp_path / "socket-root"
+    path.mkdir(mode=0o750)
+    os.chown(path, 10001, 10001)
+    sockets = []
+    directory = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        for name in ("preview-broker.sock", "skill-broker.sock"):
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sockets.append(listener)
+            leaf = path / name
+            listener.bind(f"/proc/self/fd/{directory}/{name}")
+            os.chown(leaf, 0, 10001)
+            leaf.chmod(0o660)
+        yield path
+        info = path.stat()
+        assert (info.st_uid, info.st_gid, stat.S_IMODE(info.st_mode)) == (10001, 10001, 0o750)
+        assert sorted(p.name for p in path.iterdir()) == ["preview-broker.sock", "skill-broker.sock"]
+        for leaf in path.iterdir():
+            info = leaf.stat()
+            assert stat.S_ISSOCK(info.st_mode)
+            assert (info.st_uid, info.st_gid, stat.S_IMODE(info.st_mode)) == (0, 10001, 0o660)
+    finally:
+        try:
+            for listener in sockets:
+                listener.close()
+        finally:
+            os.close(directory)
 
 
 def test_native_inspector_mount_namespace_is_not_exempt(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -58,8 +95,10 @@ def marker(path: Path, execution: str, state: str, owner: PythonFailedMaintenanc
 
 
 @pytest.mark.parametrize("defect", [None, "changed-control", "missing-origin"])
+@pytest.mark.parametrize("same_execution_root", [False, True])
 def test_native_root_entry_retains_unknown_controls_and_rejects_changed_snapshot(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, defect: str | None,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, defect: str | None, app_socket_root: Path,
+    same_execution_root: bool,
 ) -> None:
     if os.geteuid() != 0:
         pytest.skip("actual Root required")
@@ -72,7 +111,10 @@ def test_native_root_entry_retains_unknown_controls_and_rejects_changed_snapshot
     )
     stage_root, runtime_root = tmp_path / "stages", tmp_path / "runtime-stages"
     stage_root.mkdir(mode=0o700)
-    runtime_root.mkdir(mode=0o700)
+    if same_execution_root:
+        runtime_root = stage_root
+    else:
+        runtime_root.mkdir(mode=0o700)
     own = stage_root / (owner.execution_id + "-abcd1234")
     marker(own, owner.execution_id, "RUNNING", owner)
     first = runtime_root / "original-abcd1234"
@@ -82,7 +124,7 @@ def test_native_root_entry_retains_unknown_controls_and_rejects_changed_snapshot
     configuration = replace(root.RootConfig.from_payload(configuration_payload()),
                             environment_root=cache.root, stage_root=stage_root,
                             cache_policy=cache.policy)
-    policy = replace(BrokerPolicy(), runtime_root=runtime_root)
+    policy = replace(BrokerPolicy(), runtime_root=app_socket_root, project_runtime_root=runtime_root)
     # Advance the fixture's cache age; all process, unit and FD observations are real.
     now = time.time()
     monkeypatch.setattr(cache_api.time, "time", lambda: now + cache.policy.retention_seconds + 1)
@@ -95,7 +137,7 @@ def test_native_root_entry_retains_unknown_controls_and_rejects_changed_snapshot
             response.require_for(request)
         snapshot = response.retirement_snapshot
         assert snapshot is not None and len(snapshot.stages) == 2
-        assert {s.root for s in snapshot.stages} == {"runtime", "stage"}
+        assert {s.root for s in snapshot.stages} == ({"stage"} if same_execution_root else {"runtime", "stage"})
         assert snapshot.reference_sha256 == hashlib.sha256(snapshot.reference.encode()).hexdigest()
         assert json.loads(snapshot.reference) == reference.model_dump(mode="json")
         # The Root fixture checks transport binding, not database authorization.
