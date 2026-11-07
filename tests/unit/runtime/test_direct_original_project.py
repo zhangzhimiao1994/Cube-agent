@@ -179,9 +179,15 @@ def test_only_strict_new_policy_accepts_project_delivery_without_inventing_scale
 
 async def test_new_policy_prose_cannot_complete_failed_original(tmp_path: Path) -> None:
     configured = await fixture(tmp_path)
-    runtime, _, _ = configured.runtime(Model('Fixed it; all tests pass.'))
-    with pytest.raises(direct.RuntimeExecutionError, match='bundle is missing'):
-        _ = [event async for event in runtime.run(configured.context)]
+    model = Model('Fixed it; all tests pass.', 'Fixed it; all tests pass.')
+    runtime, _, _ = configured.runtime(model)
+    events = []
+    with pytest.raises(direct.RuntimeExecutionError, match='workspace batch is invalid'):
+        async for event in runtime.run(configured.context):
+            events.append(event)
+    assert len(model.requests) == 2
+    assert sum(event.kind is EventKind.MODEL_COMPLETED for event in events) == 2
+    assert not any(event.kind is EventKind.RUNTIME_COMPLETED for event in events)
     assert configured.backend.calls == []
 
 

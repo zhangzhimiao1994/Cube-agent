@@ -3299,9 +3299,14 @@ class DirectRuntime:
             retry_deadline = asyncio.get_running_loop().time() + context.timeout_seconds
             inspection_artifact: Artifact | None = None
             generated_entry = generated_history_selected(context) and _is_workspace_project_delivery(context)
-            if generated_entry:
+            workspace_entry = generated_entry or (
+                self._capability_gateway is not None and _is_workspace_project_delivery(context)
+                and (_original_project_policy(context) or _diagnostic_workspace_reads(context))
+            )
+            if workspace_entry:
                 self._generated_model_events = asyncio.Queue()
                 self._generated_model_run_id = context.run_id
+            if generated_entry:
                 inspection_request = HarnessToolCallRequest(run_id=context.run_id, actor='main_agent',
                     tool_name='project.inspect', arguments={}, approval_required=False,
                     sandbox=cast(str, context.routing_decision.get('sandbox_profile', 'none')),
@@ -3399,8 +3404,8 @@ class DirectRuntime:
                 )
                 injection_offset += 1
                 context_injections = 1
-            if generated_entry:
-                injection_offset -= 1  # Generated calls emit their own persisted lifecycle boundaries.
+            if workspace_entry:
+                injection_offset -= 1  # Workspace calls persist their own lifecycle boundaries.
             else:
                 yield RunEvent(
                     kind=EventKind.MODEL_STARTED,
@@ -3422,7 +3427,7 @@ class DirectRuntime:
             consumed_retry_tokens = 0
             entry_usage = TokenUsage(0, 0, 0)
             entry_usage_estimated = False
-            protocol_corrections = 0
+            protocol_failures: set[str] = set()
             failure_fingerprints: dict[str, int] = {}
             while True:
                 attempt_count += 1
@@ -3433,7 +3438,7 @@ class DirectRuntime:
                 fingerprint_count = 0
                 retryable = False
                 try:
-                    if generated_entry:
+                    if workspace_entry:
                         async with aclosing(self._generated_task_events(gateway_task)) as call_events:
                             async for call_event in call_events:
                                 generated_starts += call_event.kind is EventKind.MODEL_STARTED
@@ -3455,7 +3460,7 @@ class DirectRuntime:
                     fingerprint = _failure_fingerprint(error)
                     fingerprint_count = failure_fingerprints.get(fingerprint, 0) + 1
                     failure_fingerprints[fingerprint] = fingerprint_count
-                    retryable = not generated_entry and hybrid_delivery is None and _retryable_gateway_failure(error)
+                    retryable = not workspace_entry and hybrid_delivery is None and _retryable_gateway_failure(error)
                     failure_source = RuntimeExecutionError(failure_reason)
                     preserve_gateway_scope_diagnostic(failure_source, error)
                     error.__traceback__ = None
@@ -3504,13 +3509,11 @@ class DirectRuntime:
                 completion = validated_completion
                 del validated_completion
                 response = completion.response
-                if generated_entry and (response.tool_calls or response.text is None
+                if workspace_entry and (response.tool_calls or response.text is None
                         or _workspace_batch_from_model_text(response.text, allow_reads=True,
                             allow_catalog=_catalog_workspace_reads(context)) is None):
                     # A known response can be corrected on the same authorized
                     # model. Alias/fallback count is not a protocol retry budget.
-                    if protocol_corrections >= 1:
-                        _raise_execution_error('generated project response did not satisfy workspace_batch protocol')
                     rejected_text = _workspace_batch_budget_text(response)
                     rejected_usage = self._verified_budget_usage(response.usage, prompt_estimate=prompt_estimate,
                         response_text=rejected_text, request_max_output_tokens=request.max_output_tokens,
@@ -3522,15 +3525,31 @@ class DirectRuntime:
                         entry_usage.completion_tokens + usage.completion_tokens, entry_usage.total_tokens + usage.total_tokens)
                     entry_usage_estimated = entry_usage_estimated or rejected_usage.estimated
                     consumed_retry_tokens += usage.total_tokens
+                    parsed_rejection = _json_mapping_from_model_text(response.text or '')
+                    rejected_batch = (None if parsed_rejection is None else parsed_rejection.get(
+                        'workspace_batch', parsed_rejection.get('workspace_bundle', parsed_rejection)))
+                    if isinstance(rejected_batch, Mapping) and (
+                            {'read_paths', 'python_catalog'} & rejected_batch.keys()):
+                        # Malformed/disabled reads are not recoverable permission requests.
+                        _raise_execution_error('workspace batch is invalid')
+                    rejection_code = _workspace_batch_rejection_code(response)
+                    if rejection_code in protocol_failures:
+                        _raise_execution_error('workspace batch is invalid')
+                    protocol_failures.add(rejection_code)
                     preview = _event_text_preview(rejected_text).replace('<', '\\u003c').replace('>', '\\u003e')
                     messages = (*request.messages, ModelMessage(role='user', content=(
                         'The prior response did not provide a valid structured workspace_batch. '
                         'No requested native/model tools were executed and no source was written. '
-                        'The Harness has already performed project.inspect. Use its supplied profile pins. '
+                        + ('The Harness has already performed project.inspect. Use its supplied profile pins. '
+                           if inspection_artifact is not None else
+                           'Preserve the supplied original project evidence and protected files. ')
+                        + 'Rejection: ' + rejection_code + '. '
                         'Continue the same user request and return only JSON shaped as '
                         '{"workspace_batch":{"files":{"safe/relative/path":"full UTF-8 contents"},'
                         '"complete":true,"continuation":""},"summary":"delivery summary"}. '
                         'The complete boolean and continuation MUST be INSIDE workspace_batch, not at the root. '
+                        'For an enabled scoped read use files={}, safe relative read_paths, complete=false '
+                        'and a nonempty continuation. This correction grants no permissions or successful checks. '
                         'Tool requests/planning text cannot complete delivery. '
                         '<UNTRUSTED_REJECTED_DIRECT_RESPONSE>' + preview + '</UNTRUSTED_REJECTED_DIRECT_RESPONSE>')))
                     next_estimate = _estimate_text_tokens(json.dumps([
@@ -3541,7 +3560,6 @@ class DirectRuntime:
                     if retry_request is None:
                         _raise_execution_error('workspace delivery budget is exhausted')
                     await self._consume_task_terminal(gateway_task)
-                    protocol_corrections += 1
                     request, prompt_estimate = retry_request, next_estimate
                     gateway_task = asyncio.create_task(submit_model(request))
                     gateway_task.add_done_callback(lambda _task: submission_ready.set())
@@ -3633,7 +3651,7 @@ class DirectRuntime:
                     entry_usage=entry_usage,
                     entry_usage_estimated=entry_usage_estimated,
                 )
-                if generated_entry:
+                if workspace_entry:
                     delivery_task = asyncio.create_task(delivery)
                     async with aclosing(self._generated_task_events(delivery_task)) as call_events:
                         async for call_event in call_events:
