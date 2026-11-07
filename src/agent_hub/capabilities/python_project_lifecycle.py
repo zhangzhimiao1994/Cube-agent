@@ -512,6 +512,7 @@ def _generated_preparation(route: Mapping[str, object]) -> Mapping[str, object] 
 
 async def _historical_nonblocking_repair_suggestion(
     session: AsyncSession, row: RunRow, route: dict[str, object],
+    *, stopped_pre_model: bool = False,
 ) -> bool:
     """Classify one persisted suggestion for cleanup, never approve or resume it.
 
@@ -533,6 +534,23 @@ async def _historical_nonblocking_repair_suggestion(
         return json.dumps(_mutable_json(bounded), sort_keys=True, separators=(',', ':'), allow_nan=False)
 
     try:
+        if type(stopped_pre_model) is not bool:
+            return False
+        uncertainty_view = route
+        if stopped_pre_model:
+            preparation = route.get('project_input_preparation')
+            if ({'generated_project_contract_version', 'generated_project_preparation'} & route.keys()
+                    or type(preparation) is not dict
+                    or set(preparation) != {'schema_version', 'phase', 'execution_id',
+                                            'reference', 'python_recipe'}
+                    or type(preparation['schema_version']) is not int
+                    or preparation['schema_version'] != 2 or preparation['phase'] != 'executing'):
+                return False
+            # The locked pre-model selector proves this one executing phase.
+            # Only uncertainty classification sees captured; every persisted
+            # route/proposal/event comparison below retains the original bytes.
+            uncertainty_view = {**route, 'project_input_preparation': {
+                **preparation, 'phase': 'captured'}}
         proposal = route.get('repair_proposal')
         token = route.get('decision_token')
         if (row.status != 'failed' or type(route) is not dict
@@ -540,7 +558,7 @@ async def _historical_nonblocking_repair_suggestion(
                 or type(token) is not str or re.fullmatch(r'decision-[a-f0-9]{64}', token) is None
                 or route.get('source') == 'self_repair'
                 or any(not isinstance(key, str) or key.startswith('self_repair_') for key in route)
-                or _uncertain(route) or type(proposal) is not dict
+                or _uncertain(uncertainty_view) or type(proposal) is not dict
                 or proposal.get('kind') != 'self_repair'
                 or proposal.get('source_run_id') != str(row.id)
                 or proposal.get('pauses_run') is not False
@@ -619,7 +637,23 @@ async def _historical_nonblocking_repair_suggestion(
         fingerprint = _fingerprint(status=RunStatus.FAILED, mode=mode, source_kind=source.kind,
                                    failure_category=failure_category, failure=failure)
         if payload.get('fingerprint') != fingerprint or proposal.get('fingerprint') != fingerprint:
-            return False
+            if not stopped_pre_model:
+                return False
+            from agent_hub.runs.repository import _event_with_failure_diagnostic
+
+            # Runtime classification can precede repository diagnostic enrichment.
+            # Admit only the exact forward producer image of a reason-only event,
+            # never an arbitrary payload-stripping or historical-hash fallback.
+            origin = failure.model_copy(update={'payload': {}})
+            replayed = RunEvent.model_validate(_event_with_failure_diagnostic(origin))
+            if (encoded(replayed.to_payload()) != encoded(source.payload)
+                    or _failure_category(origin) != failure_category):
+                return False
+            fingerprint = _fingerprint(status=RunStatus.FAILED, mode=mode, source_kind=source.kind,
+                                       failure_category=failure_category, failure=origin)
+            if (payload.get('fingerprint') != fingerprint
+                    or proposal.get('fingerprint') != fingerprint):
+                return False
         decision = SelfRepairDecision(
             kind='repair.classified', trigger=trigger, action=action,
             severity=severity, status=RunStatus.FAILED, mode=mode,
@@ -871,8 +905,11 @@ class PythonProjectTerminalHook:
                 or {'generated_project_contract_version', 'generated_project_preparation'} & route.keys()
                 or item.source_kind != 'original'
                 or type(row.version) is not int or row.version < 0
-                or row.blocked_by_run_id is not None
-                or route.get('approval_kind') is not None or route.get('decision_token') is not None):
+                or row.blocked_by_run_id is not None):
+            return None
+        if ((route.get('approval_kind') is not None or route.get('decision_token') is not None)
+                and not await _historical_nonblocking_repair_suggestion(
+                    session, row, route, stopped_pre_model=True)):
             return None
         intent_id = self._stopped_intent_id(item)
         intent = await session.scalar(select(RuntimeArtifactRow).where(
