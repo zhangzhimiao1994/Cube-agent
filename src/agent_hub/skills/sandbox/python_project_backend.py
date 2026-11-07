@@ -850,7 +850,7 @@ def _host_disk(fd: int) -> None:
 
 def _disk_budget(
     config: RootConfig, roots: _Roots, budget: int, copying: bool, *, source_bytes: int = 0,
-    product_bytes: int = 0,
+    product_bytes: int = 0, cache_copy_bytes: int | None = None,
 ) -> None:
     # Native FD authority is established by _roots; this is only bounded admission
     # arithmetic on the actual filesystems. External writers remain outside it.
@@ -860,18 +860,47 @@ def _disk_budget(
     _need(not copying or roots.cache_fd is not None, "python_project_environment_unavailable")
     reserve = config.cache_policy.disk_reserve_bytes
     _need(type(product_bytes) is int and product_bytes >= 0, "python_project_environment_quota")
+    copy_bytes = budget if cache_copy_bytes is None else cache_copy_bytes
+    _need(type(copy_bytes) is int and 0 <= copy_bytes <= budget,
+          "python_project_environment_quota")
     stage_required = (source_bytes + product_bytes + _STAGE_CONTROL_ALLOWANCE
                       + (budget if copying else 0))
     requirements = [(roots.stage_fd, stage_required)]
     if roots.cache_fd is not None:
         if os.fstat(roots.stage_fd).st_dev == os.fstat(roots.cache_fd).st_dev and copying:
-            requirements[0] = (roots.stage_fd, stage_required + budget)
-        requirements.append((roots.cache_fd, _CONTROL_ALLOWANCE + (budget if copying else 0)))
+            requirements[0] = (roots.stage_fd, stage_required + copy_bytes)
+        requirements.append((roots.cache_fd, _CONTROL_ALLOWANCE + (copy_bytes if copying else 0)))
     for fd, required in requirements:
         disk = statvfs(fd)
         _need(
             disk.f_bavail * disk.f_frsize >= required + reserve, "python_project_environment_quota"
         )
+
+
+def _fresh_copy_budget(
+    config: RootConfig, roots: _Roots, producer_budget: int, proposed: int, *, product_bytes: int,
+) -> int:
+    """Bound only the cache copy; keep the producer export ceiling fully reserved."""
+    statvfs = getattr(os, "fstatvfs", None)
+    _need(callable(statvfs), "python_project_unsupported")
+    assert callable(statvfs)
+    _need(roots.cache_fd is not None, "python_project_environment_unavailable")
+    assert roots.cache_fd is not None
+    reserve = config.cache_policy.disk_reserve_bytes
+    stage_disk = statvfs(roots.stage_fd)
+    cache_disk = statvfs(roots.cache_fd)
+    stage_free = stage_disk.f_bavail * stage_disk.f_frsize
+    cache_free = cache_disk.f_bavail * cache_disk.f_frsize
+    # One allowance belongs to the normal disk gate; the other leaves room for
+    # reservation/control writes between this callback and the post-lease check.
+    selected = min(proposed, cache_free - reserve - 2 * _CONTROL_ALLOWANCE)
+    if os.fstat(roots.stage_fd).st_dev == os.fstat(roots.cache_fd).st_dev:
+        selected = min(selected, stage_free - reserve - product_bytes
+                       - _STAGE_CONTROL_ALLOWANCE - producer_budget - _CONTROL_ALLOWANCE)
+    _need(type(selected) is int and selected > 0, "python_project_environment_quota")
+    _disk_budget(config, roots, producer_budget, True, product_bytes=product_bytes,
+                 cache_copy_bytes=selected)
+    return cast(int, selected)
 
 
 def _write_plan(plan: PythonProjectRunnerPlan, parent: int, stage: Path) -> Path:
@@ -1333,21 +1362,21 @@ def _run(
     )
     cache = PythonProjectEnvironmentCache(config.environment_root, config.cache_policy)
     minimum = _minimum_environment_bytes(config, deadline)
-    def fresh_check() -> None:
-        # Runner export still has the original producer ceiling. Lowering the
-        # cache copy budget must not lower the temporary-disk safety reserve.
+    def fresh_budget(proposed: int) -> int:
         try:
-            _disk_budget(config, roots, budget, True, product_bytes=invocation.workspace_limit_bytes)
+            return _fresh_copy_budget(config, roots, budget, proposed,
+                                      product_bytes=invocation.workspace_limit_bytes)
         except PythonProjectBackendError as error:
             if error.code == "python_project_environment_quota":
                 raise PythonProjectCacheError("cache_quota") from None
             raise
 
     with cache.reserve(invocation, next_bytes=budget, deadline=deadline,
-            adaptive=True, minimum_bytes=minimum, fresh_check=fresh_check) as lease:
+            adaptive=True, minimum_bytes=minimum, fresh_budget=fresh_budget) as lease:
         reused = lease.current(deadline=deadline)
         _disk_budget(config, roots, budget, reused is None,
-                     product_bytes=invocation.workspace_limit_bytes)
+                     product_bytes=invocation.workspace_limit_bytes,
+                     cache_copy_bytes=lease.limits.max_bytes)
         plan = PythonProjectRunnerPlan(
             invocation=invocation,
             inputs=prepared.inputs.to_payload(),

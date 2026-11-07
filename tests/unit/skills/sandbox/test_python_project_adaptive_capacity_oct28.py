@@ -319,13 +319,16 @@ def test_real_backend_flow_uses_lease_budget_after_validation(monkeypatch: pytes
             assert actual == item
             events.append('cache-lock')
             if not reuse:
-                kwargs['fresh_check']()
+                # The real cache first clamps its copy headroom, then asks the
+                # backend to clamp only that copy against actual disk space.
+                assert kwargs['fresh_budget'](selected) == selected
             yield lease
             events.append('cache-unlock')
 
     def disk(config: Any, roots: Any, budget: int, copying: bool, **kwargs: Any) -> None:
         if copying:
             assert not reuse and 'cache-lock' in events and budget == REQUESTED
+            assert kwargs['cache_copy_bytes'] == selected
         if 'validated-current' in events:
             assert copying is (not reuse)
         if reuse:
@@ -346,6 +349,11 @@ def test_real_backend_flow_uses_lease_budget_after_validation(monkeypatch: pytes
     monkeypatch.setattr(backend, '_source_snapshot', lambda *args: recipe.original_reference.input_source_sha256)
     monkeypatch.setattr(backend, '_recheck_source', lambda *args: None)
     monkeypatch.setattr(backend, '_write_plan', lambda *args: stage / 'plan.json')
+    # Model ample native disk space while retaining the real callback arithmetic.
+    if not reuse:
+        monkeypatch.setattr(backend, 'os', SimpleNamespace(
+            fstat=lambda fd: SimpleNamespace(st_dev=64769),
+            fstatvfs=lambda fd: SimpleNamespace(f_bavail=7644811264, f_frsize=1)))
     monkeypatch.setattr(backend, '_disk_budget', disk)
     monkeypatch.setattr(backend, '_make_export', lambda *args: stage / 'export')
     monkeypatch.setattr(backend, '_export_empty', lambda *args: None)

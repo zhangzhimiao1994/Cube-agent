@@ -1167,10 +1167,12 @@ class PythonProjectEnvironmentCache:
         self, invocation: PythonProjectInvocation, *, next_bytes: int, deadline: float,
         adaptive: bool = False, minimum_bytes: int = 1,
         fresh_check: Callable[[], None] | None = None,
+        fresh_budget: Callable[[int], int] | None = None,
     ) -> Iterator[PythonProjectCacheLease]:
         key = python_project_cache_key(invocation)
         _need(type(adaptive) is bool and type(minimum_bytes) is int and minimum_bytes > 0
-            and (fresh_check is None or callable(fresh_check)), "cache_invalid")
+            and (fresh_check is None or callable(fresh_check))
+            and (fresh_budget is None or callable(fresh_budget)), "cache_invalid")
         _need(type(next_bytes) is int and 0 < next_bytes <= self.policy.max_bytes, "cache_quota")
         with self._locked(deadline) as locked:
             with _io_errors():
@@ -1184,6 +1186,11 @@ class PythonProjectEnvironmentCache:
                     selected = min(next_bytes, self.policy.max_bytes - used - _CONTROL_ALLOWANCE,
                         free - self.policy.disk_reserve_bytes - _CONTROL_ALLOWANCE) if adaptive else next_bytes
                     _need(selected >= minimum_bytes, "cache_quota")
+                    if fresh_budget is not None:
+                        bounded = fresh_budget(selected)
+                        _need(type(bounded) is int and minimum_bytes <= bounded <= selected,
+                              "cache_quota")
+                        selected = bounded
                     if fresh_check is not None:
                         fresh_check()
                     return selected
