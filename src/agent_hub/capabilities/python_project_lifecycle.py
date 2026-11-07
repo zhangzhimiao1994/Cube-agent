@@ -15,7 +15,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import TracebackType
 from typing import TYPE_CHECKING, Protocol, cast
-from uuid import UUID, uuid4
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -46,6 +46,7 @@ from agent_hub.runs.artifacts import PostgresArtifactRepository
 from agent_hub.runs.repository import RunRepository, _database_uuid
 from agent_hub.runtime.artifacts import ArtifactReference, ArtifactRepository
 from agent_hub.runtime.contracts import Artifact, JsonValue, RuntimeCheckpoint, _freeze_object
+from agent_hub.skills.sandbox.python_premodel_retirement import PythonStoppedPremodelSnapshot
 from agent_hub.skills.sandbox.python_project_client import PythonProjectSystemdSandbox
 from agent_hub.skills.sandbox.python_project_protocol import (
     PythonEnvironmentReference,
@@ -161,7 +162,7 @@ class _GeneratedContextReader(Protocol):
     ) -> PythonGeneratedEnvironmentContext | None: ...
 
 
-class _Releaser(Protocol):
+class _LegacyReleaser(Protocol):
     async def release_expired(self, invocation: PythonProjectInvocation) -> bool: ...
 
     async def inspect_failed(self, invocation: PythonFailedMaintenanceInvocation) -> PythonFailedReservationSnapshot | None: ...
@@ -176,6 +177,17 @@ class _Releaser(Protocol):
         *,
         expected_environment: PythonEnvironmentReference,
     ) -> PythonEnvironmentReference: ...
+
+
+
+class _Releaser(_LegacyReleaser, Protocol):
+    async def inspect_stopped_premodel(
+        self, invocation: PythonFailedMaintenanceInvocation,
+    ) -> PythonStoppedPremodelSnapshot | None: ...
+
+    async def commit_stopped_premodel(
+        self, invocation: PythonFailedMaintenanceInvocation, snapshot: PythonStoppedPremodelSnapshot,
+    ) -> bool: ...
 
 
 def _uncertain(value: object) -> bool:
@@ -498,12 +510,148 @@ def _generated_preparation(route: Mapping[str, object]) -> Mapping[str, object] 
         return None
 
 
+async def _historical_nonblocking_repair_suggestion(
+    session: AsyncSession, row: RunRow, route: dict[str, object],
+) -> bool:
+    """Classify one persisted suggestion for cleanup, never approve or resume it.
+
+    record_self_repair_decision persists repair.classified and the proposal/token
+    under this run's lock in one transaction. The event does not contain the
+    token: its authority remains the unchanged locked RunRow, not an invented
+    approval-row/token relationship. Caller retains every native release fence.
+    """
+    from agent_hub.runs.self_repair import (
+        SelfRepairDecision,
+        _failure_category,
+        _fingerprint,
+        _kind_text,
+    )
+    from agent_hub.runtime.contracts import RunEvent, _mutable_json
+
+    def encoded(value: object) -> str:
+        bounded = _freeze_object(value, name='historical repair comparison')
+        return json.dumps(_mutable_json(bounded), sort_keys=True, separators=(',', ':'), allow_nan=False)
+
+    try:
+        proposal = route.get('repair_proposal')
+        token = route.get('decision_token')
+        if (row.status != 'failed' or type(route) is not dict
+                or route.get('approval_kind') != 'self_repair'
+                or type(token) is not str or re.fullmatch(r'decision-[a-f0-9]{64}', token) is None
+                or route.get('source') == 'self_repair'
+                or any(not isinstance(key, str) or key.startswith('self_repair_') for key in route)
+                or _uncertain(route) or type(proposal) is not dict
+                or proposal.get('kind') != 'self_repair'
+                or proposal.get('source_run_id') != str(row.id)
+                or proposal.get('pauses_run') is not False
+                or proposal.get('requires_approval') is not True
+                or proposal.get('automatic_execution') is not False):
+            return False
+        original = encoded(route)
+        events = (await session.scalars(select(RunEventRow).where(
+            RunEventRow.tenant_id == row.tenant_id, RunEventRow.run_id == row.id,
+            RunEventRow.kind.in_(('repair.classified', 'repair.skipped', 'repair.started',
+                                 'repair.completed', 'repair.failed')),
+        ).order_by(RunEventRow.sequence.desc()).limit(2))).all()
+        if len(events) != 1:
+            return False
+        saved = events[0]
+        if ((saved.tenant_id, saved.run_id, saved.kind) != (row.tenant_id, row.id, 'repair.classified')
+                or type(saved.sequence) is not int or saved.sequence < 1):
+            return False
+        event = RunEvent.from_payload(saved.payload)
+        payload = event.payload
+        source_sequence = proposal.get('source_event_sequence')
+        attempt = payload.get('attempt')
+        max_attempts = payload.get('max_attempts')
+        if (event.run_id != row.id or event.sequence != saved.sequence
+                or _kind_text(event.kind) != saved.kind
+                or type(source_sequence) is not int or not 0 < source_sequence < saved.sequence
+                or payload.get('schema_version') != 1 or type(payload.get('schema_version')) is not int
+                or payload.get('status') != 'failed' or payload.get('mode') != row.mode
+                or payload.get('source_sequence') != source_sequence
+                or type(payload.get('source_sequence')) is not int
+                or payload.get('requires_approval') is not True
+                or payload.get('automatic_execution') is not False
+                or type(attempt) is not int or type(max_attempts) is not int
+                or not 1 <= attempt <= max_attempts <= 3):
+            return False
+        trigger = payload.get('trigger')
+        action = payload.get('action')
+        severity = payload.get('severity')
+        failure_category = payload.get('failure_category')
+        mode_text = row.mode
+        if (not isinstance(trigger, str) or not isinstance(action, str)
+                or not isinstance(severity, str) or not isinstance(failure_category, str)
+                or not isinstance(mode_text, str)):
+            return False
+        recovery_strategy = payload.get('recovery_strategy')
+        orchestration_recovery_hint = payload.get('orchestration_recovery_hint')
+        error_code = payload.get('error_code')
+        suggested_action = payload.get('suggested_action')
+        if ((recovery_strategy is not None and not isinstance(recovery_strategy, str))
+                or (orchestration_recovery_hint is not None and not isinstance(orchestration_recovery_hint, str))
+                or (error_code is not None and not isinstance(error_code, str))
+                or (suggested_action is not None and not isinstance(suggested_action, str))):
+            return False
+        roles = payload.get('role_capability_requirements', ())
+        if not isinstance(roles, tuple):
+            return False
+        role_requirements: list[Mapping[str, JsonValue]] = []
+        for role in roles:
+            if not isinstance(role, Mapping):
+                return False
+            role_requirements.append(role)
+        source = await session.scalar(select(RunEventRow).where(
+            RunEventRow.tenant_id == row.tenant_id, RunEventRow.run_id == row.id,
+            RunEventRow.sequence == source_sequence,
+        ).limit(1))
+        if (source is None or (source.tenant_id, source.run_id, source.sequence)
+                != (row.tenant_id, row.id, source_sequence)
+                or source.kind not in ('runtime.failed', 'step.failed', 'tool.failed')):
+            return False
+        failure = RunEvent.from_payload(source.payload)
+        if (failure.run_id != row.id or failure.sequence != source.sequence
+                or _kind_text(failure.kind) != source.kind or payload.get('source_kind') != source.kind
+                or _failure_category(failure) != payload.get('failure_category')):
+            return False
+        mode = TaskMode(mode_text)
+        fingerprint = _fingerprint(status=RunStatus.FAILED, mode=mode, source_kind=source.kind,
+                                   failure_category=failure_category, failure=failure)
+        if payload.get('fingerprint') != fingerprint or proposal.get('fingerprint') != fingerprint:
+            return False
+        decision = SelfRepairDecision(
+            kind='repair.classified', trigger=trigger, action=action,
+            severity=severity, status=RunStatus.FAILED, mode=mode,
+            source_kind=source.kind, source_sequence=source_sequence, fingerprint=fingerprint,
+            failure_category=failure_category, requires_approval=True,
+            automatic_execution=False, attempt=attempt, max_attempts=max_attempts,
+            recovery_strategy=recovery_strategy,
+            orchestration_recovery_hint=orchestration_recovery_hint,
+            error_code=error_code, suggested_action=suggested_action,
+            role_capability_requirements=tuple(role_requirements),
+        )
+        if (decision.pauses_run is not False
+                or encoded(decision.to_event(run_id=row.id, sequence=saved.sequence).to_payload()) != encoded(saved.payload)
+                or encoded(decision.to_proposal(run_id=row.id)) != encoded(proposal)):
+            return False
+        child = await session.scalar(select(RunRow.id).where(
+            RunRow.tenant_id == row.tenant_id, RunRow.id != row.id,
+            or_(RunRow.blocked_by_run_id == row.id,
+                RunRow.routing_decision.contains({'source_run_id': str(row.id)}),
+                RunRow.routing_decision.contains({'self_repair_source_run_id': str(row.id)})),
+        ).limit(1))
+        return child is None and encoded(row.routing_decision) == original
+    except (ValueError, TypeError, KeyError, AttributeError, OverflowError, RecursionError):
+        return False
+
+
 class PythonProjectTerminalHook:
     def __init__(
         self,
         repository: _Repository,
         verifier: _ContextReader,
-        executor: _Releaser,
+        executor: _LegacyReleaser,
         *,
         generated_reader: _GeneratedContextReader | None = None,
     ) -> None:
@@ -515,6 +663,7 @@ class PythonProjectTerminalHook:
         self._capacity_cursor: UUID | None = None
         self._failed_empty_cursor: UUID | None = None
         self._capacity_lock = asyncio.Lock()
+        self._stopped_unknown_owners: set[tuple[UUID, UUID]] = set()
         self._failure_archive_repository: ArtifactRepository | None = (
             PostgresArtifactRepository(repository._session_factory) if isinstance(repository, RunRepository) else None
         )
@@ -647,107 +796,238 @@ class PythonProjectTerminalHook:
                     raise ValueError('invalid failed reservation maintenance result')
                 return result
 
-    async def _release_expired_pre_model(
-        self, tenant: UUID, run: UUID, cutoff: datetime,
-    ) -> bool:
-        async with (
-            asyncio.timeout(_CAPACITY_TIMEOUT_SECONDS),
-            await self.repository.run_transaction() as session,
-            session.begin(),
-        ):
-            row = await session.scalar(select(RunRow).where(
-                RunRow.tenant_id == tenant, RunRow.id == run,
-            ).with_for_update())
-            if (row is None or (row.tenant_id, row.id, row.status) != (tenant, run, 'failed')
-                    or not isinstance(row.updated_at, datetime) or row.updated_at.tzinfo is None
-                    or row.updated_at > cutoff or any(value is not None for value in (
-                        row.worker_id, row.worker_lease_token,
-                        row.worker_lease_expires_at, row.worker_heartbeat_at))):
-                return False
-            route = row.routing_decision
-            if (type(route) is not dict or _RELEASE_MARKER in route
-                    or route.get('source') == 'self_repair'
-                    or any(not isinstance(key, str) or key.startswith('self_repair_') for key in route)):
-                return False
-            generated = bool({'generated_project_contract_version', 'generated_project_preparation'} & route.keys())
-            state: Mapping[str, object] | None
-            if generated:
-                state = _generated_preparation(route)
-                if state is None or row.mode != 'direct':
-                    return False
-            else:
-                original_state = route.get('project_input_preparation')
-                if not isinstance(original_state, dict):
-                    return False
-                state = original_state
-                if (type(state) is not dict or set(state) != {
-                    'schema_version', 'phase', 'execution_id', 'reference', 'python_recipe'}
-                    or type(state['schema_version']) is not int or state['schema_version'] != 2
-                    or state['phase'] != 'executing'):
-                    return False
-                # This exact producer phase is not an execution proof. Any
-                # other UNKNOWN/partial marker remains a veto.
-                check_route = {**route, 'project_input_preparation': {**state, 'phase': 'captured'}}
-                if _uncertain(check_route):
-                    return False
-            assert state is not None
-            probes = [
-                select(ProviderContinuationRow.id).where(ProviderContinuationRow.tenant_id == tenant,
-                                                        ProviderContinuationRow.run_id == run),
-                select(RunApprovalRow.id).where(RunApprovalRow.tenant_id == tenant,
-                    RunApprovalRow.run_id == run, RunApprovalRow.status.not_in(('approved', 'rejected', 'expired'))),
-                select(RunOutboxRow.id).where(RunOutboxRow.tenant_id == tenant,
-                    RunOutboxRow.run_id == run, RunOutboxRow.delivered.is_(False)),
-            ]
-            if not generated:
-                probes += [
-                    select(RunCheckpointRow.id).where(RunCheckpointRow.tenant_id == tenant,
-                                                     RunCheckpointRow.run_id == run),
-                    select(RunUsageRow.id).where(RunUsageRow.tenant_id == tenant, RunUsageRow.run_id == run),
-                    select(RunEventRow.id).where(RunEventRow.tenant_id == tenant, RunEventRow.run_id == run,
-                                                 RunEventRow.kind.not_in(_PRE_MODEL_EVENT_KINDS)),
-                ]
-            for query in probes:
-                if await session.scalar(query.limit(1)) is not None:
-                    return False
-            if generated:
-                from agent_hub.capabilities.python_direct_expiry import verified_direct_expiry
+    async def _pre_model_invocation(self, session: AsyncSession, tenant: UUID, run: UUID, cutoff: datetime) -> tuple[RunRow, PythonProjectInvocation] | None:
+        row = await session.scalar(select(RunRow).where(RunRow.tenant_id == tenant, RunRow.id == run).with_for_update())
+        if row is None or (row.tenant_id, row.id, row.status) != (tenant, run, 'failed') or (not isinstance(row.updated_at, datetime)) or (row.updated_at.tzinfo is None) or (row.updated_at > cutoff) or any(value is not None for value in (row.worker_id, row.worker_lease_token, row.worker_lease_expires_at, row.worker_heartbeat_at)):
+            return None
+        route = row.routing_decision
+        if type(route) is not dict or _RELEASE_MARKER in route or route.get('source') == 'self_repair' or any(not isinstance(key, str) or key.startswith('self_repair_') for key in route):
+            return None
+        generated = bool({'generated_project_contract_version', 'generated_project_preparation'} & route.keys())
+        state: Mapping[str, object] | None
+        if generated:
+            state = _generated_preparation(route)
+            if state is None or row.mode != 'direct':
+                return None
+        else:
+            original_state = route.get('project_input_preparation')
+            if not isinstance(original_state, dict):
+                return None
+            state = original_state
+            if type(state) is not dict or set(state) != {'schema_version', 'phase', 'execution_id', 'reference', 'python_recipe'} or type(state['schema_version']) is not int or (state['schema_version'] != 2) or (state['phase'] != 'executing'):
+                return None
+            check_route = {**route, 'project_input_preparation': {**state, 'phase': 'captured'}}
+            if _uncertain(check_route):
+                return None
+        assert state is not None
+        probes = [select(ProviderContinuationRow.id).where(ProviderContinuationRow.tenant_id == tenant, ProviderContinuationRow.run_id == run), select(RunApprovalRow.id).where(RunApprovalRow.tenant_id == tenant, RunApprovalRow.run_id == run, RunApprovalRow.status.not_in(('approved', 'rejected', 'expired'))), select(RunOutboxRow.id).where(RunOutboxRow.tenant_id == tenant, RunOutboxRow.run_id == run, RunOutboxRow.delivered.is_(False))]
+        if not generated:
+            probes += [select(RunCheckpointRow.id).where(RunCheckpointRow.tenant_id == tenant, RunCheckpointRow.run_id == run), select(RunUsageRow.id).where(RunUsageRow.tenant_id == tenant, RunUsageRow.run_id == run), select(RunEventRow.id).where(RunEventRow.tenant_id == tenant, RunEventRow.run_id == run, RunEventRow.kind.not_in(_PRE_MODEL_EVENT_KINDS))]
+        for query in probes:
+            if await session.scalar(query.limit(1)) is not None:
+                return None
+        if generated:
+            from agent_hub.capabilities.python_direct_expiry import verified_direct_expiry
+            if not await verified_direct_expiry(session, row):
+                return None
+            check_route = route
+            receipt = route.get('project_verification_receipt')
+            if isinstance(receipt, Mapping) and receipt.get('status') == 'running':
+                check_route = {**route, 'project_verification_receipt': {**receipt, 'status': 'expiry_liveness_proven'}}
+            if _uncertain(check_route):
+                return None
+        project, workspace = authorized_workspace_scope(row, tenant_id=tenant, run_id=run)
+        item = await self.verifier.python_expired_environment_invocation(tenant, run)
+        if item is None:
+            return None
+        item = PythonProjectInvocation.model_validate(item.model_dump(), strict=True)
+        recipe = state['python_recipe']
+        if item.install_allowed is not False or item.source_kind != ('candidate' if generated else 'original') or (item.tenant_id, item.run_id, item.project_id, item.session_id) != (tenant, run, project, workspace) or (item.original_reference.model_dump(mode='json') != state['reference']) or (not isinstance(recipe, Mapping)) or (set(recipe) != {'schema_version', 'recipe_sha256', 'environment_input_sha256'}) or (type(recipe['schema_version']) is not int) or (recipe['schema_version'] != 1) or ((item.recipe_sha256, item.environment_input_sha256) != (recipe['recipe_sha256'], recipe['environment_input_sha256'])):
+            return None
+        return (row, item)
 
-                if not await verified_direct_expiry(session, row):
-                    return False
-                # The complete proof binds a running issuance index to this
-                # exact pending verify and its native prepared authority. Only
-                # this status is non-authorizing historical metadata; every
-                # other UNKNOWN/running value still vetoes release. Root must
-                # independently fence retained runtimes, units and stages.
-                check_route = route
-                receipt = route.get('project_verification_receipt')
-                if isinstance(receipt, Mapping) and receipt.get('status') == 'running':
-                    check_route = {**route, 'project_verification_receipt': {
-                        **receipt, 'status': 'expiry_liveness_proven'}}
-                if _uncertain(check_route):
-                    return False
-            project, workspace = authorized_workspace_scope(row, tenant_id=tenant, run_id=run)
-            item = await self.verifier.python_expired_environment_invocation(tenant, run)
-            if item is None:
+    async def _release_expired_pre_model(self, tenant: UUID, run: UUID, cutoff: datetime) -> bool:
+        async with asyncio.timeout(_CAPACITY_TIMEOUT_SECONDS), await self.repository.run_transaction() as session, session.begin():
+            selected = await self._pre_model_invocation(session, tenant, run, cutoff)
+            if selected is None:
                 return False
-            item = PythonProjectInvocation.model_validate(item.model_dump(), strict=True)
-            recipe = state['python_recipe']
-            if (item.install_allowed is not False or item.source_kind != ('candidate' if generated else 'original')
-                    or (item.tenant_id, item.run_id, item.project_id, item.session_id)
-                    != (tenant, run, project, workspace)
-                    or item.original_reference.model_dump(mode='json') != state['reference']
-                    or not isinstance(recipe, Mapping) or set(recipe) != {
-                        'schema_version', 'recipe_sha256', 'environment_input_sha256'}
-                    or type(recipe['schema_version']) is not int or recipe['schema_version'] != 1
-                    or (item.recipe_sha256, item.environment_input_sha256)
-                    != (recipe['recipe_sha256'], recipe['environment_input_sha256'])):
-                return False
+            _row, item = selected
             released = await self.executor.release_expired(item)
             if type(released) is not bool:
                 raise ValueError('invalid Python expired cleanup response')
-            # No run transition, marker, version, request or flag is backfilled.
             return released
+
+
+    async def _stopped_pre_model_owner(
+        self, session: AsyncSession, tenant: UUID, run: UUID, cutoff: datetime,
+        *, expected_intent: Artifact | None = None,
+    ) -> tuple[str, PythonProjectInvocation] | None:
+        selected = await self._pre_model_invocation(session, tenant, run, cutoff)
+        if selected is None:
+            return None
+        row, item = selected
+        route = row.routing_decision
+        if (type(route) is not dict
+                or {'generated_project_contract_version', 'generated_project_preparation'} & route.keys()
+                or item.source_kind != 'original'
+                or type(row.version) is not int or row.version < 0
+                or row.blocked_by_run_id is not None
+                or route.get('approval_kind') is not None or route.get('decision_token') is not None):
+            return None
+        intent_id = self._stopped_intent_id(item)
+        intent = await session.scalar(select(RuntimeArtifactRow).where(
+            RuntimeArtifactRow.tenant_id == tenant, RuntimeArtifactRow.run_id == run,
+            RuntimeArtifactRow.id == intent_id))
+        if expected_intent is None:
+            if intent is not None:
+                return None  # A prior/private partial attempt is never automatic retry authority.
+        elif (intent is None or intent.permanent is not True
+                or (intent.tenant_id, intent.run_id, intent.id) != (tenant, run, expected_intent.id)
+                or PostgresArtifactRepository._hydrate(intent).to_payload() != expected_intent.to_payload()):
+            return None
+        child = await session.scalar(select(RunRow.id).where(
+            RunRow.tenant_id == tenant, RunRow.id != run,
+            or_(RunRow.blocked_by_run_id == run,
+                RunRow.routing_decision.contains({'source_run_id': str(run)}),
+                RunRow.routing_decision.contains({'self_repair_source_run_id': str(run)})),
+        ).limit(1))
+        if child is not None or await session.scalar(select(RuntimeArtifactWriteRow.write_id).where(
+                RuntimeArtifactWriteRow.tenant_id == tenant, RuntimeArtifactWriteRow.run_id == run,
+                RuntimeArtifactWriteRow.status == 'reserved').limit(1)) is not None:
+            return None
+        # Freeze even permitted pre-model events, not merely absence of model kinds.
+        # The real private ArtifactRepository publishes no event or version update.
+        events = (await session.scalars(select(RunEventRow).where(
+            RunEventRow.tenant_id == tenant, RunEventRow.run_id == run,
+        ).order_by(RunEventRow.sequence).limit(1025))).all()
+        if len(events) > 1024:
+            return None
+        history = []
+        previous = -1
+        for event in events:
+            if ((event.tenant_id, event.run_id) != (tenant, run)
+                    or type(event.sequence) is not int or event.sequence <= previous
+                    or event.kind not in _PRE_MODEL_EVENT_KINDS or type(event.payload) is not dict):
+                return None
+            previous = event.sequence
+            history.append({'id': str(event.id), 'sequence': event.sequence,
+                'kind': event.kind, 'payload': event.payload})
+        frozen_item = item.model_dump(mode='json')
+        frozen_item.pop('execution_id')  # The readonly selector mints no grant, only a fresh probe ID.
+        identity = {'tenant_id': str(tenant), 'run_id': str(run), 'version': row.version,
+            'status': row.status, 'updated_at': row.updated_at.isoformat(),
+            'actor_id': str(row.actor_id) if row.actor_id is not None else None,
+            'actor_role': row.actor_role, 'request': row.request, 'mode': row.mode,
+            'route': route, 'invocation': frozen_item, 'events': history}
+        _freeze_object(identity, name='stopped pre-model owner')
+        encoded = json.dumps(identity, sort_keys=True, separators=(',', ':'), allow_nan=False).encode()
+        if len(encoded) > 1024**2:
+            return None
+        return hashlib.sha256(encoded).hexdigest(), item
+
+    @staticmethod
+    def _stopped_intent_id(item: PythonProjectInvocation) -> UUID:
+        owner = ':'.join(str(getattr(item, key)) for key in (
+            'tenant_id', 'run_id', 'project_id', 'session_id'))
+        return uuid5(NAMESPACE_URL, 'agent-hub:stopped-premodel-commit-intent:' + owner)
+
+    @staticmethod
+    def _stopped_snapshot_matches(
+        snapshot: PythonStoppedPremodelSnapshot, item: PythonProjectInvocation,
+        maintenance: PythonFailedMaintenanceInvocation,
+    ) -> bool:
+        reference = PythonEnvironmentReference.model_validate_json(snapshot.reference, strict=True)
+        return (snapshot.scope == reference.scope
+            and snapshot.scope.original_reference == item.original_reference
+            and _reference_matches(item, reference)
+            and all(getattr(snapshot.scope, key) == getattr(maintenance, key)
+                    for key in ('tenant_id', 'run_id', 'project_id', 'session_id'))
+            and maintenance.execution_id not in {snapshot.origin_execution_id,
+                *(stage.execution_id for stage in snapshot.stages)})
+
+    async def _retire_stopped_pre_model(
+        self, tenant: UUID, run: UUID, cutoff: datetime,
+    ) -> bool:
+        archive_repository = self._failure_archive_repository
+        owner = tenant, run
+        # Bounded conservative circuit: a new worker must inspect durable Root
+        # state, never automatically resume an uncertain commit in this hook.
+        if (archive_repository is None or owner in self._stopped_unknown_owners
+                or len(self._stopped_unknown_owners) >= 1024):
+            return False
+        executor = cast(_Releaser, self.executor)
+        try:
+            async with asyncio.timeout(_CAPACITY_TIMEOUT_SECONDS):
+                async with await self.repository.run_transaction() as session, session.begin():
+                    selected = await self._stopped_pre_model_owner(session, tenant, run, cutoff)
+                    if selected is None:
+                        return False
+                    identity, item = selected
+                    invocation = PythonFailedMaintenanceInvocation(
+                        execution_id='python_release_expired_' + uuid4().hex,
+                        tenant_id=tenant, run_id=run, project_id=item.project_id, session_id=item.session_id)
+                    snapshot = await executor.inspect_stopped_premodel(invocation)
+                    if snapshot is None:
+                        # Only this known, non-exception outcome permits normal TTL
+                        # release, still under the original lock and a full recheck.
+                        current = await self._stopped_pre_model_owner(session, tenant, run, cutoff)
+                        if current is None or current[0] != identity:
+                            return False
+                        result = await self.executor.release_expired(current[1])
+                        if type(result) is not bool:
+                            raise ValueError('invalid stopped fallback release response')
+                        return result
+                    if type(snapshot) is not PythonStoppedPremodelSnapshot:
+                        raise ValueError('invalid stopped pre-model snapshot type')
+                    snapshot = PythonStoppedPremodelSnapshot.model_validate_json(
+                        snapshot.model_dump_json(), strict=True)
+                    if not self._stopped_snapshot_matches(snapshot, item, invocation):
+                        return False
+                # ArtifactRepo owns its own RunRow-locked transaction. Never nest it.
+                archive = snapshot.archive()
+                await archive_repository.put(tenant, run, archive)
+                readback = await archive_repository.get_many(tenant, run, (
+                    ArtifactReference(id=archive.id, sha256=archive.content_sha256),))
+                if len(readback) != 1 or readback[0].to_payload() != archive.to_payload():
+                    return False
+                # Fixed owner ID + unique inspector identity makes concurrent or
+                # restarted claimants conflict in the immutable private repository.
+                # This is an irreversible attempt fence, not execution authority.
+                intent = Artifact(id=self._stopped_intent_id(item),
+                    type='python_stopped_premodel_commit_intent', producer='python_terminal_maintenance',
+                    content={'schema_version': 1, 'owner_sha256': identity,
+                        'inspect_execution_id': invocation.execution_id,
+                        'snapshot_archive_id': str(archive.id),
+                        'snapshot_archive_sha256': archive.content_sha256})
+                await archive_repository.put(tenant, run, intent)
+                intent_readback = await archive_repository.get_many(tenant, run, (
+                    ArtifactReference(id=intent.id, sha256=intent.content_sha256),))
+                if len(intent_readback) != 1 or intent_readback[0].to_payload() != intent.to_payload():
+                    return False
+                async with await self.repository.run_transaction() as session, session.begin():
+                    current = await self._stopped_pre_model_owner(
+                        session, tenant, run, cutoff, expected_intent=intent)
+                    if current is None or current[0] != identity:
+                        return False
+                    stored = await session.scalar(select(RuntimeArtifactRow).where(
+                        RuntimeArtifactRow.tenant_id == tenant, RuntimeArtifactRow.run_id == run,
+                        RuntimeArtifactRow.id == archive.id))
+                    if (stored is None or stored.permanent is not True
+                            or (stored.tenant_id, stored.run_id, stored.id) != (tenant, run, archive.id)
+                            or PostgresArtifactRepository._hydrate(stored).to_payload() != archive.to_payload()):
+                        return False
+                    commit = invocation.model_copy(update={
+                        'execution_id': 'python_release_expired_' + uuid4().hex})
+                    if (commit.execution_id == invocation.execution_id
+                            or not self._stopped_snapshot_matches(snapshot, current[1], commit)):
+                        return False
+                    result = await executor.commit_stopped_premodel(commit, snapshot)
+                    if type(result) is not bool:
+                        raise ValueError('invalid stopped pre-model commit response')
+                    return result
+        except BaseException:
+            self._stopped_unknown_owners.add(owner)
+            raise
 
     async def _release_expired_terminal_observed(
         self, tenant: UUID, run: UUID, cutoff: datetime,
@@ -771,15 +1051,21 @@ class PythonProjectTerminalHook:
             if (type(route) is not dict or _uncertain(route) or _RELEASE_MARKER in route
                     or route.get('source') == 'self_repair'
                     or any(not isinstance(key, str) or key.startswith('self_repair_') for key in route)
-                    or {'generated_project_contract_version', 'generated_project_preparation'} & route.keys()
-                    or route.get('approval_kind') is not None or route.get('decision_token') is not None):
+                    or {'generated_project_contract_version', 'generated_project_preparation'} & route.keys()):
                 return False
+            before = _freeze_object(route, name='expired observed owner')
+            version = row.version
+            if route.get('approval_kind') is not None or route.get('decision_token') is not None:
+                if not await _historical_nonblocking_repair_suggestion(session, row, route):
+                    return False
+                # Private classification only; never assign this view to the row.
+                approval_view = {**route, 'approval_kind': None, 'decision_token': None}
+                if _uncertain(approval_view):
+                    return False
             state = route.get('project_input_preparation')
             if (not isinstance(state, Mapping) or type(state.get('schema_version')) is not int
                     or state['schema_version'] != 2 or state.get('phase') != 'observed'):
                 return False
-            before = _freeze_object(route, name='expired observed owner')
-            version = row.version
             for query in (
                 select(ProviderContinuationRow.id).where(ProviderContinuationRow.tenant_id == tenant,
                     ProviderContinuationRow.run_id == run),
@@ -853,21 +1139,34 @@ class PythonProjectTerminalHook:
                     (_database_uuid(row.tenant_id), _database_uuid(row.id),
                      isinstance((row.routing_decision or {}).get('project_input_preparation'), Mapping)
                      and cast(Mapping[str, object], (row.routing_decision or {})['project_input_preparation'])
-                         .get('phase') == 'observed') for row in rows
+                         .get('phase') == 'observed',
+                     not ({'generated_project_contract_version', 'generated_project_preparation'}
+                          & (row.routing_decision or {}).keys())) for row in rows
                 )
             if not candidates:
                 self._capacity_cursor = None
             released = 0
-            for tenant, run, observed in candidates:
+            stopped_attempts: set[tuple[UUID, UUID]] = set()
+            for tenant, run, observed, original in candidates:
+                if (tenant, run) in self._stopped_unknown_owners:
+                    self._capacity_cursor = run
+                    continue
                 try:
-                    released += int(await (self._release_expired_terminal_observed(tenant, run, cutoff)
-                        if observed else self._release_expired_pre_model(tenant, run, cutoff)))
+                    if not observed and original and self._failure_archive_repository is not None:
+                        stopped_attempts.add((tenant, run))
+                        released += int(await self._retire_stopped_pre_model(tenant, run, cutoff))
+                    else:
+                        released += int(await (self._release_expired_terminal_observed(tenant, run, cutoff)
+                            if observed else self._release_expired_pre_model(tenant, run, cutoff)))
                 except Exception:  # noqa: BLE001 - UNKNOWN is not false/absent and never grants deletion.
                     _LOGGER.warning('python_expired_environment_maintenance_blocked run_id=%s', run)
                 self._capacity_cursor = run
-            return released + await self._maintain_empty_failures(cutoff)
+            return released + await self._maintain_empty_failures(
+                cutoff, excluded=frozenset(stopped_attempts | self._stopped_unknown_owners))
 
-    async def _maintain_empty_failures(self, cutoff: datetime) -> int:
+    async def _maintain_empty_failures(
+        self, cutoff: datetime, *, excluded: frozenset[tuple[UUID, UUID]] = frozenset(),
+    ) -> int:
         if self._failure_archive_repository is None:
             return 0
         query = select(RunRow).where(RunRow.status == 'failed', RunRow.updated_at <= cutoff,
@@ -885,6 +1184,9 @@ class PythonProjectTerminalHook:
             self._failed_empty_cursor = None
         released = 0
         for tenant, run in candidates:
+            if (tenant, run) in excluded:
+                self._failed_empty_cursor = run
+                continue
             try:
                 released += int(await self._release_expired_empty_failure(tenant, run, cutoff))
             except Exception:  # noqa: BLE001 - one blocked owner never grants cleanup or stalls the bounded cursor.

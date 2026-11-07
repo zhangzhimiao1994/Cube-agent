@@ -52,6 +52,10 @@ if TYPE_CHECKING:
         PythonMetadataPreparationRequest,
         PythonMetadataPreparationResponse,
     )
+    from agent_hub.skills.sandbox.python_premodel_retirement import (
+        PythonStoppedPremodelMaintenanceRequest,
+        PythonStoppedPremodelMaintenanceResponse,
+    )
     from agent_hub.skills.sandbox.python_project_broker import ProductSink
     from agent_hub.skills.sandbox.python_project_profile import (
         PythonProjectProfileResponse,
@@ -393,9 +397,9 @@ class SkillBroker:
         return await self._project_broker.handle(request, peer_uid=peer_uid)
 
     async def handle_python_project(
-        self, request: PythonProjectBrokerRequest | PythonProjectProbeRequest | PythonProjectInspectEnvironmentRequest | PythonProjectReleaseEnvironmentRequest | PythonProjectReleaseExpiredEnvironmentRequest | PythonFailedMaintenanceRequest,
+        self, request: PythonProjectBrokerRequest | PythonProjectProbeRequest | PythonProjectInspectEnvironmentRequest | PythonProjectReleaseEnvironmentRequest | PythonProjectReleaseExpiredEnvironmentRequest | PythonFailedMaintenanceRequest | PythonStoppedPremodelMaintenanceRequest,
         *, peer_uid: int, product_sink: ProductSink | None = None,
-    ) -> PythonProjectBrokerResponse:
+    ) -> PythonProjectBrokerResponse | PythonStoppedPremodelMaintenanceResponse:
         from agent_hub.skills.sandbox.python_project_broker import handle_python_project
 
         return await handle_python_project(self._project_broker, request, peer_uid=peer_uid,
@@ -686,10 +690,12 @@ async def _serve_client(
     is_profile = False
     is_resolution = False
     is_toolchain = False
+    is_stopped_premodel = False
+    stopped_request: PythonStoppedPremodelMaintenanceRequest | None = None
     toolchain_request: ToolchainRequest | None = None
     supply_request: PythonInputSupplyRequest | None = None
-    python_request: PythonProjectBrokerRequest | PythonProjectProbeRequest | PythonProjectInspectEnvironmentRequest | PythonProjectReleaseEnvironmentRequest | PythonProjectReleaseExpiredEnvironmentRequest | PythonFailedMaintenanceRequest | None = None
-    response: BrokerResponse | PythonProjectBrokerResponse | PythonInputSupplyResponse | PythonProjectProfileResponse | ToolchainResponse | PythonDependencyClosureResponse | PythonMetadataPlanningResponse | PythonMetadataPreparationResponse | ResolutionStatus
+    python_request: PythonProjectBrokerRequest | PythonProjectProbeRequest | PythonProjectInspectEnvironmentRequest | PythonProjectReleaseEnvironmentRequest | PythonProjectReleaseExpiredEnvironmentRequest | PythonFailedMaintenanceRequest | PythonStoppedPremodelMaintenanceRequest | None = None
+    response: BrokerResponse | PythonProjectBrokerResponse | PythonStoppedPremodelMaintenanceResponse | PythonInputSupplyResponse | PythonProjectProfileResponse | ToolchainResponse | PythonDependencyClosureResponse | PythonMetadataPlanningResponse | PythonMetadataPreparationResponse | ResolutionStatus
     try:
         peer_uid = _peer_uid(writer)
         payload = await _read_frame(reader, _MAX_REQUEST_BYTES)
@@ -821,6 +827,10 @@ async def _serve_client(
             response = await broker.handle_input_supply(supply_request, peer_uid=peer_uid)
         elif isinstance(envelope, dict) and type(envelope.get("version")) is int and envelope["version"] == 4:
             is_project = True
+            from agent_hub.skills.sandbox.python_premodel_retirement import (
+                PythonStoppedPremodelMaintenanceRequest,
+                PythonStoppedPremodelMaintenanceResponse,
+            )
             from agent_hub.skills.sandbox.python_project_protocol import (
                 PythonFailedMaintenanceRequest,
                 PythonProjectBrokerRequest,
@@ -847,6 +857,10 @@ async def _serve_client(
                     raise BrokerRequestError('invalid Python expired release request') from None
             elif action == 'maintain_expired_python_failure':
                 python_request = PythonFailedMaintenanceRequest.model_validate_json(payload, strict=True)
+            elif action == 'maintain_stopped_premodel_python_project_environment':
+                is_stopped_premodel = True
+                stopped_request = PythonStoppedPremodelMaintenanceRequest.model_validate_json(payload, strict=True)
+                python_request = stopped_request
             else:
                 raise BrokerRequestError("invalid Python broker action")
             if (isinstance(python_request, PythonProjectBrokerRequest)
@@ -891,6 +905,9 @@ async def _serve_client(
             await writer.wait_closed()
             raise
         response = (
+            PythonStoppedPremodelMaintenanceResponse(execution_id=stopped_request.invocation.execution_id,
+                ok=False, error="python_project_execution_unavailable")
+            if stopped_request is not None else
             ToolchainResponse(action=toolchain_request.action,
                 execution_id=toolchain_request.invocation.execution_id,
                 scope=toolchain_request.invocation.scope, ok=False, error='toolchain_unavailable')
@@ -902,10 +919,15 @@ async def _serve_client(
             PythonProjectBrokerResponse(action=python_request.action,
                 execution_id=python_request.invocation.execution_id, ok=False,
                 error="python_project_execution_unavailable")
-            if python_request is not None else BrokerResponse(ok=False, error="project execution cancelled")
+            if python_request is not None and not isinstance(python_request, PythonStoppedPremodelMaintenanceRequest)
+            else BrokerResponse(ok=False, error="project execution cancelled")
         )
     except (BrokerRequestError, OSError, ValueError) as error:
-        if toolchain_request is not None:
+        if stopped_request is not None:
+            response = PythonStoppedPremodelMaintenanceResponse(
+                execution_id=stopped_request.invocation.execution_id,
+                ok=False, error="python_project_execution_unavailable")
+        elif toolchain_request is not None:
             response = ToolchainResponse(action=toolchain_request.action,
                 execution_id=toolchain_request.invocation.execution_id,
                 scope=toolchain_request.invocation.scope, ok=False, error='toolchain_unavailable')
@@ -915,7 +937,8 @@ async def _serve_client(
                 error="input_supply_unavailable")
         else:
             response = BrokerResponse(ok=False,
-                error='resolution_request_invalid' if is_resolution else
+                error='stopped_premodel_request_invalid' if is_stopped_premodel else
+                    'resolution_request_invalid' if is_resolution else
                     'metadata_prepare_request_invalid' if is_metadata_preparation else
                     'metadata_plan_request_invalid' if is_metadata_plan else
                     'python_dependency_request_invalid' if is_dependency else

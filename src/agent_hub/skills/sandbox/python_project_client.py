@@ -12,7 +12,7 @@ import contextlib
 import json
 import sys
 from pathlib import Path
-from typing import BinaryIO, cast
+from typing import BinaryIO, cast, overload
 
 from agent_hub.skills.sandbox.broker import (
     _MAX_REQUEST_BYTES,
@@ -27,6 +27,11 @@ from agent_hub.skills.sandbox.project import (
     _systemd_supported,
     _uninterrupted,
     request_project_broker,
+)
+from agent_hub.skills.sandbox.python_premodel_retirement import (
+    PythonStoppedPremodelMaintenanceRequest,
+    PythonStoppedPremodelMaintenanceResponse,
+    PythonStoppedPremodelSnapshot,
 )
 from agent_hub.skills.sandbox.python_project_protocol import (
     PythonEnvironmentReference,
@@ -46,11 +51,13 @@ from agent_hub.skills.sandbox.python_project_protocol import (
 )
 from agent_hub.subprocess_cleanup import ProcessCleanupIncomplete
 
-type _PythonRequest = (
+type _LegacyPythonRequest = (
     PythonProjectBrokerRequest | PythonProjectProbeRequest | PythonProjectInspectEnvironmentRequest
     | PythonProjectReleaseEnvironmentRequest
     | PythonProjectReleaseExpiredEnvironmentRequest | PythonFailedMaintenanceRequest
 )
+type _PythonRequest = _LegacyPythonRequest | PythonStoppedPremodelMaintenanceRequest
+type _PythonResponse = PythonProjectBrokerResponse | PythonStoppedPremodelMaintenanceResponse
 _REQUEST_GRACE_SECONDS = 10.0
 _CLEANUP_SECONDS = 10.0
 
@@ -64,6 +71,7 @@ def _validated_request(request: _PythonRequest) -> _PythonRequest:
             PythonProjectReleaseEnvironmentRequest,
             PythonProjectReleaseExpiredEnvironmentRequest,
     PythonFailedMaintenanceRequest,
+            PythonStoppedPremodelMaintenanceRequest,
         }:
             raise ValueError("invalid request type")
         # Frozen models can still be constructed/copied without validation. Reparse
@@ -75,11 +83,23 @@ def _validated_request(request: _PythonRequest) -> _PythonRequest:
         raise ValueError("python_project_request_invalid") from None
 
 
+@overload
+async def request_python_project_broker(
+    request: PythonStoppedPremodelMaintenanceRequest, *, socket_path: Path = BROKER_SOCKET_PATH,
+) -> PythonStoppedPremodelMaintenanceResponse: ...
+
+
+@overload
+async def request_python_project_broker(
+    request: _LegacyPythonRequest, *, socket_path: Path = BROKER_SOCKET_PATH,
+) -> PythonProjectBrokerResponse: ...
+
+
 async def request_python_project_broker(
     request: _PythonRequest,
     *,
     socket_path: Path = BROKER_SOCKET_PATH,
-) -> PythonProjectBrokerResponse:
+) -> _PythonResponse:
     """Reuse broker framing, but never parse a v4 reply as a Node response."""
     validated = _validated_request(request)
     body = validated.model_dump_json().encode("utf-8")
@@ -96,6 +116,12 @@ async def request_python_project_broker(
         try:
             first = await _read_frame(reader, _MAX_RESPONSE_BYTES)
             envelope = json.loads(first)
+            if isinstance(validated, PythonStoppedPremodelMaintenanceRequest):
+                stopped = PythonStoppedPremodelMaintenanceResponse.model_validate_json(first, strict=True)
+                stopped.require_for(validated)
+                if not stopped.ok and stopped.error == "python_project_cleanup_incomplete":
+                    raise ProcessCleanupIncomplete(stopped.error)
+                return stopped
             product: PythonProductDescriptor | None = None
             if isinstance(envelope, dict) and "python_product_stream" in envelope:
                 if (not isinstance(validated, PythonProjectBrokerRequest)
@@ -215,13 +241,43 @@ class PythonProjectSystemdSandbox:
         assert response.failure_removed is not None
         return response.failure_removed
 
-    async def _exchange(self, request: _PythonRequest) -> PythonProjectBrokerResponse:
+    async def inspect_stopped_premodel(
+        self, invocation: PythonFailedMaintenanceInvocation,
+    ) -> PythonStoppedPremodelSnapshot | None:
+        response = await self._exchange(PythonStoppedPremodelMaintenanceRequest(
+            invocation=invocation, phase="inspect",
+        ))
+        assert isinstance(response, PythonStoppedPremodelMaintenanceResponse)
+        return response.retirement_snapshot
+
+    async def commit_stopped_premodel(
+        self, invocation: PythonFailedMaintenanceInvocation, snapshot: PythonStoppedPremodelSnapshot,
+    ) -> bool:
+        archive = snapshot.archive()
+        response = await self._exchange(PythonStoppedPremodelMaintenanceRequest(
+            invocation=invocation, phase="commit", snapshot=snapshot,
+            archive_id=archive.id, archive_sha256=archive.content_sha256,
+        ))
+        assert isinstance(response, PythonStoppedPremodelMaintenanceResponse)
+        assert response.retirement_removed is not None
+        return response.retirement_removed
+
+    @overload
+    async def _exchange(self, request: PythonStoppedPremodelMaintenanceRequest) -> PythonStoppedPremodelMaintenanceResponse: ...
+
+    @overload
+    async def _exchange(self, request: _LegacyPythonRequest) -> PythonProjectBrokerResponse: ...
+
+    async def _exchange(self, request: _PythonRequest) -> _PythonResponse:
         if not _systemd_supported():
             raise OSError("python_project_systemd_linux_unsupported")
         request = _validated_request(request)
-        pending = asyncio.create_task(
-            request_python_project_broker(request, socket_path=self.socket_path)
-        )
+        async def transport() -> _PythonResponse:
+            if isinstance(request, PythonStoppedPremodelMaintenanceRequest):
+                return await request_python_project_broker(request, socket_path=self.socket_path)
+            return await request_python_project_broker(request, socket_path=self.socket_path)
+
+        pending = asyncio.create_task(transport())
         try:
             async with asyncio.timeout(request.invocation.timeout_seconds + _REQUEST_GRACE_SECONDS):
                 response = await asyncio.shield(pending)
@@ -239,7 +295,7 @@ class PythonProjectSystemdSandbox:
     async def _terminate_and_drain(
         self,
         execution_id: str,
-        pending: asyncio.Task[PythonProjectBrokerResponse],
+        pending: asyncio.Task[_PythonResponse],
     ) -> None:
         try:
             await self.terminate(execution_id)
@@ -250,7 +306,7 @@ class PythonProjectSystemdSandbox:
             # into success. Wait for the transport's finally/close to finish.
             with contextlib.suppress(asyncio.CancelledError, OSError, ValueError):
                 late = await pending
-                if late._product_stream is not None:
+                if isinstance(late, PythonProjectBrokerResponse) and late._product_stream is not None:
                     late._product_stream.close()
 
     async def terminate(self, execution_id: str) -> None:

@@ -41,6 +41,12 @@ from agent_hub.skills.sandbox.project_contract_broker import (
     _stamp,
     _write_all,
 )
+from agent_hub.skills.sandbox.python_premodel_retirement import (
+    PythonStoppedPremodelSnapshot,
+    PythonStoppedPremodelStage,
+    stopped_premodel_tombstone,
+    validate_stopped_premodel_tombstone,
+)
 from agent_hub.skills.sandbox.python_project_copy import (
     PythonProjectCopyError,
     _directory_flags,
@@ -96,6 +102,12 @@ def _retirement_name(owner: dict[str, str]) -> str:
 def _validate_retirement(name: str, value: object) -> None:
     from agent_hub.skills.sandbox.project import ProjectInvocation
 
+    if type(value) is dict and value.get('kind') == 'python_stopped_premodel_owner_retired':
+        try:
+            validate_stopped_premodel_tombstone(name, value)
+        except (ValueError, TypeError, KeyError, OverflowError):
+            raise PythonProjectCacheError('cache_unsafe') from None
+        return
     _need(type(value) is dict)
     assert isinstance(value, dict)
     _need(set(value) == {'schema_version', 'kind', 'owner', 'cache_key', 'origin_execution_id',
@@ -1038,6 +1050,112 @@ class PythonProjectEnvironmentCache:
                 _same(parent, key, os.fstat(entry), entry)
                 os.rmdir(key, dir_fd=parent)
                 os.fsync(parent)
+                return True
+        except BaseException:
+            if mutating:
+                raise ProcessCleanupIncomplete('python_project_cleanup_incomplete') from None
+            raise
+
+    def maintain_stopped_premodel(
+        self, invocation: PythonFailedMaintenanceInvocation, *, deadline: float,
+        quiescence_check: Callable[[str], tuple[PythonStoppedPremodelStage, ...]],
+        expected: PythonStoppedPremodelSnapshot | None = None,
+    ) -> PythonStoppedPremodelSnapshot | bool | None:
+        """New explicit protocol; never changes stages, replays, or accepts DB authority.
+
+        Caller holds native admission and locked pre-model lifecycle authority.
+        Expected is supplied only after permanent archive readback. A tombstone
+        is a permanent veto, including after an interrupted commit; not a retry.
+        """
+        _need(type(invocation) is PythonFailedMaintenanceInvocation and callable(quiescence_check),
+              'cache_invalid')
+        invocation = PythonFailedMaintenanceInvocation.model_validate_json(
+            invocation.model_dump_json(), strict=True)
+        if expected is not None:
+            _need(type(expected) is PythonStoppedPremodelSnapshot, 'cache_invalid')
+            expected = PythonStoppedPremodelSnapshot.model_validate_json(
+                expected.model_dump_json(), strict=True)
+        mutating = False
+        try:
+            with self._locked(deadline, create=False) as locked:
+                if locked is None:
+                    return None if expected is None else False
+                parent, stack, root_pins = locked
+                _need(not self._retired_scope(parent, _owner(invocation), deadline), 'cache_incomplete')
+                selected: tuple[str, int, dict[str, Any], list[_Observed]] | None = None
+                for key in sorted(self._catalog(parent, deadline)):
+                    _check(deadline)
+                    pins: list[_Observed] = []
+                    entry = _open_directory(parent, key, 0, stack, pins, mode=0o700, full=True)
+                    reservation = _reservation(entry, key, self.policy, pins)
+                    if {field: reservation['scope'][field] for field in _owner(invocation)} != _owner(invocation):
+                        continue
+                    _need(selected is None, 'cache_changed')
+                    # Do not erase prior failed-attempt archives through this narrow action.
+                    _need(_entry_members(entry, reservation, pins, deadline) == _READY
+                          and _names(entry, _MAX_MEMBERS, deadline) == _READY, 'cache_incomplete')
+                    selected = key, entry, reservation, pins
+                if selected is None:
+                    return None if expected is None else False
+                key, entry, reservation, pins = selected
+                if time.time() < reservation['expires_at']:
+                    _need(expected is None, 'cache_changed')
+                    return None
+                limits = ScanLimits(reservation['environment_limit_bytes'])
+                ready = _ready(entry, self.root / key, reservation, limits, stack, pins, deadline)
+                _need(invocation.execution_id != ready.reference.origin_execution_id, 'cache_invalid')
+                stages = quiescence_check(ready.reference.origin_execution_id)
+                _need(type(stages) is tuple and len(stages) <= 64
+                      and all(type(stage) is PythonStoppedPremodelStage for stage in stages), 'cache_changed')
+                _check(deadline)
+                if not stages:
+                    _need(expected is None, 'cache_changed')
+                    return None
+                _need(invocation.execution_id not in {stage.execution_id for stage in stages}, 'cache_changed')
+                raw = _encoded(reservation)
+                # _read requires canonical bytes already; preserve that exact
+                # stored control rather than re-serializing a DTO with defaults.
+                reference = _encoded(_read(entry, 'reference.json', pins))
+                snapshot = PythonStoppedPremodelSnapshot(
+                    cache_key=key, scope=ready.reference.scope, reservation=raw.decode('ascii'),
+                    reference=reference.decode('ascii'), reservation_sha256=hashlib.sha256(raw).hexdigest(),
+                    reference_sha256=hashlib.sha256(reference).hexdigest(),
+                    environment_tree_sha256=hashlib.sha256(_encoded({
+                        path: _stamp(info, full=True) for path, info in ready.snapshot.items()})).hexdigest(),
+                    identities=(_stamp(os.fstat(entry), full=True),
+                        _stamp(os.stat('reservation.json', dir_fd=entry, follow_symlinks=False), full=True),
+                        _stamp(os.stat('reference.json', dir_fd=entry, follow_symlinks=False), full=True),
+                        _stamp(os.fstat(ready.environment_fd), full=True)),
+                    stages=stages)
+                _need(_same_snapshots(ready.snapshot, _snapshot(ready.environment_fd, 0, limits, deadline)),
+                      'cache_changed')
+                for pin in (*root_pins, *pins):
+                    pin.check()
+                if expected is None:
+                    return snapshot
+                _need(expected == snapshot, 'cache_changed')
+                _need(quiescence_check(snapshot.origin_execution_id) == stages, 'cache_changed')
+                _check(deadline)
+                _need(_same_snapshots(ready.snapshot, _snapshot(ready.environment_fd, 0, limits, deadline)),
+                      'cache_changed')
+                for pin in (*root_pins, *pins):
+                    pin.check()
+                marker = stopped_premodel_tombstone(snapshot)
+                name = _retirement_name(_owner(invocation))
+                _validate_retirement(name, marker)
+                names = _names(parent, self.policy.max_entries + 1 + _MAX_RETIREMENTS, deadline)
+                _need(name not in names, 'cache_incomplete')
+                _need(sum(bool(_RETIREMENT.fullmatch(item)) for item in names) < _MAX_RETIREMENTS,
+                      'cache_quota')
+                self._capacity(parent, deadline, additional=len(_encoded(marker)))
+                _check(deadline)
+                mutating = True
+                _write(parent, name, marker)  # O_EXCL + fsync before any environment mutation.
+                _need(_read(parent, name, root_pins) == marker, 'cache_changed')
+                for pin in (*root_pins, *pins):
+                    pin.check()
+                _check(deadline)
+                _erase_ready(parent, key, entry, ready, deadline)
                 return True
         except BaseException:
             if mutating:

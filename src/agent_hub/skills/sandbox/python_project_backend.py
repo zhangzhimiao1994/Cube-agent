@@ -53,6 +53,10 @@ from agent_hub.skills.sandbox.project_contract_broker import (
     _write_all,
     stage_original_contract,
 )
+from agent_hub.skills.sandbox.python_premodel_retirement import (
+    PythonStoppedPremodelMaintenanceRequest,
+    PythonStoppedPremodelMaintenanceResponse,
+)
 from agent_hub.skills.sandbox.python_project_cache import (
     _CONTROL_ALLOWANCE,
     PythonProjectCacheError,
@@ -126,10 +130,12 @@ _Request = (
     | PythonProjectInspectEnvironmentRequest
     | PythonProjectReleaseEnvironmentRequest
     | PythonProjectReleaseExpiredEnvironmentRequest | PythonFailedMaintenanceRequest
+    | PythonStoppedPremodelMaintenanceRequest
 )
 _CONFIG_PATH = Path("/etc/agent-hub/python-project.json")
 _MAX_CONTROL = 16 * 1024
 _MAX_REQUEST = 64 * 1024
+_MAX_STOPPED_PREMODEL_REQUEST = 1024**2 + 4096
 _MAX_RECIPE_CONTROL = 32 * 1024**2
 # check_contract.json, python-inputs.json and plan.json, plus small broker controls.
 _STAGE_CONTROL_ALLOWANCE = 3 * _MAX_RECIPE_CONTROL + _CONTROL_ALLOWANCE
@@ -1002,7 +1008,7 @@ def _quiesce(policy: BrokerPolicy, job: _Execution) -> None:
 
 
 def _scope(request: _Request) -> PythonProjectScope:
-    if isinstance(request, PythonFailedMaintenanceRequest):
+    if isinstance(request, (PythonFailedMaintenanceRequest, PythonStoppedPremodelMaintenanceRequest)):
         raise TypeError('maintenance does not carry an environment reference')
     item = request.invocation
     return PythonProjectScope(
@@ -1464,7 +1470,7 @@ def _run(
 
 def execute_python_project_request(
     request: _Request, *, policy: BrokerPolicy, configuration: RootConfig, stage: Path
-) -> PythonProjectBrokerResponse:
+) -> PythonProjectBrokerResponse | PythonStoppedPremodelMaintenanceResponse:
     """Trusted root caller only; never call from an event loop or asyncio.to_thread.
 
     The caller supplies an already-created root0700 stage and a recipe grant;
@@ -1480,6 +1486,7 @@ def execute_python_project_request(
             PythonProjectReleaseEnvironmentRequest,
             PythonProjectReleaseExpiredEnvironmentRequest,
     PythonFailedMaintenanceRequest,
+            PythonStoppedPremodelMaintenanceRequest,
         },
         "python_project_request_invalid",
     )
@@ -1498,6 +1505,14 @@ def execute_python_project_request(
             ) as roots,
             _admission(roots.stage_root_fd, deadline),
         ):
+            if isinstance(request, PythonStoppedPremodelMaintenanceRequest):
+                from agent_hub.skills.sandbox.python_premodel_retirement_backend import (
+                    maintain_stopped_premodel,
+                )
+
+                stopped = maintain_stopped_premodel(request, policy, configuration, deadline, stage=stage)
+                stopped.require_for(request)
+                return stopped
             if isinstance(request, PythonFailedMaintenanceRequest):
                 response = _maintain_failed(request, policy, configuration, deadline, stage=stage)
                 response.require_for(request)
@@ -1560,6 +1575,10 @@ def execute_python_project_request(
     except Exception as error:  # noqa: BLE001 - finite privileged execution boundary
         _diagnostic("execution", error)
         code = "python_project_execution_unavailable"
+    if isinstance(request, PythonStoppedPremodelMaintenanceRequest):
+        return PythonStoppedPremodelMaintenanceResponse(
+            action=request.action, execution_id=request.invocation.execution_id, ok=False, error=code,
+        )
     return PythonProjectBrokerResponse(
         action=request.action, execution_id=request.invocation.execution_id, ok=False, error=code
     )
@@ -1567,6 +1586,8 @@ def execute_python_project_request(
 
 def _request(raw: bytes) -> _Request:
     try:
+        _need(type(raw) is bytes and 0 < len(raw) <= _MAX_STOPPED_PREMODEL_REQUEST,
+              'python_project_request_invalid')
         payload: object = json.loads(raw, object_pairs_hook=_object)
         _need(type(payload) is dict, "python_project_request_invalid")
         assert isinstance(payload, dict)
@@ -1581,10 +1602,14 @@ def _request(raw: bytes) -> _Request:
             "release_python_project_environment": PythonProjectReleaseEnvironmentRequest,
             'release_expired_python_project_environment': PythonProjectReleaseExpiredEnvironmentRequest,
             'maintain_expired_python_failure': PythonFailedMaintenanceRequest,
+            'maintain_stopped_premodel_python_project_environment': PythonStoppedPremodelMaintenanceRequest,
         }
         action = payload.get("action")
         _need(type(action) is str and action in classes, "python_project_request_invalid")
         assert isinstance(action, str)
+        _need(0 < len(raw) <= (_MAX_STOPPED_PREMODEL_REQUEST
+              if action == 'maintain_stopped_premodel_python_project_environment' else _MAX_REQUEST),
+              'python_project_request_invalid')
         return classes[action].model_validate_json(raw, strict=True)
     except (ValueError, TypeError, KeyError, OverflowError):
         raise PythonProjectBackendError("python_project_request_invalid") from None
@@ -1613,7 +1638,7 @@ def main(argv: list[str] | None = None) -> int:
             pins: list[_Observed] = []
             parent = _root(stage, 0, stack, pins, stage=True)
             info = os.stat("request.json", dir_fd=parent, follow_symlinks=False)
-            _need(0 < info.st_size <= _MAX_REQUEST, "python_project_request_invalid")
+            _need(0 < info.st_size <= _MAX_STOPPED_PREMODEL_REQUEST, "python_project_request_invalid")
             request = _request(_read_control(parent, "request.json", 0, pins))
             phase = "configuration"
             configuration = load_root_configuration()
@@ -1633,11 +1658,12 @@ def main(argv: list[str] | None = None) -> int:
         if request is None:
             sys.stderr.write(error.code + "\n")
             return 2
-        response = PythonProjectBrokerResponse(
-            action=request.action,
-            execution_id=request.invocation.execution_id,
-            ok=False,
-            error=error.code,
+        response = (
+            PythonStoppedPremodelMaintenanceResponse(action=request.action,
+                execution_id=request.invocation.execution_id, ok=False, error=error.code)
+            if isinstance(request, PythonStoppedPremodelMaintenanceRequest)
+            else PythonProjectBrokerResponse(action=request.action,
+                execution_id=request.invocation.execution_id, ok=False, error=error.code)
         )
     except (Exception, SystemExit) as error:  # noqa: BLE001 - CLI must not emit host tracebacks
         _diagnostic(phase, error)
@@ -1649,11 +1675,14 @@ def main(argv: list[str] | None = None) -> int:
             )
             sys.stderr.write(code + "\n")
             return 2
-        response = PythonProjectBrokerResponse(
-            action=request.action,
-            execution_id=request.invocation.execution_id,
-            ok=False,
-            error="python_project_execution_unavailable",
+        response = (
+            PythonStoppedPremodelMaintenanceResponse(action=request.action,
+                execution_id=request.invocation.execution_id, ok=False,
+                error="python_project_execution_unavailable")
+            if isinstance(request, PythonStoppedPremodelMaintenanceRequest)
+            else PythonProjectBrokerResponse(action=request.action,
+                execution_id=request.invocation.execution_id, ok=False,
+                error="python_project_execution_unavailable")
         )
     sys.stdout.write(response.model_dump_json() + "\n")
     return 0

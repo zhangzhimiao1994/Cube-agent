@@ -25,6 +25,10 @@ from agent_hub.skills.sandbox.project import (
     _systemd_supported,
     _uninterrupted,
 )
+from agent_hub.skills.sandbox.python_premodel_retirement import (
+    PythonStoppedPremodelMaintenanceRequest,
+    PythonStoppedPremodelMaintenanceResponse,
+)
 from agent_hub.skills.sandbox.python_project_command import _escaped
 from agent_hub.skills.sandbox.python_project_process import python_root_response_limit
 from agent_hub.skills.sandbox.python_project_protocol import (
@@ -51,6 +55,7 @@ type _Request = (
     PythonProjectBrokerRequest | PythonProjectProbeRequest | PythonProjectInspectEnvironmentRequest
     | PythonProjectReleaseEnvironmentRequest
     | PythonProjectReleaseExpiredEnvironmentRequest | PythonFailedMaintenanceRequest
+    | PythonStoppedPremodelMaintenanceRequest
 )
 type ProductSink = Callable[[Path, PythonProjectBrokerResponse, PythonProjectInvocation],
                            Awaitable[PythonProductDescriptor | None]]
@@ -177,8 +182,12 @@ async def handle_python_project(
     *,
     peer_uid: int,
     product_sink: ProductSink | None = None,
-) -> PythonProjectBrokerResponse:
-    def failure(code: PythonProjectBrokerError) -> PythonProjectBrokerResponse:
+) -> PythonProjectBrokerResponse | PythonStoppedPremodelMaintenanceResponse:
+    def failure(code: PythonProjectBrokerError) -> PythonProjectBrokerResponse | PythonStoppedPremodelMaintenanceResponse:
+        if isinstance(request, PythonStoppedPremodelMaintenanceRequest):
+            return PythonStoppedPremodelMaintenanceResponse(
+                execution_id=request.invocation.execution_id, ok=False, error=code,
+            )
         return PythonProjectBrokerResponse(
             action=request.action,
             execution_id=request.invocation.execution_id,
@@ -198,6 +207,7 @@ async def handle_python_project(
             PythonProjectReleaseEnvironmentRequest,
             PythonProjectReleaseExpiredEnvironmentRequest,
     PythonFailedMaintenanceRequest,
+            PythonStoppedPremodelMaintenanceRequest,
         }:
             raise ValueError("python_project_request_invalid")
         request = type(request).model_validate_json(request.model_dump_json(), strict=True)
@@ -269,7 +279,7 @@ async def handle_python_project(
             async with asyncio.timeout_at(deadline):
                 await broker.slots.acquire()
                 job.slot_acquired = True
-                if isinstance(request, PythonFailedMaintenanceRequest):
+                if isinstance(request, (PythonFailedMaintenanceRequest, PythonStoppedPremodelMaintenanceRequest)):
                     await _admit_unit(broker, helper, no_job=True)
                     await _admit_unit(broker, job, no_job=True)
                 else:
@@ -303,6 +313,10 @@ async def handle_python_project(
                     raise ProcessCleanupIncomplete("python_project_cleanup_incomplete")
                 if result.exit_code != 0 or result.timed_out:
                     return failure("python_project_execution_unavailable")
+                if isinstance(request, PythonStoppedPremodelMaintenanceRequest):
+                    stopped = PythonStoppedPremodelMaintenanceResponse.model_validate_json(result.stdout, strict=True)
+                    stopped.require_for(request)
+                    return stopped
                 response = PythonProjectBrokerResponse.model_validate_json(
                     result.stdout, strict=True
                 )
