@@ -14,6 +14,7 @@ from dataclasses import dataclass, field, replace
 from typing import Never, Protocol, cast, get_args
 from uuid import UUID, uuid4
 
+from agent_hub.auth.models import Role
 from agent_hub.capabilities.project_contracts import ManagedProjectInput
 from agent_hub.capabilities.project_contracts import _path as _project_relative_path
 from agent_hub.capabilities.runtime import RuntimeCapabilityError
@@ -78,6 +79,7 @@ from agent_hub.runtime.project_scale_artifact import (
 )
 from agent_hub.runtime.self_repair_context import self_repair_context_text
 from agent_hub.runtime.source_preview_projection import source_preview_excerpt
+from agent_hub.runtime.workspace_protocol_diagnostics import workspace_protocol_diagnostic
 from agent_hub.skills.sandbox.python_dependency_protocol import PythonDependencyClosureError
 from agent_hub.skills.sandbox.python_input_supply_protocol import SupplyError
 from agent_hub.skills.sandbox.python_metadata_preparation_client import PUBLIC_FAILURE_CODES
@@ -86,6 +88,8 @@ from agent_hub.subprocess_cleanup import ProcessCleanupIncomplete
 from agent_hub.website_preview_contract import WEBSITE_PREVIEW_API_GUIDANCE
 
 _RUNTIME_TYPE = "direct"
+_ORIGINAL_WORKSPACE_LAYOUT = 'original_workspace_event_layout'
+_ORIGINAL_REPORT_SCOPE = 'original_report_consumer_scope'
 _RUNTIME_VERSION = "1"
 _MAX_OUTPUT_BYTES = 65_536
 _INLINE_PROJECT_OUTPUT_WATERLINE_BYTES = 2_000_000
@@ -900,6 +904,52 @@ def _original_project_policy(context: TaskContext) -> bool:
     return type(version) is int and version == 1
 
 
+def _original_workspace_checkpoint_selected(context: TaskContext) -> bool:
+    return (context.mode is TaskMode.DIRECT and _original_project_policy(context)
+            and not generated_history_selected(context) and _is_workspace_project_delivery(context))
+
+
+def _original_workspace_scope_valid(value: object) -> bool:
+    keys = {'tenant_id', 'run_id', 'actor_id', 'actor_role', 'project_id', 'session_id'}
+    if not isinstance(value, Mapping) or set(value) != keys:
+        return False
+    try:
+        for key in ('tenant_id', 'run_id', 'actor_id'):
+            item = value[key]
+            if type(item) is not str or str(UUID(item)) != item or UUID(item).int == 0:
+                return False
+    except ValueError:
+        return False
+    return (type(value['actor_role']) is str and value['actor_role'] in {role.value for role in Role}
+            and all(type(value[key]) is str and re.fullmatch(r'[a-z0-9][a-z0-9_-]{0,63}', value[key])
+                    is not None for key in ('project_id', 'session_id')))
+
+
+def _original_workspace_checkpoint_scope(context: TaskContext) -> dict[str, JsonValue]:
+    scope: dict[str, JsonValue] = {
+        'tenant_id': str(context.tenant_id), 'run_id': str(context.run_id),
+        'actor_id': str(context.actor_id),
+        'actor_role': None if context.actor_role is None else context.actor_role.value,
+        'project_id': context.routing_decision.get('project_id'),
+        'session_id': context.routing_decision.get('workspace_session_id'),
+    }
+    if not _original_workspace_scope_valid(scope):
+        _raise_execution_error('original project checkpoint scope is invalid')
+    return scope
+
+
+def _original_report_consumer_scope(context: TaskContext) -> dict[str, JsonValue]:
+    # Public original-check bindings retain hashes, not the full contract scope.
+    # Bind this report consumer's scope into its existing delivery-report digest.
+    from agent_hub.capabilities.project_contracts import _scope
+
+    return {'schema_version': 1, 'tenant_id': str(context.tenant_id), 'run_id': str(context.run_id),
+            'actor_id': None if context.actor_id is None else str(context.actor_id),
+            'actor_role': None if context.actor_role is None else context.actor_role.value,
+            'project_id': _scope(context.routing_decision.get('project_id')),
+            'session_id': _scope(context.routing_decision.get('workspace_session_id'))}
+
+
 def _original_project_terminal_artifact_matches(
     context: TaskContext | None, artifact: Artifact,
 ) -> bool:
@@ -967,6 +1017,11 @@ def _catalog_workspace_reads(context: TaskContext) -> bool:
     return (context.mode is TaskMode.DIRECT and type(version) is int and version == 1
             and context.routing_decision.get('sandbox_profile') == 'workspace_write'
             and _is_workspace_project_delivery(context))
+
+
+def _workspace_batch_reads_enabled(context: TaskContext) -> bool:
+    return (_original_project_policy(context) or generated_history_selected(context)
+            or _diagnostic_workspace_reads(context))
 
 
 def _manifest_prerequisite_repair(context: TaskContext) -> bool:
@@ -1172,6 +1227,17 @@ def _workspace_batch_from_model_text(
             complete = True
             continuation = ""
         summary = parsed.get("summary", raw_batch.get("summary", ""))
+    # Read-bearing envelopes never use embedded/truncated JSON recovery or
+    # silently discard duplicate controls and additional model operations.
+    if ({"read_paths", "python_catalog"} & raw_batch.keys()
+            and (parsed is None or _single_batch_envelope(text) != parsed
+                or not isinstance(parsed.get("workspace_batch"), Mapping)
+                or not parsed.keys() <= {"workspace_batch", "summary", "complete", "continuation"}
+                or not raw_batch.keys() <= {"files", "read_paths", "python_catalog",
+                                           "complete", "continuation", "summary"}
+                or {"read_paths", "python_catalog"} <= raw_batch.keys()
+                or not isinstance(raw_batch.get("files"), Mapping) or raw_batch["files"])):
+        return None
     read_paths: tuple[str, ...] = ()
     if "read_paths" in raw_batch:
         raw_reads = raw_batch["read_paths"]
@@ -1295,6 +1361,77 @@ def _workspace_batch_rejection_code(response: ModelResponse) -> str:
     if not files and "read_paths" not in raw and "python_catalog" not in raw:
         return "empty_batch_without_completion"
     return "invalid_batch_controls"
+
+
+def _workspace_read_batch_rejection(
+    response: ModelResponse, *, allow_reads: bool, allow_catalog: bool,
+) -> tuple[str, bool] | None:
+    """Classify rejected read syntax without executing or repairing its payload.
+
+    True permits only a bounded model feedback round, never a read. The new
+    response still crosses the unchanged parser, Harness policy and scoped IO.
+    """
+    parsed = _json_mapping_from_model_text(response.text or '')
+    raw = None if parsed is None else parsed.get('workspace_batch', parsed.get('workspace_bundle', parsed))
+    if not isinstance(raw, Mapping) or not {'read_paths', 'python_catalog'} & raw.keys():
+        return None
+    if response.tool_calls:
+        return 'native_read_tools_not_executed', False
+    if 'read_paths' in raw and not allow_reads:
+        return 'read_not_enabled', False
+    if 'python_catalog' in raw and not allow_catalog:
+        return 'catalog_not_enabled', False
+    strict = _single_batch_envelope(response.text or '')
+    if (strict is None or strict != parsed or not isinstance(strict.get('workspace_batch'), Mapping)
+            or not strict.keys() <= {'workspace_batch', 'summary', 'complete', 'continuation'}
+            or not raw.keys() <= {'files', 'read_paths', 'python_catalog', 'complete', 'continuation', 'summary'}
+            or ({'complete', 'continuation'} & strict.keys()
+                and {'complete', 'continuation'} & raw.keys())
+            or any(type(value.get('summary', '')) is not str for value in (strict, raw))):
+        return 'unsafe_read_envelope', False
+    if (('files' in raw and (not isinstance(raw['files'], Mapping) or raw['files']))
+            or {'read_paths', 'python_catalog'} <= raw.keys()):
+        return 'mixed_read_operations', False
+    if 'read_paths' in raw:
+        paths = raw['read_paths']
+        if type(paths) is not list or not 1 <= len(paths) <= 8 or any(type(p) is not str for p in paths):
+            return 'invalid_read_paths', False
+        try:
+            normalized = tuple(_project_relative_path(p) for p in paths)
+        except ValueError:
+            return 'invalid_read_paths', False
+        if len({p.lower() for p in normalized}) != len(normalized):
+            return 'invalid_read_paths', False
+        kind = 'read'
+    else:
+        from agent_hub.capabilities.project_inspection import (
+            ProjectInspectionError,
+            parse_python_catalog_query,
+        )
+
+        try:
+            query = parse_python_catalog_query({'python_catalog': cast(JsonValue, raw['python_catalog'])})
+        except (ProjectInspectionError, ValueError, TypeError):
+            return 'invalid_catalog_query', False
+        if query is None:
+            return 'invalid_catalog_query', False
+        kind = 'catalog'
+    if ('files' in raw and raw.get('complete') is False and type(raw.get('continuation')) is str
+            and cast(str, raw['continuation']).strip()):
+        return 'invalid_read_batch', False
+    return kind + '_batch_controls', True
+
+
+def _workspace_protocol_feedback(
+    context: TaskContext, response: ModelResponse, *, reason: str, retryable: bool,
+) -> RunEvent:
+    diagnostic = workspace_protocol_diagnostic(response.text, rejection_code=reason,
+        allow_reads=_workspace_batch_reads_enabled(context), allow_catalog=_catalog_workspace_reads(context),
+        native_tool_count=len(response.tool_calls))
+    return RunEvent(kind='runtime.control_feedback', sequence=1, run_id=context.run_id,
+        payload={'stage': 'workspace_batch_protocol', 'phase': 'response_rejected',
+            **diagnostic, 'reason': diagnostic['rejection_code'],
+            'retryable': retryable, 'rejected_response_tool_io': False})
 
 
 def _workspace_files_from_truncated_json(text: str) -> dict[str, str]:
@@ -1761,7 +1898,7 @@ class DirectRuntime:
             await acknowledged
 
     async def _generated_task_events(
-        self, task: asyncio.Task[GatewayCompletion] | asyncio.Task[_BatchedWorkspaceOutcome],
+        self, task: asyncio.Task[GatewayCompletion] | asyncio.Task[_BatchedWorkspaceOutcome] | asyncio.Task[None],
     ) -> AsyncGenerator[RunEvent, None]:
         """A yielded boundary must be persisted before its producer resumes I/O."""
         queue = self._generated_model_events
@@ -2544,7 +2681,7 @@ class DirectRuntime:
         validation_failures: dict[str, int] = {}
         original_policy = _original_project_policy(context)
         diagnostic_reads = _diagnostic_workspace_reads(context)
-        scoped_reads = original_policy or generated_history_selected(context) or diagnostic_reads
+        scoped_reads = _workspace_batch_reads_enabled(context)
         verification_enabled = original_policy or generated_history_selected(context) or self._project_verification_enabled(context)
         verification_trace = _WorkspaceVerificationTrace(context=context) if verification_enabled else None
         verification_attempt = 0
@@ -3063,19 +3200,20 @@ class DirectRuntime:
                         allow_completion=bool(known_files) and verification_enabled and not validation_failures))
                 if next_batch is not None:
                     break
+                read_rejection = _workspace_read_batch_rejection(response,
+                    allow_reads=scoped_reads, allow_catalog=_catalog_workspace_reads(context))
+                rejection_code = (read_rejection[0] if read_rejection is not None
+                                  else _workspace_batch_rejection_code(response))
+                retryable = (read_rejection is None or read_rejection[1]) and rejection_code not in protocol_failures
                 parsed_rejection = _json_mapping_from_model_text(response.text or "")
-                rejected_batch: object = None
-                if parsed_rejection is not None:
-                    rejected_batch = parsed_rejection.get("workspace_batch",
-                        parsed_rejection.get("workspace_bundle", parsed_rejection))
-                if isinstance(rejected_batch, Mapping) and (
-                    ("read_paths" in rejected_batch and not scoped_reads)
-                    or ("python_catalog" in rejected_batch and not _catalog_workspace_reads(context))
-                    or (validation_failures and rejected_batch.get("files") == {}
-                        and rejected_batch.get("complete") is True)
-                ):
-                    # A protocol retry cannot turn a disabled read into a grant or
-                    # clear a rejected write using an empty completion claim.
+                rejected_batch = (None if parsed_rejection is None else parsed_rejection.get(
+                    'workspace_batch', parsed_rejection.get('workspace_bundle', parsed_rejection)))
+                if (isinstance(rejected_batch, Mapping) and validation_failures
+                        and rejected_batch.get('files') == {} and rejected_batch.get('complete') is True):
+                    retryable = False  # Empty completion cannot clear rejected writes.
+                await self._generated_model_boundary(_workspace_protocol_feedback(
+                    context, response, reason=rejection_code, retryable=retryable))
+                if not retryable:
                     _raise_execution_error("workspace batch is invalid")
                 rejected_text = _workspace_batch_budget_text(response)
                 rejected = self._verified_budget_usage(response.usage,
@@ -3091,9 +3229,6 @@ class DirectRuntime:
                 usage_estimated = usage_estimated or rejected.estimated
                 if consumed_tokens > active_token_limit:
                     _raise_execution_error("model response budget exceeds runtime limit")
-                rejection_code = _workspace_batch_rejection_code(response)
-                if rejection_code in protocol_failures:
-                    _raise_execution_error("workspace batch is invalid")
                 protocol_failures.add(rejection_code)
                 correction = ModelMessage(role="user", content=(
                     "The received response was rejected: workspace_batch_is_invalid ("
@@ -3106,6 +3241,8 @@ class DirectRuntime:
                     "a nonempty continuation for unfinished work. A read request needs files={}, "
                     "1..8 safe relative read_paths, complete=false and nonempty continuation; "
                     "only use reads already enabled by the task. No native tool calls. "
+                    "For an enabled Python catalog read use files={}, python_catalog with the original "
+                    "profile digest/query, complete=false and a nonempty continuation; do not mix operations. "
                     "This correction grants no permissions, budget, successful verification or completion."
                 ))
                 corrected_messages = (*next_messages, correction)
@@ -3178,6 +3315,7 @@ class DirectRuntime:
         injection_offset = 0
         generated_starts = generated_completions = generated_costs = context_injections = generated_failures = 0
         generated_read_progress = 0
+        generated_protocol_feedback = 0
         self._last_checkpoint = None
         try:
             restored = self._restored_checkpoint
@@ -3450,6 +3588,11 @@ class DirectRuntime:
                                     and call_event.payload.get("stage") == "workspace_read_context"
                                     and call_event.payload.get("phase") == "batch_progress"
                                 )
+                                generated_protocol_feedback += (
+                                    call_event.kind == 'runtime.control_feedback'
+                                    and call_event.payload.get('stage') == 'workspace_batch_protocol'
+                                    and call_event.payload.get('phase') == 'response_rejected'
+                                )
                                 yield call_event.model_copy(update={'sequence': 2 + injection_offset})
                                 injection_offset += 1
                     completion = await gateway_task
@@ -3510,7 +3653,8 @@ class DirectRuntime:
                 del validated_completion
                 response = completion.response
                 if workspace_entry and (response.tool_calls or response.text is None
-                        or _workspace_batch_from_model_text(response.text, allow_reads=True,
+                        or _workspace_batch_from_model_text(response.text,
+                            allow_reads=_workspace_batch_reads_enabled(context),
                             allow_catalog=_catalog_workspace_reads(context)) is None):
                     # A known response can be corrected on the same authorized
                     # model. Alias/fallback count is not a protocol retry budget.
@@ -3525,18 +3669,27 @@ class DirectRuntime:
                         entry_usage.completion_tokens + usage.completion_tokens, entry_usage.total_tokens + usage.total_tokens)
                     entry_usage_estimated = entry_usage_estimated or rejected_usage.estimated
                     consumed_retry_tokens += usage.total_tokens
-                    parsed_rejection = _json_mapping_from_model_text(response.text or '')
-                    rejected_batch = (None if parsed_rejection is None else parsed_rejection.get(
-                        'workspace_batch', parsed_rejection.get('workspace_bundle', parsed_rejection)))
-                    if isinstance(rejected_batch, Mapping) and (
-                            {'read_paths', 'python_catalog'} & rejected_batch.keys()):
-                        # Malformed/disabled reads are not recoverable permission requests.
-                        _raise_execution_error('workspace batch is invalid')
-                    rejection_code = _workspace_batch_rejection_code(response)
-                    if rejection_code in protocol_failures:
+                    read_rejection = _workspace_read_batch_rejection(response,
+                        allow_reads=_workspace_batch_reads_enabled(context), allow_catalog=_catalog_workspace_reads(context))
+                    rejection_code = (read_rejection[0] if read_rejection is not None
+                                      else _workspace_batch_rejection_code(response))
+                    retryable = (read_rejection is None or read_rejection[1]) and rejection_code not in protocol_failures
+                    feedback_task = asyncio.create_task(self._generated_model_boundary(
+                        _workspace_protocol_feedback(context, response, reason=rejection_code, retryable=retryable)))
+                    async with aclosing(self._generated_task_events(feedback_task)) as feedback_events:
+                        async for feedback_event in feedback_events:
+                            generated_protocol_feedback += (
+                                feedback_event.kind == 'runtime.control_feedback'
+                                and feedback_event.payload.get('stage') == 'workspace_batch_protocol'
+                                and feedback_event.payload.get('phase') == 'response_rejected'
+                            )
+                            yield feedback_event.model_copy(update={'sequence': 2 + injection_offset})
+                            injection_offset += 1
+                    if not retryable:
                         _raise_execution_error('workspace batch is invalid')
                     protocol_failures.add(rejection_code)
-                    preview = _event_text_preview(rejected_text).replace('<', '\\u003c').replace('>', '\\u003e')
+                    preview = ('' if read_rejection is not None else
+                               _event_text_preview(rejected_text).replace('<', '\\u003c').replace('>', '\\u003e'))
                     messages = (*request.messages, ModelMessage(role='user', content=(
                         'The prior response did not provide a valid structured workspace_batch. '
                         'No requested native/model tools were executed and no source was written. '
@@ -3549,7 +3702,10 @@ class DirectRuntime:
                         '"complete":true,"continuation":""},"summary":"delivery summary"}. '
                         'The complete boolean and continuation MUST be INSIDE workspace_batch, not at the root. '
                         'For an enabled scoped read use files={}, safe relative read_paths, complete=false '
-                        'and a nonempty continuation. This correction grants no permissions or successful checks. '
+                        'and a nonempty continuation. For an enabled Python catalog read use files={}, '
+                        'python_catalog with the original profile digest/query, complete=false and nonempty '
+                        'continuation. Never mix reads, catalog queries and writes. '
+                        'This correction grants no permissions or successful checks. '
                         'Tool requests/planning text cannot complete delivery. '
                         '<UNTRUSTED_REJECTED_DIRECT_RESPONSE>' + preview + '</UNTRUSTED_REJECTED_DIRECT_RESPONSE>')))
                     next_estimate = _estimate_text_tokens(json.dumps([
@@ -3612,12 +3768,14 @@ class DirectRuntime:
                 if direct_delivery_report.is_whole_body_json(text):
                     _raise_execution_error("direct final report is invalid (reason=json_only)")
                 workspace_delivery = hybrid_delivery
+                if self._capability_gateway is None and _original_workspace_checkpoint_selected(context):
+                    workspace_delivery = {**hybrid_delivery,
+                        _ORIGINAL_REPORT_SCOPE: _original_report_consumer_scope(context)}
                 artifact_origin = "verified_hybrid_final_report"
-                delivery_report_binding = direct_delivery_report.binding(context, hybrid_delivery, request, completion)
+                delivery_report_binding = direct_delivery_report.binding(context, workspace_delivery, request, completion)
             batch = (
                 _workspace_batch_from_model_text(text,
-                    allow_reads=_original_project_policy(context) or generated_entry
-                    or _diagnostic_workspace_reads(context), allow_catalog=_catalog_workspace_reads(context))
+                    allow_reads=_workspace_batch_reads_enabled(context), allow_catalog=_catalog_workspace_reads(context))
                 if delivery_report_binding is None and self._capability_gateway is not None
                 and _is_workspace_project_delivery(context)
                 else None
@@ -3630,6 +3788,12 @@ class DirectRuntime:
                     raw_batch = parsed_batch
             if (batch is None and isinstance(raw_batch, Mapping)
                     and {'read_paths', 'python_catalog'} & raw_batch.keys()):
+                rejection = _workspace_read_batch_rejection(response,
+                    allow_reads=_workspace_batch_reads_enabled(context), allow_catalog=_catalog_workspace_reads(context))
+                yield _workspace_protocol_feedback(context, response,
+                    reason=rejection[0] if rejection is not None else 'invalid_batch_controls',
+                    retryable=False).model_copy(update={'sequence': 2 + injection_offset})
+                injection_offset += 1
                 _raise_execution_error("workspace batch is invalid")
             if (delivery_report_binding is None and batch is None
                     and self._project_verification_enabled(context)):
@@ -3663,6 +3827,11 @@ class DirectRuntime:
                                 call_event.kind == "runtime.control_feedback"
                                 and call_event.payload.get("stage") == "workspace_read_context"
                                 and call_event.payload.get("phase") == "batch_progress"
+                            )
+                            generated_protocol_feedback += (
+                                call_event.kind == 'runtime.control_feedback'
+                                and call_event.payload.get('stage') == 'workspace_batch_protocol'
+                                and call_event.payload.get('phase') == 'response_rejected'
                             )
                             yield call_event.model_copy(update={'sequence': 2 + injection_offset})
                             injection_offset += 1
@@ -3793,6 +3962,7 @@ class DirectRuntime:
                 project_scale_workspace_bundle = None
             artifact_text_preview = _event_text_preview(text)
             generated_event_layout: Mapping[str, JsonValue] | None = None
+            original_event_layout: Mapping[str, JsonValue] | None = None
             if generated_entry:
                 assert inspection_artifact is not None
                 if generated_starts != generated_completions or generated_starts < 1:
@@ -3803,7 +3973,23 @@ class DirectRuntime:
                     'context_injection_event_count': context_injections,
                     'model_call_count': generated_starts, 'model_cost_event_count': generated_costs,
                     'verification_failure_event_count': generated_failures,
-                    **({'read_progress_event_count': generated_read_progress} if generated_read_progress else {})}
+                    **({'read_progress_event_count': generated_read_progress} if generated_read_progress else {}),
+                    **({'protocol_feedback_event_count': generated_protocol_feedback}
+                       if generated_protocol_feedback else {})}
+            elif workspace_entry and _original_workspace_checkpoint_selected(context):
+                if generated_starts != generated_completions or generated_starts < 1:
+                    _raise_execution_error('original project model lifecycle is incomplete')
+                original_event_layout = {
+                    'schema_version': 1, 'scope': _original_workspace_checkpoint_scope(context),
+                    'context_injection_event_count': context_injections,
+                    'model_started_event_count': generated_starts,
+                    'model_completed_event_count': generated_completions,
+                    'model_cost_event_count': generated_costs,
+                    'verification_failure_event_count': generated_failures,
+                    'read_progress_event_count': generated_read_progress,
+                    'protocol_feedback_event_count': generated_protocol_feedback,
+                    'model_scope_event_count': 0,
+                }
             artifact_failed = False
             artifact: Artifact | None = None
             try:
@@ -3828,6 +4014,8 @@ class DirectRuntime:
                     artifact_content = {"text": text}
                 if generated_event_layout is not None:
                     artifact_content['generated_event_layout'] = generated_event_layout
+                if original_event_layout is not None:
+                    artifact_content[_ORIGINAL_WORKSPACE_LAYOUT] = original_event_layout
                 if delivery_report_binding is not None:
                     artifact_content.update(text=text, delivery_report_binding=delivery_report_binding)
                 artifact = Artifact(
@@ -3950,6 +4138,14 @@ class DirectRuntime:
             scope_events = self._model_scope_events(
                 run_id=scope_run_id, sequence=2 + injection_offset,
             )
+            if original_event_layout is not None:
+                # Seal the actual scope-event count before publishing the single
+                # final artifact. The intermediate object has never been emitted.
+                original_event_layout = {**original_event_layout, 'model_scope_event_count': len(scope_events)}
+                artifact = Artifact(id=artifact.id, version=artifact.version, type=artifact.type,
+                    producer=artifact.producer, content={**artifact.content,
+                        _ORIGINAL_WORKSPACE_LAYOUT: original_event_layout},
+                    source_ids=artifact.source_ids, provenance=artifact.provenance)
             for scope_event in scope_events:
                 yield scope_event
             injection_offset += len(scope_events)
@@ -3976,6 +4172,7 @@ class DirectRuntime:
                     "next_sequence": 4 + injection_offset,
                     **({"model_scope_event_count": len(scope_events)} if scope_events else {}),
                     **({'generated_event_layout': generated_event_layout} if generated_event_layout is not None else {}),
+                    **({_ORIGINAL_WORKSPACE_LAYOUT: original_event_layout} if original_event_layout is not None else {}),
                     **({direct_delivery_report.CHECKPOINT_POLICY: direct_delivery_report.policy_identity(context)}
                        if delivery_report_binding is not None else {}),
                 },
@@ -4453,6 +4650,28 @@ class DirectRuntime:
                 and checkpoint.state[direct_delivery_report.CHECKPOINT_POLICY]
                 != direct_delivery_report.policy_identity(context)):
             raise RuntimeExecutionError("direct final report checkpoint policy changed")
+        original_layout = checkpoint.state.get(_ORIGINAL_WORKSPACE_LAYOUT)
+        original_selected = _original_workspace_checkpoint_selected(context)
+        if original_layout is not None and not original_selected:
+            raise RuntimeExecutionError('original project checkpoint layout is invalid')
+        if original_selected and original_layout is None:
+            if self._capability_gateway is not None:
+                raise RuntimeExecutionError('original project checkpoint layout is invalid')
+            self._validate_original_framed_report_checkpoint(checkpoint, context)
+        if original_layout is not None:
+            final = tuple(item for item in context.artifacts if str(item.id) == checkpoint.state['artifact_id'])
+            if (not isinstance(original_layout, Mapping)
+                    or original_layout.get('scope') != _original_workspace_checkpoint_scope(context)
+                    or len(final) != 1 or final[0].content.get(_ORIGINAL_WORKSPACE_LAYOUT) != original_layout
+                    or final[0].content_sha256 != checkpoint.state['artifact_sha256']
+                    or final[0].recompute_content_sha256() != checkpoint.state['artifact_sha256']
+                    or not _original_project_terminal_artifact_matches(context, final[0])):
+                raise RuntimeExecutionError('original project checkpoint proof is invalid')
+            if direct_delivery_report.selected(context) and (
+                    checkpoint.state.get(direct_delivery_report.CHECKPOINT_POLICY)
+                    != direct_delivery_report.policy_identity(context)
+                    or not direct_delivery_report.valid(context, final[0])):
+                raise RuntimeExecutionError('direct final report checkpoint proof is invalid')
         if (layout is None and generated_history_selected(context) and _is_workspace_project_delivery(context)):
             raise RuntimeExecutionError('generated project checkpoint evidence is invalid')
         if layout is not None:
@@ -4477,12 +4696,39 @@ class DirectRuntime:
             }:
                 raise RuntimeExecutionError('generated project checkpoint evidence is invalid')
 
+    def _validate_original_framed_report_checkpoint(
+        self, checkpoint: RuntimeCheckpoint, context: TaskContext,
+    ) -> None:
+        # A Hybrid final stage has no workspace tools and does not execute the
+        # original project. Absence of tools alone is never a proof of that role.
+        try:
+            if self._capability_gateway is not None or not hybrid_delivery_report.selected(context):
+                raise ValueError
+            delivery, _required = hybrid_delivery_report.framed(context)
+            expected_delivery = {**delivery, _ORIGINAL_REPORT_SCOPE: _original_report_consumer_scope(context)}
+            final = tuple(item for item in context.artifacts if str(item.id) == checkpoint.state['artifact_id'])
+            if (len(final) != 1 or final[0].content_sha256 != checkpoint.state['artifact_sha256']
+                    or final[0].recompute_content_sha256() != checkpoint.state['artifact_sha256']
+                    or not direct_delivery_report.valid(context, final[0])
+                    or not _original_project_terminal_artifact_matches(context, final[0])
+                    or checkpoint.state.get(direct_delivery_report.CHECKPOINT_POLICY)
+                    != direct_delivery_report.policy_identity(context)
+                    or direct_delivery_report.digest(final[0].content.get('workspace_delivery'))
+                    != direct_delivery_report.digest(expected_delivery)):
+                raise ValueError
+        except (TypeError, ValueError, RuntimeError, KeyError, RecursionError):
+            raise RuntimeExecutionError('original framed final report checkpoint proof is invalid') from None
+
     @staticmethod
     def _is_completed_checkpoint_state(checkpoint: RuntimeCheckpoint) -> bool:
         state = checkpoint.state
         base_keys = {"completed", "artifact_id", "artifact_sha256", "next_sequence"}
         generated = 'generated_event_layout' in state
-        allowed = base_keys | ({'generated_event_layout'} if generated else set())
+        original = _ORIGINAL_WORKSPACE_LAYOUT in state
+        if original and generated:
+            return False
+        allowed = (base_keys | ({'generated_event_layout'} if generated else set())
+                   | ({_ORIGINAL_WORKSPACE_LAYOUT} if original else set()))
         if direct_delivery_report.CHECKPOINT_POLICY in state:
             policy = state[direct_delivery_report.CHECKPOINT_POLICY]
             if (not isinstance(policy, Mapping) or not policy
@@ -4499,6 +4745,36 @@ class DirectRuntime:
         except ValueError:
             return False
         generated_sequence: int | None = None
+        if original:
+            layout = state[_ORIGINAL_WORKSPACE_LAYOUT]
+            count_keys = {'context_injection_event_count', 'model_started_event_count',
+                          'model_completed_event_count', 'model_cost_event_count',
+                          'verification_failure_event_count', 'read_progress_event_count',
+                          'protocol_feedback_event_count', 'model_scope_event_count'}
+            if (not isinstance(layout, Mapping) or set(layout) != {'schema_version', 'scope', *count_keys}
+                    or type(layout['schema_version']) is not int or layout['schema_version'] != 1
+                    or not _original_workspace_scope_valid(layout['scope'])
+                    or any(type(layout[key]) is not int or not 0 <= cast(int, layout[key]) <= 2**31
+                           for key in count_keys)):
+                return False
+            scope = cast(Mapping[str, JsonValue], layout['scope'])
+            if scope['tenant_id'] != str(checkpoint.tenant_id) or scope['run_id'] != str(checkpoint.run_id):
+                return False
+            counts = {key: cast(int, layout[key]) for key in count_keys}
+            original_calls = counts['model_started_event_count']
+            if (original_calls < 1 or counts['model_completed_event_count'] != original_calls
+                    or counts['model_cost_event_count'] > original_calls
+                    or counts['verification_failure_event_count'] > original_calls
+                    or counts['protocol_feedback_event_count'] >= original_calls
+                    or counts['protocol_feedback_event_count'] + counts['read_progress_event_count'] > original_calls
+                    or counts['context_injection_event_count'] not in (0, 1)
+                    or type(state.get('model_scope_event_count', 0)) is not int
+                    or state.get('model_scope_event_count', 0) != counts['model_scope_event_count']
+                    or 'model_scope_event_count' in state and state['model_scope_event_count'] == 0):
+                return False
+            # Original workspace has no emitted three-event generated inspection
+            # prefix. Its first queued model boundary starts at sequence one.
+            generated_sequence = 3 + sum(counts.values())
         if generated:
             layout = state['generated_event_layout']
             layout_keys = {'schema_version', 'inspection_event_count',
@@ -4506,7 +4782,8 @@ class DirectRuntime:
                     'model_call_count', 'model_cost_event_count'}
             if (not isinstance(layout, Mapping)
                     or not layout_keys.issubset(layout)
-                    or set(layout) - layout_keys - {'verification_failure_event_count', 'read_progress_event_count'}
+                    or set(layout) - layout_keys - {'verification_failure_event_count', 'read_progress_event_count',
+                                                   'protocol_feedback_event_count'}
                     or type(layout['schema_version']) is not int or layout['schema_version'] != 1
                     or type(layout['inspection_event_count']) is not int or layout['inspection_event_count'] != 3):
                 return False
@@ -4515,13 +4792,18 @@ class DirectRuntime:
             scope_events = state.get('model_scope_event_count', 0)
             failures = layout.get('verification_failure_event_count', 0)
             read_progress = layout.get('read_progress_event_count', 0)
+            protocol_feedback = layout.get('protocol_feedback_event_count', 0)
             if (type(injections) is not int or injections not in (0, 1)
                     or type(calls) is not int or not 1 <= calls <= 2**31
                     or type(costs) is not int or not 0 <= costs <= calls
                     or type(scope_events) is not int or not 0 <= scope_events <= 2**31
                     or type(failures) is not int or not 0 <= failures <= calls
                     or type(read_progress) is not int or not 0 <= read_progress <= calls
+                    or type(protocol_feedback) is not int or not 0 <= protocol_feedback < calls
+                    # A rejected response is not an accepted read-progress batch.
+                    or read_progress + protocol_feedback > calls
                     or 'read_progress_event_count' in layout and read_progress == 0
+                    or 'protocol_feedback_event_count' in layout and protocol_feedback == 0
                     or 'model_scope_event_count' in state and scope_events == 0):
                 return False
             inspection_id, inspection_sha = layout['inspection_artifact_id'], layout['inspection_artifact_sha256']
@@ -4531,7 +4813,8 @@ class DirectRuntime:
                     return False
             except ValueError:
                 return False
-            generated_sequence = 6 + injections + 2 * calls + costs + scope_events + failures + read_progress
+            generated_sequence = (6 + injections + 2 * calls + costs + scope_events
+                                  + failures + read_progress + protocol_feedback)
         return (
             state["completed"] is True
             and type(artifact_id) is str
@@ -4540,7 +4823,7 @@ class DirectRuntime:
             and _SHA256.fullmatch(artifact_sha256) is not None
             and type(state["next_sequence"]) is int
             and (
-                state['next_sequence'] == generated_sequence if generated else (
+                state['next_sequence'] == generated_sequence if generated or original else (
                 state["next_sequence"] in (3, 4, 5) if "model_scope_event_count" not in state
                 else type(state["model_scope_event_count"]) is int
                 and 0 < state["model_scope_event_count"] <= 2**63 - 6

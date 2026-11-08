@@ -289,15 +289,25 @@ async def test_completed_generated_checkpoint_restores_without_model_or_tool_rep
     checkpoint = await runtime.save_checkpoint()
     next_sequence = checkpoint.state['next_sequence']
     assert type(next_sequence) is int and next_sequence >= 7
+    protocol_feedback = sum(event.kind == 'runtime.control_feedback'
+        and event.payload.get('stage') == 'workspace_batch_protocol'
+        and event.payload.get('phase') == 'response_rejected' for event in events)
+    assert protocol_feedback == int(corrected)
+    layout = checkpoint.state['generated_event_layout']
+    assert layout.get('protocol_feedback_event_count', 0) == protocol_feedback
+    assert ('protocol_feedback_event_count' in layout) is corrected
     artifacts = tuple(event.artifact for event in events if event.artifact is not None)
     if legacy_layout:
         state: Any = json.loads(json.dumps(checkpoint.state, default=dict))
         layout = state['generated_event_layout']
         assert layout.pop('verification_failure_event_count') == 0
+        # A historical layout predates optional protocol-feedback events. Keep
+        # its original prefix formula and matching durable artifact binding.
+        removed_feedback = layout.pop('protocol_feedback_event_count', 0)
         state['next_sequence'] = (6 + layout['context_injection_event_count']
             + 2 * layout['model_call_count'] + layout['model_cost_event_count']
             + state.get('model_scope_event_count', 0))
-        assert state['next_sequence'] == next_sequence
+        assert state['next_sequence'] == next_sequence - removed_feedback
         final = next(item for item in artifacts if str(item.id) == state['artifact_id'])
         legacy_final = Artifact(id=final.id, version=final.version, type=final.type, producer=final.producer,
             content={**final.content, 'generated_event_layout': layout}, source_ids=final.source_ids,
@@ -317,7 +327,9 @@ async def test_completed_generated_checkpoint_restores_without_model_or_tool_rep
     assert len(replayed) == 1 and replayed[0].kind is EventKind.RUNTIME_COMPLETED
     assert not fresh_model.requests and tuple(harness.calls) == before
     # Even a self-consistent forged offset must match the durable delivery layout.
-    for defect in ('sequence', 'counts', 'missing', 'inspection', 'failure_bool', 'failure_nonzero', 'extra'):
+    for defect in ('sequence', 'counts', 'missing', 'inspection', 'failure_bool', 'failure_nonzero', 'extra',
+                   'feedback_bool', 'feedback_zero', 'feedback_negative', 'feedback_overflow',
+                   'feedback_missing', 'feedback_read_mix', 'feedback_counts'):
         state = json.loads(json.dumps(checkpoint.state, default=dict))
         if defect == 'sequence':
             state['next_sequence'] += 1
@@ -332,6 +344,25 @@ async def test_completed_generated_checkpoint_restores_without_model_or_tool_rep
             state['generated_event_layout']['verification_failure_event_count'] = 1
         elif defect == 'extra':
             state['generated_event_layout']['unknown_event_count'] = 0
+        elif defect.startswith('feedback_'):
+            layout = state['generated_event_layout']
+            count = layout.get('protocol_feedback_event_count', 0)
+            if defect == 'feedback_missing':
+                if 'protocol_feedback_event_count' not in layout:
+                    continue
+                layout.pop('protocol_feedback_event_count')
+            elif defect == 'feedback_counts':
+                layout['protocol_feedback_event_count'] = count + 1
+                state['next_sequence'] += 1  # Self-consistent sum is not artifact proof.
+            elif defect == 'feedback_read_mix':
+                layout['protocol_feedback_event_count'] = 1
+                layout['read_progress_event_count'] = layout['model_call_count']
+                state['next_sequence'] += 1 - count + layout['model_call_count']
+            else:
+                layout['protocol_feedback_event_count'] = {
+                    'feedback_bool': True, 'feedback_zero': 0, 'feedback_negative': -1,
+                    'feedback_overflow': layout['model_call_count'] + 1,
+                }[defect]
         else:
             state.pop('generated_event_layout')
             state.pop('model_scope_event_count', None)
@@ -339,6 +370,8 @@ async def test_completed_generated_checkpoint_restores_without_model_or_tool_rep
         bad = RuntimeCheckpoint(id=checkpoint.id, runtime_type=checkpoint.runtime_type,
             runtime_version=checkpoint.runtime_version, run_id=context.run_id,
             tenant_id=context.tenant_id, mode=context.mode, state=state)
+        if defect.startswith('feedback_') and defect != 'feedback_counts':
+            assert not DirectRuntime._is_completed_checkpoint_state(bad)
         rejected = DirectRuntime(fresh_model, logical_model='fixture', capability_gateway=harness,
             harness_tool_gateway=cast(Any, harness))
         with pytest.raises(RuntimeExecutionError):
