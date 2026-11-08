@@ -1240,12 +1240,12 @@ class PythonProjectEnvironmentCache:
                 names = self._catalog(parent, deadline)
                 _need(not self._retired_scope(parent, _owner(invocation), deadline), 'cache_incomplete')
                 used, free = self._capacity(parent, deadline)
-                def new_budget() -> int:
+                def new_budget(*, adjust_copy: bool = True) -> int:
                     # Called only under the global cache lock, before any mutation.
                     selected = min(next_bytes, self.policy.max_bytes - used - _CONTROL_ALLOWANCE,
                         free - self.policy.disk_reserve_bytes - _CONTROL_ALLOWANCE) if adaptive else next_bytes
                     _need(selected >= minimum_bytes, "cache_quota")
-                    if fresh_budget is not None:
+                    if adjust_copy and fresh_budget is not None:
                         bounded = fresh_budget(selected)
                         _need(type(bounded) is int and minimum_bytes <= bounded <= selected,
                               "cache_quota")
@@ -1257,6 +1257,15 @@ class PythonProjectEnvironmentCache:
                 fresh = key not in names
                 if fresh:
                     _need(invocation.install_allowed, "cache_incomplete")
+                    if len(names) == self.policy.max_entries:
+                        # No persistent copy can be published into a full cache.
+                        # Classify exact slot pressure before its copy-only disk
+                        # callback; the opt-in ephemeral path independently checks
+                        # READY owners, producer space and the unchanged reserve.
+                        self.policy.require_capacity(
+                            used_bytes=used, entries=len(names),
+                            next_bytes=new_budget(adjust_copy=False), free_bytes=free,
+                        )
                     next_bytes = new_budget()
                     self.policy.require_capacity(
                         used_bytes=used, entries=len(names), next_bytes=next_bytes, free_bytes=free
