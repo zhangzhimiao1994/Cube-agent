@@ -203,12 +203,20 @@ async def test_original_terminal_replay_rejects_unbound_delivery_before_executio
 
 
 @pytest.mark.parametrize('mode', ['direct', 'hybrid'])
-async def test_original_terminal_replay_accepts_rich_delivery_without_rewriting_checkpoint(mode: str) -> None:
+async def test_original_terminal_replay_requires_executor_layout_and_preserves_checkpoint(mode: str) -> None:
     configured = await replay(mode)
     before = configured.checkpoint.to_payload()
-    events = await configured.events()
+    if mode == 'direct':
+        # This synthetic checkpoint has neither an executor event layout nor a
+        # bound Hybrid report frame. Rich file metadata cannot replace either.
+        # Actual producer checkpoints retain positive coverage below.
+        await configured.runtime.restore_checkpoint(configured.checkpoint)
+        with pytest.raises(direct.RuntimeExecutionError, match='original .*checkpoint'):
+            _ = [event async for event in configured.runtime.run(configured.context)]
+    else:
+        events = await configured.events()
+        assert events[-1].kind is EventKind.RUNTIME_COMPLETED
     configured.assert_no_execution()
-    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
     assert configured.checkpoint.to_payload() == before
 
 
