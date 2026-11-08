@@ -15753,9 +15753,19 @@ def test_conversation_metadata_is_tenant_scoped() -> None:
 
 
 @pytest.mark.asyncio
-async def test_persistent_admin_conversation_keeps_chronological_messages() -> None:
+@pytest.mark.parametrize("install_state", ["no_proposal", "offered", "cancelled"])
+async def test_persistent_admin_conversation_keeps_chronological_messages(
+    install_state: str,
+) -> None:
     first_id = UUID("33333333-3333-4333-8333-333333333331")
     second_id = UUID("33333333-3333-4333-8333-333333333332")
+    routing = {"conversation_id": "conv-multi-turn"}
+    if install_state != "no_proposal":
+        routing["capability_install_query"] = "读取 Office 文档并搜索"
+    proposal = _capability_install_proposal(routing)
+    if install_state != "no_proposal":
+        assert proposal is not None
+    reads: list[str] = []
 
     class FakeRunRepository:
         async def list_conversation(
@@ -15775,7 +15785,7 @@ async def test_persistent_admin_conversation_keeps_chronological_messages() -> N
                     status=RunStatus.COMPLETED,
                     version=1,
                     created_at=datetime.now(UTC),
-                    routing_decision={"conversation_id": "conv-multi-turn"},
+                    routing_decision=routing,
                 ),
                 RunRecord(
                     id=second_id,
@@ -15786,7 +15796,7 @@ async def test_persistent_admin_conversation_keeps_chronological_messages() -> N
                     status=RunStatus.COMPLETED,
                     version=1,
                     created_at=datetime.now(UTC),
-                    routing_decision={"conversation_id": "conv-multi-turn"},
+                    routing_decision=routing,
                 ),
             )
 
@@ -15808,7 +15818,35 @@ async def test_persistent_admin_conversation_keeps_chronological_messages() -> N
             assert run_id in {first_id, second_id}
             return ()
 
-    service = PersistentAdminResourceService(
+    class ConversationService(PersistentAdminResourceService):
+        async def list_plugins(
+            self, *, tenant_id: UUID | None = None,
+        ) -> tuple[PluginResourceResponse, ...]:
+            assert tenant_id == TENANT_ID
+            reads.append("plugins")
+            return ()
+
+        async def list_audit_events(
+            self,
+            action: str | None = None,
+            *,
+            run_id: str | None = None,
+            resource: str | None = None,
+            user_id: str | None = None,
+            limit: int | None = None,
+        ) -> tuple[AuditEventResponse, ...]:
+            assert action == "capability_installer.cancel"
+            reads.append("cancellations")
+            if install_state != "cancelled":
+                return ()
+            assert proposal is not None
+            return (AuditEventResponse(
+                id="cancelled-install-plan", actor=str(ACTOR_ID), action=action,
+                resource="plugin:office-doc-search", created_at=datetime.now(UTC),
+                details={"plan_id": cast(str, proposal["plan_id"])},
+            ),)
+
+    service = ConversationService(
         config_service=FakeConfigService(),  # type: ignore[arg-type]
         secret_service=FakeSecretService(),  # type: ignore[arg-type]
         tenant_id=TENANT_ID,
@@ -15821,6 +15859,10 @@ async def test_persistent_admin_conversation_keeps_chronological_messages() -> N
     assert [run.request for run in conversation.runs] == [
         "第一轮：先做方案",
         "第二轮：继续细化方案",
+    ]
+    assert reads == ([] if install_state == "no_proposal" else ["plugins", "cancellations"])
+    assert [run.capability_install_proposal is not None for run in conversation.runs] == [
+        install_state == "offered", install_state == "offered",
     ]
 
 

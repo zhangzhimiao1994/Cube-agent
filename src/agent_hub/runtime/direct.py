@@ -4218,6 +4218,7 @@ class DirectRuntime:
                 completed_payload["workspace_delivery"] = workspace_delivery
             scope_events = self._model_scope_events(
                 run_id=scope_run_id, sequence=2 + injection_offset,
+                model_failure=False,
             )
             if original_event_layout is not None:
                 # Seal the actual scope-event count before publishing the single

@@ -99,6 +99,35 @@ async def test_direct_recovery_keeps_failed_call_scope_and_resets_next_run() -> 
     ]
 
 
+async def test_successful_workspace_continuation_keeps_scope_without_failure_label() -> None:
+    responses = [ModelResponse(text=json.dumps({"workspace_batch": {
+        "files": {path: "export {};\n"}, "complete": complete,
+        "continuation": "" if complete else "remaining files",
+    }}), usage=TokenUsage(10, 20, 30)) for path, complete in (
+        ("src/first.ts", False), ("src/second.ts", True),
+    )]
+    capacity = CapacityStub([lease("primary") for _ in responses])
+    runtime = DirectRuntime(make_gateway(OutcomesTransport(responses), capacity),
+        logical_model="primary", capability_gateway=RecordingCapabilityGateway())
+    context = TaskContext(run_id=uuid4(), tenant_id=uuid4(), mode=TaskMode.DIRECT,
+        token_budget=50_000, request="Build a project with source and tests.",
+        routing_decision={"project_scale": "small", "project_delivery": "workspace",
+                          "artifact_strategy": "workspace_bundle"})
+
+    events = [event async for event in runtime.run(context)]
+
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert not any(event.kind == "model.failure_receipt" for event in events)
+    attempts = [event.artifact for event in events
+        if event.artifact is not None and event.artifact.type == "model_attempt"]
+    assert len(attempts) == 1 and attempts[0] is not None
+    scope = validate_model_scope_artifact(attempts[0], str(context.run_id))
+    assert scope["call_count"] == 2
+    assert all(call["outcome"] == "received" for call in cast(Any, scope["calls"]))
+    assert len(capacity.releases) == 2
+    assert [event.sequence for event in events] == list(range(1, len(events) + 1))
+
+
 async def test_cancelled_scope_does_not_publish_failure_or_completion() -> None:
     class Transport:
         def __init__(self) -> None:

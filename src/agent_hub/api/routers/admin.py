@@ -9164,6 +9164,12 @@ class InMemoryAdminResourceService:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class _CapabilityInstallVisibility:
+    installed_plugin_ids: frozenset[str] = frozenset()
+    cancelled_plan_ids: frozenset[str] = frozenset()
+
+
 class PersistentAdminResourceService(InMemoryAdminResourceService):
     """Production admin resource service backed by config revisions and sealed secrets."""
 
@@ -9532,7 +9538,11 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
         )
         if metadata is None and not records:
             raise KeyError(conversation_id)
-        runs = [await self._run_detail(record) for record in records]
+        install_visibility = await self._capability_install_visibility(records)
+        runs = [
+            await self._run_detail(record, install_visibility=install_visibility)
+            for record in records
+        ]
         if metadata is None:
             return ConversationResponse(conversation_id=conversation_id, runs=runs)
         return ConversationResponse(**_conversation_metadata_response(metadata).model_dump(), runs=runs)
@@ -9655,13 +9665,36 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             cost_usd=str(await self._run_repository.usage_cost(self._tenant_id, record.id)),
         )
 
-    async def _run_detail(self, record: RunRecord) -> RunDetailResponse:
+    async def _capability_install_visibility(
+        self, records: Sequence[RunRecord],
+    ) -> _CapabilityInstallVisibility:
+        # Conversation history can have many runs. Only an install proposal
+        # depends on tenant plugin state or on capability installer audit events.
+        if not any(
+            record.routing_decision is not None
+            and _capability_install_query(record.routing_decision) is not None
+            for record in records
+        ):
+            return _CapabilityInstallVisibility()
+        plugins = await self.list_plugins(tenant_id=self._tenant_id)
+        cancellations = await self.list_audit_events(action="capability_installer.cancel")
+        return _CapabilityInstallVisibility(
+            installed_plugin_ids=frozenset(plugin.id for plugin in plugins),
+            cancelled_plan_ids=_capability_installer_cancelled_plan_ids(cancellations),
+        )
+
+    async def _run_detail(
+        self,
+        record: RunRecord,
+        *,
+        install_visibility: _CapabilityInstallVisibility | None = None,
+    ) -> RunDetailResponse:
         assert self._run_repository is not None
         list_item = await self._run_list_item(record)
         events = await self._run_repository.events(self._tenant_id, record.id)
         artifacts = await self._run_repository.artifacts(self._tenant_id, record.id)
-        plugins = await self.list_plugins(tenant_id=self._tenant_id)
-        audit_events = await self.list_audit_events()
+        if install_visibility is None:
+            install_visibility = await self._capability_install_visibility((record,))
         return RunDetailResponse(
             **list_item.model_dump(),
             events=[_admin_run_event(event) for event in events],
@@ -9680,8 +9713,8 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             repair_proposal=_repair_proposal(record.routing_decision),
             capability_install_proposal=_capability_install_proposal(
                 record.routing_decision,
-                installed_plugin_ids=frozenset(plugin.id for plugin in plugins),
-                cancelled_plan_ids=_capability_installer_cancelled_plan_ids(audit_events),
+                installed_plugin_ids=install_visibility.installed_plugin_ids,
+                cancelled_plan_ids=install_visibility.cancelled_plan_ids,
             ),
         )
 
