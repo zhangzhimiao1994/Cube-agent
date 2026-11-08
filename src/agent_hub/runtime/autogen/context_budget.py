@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+from collections.abc import Callable
 from dataclasses import replace
 from typing import cast
 
@@ -76,11 +77,34 @@ def _history_groups(messages: tuple[ModelMessage, ...]) -> tuple[list[tuple[int,
     latest_pair: int | None = None
     plain_group: int | None = None
     index = 0
+    native_ids: set[str] = set()
     while index < len(messages):
         message = messages[index]
         content = message.content
-        if (message.native_assistant is not None or message.tool_call_id is not None
-                or message.role not in {"system", "user", "assistant"}
+        native = message.native_assistant
+        if native is not None:
+            calls = native.tool_calls
+            identifiers = tuple(call.id for call in calls)
+            following = messages[index + 1:index + 1 + len(calls)]
+            if (message.role != 'assistant' or message.tool_call_id is not None
+                    or len(set(identifiers)) != len(identifiers)
+                    or native_ids.intersection(identifiers)
+                    or len(following) != len(calls)
+                    or tuple(item.tool_call_id for item in following) != identifiers
+                    or any(item.role != 'tool' or item.native_assistant is not None
+                           or not isinstance(item.content, str) for item in following)):
+                raise ContextBudgetExceeded()
+            native_ids.update(identifiers)
+            group = len(groups)
+            groups.append(tuple(range(index, index + len(calls) + 1)))
+            if calls:
+                latest_pair = group
+            else:
+                pinned.add(group)  # A standalone native message/signature is mandatory.
+            plain_group = None
+            index += len(calls) + 1
+            continue
+        if (message.tool_call_id is not None or message.role not in {"system", "user", "assistant"}
                 or not isinstance(content, str)):
             raise ContextBudgetExceeded()
         group = len(groups)
@@ -137,22 +161,37 @@ def _replacement(request: ModelRequest, removed: set[int]) -> ModelRequest:
     return replace(request, messages=tuple(messages))
 
 
-def fit_request_history(request: ModelRequest, *, context_window_tokens: int) -> ModelRequest:
+def fit_request_history(request: ModelRequest, *, context_window_tokens: int | None,
+                        admission_token_limit: int | None = None,
+                        estimate_input: Callable[[ModelRequest], int] | None = None) -> ModelRequest:
     """Fit input with a one-eighth reserve, removing only oldest complete history groups.
 
     The marker is an omission receipt, not a generated summary or execution evidence.
-    Native/multimodal protocols are deliberately unsupported for compression.
+    Native assistant/tool exchanges are indivisible, including private signatures.
+    The latest complete group is mandatory; orphan/incomplete/multimodal groups fail closed.
     """
-    if type(context_window_tokens) is not int or context_window_tokens <= 0:
+    from agent_hub.runtime.request_admission import input_target
+
+    if (context_window_tokens is not None
+            and (type(context_window_tokens) is not int or context_window_tokens <= 0)):
         raise ContextBudgetExceeded()
-    target = context_window_tokens - max(1, context_window_tokens // 8)
-    estimator = ConservativeTokenEstimator()
-    original_tokens = estimator.estimate_input(request)
+    target = input_target(context_window_tokens, admission_token_limit)
+    if target is None:
+        raise ContextBudgetExceeded()
+    def tokens(candidate: ModelRequest) -> int:
+        value = (estimate_input(candidate) if estimate_input is not None
+                 else ConservativeTokenEstimator().estimate_input(candidate))
+        if type(value) is not int or value <= 0:
+            raise ContextBudgetExceeded()
+        return value
+
+    native = request.native_tool_continuation or any(
+        message.native_assistant is not None or message.tool_call_id is not None for message in request.messages)
+    validated = _history_groups(request.messages) if native else None
+    original_tokens = tokens(request)
     if original_tokens <= target:
         return request
-    if request.native_tool_continuation:
-        raise ContextBudgetExceeded()
-    groups, pinned = _history_groups(request.messages)
+    groups, pinned = validated if validated is not None else _history_groups(request.messages)
     removed: set[int] = set()
     # Each complete group is considered once; pinned messages are never sliced or rewritten.
     for index, group in enumerate(groups):
@@ -160,7 +199,12 @@ def fit_request_history(request: ModelRequest, *, context_window_tokens: int) ->
             continue
         removed.update(group)
         candidate = _replacement(request, removed)
-        candidate_tokens = estimator.estimate_input(candidate)
+        candidate_tokens = tokens(candidate)
         if candidate_tokens < original_tokens and candidate_tokens <= target:
             return candidate
+    if admission_token_limit is not None and (
+            context_window_tokens is None or admission_token_limit < context_window_tokens):
+        from agent_hub.models.capacity import CapacityRequestTooLarge
+
+        raise CapacityRequestTooLarge()
     raise ContextBudgetExceeded()

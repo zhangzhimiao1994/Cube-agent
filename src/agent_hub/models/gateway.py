@@ -1418,6 +1418,24 @@ class ModelGateway:
                    if item.context_window_tokens is not None]
         return min(windows) if windows else None
 
+    def admission_token_limit(self, request: ModelRequest) -> int | None:
+        """Local token-bucket planning bound, distinct from the model context window.
+
+        This neither acquires a lease nor issues a billing/admission bound. Include
+        every catalog peer sharing an authorized candidate's quota scope, as local
+        capacity registration uses the most restrictive policy for that scope.
+        The actual capacity backend remains authoritative at submission.
+        """
+        groups, _, _, _ = self._capable_candidate_groups(request)
+        scopes = {item.quota_scope_id for _, items in groups for item in items}
+        limits = [item.tpm for item in self._registry.deployments
+                  if item.quota_scope_id in scopes and item.tpm]
+        return min(limits) if limits else None
+
+    def estimate_request_tokens(self, request: ModelRequest) -> int:
+        """Pure full-request estimate; never a trusted physical admission record."""
+        return self._estimate_tokens(replace(request, timeout_seconds=1))
+
     def supports_native_tool_continuation(self, request: ModelRequest) -> bool:
         """Opt in without removing an existing protocol or fallback candidate."""
         if any(message.native_assistant is not None for message in request.messages):

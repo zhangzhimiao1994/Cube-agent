@@ -5,7 +5,9 @@ import hashlib
 import json
 from dataclasses import replace
 
+from agent_hub.models.capacity import CapacityRequestTooLarge
 from agent_hub.models.types import ModelMessage, ModelRequest, model_message_payload
+from agent_hub.runtime.request_admission import admission_token_limit, fit_output, request_tokens
 
 _RESULT = "UNTRUSTED_CAPABILITY_RESULTS_JSON="
 _OBSERVATIONS = frozenset({"read_context", "workspace.read", "workspace_read", "workspace.list", "workspace_list"})
@@ -37,12 +39,13 @@ def fit_request(
     """
     window_for = getattr(gateway, "context_window_tokens", None)
     estimate = getattr(gateway, "estimate_input_tokens", None)
-    if not callable(window_for) or not callable(estimate):
+    if not callable(estimate):
         return request
-    window = window_for(request)
-    if window is None:
+    window = window_for(request) if callable(window_for) else None
+    admission_limit = admission_token_limit(gateway, request)
+    if window is None and admission_limit is None:
         return request
-    if type(window) is not int or window <= 0:
+    if window is not None and (type(window) is not int or window <= 0):
         raise ValueError("invalid model context window")
 
     def tokens(candidate: ModelRequest) -> int:
@@ -53,10 +56,14 @@ def fit_request(
 
     def fits(candidate: ModelRequest) -> bool:
         count = tokens(candidate)
-        return (count + candidate.max_output_tokens <= window if reserve_output else count < window)
+        context_fits = (window is None or (count + candidate.max_output_tokens <= window
+                                          if reserve_output else count < window))
+        admission_fits = (admission_limit is None or request_tokens(
+            gateway, replace(candidate, max_output_tokens=1)) <= admission_limit)
+        return context_fits and admission_fits
 
     if fits(request):
-        return request
+        return fit_output(gateway, request)
     messages = request.messages
     groups: list[tuple[int, ...]] = []
     removable: list[int] = []
@@ -108,7 +115,7 @@ def fit_request(
         ))
         candidate = replace(request, messages=(marker, *(message for i, message in enumerate(messages) if i not in omitted)))
         if fits(candidate):
-            return candidate
+            return fit_output(gateway, candidate)
     if reserve_output:
         # Required instructions/latest/native groups stay complete. If the
         # desired output cannot fit, use only a verified smaller positive cap.
@@ -124,5 +131,8 @@ def fit_request(
             else:
                 high = cap - 1
         if clipped is not None:
-            return clipped
+            return fit_output(gateway, clipped)
+    if admission_limit is not None and request_tokens(
+            gateway, replace(candidate, max_output_tokens=1)) > admission_limit:
+        raise CapacityRequestTooLarge()
     raise ValueError("required model context exceeds configured window")

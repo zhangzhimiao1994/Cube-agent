@@ -2201,6 +2201,9 @@ async def test_assembled_allow_revocation_fences_consume_and_dispatch(
         "runs/automatic_project_inputs.py",
         "capabilities/python_project_service.py",
         "capabilities/python_project_lifecycle.py",
+        "runtime/request_admission.py",
+        "runtime/crew/context_window.py",
+        "runtime/autogen/context_budget.py",
     ],
 )
 async def test_actual_proof_dependency_change_invalidates_installed_evidence(

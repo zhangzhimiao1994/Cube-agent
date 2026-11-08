@@ -23,7 +23,7 @@ from agent_hub.auth.models import Role
 from agent_hub.capabilities.action_preparation import CONTRACT_ROUTE_KEYS as _CONTRACT_ROUTE_KEYS
 from agent_hub.capabilities.generated_project_service import validate_generated_preparation
 from agent_hub.harness.types import HarnessToolCallRequest, HarnessToolCallResult
-from agent_hub.models.types import ModelMessage
+from agent_hub.models.types import ModelMessage, ModelRequest
 from agent_hub.runtime.action_approval_capture import capture_action_approval
 from agent_hub.runtime.action_checkpoint import (
     action_checkpoint_valid as action_checkpoint_valid,  # noqa: PLC0414
@@ -242,6 +242,21 @@ class _ModelGateway:
     async def complete_with_context(self, request: Any) -> Any:
         assert self.owner._journal is not None
         return await self.owner._journal.complete(request, self.gateway.complete_with_context)
+
+    def admission_token_limit(self, request: ModelRequest) -> int | None:
+        from agent_hub.runtime.request_admission import admission_token_limit
+
+        return admission_token_limit(self.gateway, request)
+
+    def estimate_input_tokens(self, request: ModelRequest) -> int:
+        from agent_hub.runtime.request_admission import input_tokens
+
+        return input_tokens(self.gateway, request)
+
+    def estimate_request_tokens(self, request: ModelRequest) -> int:
+        from agent_hub.runtime.request_admission import request_tokens
+
+        return request_tokens(self.gateway, request)
 
 
 class _WorkspaceGateway:

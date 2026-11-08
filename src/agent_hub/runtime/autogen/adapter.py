@@ -61,6 +61,7 @@ from agent_hub.domain.runs import TaskMode
 from agent_hub.harness import HarnessToolGateway
 from agent_hub.harness.events import safe_tool_event_payload
 from agent_hub.harness.types import HarnessToolCallRequest, HarnessToolCallResult
+from agent_hub.models.capacity import CapacityRequestTooLarge
 from agent_hub.models.gateway import (
     ConservativeTokenEstimator,
     GatewayCompletion,
@@ -2620,10 +2621,20 @@ class GatewayChatCompletionClient(ChatCompletionClient):
             if row.get("request_hash") == durable.request_hash(request, tool_names=tool_names):
                 return request
         window = self._context_window(request)
-        if window is None:
+        from agent_hub.runtime.request_admission import (
+            admission_token_limit,
+            fit_output,
+            input_tokens,
+        )
+
+        admission_limit = admission_token_limit(self._gateway, request)
+        if window is None and admission_limit is None:
             return request
         try:
-            return fit_request_history(request, context_window_tokens=window)
+            fitted = fit_request_history(request, context_window_tokens=window,
+                                         admission_token_limit=admission_limit,
+                                         estimate_input=lambda value: input_tokens(self._gateway, value))
+            return fit_output(self._gateway, fitted)
         except ContextBudgetExceeded:
             raise ModelContextWindowExceeded() from None
 
@@ -4259,17 +4270,33 @@ class AutoGenDiscussionRuntime:
                     return candidate
         query = getattr(self._gateway, "context_window_tokens", None)
         window = query(request) if callable(query) else None
-        if window is None:
+        from agent_hub.runtime.request_admission import (
+            admission_token_limit,
+            fit_output,
+            input_target,
+            input_tokens,
+        )
+
+        admission_limit = admission_token_limit(self._gateway, request)
+        if window is None and admission_limit is None:
             return request
-        if type(window) is not int or window <= 0:
+        if window is not None and (type(window) is not int or window <= 0):
             raise RuntimeExecutionError("model context window configuration is invalid")
         estimate = getattr(self._gateway, "estimate_input_tokens", None)
-        target = window - max(1, window // 8)  # Same reserve as the existing history fitter.
+        target = input_target(window, admission_limit)
+        assert target is not None
         fitted_candidates: list[ModelRequest] = []
+        exhausted: ModelContextWindowExceeded | CapacityRequestTooLarge = ModelContextWindowExceeded()
         for candidate in candidates:
             try:
-                fitted = fit_request_history(candidate, context_window_tokens=window)
+                fitted = fit_request_history(candidate, context_window_tokens=window,
+                                             admission_token_limit=admission_limit,
+                                             estimate_input=lambda value: input_tokens(self._gateway, value))
             except ContextBudgetExceeded:
+                exhausted = ModelContextWindowExceeded()
+                continue
+            except CapacityRequestTooLarge as error:
+                exhausted = error
                 continue
             if (durability is not None and durability._model_cursor < len(durability.model_entries)
                     and durability.request_hash(fitted, tool_names=tool_names) == digest):
@@ -4281,8 +4308,11 @@ class AutoGenDiscussionRuntime:
             if type(tokens) is not int or tokens <= 0:
                 raise RuntimeExecutionError("input token estimator is invalid")
             if tokens <= target:
-                return candidate
-        raise ModelContextWindowExceeded()
+                try:
+                    return fit_output(self._gateway, candidate)
+                except CapacityRequestTooLarge as error:
+                    exhausted = error
+        raise exhausted
 
     @staticmethod
     def _task_text(
