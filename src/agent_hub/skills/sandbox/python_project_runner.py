@@ -17,7 +17,7 @@ import stat
 import sys
 import time
 from pathlib import Path
-from typing import Any, Self
+from typing import Any, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -79,12 +79,14 @@ class PythonProjectRunnerPlan(BaseModel):
     inputs: dict[str, object]
     source_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
     reused_environment: PythonEnvironmentReference | None = None
+    environment_storage: Literal['persistent_cache', 'ephemeral_current_execution'] = 'persistent_cache'
     generated_manifest_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
 
     @model_validator(mode="after")
     def bound_plan(self) -> Self:
         prepared = PythonProjectInputs.from_payload(self.inputs)
         invocation = self.invocation
+        _need(self.environment_storage != 'ephemeral_current_execution' or self.reused_environment is None)
         _need(self.generated_manifest_sha256 is None or invocation.source_kind == "candidate")
         _need(
             (

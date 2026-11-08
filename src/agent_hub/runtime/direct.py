@@ -2530,7 +2530,7 @@ class DirectRuntime:
                 if generated_success_source(context, result.payload) is None or not isinstance(verification, Mapping):
                     raise _WorkspaceVerificationError("not_passed") from None
                 if verification_evidence is not None:
-                    for key in ('generated_project_acceptance', 'python_recipe', 'python_environment_reference'):
+                    for key in ('generated_project_acceptance', 'python_recipe', 'python_environment_reference', 'python_ephemeral_environment'):
                         if key in result.payload:
                             verification_evidence[key] = result.payload[key]
                 if verification_trace is not None:
@@ -2541,8 +2541,10 @@ class DirectRuntime:
                     raise _WorkspaceVerificationError("not_passed") from None
                 if verification_trace is not None:
                     verification_trace.record(result, known_files=known_files, attempt=attempt)
-                if verification_evidence is not None and "python_environment_reference" in result.payload:
-                    verification_evidence["python_environment_reference"] = result.payload["python_environment_reference"]
+                if verification_evidence is not None:
+                    for key in ('python_environment_reference', 'python_ephemeral_environment'):
+                        if key in result.payload:
+                            verification_evidence[key] = result.payload[key]
                 return verification
             source_sha256 = (
                 verification.get("source_sha256") if isinstance(verification, Mapping) else None

@@ -46,7 +46,12 @@ def consume_response(raw: PythonProjectBrokerResponse, invocation: PythonProject
         raw._product_stream = None
         try:
             response = PythonProjectBrokerResponse.model_validate(raw.model_dump(), strict=True)
-            response.require_for(PythonProjectBrokerRequest(invocation=invocation, product_transfer_version=1))
+            response.require_for(PythonProjectBrokerRequest(
+                invocation=invocation, product_transfer_version=1,
+                ephemeral_environment_version=1 if invocation.install_allowed else None,
+            ))
+            if response.ephemeral_environment is not None:
+                _need(response.ephemeral_environment.source_sha256 == source)
             if response.product is not None:
                 _need(stream is not None and response.product.source_sha256 == source)
                 require_product_report(response, response.product)

@@ -19,10 +19,17 @@ from agent_hub.capabilities.project_verification import (
     validated_project_failure_payload,
 )
 from agent_hub.capabilities.python_project_receipts import validate_python_passed_receipt
+from agent_hub.capabilities.python_project_reports import (
+    PythonEphemeralProjectReport,
+    PythonProjectFailure,
+)
 from agent_hub.runtime.contracts import JsonValue, TaskContext
 from agent_hub.runtime.python_project_history import python_failure_feedback
 from agent_hub.skills.sandbox.python_project_phase import validate_generated_python_test_execution
-from agent_hub.skills.sandbox.python_project_protocol import PythonEnvironmentReference
+from agent_hub.skills.sandbox.python_project_protocol import (
+    PythonEnvironmentReference,
+    PythonEphemeralEnvironmentEvidence,
+)
 
 _ERRORS = (ValueError, TypeError, KeyError, AttributeError, RecursionError, OverflowError)
 _FIELDS = {'schema_version', 'kind', 'capture_phase', 'tenant_id', 'user_id', 'run_id',
@@ -115,6 +122,14 @@ def _root_reference(context: TaskContext, value: object) -> PythonEnvironmentRef
     return ref
 
 
+def _root_ephemeral(context: TaskContext, value: object) -> PythonEphemeralEnvironmentEvidence:
+    evidence = PythonEphemeralEnvironmentEvidence.model_validate_json(_encoded(value), strict=True)
+    _need(evidence.scope.tenant_id == context.tenant_id and evidence.scope.run_id == context.run_id
+        and evidence.scope.project_id == context.routing_decision.get('project_id')
+        and evidence.scope.session_id == context.routing_decision.get('workspace_session_id'))
+    return evidence
+
+
 def generated_success_source(context: TaskContext, result: Mapping[str, JsonValue]) -> str | None:
     try:
         binding = _binding(context, result)
@@ -126,16 +141,23 @@ def generated_success_source(context: TaskContext, result: Mapping[str, JsonValu
             and receipt.get('generated_acceptance_sha256') == binding['acceptance_sha256'])
         core = {key: value for key, value in receipt.items() if key != 'generated_acceptance_sha256'}
         if binding['stack'] == 'python':
-            ref = _root_reference(context, result.get('python_environment_reference'))
+            if 'python_ephemeral_environment' in result:
+                _need('python_environment_reference' not in result)
+                temporary = _root_ephemeral(context, result['python_ephemeral_environment'])
+                report = PythonEphemeralProjectReport(core, temporary, source).to_payload()
+                recipe_sha, input_sha = temporary.recipe_sha256, temporary.environment_input_sha256
+            else:
+                ref = _root_reference(context, result.get('python_environment_reference'))
+                recipe_sha, input_sha = ref.recipe_sha256, ref.environment_input_sha256
+                report = validate_python_passed_receipt(core, expected_source=source,
+                    expected_recipe=recipe_sha, expected_environment_inputs=input_sha,
+                    expected_environment=ref.environment_sha256)
+                install = cast(Mapping[str, JsonValue], report['dependency_install'])
+                _need(install['origin_execution_id'] == ref.origin_execution_id)
             _need(result.get('python_recipe') == {'schema_version': 1,
-                'recipe_sha256': ref.recipe_sha256, 'environment_input_sha256': ref.environment_input_sha256})
-            report = validate_python_passed_receipt(core, expected_source=source,
-                expected_recipe=ref.recipe_sha256, expected_environment_inputs=ref.environment_input_sha256,
-                expected_environment=ref.environment_sha256)
-            install = cast(Mapping[str, JsonValue], report['dependency_install'])
+                'recipe_sha256': recipe_sha, 'environment_input_sha256': input_sha})
             proof = cast(Mapping[str, JsonValue], binding['test_execution'])
-            _need(install['origin_execution_id'] == ref.origin_execution_id
-                and report['test_count'] == proof['count'])
+            _need(report['test_count'] == proof['count'])
         else:
             _need(set(core) == {'schema_version', 'status', 'source_sha256', 'checks', 'runtime'}
                 and type(core['schema_version']) is int and core['schema_version'] == 1
@@ -182,7 +204,11 @@ def generated_failure_current(context: TaskContext, result: Mapping[str, JsonVal
             assert feedback is not None
             report = cast(Mapping[str, JsonValue], feedback['python_verification_failure'])
             sibling = feedback.get('python_environment_reference')
-            if sibling is not None:
+            if 'python_ephemeral_environment' in feedback:
+                _need(sibling is None)
+                temporary = _root_ephemeral(context, feedback['python_ephemeral_environment'])
+                PythonProjectFailure(report, None, ephemeral_environment=temporary)
+            elif sibling is not None:
                 ref = _root_reference(context, sibling)
                 _need(report['recipe_sha256'] == ref.recipe_sha256
                     and report['environment_input_sha256'] == ref.environment_input_sha256

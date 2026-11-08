@@ -25,12 +25,17 @@ from agent_hub.capabilities.project_verification import _validate_original_diagn
 from agent_hub.capabilities.python_project_inputs import PythonInterpreterIdentity
 from agent_hub.capabilities.python_project_receipts import validate_python_passed_receipt
 from agent_hub.capabilities.python_project_reports import (
+    PythonEphemeralProjectReport,
+    PythonProjectFailure,
     _failure_shape,
     _hash,
     _object,
 )
 from agent_hub.runtime.contracts import Artifact, JsonValue, TaskContext, _freeze_object
-from agent_hub.skills.sandbox.python_project_protocol import PythonEnvironmentReference
+from agent_hub.skills.sandbox.python_project_protocol import (
+    PythonEnvironmentReference,
+    PythonEphemeralEnvironmentEvidence,
+)
 
 if TYPE_CHECKING:
     from agent_hub.capabilities.python_project_service import PythonOriginalContext
@@ -308,6 +313,7 @@ def _report(
     passed: bool,
     sibling: object = None,
     source_label: object = None,
+    ephemeral_sibling: object = None,
 ) -> Mapping[str, JsonValue]:
     if passed:
         _need(isinstance(value, Mapping))
@@ -322,6 +328,24 @@ def _report(
         and report["environment_input_sha256"] == recipe["environment_input_sha256"]
         and report["runtime"] == metadata["runtime"]
     )
+    if ephemeral_sibling is not None:
+        _need(sibling is None)
+        ephemeral = PythonEphemeralEnvironmentEvidence.model_validate_json(
+            _encoded(ephemeral_sibling), strict=True,
+        )
+        scope = _object(metadata["scope"], {
+            "tenant_id", "run_id", "project_id", "workspace_session_id",
+        })
+        _need(
+            str(ephemeral.scope.tenant_id) == scope["tenant_id"]
+            and str(ephemeral.scope.run_id) == scope["run_id"]
+            and ephemeral.scope.project_id == scope["project_id"]
+            and ephemeral.scope.session_id == scope["workspace_session_id"]
+            and ephemeral.scope.original_reference.model_dump() == metadata["reference"]
+        )
+        if passed:
+            return PythonEphemeralProjectReport(report, ephemeral, _hash(source_label)).to_payload()
+        return PythonProjectFailure(report, None, ephemeral_environment=ephemeral).to_payload()
     environment = report["environment_sha256"]
     expected_environment: str | None = None
     if environment is not None:
@@ -389,6 +413,9 @@ def python_success_source(context: TaskContext, result: Mapping[str, JsonValue])
     try:
         if "python_environment_reference" in result:
             _need(result["python_environment_reference"] is not None)
+        if "python_ephemeral_environment" in result:
+            _need("python_environment_reference" not in result
+                  and result["python_ephemeral_environment"] is not None)
         binding = result.get("original_check_contract")
         _need(isinstance(binding, Mapping))
         assert isinstance(binding, Mapping)
@@ -398,6 +425,7 @@ def python_success_source(context: TaskContext, result: Mapping[str, JsonValue])
             passed=True,
             sibling=result.get("python_environment_reference"),
             source_label=binding.get("candidate_source_sha256"),
+            ephemeral_sibling=result.get("python_ephemeral_environment"),
         )
         source = _hash(report["source_sha256"])
         _need(python_binding_matches(context, result, source))
@@ -445,6 +473,13 @@ def python_failure_feedback(
                     ).model_dump(mode="json"),
                 )
             )
+        if "python_ephemeral_environment" in payload:
+            _need(payload.get("python_environment_reference") is None)
+            ephemeral = PythonEphemeralEnvironmentEvidence.model_validate_json(
+                _encoded(payload["python_ephemeral_environment"]), strict=True,
+            )
+            PythonProjectFailure(report, None, ephemeral_environment=ephemeral)
+            result["python_ephemeral_environment"] = ephemeral.model_dump(mode="json")
         return _freeze_object(result, name="Python failure feedback")
     except _INVALID:
         return None
@@ -460,6 +495,7 @@ def python_failure_current(context: TaskContext, payload: Mapping[str, JsonValue
             _history(context),
             passed=False,
             sibling=feedback.get("python_environment_reference"),
+            ephemeral_sibling=feedback.get("python_ephemeral_environment"),
         )
         return True
     except _INVALID:
@@ -471,7 +507,8 @@ def python_original_failed(context: TaskContext) -> bool:
         metadata = _history(context)
         state = cast(Mapping[str, JsonValue], context.routing_decision["project_input_preparation"])
         observation = cast(Mapping[str, JsonValue], state["observation"])
-        report = _report(observation.get("verification"), metadata, passed=False)
+        report = _report(observation.get("verification"), metadata, passed=False,
+                         ephemeral_sibling=observation.get("ephemeral_environment"))
         reference = cast(Mapping[str, JsonValue], metadata["reference"])
         _need(
             report["source_sha256"] == reference["input_source_sha256"]
@@ -488,6 +525,8 @@ def python_original_failed(context: TaskContext) -> bool:
             {
                 "python_verification_failure": report,
                 "execution_diagnostic": observation.get("execution_diagnostic"),
+                **({"python_ephemeral_environment": observation["ephemeral_environment"]}
+                   if "ephemeral_environment" in observation else {}),
             },
         )
     except _INVALID:

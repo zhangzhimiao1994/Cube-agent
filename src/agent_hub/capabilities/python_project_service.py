@@ -44,6 +44,7 @@ from agent_hub.capabilities.python_project_inputs import (
 from agent_hub.capabilities.python_project_receipts import validate_python_passed_receipt
 from agent_hub.capabilities.python_project_recipe import parse_python_project_declaration
 from agent_hub.capabilities.python_project_reports import (
+    PythonEphemeralProjectReport,
     PythonProjectFailure,
     PythonProjectReport,
     decode_python_project_report,
@@ -61,6 +62,7 @@ from agent_hub.skills.sandbox.project import (
 from agent_hub.skills.sandbox.python_project_client import PythonProjectSystemdSandbox
 from agent_hub.skills.sandbox.python_project_protocol import (
     PythonEnvironmentReference,
+    PythonEphemeralEnvironmentEvidence,
     PythonProjectBrokerError,
     PythonProjectBrokerResponse,
     PythonProjectInputsObservation,
@@ -184,6 +186,7 @@ def validate_python_original_observation(
         )
         item = _freeze_object(value, name="Python original observation")
         failed = item.get("status") == "failed"
+        ephemeral = item.get("schema_version") == 3
         _need(
             set(item)
             == {
@@ -196,8 +199,9 @@ def validate_python_original_observation(
                 "execution_id",
             }
             | ({"execution_diagnostic"} if failed else set())
+            | ({"ephemeral_environment"} if ephemeral else set())
         )
-        _need(type(item["schema_version"]) is int and item["schema_version"] == 2)
+        _need(type(item["schema_version"]) is int and item["schema_version"] == (3 if ephemeral else 2))
         _need(
             item["status"] in ("passed", "failed")
             and item["execution_id"] == invocation.execution_id
@@ -227,6 +231,14 @@ def validate_python_original_observation(
         )
         if reference is not None:
             _need(_reference_matches(invocation, reference))
+        evidence: PythonEphemeralEnvironmentEvidence | None = None
+        if ephemeral:
+            _need(reference is None)
+            evidence = PythonEphemeralEnvironmentEvidence.model_validate_json(
+                _encoded(item["ephemeral_environment"]), strict=True,
+            )
+            evidence.require_for(invocation)
+            _need(evidence.interpreter_sha256 == inputs.interpreter.binary_sha256)
         if failed:
             failure = validate_python_failure(
                 item["verification"],
@@ -234,6 +246,7 @@ def validate_python_original_observation(
                 inputs=inputs,
                 expected_source_sha256=expected_source,
                 environment_reference=reference,
+                ephemeral_environment=evidence,
             )
             diagnostic = item["execution_diagnostic"]
             _validate_original_diagnostic(diagnostic, retain_tail=True)
@@ -247,6 +260,11 @@ def validate_python_original_observation(
                     if key not in {"stdout", "stderr"}
                 }
             )
+        elif evidence is not None:
+            verification = item["verification"]
+            _need(isinstance(verification, Mapping))
+            assert isinstance(verification, Mapping)
+            PythonEphemeralProjectReport(verification, evidence, expected_source)
         else:
             _need(reference is not None)
             assert reference is not None
@@ -288,10 +306,12 @@ def _validate_expired_original_observation(
     _need(type(state['observation_sha256']) is str
           and hashlib.sha256(_encoded(observation)).hexdigest() == state['observation_sha256'])
     failed = observation.get('status') == 'failed'
+    ephemeral = observation.get('schema_version') == 3
     _need(set(observation) == {'schema_version', 'status', 'verification', 'original_check_contract',
                               'python_recipe', 'environment_reference', 'execution_id'}
           | ({'execution_diagnostic'} if failed else set())
-          and type(observation['schema_version']) is int and observation['schema_version'] == 2
+          | ({'ephemeral_environment'} if ephemeral else set())
+          and type(observation['schema_version']) is int and observation['schema_version'] == (3 if ephemeral else 2)
           and observation['status'] in {'passed', 'failed'}
           and observation['execution_id'] == state['execution_id']
           and observation['python_recipe'] == marker)
@@ -304,13 +324,25 @@ def _validate_expired_original_observation(
     _need(type(protected) is str and re.fullmatch('[a-f0-9]{64}', protected) is not None
           and type(binding.get('schema_version')) is int
           and binding == {'schema_version': 1, 'contract_sha256': protected, 'protected_sha256': protected})
-    # Only a recorded issued environment is eligible in this legacy branch.
-    # Root still selects and remeasures the live READY and its reservation TTL.
-    reference = PythonEnvironmentReference.model_validate_json(
-        _encoded(observation['environment_reference']), strict=True)
-    _need(_reference_matches(invocation, reference))
+    # This validates history only. Root independently selects any actual READY;
+    # a removed original environment never becomes a cache reference.
+    reference: PythonEnvironmentReference | None = None
+    evidence: PythonEphemeralEnvironmentEvidence | None = None
+    if ephemeral:
+        _need(observation['environment_reference'] is None)
+        evidence = PythonEphemeralEnvironmentEvidence.model_validate_json(
+            _encoded(observation['ephemeral_environment']), strict=True)
+        _need(evidence.scope.model_dump() == _scope_payload(invocation)
+              and evidence.recipe_sha256 == invocation.recipe_sha256
+              and evidence.environment_input_sha256 == invocation.environment_input_sha256
+              and evidence.execution_id == state['execution_id'])
+    else:
+        reference = PythonEnvironmentReference.model_validate_json(
+            _encoded(observation['environment_reference']), strict=True)
+        _need(_reference_matches(invocation, reference))
     if failed:
-        report = PythonProjectFailure(cast(Mapping[str, JsonValue], observation['verification']), reference).to_payload()
+        report = PythonProjectFailure(cast(Mapping[str, JsonValue], observation['verification']), reference,
+                                      ephemeral_environment=evidence).to_payload()
         _need(report['original_check_contract'] == protected)
         diagnostic = observation['execution_diagnostic']
         _validate_original_diagnostic(diagnostic, retain_tail=True)
@@ -318,7 +350,11 @@ def _validate_expired_original_observation(
         checks = cast(tuple[Mapping[str, JsonValue], ...], report['checks'])
         _need(checks[-1]['execution_diagnostic'] == {
             key: value for key, value in diagnostic.items() if key not in {'stdout', 'stderr'}})
+    elif evidence is not None:
+        report = PythonEphemeralProjectReport(cast(Mapping[str, JsonValue], observation['verification']),
+            evidence, invocation.original_reference.input_source_sha256).to_payload()
     else:
+        assert reference is not None
         report = PythonProjectReport(cast(Mapping[str, JsonValue], observation['verification']),
             reference, invocation.original_reference.input_source_sha256).to_payload()
     _need(report['source_sha256'] == invocation.original_reference.input_source_sha256
@@ -368,7 +404,7 @@ class _Receipt:
     context: _Context
     invocation: PythonProjectInvocation
     source: str
-    reference: PythonEnvironmentReference
+    reference: PythonEnvironmentReference | PythonEphemeralEnvironmentEvidence
     actor: str
     product: Mapping[str, JsonValue] | None = None
 
@@ -651,7 +687,7 @@ class PythonProjectService:
         original: bool,
         execution_id: str | None = None,
         timeout_seconds: float | None = None,
-    ) -> tuple[PythonProjectReport | PythonProjectFailure, PythonProjectInvocation, str,
+    ) -> tuple[PythonProjectReport | PythonEphemeralProjectReport | PythonProjectFailure, PythonProjectInvocation, str,
                Mapping[str, JsonValue] | None]:
         base = context.invocation
         if execution_id is not None:
@@ -717,6 +753,7 @@ class PythonProjectService:
                     inputs=context.inputs,
                     expected_source_sha256=before,
                     environment_reference=response.environment_reference,
+                    ephemeral_environment=response.ephemeral_environment,
                     result=response.result,
                 )
                 key = (base.tenant_id, base.run_id)
@@ -742,7 +779,7 @@ class PythonProjectService:
                     "python_project_scope_changed",
                 )
                 product = None
-                if not original and isinstance(report, PythonProjectReport):
+                if not original and isinstance(report, (PythonProjectReport, PythonEphemeralProjectReport)):
                     product = await persist_product(self.owner.generated_file_store, response, stream,
                         invocation, before, report.to_payload())
                     try:
@@ -931,8 +968,10 @@ class PythonProjectService:
                 "contract_sha256": context.stored.contract.protected_sha256,
                 "protected_sha256": context.stored.contract.protected_sha256,
             }
+            ephemeral = (report.ephemeral_environment
+                         if isinstance(report, (PythonEphemeralProjectReport, PythonProjectFailure)) else None)
             observation: dict[str, JsonValue] = {
-                "schema_version": 2,
+                "schema_version": 3 if ephemeral is not None else 2,
                 "status": report.report["status"],
                 "verification": report.to_payload(),
                 "original_check_contract": binding,
@@ -942,6 +981,8 @@ class PythonProjectService:
                 if report.environment_reference is None
                 else report.environment_reference.model_dump(mode="json"),
             }
+            if ephemeral is not None:
+                observation["ephemeral_environment"] = ephemeral.model_dump(mode="json")
             if isinstance(report, PythonProjectFailure):
                 _need(report.diagnostic is not None)
                 assert report.diagnostic is not None
@@ -977,7 +1018,9 @@ class PythonProjectService:
                 )
             binding = _OriginalScope(context.stored, context.observation_sha256).binding(source)
             self.receipts[key] = _Receipt(
-                context, invocation, source, report.environment_reference, actor, product
+                context, invocation, source,
+                report.ephemeral_environment if isinstance(report, PythonEphemeralProjectReport)
+                else report.environment_reference, actor, product
             )
             self.owner._original_receipts[key] = binding
             result: dict[str, JsonValue] = {
@@ -986,9 +1029,9 @@ class PythonProjectService:
                 "original_check_contract": binding,
                 "python_recipe": python_recipe_marker(context.inputs),
                 # Root issuance evidence for trusted tool history, not a fresh grant.
-                "python_environment_reference": report.environment_reference.model_dump(
-                    mode="json"
-                ),
+                **({"python_ephemeral_environment": report.ephemeral_environment.model_dump(mode="json")}
+                   if isinstance(report, PythonEphemeralProjectReport) else
+                   {"python_environment_reference": report.environment_reference.model_dump(mode="json")}),
                 "summary": "Original checks preserved; Python build and tests verified in isolation.",
             }
             committed = True
@@ -1024,18 +1067,23 @@ class PythonProjectService:
                 await project_source_manifest(self.owner.root, base)
             )
             _need(await project_source_fingerprint(self.owner.root, base) == receipt.source)
-            inspect_invocation = PythonProjectInvocation.model_validate(
-                {
-                    **receipt.invocation.model_dump(),
-                    "execution_id": "python_inspect_" + uuid4().hex,
-                    "install_allowed": False,
-                },
-                strict=True,
-            )
-            actual = await self.executor.inspect_environment(
-                inspect_invocation, expected_environment=receipt.reference
-            )
-            _need(type(actual) is PythonEnvironmentReference and actual == receipt.reference)
+            if isinstance(receipt.reference, PythonEphemeralEnvironmentEvidence):
+                receipt.reference.require_for(receipt.invocation)
+                _need(receipt.reference.source_sha256 == receipt.source
+                      and receipt.reference.interpreter_sha256 == current.inputs.interpreter.binary_sha256)
+            else:
+                inspect_invocation = PythonProjectInvocation.model_validate(
+                    {
+                        **receipt.invocation.model_dump(),
+                        "execution_id": "python_inspect_" + uuid4().hex,
+                        "install_allowed": False,
+                    },
+                    strict=True,
+                )
+                actual = await self.executor.inspect_environment(
+                    inspect_invocation, expected_environment=receipt.reference
+                )
+                _need(type(actual) is PythonEnvironmentReference and actual == receipt.reference)
             _need(await project_source_fingerprint(self.owner.root, base) == receipt.source)
             after = await self.select(tenant_id, run_id, receipt.actor, approve=True)
             _need(

@@ -133,6 +133,13 @@ class PythonProjectCacheError(ValueError):
         super().__init__(reason)
 
 
+class PythonProjectCacheSlotsFull(PythonProjectCacheError):
+    """Only a valid cache with otherwise sufficient capacity can produce this."""
+
+    def __init__(self) -> None:
+        super().__init__('cache_quota')
+
+
 @contextmanager
 def _io_errors() -> Iterator[None]:
     """Map cache-owned operations only, never the reservation caller's body."""
@@ -275,11 +282,13 @@ class PythonProjectCachePolicy:
         required = next_bytes + _CONTROL_ALLOWANCE
         _need(
             next_bytes > 0
-            and entries < self.max_entries
+            and entries <= self.max_entries
             and required <= self.max_bytes - used_bytes
             and required <= free_bytes - self.disk_reserve_bytes,
             "cache_quota",
         )
+        if entries == self.max_entries:
+            raise PythonProjectCacheSlotsFull()
 
 
 def _write(parent: int, name: str, value: object) -> None:
@@ -1161,6 +1170,56 @@ class PythonProjectEnvironmentCache:
             if mutating:
                 raise ProcessCleanupIncomplete('python_project_cleanup_incomplete') from None
             raise
+
+    @contextmanager
+    def ephemeral(
+        self, invocation: PythonProjectInvocation, *, next_bytes: int,
+        minimum_bytes: int, deadline: float,
+    ) -> Iterator[ScanLimits]:
+        """Reconfirm slots-only pressure without creating any cache state.
+
+        Existing READY owners remain protected, regardless of age or DB status.
+        Native admission is also held by the caller; this lock remains held for
+        exactly the normal lease lifetime. A partial/UNKNOWN entry is not pressure
+        evidence and cannot enable this branch.
+        """
+        key = python_project_cache_key(invocation)
+        _need(invocation.install_allowed and type(next_bytes) is int
+              and type(minimum_bytes) is int and 0 < minimum_bytes <= next_bytes <= self.policy.max_bytes,
+              'cache_invalid')
+        with self._locked(deadline, create=False) as locked:
+            _need(locked is not None, 'cache_incomplete')
+            assert locked is not None
+            parent, stack, pins = locked
+            with _io_errors():
+                names = self._catalog(parent, deadline)
+                _need(key not in names and len(names) == self.policy.max_entries, 'cache_incomplete')
+                _need(not self._retired_scope(parent, _owner(invocation), deadline), 'cache_incomplete')
+                used, free = self._capacity(parent, deadline)
+                selected = min(next_bytes, self.policy.max_bytes - used - _CONTROL_ALLOWANCE,
+                               free - self.policy.disk_reserve_bytes - _CONTROL_ALLOWANCE)
+                _need(selected >= minimum_bytes, 'cache_quota')
+                try:
+                    self.policy.require_capacity(used_bytes=used, entries=len(names),
+                                                 next_bytes=selected, free_bytes=free)
+                except PythonProjectCacheSlotsFull:
+                    pass
+                else:
+                    raise PythonProjectCacheError('cache_changed')
+                for name in sorted(names):
+                    _check(deadline)
+                    entry = _open_directory(parent, name, 0, stack, pins, mode=0o700)
+                    reservation = _reservation(entry, name, self.policy, pins)
+                    _ready(entry, self.root / name, reservation,
+                           ScanLimits(reservation['environment_limit_bytes']), stack, pins, deadline)
+                for pin in pins:
+                    pin.check()
+            yield ScanLimits(next_bytes)
+            with _io_errors():
+                _need(self._catalog(parent, deadline) == names
+                      and self._capacity(parent, deadline)[0] == used, 'cache_changed')
+                for pin in pins:
+                    pin.check()
 
     @contextmanager
     def reserve(

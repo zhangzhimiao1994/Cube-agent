@@ -471,9 +471,13 @@ class HarnessToolGateway:
                 if request.tool_name == "project.verify" and error.python_project_failure is not None:
                     failure_payload["python_verification_failure"] = error.python_project_failure.to_payload()
                     reference = error.python_project_failure.environment_reference
-                    failure_payload["python_environment_reference"] = (
-                        None if reference is None else reference.model_dump(mode="json")
-                    )
+                    ephemeral = error.python_project_failure.ephemeral_environment
+                    if ephemeral is not None:
+                        failure_payload["python_ephemeral_environment"] = ephemeral.model_dump(mode="json")
+                    else:
+                        failure_payload["python_environment_reference"] = (
+                            None if reference is None else reference.model_dump(mode="json")
+                        )
             elif (request.tool_name == "project.verify"
                   and type(error.project_prerequisite) is ProjectPrerequisiteObservation
                   and error.project_failure is None):

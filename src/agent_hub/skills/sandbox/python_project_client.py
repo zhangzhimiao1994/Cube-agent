@@ -185,7 +185,8 @@ class PythonProjectSystemdSandbox:
     async def run(self, invocation: PythonProjectInvocation) -> PythonProjectBrokerResponse:
         """Return execution and reference separately; stdout is opaque project data."""
         return await self._exchange(PythonProjectBrokerRequest(
-            invocation=invocation, product_transfer_version=1))
+            invocation=invocation, product_transfer_version=1,
+            ephemeral_environment_version=1 if invocation.install_allowed else None))
 
     async def probe(
         self, invocation: PythonProjectProbeInvocation

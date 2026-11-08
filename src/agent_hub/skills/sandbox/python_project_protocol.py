@@ -66,8 +66,9 @@ class PythonProjectBrokerRequest(_PythonRequest):
     action: Literal["run_python_project"] = "run_python_project"
     invocation: PythonProjectInvocation
     product_transfer_version: Literal[1] | None = None
+    ephemeral_environment_version: Literal[1] | None = None
 
-    @field_validator("product_transfer_version", mode="before")
+    @field_validator("product_transfer_version", "ephemeral_environment_version", mode="before")
     @classmethod
     def strict_transfer(cls, value: object) -> object:
         if value is not None and (type(value) is not int or value != 1):
@@ -109,6 +110,54 @@ class PythonEnvironmentReference(BaseModel):
         if type(value) is not int:
             raise ValueError("invalid Python environment reference")
         return value
+
+
+class PythonEphemeralEnvironmentEvidence(BaseModel):
+    """One verified, removed execution environment; never a cache reference or grant."""
+
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+
+    schema_version: Literal[1] = 1
+    storage: Literal['ephemeral_current_execution'] = 'ephemeral_current_execution'
+    scope: PythonProjectScope
+    execution_id: str = Field(pattern=r'^[a-z0-9][a-z0-9_-]{0,127}$')
+    recipe_sha256: str = Field(pattern=r'^[a-f0-9]{64}$')
+    environment_input_sha256: str = Field(pattern=r'^[a-f0-9]{64}$')
+    environment_sha256: str = Field(pattern=r'^[a-f0-9]{64}$')
+    source_sha256: str = Field(pattern=r'^[a-f0-9]{64}$')
+    interpreter_sha256: str = Field(pattern=r'^[a-f0-9]{64}$')
+    environment_bytes: int = Field(gt=0)
+    unit_quiet: Literal[True]
+    environment_removed: Literal[True]
+    cache_written: Literal[False]
+
+    @field_validator('schema_version', mode='before')
+    @classmethod
+    def strict_schema(cls, value: object) -> object:
+        if type(value) is not int:
+            raise ValueError('invalid ephemeral schema')
+        return value
+
+    @field_validator('unit_quiet', 'environment_removed', 'cache_written', mode='before')
+    @classmethod
+    def strict_flags(cls, value: object) -> object:
+        if type(value) is not bool:
+            raise ValueError('invalid ephemeral state')
+        return value
+
+    def require_for(self, invocation: PythonProjectInvocation) -> None:
+        if type(self) is not PythonEphemeralEnvironmentEvidence or type(invocation) is not PythonProjectInvocation:
+            raise ValueError('invalid ephemeral environment evidence')
+        PythonEphemeralEnvironmentEvidence.model_validate(self.model_dump(warnings='error'), strict=True)
+        invocation = PythonProjectInvocation.model_validate(invocation.model_dump(warnings='error'), strict=True)
+        if (not invocation.install_allowed
+                or self.scope.model_dump() != _scope_payload(invocation)
+                or (self.execution_id, self.recipe_sha256, self.environment_input_sha256)
+                != (invocation.execution_id, invocation.recipe_sha256, invocation.environment_input_sha256)
+                or self.environment_bytes > invocation.workspace_limit_bytes
+                or invocation.source_kind == 'original'
+                and self.source_sha256 != invocation.original_reference.input_source_sha256):
+            raise ValueError('ephemeral environment execution mismatch')
 
 
 def _scope_payload(
@@ -361,6 +410,7 @@ class PythonProjectBrokerResponse(_PythonRequest):
     result: SkillResult | None = None
     observation: PythonProjectInputsObservation | None = None
     environment_reference: PythonEnvironmentReference | None = None
+    ephemeral_environment: PythonEphemeralEnvironmentEvidence | None = None
     released_environment: PythonEnvironmentReference | None = None
     release_outcome: Literal["released", "absent"] | None = None
     expired_environment_released: bool | None = None
@@ -373,6 +423,10 @@ class PythonProjectBrokerResponse(_PythonRequest):
 
     @model_validator(mode="after")
     def exclusive_outcome(self) -> Self:
+        if self.ephemeral_environment is not None and (
+                not self.ok or self.action != 'run_python_project'
+                or self.environment_reference is not None):
+            raise ValueError('invalid ephemeral environment outcome')
         if self.ok and self.action == 'maintain_expired_python_failure':
             if (self.error is not None or self.failure_phase is None or any(value is not None for value in (
                     self.result, self.observation, self.environment_reference, self.released_environment,
@@ -454,6 +508,10 @@ class PythonProjectBrokerResponse(_PythonRequest):
         }:
             raise ValueError("invalid Python broker request type")
         invocation = request.invocation
+        if self.ephemeral_environment is not None:
+            if not isinstance(request, PythonProjectBrokerRequest) or request.ephemeral_environment_version != 1:
+                raise ValueError('unsolicited ephemeral environment')
+            self.ephemeral_environment.require_for(request.invocation)
         if self.product is not None:
             if not isinstance(request, PythonProjectBrokerRequest) or request.product_transfer_version != 1:
                 raise ValueError("unsolicited Python product")

@@ -37,6 +37,7 @@ from agent_hub.skills.sandbox.python_project_process import (
 )
 from agent_hub.skills.sandbox.python_project_protocol import (
     PythonEnvironmentReference,
+    PythonEphemeralEnvironmentEvidence,
     PythonProjectInvocation,
     _reference_matches,
 )
@@ -266,6 +267,48 @@ class PythonProjectReport:
 
 
 @dataclass(frozen=True, slots=True)
+class PythonEphemeralProjectReport:
+    """A passed current execution whose environment was verified and removed.
+
+    This observation grants neither future installation nor cache reuse.
+    """
+
+    report: Mapping[str, JsonValue]
+    ephemeral_environment: PythonEphemeralEnvironmentEvidence
+    expected_source_sha256: InitVar[str]
+
+    def __post_init__(self, expected_source_sha256: str) -> None:
+        evidence = _ephemeral(self.ephemeral_environment)
+        assert evidence is not None
+        _need(evidence.source_sha256 == expected_source_sha256)
+        report = validate_python_passed_receipt(
+            _object(_freeze_object(self.report, name="Python ephemeral passed data"), _PUBLIC_FIELDS),
+            expected_source=expected_source_sha256,
+            expected_recipe=evidence.recipe_sha256,
+            expected_environment_inputs=evidence.environment_input_sha256,
+            expected_environment=evidence.environment_sha256,
+        )
+        dependency = _object(report["dependency_install"], {"mode", "origin_execution_id"})
+        runtime = report["runtime"]
+        _need(isinstance(runtime, Mapping))
+        assert isinstance(runtime, Mapping)
+        _need(
+            report["execution_id"] == evidence.execution_id
+            and dependency == {"mode": "created", "origin_execution_id": evidence.execution_id}
+            and runtime["binary_sha256"] == evidence.interpreter_sha256
+        )
+        object.__setattr__(self, "report", report)
+        object.__setattr__(self, "ephemeral_environment", evidence)
+
+    @property
+    def environment_reference(self) -> None:
+        return None
+
+    def to_payload(self) -> Mapping[str, JsonValue]:
+        return self.report
+
+
+@dataclass(frozen=True, slots=True)
 class PythonProjectFailure:
     """Safe Python failure with an optional, nonpersisted native phase preview.
 
@@ -277,11 +320,17 @@ class PythonProjectFailure:
     report: Mapping[str, JsonValue]
     environment_reference: PythonEnvironmentReference | None
     diagnostic: ExecutionDiagnostic | None = field(default=None, repr=False)
+    ephemeral_environment: PythonEphemeralEnvironmentEvidence | None = None
 
     def __post_init__(self) -> None:
         value = _failure_shape(self.report)
         reference = _reference(self.environment_reference)
-        _bind_reference(value, reference)
+        ephemeral = _ephemeral(self.ephemeral_environment)
+        if ephemeral is None:
+            _bind_reference(value, reference)
+        else:
+            _need(reference is None)
+            _bind_ephemeral_failure(value, ephemeral)
         if self.diagnostic is not None:
             _need(type(self.diagnostic) is ExecutionDiagnostic)
             checks = value["checks"]
@@ -298,6 +347,7 @@ class PythonProjectFailure:
             _need(_diagnostic_metadata(self.diagnostic) == last["execution_diagnostic"])
         object.__setattr__(self, "report", value)
         object.__setattr__(self, "environment_reference", reference)
+        object.__setattr__(self, "ephemeral_environment", ephemeral)
 
     def to_payload(self) -> Mapping[str, JsonValue]:
         return self.report
@@ -309,6 +359,39 @@ def _reference(value: PythonEnvironmentReference | None) -> PythonEnvironmentRef
     _need(type(value) is PythonEnvironmentReference)
     return PythonEnvironmentReference.model_validate(
         value.model_dump(warnings="error"), strict=True
+    )
+
+
+def _ephemeral(
+    value: PythonEphemeralEnvironmentEvidence | None,
+) -> PythonEphemeralEnvironmentEvidence | None:
+    if value is None:
+        return None
+    _need(type(value) is PythonEphemeralEnvironmentEvidence)
+    return PythonEphemeralEnvironmentEvidence.model_validate(
+        value.model_dump(warnings="error"), strict=True,
+    )
+
+
+def _bind_ephemeral_failure(
+    report: Mapping[str, JsonValue], evidence: PythonEphemeralEnvironmentEvidence,
+) -> None:
+    checks = report["checks"]
+    _need(isinstance(checks, tuple) and len(checks) in (2, 3))
+    assert isinstance(checks, tuple)
+    last = checks[-1]
+    runtime = report["runtime"]
+    _need(isinstance(last, Mapping) and isinstance(runtime, Mapping))
+    assert isinstance(last, Mapping) and isinstance(runtime, Mapping)
+    _need(
+        report["source_sha256"] == evidence.source_sha256
+        and report["execution_id"] == evidence.execution_id
+        and report["recipe_sha256"] == evidence.recipe_sha256
+        and report["environment_input_sha256"] == evidence.environment_input_sha256
+        and report["environment_sha256"] == evidence.environment_sha256
+        and report["dependency_install"] == {"mode": "created", "origin_execution_id": evidence.execution_id}
+        and runtime["binary_sha256"] == evidence.interpreter_sha256
+        and last["failure_reason"] == "process_failed"
     )
 
 
@@ -484,7 +567,8 @@ def decode_python_project_report(
     expected_source_sha256: str,
     environment_reference: PythonEnvironmentReference | None,
     result: SkillResult,
-) -> PythonProjectReport | PythonProjectFailure:
+    ephemeral_environment: PythonEphemeralEnvironmentEvidence | None = None,
+) -> PythonProjectReport | PythonEphemeralProjectReport | PythonProjectFailure:
     """Observe explicitly selected Python raw2 against independent trusted context.
 
     The outer runner must exit naturally with zero; individual phase failures
@@ -498,6 +582,14 @@ def decode_python_project_report(
             expected_source_sha256,
             environment_reference,
         )
+        ephemeral = _ephemeral(ephemeral_environment)
+        if ephemeral is not None:
+            _need(reference is None)
+            ephemeral.require_for(invocation)
+            _need(
+                ephemeral.source_sha256 == expected_source_sha256
+                and ephemeral.interpreter_sha256 == inputs.interpreter.binary_sha256
+            )
         _need(type(result) is SkillResult)
         result = SkillResult.model_validate(result.model_dump(), strict=True)
         _need(type(result.exit_code) is int and result.exit_code == 0 and not result.timed_out)
@@ -563,12 +655,19 @@ def decode_python_project_report(
             _need(raw["environment_sha256"] is None and reference is None)
         if reference is not None:
             _bind_reference(raw, reference)
+        if ephemeral is not None:
+            _need(raw["environment_sha256"] == ephemeral.environment_sha256)
         safe_report = {key: raw[key] for key in _PUBLIC_FIELDS}
         safe_report.update(
             checks=tuple(safe_checks),
-            environment_sha256=reference.environment_sha256 if reference else None,
+            environment_sha256=(reference.environment_sha256 if reference else
+                                ephemeral.environment_sha256 if ephemeral else None),
         )
         if status == "passed":
+            if ephemeral is not None:
+                return PythonEphemeralProjectReport(
+                    safe_report, ephemeral, expected_source_sha256,
+                )
             if reference is None:
                 raise ValueError(_ERROR)
             receipt = validate_python_passed_receipt(
@@ -580,7 +679,7 @@ def decode_python_project_report(
             )
             return PythonProjectReport(receipt, reference, expected_source_sha256)
         safe_report["original_check_contract"] = inputs.contract.protected_sha256
-        return PythonProjectFailure(safe_report, reference, failure_diagnostic)
+        return PythonProjectFailure(safe_report, reference, failure_diagnostic, ephemeral)
     except _INVALID:
         raise ProjectVerificationError(_ERROR) from None
 
@@ -592,6 +691,7 @@ def validate_python_failure(
     inputs: PythonProjectInputs,
     expected_source_sha256: str,
     environment_reference: PythonEnvironmentReference | None,
+    ephemeral_environment: PythonEphemeralEnvironmentEvidence | None = None,
 ) -> PythonProjectFailure:
     """Validate persisted *safe* failure data, not raw output or execution evidence.
 
@@ -607,7 +707,11 @@ def validate_python_failure(
         )
         report = _failure_shape(value)
         _bind_expected(report, invocation, inputs, expected_source_sha256)
-        _bind_reference(report, reference)
-        return PythonProjectFailure(report, reference)
+        ephemeral = _ephemeral(ephemeral_environment)
+        if ephemeral is not None:
+            _need(reference is None)
+            ephemeral.require_for(invocation)
+            _need(ephemeral.interpreter_sha256 == inputs.interpreter.binary_sha256)
+        return PythonProjectFailure(report, reference, ephemeral_environment=ephemeral)
     except _INVALID:
         raise ProjectVerificationError(_ERROR) from None

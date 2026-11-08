@@ -250,6 +250,72 @@ def _snapshot(
     return result
 
 
+def remove_exported_python_environment(
+    parent: int, environment: int, snapshot: dict[str, os.stat_result], *,
+    owner: int, deadline: float,
+) -> None:
+    """Root-only current-export disposal after broker quiescence and full validation.
+
+    No path selection: the only child name is ``environment``. The caller holds
+    its current private export FD and a complete, freshly rechecked snapshot.
+    Every unlink stays rooted in held directories; no symlink is traversed.
+    """
+    if sys.platform != 'linux' or os.geteuid() != 0:
+        raise PythonProjectCopyError('copy_unsupported')
+    _need('.' in snapshot and snapshot['.'].st_uid == owner)
+    children: dict[str, list[str]] = {}
+    for relative in snapshot:
+        _check(deadline)
+        if relative != '.':
+            _need(not relative.startswith('/') and '..' not in PurePosixPath(relative).parts)
+            children.setdefault(PurePosixPath(relative).parent.as_posix(), []).append(relative)
+
+    def remove(fd: int, relative: str) -> None:
+        _check(deadline)
+        expected = snapshot[relative]
+        _need(expected.st_uid == owner)
+        _need(_stamp(os.fstat(fd), full=True) == _stamp(expected, full=True))
+        with os.scandir(fd) as entries:
+            names = {entry.name for entry in entries}
+        _need(names == {PurePosixPath(child).name for child in children.get(relative, ())})
+        os.fchmod(fd, 0o700)
+        for child in children.get(relative, ()):
+            _check(deadline)
+            name = PurePosixPath(child).name
+            info = snapshot[child]
+            _need(info.st_uid == owner)
+            _same(fd, name, info)
+            if stat.S_ISDIR(info.st_mode):
+                descriptor = os.open(name, _directory_flags(), dir_fd=fd)
+                try:
+                    _same(fd, name, info, descriptor)
+                    remove(descriptor, child)
+                    current = os.fstat(descriptor)
+                    _need((current.st_dev, current.st_ino, current.st_uid)
+                          == (info.st_dev, info.st_ino, owner))
+                    _same(fd, name, current, descriptor)
+                    os.rmdir(name, dir_fd=fd)
+                finally:
+                    os.close(descriptor)
+            else:
+                _need(info.st_nlink == 1)
+                if stat.S_ISLNK(info.st_mode):
+                    _need(child == 'lib64' and os.readlink(name, dir_fd=fd) == 'lib')
+                else:
+                    _need(stat.S_ISREG(info.st_mode))
+                os.unlink(name, dir_fd=fd)
+        with os.scandir(fd) as entries:
+            _need(next(entries, None) is None)
+        os.fsync(fd)
+
+    _same(parent, 'environment', snapshot['.'], environment)
+    remove(environment, '.')
+    _same(parent, 'environment', os.fstat(environment), environment)
+    os.rmdir('environment', dir_fd=parent)
+    os.fsync(parent)
+    _check(deadline)
+
+
 def _write_all(descriptor: int, raw: bytes, deadline: float) -> None:
     remaining = memoryview(raw)
     while remaining:

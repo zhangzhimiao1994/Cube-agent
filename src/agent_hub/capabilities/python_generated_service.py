@@ -30,6 +30,7 @@ from agent_hub.capabilities.python_input_preparation import (
 )
 from agent_hub.capabilities.python_project_inputs import PythonProjectInputs
 from agent_hub.capabilities.python_project_reports import (
+    PythonEphemeralProjectReport,
     PythonProjectFailure,
     decode_python_project_report,
 )
@@ -52,6 +53,7 @@ from agent_hub.skills.sandbox.python_input_supply_protocol import (
 )
 from agent_hub.skills.sandbox.python_project_protocol import (
     PythonEnvironmentReference,
+    PythonEphemeralEnvironmentEvidence,
     PythonProjectInvocation,
     PythonProjectProbeInvocation,
     _reference_matches,
@@ -148,7 +150,7 @@ class _Receipt:
     invocation: PythonProjectInvocation
     inputs: PythonProjectInputs
     source: str
-    reference: PythonEnvironmentReference
+    reference: PythonEnvironmentReference | PythonEphemeralEnvironmentEvidence
     actor: str
     binding: Mapping[str, JsonValue]
     product: Mapping[str, JsonValue] | None = None
@@ -390,7 +392,7 @@ class PythonGeneratedProjectService:
                 assert response.result is not None
                 report = decode_python_project_report(invocation=invocation, inputs=inputs,
                     expected_source_sha256=source, environment_reference=response.environment_reference,
-                    result=response.result)
+                    result=response.result, ephemeral_environment=response.ephemeral_environment)
                 await self._after(context, actor, approval, source)
                 if report.environment_reference is not None:
                     await asyncio.to_thread(self._persist_reference, context, inputs, report.environment_reference)
@@ -410,12 +412,15 @@ class PythonGeneratedProjectService:
                     self.owner._pending_python_products[key] = product
                 await self._after(context, actor, approval, source)
                 self.receipts[key] = _Receipt(context, invocation, inputs, source,
-                    report.environment_reference, actor, binding, product)
+                    report.ephemeral_environment if isinstance(report, PythonEphemeralProjectReport)
+                    else report.environment_reference, actor, binding, product)
                 result: dict[str, JsonValue] = {**({'python_product': product} if product is not None else {}), 'verification': {**report.to_payload(),
                         'generated_acceptance_sha256': context.envelope.sha256},
                     'generated_project_acceptance': binding,
                     'python_recipe': python_recipe_marker(inputs),
-                    'python_environment_reference': report.environment_reference.model_dump(mode='json'),
+                    **({'python_ephemeral_environment': report.ephemeral_environment.model_dump(mode='json')}
+                       if isinstance(report, PythonEphemeralProjectReport) else
+                       {'python_environment_reference': report.environment_reference.model_dump(mode='json')}),
                     'summary': '已保留生成项目的验收要求，通过离线依赖环境核验，并在隔离环境中完成构建和指定测试；可继续按交付流程读取实际产物。'}
             committed = True
             return result
@@ -521,11 +526,16 @@ class PythonGeneratedProjectService:
             approval = inputs.approval_request(user_id=context.envelope.user_id, agent_id=receipt.actor,
                 idempotency_key='generated-python-delivery-check')
             await self._after(context, receipt.actor, approval, receipt.source)
-            invocation = PythonProjectInvocation.model_validate({**receipt.invocation.model_dump(),
-                'execution_id': 'python_inspect_' + uuid4().hex, 'install_allowed': False}, strict=True)
-            actual = await self.executor.inspect_environment(invocation, expected_environment=receipt.reference)
-            _need(type(actual) is PythonEnvironmentReference and actual == receipt.reference)
-            _need(receipt.reference in await asyncio.to_thread(self._read_references, context, inputs))
+            if isinstance(receipt.reference, PythonEphemeralEnvironmentEvidence):
+                receipt.reference.require_for(receipt.invocation)
+                _need(receipt.reference.source_sha256 == receipt.source
+                      and receipt.reference.interpreter_sha256 == inputs.interpreter.binary_sha256)
+            else:
+                invocation = PythonProjectInvocation.model_validate({**receipt.invocation.model_dump(),
+                    'execution_id': 'python_inspect_' + uuid4().hex, 'install_allowed': False}, strict=True)
+                actual = await self.executor.inspect_environment(invocation, expected_environment=receipt.reference)
+                _need(type(actual) is PythonEnvironmentReference and actual == receipt.reference)
+                _need(receipt.reference in await asyncio.to_thread(self._read_references, context, inputs))
             await self._after(context, receipt.actor, approval, receipt.source)
             return receipt.source
         except (asyncio.CancelledError, ProcessCleanupIncomplete):

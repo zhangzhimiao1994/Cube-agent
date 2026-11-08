@@ -104,7 +104,8 @@ def _failure_result(issued: VerificationRecord, error: ProjectVerificationError)
             or error.diagnostic is not failure.diagnostic
             or error.diagnostic is not None and type(error.diagnostic) is not ExecutionDiagnostic):
         raise ValueError(_ERROR)
-    report = PythonProjectFailure(failure.report, failure.environment_reference, failure.diagnostic).to_payload()
+    report = PythonProjectFailure(failure.report, failure.environment_reference, failure.diagnostic,
+                                 failure.ephemeral_environment).to_payload()
     if report['source_sha256'] != issued.source_sha256 or report['execution_id'] != issued.execution_id:
         raise ValueError(_ERROR)
     preview = None if failure.diagnostic is None else failure.diagnostic.to_payload()

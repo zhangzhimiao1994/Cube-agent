@@ -62,6 +62,7 @@ from agent_hub.skills.sandbox.python_project_cache import (
     PythonProjectCacheError,
     PythonProjectCacheLease,
     PythonProjectCachePolicy,
+    PythonProjectCacheSlotsFull,
     PythonProjectEnvironmentCache,
 )
 from agent_hub.skills.sandbox.python_project_command import build_python_project_systemd_command
@@ -71,7 +72,9 @@ from agent_hub.skills.sandbox.python_project_copy import (
     _observe,
     _recipe_entries,
     _same,
+    _same_snapshots,
     _snapshot,
+    remove_exported_python_environment,
 )
 from agent_hub.skills.sandbox.python_project_process import (
     PythonPhaseCleanupError,
@@ -89,6 +92,7 @@ from agent_hub.skills.sandbox.python_project_product_export import (
 from agent_hub.skills.sandbox.python_project_protocol import (
     PYTHON_PROJECT_NATIVE_UNCERTAIN_EXIT_CODE,
     PythonEnvironmentReference,
+    PythonEphemeralEnvironmentEvidence,
     PythonFailedMaintenanceRequest,
     PythonProjectBrokerError,
     PythonProjectBrokerRequest,
@@ -960,6 +964,69 @@ def _minimum_environment_bytes(config: RootConfig, deadline: float) -> int:
     return 3 * len(raw)
 
 
+def _consume_ephemeral_export(
+    parent: int, export: Path, inputs: PythonProjectInputs, config: RootConfig,
+    budget: int, reported_sha: str, deadline: float, *, execution: _Execution,
+    source_sha256: str, product: bool = False,
+) -> PythonEphemeralEnvironmentEvidence:
+    """Observe then erase only this drained execution's exported environment."""
+    _need(type(execution) is _Execution and execution.quiet is True
+          and execution.launched is True and execution.stage is not None
+          and export == execution.stage / 'export'
+          and source_sha256 == execution.source_sha256
+          and (execution.invocation.tenant_id, execution.invocation.run_id,
+               execution.invocation.project_id, execution.invocation.session_id)
+          == (inputs.contract.tenant_id, inputs.contract.run_id,
+              inputs.contract.project_id, inputs.contract.session_id)
+          and execution.invocation.install_allowed
+          and inputs.interpreter == config.interpreter
+          and type(budget) is int and 0 < budget <= min(config.max_environment_bytes,
+                                                       execution.invocation.workspace_limit_bytes))
+    limits = ScanLimits(budget)
+    with ExitStack() as stack:
+        pins: list[_Observed] = []
+        exported = _open_directory(parent, 'export', 0, stack, pins, mode=0o1777)
+        with os.scandir(exported) as members:
+            _need(sorted(entry.name for _, entry in zip(range(3), members, strict=False))
+                  == (['product', 'ready'] if product else ['ready']), 'python_project_environment_changed')
+        info = os.stat('ready', dir_fd=exported, follow_symlinks=False)
+        owner = info.st_uid
+        ready = _open_directory(exported, 'ready', owner, stack, pins, mode=0o700)
+        with os.scandir(ready) as members:
+            _need([entry.name for _, entry in zip(range(2), members, strict=False)] == ['environment'])
+        environment = _open_directory(ready, 'environment', owner, stack, pins, mode=0o555)
+        snapshot = _snapshot(environment, owner, limits, deadline)
+        actual = _observe(export / 'ready/environment', inputs.environment_input_sha256, limits, deadline)
+        _recipe_entries(actual.security_manifest, config.interpreter.binary_sha256)
+        _need(actual.environment_sha256 == reported_sha, 'python_project_environment_changed')
+        _need(_same_snapshots(snapshot, _snapshot(environment, owner, limits, deadline)),
+              'python_project_environment_changed')
+        for pin in pins:
+            pin.check()
+        _check(deadline)
+        try:
+            remove_exported_python_environment(ready, environment, snapshot, owner=owner, deadline=deadline)
+            with os.scandir(ready) as members:
+                _need(next(members, None) is None)
+            _same(exported, 'ready', os.fstat(ready), ready)
+            os.rmdir('ready', dir_fd=exported)
+            os.fsync(exported)
+            _check(deadline)
+        except BaseException:  # noqa: BLE001 - mutation/cancellation uncertainty must retain the native fence.
+            raise ProcessCleanupIncomplete('python_project_cleanup_incomplete') from None
+        return PythonEphemeralEnvironmentEvidence(
+            scope=PythonProjectScope.model_validate({'tenant_id': inputs.contract.tenant_id,
+                'run_id': inputs.contract.run_id, 'project_id': inputs.contract.project_id,
+                'session_id': inputs.contract.session_id,
+                'original_reference': inputs.original_reference.to_payload()}, strict=True),
+            execution_id=execution.invocation.execution_id, recipe_sha256=inputs.sha256,
+            environment_input_sha256=inputs.environment_input_sha256,
+            environment_sha256=actual.environment_sha256, source_sha256=source_sha256,
+            interpreter_sha256=config.interpreter.binary_sha256, environment_bytes=actual.total_bytes,
+            unit_quiet=True, environment_removed=True, cache_written=False,
+        )
+
+
 def _publish_export(
     lease: PythonProjectCacheLease,
     parent: int,
@@ -1371,17 +1438,29 @@ def _run(
                 raise PythonProjectCacheError("cache_quota") from None
             raise
 
-    with cache.reserve(invocation, next_bytes=budget, deadline=deadline,
-            adaptive=True, minimum_bytes=minimum, fresh_budget=fresh_budget) as lease:
-        reused = lease.current(deadline=deadline)
+    with ExitStack() as resources:
+        lease: PythonProjectCacheLease | None
+        storage: Literal['persistent_cache', 'ephemeral_current_execution'] = 'persistent_cache'
+        try:
+            lease = resources.enter_context(cache.reserve(invocation, next_bytes=budget, deadline=deadline,
+                adaptive=True, minimum_bytes=minimum, fresh_budget=fresh_budget))
+        except PythonProjectCacheSlotsFull:
+            if request.ephemeral_environment_version != 1:
+                raise
+            resources.enter_context(cache.ephemeral(invocation, next_bytes=budget,
+                                                    minimum_bytes=minimum, deadline=deadline))
+            lease = None
+            storage = 'ephemeral_current_execution'
+        reused = lease.current(deadline=deadline) if lease is not None else None
         _disk_budget(config, roots, budget, reused is None,
                      product_bytes=invocation.workspace_limit_bytes,
-                     cache_copy_bytes=lease.limits.max_bytes)
+                      cache_copy_bytes=lease.limits.max_bytes if lease is not None else 0)
         plan = PythonProjectRunnerPlan(
             invocation=invocation,
             inputs=prepared.inputs.to_payload(),
             source_sha256=digest,
             reused_environment=reused,
+            environment_storage=storage,
             generated_manifest_sha256=(cast(str, prepared.original.generated_metadata["manifest_sha256"])
                 if prepared.original.generated_metadata is not None else None),
         )
@@ -1396,7 +1475,7 @@ def _run(
             runtime=config.runtime_root,
             wheels=wheels,
             export=export,
-            environment=lease.path / "environment" if reused is not None else None,
+            environment=lease.path / "environment" if lease is not None and reused is not None else None,
         )
         job = _Execution(
             base_python_invocation(invocation),
@@ -1434,7 +1513,18 @@ def _run(
             pin.check()
         installed = payload["checks"][0]["status"] == "passed"
         reference = None
-        if reused is None and installed:
+        ephemeral = None
+        if lease is None and installed:
+            _need(not any(check['timed_out'] for check in payload['checks']))
+            if payload['status'] == 'failed':
+                failed_check = payload['checks'][-1]
+                _need(type(failed_check['exit_code']) is int and 0 < failed_check['exit_code'] <= 255
+                      and failed_check['stdout_truncated'] is False)
+            ephemeral = _consume_ephemeral_export(roots.stage_fd, export, prepared.inputs, config,
+                budget, payload['environment_sha256'], deadline, execution=job,
+                source_sha256=digest, product=payload['status'] == 'passed')
+        elif reused is None and installed:
+            assert lease is not None
             reference = _publish_export(
                 lease,
                 roots.stage_fd,
@@ -1450,6 +1540,7 @@ def _run(
         else:
             _export_empty(roots.stage_fd, deadline, payload["status"] == "passed")
             if reused is not None and installed:
+                assert lease is not None
                 reference = lease.current(deadline=deadline, expected=reused)
                 _need(reference == reused, "python_project_environment_changed")
         _need(
@@ -1457,7 +1548,7 @@ def _run(
             "python_project_recipe_unavailable",
         )
         _check(deadline)
-        if reused is None and not installed:
+        if lease is not None and reused is None and not installed:
             check = payload["checks"][0]
             # Only a natural failed install can become retryable. Malformed or
             # timed-out phase output keeps the consumed partial/UNKNOWN fence.
@@ -1494,6 +1585,7 @@ def _run(
                 timed_out=False,
             ),
             environment_reference=reference,
+            ephemeral_environment=ephemeral,
         )
 
 

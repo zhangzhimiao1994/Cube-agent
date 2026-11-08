@@ -19,7 +19,10 @@ from agent_hub.capabilities.python_generated_service import _Receipt as _Generat
 from agent_hub.capabilities.python_product_delivery import restore_product
 from agent_hub.capabilities.python_project_inputs import PythonProjectInputs
 from agent_hub.capabilities.python_project_receipts import validate_python_passed_receipt
-from agent_hub.capabilities.python_project_reports import PythonProjectReport
+from agent_hub.capabilities.python_project_reports import (
+    PythonEphemeralProjectReport,
+    PythonProjectReport,
+)
 from agent_hub.capabilities.python_project_service import (
     _encoded,
     python_original_invocation,
@@ -32,6 +35,7 @@ from agent_hub.runtime.contracts import JsonValue, _freeze_object
 from agent_hub.skills.sandbox.project import project_source_fingerprint, project_source_manifest
 from agent_hub.skills.sandbox.python_project_protocol import (
     PythonEnvironmentReference,
+    PythonEphemeralEnvironmentEvidence,
     PythonProjectInvocation,
     _reference_matches,
 )
@@ -59,10 +63,15 @@ def _clear(owner: ProjectVerificationService, key: tuple[UUID, UUID]) -> None:
 
 def _passed(
     payload: Mapping[str, JsonValue], *, inputs: PythonProjectInputs,
-    invocation: PythonProjectInvocation, reference: PythonEnvironmentReference,
+    invocation: PythonProjectInvocation,
+    reference: PythonEnvironmentReference | PythonEphemeralEnvironmentEvidence,
     source: str, generated_acceptance: str | None = None,
-) -> PythonProjectReport:
-    _need(_reference_matches(invocation, reference))
+) -> PythonProjectReport | PythonEphemeralProjectReport:
+    if isinstance(reference, PythonEphemeralEnvironmentEvidence):
+        reference.require_for(invocation)
+        _need(reference.interpreter_sha256 == inputs.interpreter.binary_sha256)
+    else:
+        _need(_reference_matches(invocation, reference))
     _need(payload["python_recipe"] == python_recipe_marker(inputs))
     value = payload["verification"]
     _need(isinstance(value, Mapping))
@@ -78,6 +87,8 @@ def _passed(
     )
     _need(report["execution_id"] == invocation.execution_id
           and report["runtime"] == inputs.interpreter.to_payload())
+    if isinstance(reference, PythonEphemeralEnvironmentEvidence):
+        return PythonEphemeralProjectReport(report, reference, source)
     return PythonProjectReport(report, reference, source)
 
 
@@ -101,10 +112,17 @@ async def restore_python_verification(
         payload = _freeze_object(payload, name="private Python verification recovery")
         binding_field = ("original_check_contract" if kind == "python_original"
                          else "generated_project_acceptance")
-        expected = {"verification", binding_field, "python_recipe", "python_environment_reference", "summary"}
+        ephemeral = 'python_ephemeral_environment' in payload
+        environment_field = 'python_ephemeral_environment' if ephemeral else 'python_environment_reference'
+        expected = {"verification", binding_field, "python_recipe", environment_field, "summary"}
         _need(set(payload) == expected | ({"python_product"} if "python_product" in payload else set()))
-        reference = PythonEnvironmentReference.model_validate_json(
-            _encoded(payload["python_environment_reference"]), strict=True)
+        reference: PythonEnvironmentReference | PythonEphemeralEnvironmentEvidence
+        if ephemeral:
+            reference = PythonEphemeralEnvironmentEvidence.model_validate_json(
+                _encoded(payload[environment_field]), strict=True)
+        else:
+            reference = PythonEnvironmentReference.model_validate_json(
+                _encoded(payload[environment_field]), strict=True)
         if kind == "python_original":
             service = owner._python
             context = await service.select(tenant_id, run_id, actor, approve=True)
@@ -112,13 +130,13 @@ async def restore_python_verification(
             assert context is not None
             invocation = PythonProjectInvocation.model_validate({
                 **python_original_invocation(context.invocation, context.inputs).model_dump(),
-                "execution_id": execution_id, "source_kind": "candidate", "install_allowed": False,
+                "execution_id": execution_id, "source_kind": "candidate", "install_allowed": ephemeral,
             }, strict=True)
             context.stored.contract.require_current(
                 await project_source_manifest(owner.root, context.invocation))
             _need(await project_source_fingerprint(owner.root, context.invocation) == source_sha256)
             references = await asyncio.to_thread(service._read_references, context)
-            if reference not in references:
+            if isinstance(reference, PythonEnvironmentReference) and reference not in references:
                 # select already validated this DB-owned original observation.
                 observation = cast(Mapping[str, JsonValue], context.state["observation"])
                 historical = observation["environment_reference"]
@@ -131,7 +149,8 @@ async def restore_python_verification(
             binding = _OriginalScope(context.stored, context.observation_sha256).binding(source_sha256)
             _need(payload[binding_field] == binding)
             service.receipts[key] = _OriginalReceipt(context, invocation, source_sha256, reference, actor, product)
-            service.environments[key] = reference
+            if isinstance(reference, PythonEnvironmentReference):
+                service.environments[key] = reference
             owner._original_receipts[key] = binding
             _need(await service.require_current(tenant_id, run_id) == source_sha256)
         else:
@@ -146,9 +165,10 @@ async def restore_python_verification(
             _need(await project_source_fingerprint(owner.root, current.invocation) == source_sha256)
             invocation = PythonProjectInvocation.model_validate({
                 **python_original_invocation(current.invocation, inputs).model_dump(),
-                "execution_id": execution_id, "source_kind": "candidate", "install_allowed": False,
+                "execution_id": execution_id, "source_kind": "candidate", "install_allowed": ephemeral,
             }, strict=True)
-            _need(reference in await asyncio.to_thread(generated._read_references, current, inputs))
+            if isinstance(reference, PythonEnvironmentReference):
+                _need(reference in await asyncio.to_thread(generated._read_references, current, inputs))
             report = _passed(payload, inputs=inputs, invocation=invocation,
                              reference=reference, source=source_sha256,
                              generated_acceptance=current.envelope.sha256)

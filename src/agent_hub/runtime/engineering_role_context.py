@@ -164,10 +164,17 @@ def _generated(context: TaskContext) -> bool:
             if state['stack'] == 'python':
                 from agent_hub.skills.sandbox.python_project_protocol import (
                     PythonEnvironmentReference,
+                    PythonEphemeralEnvironmentEvidence,
                 )
 
-                reference = PythonEnvironmentReference.model_validate_json(
-                    _encoded(result.get('python_environment_reference')), strict=True)
+                reference: PythonEnvironmentReference | PythonEphemeralEnvironmentEvidence
+                if 'python_ephemeral_environment' in result:
+                    from agent_hub.runtime.generated_project_history import _root_ephemeral
+
+                    reference = _root_ephemeral(context, result['python_ephemeral_environment'])
+                else:
+                    reference = PythonEnvironmentReference.model_validate_json(
+                        _encoded(result.get('python_environment_reference')), strict=True)
                 if (state.get('python_recipe') != result.get('python_recipe')
                         or reference.scope.original_reference.model_dump() != state['reference']):
                     continue
