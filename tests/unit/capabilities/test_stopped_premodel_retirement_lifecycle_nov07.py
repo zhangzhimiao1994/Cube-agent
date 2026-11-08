@@ -6,6 +6,8 @@ import asyncio
 import copy
 import hashlib
 import json
+import selectors
+from collections.abc import Coroutine
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from typing import Any
@@ -16,17 +18,30 @@ import pytest
 from agent_hub.capabilities.python_project_lifecycle import PythonProjectTerminalHook
 from agent_hub.db.models import RunEventRow, RunRow, RuntimeArtifactRow
 from agent_hub.runs.artifacts import PostgresArtifactRepository
-from agent_hub.runtime.artifacts import InMemoryArtifactRepository
+from agent_hub.runtime.artifacts import ArtifactReference, InMemoryArtifactRepository
 from agent_hub.runtime.contracts import Artifact
 from agent_hub.skills.sandbox.python_premodel_retirement import PythonStoppedPremodelSnapshot
 from agent_hub.skills.sandbox.python_project_cache import python_project_cache_key
+from agent_hub.skills.sandbox.python_project_protocol import (
+    PythonFailedMaintenanceInvocation,
+    PythonProjectInvocation,
+)
 from agent_hub.subprocess_cleanup import ProcessCleanupIncomplete
 from tests.unit.capabilities.test_python_expired_capacity_oct29 import Session as OldSession
 from tests.unit.skills.sandbox.test_python_project_client import invocation
 from tests.unit.skills.sandbox.test_python_stopped_premodel_retirement import snapshot_payload
 
 
+class MemorySelector(selectors.SelectSelector):
+    def select(self, timeout: float | None = None) -> list[tuple[selectors.SelectorKey, int]]:
+        return []
+
+
 class MemoryLoop(asyncio.SelectorEventLoop):
+    def __init__(self) -> None:
+        self.memory_selector = MemorySelector()
+        super().__init__(selector=self.memory_selector)
+
     def _make_self_pipe(self) -> None:
         self._ssock = self._csock = None
 
@@ -37,9 +52,8 @@ class MemoryLoop(asyncio.SelectorEventLoop):
         pass
 
 
-def run(coro: Any) -> Any:
+def run[T](coro: Coroutine[object, object, T]) -> T:
     loop = MemoryLoop()
-    loop._selector.select = lambda timeout=None: []
     try:
         return loop.run_until_complete(coro)
     finally:
@@ -100,6 +114,8 @@ def snapshot_for(item: Any) -> PythonStoppedPremodelSnapshot:
 
 
 class Session(OldSession):
+    item: PythonProjectInvocation
+    inspected: PythonFailedMaintenanceInvocation
     def __init__(self) -> None:
         super().__init__()
         self.row.blocked_by_run_id = None
@@ -251,7 +267,9 @@ def setup(defect: str | None = None, *, archive_repo: bool = True) -> tuple[Any,
             raise AssertionError("unexpected completed cleanup")
 
     class Archive(InMemoryArtifactRepository):
-        async def put(self, tenant: UUID, run: UUID, artifact: Artifact, **kwargs: Any) -> None:
+        async def put(
+            self, tenant_id: UUID, run_id: UUID, artifact: Artifact, *, write_id: UUID | None = None,
+        ) -> None:
             assert not s.open, "recursive RunRow archive lock"
             intent = artifact.type == "python_stopped_premodel_commit_intent"
             calls.append("intent" if intent else "archive")
@@ -263,12 +281,12 @@ def setup(defect: str | None = None, *, archive_repo: bool = True) -> tuple[Any,
             if intent and defect == "intent-other-owner-attempt":
                 foreign = Artifact(id=artifact.id, type=artifact.type, producer=artifact.producer,
                     content={"different_inspector": True})
-                await super().put(tenant, run, foreign)
-            await super().put(tenant, run, artifact, **kwargs)
+                await super().put(tenant_id, run_id, foreign)
+            await super().put(tenant_id, run_id, artifact, write_id=write_id)
             raw = PostgresArtifactRepository._encode_payload(artifact.to_payload())
             row = RuntimeArtifactRow(
-                tenant_id=tenant,
-                run_id=run,
+                tenant_id=tenant_id,
+                run_id=run_id,
                 id=artifact.id,
                 payload=raw,
                 content_sha256=artifact.content_sha256,
@@ -281,9 +299,9 @@ def setup(defect: str | None = None, *, archive_repo: bool = True) -> tuple[Any,
             if not intent:
                 s.archive = row
 
-        async def get_many(self, *args: Any, **kwargs: Any) -> Any:
+        async def get_many(self, tenant_id: UUID, run_id: UUID, references: tuple[ArtifactReference, ...]) -> tuple[Artifact, ...]:
             assert not s.open
-            refs = args[2]
+            refs = references
             intent = bool(refs and s.artifacts.get(refs[0].id) is not s.archive)
             calls.append("intent-readback" if intent else "readback")
             s.trace.append("intent-readback" if intent else "readback")
@@ -323,10 +341,12 @@ def setup(defect: str | None = None, *, archive_repo: bool = True) -> tuple[Any,
             if defect == "reference-race":
                 s.item = s.item.model_copy(update={"environment_input_sha256": "3" * 64})
             if defect == "stored-corrupt":
+                assert s.archive is not None
                 s.archive.payload = "{}"
             if defect == "stored-foreign":
+                assert s.archive is not None
                 s.archive.tenant_id = UUID(int=99)
-            return await super().get_many(*args, **kwargs)
+            return await super().get_many(tenant_id, run_id, references)
 
     h = PythonProjectTerminalHook(Repository(), Reader(), Executor())
     if archive_repo:

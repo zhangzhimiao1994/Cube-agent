@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import json
+import os
 import time
+from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import PurePosixPath
 from types import SimpleNamespace
@@ -22,7 +24,7 @@ def owner() -> PythonFailedMaintenanceInvocation:
 
 
 def marker(**changes: object) -> bytes:
-    fields = {"execution_id": "python_old", "tenant_id": str(UUID(int=1)), "run_id": str(UUID(int=2)),
+    fields: dict[str, object] = {"execution_id": "python_old", "tenant_id": str(UUID(int=1)), "run_id": str(UUID(int=2)),
               "project_id": "billing", "session_id": "main", "source_sha256": "b" * 64,
               "state": "UNKNOWN", "unit": "agent-hub-project-python_old.service"}
     fields.update(changes)
@@ -87,8 +89,8 @@ def test_both_original_units_require_no_job_and_no_live_task(monkeypatch: pytest
         return SkillResult(exit_code=0, stdout="\n".join(f"{k}={v}" for k, v in properties.items()),
                            stderr="", timed_out=False)
 
-    broker = SimpleNamespace(policy=BrokerPolicy(), _helper=helper,
-                             _unit_quiet=ProjectExecutionBroker._unit_quiet)
+    broker = ProjectExecutionBroker(BrokerPolicy())
+    monkeypatch.setattr(broker, "_helper", helper)
 
     def run() -> None:
         coroutine = backend.check_stopped_units(broker, (invocation,), time.monotonic() + 10)
@@ -137,14 +139,14 @@ def test_missing_process_metadata_does_not_prove_a_live_pid_exited(
     monkeypatch.setattr(backend, "_PROC_ROOT", PurePosixPath("/proc"))
 
     @contextmanager
-    def scandir(path: object):
+    def scandir(path: object) -> Iterator[Iterator[SimpleNamespace]]:
         yield iter([SimpleNamespace(name="22")] if str(path) == "/proc" else [])
 
     stat_reads = 0
 
     def read(path: PurePosixPath, limit: int, deadline: float) -> bytes:
         nonlocal stat_reads
-        if path.parent.name == str(backend.os.getpid()) and path.name == "mountinfo":
+        if path.parent.name == str(os.getpid()) and path.name == "mountinfo":
             return b""
         if path.name == "maps":
             raise FileNotFoundError
@@ -154,8 +156,8 @@ def test_missing_process_metadata_does_not_prove_a_live_pid_exited(
             raise FileNotFoundError
         return b"22 (still-live) " + b" ".join([b"R"] + [b"0"] * 19)
 
-    monkeypatch.setattr(backend.os, "scandir", scandir)
-    monkeypatch.setattr(backend.os, "readlink", lambda _: "/unrelated")
+    monkeypatch.setattr(os, "scandir", scandir)
+    monkeypatch.setattr(os, "readlink", lambda _: "/unrelated")
     monkeypatch.setattr(backend, "_process_bytes", read)
     if gone:
         backend._scan_process_consumers(("/var/lib/cache/abc",), time.monotonic() + 10)
@@ -183,7 +185,7 @@ def test_inspector_own_mount_namespace_is_not_covered_by_own_fd_exemption(
         pytest.fail("own mount must veto before another PID or FD is examined")
 
     monkeypatch.setattr(backend, "_process_bytes", read)
-    monkeypatch.setattr(backend.os, "scandir", forbidden)
+    monkeypatch.setattr(os, "scandir", forbidden)
     with pytest.raises(ValueError, match="mounted consumer"):
         backend._scan_process_consumers(("/var/lib/cache/abc",), time.monotonic() + 5)
-    assert calls == [str(backend._PROC_ROOT / str(backend.os.getpid()) / "mountinfo")]
+    assert calls == [str(backend._PROC_ROOT / str(os.getpid()) / "mountinfo")]

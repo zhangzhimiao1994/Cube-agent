@@ -180,7 +180,9 @@ async def test_cached_repeat_does_not_buy_progress_tokens_or_more_rounds(
     model = Model(*(response(read_batch('src/a.py')) for _ in range(3)), response(batch()))
     progress: list[int] = []
     limits: list[dict[str, Any]] = []
-    original_deadline, original_limit = direct.deadline_from_routing, direct._workspace_delivery_token_limit
+    from agent_hub.runtime.adaptive_budget import deadline_from_routing
+
+    original_deadline, original_limit = deadline_from_routing, direct._workspace_delivery_token_limit
 
     class Deadline:
         def __init__(self, target: Any) -> None:

@@ -34,6 +34,8 @@ pytestmark = pytest.mark.skipif(
 @pytest.fixture
 def app_socket_root(tmp_path: Path) -> Iterator[Path]:
     """Match the deployed socket directory, not a root-owned stage substitute."""
+    if sys.platform != "linux":
+        pytest.skip("actual Linux Root required")
     if os.geteuid() != 0:
         pytest.skip("actual Root required")
     path = tmp_path / "socket-root"
@@ -68,13 +70,15 @@ def app_socket_root(tmp_path: Path) -> Iterator[Path]:
 def test_native_inspector_mount_namespace_is_not_exempt(monkeypatch: pytest.MonkeyPatch) -> None:
     from agent_hub.skills.sandbox import python_premodel_retirement_backend as backend
 
+    if sys.platform != "linux":
+        pytest.skip("actual Linux Root required")
     if os.geteuid() != 0:
         pytest.skip("actual Root required")
 
     def forbidden(*args: object) -> None:
         pytest.fail("own mount must veto before scanning another PID")
 
-    monkeypatch.setattr(backend.os, "scandir", forbidden)
+    monkeypatch.setattr(os, "scandir", forbidden)
     # The real inspector namespace always mounts /. Reading that actual
     # kernel record proves the own-PID exemption cannot hide its mounts.
     with pytest.raises(ValueError, match="mounted consumer"):
@@ -100,6 +104,8 @@ def test_native_root_entry_retains_unknown_controls_and_rejects_changed_snapshot
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, defect: str | None, app_socket_root: Path,
     same_execution_root: bool,
 ) -> None:
+    if sys.platform != "linux":
+        pytest.skip("actual Linux Root required")
     if os.geteuid() != 0:
         pytest.skip("actual Root required")
     cache, reference = ready(cache_api, tmp_path)
@@ -127,7 +133,7 @@ def test_native_root_entry_retains_unknown_controls_and_rejects_changed_snapshot
     policy = replace(BrokerPolicy(), runtime_root=app_socket_root, project_runtime_root=runtime_root)
     # Advance the fixture's cache age; all process, unit and FD observations are real.
     now = time.time()
-    monkeypatch.setattr(cache_api.time, "time", lambda: now + cache.policy.retention_seconds + 1)
+    monkeypatch.setattr(time, "time", lambda: now + cache.policy.retention_seconds + 1)
     request = PythonStoppedPremodelMaintenanceRequest(invocation=owner, phase="inspect")
     stage_fd = os.open(stage_root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:

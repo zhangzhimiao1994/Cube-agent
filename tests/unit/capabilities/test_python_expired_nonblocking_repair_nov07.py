@@ -3,27 +3,41 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import selectors
+from collections.abc import Coroutine
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any, Self
+from unittest.mock import patch
 from uuid import UUID
 
 import pytest
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from agent_hub.capabilities.python_project_lifecycle import PythonProjectTerminalHook
 from agent_hub.db.models import RunCheckpointRow, RunEventRow, RunRow
 from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.runs.self_repair import SelfRepairPolicy, classify_terminal_run
 from agent_hub.runtime.contracts import EventKind, RunEvent
+from tests.unit.capabilities.capability_lifecycle_typed_fixture import UnusedContextReader
 
 
 class MetadataBoundary(Exception):
     """The real lifecycle reached its unchanged downstream metadata selector."""
 
 
+class MemorySelector(selectors.SelectSelector):
+    def select(self, timeout: float | None = None) -> list[tuple[selectors.SelectorKey, int]]:
+        return []
+
+
 class MemoryLoop(asyncio.SelectorEventLoop):
     """These tests need task/deadline scheduling, never Windows socketpair IO."""
+
+    def __init__(self) -> None:
+        self.memory_selector = MemorySelector()
+        super().__init__(selector=self.memory_selector)
 
     def _make_self_pipe(self) -> None:
         self._ssock = self._csock = None
@@ -35,9 +49,8 @@ class MemoryLoop(asyncio.SelectorEventLoop):
         pass
 
 
-def run(coro: Any) -> Any:
+def run[T](coro: Coroutine[object, object, T]) -> T:
     loop = MemoryLoop()
-    loop._selector.select = lambda timeout=None: []
     try:
         return loop.run_until_complete(coro)
     finally:
@@ -61,7 +74,7 @@ class Session:
                 'sandbox_profile':'workspace_write','requested_permissions':['workspace.read'],
                 'approval_kind':'self_repair', 'decision_token':'decision-'+'1'*64,
                 'repair_proposal':proposal, 'project_input_preparation':{'schema_version':2,'phase':'observed'}})
-        self.source = SimpleNamespace(tenant_id=self.tenant,run_id=self.owner,sequence=5,
+        self.source: SimpleNamespace | None = SimpleNamespace(tenant_id=self.tenant,run_id=self.owner,sequence=5,
             kind='runtime.failed',payload=failure.to_payload())
         classified = decision.to_event(run_id=self.owner, sequence=6)
         self.events = [SimpleNamespace(tenant_id=self.tenant,run_id=self.owner,sequence=6,
@@ -71,6 +84,11 @@ class Session:
         self.block_table: str | None = None
         self.child: Any = None
         self.checkpoint: Any = None
+        # Real SQLAlchemy interface; query results remain deliberate in-memory
+        # metadata doubles, including malformed values under test.
+        self.sql_session = AsyncSession()
+        for name in ("begin", "scalar", "scalars"):
+            patch.object(self.sql_session, name, getattr(self, name)).start()
 
     async def __aenter__(self) -> Self:
         return self
@@ -111,10 +129,10 @@ class Session:
 
 def hook(session: Session) -> PythonProjectTerminalHook:
     class Repository:
-        async def run_transaction(self) -> Session:
-            return session
+        async def run_transaction(self) -> AsyncSession:
+            return session.sql_session
 
-    class Reader:
+    class Reader(UnusedContextReader):
         async def python_expired_environment_invocation(self, tenant: UUID, owner: UUID) -> Any:
             assert session.open and (tenant,owner)==(session.tenant,session.owner)
             raise MetadataBoundary
@@ -168,10 +186,12 @@ def test_unproved_suggestion_or_original_downstream_blocker_stays_rejected(defec
     elif defect=='foreign-event':
         session.events[0].tenant_id=UUID(int=99)
     elif defect=='foreign-source':
+        assert session.source is not None
         session.source.run_id=UUID(int=99)
     elif defect=='source-sequence':
         proposal['source_event_sequence']=4
     elif defect=='source-kind':
+        assert session.source is not None
         session.source.kind='model.completed'
     elif defect=='fingerprint':
         proposal['fingerprint']='0'*64
@@ -188,6 +208,7 @@ def test_unproved_suggestion_or_original_downstream_blocker_stays_rejected(defec
     elif defect=='missing-source':
         session.source=None
     elif defect=='replaced-source':
+        assert session.source is not None
         session.source.payload['reason']='different failure'
     elif defect=='unknown-route':
         route['other_consumer']='UNKNOWN'

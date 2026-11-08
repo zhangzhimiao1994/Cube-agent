@@ -1,5 +1,6 @@
 """Strict persisted suggestion types, without DB/Root execution."""
 import copy
+from collections.abc import Awaitable
 from dataclasses import replace
 
 import pytest
@@ -22,16 +23,23 @@ from tests.unit.capabilities.test_python_expired_nonblocking_repair_nov07 import
     ('role_capability_requirements', [17]),
     ('role_capability_requirements', [None]),
 ])
-def test_heterogeneous_persisted_payload_is_not_a_proved_suggestion(field, value) -> None:
+def test_heterogeneous_persisted_payload_is_not_a_proved_suggestion(field: str, value: object) -> None:
     session = Session()
     session.events[0].payload['payload'][field] = copy.deepcopy(value)
     session.row.routing_decision['repair_proposal'][field] = copy.deepcopy(value)
     before = copy.deepcopy(vars(session.row)), copy.deepcopy(session.events[0].payload)
 
-    async def check():
+    async def check() -> bool:
         async with session, session.begin():
-            return await _historical_nonblocking_repair_suggestion(
-                session, session.row, session.row.routing_decision)
+            # Deliberately heterogeneous row fields are not a typed RunRow.
+            # Call the real validator without normalizing the rejected data.
+            target: object = _historical_nonblocking_repair_suggestion
+            assert callable(target)
+            pending: object = target(session.sql_session, session.row, session.row.routing_decision)
+            assert isinstance(pending, Awaitable)
+            result: object = await pending
+            assert isinstance(result, bool)
+            return result
 
     assert run(check()) is False
     assert (vars(session.row), session.events[0].payload) == before
@@ -42,17 +50,25 @@ def test_persisted_suggestion_with_missing_mode_is_rejected() -> None:
     session.row.mode = None
     session.events[0].payload['payload']['mode'] = None
 
-    async def check():
+    async def check() -> bool:
         async with session, session.begin():
-            return await _historical_nonblocking_repair_suggestion(
-                session, session.row, session.row.routing_decision)
+            # Deliberately heterogeneous row fields are not a typed RunRow.
+            # Call the real validator without normalizing the rejected data.
+            target: object = _historical_nonblocking_repair_suggestion
+            assert callable(target)
+            pending: object = target(session.sql_session, session.row, session.row.routing_decision)
+            assert isinstance(pending, Awaitable)
+            result: object = await pending
+            assert isinstance(result, bool)
+            return result
 
     assert run(check()) is False
 
 
 @pytest.mark.parametrize('with_optional_values', [False, True])
-def test_producer_payload_with_valid_optional_fields_keeps_original_binding(with_optional_values) -> None:
+def test_producer_payload_with_valid_optional_fields_keeps_original_binding(with_optional_values: bool) -> None:
     session = Session()
+    assert session.source is not None
     decision = classify_terminal_run(
         status=RunStatus.FAILED, mode=TaskMode.HYBRID, routing_decision={},
         events=(RunEvent.from_payload(session.source.payload),), policy=SelfRepairPolicy())
@@ -65,10 +81,17 @@ def test_producer_payload_with_valid_optional_fields_keeps_original_binding(with
     session.row.routing_decision['repair_proposal'] = decision.to_proposal(run_id=session.owner)
     before = copy.deepcopy(vars(session.row)), copy.deepcopy(session.events[0].payload)
 
-    async def check():
+    async def check() -> bool:
         async with session, session.begin():
-            return await _historical_nonblocking_repair_suggestion(
-                session, session.row, session.row.routing_decision)
+            # Deliberately heterogeneous row fields are not a typed RunRow.
+            # Call the real validator without normalizing the rejected data.
+            target: object = _historical_nonblocking_repair_suggestion
+            assert callable(target)
+            pending: object = target(session.sql_session, session.row, session.row.routing_decision)
+            assert isinstance(pending, Awaitable)
+            result: object = await pending
+            assert isinstance(result, bool)
+            return result
 
     assert run(check()) is True
     assert (vars(session.row), session.events[0].payload) == before

@@ -7,6 +7,7 @@ import hashlib
 import importlib
 import importlib.util
 import json
+import os
 import stat
 import time
 from contextlib import ExitStack, contextmanager
@@ -338,49 +339,16 @@ def logical_cache(monkeypatch: Any) -> Any:
     reservation = json.loads(initial["reservation"])
     reference = PythonEnvironmentReference.model_validate_json(initial["reference"], strict=True)
     key = initial["cache_key"]
-    files = {}
+    files: dict[str, object] = {}
     entries = {key: reservation}
-    tree = {
-        ".": SimpleNamespace(
-            **{
-                k: v
-                for k, v in zip(
-                    (
-                        "st_dev",
-                        "st_ino",
-                        "st_mode",
-                        "st_uid",
-                        "st_gid",
-                        "st_nlink",
-                        "st_size",
-                        "st_mtime_ns",
-                        "st_ctime_ns",
-                    ),
-                    identity(30, stat.S_IFDIR | 0o555),
-                )
-            }
+    def info(stamp: tuple[int, ...]) -> os.stat_result:
+        dev, ino, mode, uid, gid, nlink, size, mtime, ctime = stamp
+        return os.stat_result(
+            (mode, ino, dev, nlink, uid, gid, size, 0, mtime / 10**9, ctime / 10**9),
+            {"st_mtime_ns": mtime, "st_ctime_ns": ctime},
         )
-    }
 
-    def info(stamp: tuple[int, ...]) -> Any:
-        return SimpleNamespace(
-            **dict(
-                zip(
-                    (
-                        "st_dev",
-                        "st_ino",
-                        "st_mode",
-                        "st_uid",
-                        "st_gid",
-                        "st_nlink",
-                        "st_size",
-                        "st_mtime_ns",
-                        "st_ctime_ns",
-                    ),
-                    stamp,
-                )
-            )
-        )
+    tree = {".": info(identity(30, stat.S_IFDIR | 0o555))}
 
     cache = cache_api.PythonProjectEnvironmentCache(
         Path.cwd() / "unused", cache_api.PythonProjectCachePolicy(2**30, 8, 0, 7200)
@@ -521,7 +489,12 @@ def test_changed_or_unproven_ready_never_writes_tombstone(
             ),
         )
     elif defect == "tree-drift":
-        h.tree["."].st_ino = 90
+        observed = h.tree["."]
+        fields = list(observed)
+        fields[1] = 90
+        h.tree["."] = os.stat_result(fields, {
+            "st_mtime_ns": observed.st_mtime_ns, "st_ctime_ns": observed.st_ctime_ns,
+        })
     elif defect == "generation":
         h.initial["identities"] = (*h.initial["identities"][:3], identity(99, stat.S_IFDIR | 0o555))
     elif defect == "partial":
@@ -696,12 +669,16 @@ def test_stage_pretty_bytes_both_roots_and_bounded_inventory() -> None:
 def test_native_ready_inspect_commit_retains_stages_and_disables_owner(tmp_path: Path) -> None:
     """Actual native cache IO; no project execution, model, service or remote RPC."""
     import os
+    import sys
 
+    if sys.platform != "linux":
+        pytest.skip("actual Linux Root required")
     if os.geteuid() != 0:
         pytest.skip("requires actual root ownership checks")
     spec = importlib.util.spec_from_file_location(
         "_native_ready_test_fixture", Path(__file__).with_name("test_python_project_cache.py")
     )
+    assert spec is not None and spec.loader is not None
     helper = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(helper)
     cache, reference = helper.ready(cache_api, tmp_path)
@@ -716,8 +693,8 @@ def test_native_ready_inspect_commit_retains_stages_and_disables_owner(tmp_path:
     # The native fixture's default policy retains 7200s. Advancing only the
     # cache wall clock does not manufacture a Root unit/quiescence proof.
     before = time.time()
-    actual_clock = cache_api.time.time
-    cache_api.time.time = lambda: before + cache.policy.retention_seconds + 1
+    actual_clock = time.time
+    time.time = lambda: before + cache.policy.retention_seconds + 1
     try:
         marker = stage_payload()
         raw = json.loads(marker["record"])
@@ -751,4 +728,4 @@ def test_native_ready_inspect_commit_retains_stages_and_disables_owner(tmp_path:
         ):
             pytest.fail("retired owner admitted")
     finally:
-        cache_api.time.time = actual_clock
+        time.time = actual_clock

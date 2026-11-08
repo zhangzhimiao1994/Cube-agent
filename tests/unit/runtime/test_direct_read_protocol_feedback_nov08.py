@@ -6,6 +6,7 @@ native execution, approvals, or claim that these bytes reproduce the paid run.
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 import pytest
@@ -14,7 +15,7 @@ from agent_hub.capabilities.gateway import CapabilityStatus
 from agent_hub.harness.tool_gateway import HarnessToolGateway
 from agent_hub.models.types import ModelResponse
 from agent_hub.runtime import direct
-from agent_hub.runtime.contracts import EventKind
+from agent_hub.runtime.contracts import EventKind, JsonValue, RunEvent
 from tests.unit.runtime.test_direct_original_entry_protocol_regression_nov07 import (
     EntryBackend,
     PricedModel,
@@ -30,7 +31,7 @@ def envelope(kind: str = 'read', **controls: object) -> str:
     return json.dumps({'workspace_batch': {'files': {}, **operation, **controls}})
 
 
-def feedback(events):
+def feedback(events: Sequence[RunEvent]) -> list[Mapping[str, JsonValue]]:
     return [e.payload for e in events if e.kind == 'runtime.control_feedback'
             and e.payload.get('stage') == 'workspace_batch_protocol']
 
@@ -38,7 +39,7 @@ def feedback(events):
 @pytest.mark.parametrize('kind', ['read', 'catalog'])
 @pytest.mark.parametrize('controls', [{}, {'complete': False},
     {'complete': 'false', 'continuation': 'inspect'}, {'complete': False, 'continuation': ''}])
-async def test_safe_read_control_format_gets_one_correction_without_tools(kind, controls):
+async def test_safe_read_control_format_gets_one_correction_without_tools(kind: str, controls: dict[str, object]) -> None:
     rejected = envelope(kind, **controls)
     model = PricedModel(rejected, rejected)
     context = entry_context()
@@ -51,7 +52,7 @@ async def test_safe_read_control_format_gets_one_correction_without_tools(kind, 
     assert all(not r.tools and r.logical_model == 'main' for r in model.requests)
     assert all(0 < r.timeout_seconds <= context.timeout_seconds for r in model.requests)
     costs = [e for e in events if e.kind is EventKind.COST_RECORDED]
-    assert len(costs) == 2 and sum(e.payload['total_tokens'] for e in costs) == 360
+    assert len(costs) == 2 and sum(e.payload['total_tokens'] == 180 for e in costs) * 180 == 360
     notes = feedback(events)
     assert len(notes) == 2 and notes[0]['retryable'] is True and notes[1]['retryable'] is False
     assert all(n['rejected_response_tool_io'] is False for n in notes)
@@ -66,7 +67,7 @@ async def test_safe_read_control_format_gets_one_correction_without_tools(kind, 
     '{"workspace_batch":{"files":{},"read_paths":["src/x.py"],"complete":false,"continuation":"read","other":NaN}}',
     'prefix {"workspace_batch":{"files":{},"read_paths":["src/x.py"],"complete":false,"continuation":"read"}} suffix',
 ])
-def test_ambiguous_or_extra_read_envelope_never_becomes_a_batch(raw):
+def test_ambiguous_or_extra_read_envelope_never_becomes_a_batch(raw: str) -> None:
     assert direct._workspace_batch_from_model_text(raw, allow_reads=True) is None
 
 
@@ -81,7 +82,7 @@ def test_ambiguous_or_extra_read_envelope_never_becomes_a_batch(raw):
     envelope('catalog', python_catalog={'catalog_sha256': 'not-a-digest'}),
     envelope('catalog', read_paths=['src/x.py']),
 ])
-async def test_unsafe_or_mixed_read_stays_hard_rejected(raw):
+async def test_unsafe_or_mixed_read_stays_hard_rejected(raw: str) -> None:
     model = PricedModel(raw, raw)
     runtime = direct.DirectRuntime(model, logical_model='main', capability_gateway=EntryBackend())
     events = []
@@ -94,7 +95,7 @@ async def test_unsafe_or_mixed_read_stays_hard_rejected(raw):
     assert notes[0]['rejected_response_tool_io'] is False
 
 
-async def test_disabled_catalog_does_not_buy_format_feedback():
+async def test_disabled_catalog_does_not_buy_format_feedback() -> None:
     context = entry_context()
     context = context.model_copy(update={'routing_decision': {
         **context.routing_decision, 'engineering_catalog_reads_version': None}})
@@ -108,7 +109,7 @@ async def test_disabled_catalog_does_not_buy_format_feedback():
     assert feedback(events)[0]['reason'] == 'catalog_not_enabled'
 
 
-def test_parser_valid_controls_do_not_imply_read_authority():
+def test_parser_valid_controls_do_not_imply_read_authority() -> None:
     raw = envelope(complete=False, continuation='read')
     assert direct._workspace_batch_from_model_text(raw, allow_reads=False) is None
     assert direct._workspace_batch_from_model_text(raw, allow_reads=True) is not None
@@ -116,7 +117,7 @@ def test_parser_valid_controls_do_not_imply_read_authority():
 
 
 @pytest.mark.parametrize('kind', ['read', 'catalog'])
-async def test_only_absent_files_can_receive_feedback_without_inventing_writes(kind):
+async def test_only_absent_files_can_receive_feedback_without_inventing_writes(kind: str) -> None:
     value = json.loads(envelope(kind, complete=False, continuation='inspect'))
     del value['workspace_batch']['files']
     raw = json.dumps(value)
@@ -134,7 +135,7 @@ async def test_only_absent_files_can_receive_feedback_without_inventing_writes(k
 @pytest.mark.parametrize('denied', [False, True])
 async def test_feedback_then_corrected_read_still_uses_real_policy_and_preserves_original(
     tmp_path: Path, later: bool, denied: bool,
-):
+) -> None:
     configured = await fixture(tmp_path)
     protected = {p: (configured.source / p).read_bytes() for p in ('tests/original.js', 'package.json')}
     malformed = json.dumps({'workspace_batch': {'files': {}, 'read_paths': ['src/detail.js']}})

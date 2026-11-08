@@ -8,10 +8,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -20,8 +21,10 @@ from agent_hub.capabilities.gateway import CapabilityStatus
 from agent_hub.capabilities.project_contracts import ManagedProjectInput
 from agent_hub.domain.runs import TaskMode
 from agent_hub.harness.tool_gateway import HarnessToolGateway
+from agent_hub.models.gateway import GatewayCompletion
+from agent_hub.models.types import ModelRequest
 from agent_hub.runtime import direct
-from agent_hub.runtime.contracts import EventKind, TaskContext
+from agent_hub.runtime.contracts import EventKind, JsonValue, RunEvent, TaskContext, _freeze_object
 from agent_hub.runtime.generated_project_history import generated_history_selected
 from tests.unit.runtime.test_direct_original_project import batch, fixture, prompt
 from tests.unit.runtime.test_direct_project_verification import Model, Policy
@@ -31,11 +34,13 @@ PATCH = 'module.exports = () => 12;\n'
 
 
 class PricedModel(Model):
-    async def complete_with_context(self, request):
+    async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
         return replace(await super().complete_with_context(request), cost_usd=Decimal('0.001'))
 
 
-def assert_received_responses_accounted(events, model, context) -> None:
+def assert_received_responses_accounted(
+    events: Sequence[RunEvent], model: Model, context: TaskContext,
+) -> None:
     calls = len(model.requests)
     assert calls == 2, 'One correction of a known response; repeated unchanged prose must stop'
     assert not model.texts
@@ -44,8 +49,10 @@ def assert_received_responses_accounted(events, model, context) -> None:
     costs = [e for e in events if e.kind is EventKind.COST_RECORDED]
     assert len(costs) == calls
     assert all(e.cost_usd == Decimal('0.001') and e.payload['total_tokens'] == 180 for e in costs)
-    assert sum(e.payload['total_tokens'] for e in costs) <= context.token_budget
-    assert sum(e.cost_usd for e in costs) == Decimal('0.002')
+    token_counts = [e.payload['total_tokens'] for e in costs]
+    assert all(isinstance(value, int) for value in token_counts)
+    assert sum(value for value in token_counts if isinstance(value, int)) <= context.token_budget
+    assert sum(e.cost_usd for e in costs if e.cost_usd is not None) == Decimal('0.002')
     assert all(0 < r.timeout_seconds <= context.timeout_seconds for r in model.requests)
     assert all(0 < r.max_output_tokens <= context.token_budget for r in model.requests)
     assert all(r.logical_model == model.requests[0].logical_model for r in model.requests)
@@ -57,7 +64,7 @@ def entry_context() -> TaskContext:
     """Routing-only fixture; no baseline or delivery receipt is fabricated."""
     return TaskContext(run_id=uuid4(), tenant_id=uuid4(), actor_id=uuid4(), actor_role=Role.OPERATOR,
         mode=TaskMode.DIRECT, request='Repair the existing project.', token_budget=50_000,
-        timeout_seconds=60, routing_decision={
+        timeout_seconds=60, routing_decision=_freeze_object({
             'project_id': 'existing', 'workspace_session_id': 'same-session',
             'sandbox_profile': 'workspace_write', 'execution_backend': 'systemd',
             'requested_permissions': ['workspace.read', 'workspace.write', 'command.run', 'network.read'],
@@ -65,15 +72,21 @@ def entry_context() -> TaskContext:
             'project_scale': 'medium', 'project_input_contract_version': 1,
             'project_input': ManagedProjectInput(('src',)).to_payload(),
             'engineering_diagnostic_reads_version': 1, 'engineering_catalog_reads_version': 1,
-        })
+        }, name='entry routing'))
 
 
 class EntryBackend:
     """Discovery only: any accidental execution fails instead of granting a tool."""
-    def is_available(self, tenant_id, name):
+    def is_available(self, tenant_id: UUID, name: str) -> bool:
         return True
 
-    async def execute(self, **kwargs):
+    def is_replay_safe(self, name: str) -> bool:
+        raise AssertionError('entry-only regression cannot replay capabilities')
+
+    async def execute(
+        self, *, tenant_id: UUID, run_id: UUID, actor: str, name: str,
+        arguments: Mapping[str, JsonValue], idempotency_key: str,
+    ) -> Mapping[str, JsonValue]:
         raise AssertionError('entry-only regression cannot execute capabilities')
 
 
@@ -129,7 +142,7 @@ async def test_portable_expired_deadline_does_not_restart_for_protocol(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class ExpiringModel(Model):
-        async def complete_with_context(self, request):
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
             response = await super().complete_with_context(request)
             loop = asyncio.get_running_loop()
             expired = loop.time() + 61
@@ -145,7 +158,7 @@ async def test_portable_expired_deadline_does_not_restart_for_protocol(
 
 async def test_portable_unknown_outcome_is_not_a_protocol_rejection() -> None:
     class UnknownModel(Model):
-        async def complete_with_context(self, request):
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
             self.requests.append(request)
             raise RuntimeError('unknown_outcome_no_replay')
 
@@ -175,7 +188,7 @@ async def test_portable_two_rejection_shapes_charge_budget_before_first_scoped_r
         assert request.max_output_tokens + index * 8_000 <= context.token_budget
         assert request.timeout_seconds <= context.timeout_seconds
     costs = [event for event in events if event.kind is EventKind.COST_RECORDED]
-    assert len(costs) == 3 and sum(event.payload['total_tokens'] for event in costs) == 24_000
+    assert len(costs) == 3 and sum(event.payload['total_tokens'] == 8_000 for event in costs) * 8_000 == 24_000
     assert sum(event.kind is EventKind.MODEL_COMPLETED for event in events) == 3
     assert not any(event.tool_name == 'project.inspect' for event in events)
     assert runtime._generated_model_events is None and runtime._generated_model_run_id is None
@@ -289,7 +302,7 @@ async def test_unknown_gateway_outcome_never_becomes_protocol_response(tmp_path:
     configured = await fixture(tmp_path)
 
     class UnknownModel(Model):
-        async def complete_with_context(self, request):
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
             self.requests.append(request)
             raise RuntimeError('unknown_outcome_no_replay')
 

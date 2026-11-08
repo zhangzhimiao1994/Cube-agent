@@ -6,25 +6,31 @@ evidence. No server, real provider, approval or historical user run is invoked.
 from __future__ import annotations
 
 import json
+from collections.abc import AsyncIterator, Mapping
 from copy import deepcopy
 from pathlib import Path
 from uuid import uuid4
 
 import pytest
 
+from agent_hub.auth.models import Role
 from agent_hub.capabilities.gateway import CapabilityStatus
+from agent_hub.domain.runs import TaskMode
 from agent_hub.harness.tool_gateway import HarnessToolGateway
 from agent_hub.runs.service import _main_delivery_publication_batches
 from agent_hub.runtime import direct, hybrid_delivery_report
 from agent_hub.runtime.contracts import (
     Artifact,
     EventKind,
+    RunEvent,
     RuntimeCheckpoint,
+    TaskContext,
     validate_publication_checkpoint,
 )
+from agent_hub.runtime.generated_project_history import generated_history_selected
 from tests.unit.runtime.crew import test_delivery_report_verification_tail as tail_fixtures
 from tests.unit.runtime.test_direct_original_entry_protocol_regression_nov07 import PricedModel
-from tests.unit.runtime.test_direct_original_project import batch, fixture
+from tests.unit.runtime.test_direct_original_project import Fixture, batch, fixture
 from tests.unit.runtime.test_direct_project_verification import Model, Policy
 
 LAYOUT = 'original_workspace_event_layout'
@@ -34,7 +40,10 @@ native_node_case = tail_fixtures.native_node_case
 node_case = tail_fixtures.node_case
 
 
-async def completed(tmp_path: Path, *, corrected: bool, report: bool):
+async def completed(
+    tmp_path: Path, *, corrected: bool, report: bool,
+) -> tuple[Fixture, TaskContext, direct.DirectRuntime, PricedModel, HarnessToolGateway,
+           list[RunEvent], RuntimeCheckpoint, TaskContext]:
     configured = await fixture(tmp_path)
     context = configured.context
     if report:
@@ -64,13 +73,15 @@ async def completed(tmp_path: Path, *, corrected: bool, report: bool):
 
 @pytest.mark.parametrize('corrected', [False, True])
 @pytest.mark.parametrize('report', [False, True])
-async def test_original_completion_publishes_and_recovers_without_replay(tmp_path, corrected, report):
+async def test_original_completion_publishes_and_recovers_without_replay(tmp_path: Path, corrected: bool, report: bool) -> None:
     configured, context, runtime, model, harness, events, cp, recovery = await completed(
         tmp_path, corrected=corrected, report=report)
     # RED on56bafa: completed original runtime rejects its own checkpoint here.
     assert runtime._is_completed_checkpoint_state(cp)
     validate_publication_checkpoint(runtime, cp, recovery)
     layout = cp.state[LAYOUT]
+    assert isinstance(layout, Mapping)
+    assert context.actor_role is not None
     assert 'generated_event_layout' not in cp.state
     assert layout['schema_version'] == 1
     assert layout['scope'] == {
@@ -90,7 +101,7 @@ async def test_original_completion_publishes_and_recovers_without_replay(tmp_pat
     final = next(a for a in recovery.artifacts if str(a.id) == cp.state['artifact_id'])
     assert final.content[LAYOUT] == layout and final.content_sha256 == cp.state['artifact_sha256']
     requests_before, calls_before = len(model.requests), tuple(configured.backend.calls)
-    async def stored_events():
+    async def stored_events() -> AsyncIterator[RunEvent]:
         for event in events:
             yield event
     published = [group async for group in _main_delivery_publication_batches(
@@ -107,7 +118,7 @@ async def test_original_completion_publishes_and_recovers_without_replay(tmp_pat
     assert not fresh_model.requests and tuple(configured.backend.calls) == calls_before
 
 
-async def test_original_layout_tampering_never_authorizes_publication_or_recovery(tmp_path):
+async def test_original_layout_tampering_never_authorizes_publication_or_recovery(tmp_path: Path) -> None:
     configured, _, runtime, _, harness, _, cp, recovery = await completed(tmp_path, corrected=True, report=True)
     assert runtime._is_completed_checkpoint_state(cp)
     final = next(a for a in recovery.artifacts if str(a.id) == cp.state['artifact_id'])
@@ -188,7 +199,7 @@ async def test_original_layout_tampering_never_authorizes_publication_or_recover
         assert not model.requests and tuple(configured.backend.calls) == before, defect
 
 
-async def test_plain_chat_keeps_legacy_small_prefix_and_has_no_workspace_layout():
+async def test_plain_chat_keeps_legacy_small_prefix_and_has_no_workspace_layout() -> None:
     from tests.unit.runtime.test_direct_project_verification import context
 
     runtime = direct.DirectRuntime(Model('A plain explanation.'), logical_model='main')
@@ -205,22 +216,22 @@ async def test_plain_chat_keeps_legacy_small_prefix_and_has_no_workspace_layout(
     assert events[-1].kind is EventKind.RUNTIME_COMPLETED
 
 
-def framed_original_context(case):
+def framed_original_context(case: tail_fixtures.Case) -> TaskContext:
     report, _, models = tail_fixtures.report(case)
     artifacts = (*case.artifacts.values(), *case.sources.values(), *models.values(), report)
     _, required = hybrid_delivery_report.delivery(case.context, artifacts,
                                                   output_ids={a.id for a in artifacts})
-    return case.context.model_copy(update={'mode': direct.TaskMode.DIRECT, 'artifacts': required,
+    return case.context.model_copy(update={'mode': TaskMode.DIRECT, 'artifacts': required,
         'routing_decision': {**case.context.routing_decision, 'engineering_hybrid_report_version': 1,
             'project_delivery': 'workspace', 'artifact_strategy': 'workspace_bundle',
             hybrid_delivery_report.INPUT: {str(a.id): a.content_sha256 for a in required}}})
 
 
-async def test_original_framed_report_only_consumer_keeps_legacy_publication_and_recovery(node_case):
+async def test_original_framed_report_only_consumer_keeps_legacy_publication_and_recovery(node_case: tail_fixtures.Case) -> None:
     context = framed_original_context(node_case)
     assert direct._original_project_policy(context)
     assert direct._is_workspace_project_delivery(context)
-    assert not direct.generated_history_selected(context)
+    assert not generated_history_selected(context)
     model = Model(REPORT)
     runtime = direct.DirectRuntime(model, logical_model='main')
     events = [e async for e in runtime.run(context)]
@@ -229,7 +240,9 @@ async def test_original_framed_report_only_consumer_keeps_legacy_publication_and
     assert LAYOUT not in cp.state and 'generated_event_layout' not in cp.state
     artifacts = tuple(e.artifact for e in events if e.artifact is not None)
     final = next(a for a in artifacts if str(a.id) == cp.state['artifact_id'])
-    assert final.content['workspace_delivery'][direct._ORIGINAL_REPORT_SCOPE] == {
+    delivery = final.content['workspace_delivery']
+    assert isinstance(delivery, Mapping)
+    assert delivery[direct._ORIGINAL_REPORT_SCOPE] == {
         'schema_version': 1, 'tenant_id': str(context.tenant_id), 'run_id': str(context.run_id),
         'actor_id': None if context.actor_id is None else str(context.actor_id),
         'actor_role': None if context.actor_role is None else context.actor_role.value,
@@ -239,7 +252,7 @@ async def test_original_framed_report_only_consumer_keeps_legacy_publication_and
     # RED7037: inherited original flags falsely require an executor's layout.
     validate_publication_checkpoint(runtime, cp, recovery)
     assert len(model.requests) == 1 and all(not r.tools for r in model.requests)
-    async def stored_events():
+    async def stored_events() -> AsyncIterator[RunEvent]:
         for event in events:
             yield event
     published = [group async for group in _main_delivery_publication_batches(
@@ -253,7 +266,7 @@ async def test_original_framed_report_only_consumer_keeps_legacy_publication_and
     assert not cold_model.requests
 
 
-async def test_report_consumer_exception_cannot_replace_frame_scope_or_executor_layout(node_case):
+async def test_report_consumer_exception_cannot_replace_frame_scope_or_executor_layout(node_case: tail_fixtures.Case) -> None:
     context = framed_original_context(node_case)
     runtime = direct.DirectRuntime(Model(REPORT), logical_model='main')
     events = [e async for e in runtime.run(context)]
@@ -290,7 +303,7 @@ async def test_report_consumer_exception_cannot_replace_frame_scope_or_executor_
         elif defect == 'mirror_actor':
             actor_id = uuid4()
         elif defect == 'mirror_role':
-            actor_role = direct.Role.ADMIN if actor_role is not direct.Role.ADMIN else direct.Role.VIEWER
+            actor_role = Role.ADMIN if actor_role is not Role.ADMIN else Role.VIEWER
         elif defect in ('protected', 'report', 'missing_scope', 'rewrite_scope'):
             content = json.loads(json.dumps(final.content, default=dict))
             if defect == 'protected':

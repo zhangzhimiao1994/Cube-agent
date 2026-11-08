@@ -1,12 +1,20 @@
 """Framing tests use the real parsers with in-memory streams, never a socket."""
 from __future__ import annotations
 
+import asyncio
 import json
 import struct
-from types import SimpleNamespace
+from collections.abc import Coroutine
+from typing import TYPE_CHECKING
 from uuid import UUID
 
 import pytest
+
+from agent_hub.skills.sandbox.broker import BrokerPolicy, SkillBroker
+from agent_hub.skills.sandbox.project import ProjectExecutionBroker
+
+if TYPE_CHECKING:
+    from _typeshed import ReadableBuffer
 
 from agent_hub.skills.sandbox.python_premodel_retirement import (
     PythonStoppedPremodelMaintenanceRequest,
@@ -22,12 +30,19 @@ def request() -> PythonStoppedPremodelMaintenanceRequest:
     ))
 
 
-def run_immediate(coroutine):
+def run_immediate[T](coroutine: Coroutine[object, object, T]) -> T:
+    values: list[T] = []
+
+    async def capture() -> None:
+        values.append(await coroutine)
+
+    pending = capture()
     try:
-        coroutine.send(None)
-    except StopIteration as result:
-        return result.value
+        pending.send(None)
+    except StopIteration:
+        return values[0]
     finally:
+        pending.close()
         coroutine.close()
     raise AssertionError("test unexpectedly performed asynchronous external IO")
 
@@ -69,14 +84,14 @@ def test_unauthorized_peer_receives_a_typed_failure_before_config_or_stage(
 
     monkeypatch.setattr(broker, "_configuration", lambda: pytest.fail("read unauthorized config"))
     reply = run_immediate(broker.handle_python_project(
-        SimpleNamespace(policy=SimpleNamespace(allowed_uid=10001)), request(), peer_uid=10002,
+        ProjectExecutionBroker(BrokerPolicy(allowed_uid=10001)), request(), peer_uid=10002,
     ))
     assert type(reply) is PythonStoppedPremodelMaintenanceResponse
     assert reply.ok is False and reply.error == "python_project_request_invalid"
     reply.require_for(request())
 
 
-class Reader:
+class Reader(asyncio.StreamReader):
     def __init__(self, body: bytes):
         self.body = struct.pack("!I", len(body)) + body
 
@@ -86,13 +101,17 @@ class Reader:
         return value
 
 
-class Writer:
-    def __init__(self):
+class Writer(asyncio.StreamWriter):
+    def __init__(self) -> None:
         self.body = bytearray()
         self.closed = False
 
-    def write(self, body: bytes) -> None:
-        self.body.extend(body)
+    def __del__(self) -> None:
+        # This in-memory StreamWriter has no transport or external resource.
+        pass
+
+    def write(self, body: ReadableBuffer) -> None:
+        self.body.extend(memoryview(body))
 
     async def drain(self) -> None:
         pass
@@ -109,7 +128,9 @@ def test_real_broker_frame_dispatches_to_the_new_request_type(monkeypatch: pytes
 
     calls = []
 
-    async def handle(value, *, peer_uid):
+    async def handle(
+        value: PythonStoppedPremodelMaintenanceRequest, *, peer_uid: int,
+    ) -> PythonStoppedPremodelMaintenanceResponse:
         calls.append((type(value), peer_uid))
         return PythonStoppedPremodelMaintenanceResponse(execution_id=value.invocation.execution_id,
             ok=True, retirement_phase="inspect", retirement_snapshot=None)
@@ -117,7 +138,9 @@ def test_real_broker_frame_dispatches_to_the_new_request_type(monkeypatch: pytes
     monkeypatch.setattr(broker, "_peer_uid", lambda _: 10001)
     writer = Writer()
     body = json.dumps(request().model_dump(mode="json") | {"version": 4}).encode()
-    run_immediate(broker._serve_client(Reader(body), writer, SimpleNamespace(handle_python_project=handle)))
+    instance = SkillBroker(BrokerPolicy())
+    monkeypatch.setattr(instance, "handle_python_project", handle)
+    run_immediate(broker._serve_client(Reader(body), writer, instance))
     assert calls == [(PythonStoppedPremodelMaintenanceRequest, 10001)]
     reply = PythonStoppedPremodelMaintenanceResponse.model_validate_json(bytes(writer.body[4:]), strict=True)
     assert reply.ok and writer.closed
@@ -133,9 +156,9 @@ def test_real_client_frame_parses_the_new_reply_without_product_assumptions(
         ok=True, retirement_phase="inspect", retirement_snapshot=None)
     writer = Writer()
 
-    async def connect(_):
+    async def connect(_: object) -> tuple[Reader, Writer]:
         return Reader(expected.model_dump_json().encode()), writer
 
-    monkeypatch.setattr(client.asyncio, "open_unix_connection", connect, raising=False)
+    monkeypatch.setattr(asyncio, "open_unix_connection", connect, raising=False)
     result = run_immediate(client.request_python_project_broker(request()))
     assert result == expected and writer.closed

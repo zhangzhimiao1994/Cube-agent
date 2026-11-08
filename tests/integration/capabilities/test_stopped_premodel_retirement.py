@@ -38,6 +38,7 @@ async def test_real_permanent_archive_is_outside_owner_lock_and_requeued_owner_c
     async with database.session_factory() as session, session.begin():
         row = await repository.get_for_update(session, record.id)
         row.updated_at = cutoff - timedelta(days=1)
+        assert row.routing_decision is not None
         before = (row.version, row.status, row.updated_at, row.request, dict(row.routing_decision))
     calls: list[str] = []
 
@@ -91,9 +92,10 @@ async def test_real_permanent_archive_is_outside_owner_lock_and_requeued_owner_c
             assert await hook._retire_stopped_pre_model(tenant, record.id, cutoff) is not requeue_after_archive
         assert calls == (["inspect"] if requeue_after_archive else ["inspect", "commit"])
         async with database.session_factory() as session:
-            row = await session.get(RunRow, record.id)
-            assert row is not None
-            actual = (row.version, row.status, row.updated_at, row.request, dict(row.routing_decision))
+            actual_row = await session.get(RunRow, record.id)
+            assert actual_row is not None and actual_row.routing_decision is not None
+            actual = (actual_row.version, actual_row.status, actual_row.updated_at, actual_row.request,
+                      dict(actual_row.routing_decision))
             if requeue_after_archive:
                 assert actual[:2] == (before[0] + 1, "queued")
                 assert actual[2] >= before[2] and actual[3:] == before[3:]

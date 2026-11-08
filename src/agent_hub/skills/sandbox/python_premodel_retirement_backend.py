@@ -22,6 +22,8 @@ from agent_hub.skills.sandbox.python_project_backend import (
 from agent_hub.skills.sandbox.python_project_protocol import PythonFailedMaintenanceInvocation
 
 if TYPE_CHECKING:
+    from typing import Literal
+
     from agent_hub.skills.sandbox.broker import BrokerPolicy
     from agent_hub.skills.sandbox.project_contract_broker import _Observed
     from agent_hub.skills.sandbox.python_premodel_retirement import (
@@ -235,12 +237,13 @@ def capture_stopped_stages(
             or origin == owner.execution_id):
         raise ValueError("invalid stopped pre-model Root observation")
     own_seen = False
-    records = []
+    records: list[PythonStoppedPremodelStage] = []
     consumers = []
     invocations = [base_python_invocation(owner).model_copy(update={"execution_id": origin})]
     seen_roots: set[Path] = set()
     with ExitStack() as stack:
-        pins = []
+        pins: list[_Observed] = []
+        group: Literal["stage", "runtime"]
         for group, root in (("stage", configuration.stage_root), ("runtime", policy.project_runtime_root)):
             _check(deadline)
             if root in seen_roots:
@@ -250,7 +253,7 @@ def capture_stopped_stages(
                 continue
             parent = _root(root, 0, stack, pins, stage=True)
             with os.scandir(parent) as entries:
-                names = []
+                names: list[str] = []
                 for entry in entries:
                     _check(deadline)
                     if len(names) >= 4096:

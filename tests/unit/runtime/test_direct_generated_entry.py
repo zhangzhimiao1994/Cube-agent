@@ -294,6 +294,7 @@ async def test_completed_generated_checkpoint_restores_without_model_or_tool_rep
         and event.payload.get('phase') == 'response_rejected' for event in events)
     assert protocol_feedback == int(corrected)
     layout = checkpoint.state['generated_event_layout']
+    assert isinstance(layout, Mapping)
     assert layout.get('protocol_feedback_event_count', 0) == protocol_feedback
     assert ('protocol_feedback_event_count' in layout) is corrected
     artifacts = tuple(event.artifact for event in events if event.artifact is not None)

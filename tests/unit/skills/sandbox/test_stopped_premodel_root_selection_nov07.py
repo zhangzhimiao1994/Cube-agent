@@ -1,7 +1,10 @@
 """A base broker's socket root must not be traversed as retained executions."""
 from __future__ import annotations
 
+import os
+import sys
 import time
+from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
@@ -35,7 +38,7 @@ def test_base_policy_reads_project_execution_root_without_opening_socket_root(
         project_root = stage_root
     policy = replace(BrokerPolicy(), runtime_root=socket_root, project_runtime_root=project_root)
     selected = []
-    real_scandir = backend.os.scandir
+    real_scandir = os.scandir
 
     # Native directory-FD opening is Linux-only. Stop at that exact boundary:
     # this test never supplies a fake successful quiescence or retirement result.
@@ -51,18 +54,22 @@ def test_base_policy_reads_project_execution_root_without_opening_socket_root(
         raise ExecutionRootReached
 
     @contextmanager
-    def scandir(path: object):
+    def scandir(path: object) -> Iterator[Iterator[os.DirEntry[str]]]:
         assert path == 912345
         with real_scandir(stage_root) as entries:
             yield entries
 
-    monkeypatch.setattr(backend.sys, "platform", "linux")
-    monkeypatch.setattr(backend.os, "geteuid", lambda: 0, raising=False)
-    monkeypatch.setattr(backend.os, "scandir", scandir)
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(os, "geteuid", lambda: 0, raising=False)
+    monkeypatch.setattr(os, "scandir", scandir)
     monkeypatch.setattr(controls, "_root", root)
     error = ValueError if same_root else PermissionError if refuse_execution_root else ExecutionRootReached
+    # This test deliberately provides only stage metadata on Windows. It stops
+    # at _root, before a complete Linux RootConfig could authorize any IO.
+    target: object = backend.capture_stopped_stages
+    assert callable(target)
     with pytest.raises(error):
-        backend.capture_stopped_stages(
+        target(
             owner(), "python_old", policy, SimpleNamespace(stage_root=stage_root),
             stage_root / (owner().execution_id + "-abcd1234"), time.monotonic() + 5,
         )

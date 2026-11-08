@@ -337,6 +337,7 @@ def test_root_expiry_dispatch_holds_admission_without_project_preparation(
         monkeypatch.setattr(backend, name, forbidden)
     result = backend.execute_python_project_request(request(), policy=BrokerPolicy(), stage=tmp_path,
         configuration=backend.RootConfig.from_payload(configuration_payload()))
+    assert isinstance(result, protocol.PythonProjectBrokerResponse)
     assert result.ok and result.expired_environment_released is False and held == []
 
 

@@ -1,18 +1,20 @@
 """Structural protocol evidence must explain rejection without leaking a project."""
 import hashlib
 import json
+from collections.abc import Mapping
 
 import pytest
 
+from agent_hub.runtime.contracts import JsonValue
 from agent_hub.runtime.workspace_protocol_diagnostics import workspace_protocol_diagnostic
 
 
-def diagnostic(text, **kwargs):
+def diagnostic(text: str | None) -> dict[str, JsonValue]:
     return workspace_protocol_diagnostic(text, rejection_code='invalid_batch_controls',
-        allow_reads=True, allow_catalog=False, **kwargs)
+        allow_reads=True, allow_catalog=False)
 
 
-def test_rejected_read_controls_are_observable_without_paths_or_contents():
+def test_rejected_read_controls_are_observable_without_paths_or_contents() -> None:
     secret = 'private-customer-source-987'
     text = json.dumps({'workspace_batch': {'files': {'secret/path.py': secret},
         'read_paths': ['private/account.txt'], 'complete': 'yes', 'continuation': secret},
@@ -35,14 +37,14 @@ def test_rejected_read_controls_are_observable_without_paths_or_contents():
     '{"workspace_batch":{"files":{},"complete":NaN}}',
     '{"workspace_batch":{"files":{},"complete":Infinity}}',
 ])
-def test_ambiguous_or_non_json_input_never_yields_a_trusted_shape(text):
+def test_ambiguous_or_non_json_input_never_yields_a_trusted_shape(text: str | None) -> None:
     value = diagnostic(text)
     assert value['parse_status'] == 'invalid_json'
     assert 'field_types' not in value
 
 
 @pytest.mark.parametrize('text', [None, '', 'prose', '[]', 'true', 'null'])
-def test_missing_and_non_envelopes_stay_bounded_metadata(text):
+def test_missing_and_non_envelopes_stay_bounded_metadata(text: str | None) -> None:
     value = diagnostic(text)
     assert value['schema_version'] == 1
     assert value['response_present'] is (text is not None)
@@ -51,7 +53,7 @@ def test_missing_and_non_envelopes_stay_bounded_metadata(text):
     assert len(json.dumps(value)) < 1000
 
 
-def test_large_response_is_hashed_but_not_reparsed_or_exported():
+def test_large_response_is_hashed_but_not_reparsed_or_exported() -> None:
     text = json.dumps({'workspace_batch': {'files': {'a.py': 'z' * 70000}}})
     value = diagnostic(text)
     assert value['parse_status'] == 'omitted_size'
@@ -59,7 +61,7 @@ def test_large_response_is_hashed_but_not_reparsed_or_exported():
     assert len(json.dumps(value)) < 1000
 
 
-def test_reason_is_finite_and_never_copies_untrusted_text():
+def test_reason_is_finite_and_never_copies_untrusted_text() -> None:
     value = workspace_protocol_diagnostic('{}', rejection_code='secret-dangerous-input',
         allow_reads=False, allow_catalog=True, native_tool_count=2)
     assert value['rejection_code'] == 'invalid_batch_controls'
@@ -67,11 +69,13 @@ def test_reason_is_finite_and_never_copies_untrusted_text():
     assert 'secret-dangerous-input' not in json.dumps(value)
 
 
-def test_catalog_shape_contains_no_query_values_and_round_trips_as_json():
+def test_catalog_shape_contains_no_query_values_and_round_trips_as_json() -> None:
     text = json.dumps({'workspace_batch': {'files': {}, 'python_catalog': {'secret': 'value'},
         'complete': False, 'continuation': 'private instruction'}})
     value = diagnostic(text)
-    assert value['field_types']['python_catalog'] == 'object'
+    fields = value['field_types']
+    assert isinstance(fields, Mapping)
+    assert fields['python_catalog'] == 'object'
     assert value['complete'] is False
     assert json.loads(json.dumps(value)) == value
     assert 'private instruction' not in json.dumps(value)
