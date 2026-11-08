@@ -1382,10 +1382,15 @@ def _workspace_read_batch_rejection(
     if 'python_catalog' in raw and not allow_catalog:
         return 'catalog_not_enabled', False
     strict = _single_batch_envelope(response.text or '')
-    if (strict is None or strict != parsed or not isinstance(strict.get('workspace_batch'), Mapping)
-            or not strict.keys() <= {'workspace_batch', 'summary', 'complete', 'continuation'}
+    # Root-shaped fields are a format error, not authority to perform a read.
+    # Only the correction classifier recognizes this layout; the execution
+    # parser still requires workspace_batch and every scoped IO policy check.
+    root_shape = raw is parsed
+    if (strict is None or strict != parsed
+            or (not root_shape and not isinstance(strict.get('workspace_batch'), Mapping))
+            or (not root_shape and not strict.keys() <= {'workspace_batch', 'summary', 'complete', 'continuation'})
             or not raw.keys() <= {'files', 'read_paths', 'python_catalog', 'complete', 'continuation', 'summary'}
-            or ({'complete', 'continuation'} & strict.keys()
+            or (not root_shape and {'complete', 'continuation'} & strict.keys()
                 and {'complete', 'continuation'} & raw.keys())
             or any(type(value.get('summary', '')) is not str for value in (strict, raw))):
         return 'unsafe_read_envelope', False
@@ -1416,7 +1421,7 @@ def _workspace_read_batch_rejection(
         if query is None:
             return 'invalid_catalog_query', False
         kind = 'catalog'
-    if ('files' in raw and raw.get('complete') is False and type(raw.get('continuation')) is str
+    if (not root_shape and 'files' in raw and raw.get('complete') is False and type(raw.get('continuation')) is str
             and cast(str, raw['continuation']).strip()):
         return 'invalid_read_batch', False
     return kind + '_batch_controls', True

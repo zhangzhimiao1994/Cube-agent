@@ -5255,21 +5255,22 @@ article:hover {
 }
 
 .conversation-files-panel {
-  background:
-    linear-gradient(90deg, rgba(85, 215, 255, 0.09), rgba(125, 255, 189, 0.045)),
-    rgba(3, 10, 20, 0.32);
-  border: 1px solid rgba(123, 225, 255, 0.18);
+  background: #f8fafb;
+  border: 1px solid #dfe3e8;
   border-radius: 0.9rem;
+  color: #1f2329;
   display: grid;
   gap: 0.55rem;
   margin: 0.65rem 0 0.25rem;
+  min-width: 0;
   padding: 0.7rem;
 }
 
 .conversation-file-link-grid {
   display: grid;
   gap: 0.4rem;
-  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  align-items: start;
+  grid-template-columns: repeat(auto-fit, minmax(min(210px, 100%), 1fr));
 }
 
 .conversation-file-link {
@@ -5280,8 +5281,11 @@ article:hover {
   color: #0f172a;
   display: grid;
   gap: 0.14rem;
+  height: auto;
   justify-items: start;
   min-height: 0;
+  min-width: 0;
+  overflow: visible;
   padding: 0.48rem 0.58rem;
   text-align: left;
   transform: none;
@@ -5306,12 +5310,17 @@ article:hover {
   font-size: 0.78rem;
   font-weight: 900;
   line-height: 1.4;
+  overflow-wrap: anywhere;
+  white-space: normal;
 }
 
 .conversation-file-link strong,
 .conversation-file-link span {
+  display: block;
+  height: auto;
   max-width: 100%;
   min-width: 0;
+  overflow: visible;
   overflow-wrap: anywhere;
   white-space: normal;
 }
@@ -5330,9 +5339,10 @@ article:hover {
 }
 
 .conversation-files-header {
-  align-items: end;
+  align-items: start;
   display: flex;
-  gap: 0.75rem;
+  flex-wrap: wrap;
+  gap: 0.4rem 1rem;
   justify-content: space-between;
 }
 
@@ -5344,10 +5354,12 @@ article:hover {
 }
 
 .conversation-files-header small,
-.conversation-files-details > summary {
-  color: rgba(178, 194, 216, 0.78);
+.conversation-files-details > summary,
+.conversation-file-more {
+  color: #646b78;
   font-size: 0.78rem;
-  font-weight: 900;
+  font-weight: 500;
+  line-height: 1.5;
 }
 
 .conversation-files-group {
@@ -5356,7 +5368,7 @@ article:hover {
 }
 
 .conversation-files-details {
-  border-top: 1px solid rgba(123, 225, 255, 0.12);
+  border-top: 1px solid #dfe3e8;
   padding-top: 0.5rem;
 }
 
