@@ -2025,8 +2025,11 @@ class RunService:
 
         before = await current_route()
         started = asyncio.get_running_loop().time()
+        from agent_hub.capabilities.execution_authority import bind_execution_authority
+
         async with asyncio.timeout(context.timeout_seconds):
-            prepared = await self._project_input_preparer(context)
+            with bind_execution_authority(context, worker_id=self._worker_id):
+                prepared = await self._project_input_preparer(context)
         # model_copy is not validation; revalidate internal and public fields before use.
         if type(prepared) is not TaskContext:
             raise RuntimeError(failure)

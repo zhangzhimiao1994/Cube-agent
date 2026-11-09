@@ -19,6 +19,7 @@ from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, cast
 
 from agent_hub.capabilities.project_baselines import StoredProjectBaseline
+from agent_hub.capabilities.python_original_metadata import StandardPythonIntentError
 from agent_hub.capabilities.python_project_recipe import parse_python_project_declaration
 from agent_hub.capabilities.scoped_read import ScopedReadError, _read_no_links
 from agent_hub.capability_installer.python_attestation import ScanLimits
@@ -275,20 +276,41 @@ def plan_inputs(
               and original.reference.to_payload() == invocation.original_reference.model_dump()
               and contract.input_source_sha256 == original.reference.input_source_sha256,
               "input_supply_scope_changed")
-        controls: dict[str, bytes] = {}
+        from agent_hub.skills.sandbox.python_original_root_recipe import (
+            resolve_standard_original_inputs,
+            standard_original_intent,
+        )
+
         maximum = min(_MAX_CONTROLS, invocation.source_limit_bytes)
-        for name in ("pyproject.toml", "requirements.lock"):
+
+        def control(name: str) -> bytes:
             _check(deadline)
             raw = _read_no_links(original.snapshot, (name,), max_bytes=maximum)
             _need(0 < len(raw) <= maximum, "input_supply_quota")
             _need(contract.protected_files.get(name) in {
                 hashlib.sha256(tag + raw).hexdigest() for tag in (b"f\0", b"x\0")},
                 "input_supply_scope_changed")
-            controls[name] = raw
+            return raw
+
+        manifest = control("pyproject.toml")
+        intent = standard_original_intent(original, manifest)
+        if intent is None:
+            lock = control("requirements.lock")
+            _need(len(manifest) + len(lock) <= maximum, "input_supply_quota")
+            declaration = parse_python_project_declaration(manifest, lock,
+                max_control_bytes=maximum, max_requirements=1000)
+        else:
+            try:
+                private = resolve_standard_original_inputs(
+                    original, intent, configuration, deadline=deadline, supply=supply,
+                )
+            except StandardPythonIntentError as error:
+                code: SupplyError = ("input_supply_artifact_missing"
+                    if str(error) == "python_original_catalog_incomplete" else "input_supply_unavailable")
+                raise InputSupplyError(code) from None
+            declaration = private.declaration
+            _need(len(manifest) + len(private.lock) <= maximum, "input_supply_quota")
         _check(deadline)
-        _need(sum(len(raw) for raw in controls.values()) <= maximum, "input_supply_quota")
-        declaration = parse_python_project_declaration(controls["pyproject.toml"],
-            controls["requirements.lock"], max_control_bytes=maximum, max_requirements=1000)
         runtime = observe_python_distribution(configuration.runtime_root,
             interpreter_relative="bin/python3.12", limits=ScanLimits(configuration.runtime_max_bytes),
             deadline=deadline)

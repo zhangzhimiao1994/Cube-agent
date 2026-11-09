@@ -13,9 +13,14 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from agent_hub.capabilities.python_dependency_closure import PythonWheelMetadata
-from agent_hub.skills.sandbox.project import ProjectInvocation
+from agent_hub.skills.sandbox.project import OriginalProjectReference, ProjectInvocation
 from agent_hub.skills.sandbox.python_input_fetch import WheelDownload
-from agent_hub.skills.sandbox.python_metadata_plan_protocol import PythonMetadataPlanningRequest
+from agent_hub.skills.sandbox.python_metadata_plan_protocol import (
+    PythonMetadataPlanningRequest,
+    PythonMetadataScope,
+    _base_invocation,
+)
+from agent_hub.skills.sandbox.python_project_profile import Digest
 from agent_hub.skills.sandbox.python_registry_protocol import (
     DependencyNeed,
     RegistryCandidate,
@@ -136,6 +141,44 @@ class _Strict(BaseModel):
     )
 
 
+class ProtectedOriginalResolutionSource(_Strict):
+    """Identity of an already captured original, with no generated controls."""
+
+    original_reference: OriginalProjectReference
+    protected_sha256: Digest
+    manifest_sha256: Digest
+
+    @property
+    def source_sha256(self) -> str:
+        return self.original_reference.input_source_sha256
+
+
+class ProtectedOriginalResolutionPlanning(_Strict):
+    kind: Literal["protected_original_python"] = "protected_original_python"
+    invocation: ProjectInvocation
+    scope: PythonMetadataScope
+    draft: ProtectedOriginalResolutionSource
+    expected_root_config_sha256: Digest
+    expected_catalog_sha256: Digest
+
+    @model_validator(mode="before")
+    @classmethod
+    def validated_base_invocation(cls, value: object) -> object:
+        if isinstance(value, dict) and "invocation" in value:
+            return {**value, "invocation": _base_invocation(value["invocation"])}
+        return value
+
+    @model_validator(mode="after")
+    def readonly(self) -> Self:
+        need(self.invocation.sandbox_profile == "restricted" and self.invocation.install_allowed is False,
+             "resolution_request_invalid")
+        self.scope.require_invocation(self.invocation)
+        return self
+
+
+type ResolutionPlanning = PythonMetadataPlanningRequest | ProtectedOriginalResolutionPlanning
+
+
 class ResolutionClaim(_Strict):
     """Trusted service-UID witness, derived from original worker plus a fresh DB read.
 
@@ -143,7 +186,7 @@ class ResolutionClaim(_Strict):
     client grant; arbitrary API callers must never construct the privileged IPC.
     """
 
-    planning: PythonMetadataPlanningRequest
+    planning: ResolutionPlanning
     worker_id: str = Field(min_length=1, max_length=128)
     lease_token: UUID
     lease_expires_at: datetime
@@ -178,7 +221,7 @@ class ResolutionClaim(_Strict):
         return value
 
     def anchor(self) -> dict[str, object]:
-        return {
+        result: dict[str, object] = {
             "scope": self.planning.scope.model_dump(mode="json"),
             "worker_id": self.worker_id,
             "lease_token": str(self.lease_token),
@@ -186,6 +229,9 @@ class ResolutionClaim(_Strict):
             "root": self.planning.expected_root_config_sha256,
             "catalog": self.planning.expected_catalog_sha256,
         }
+        if isinstance(self.planning, ProtectedOriginalResolutionPlanning):
+            result["protected_original"] = self.planning.draft.model_dump(mode="json")
+        return result
 
     def require_continuity(self, original: ResolutionClaim) -> None:
         current = ResolutionClaim.model_validate(self, strict=True)
@@ -195,9 +241,12 @@ class ResolutionClaim(_Strict):
         _ = current.deadline
 
     def data_identity(self) -> dict[str, object]:
-        return {"scope": self.planning.scope.model_dump(mode="json"),
+        result: dict[str, object] = {"scope": self.planning.scope.model_dump(mode="json"),
             "root": self.planning.expected_root_config_sha256,
             "catalog": self.planning.expected_catalog_sha256}
+        if isinstance(self.planning, ProtectedOriginalResolutionPlanning):
+            result["protected_original"] = self.planning.draft.model_dump(mode="json")
+        return result
 
     def require_data_origin(self, original: ResolutionClaim) -> None:
         """Immutable bytes may cross a fresh bound worker; its grant never does."""

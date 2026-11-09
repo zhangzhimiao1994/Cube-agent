@@ -14,8 +14,19 @@ from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 from agent_hub.auth.models import Role
 from agent_hub.capabilities.project_baselines import ProjectBaselineReference, StoredProjectBaseline
 from agent_hub.capabilities.project_contracts import ManagedProjectInput
-from agent_hub.capabilities.python_project_inputs import PythonProjectInputs
-from agent_hub.capabilities.python_project_recipe import parse_python_project_declaration
+from agent_hub.capabilities.python_original_metadata import standard_python_intent
+from agent_hub.capabilities.python_original_private_recipe import (
+    declaration_for_original_pins,
+    original_pin_environment,
+)
+from agent_hub.capabilities.python_project_inputs import (
+    PythonInterpreterIdentity,
+    PythonProjectInputs,
+)
+from agent_hub.capabilities.python_project_recipe import (
+    PythonLockedRequirement,
+    parse_python_project_declaration,
+)
 from agent_hub.capabilities.scoped_read import _read_no_links, authorized_workspace_scope
 from agent_hub.capabilities.types import CapabilityRequest
 from agent_hub.runtime.artifacts import ArtifactReference, ArtifactRepository
@@ -173,15 +184,23 @@ def validate_supply_declaration(
     plan.require_scope(invocation)
     if expected_catalog_sha256 is not None and plan.catalog_sha256 != expected_catalog_sha256:
         raise ValueError('input_supply_plan_changed')
-    controls: list[bytes] = []
-    for name in ('pyproject.toml', 'requirements.lock'):
+    def control(name: str) -> bytes:
         raw = _read_no_links(stored.snapshot, (name,), max_bytes=256 * 1024)
         if stored.source_files.get(name) not in {
                 hashlib.sha256(tag + raw).hexdigest() for tag in (b'f\0', b'x\0')}:
             raise ValueError(_ERROR)
-        controls.append(raw)
-    declaration = parse_python_project_declaration(*controls, max_control_bytes=256 * 1024,
-                                                  max_requirements=128)
+        return raw
+
+    manifest = control('pyproject.toml')
+    intent = (standard_python_intent(manifest, paths=stored.source_files.keys(),
+        protected=stored.contract.protected_files.keys()) if stored.generated_metadata is None else None)
+    if intent is None:
+        declaration = parse_python_project_declaration(manifest, control('requirements.lock'),
+            max_control_bytes=256 * 1024, max_requirements=128)
+    else:
+        interpreter = PythonInterpreterIdentity.from_payload(plan.interpreter.model_dump())
+        pins = tuple(PythonLockedRequirement(item.name, item.version, (item.sha256,)) for item in plan.artifacts)
+        declaration = declaration_for_original_pins(intent, pins, environment=original_pin_environment(interpreter))
     locked = {item.name: item for item in declaration.requirements}
     if (plan.declaration_sha256 != declaration.sha256
             or plan.manifest_sha256 != declaration.manifest_sha256

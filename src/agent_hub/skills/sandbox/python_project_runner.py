@@ -21,6 +21,7 @@ from typing import Any, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from agent_hub.capabilities.python_original_private_recipe import canonical_original_lock
 from agent_hub.capabilities.python_project_inputs import PythonProjectInputs
 from agent_hub.capability_installer.python_attestation import ScanLimits
 from agent_hub.skills.sandbox.project_contract_mounts import validate_contract_work
@@ -81,6 +82,7 @@ class PythonProjectRunnerPlan(BaseModel):
     reused_environment: PythonEnvironmentReference | None = None
     environment_storage: Literal['persistent_cache', 'ephemeral_current_execution'] = 'persistent_cache'
     generated_manifest_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+    private_lock_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
 
     @model_validator(mode="after")
     def bound_plan(self) -> Self:
@@ -88,6 +90,11 @@ class PythonProjectRunnerPlan(BaseModel):
         invocation = self.invocation
         _need(self.environment_storage != 'ephemeral_current_execution' or self.reused_environment is None)
         _need(self.generated_manifest_sha256 is None or invocation.source_kind == "candidate")
+        if self.private_lock_sha256 is not None:
+            _need(self.generated_manifest_sha256 is None
+                and self.private_lock_sha256 == prepared.declaration.lock_sha256
+                and hashlib.sha256(canonical_original_lock(prepared.declaration.requirements)).hexdigest()
+                == self.private_lock_sha256)
         _need(
             (
                 prepared.contract.tenant_id,
@@ -333,6 +340,8 @@ def run_python_project(plan: PythonProjectRunnerPlan) -> dict[str, Any]:
     wheel = None
     test_count = None
     generated_test_execution = None
+    private_lock = (canonical_original_lock(inputs.declaration.requirements)
+                    if plan.private_lock_sha256 is not None else None)
     phases = ("check_environment" if initial is not None else "install", "build", "test")
     for phase in phases:
         with build_python_phase_mounts(
@@ -345,6 +354,7 @@ def run_python_project(plan: PythonProjectRunnerPlan) -> dict[str, Any]:
             phase_script=Path(__file__).with_name("python_project_phase.py"),
             import_module=inputs.declaration.import_module,
             contract_arguments=arguments,
+            private_lock=private_lock if phase == "install" else None,
         ) as mounts:
             command = mounts.argv
             if phase == "test" and plan.generated_manifest_sha256 is not None:

@@ -36,13 +36,21 @@ from agent_hub.capabilities.project_verification import (
     _strict_object,
     _validate_original_diagnostic,
 )
+from agent_hub.capabilities.python_original_metadata import (
+    StandardPythonIntent,
+    StandardPythonIntentError,
+    standard_python_intent,
+)
 from agent_hub.capabilities.python_project_input_store import PythonProjectInputStore
 from agent_hub.capabilities.python_project_inputs import (
     PythonInterpreterIdentity,
     PythonProjectInputs,
 )
 from agent_hub.capabilities.python_project_receipts import validate_python_passed_receipt
-from agent_hub.capabilities.python_project_recipe import parse_python_project_declaration
+from agent_hub.capabilities.python_project_recipe import (
+    PythonProjectDeclaration,
+    parse_python_project_declaration,
+)
 from agent_hub.capabilities.python_project_reports import (
     PythonEphemeralProjectReport,
     PythonProjectFailure,
@@ -78,6 +86,7 @@ if TYPE_CHECKING:
     from agent_hub.capabilities.project_verification import ProjectVerificationService
 
 _ERROR = "python_project_service_unavailable"
+_METADATA_REQUIRED = "python_original_metadata_preparation_required"
 _CONTROL_BYTES = 256 * 1024
 _MAX_REQUIREMENTS = 128
 _REFERENCE_PREFIX = "python-environment-"
@@ -125,7 +134,7 @@ def python_original_invocation(
     )
 
 
-def _declaration(stored: StoredProjectBaseline) -> Mapping[str, object] | None:
+def _declaration(stored: StoredProjectBaseline) -> Mapping[str, object] | StandardPythonIntent | None:
     if "pyproject.toml" not in stored.source_files:
         return None
     manifest = _read_no_links(stored.snapshot, ("pyproject.toml",), max_bytes=_CONTROL_BYTES)
@@ -133,6 +142,22 @@ def _declaration(stored: StoredProjectBaseline) -> Mapping[str, object] | None:
     tool = document.get("tool", {})
     agent = tool.get("agent-hub", {}) if isinstance(tool, dict) else {}
     if not isinstance(agent, dict) or "python-project" not in agent:
+        project = document.get("project")
+        build_system = document.get("build-system")
+        name = project.get("name") if isinstance(project, dict) else None
+        backend = build_system.get("build-backend") if isinstance(build_system, dict) else None
+        if isinstance(name, str) and name.strip() and (
+            isinstance(backend, str) and backend.strip()
+            or any(path.endswith(".py") for path in stored.source_files)
+        ):
+            _need(stored.generated_metadata is None, _METADATA_REQUIRED)
+            try:
+                intent = standard_python_intent(manifest, paths=stored.source_files.keys(),
+                    protected=stored.contract.protected_files.keys())
+            except StandardPythonIntentError:
+                raise ProjectVerificationError(_METADATA_REQUIRED) from None
+            _need(intent is not None, _METADATA_REQUIRED)
+            return intent
         return None
     lock = _read_no_links(stored.snapshot, ("requirements.lock",), max_bytes=_CONTROL_BYTES)
     return parse_python_project_declaration(
@@ -497,10 +522,12 @@ class PythonProjectService:
             measured = PythonProjectInputsObservation.model_validate(
                 measured.model_dump(), strict=True
             )
-            _need(
-                measured.scope.model_dump() == _scope_payload(probe)
-                and measured.declaration == declaration
-            )
+            _need(measured.scope.model_dump() == _scope_payload(probe))
+            private_declaration = None
+            if isinstance(declaration, StandardPythonIntent):
+                private_declaration = PythonProjectDeclaration.from_payload(measured.declaration)
+            else:
+                _need(measured.declaration == declaration)
             interpreter = PythonInterpreterIdentity.from_payload(measured.interpreter)
             wheels = tuple(
                 PythonWheelBinding(**cast(dict[str, str], wheel)) for wheel in measured.wheels
@@ -513,6 +540,7 @@ class PythonProjectService:
                 wheels=wheels,
                 max_control_bytes=_CONTROL_BYTES,
                 max_requirements=_MAX_REQUIREMENTS,
+                private_declaration=private_declaration,
             )
         except ProcessCleanupIncomplete:
             raise
@@ -523,6 +551,7 @@ class PythonProjectService:
     def _raise_backend(error: Exception) -> NoReturn:
         code = str(error)
         allowed = set(get_args(PythonProjectBrokerError)) | {
+            _METADATA_REQUIRED,
             "python_project_systemd_linux_unsupported",
             "python_project_recipe_invalid",
             "python_project_recipe_unsupported",
@@ -560,7 +589,7 @@ class PythonProjectService:
                 return None
             is_python = type(state.get("schema_version")) is int and state["schema_version"] == 2
             reference = ProjectBaselineReference.from_payload(state.get("reference"))
-            # Read only the immutable baseline to distinguish Node from explicit Python.
+            # Read only the immutable baseline to distinguish Node from both Python paths.
             project, session = authorized_workspace_scope(
                 record, tenant_id=tenant_id, run_id=run_id
             )
@@ -580,7 +609,8 @@ class PythonProjectService:
             if declared is None:
                 _need(not is_python, "python_project_recipe_invalid")
                 return None
-            _need(is_python, "python_project_recipe_unavailable")
+            _need(is_python, _METADATA_REQUIRED if isinstance(declared, StandardPythonIntent)
+                  else "python_project_recipe_unavailable")
             _need(
                 type(route.get("project_input_contract_version")) is int
                 and route["project_input_contract_version"] == 1

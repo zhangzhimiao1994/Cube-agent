@@ -98,7 +98,7 @@ def stage_python_project_inputs(
             inputs = decode_python_project_inputs(raw, invocation=invocation, original=original)
             captured = _capture(original, interpreter=inputs.interpreter, wheels=inputs.wheels,
                 max_control_bytes=min(_CONTROL_LIMIT, invocation.source_limit_bytes),
-                max_requirements=len(inputs.declaration.requirements))
+                max_requirements=len(inputs.declaration.requirements), private_declaration=inputs.declaration)
             _need(captured == inputs)
             for entry in observed:
                 entry.check()

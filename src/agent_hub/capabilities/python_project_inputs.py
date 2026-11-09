@@ -88,9 +88,23 @@ class PythonProjectInputs:
             and type(self.original_reference) is ProjectBaselineReference
             and type(self.declaration) is PythonProjectDeclaration
             and type(self.interpreter) is PythonInterpreterIdentity)
+        protected = self.contract.protected_files
         _need(self.contract.input_source_sha256 == self.original_reference.input_source_sha256
-            and {'pyproject.toml', 'requirements.lock'} <= self.contract.protected_files.keys())
-        object.__setattr__(self, 'wheels', bind_python_project_wheels(self.declaration.requirements, self.wheels))
+            and 'pyproject.toml' in protected)
+        wheels = bind_python_project_wheels(self.declaration.requirements, self.wheels)
+        if 'requirements.lock' not in protected:
+            # Private locks bind data only. Root must still remeasure the
+            # declaration, wheel selection and actual original before use.
+            from agent_hub.capabilities.python_original_private_recipe import (
+                canonical_original_lock,
+            )
+
+            pins = self.declaration.requirements
+            if (any(pin.hashes != (wheel.sha256,) for pin, wheel in zip(pins, wheels, strict=True))
+                    or hashlib.sha256(canonical_original_lock(pins)).hexdigest()
+                    != self.declaration.lock_sha256):
+                raise PythonProjectRecipeError('python_project_lock_invalid')
+        object.__setattr__(self, 'wheels', wheels)
 
     def _binding(self) -> dict[str, object]:
         return {'schema_version': 1, 'kind': 'python_offline_wheel_v1',

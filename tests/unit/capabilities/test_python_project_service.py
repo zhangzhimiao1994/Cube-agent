@@ -7,14 +7,17 @@ import json
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
+from unittest.mock import AsyncMock, Mock
 from uuid import UUID
 
 import pytest
 
 from agent_hub.auth.models import Role
+from agent_hub.capabilities import python_project_service
 from agent_hub.capabilities.approvals import capability_approval_scope
-from agent_hub.capabilities.project_baselines import ProjectBaselineStore
+from agent_hub.capabilities.project_baselines import ProjectBaselineReference, ProjectBaselineStore
 from agent_hub.capabilities.project_contracts import ManagedProjectInput
 from agent_hub.capabilities.project_verification import (
     ProjectVerificationError,
@@ -24,7 +27,7 @@ from agent_hub.capabilities.project_verification import (
 from agent_hub.capabilities.python_project_input_store import _capture
 from agent_hub.capabilities.types import CapabilityRequest
 from agent_hub.skills.sandbox.base import SkillResult
-from agent_hub.skills.sandbox.project import project_source_fingerprint
+from agent_hub.skills.sandbox.project import ProjectInvocation, project_source_fingerprint
 from agent_hub.skills.sandbox.python_project_protocol import (
     PythonEnvironmentReference,
     PythonProjectBrokerResponse,
@@ -37,6 +40,7 @@ from tests.unit.capabilities.test_python_project_input_store import (
     python_controls,
     selected,
 )
+from tests.unit.capabilities.test_python_project_recipe import LOCK, MANIFEST
 from tests.unit.capabilities.test_python_project_reports import fail, fixture
 from tests.unit.capabilities.test_scoped_read import FakeRunRepository, StoredRun, stored_run
 
@@ -621,6 +625,196 @@ async def test_missing_original_state_is_unknown_not_node_authorization_fallback
     repository.record.routing_decision.pop("project_input_preparation")
     with pytest.raises(ProjectVerificationError):
         await verifier.authorization_request(request(repository, invocation))
+
+
+_PLAIN_PYTHON_MANIFEST = b'''[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "discuss-expense-cli"
+version = "0.1.0"
+description = "A small expense summary CLI repair fixture"
+requires-python = ">=3.11"
+dependencies = ["click>=8.1,<9"]
+
+[project.scripts]
+expense-report = "expense_cli.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+'''
+
+
+def _verifier_with_sealed_original(
+    monkeypatch: pytest.MonkeyPatch, files: Mapping[str, bytes],
+) -> tuple[ProjectVerificationService, ProjectInvocation, ProjectBaselineReference]:
+    invocation = ProjectInvocation(
+        execution_id="original_1", tenant_id=UUID(int=1), run_id=UUID(int=2),
+        project_id="project-a", session_id="session-a", sandbox_profile="workspace_write",
+        timeout_seconds=30,
+    )
+    reference = ProjectBaselineReference("a" * 64, "b" * 64, len(files))
+    root = Path("sealed-original")
+    selection = ManagedProjectInput(("src",))
+    record = stored_run(
+        tenant=invocation.tenant_id, run=invocation.run_id, actor_id=UUID(int=456),
+        requested_permissions=["workspace.read", "workspace.write", "command.run"],
+        project_input_contract_version=1, project_input=selection.to_payload(),
+        project_input_preparation={
+            "schema_version": 1, "phase": "executing", "reference": reference.to_payload(),
+            "execution_id": invocation.execution_id,
+        },
+    )
+    record = ServiceRecord(record.tenant_id, record.id, record.routing_decision, record.actor_id)
+    monkeypatch.setattr(ProjectBaselineStore, "load", lambda *_: SimpleNamespace(
+        source_files=files, snapshot=root, generated_metadata=None,
+        contract=SimpleNamespace(editable_paths=selection.editable_paths, protected_files=files),
+    ))
+    monkeypatch.setattr(python_project_service, "_read_no_links",
+                        lambda _root, parts, **_kwargs: files["/".join(parts)])
+    verifier = ProjectVerificationService(root=root, repository=FakeRunRepository(record), executor=None)
+    monkeypatch.setattr(verifier, "_require_supported_source", AsyncMock())
+    return verifier, invocation, reference
+
+
+_PLAIN_PYTHON_FILES = {
+    "README.md": b"# Expense summary CLI\n",
+    "cases/input.csv": b"category,amount\ntravel,12.00\n",
+    "pyproject.toml": _PLAIN_PYTHON_MANIFEST,
+    "src/expense_cli/__init__.py": b"",
+    "src/expense_cli/cli.py": b"import click\n",
+    "tests/test_contract.py": b"import unittest\n",
+}
+
+
+async def test_unprepared_standard_python_never_falls_back_to_node(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    verifier, invocation, reference = _verifier_with_sealed_original(monkeypatch, _PLAIN_PYTHON_FILES)
+    with pytest.raises(ProjectVerificationError, match="^python_original_metadata_preparation_required$"):
+        await verifier.observe_original(
+            tenant_id=invocation.tenant_id, run_id=invocation.run_id, actor="main_agent",
+            reference=reference, execution_id=invocation.execution_id, timeout_seconds=30,
+        )
+
+
+@pytest.mark.parametrize("scope_drift", [False, True])
+async def test_standard_python_probes_then_selects_persisted_recipe(
+    monkeypatch: pytest.MonkeyPatch, scope_drift: bool,
+) -> None:
+    from agent_hub.capabilities.python_original_metadata import standard_python_intent
+    from agent_hub.capabilities.python_original_private_recipe import (
+        derive_private_original_recipe, original_dependency_needs,
+    )
+    from tests.unit.capabilities.test_standard_python_private_recipe import ENVIRONMENT, _descriptor
+
+    verifier, invocation, reference = _verifier_with_sealed_original(monkeypatch, _PLAIN_PYTHON_FILES)
+    intent = standard_python_intent(
+        _PLAIN_PYTHON_MANIFEST, paths=_PLAIN_PYTHON_FILES, protected=_PLAIN_PYTHON_FILES,
+    )
+    assert intent is not None
+    descriptor = _descriptor()
+    scope = replace(descriptor.scope, source_sha256=reference.input_source_sha256)
+    descriptor = replace(descriptor, scope=scope, needs=original_dependency_needs(intent, ENVIRONMENT))
+    measured = derive_private_original_recipe(
+        intent, descriptor, expected_scope=scope, verified_descriptor_sha256=descriptor.sha256,
+    )
+    identity = replace(interpreter(), version="3.12.8")
+
+    async def reply(probe: Any) -> PythonProjectInputsObservation:
+        scope_payload = python_project_service._scope_payload(probe)
+        if scope_drift:
+            scope_payload["project_id"] = "other-project"
+        return PythonProjectInputsObservation.model_validate({
+            "scope": scope_payload, "declaration": measured.declaration.to_payload(),
+            "interpreter": identity.to_payload(),
+            "wheels": tuple(wheel.to_payload() for wheel in measured.wheels),
+        }, strict=True)
+
+    probe = AsyncMock(side_effect=reply)
+    monkeypatch.setattr(verifier._python.executor, "probe", probe)
+    saved = SimpleNamespace(sha256="c" * 64, environment_input_sha256="d" * 64)
+    capture = Mock(return_value=saved)
+    monkeypatch.setattr(python_project_service.PythonProjectInputStore, "capture_or_load_matching", capture)
+    if scope_drift:
+        with pytest.raises(ProjectVerificationError, match="^python_project_service_unavailable$"):
+            await verifier.prepare_python_original(invocation=invocation, reference=reference)
+        capture.assert_not_called()
+        return
+    assert await verifier.prepare_python_original(invocation=invocation, reference=reference) is saved
+    args, kwargs = capture.call_args
+    assert args == (invocation, reference)
+    assert kwargs["private_declaration"] == measured.declaration
+    assert kwargs["wheels"] == measured.wheels and kwargs["interpreter"] == identity
+    sent = probe.await_args.args[0]
+    assert not sent.install_allowed and sent.original_reference.model_dump() == reference.to_payload()
+
+    record = verifier.repository.records[(invocation.tenant_id, invocation.run_id)]
+    record.routing_decision["project_input_preparation"] = {
+        "schema_version": 2, "phase": "captured", "reference": reference.to_payload(),
+        "python_recipe": python_project_service.python_recipe_marker(saved),
+    }
+    load = Mock(return_value=saved)
+    monkeypatch.setattr(python_project_service.PythonProjectInputStore, "load", load)
+    context = await verifier._python.select(
+        invocation.tenant_id, invocation.run_id, "main_agent", phases=("captured",),
+    )
+    assert context is not None and context.inputs is saved
+    assert load.call_args.kwargs == {"expected_sha256": saved.sha256}
+    probe.assert_awaited_once()
+
+
+async def test_node_original_with_python_tool_config_still_uses_node_selection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    verifier, invocation, reference = _verifier_with_sealed_original(monkeypatch, {
+        "package.json": b'{"scripts":{"test":"node tests/original.js"}}',
+        "src/index.js": b"module.exports = () => 0;\n",
+        "tests/original.js": b"// immutable original user check\n",
+        "pyproject.toml": b"[tool.ruff]\nline-length = 100\n",
+        "tests/tooling.py": b"pass\n",
+    })
+    assert await verifier.prepare_python_original(invocation=invocation, reference=reference) is None
+
+
+@pytest.mark.parametrize("declaration_drift", [False, True])
+async def test_declared_python_original_still_probes_exact_recipe(
+    monkeypatch: pytest.MonkeyPatch, declaration_drift: bool,
+) -> None:
+    verifier, invocation, reference = _verifier_with_sealed_original(monkeypatch, {
+        "pyproject.toml": MANIFEST,
+        "requirements.lock": LOCK,
+        "src/billing/__init__.py": b"",
+    })
+    declaration = python_project_service.parse_python_project_declaration(
+        MANIFEST, LOCK, max_control_bytes=256 * 1024, max_requirements=128,
+    )
+    payload = declaration.to_payload()
+    if declaration_drift:
+        payload["project_name"] = "other-project"
+
+    async def reply(probe: Any) -> PythonProjectInputsObservation:
+        return PythonProjectInputsObservation.model_validate({
+            "scope": python_project_service._scope_payload(probe),
+            "declaration": payload, "interpreter": interpreter().to_payload(),
+            "wheels": tuple(wheel.to_payload() for wheel in selected()),
+        }, strict=True)
+
+    probe = AsyncMock(side_effect=reply)
+    monkeypatch.setattr(verifier._python.executor, "probe", probe)
+    saved = object()
+    capture = Mock(return_value=saved)
+    monkeypatch.setattr(python_project_service.PythonProjectInputStore, "capture_or_load_matching", capture)
+    if declaration_drift:
+        with pytest.raises(ProjectVerificationError, match="^python_project_service_unavailable$"):
+            await verifier.prepare_python_original(invocation=invocation, reference=reference)
+        capture.assert_not_called()
+    else:
+        assert await verifier.prepare_python_original(invocation=invocation, reference=reference) is saved
+        assert capture.call_args.kwargs["private_declaration"] is None
+    probe.assert_awaited_once()
+    assert probe.await_args.args[0].install_allowed is False
 
 
 @pytest.mark.parametrize("change", ["user", "resource", "arguments"])

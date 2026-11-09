@@ -17,11 +17,12 @@ from agent_hub.capabilities.generated_project_service import generated_authority
 from agent_hub.capabilities.types import CapabilityRequest
 from agent_hub.models.physical_budget import _budget_deadline, _run_budget
 from agent_hub.runs.repository import RunRecord
-from agent_hub.skills.sandbox.python_metadata_plan_protocol import PythonMetadataPlanningRequest
 from agent_hub.skills.sandbox.python_registry_protocol import DependencyNeed, digest, need
 from agent_hub.skills.sandbox.python_resolution_protocol import (
+    ProtectedOriginalResolutionPlanning,
     ResolutionClaim,
     ResolutionPlan,
+    ResolutionPlanning,
     ResolutionRequest,
     ResolutionStatus,
     resolution_key,
@@ -59,6 +60,8 @@ def resolution_action(
         need(plan.claim.approval_payload() == claim.approval_payload(), "resolution_scope_changed")
         binding["plan_sha256"] = plan.sha256
         binding["artifacts"] = [list(a) for a in plan.artifacts]
+    if isinstance(claim.planning, ProtectedOriginalResolutionPlanning):
+        binding["protected_original"] = claim.planning.draft.model_dump(mode="json")
     return CapabilityRequest(
         tenant_id=scope.tenant_id,
         run_id=scope.run_id,
@@ -86,14 +89,16 @@ class PythonResolutionPreparation:
         approved: Callable[[CapabilityRequest], Awaitable[bool]] | None,
         transport: Callable[[ResolutionRequest], Awaitable[ResolutionStatus]] | None = None,
         original_deadline: datetime | None = None,
+        protected_original: Callable[[RunRecord, ProtectedOriginalResolutionPlanning], int] | None = None,
     ) -> None:
         self.current = current
         self.approved = approved
         self.transport = transport
         self._original: ResolutionClaim | None = None
         self._original_deadline = original_deadline
+        self._protected_original = protected_original
 
-    async def _claim(self, planning: PythonMetadataPlanningRequest) -> ResolutionClaim:
+    async def _claim(self, planning: ResolutionPlanning) -> ResolutionClaim:
         budget = _run_budget.get()
         if budget is not None:
             await budget.require_current()
@@ -116,7 +121,6 @@ class PythonResolutionPreparation:
             role=record.actor_role,
             current_record=record,
         )
-        live = generated_authority(record, scope.tenant_id, scope.run_id)
         need(
             (
                 authority.actor,
@@ -134,33 +138,38 @@ class PythonResolutionPreparation:
             ),
             "resolution_scope_changed",
         )
-        need(
-            (live.project_id, live.session_id) == (scope.project_id, scope.session_id),
-            "resolution_scope_changed",
-        )
-        from agent_hub.capabilities.python_metadata_preparation import metadata_scope
+        if isinstance(planning, ProtectedOriginalResolutionPlanning):
+            need(self._protected_original is not None, "resolution_authority_unavailable")
+            assert self._protected_original is not None
+            allowed_timeout = self._protected_original(record, planning)
+            need(type(allowed_timeout) is int and 0 < allowed_timeout <= 3600, "resolution_deadline")
+        else:
+            live = generated_authority(record, scope.tenant_id, scope.run_id)
+            need(
+                (live.project_id, live.session_id) == (scope.project_id, scope.session_id),
+                "resolution_scope_changed",
+            )
+            from agent_hub.capabilities.python_metadata_preparation import metadata_scope
 
-        need(
-            metadata_scope(record, actor=scope.actor, live=True) == scope,
-            "resolution_scope_changed",
-        )
+            need(metadata_scope(record, actor=scope.actor, live=True) == scope, "resolution_scope_changed")
+            allowed_timeout = live.timeout_seconds
         need(hashlib.sha256(record.request.encode()).hexdigest() == scope.request_sha256)
         if self._original is None:
             # The route retains the original total; context timeout is remaining
             # time and tightens the monotonic deadline below from the current time.
             original_deadline = self._original_deadline or record.created_at + timedelta(
-                seconds=live.timeout_seconds)
+                seconds=allowed_timeout)
         else:
             original_deadline = self._original.original_deadline
         # Registered data can retain an earlier exact cutoff across workers. It
         # cannot extend the durable authority or this worker's remaining budget.
         need(original_deadline.tzinfo is not None and record.created_at < original_deadline
-             <= record.created_at + timedelta(seconds=live.timeout_seconds), "resolution_deadline")
+             <= record.created_at + timedelta(seconds=allowed_timeout), "resolution_deadline")
         remaining = (original_deadline - datetime.now(UTC)).total_seconds()
         deadline = _budget_deadline(time.monotonic() + remaining if self._original is None
             else self._original.monotonic_deadline)
         deadline = min(deadline, time.monotonic() + min(
-            float(context.timeout_seconds), float(live.timeout_seconds),
+            float(context.timeout_seconds), float(allowed_timeout),
             (original_deadline - datetime.now(UTC)).total_seconds()))
         if budget is not None:
             budget.check()
@@ -199,7 +208,7 @@ class PythonResolutionPreparation:
         *,
         needs: tuple[DependencyNeed, ...],
         environment: dict[str, str],
-        planning: PythonMetadataPlanningRequest,
+        planning: ResolutionPlanning,
         plan: ResolutionPlan | None = None,
         expected_plan_sha256: str | None = None,
     ) -> ResolutionStatus:
@@ -284,7 +293,7 @@ class PythonResolutionPreparation:
         *,
         needs: tuple[DependencyNeed, ...],
         environment: dict[str, str],
-        planning: PythonMetadataPlanningRequest,
+        planning: ResolutionPlanning,
     ) -> ResolutionStatus:
         return await self._send(
             "resolve_python_inputs", needs=needs, environment=environment, planning=planning
@@ -295,7 +304,7 @@ class PythonResolutionPreparation:
         *,
         needs: tuple[DependencyNeed, ...],
         environment: dict[str, str],
-        planning: PythonMetadataPlanningRequest,
+        planning: ResolutionPlanning,
     ) -> ResolutionStatus:
         return await self._send(
             "freeze_python_resolution", needs=needs, environment=environment, planning=planning
@@ -307,8 +316,10 @@ class PythonResolutionPreparation:
         *,
         needs: tuple[DependencyNeed, ...],
         environment: dict[str, str],
+        planning: ResolutionPlanning | None = None,
     ) -> ResolutionStatus:
         plan = ResolutionPlan.model_validate(plan, strict=True)
+        current_planning = plan.claim.planning if planning is None else planning
         need(plan.resolution_key == resolution_key(plan.claim, needs, environment),
              "resolution_scope_changed")
         transport_losses = (
@@ -320,7 +331,7 @@ class PythonResolutionPreparation:
                 "publish_python_resolution",
                 needs=needs,
                 environment=environment,
-                planning=plan.claim.planning,
+                planning=current_planning,
                 plan=plan,
             )
         except (ConnectionError, EOFError) as error:
@@ -330,18 +341,22 @@ class PythonResolutionPreparation:
             if type(error) not in transport_losses:
                 raise
             async with asyncio.timeout_at(plan.claim.task_deadline) as timeout:
-                current = await self._claim(plan.claim.planning)
-                current.require_continuity(plan.claim)
+                current = await self._claim(current_planning)
+                if isinstance(current_planning, ProtectedOriginalResolutionPlanning):
+                    current.require_data_origin(plan.claim)
+                    need(current.approval_payload() == plan.claim.approval_payload(), "resolution_scope_changed")
+                else:
+                    current.require_continuity(plan.claim)
                 timeout.reschedule(current.task_deadline)
                 action = resolution_action(current, needs, environment, plan=plan)
                 if self.approved is None or await self.approved(action) is not True:
                     raise ResolutionApprovalRequired(action) from error
-                fresh = await self._claim(plan.claim.planning)
+                fresh = await self._claim(current_planning)
                 fresh.require_continuity(current)
                 timeout.reschedule(fresh.task_deadline)
                 try:
                     status = await self.inspect(
-                        needs=needs, environment=environment, planning=plan.claim.planning,
+                        needs=needs, environment=environment, planning=current_planning,
                         plan=plan, expected_plan_sha256=plan.sha256,
                     )
                 except (ConnectionError, EOFError) as inspect_error:
@@ -354,14 +369,14 @@ class PythonResolutionPreparation:
                     raise
                 need(status.plan is None or status.plan.sha256 == plan.sha256,
                      "resolution_response_invalid")
-                inspected = await self._claim(plan.claim.planning)
+                inspected = await self._claim(current_planning)
                 inspected.require_continuity(fresh)
                 timeout.reschedule(inspected.task_deadline)
                 # Inspect is data-only. Recheck the concrete publication grant
                 # before letting its receipt complete the original operation.
                 if await self.approved(action) is not True:
                     raise ResolutionApprovalRequired(action) from error
-                final = await self._claim(plan.claim.planning)
+                final = await self._claim(current_planning)
                 final.require_continuity(inspected)
                 # Opaque Root inspections intentionally omit plan bytes; only
                 # the exact validated, requested plan can fill that field.
@@ -372,7 +387,7 @@ class PythonResolutionPreparation:
         *,
         needs: tuple[DependencyNeed, ...],
         environment: dict[str, str],
-        planning: PythonMetadataPlanningRequest,
+        planning: ResolutionPlanning,
         plan: ResolutionPlan | None = None,
         expected_plan_sha256: str | None = None,
     ) -> ResolutionStatus:

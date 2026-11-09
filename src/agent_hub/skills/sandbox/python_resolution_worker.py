@@ -9,12 +9,20 @@ import time
 from collections.abc import Awaitable, Callable
 from contextlib import ExitStack
 from dataclasses import replace
+from pathlib import Path
 from typing import TYPE_CHECKING
 
+from agent_hub.capabilities.project_baselines import ProjectBaselineReference, StoredProjectBaseline
 from agent_hub.capabilities.python_dependency_resolution import resolve_dependencies
+from agent_hub.capabilities.python_original_private_recipe import original_dependency_needs
+from agent_hub.capabilities.scoped_read import _read_no_links
 from agent_hub.skills.sandbox import python_dependency_index_store as index_store
-from agent_hub.skills.sandbox.project import _uninterrupted
-from agent_hub.skills.sandbox.project_contract_broker import _Observed, _root
+from agent_hub.skills.sandbox.project import _uninterrupted, project_source_fingerprint
+from agent_hub.skills.sandbox.project_contract_broker import (
+    _Observed,
+    _root,
+    stage_original_contract,
+)
 from agent_hub.skills.sandbox.python_dependency_metadata import extract_python_wheel_metadata
 from agent_hub.skills.sandbox.python_input_fetch import WheelDownload
 from agent_hub.skills.sandbox.python_input_publish import publish_verified_wheel
@@ -28,6 +36,7 @@ from agent_hub.skills.sandbox.python_input_supply_worker import (
 )
 from agent_hub.skills.sandbox.python_metadata_planning import _controls, _source
 from agent_hub.skills.sandbox.python_metadata_preparation_worker import _claim
+from agent_hub.skills.sandbox.python_original_root_recipe import standard_original_intent
 from agent_hub.skills.sandbox.python_project_backend import (
     RootConfig,
     _admission,
@@ -42,6 +51,7 @@ from agent_hub.skills.sandbox.python_registry_protocol import (
 )
 from agent_hub.skills.sandbox.python_resolution_protocol import (
     MAX_CONTROL,
+    ProtectedOriginalResolutionPlanning,
     ResolutionClaim,
     ResolutionRequest,
     ResolutionStatus,
@@ -68,6 +78,7 @@ async def _context(
     deadline: float,
     *,
     current_claim: Callable[[], ResolutionClaim] | None = None,
+    original: StoredProjectBaseline | None = None,
 ) -> None:
     def check_lease() -> None:
         live = request.claim if current_claim is None else current_claim()
@@ -86,8 +97,13 @@ async def _context(
         "resolution_configuration_changed",
     )
     validate_configuration(policy, root, supply)
-    await _source(request.claim.planning, policy, deadline)
-    _controls(request.claim.planning, policy, deadline)
+    planning = request.claim.planning
+    if isinstance(planning, ProtectedOriginalResolutionPlanning):
+        need(await project_source_fingerprint(policy.project_workspace_root, request.invocation)
+             == planning.draft.source_sha256, "resolution_source_changed")
+    else:
+        await _source(planning, policy, deadline)
+    _resolution_controls(request, policy, root, deadline, original)
     env = request.environment
     need(
         env["implementation_name"] == root.interpreter.implementation
@@ -102,6 +118,34 @@ async def _context(
         and read_supply_configuration().digest == supply.digest,
         "resolution_configuration_changed",
     )
+
+
+def _resolution_controls(
+    request: ResolutionRequest, policy: BrokerPolicy, root: RootConfig, deadline: float,
+    original: StoredProjectBaseline | None,
+) -> None:
+    planning = request.claim.planning
+    if not isinstance(planning, ProtectedOriginalResolutionPlanning):
+        _controls(planning, policy, deadline)
+        return
+    need(original is not None, "resolution_source_changed")
+    assert original is not None
+    expected = planning.draft
+    need(original.reference.to_payload() == expected.original_reference.model_dump()
+         and original.contract.protected_sha256 == expected.protected_sha256,
+         "resolution_source_changed")
+    raw = _read_no_links(original.snapshot, ("pyproject.toml",),
+                         max_bytes=min(request.invocation.source_limit_bytes, 256 * 1024))
+    intent = standard_original_intent(original, raw)
+    need(intent is not None and intent.manifest_sha256 == expected.manifest_sha256,
+         "resolution_source_changed")
+    assert intent is not None
+    from agent_hub.skills.sandbox.python_dependency_inspection import _target_environment
+
+    target = _target_environment(root)
+    need(request.environment == target, "resolution_environment_changed")
+    need(request.needs == original_dependency_needs(intent, target), "resolution_requirements_changed")
+    need(time.monotonic() < deadline, "resolution_deadline")
 
 
 async def _fetch(
@@ -136,19 +180,20 @@ async def _fetch(
 
 async def execute_resolution(
     request: ResolutionRequest, *, policy: BrokerPolicy, root: RootConfig, supply: RootSupplyConfig,
-    lease_witness: ResolutionLeaseWitness | None = None,
+    lease_witness: ResolutionLeaseWitness | None = None, stage: Path | None = None,
 ) -> ResolutionStatus:
     if lease_witness is None:
         # Non-renewing callers retain the original short lease bound.
-        return await _execute_resolution(request, policy=policy, root=root, supply=supply)
+        return await _execute_resolution(request, policy=policy, root=root, supply=supply, stage=stage)
     return await _await_resolution_with_root_lease(request,
         operation=_execute_resolution(request, policy=policy, root=root, supply=supply,
-            current_claim=lease_witness.current), current=lease_witness.current)
+            current_claim=lease_witness.current, stage=stage), current=lease_witness.current)
 
 
 async def _execute_resolution(
     request: ResolutionRequest, *, policy: BrokerPolicy, root: RootConfig, supply: RootSupplyConfig,
     current_claim: Callable[[], ResolutionClaim] | None = None,
+    stage: Path | None = None,
 ) -> ResolutionStatus:
     """Root peer validation is done by handle_resolution; all persisted data is re-read.
 
@@ -160,6 +205,15 @@ async def _execute_resolution(
     request = ResolutionRequest.model_validate(request, strict=True)
     root, supply = replace(root), replace(supply)
     deadline = request.claim.deadline if current_claim is None else request.claim.task_deadline
+    original = None
+    if isinstance(request.claim.planning, ProtectedOriginalResolutionPlanning):
+        need(stage is not None and stage.parent == root.stage_root, "resolution_stage_invalid")
+        assert stage is not None
+        original = stage_original_contract(
+            policy.project_workspace_root, request.invocation,
+            ProjectBaselineReference.from_payload(request.claim.planning.draft.original_reference.model_dump()),
+            stage, policy.allowed_uid,
+        )
 
     def active() -> ResolutionRequest:
         nonlocal request
@@ -171,7 +225,13 @@ async def _execute_resolution(
         return request
 
     live_claim = None if current_claim is None else lambda: active().claim
-    await _context(active(), policy, root, supply, deadline, current_claim=live_claim)
+    async def context() -> None:
+        if original is None:
+            await _context(active(), policy, root, supply, deadline, current_claim=live_claim)
+        else:
+            await _context(active(), policy, root, supply, deadline, current_claim=live_claim, original=original)
+
+    await context()
     store = ResolutionStore(supply)
     status = store.inspect(request.key, request.claim)
     if request.action == "inspect_python_resolution":
@@ -198,9 +258,9 @@ async def _execute_resolution(
         # A durable intent exists before even the first registry read. Every error
         # leaves UNKNOWN; a new execution id or changed source cannot replay it.
         async def content(entry: WheelDownload) -> bytes:
-            await _context(active(), policy, root, supply, deadline, current_claim=live_claim)
+            await context()
             raw = await _fetch(entry, request, policy, root, supply, deadline)
-            await _context(active(), policy, root, supply, deadline, current_claim=live_claim)
+            await context()
             extract_python_wheel_metadata(entry, raw, deadline=deadline)
             store.put_wheel(request.key, entry.sha256, raw, deadline=deadline)
             return raw
@@ -213,7 +273,7 @@ async def _execute_resolution(
             wheel_reader=content,
             budget=ResolutionBudget(limits, deadline),
         )
-        await _context(active(), policy, root, supply, deadline, current_claim=live_claim)
+        await context()
         store.complete(request.key, active().claim, descriptor)
         return store.inspect(request.key, active().claim)
     need(status.state == "resolved" and status.descriptor is not None, "resolution_inspect_only")
@@ -224,7 +284,7 @@ async def _execute_resolution(
         from agent_hub.skills.sandbox.python_resolution_overlay import record_frozen_plan
 
         record_frozen_plan(supply,plan,deadline=min(deadline,plan.claim.monotonic_deadline))
-        await _context(active(), policy, root, supply, deadline, current_claim=live_claim)
+        await context()
         return ResolutionStatus(
             state="frozen", key=request.key, descriptor=descriptor.to_payload(), plan=plan
         )
@@ -236,7 +296,7 @@ async def _execute_resolution(
         effective.digest == plan.overlay_sha256 and plan.descriptor_sha256 == descriptor.sha256,
         "resolution_plan_changed",
     )
-    await _context(active(), policy, root, supply, deadline, current_claim=live_claim)
+    await context()
     store.publication_begin(request.key, request.claim, plan)
     # Reuse metadata's Root700 claim scratch and the shared stage admission. No
     # temporary wheel/cache pathname is model-controlled.
@@ -245,7 +305,7 @@ async def _execute_resolution(
         stage_pins: list[_Observed] = []
         stage_fd = _root(root.stage_root, 0, stack, stage_pins, stage=True)
         with _admission(stage_fd, deadline):
-            _controls(request.claim.planning, policy, deadline)
+            _resolution_controls(request, policy, root, deadline, original)
             for wheel in descriptor.wheels:
                 entry = wheel.candidate.download
                 raw = store.wheel(request.key, entry.sha256, entry.size_bytes, deadline=deadline)
@@ -262,9 +322,14 @@ async def _execute_resolution(
                     raw,
                     deadline=deadline,
                 )
-        await _context(active(), policy, root, supply, deadline, current_claim=live_claim)
-        index = index_store.publish_dependency_metadata_index(root, effective, deadline=deadline)
-        await _context(active(), policy, root, supply, deadline, current_claim=live_claim)
+        await context()
+        if original is not None and effective.digest != supply.digest:
+            index = index_store.publish_dependency_metadata_index(
+                root, effective, deadline=deadline, reuse_unchanged_from=supply,
+            )
+        else:
+            index = index_store.publish_dependency_metadata_index(root, effective, deadline=deadline)
+        await context()
         for pin in pins + stage_pins:
             pin.check()
         store.publication_finish(request.key, request.claim, plan, index.sha256)
@@ -476,8 +541,6 @@ def main() -> int:
             "resolution_unavailable",
         )
         parser = argparse.ArgumentParser(allow_abbrev=False)
-        from pathlib import Path
-
         parser.add_argument("--stage", type=Path, required=True)
         args = parser.parse_args()
         root, supply = read_root_configuration(), read_supply_configuration()
@@ -493,7 +556,7 @@ def main() -> int:
                 pin.check()
         status = asyncio.run(
             execute_resolution(request, policy=load_broker_policy(), root=root, supply=supply,
-                lease_witness=ResolutionLeaseWitness(args.stage, request))
+                lease_witness=ResolutionLeaseWitness(args.stage, request), stage=args.stage)
         )
         need(status.key == request.key, "resolution_response_invalid")
         print(status.model_dump_json(), flush=True)

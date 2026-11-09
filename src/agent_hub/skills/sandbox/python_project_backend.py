@@ -25,6 +25,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Literal, Never, cast
 
 from agent_hub.capabilities.project_baselines import ProjectBaselineReference, StoredProjectBaseline
+from agent_hub.capabilities.python_original_metadata import StandardPythonIntentError
 from agent_hub.capabilities.python_project_input_store import _capture
 from agent_hub.capabilities.python_project_inputs import (
     PythonInterpreterIdentity,
@@ -52,6 +53,10 @@ from agent_hub.skills.sandbox.project_contract_broker import (
     _stamp,
     _write_all,
     stage_original_contract,
+)
+from agent_hub.skills.sandbox.python_original_root_recipe import (
+    resolve_standard_original_inputs,
+    standard_original_intent,
 )
 from agent_hub.skills.sandbox.python_premodel_retirement import (
     PythonStoppedPremodelMaintenanceRequest,
@@ -126,6 +131,7 @@ from agent_hub.skills.sandbox.python_project_wheel_stage import (
     stage_python_project_wheels,
     verify_staged_python_wheels,
 )
+from agent_hub.skills.sandbox.python_registry_protocol import ResolutionError
 from agent_hub.subprocess_cleanup import ProcessCleanupIncomplete
 
 _Request = (
@@ -500,15 +506,28 @@ def _measured_inputs(
         "python_project_recipe_unavailable",
     )
     maximum = min(_MAX_RECIPE_CONTROL, invocation.source_limit_bytes)
-    controls = {
-        name: _read_no_links(original.snapshot, (name,), max_bytes=maximum)
-        for name in ("pyproject.toml", "requirements.lock")
-    }
-    declaration = parse_python_project_declaration(
-        controls["pyproject.toml"],
-        controls["requirements.lock"],
-        max_control_bytes=maximum,
-        max_requirements=1000,
+    manifest = _read_no_links(original.snapshot, ("pyproject.toml",), max_bytes=maximum)
+    try:
+        intent = standard_original_intent(original, manifest)
+        private = (resolve_standard_original_inputs(
+                   original, intent, config, deadline=deadline, invocation=base_python_invocation(invocation))
+                   if intent is not None else None)
+    except StandardPythonIntentError as error:
+        code = str(error)
+        if code == "python_original_catalog_incomplete":
+            raise PythonProjectBackendError("python_original_catalog_incomplete") from None
+        if code == "python_original_catalog_unavailable":
+            raise PythonProjectBackendError("python_original_catalog_unavailable") from None
+        if code == "python_original_catalog_untrusted":
+            raise PythonProjectBackendError("python_original_catalog_untrusted") from None
+        raise PythonProjectBackendError("python_project_recipe_unavailable") from None
+    except ResolutionError as error:
+        if str(error) == "resolution_deadline":
+            raise TimeoutError from None
+        raise PythonProjectBackendError("python_project_recipe_unavailable") from None
+    declaration = private.declaration if private is not None else parse_python_project_declaration(
+        manifest, _read_no_links(original.snapshot, ("requirements.lock",), max_bytes=maximum),
+        max_control_bytes=maximum, max_requirements=1000,
     )
     try:
         runtime = observe_python_distribution(
@@ -541,8 +560,10 @@ def _measured_inputs(
         wheels=wheels,
         max_control_bytes=maximum,
         max_requirements=1000,
+        private_declaration=private.declaration if private is not None else None,
     )
     _need(result.declaration == declaration, "python_project_recipe_unavailable")
+    _need(private is None or result.wheels == private.wheels, "python_project_wheel_integrity")
     _check(deadline)
     return result
 
@@ -1463,6 +1484,11 @@ def _run(
             environment_storage=storage,
             generated_manifest_sha256=(cast(str, prepared.original.generated_metadata["manifest_sha256"])
                 if prepared.original.generated_metadata is not None else None),
+            private_lock_sha256=(prepared.inputs.declaration.lock_sha256
+                if standard_original_intent(prepared.original, _read_no_links(
+                    prepared.original.snapshot, ("pyproject.toml",),
+                    max_bytes=min(_MAX_RECIPE_CONTROL, invocation.source_limit_bytes),
+                )) is not None else None),
         )
         plan_path = _write_plan(plan, roots.stage_fd, stage)
         export = _make_export(roots.stage_fd, stage)

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import cast
 
 from agent_hub.skills.sandbox import python_dependency_index_store as indexes
@@ -12,7 +12,12 @@ from agent_hub.skills.sandbox.python_input_supply_catalog import (
     read_supply_configuration,
 )
 from agent_hub.skills.sandbox.python_project_backend import read_root_configuration
-from agent_hub.skills.sandbox.python_registry_protocol import digest, need, require_sha
+from agent_hub.skills.sandbox.python_registry_protocol import (
+    ResolutionDescriptor,
+    digest,
+    need,
+    require_sha,
+)
 from agent_hub.skills.sandbox.python_resolution_protocol import (
     ResolutionClaim,
     ResolutionPlan,
@@ -127,9 +132,18 @@ def has_overlay(
     )
 
 
-def effective_supply(
+@dataclass(frozen=True, slots=True)
+class PublishedResolution:
+    supply: RootSupplyConfig
+    descriptor: ResolutionDescriptor
+    claim: ResolutionClaim
+    plan_sha256: str
+    descriptor_sha256: str
+
+
+def verified_resolution_publication(
     base: RootSupplyConfig, invocation: ProjectInvocation, *, source_sha256: str, deadline: float
-) -> RootSupplyConfig:
+) -> PublishedResolution | None:
     """Re-read Root evidence for this scope/source, without adopting its old authority.
 
     The caller supplies a Root-observed draft hash, or a verified original contract
@@ -145,7 +159,7 @@ def effective_supply(
     attempt = _read(store, _name(scope, "attempt"), deadline)
     if binding is None:
         need(attempt is None, "resolution_overlay_pending")
-        return base
+        return None
     need(
         type(binding) is dict
         and set(binding)
@@ -232,4 +246,11 @@ def effective_supply(
         "resolution_overlay_catalog",
     )
     _check(deadline)
-    return effect
+    return PublishedResolution(effect, descriptor, original, plan_sha, plan.descriptor_sha256)
+
+
+def effective_supply(
+    base: RootSupplyConfig, invocation: ProjectInvocation, *, source_sha256: str, deadline: float
+) -> RootSupplyConfig:
+    result = verified_resolution_publication(base, invocation, source_sha256=source_sha256, deadline=deadline)
+    return replace(base) if result is None else result.supply

@@ -19,10 +19,20 @@ from uuid import UUID
 
 import pytest
 
+from agent_hub.capabilities.project_baselines import ProjectBaselineReference, StoredProjectBaseline
+from agent_hub.capabilities.project_contracts import build_project_check_contract
+from agent_hub.capabilities.python_input_preparation import validate_supply_declaration
+from agent_hub.skills.sandbox import python_dependency_inspection, python_original_root_recipe
+from agent_hub.skills.sandbox.python_dependency_metadata import PythonDependencyMetadataIndex
 from agent_hub.skills.sandbox.python_input_fetch import WheelDownload
 from agent_hub.skills.sandbox.python_project_protocol import PythonProjectProbeInvocation
 from agent_hub.skills.sandbox.python_project_wheel_cache import PythonWheelCacheError, _Code
 from tests.unit.capabilities.test_python_project_recipe import LOCK, MANIFEST
+from tests.unit.capabilities.test_standard_python_original_intent import FILES
+from tests.unit.capabilities.test_standard_python_original_intent import (
+    MANIFEST as STANDARD_MANIFEST,
+)
+from tests.unit.capabilities.test_standard_python_private_recipe import ENVIRONMENT, _wheel
 from tests.unit.skills.sandbox.test_python_project_backend import configuration_payload
 from tests.unit.skills.sandbox.test_python_project_staging import fixture
 
@@ -155,6 +165,49 @@ def test_empty_cache_plan_binds_measured_inputs_and_full_selected_total(api: Any
     assert planned.calls == [w.name for w in catalog()]
     with pytest.raises((AttributeError, TypeError)):
         result.downloads = ()
+
+
+def test_standard_original_missing_cached_wheel_produces_exact_bound_download(
+    planned: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    snapshot = tmp_path / "standard"
+    snapshot.mkdir()
+    content = dict.fromkeys(FILES, b"pass\n") | {"pyproject.toml": STANDARD_MANIFEST}
+    for name, data in content.items():
+        path = snapshot / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+    files = {name: hashlib.sha256(b"f\0" + data).hexdigest() for name, data in content.items()}
+    source_sha = hashlib.sha256(json.dumps(files, sort_keys=True, separators=(",", ":")).encode("ascii")).hexdigest()
+    invocation = planned.invocation
+    contract = build_project_check_contract(
+        tenant_id=invocation.tenant_id, run_id=invocation.run_id, project_id=invocation.project_id,
+        session_id=invocation.session_id, input_source_sha256=source_sha,
+        editable_paths=("src/expense_cli/cli.py",), source_files=files,
+    )
+    reference = ProjectBaselineReference("a" * 64, source_sha, len(files))
+    original = StoredProjectBaseline(reference, contract, snapshot, files)
+    invocation = PythonProjectProbeInvocation.model_validate({
+        **invocation.model_dump(), "original_reference": reference.to_payload(),
+    }, strict=True)
+    wheels = (_wheel("click", "8.1.8"), _wheel("setuptools", "80.9.0"), _wheel("wheel", "0.45.1"))
+    supply = replace(planned.supply, catalog=tuple(item.candidate.download for item in wheels), max_total_bytes=4096)
+    index = PythonDependencyMetadataIndex(supply.digest, tuple(item.metadata for item in wheels))
+    monkeypatch.setattr(python_original_root_recipe, "read_dependency_metadata_index", lambda *args, **kwargs: index)
+    monkeypatch.setattr(python_dependency_inspection, "_target_environment", lambda config: {
+        **ENVIRONMENT, "python_full_version": config.interpreter.version,
+        "implementation_version": config.interpreter.version,
+    })
+    result = planned.run(original=original, invocation=invocation, supply=supply)
+    validate_supply_declaration(result.plan, invocation, original)
+    assert result.downloads == supply.catalog
+    assert result.plan.manifest_sha256 == hashlib.sha256(STANDARD_MANIFEST).hexdigest()
+    assert result.plan.catalog_sha256 == supply.digest
+    assert not (snapshot / "requirements.lock").exists()
+    assert (snapshot / "pyproject.toml").read_bytes() == STANDARD_MANIFEST
+    tampered = result.plan.model_copy(update={"lock_sha256": "0" * 64})
+    with pytest.raises(ValueError, match="input_supply_plan_changed"):
+        validate_supply_declaration(tampered, invocation, original)
 
 
 def test_missing_is_not_plan_identity_or_an_approval_change(

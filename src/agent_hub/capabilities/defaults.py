@@ -636,11 +636,33 @@ async def _project_resolution_preparation_effect(
         if not callable(getter):
             return PolicyEffect.DENY
         record = await getter(checked.tenant_id, checked.run_id)
-        scope = metadata_scope(record, actor=checked.agent_id, live=True)
         authority = get_verification_authority(tenant_id=checked.tenant_id, run_id=checked.run_id,
             user_id=checked.user_id, role=role, current_record=record)
         context, worker = _trusted_review_context(tenant_id=checked.tenant_id, run_id=checked.run_id,
             user_id=checked.user_id, role=role, current_record=record)
+        if "protected_original" in checked.arguments:
+            from agent_hub.capabilities.python_resolution_authorization import (
+                original_resolution_scope,
+                validate_resolution_authorization,
+            )
+            from agent_hub.runs.original_python_resolution import (
+                _timeout as _original_resolution_timeout,
+            )
+            from agent_hub.skills.sandbox.python_resolution_protocol import (
+                ProtectedOriginalResolutionSource,
+            )
+
+            args = validate_resolution_authorization(checked).arguments
+            source = ProtectedOriginalResolutionSource.model_validate(args["protected_original"], strict=True)
+            scope = original_resolution_scope(record, actor=checked.agent_id, source=source, live=True)
+            deadline = record.created_at + timedelta(seconds=_original_resolution_timeout(record))
+            if (authority.actor != scope.actor or record.worker_id != worker
+                    or record.worker_lease_token != authority.execution_token
+                    or args["permissions_sha256"] != scope.permissions_sha256
+                    or deadline <= datetime.now(UTC) or args["original_deadline"] != deadline.isoformat()):
+                return PolicyEffect.DENY
+            return PolicyEffect.REQUIRE_APPROVAL
+        scope = metadata_scope(record, actor=checked.agent_id, live=True)
         live = generated_authority(record, checked.tenant_id, checked.run_id)
         permissions = record.routing_decision.get('requested_permissions', ())
         if (authority.actor != checked.agent_id or record.actor_role is not role

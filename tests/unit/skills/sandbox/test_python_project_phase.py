@@ -147,6 +147,28 @@ def test_install_bootstraps_then_installs_hash_locked_binary_closure(isolated: P
     assert result['phase'] == 'install'
 
 
+def test_standard_install_uses_only_hash_verified_private_lock(
+    isolated: PhaseModule, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    source_lock = isolated._WORKSPACE / 'requirements.lock'
+    source_lock.unlink()
+    private_lock = tmp_path / 'trusted' / 'requirements.lock'
+    private_lock.parent.mkdir()
+    private_lock.write_bytes(b'click==8.1.8 --hash=sha256:' + b'a' * 64 + b'\n')
+    monkeypatch.setattr(isolated, '_PRIVATE_LOCK', private_lock, raising=False)
+    command = ['install', '--import-module', 'sample', '--private-lock-sha256']
+    digest = hashlib.sha256(private_lock.read_bytes()).hexdigest()
+    assert isolated.main([*command, digest]) == 0
+    assert process_mock(isolated).call_args_list[1].args[0][-2:] == ['-r', str(private_lock)]
+    assert not source_lock.exists()
+    process_mock(isolated).reset_mock()
+    private_lock.write_bytes(b'tampered')
+    assert isolated.main([*command, digest]) == 1
+    process_mock(isolated).assert_not_called()
+    assert 'phase_failed' in capsys.readouterr().out
+
+
 def test_reused_environment_is_checked_without_venv_or_install(isolated: PhaseModule) -> None:
     result = isolated.run_phase('check_environment', import_module='sample.api')
     assert result == {'phase': 'check_environment', 'evidence': 'native_process_only',

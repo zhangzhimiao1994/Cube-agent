@@ -20,6 +20,7 @@ from contextlib import ExitStack
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Literal
 
+from agent_hub.capabilities.python_dependency_closure import PythonWheelMetadata
 from agent_hub.skills.sandbox.python_dependency_metadata import (
     PythonDependencyMetadataIndex,
     extract_python_wheel_metadata,
@@ -326,8 +327,9 @@ def _publish(parent: int, name: str, value: PythonDependencyMetadataIndex,
 
 def publish_dependency_metadata_index(
     root: RootConfig, supply: RootSupplyConfig, *, deadline: float | None = None,
+    reuse_unchanged_from: RootSupplyConfig | None = None,
 ) -> PythonDependencyMetadataIndex:
-    """Explicit Root publisher: verify every configured local wheel, never fetch."""
+    """Publish Root-measured metadata; optionally reuse exact existing base records."""
     try:
         deadline = _bounded_deadline(deadline, _PUBLISH_SECONDS)
         _native()
@@ -346,11 +348,14 @@ def publish_dependency_metadata_index(
             parent = _state(configured, stack, pins, exclusive=True, deadline=deadline)
             wheel_pins: list[_DirectoryPin] = []
             files: list[tuple[int, str, tuple[int, ...]]] = []
+            base_pin: _FilePin | None = None
 
             def check() -> None:
                 _same_supply(supply, digest)
                 _need(root.to_payload() == configured_root.to_payload())
                 _directories(pins + wheel_pins, deadline)
+                if base_pin is not None:
+                    base_pin.check()
                 for directory, filename, identity in files:
                     _check(deadline)
                     _need(_stamp(os.stat(filename, dir_fd=directory, follow_symlinks=False)) == identity)
@@ -363,14 +368,25 @@ def publish_dependency_metadata_index(
                 check()
                 file_pin.check()
                 return existing
+            records: list[PythonWheelMetadata] = []
+            required = configured.catalog
+            if reuse_unchanged_from is not None:
+                base = _supply(reuse_unchanged_from)
+                _need(replace(configured, catalog=base.catalog) == base and base.digest != digest)
+                base_index, base_pin = _read_index(
+                    parent, "dependency-metadata-" + base.digest + ".json", base, stack, deadline,
+                )
+                old = set(base.catalog)
+                reusable = {entry.filename for entry in configured.catalog if entry in old}
+                records.extend(item for item in base_index.records if item.wheel.filename in reusable)
+                required = tuple(entry for entry in configured.catalog if entry.filename not in reusable)
             check()
-            _need(sum(entry.size_bytes for entry in configured.catalog) <= configured_root.wheel_max_bytes)
+            _need(sum(entry.size_bytes for entry in required) <= configured_root.wheel_max_bytes)
             cache = _directory(configured_root.wheel_root, stack, wheel_pins)
             state_id, cache_id = _stamp(os.fstat(parent))[:2], _stamp(os.fstat(cache))[:2]
             _need(state_id not in {pin[3][:2] for pin in wheel_pins}
                   and cache_id not in {pin[3][:2] for pin in pins})
-            records = []
-            for entry in configured.catalog:
+            for entry in required:
                 check()
                 with ExitStack() as wheel_stack:
                     raw, wheel_pin = _read_file(cache, entry.filename, entry.size_bytes, wheel_stack,

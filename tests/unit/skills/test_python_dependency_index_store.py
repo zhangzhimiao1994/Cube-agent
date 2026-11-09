@@ -540,6 +540,22 @@ def test_existing_correct_index_is_reused_even_with_no_wheels(api: Any, simulate
     assert not any(event in {"write", "link", "unlink", "create"} for event, _ in simulated.fs.events)
 
 
+def test_protected_original_overlay_reuses_verified_base_without_requiring_unrelated_cache_bytes(
+    api: Any, simulated: Any,
+) -> None:
+    prior = install_index(simulated)
+    addition, raw = wheel(name="new-dependency")
+    base = simulated.supply
+    overlay = replace(base, catalog=(*base.catalog, addition))
+    simulated.fs.add(WHEELS + "/" + addition.filename, stat.S_IFREG | 0o444, raw)
+    result = api.publish_dependency_metadata_index(simulated.root, overlay, reuse_unchanged_from=base)
+    result.require_catalog(overlay.catalog, overlay.digest)
+    assert {row.wheel.name for row in result.records} == {"demo-pkg", "new-dependency"}
+    assert simulated.fs.nodes[final_path(base)] is prior
+    assert ("open", WHEELS + "/" + base.catalog[0].filename) not in simulated.fs.events
+    assert ("open", WHEELS + "/" + addition.filename) in simulated.fs.events
+
+
 @pytest.mark.parametrize("raw,code", [(b"{", "metadata_untrusted"), (b"", "metadata_untrusted")])
 def test_publisher_never_replaces_bad_existing_index(api: Any, simulated: Any, raw: bytes, code: str) -> None:
     original = install_index(simulated, raw)

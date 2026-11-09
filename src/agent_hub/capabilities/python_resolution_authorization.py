@@ -2,13 +2,14 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import re
 from collections.abc import Awaitable, Callable, Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
-from datetime import datetime
-from typing import TYPE_CHECKING, cast
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING, Literal, cast
 from uuid import UUID
 
 from agent_hub.capabilities.policy import normalize_resource
@@ -23,6 +24,10 @@ from agent_hub.skills.sandbox.python_registry_protocol import (
 
 if TYPE_CHECKING:
     from agent_hub.capabilities.gateway import CapabilityResult
+    from agent_hub.skills.sandbox.python_metadata_plan_protocol import PythonMetadataScope
+    from agent_hub.skills.sandbox.python_resolution_protocol import (
+        ProtectedOriginalResolutionSource,
+    )
 
 PREFIX = "workspace/current/project-resolution/python/"
 _FIELDS = {"purpose", "key", "source_sha256", "root_sha256", "catalog_sha256", "permissions_sha256",
@@ -149,6 +154,80 @@ async def resolution_policy_allowed(request: CapabilityRequest) -> bool | None:
         binding.busy = False
 
 
+def _protected_original_source(arguments: Mapping[str, object]) -> ProtectedOriginalResolutionSource:
+    from agent_hub.skills.sandbox.python_resolution_protocol import (
+        ProtectedOriginalResolutionSource,
+    )
+
+    raw = arguments["protected_original"]
+    source = ProtectedOriginalResolutionSource.model_validate(raw, strict=True)
+    if source.model_dump(mode="json") != raw or source.source_sha256 != arguments["source_sha256"]:
+        raise ValueError
+    return source
+
+
+def original_resolution_scope(
+    record: object, *, actor: str, source: ProtectedOriginalResolutionSource, live: bool = True,
+) -> PythonMetadataScope:
+    """Revalidate the locked original capture, without establishing approval."""
+    from agent_hub.auth.models import Role
+    from agent_hub.capabilities.project_baselines import ProjectBaselineReference
+    from agent_hub.capabilities.scoped_read import authorized_workspace_scope
+    from agent_hub.domain.runs import RunStatus
+    from agent_hub.runs.repository import RunRecord, _pre_model_original_capture
+    from agent_hub.skills.sandbox.python_metadata_plan_protocol import PythonMetadataScope
+    from agent_hub.skills.sandbox.python_resolution_protocol import (
+        ProtectedOriginalResolutionSource,
+    )
+
+    try:
+        if (type(record) is not RunRecord or actor != "main_agent" or type(actor) is not str
+                or type(source) is not ProtectedOriginalResolutionSource or type(live) is not bool):
+            raise ValueError
+        source = ProtectedOriginalResolutionSource.model_validate(source, strict=True)
+        route = record.routing_decision
+        role, user_id = record.actor_role, record.actor_id
+        if (type(role) is not Role or role not in {Role.OPERATOR, Role.ADMIN, Role.SUPER_ADMIN}
+                or type(user_id) is not UUID or not isinstance(route, Mapping)
+                or not _pre_model_original_capture(route)):
+            raise ValueError
+        capture = route["project_input_preparation"]
+        if (not isinstance(capture, Mapping) or capture["schema_version"] != 1
+                or ProjectBaselineReference.from_payload(capture["reference"]).to_payload()
+                != source.original_reference.model_dump(mode="json")):
+            raise ValueError
+        if record.status is RunStatus.RUNNING:
+            worker, expires = record.worker_id, record.worker_lease_expires_at
+            if (type(worker) is not str or not worker.strip() or worker != worker.strip()
+                    or type(record.worker_lease_token) is not UUID
+                    or not isinstance(expires, datetime) or expires.tzinfo is None
+                    or expires <= datetime.now(UTC)):
+                raise ValueError
+        elif (live or record.status not in {RunStatus.WAITING_APPROVAL, RunStatus.QUEUED}
+                or any(value is not None for value in (record.worker_id, record.worker_lease_token,
+                       record.worker_lease_expires_at, record.worker_heartbeat_at))):
+            raise ValueError
+        project, session = authorized_workspace_scope(record, tenant_id=record.tenant_id, run_id=record.id)
+        permissions = route["requested_permissions"]
+        backend = route.get("execution_backend", "systemd")
+        if (route["sandbox_profile"] != "workspace_write" or backend != "systemd"
+                or not isinstance(permissions, (tuple, list))
+                or not {"workspace.read", "workspace.write", "command.run"} <= set(permissions)
+                or type(record.request) is not str):
+            raise ValueError
+        return PythonMetadataScope(
+            tenant_id=record.tenant_id, run_id=record.id, user_id=user_id, actor=actor,
+            project_id=project, session_id=session,
+            actor_role=cast(Literal["operator", "admin", "super_admin"], role.value),
+            request_sha256=hashlib.sha256(record.request.encode("utf-8")).hexdigest(),
+            permissions_sha256=digest({"sandbox_profile": "workspace_write",
+                                       "execution_backend": backend,
+                                       "permissions": sorted(set(permissions))}),
+        )
+    except (ValueError, TypeError, KeyError, AttributeError, RuntimeError, OverflowError, RecursionError):
+        raise InvalidResolutionAuthorization("project verification scope is not authorized") from None
+
+
 def validate_resolution_authorization(
     request: CapabilityRequest, *, expected: CapabilityRequest | None = None,
 ) -> CapabilityRequest:
@@ -159,6 +238,13 @@ def validate_resolution_authorization(
         args = checked.arguments
         fields = _FIELDS | ({"plan_sha256", "artifacts"} if args.get("purpose") == "python_dependency_publication"
                             else set())
+        if "protected_original" in args:
+            fields |= {"protected_original"}
+            key = args["key"]
+            if (type(key) is not str or checked.agent_id != "main_agent"
+                    or checked.idempotency_key != "resolution-" + key):
+                raise ValueError
+            _protected_original_source(args)
         if (checked.tool_origin != "builtin" or (checked.capability, checked.operation) != ("command", "run")
                 or normalize_resource(checked.resource) != checked.resource
                 or re.fullmatch(re.escape(PREFIX) + r"[a-f0-9]{64}", checked.resource) is None
@@ -226,30 +312,59 @@ def resolution_approval_binding(record: object, request: CapabilityRequest) -> d
     from agent_hub.capabilities.python_metadata_preparation import metadata_scope
 
     checked = validate_resolution_authorization(request)
-    scope = metadata_scope(record, actor=checked.agent_id, live=True)
+    if "protected_original" in checked.arguments:
+        scope = original_resolution_scope(
+            record, actor=checked.agent_id, source=_protected_original_source(checked.arguments),
+        )
+        # Keep the hashed arguments so an approved read can verify the resource
+        # against the exact snapshot, even after the original lease is cleared.
+        binding = {"schema_version": 2, "arguments": checked.model_dump(mode="json")["arguments"]}
+    else:
+        scope = metadata_scope(record, actor=checked.agent_id, live=True)
+        binding = {"schema_version": 1}
     if ((scope.tenant_id, scope.run_id, scope.user_id) != (checked.tenant_id, checked.run_id, checked.user_id)
             or checked.arguments['permissions_sha256'] != scope.permissions_sha256):
         raise InvalidResolutionAuthorization('project verification scope is not authorized')
-    return {'schema_version': 1, 'scope': scope.model_dump(mode='json'), 'resource': checked.resource}
+    return {**binding, 'scope': scope.model_dump(mode='json'), 'resource': checked.resource}
 
 
 def resolution_binding_matches(record: object, binding: object, approval_scope: object) -> bool:
     from agent_hub.capabilities.python_metadata_preparation import metadata_scope
 
     try:
-        if (not isinstance(binding, Mapping) or set(binding) != {'schema_version', 'scope', 'resource'}
-                or type(binding['schema_version']) is not int or binding['schema_version'] != 1
-                or not isinstance(binding['scope'], Mapping)):
+        if (not isinstance(binding, Mapping)
+                or type(binding.get('schema_version')) is not int
+                or not isinstance(binding.get('scope'), Mapping)):
             return False
         actor = binding['scope'].get('actor')
         if type(actor) is not str:
             return False
-        current = metadata_scope(record, actor=actor)
+        fields = {'schema_version', 'scope', 'resource'}
+        if binding['schema_version'] == 2 and set(binding) == fields | {'arguments'}:
+            args = binding['arguments']
+            resource_value = binding['resource']
+            if type(args) is not dict or type(resource_value) is not str:
+                return False
+            current = original_resolution_scope(
+                record, actor=actor, source=_protected_original_source(args), live=False,
+            )
+            request = CapabilityRequest(
+                tenant_id=current.tenant_id, run_id=current.run_id, user_id=current.user_id,
+                agent_id=actor, capability="command", operation="run", resource=resource_value,
+                arguments=args, idempotency_key="resolution-" + args["key"],
+            )
+            validate_resolution_authorization(request)
+            if args["permissions_sha256"] != current.permissions_sha256:
+                return False
+        elif binding['schema_version'] == 1 and set(binding) == fields:
+            current = metadata_scope(record, actor=actor)
+        else:
+            return False
         resource = resolution_scope_resource(approval_scope, tenant_id=current.tenant_id,
             user_id=current.user_id, run_id=current.run_id)
         return (resource is not None and resource == binding['resource']
                 and approval_scope == (f'capability-scope:v1:tenant={current.tenant_id}:user={current.user_id}:'
                     f'run={current.run_id}:capability=command:operation=run:resource={resource}:agent={actor}')
                 and binding['scope'] == current.model_dump(mode='json'))
-    except (ValueError, TypeError, AttributeError, KeyError, RuntimeError):
+    except (ValueError, TypeError, AttributeError, KeyError, RuntimeError, OverflowError, RecursionError):
         return False

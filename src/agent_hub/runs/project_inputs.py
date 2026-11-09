@@ -68,7 +68,8 @@ class OriginalProjectApprovalPending(RuntimeError):
     """Captured inputs are durable; no model or project command has started."""
 
     def __init__(self, approval_id: str, preparation: Mapping[str, JsonValue], *,
-                 supply_binding: Mapping[str, JsonValue] | None = None) -> None:
+                 supply_binding: Mapping[str, JsonValue] | None = None,
+                 resolution_scope: str | None = None) -> None:
         super().__init__('original project preparation authorization pending')
         if re.fullmatch(r'approval_[a-zA-Z0-9_-]{1,100}', approval_id) is None:
             raise ValueError(_FAILURE)
@@ -76,6 +77,9 @@ class OriginalProjectApprovalPending(RuntimeError):
         self.preparation = _freeze_object(preparation, name='original project approval capture')
         self.supply_binding = None if supply_binding is None else _freeze_object(
             supply_binding, name='original input supply approval')
+        if resolution_scope is not None and supply_binding is not None:
+            raise ValueError(_FAILURE)
+        self.resolution_scope = resolution_scope
 
     def matches(self, record: RunRecord, context: TaskContext) -> bool:
         route = record.routing_decision
@@ -96,6 +100,16 @@ class OriginalProjectApprovalPending(RuntimeError):
                                       name='original scope')):
             return False
         resource = 'workspace/current/project-verification'
+        if self.resolution_scope is not None:
+            from agent_hub.capabilities.python_resolution_authorization import (
+                resolution_scope_resource,
+            )
+
+            selected = resolution_scope_resource(self.resolution_scope,
+                tenant_id=record.tenant_id, user_id=record.actor_id, run_id=record.id)
+            return (self.preparation['schema_version'] == 1 and selected is not None
+                and self.resolution_scope.endswith(':agent=main_agent')
+                and route.get('approval_scope') == self.resolution_scope)
         if self.supply_binding is not None:
             try:
                 from agent_hub.capabilities.python_input_preparation import input_supply_binding
@@ -366,9 +380,52 @@ class OriginalProjectPreparer:
                     python_inputs = await self.verifier.prepare_python_original(
                         invocation=probe_invocation, reference=reference)
                 except ProjectVerificationError as error:
-                    if type(error) is not ProjectVerificationError or str(error) != 'python_project_wheel_missing':
+                    if type(error) is not ProjectVerificationError:
                         raise
-                    missing = True
+                    if str(error) == 'python_original_catalog_incomplete':
+                        if self.artifact_repository is None:
+                            raise ProjectVerificationError(
+                                'project verification failed: blocked prerequisites (backend=python_original_catalog_incomplete)',
+                            ) from None
+                        from agent_hub.capabilities.python_input_preparation import InspectOnlyError
+                        from agent_hub.capabilities.python_resolution_preparation import (
+                            ResolutionApprovalRequired,
+                        )
+                        from agent_hub.runs.original_python_resolution import (
+                            resolve_missing_original_python_inputs,
+                        )
+
+                        try:
+                            await resolve_missing_original_python_inputs(
+                                context=context, stored=stored, preparation=state, invocation=probe_invocation,
+                                repository=self.repository, authorizer=self.authorizer,
+                                artifacts=self.artifact_repository, deadline=started + context.timeout_seconds,
+                            )
+                        except InspectOnlyError:
+                            raise ProjectVerificationError(
+                                'project verification failed: resolution inspect only',
+                            ) from None
+                        except ResolutionApprovalRequired:
+                            raise ProjectVerificationError('project verification failed: capability denied') from None
+                        remaining = started + context.timeout_seconds - asyncio.get_running_loop().time()
+                        if remaining < 1:
+                            raise TimeoutError('original project preparation exhausted its time budget') from None
+                        python_inputs = await self.verifier.prepare_python_original(
+                            invocation=probe_invocation.model_copy(update={
+                                'execution_id': 'python_probe_' + uuid4().hex,
+                                'timeout_seconds': int(remaining),
+                            }), reference=reference,
+                        )
+                        if python_inputs is None or await self._state(context) != state:
+                            raise RunConflict(_FAILURE)
+                    elif str(error) in {'python_original_catalog_unavailable', 'python_original_catalog_untrusted'}:
+                        raise ProjectVerificationError(
+                            f'project verification failed: blocked prerequisites (backend={error})',
+                        ) from None
+                    elif str(error) != 'python_project_wheel_missing':
+                        raise
+                    else:
+                        missing = True
             if python_inputs is None and missing:
                 captured_state = state
 

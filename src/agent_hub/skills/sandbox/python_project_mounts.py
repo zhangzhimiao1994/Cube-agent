@@ -7,6 +7,7 @@ is reconstructed read-only before phase-specific writable mounts are added.
 
 from __future__ import annotations
 
+import hashlib
 import keyword
 import os
 import re
@@ -112,7 +113,6 @@ def _pin_directory(path: Path, stack: ExitStack, pins: list[_Pinned]) -> int:
 def _seal_script(path: Path, stack: ExitStack, pins: list[_Pinned]) -> int:
     if sys.platform != 'linux':
         raise ValueError('python_project_mounts_rejected')
-    import fcntl
 
     parent = _pin_directory(path.parent, stack, pins)
     descriptor = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=parent)
@@ -133,7 +133,15 @@ def _seal_script(path: Path, stack: ExitStack, pins: list[_Pinned]) -> int:
     data = b''.join(chunks)
     _need(len(data) == before.st_size and _file_stamp(os.fstat(descriptor)) == _file_stamp(before)
         and _file_stamp(os.stat(path.name, dir_fd=parent, follow_symlinks=False)) == _file_stamp(before))
-    sealed = os.memfd_create('python-project-phase', os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
+    return _seal_data(data, 'python-project-phase', stack)
+
+
+def _seal_data(data: bytes, label: str, stack: ExitStack) -> int:
+    if sys.platform != 'linux':
+        raise ValueError('python_project_mounts_rejected')
+    import fcntl
+
+    sealed = os.memfd_create(label, os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
     stack.callback(os.close, sealed)
     remaining = memoryview(data)
     while remaining:
@@ -163,7 +171,7 @@ def _closed_execution(command: tuple[str, ...], descriptors: tuple[int, ...], cl
 def build_python_phase_mounts(
     phase: str, *, work_root: Path, runtime_root: Path, wheel_root: Path,
     environment_root: Path, output_root: Path, phase_script: Path, import_module: str,
-    contract_arguments: Mapping[str, object],
+    contract_arguments: Mapping[str, object], private_lock: bytes | None = None,
 ) -> Iterator[PythonPhaseMountPlan]:
     _need(sys.platform == 'linux'
         and os.environ.get('AGENT_HUB_GENERATED_PROJECT_VALIDATION_SANDBOX') == 'systemd')
@@ -173,6 +181,8 @@ def build_python_phase_mounts(
     _need(not any(phase_script.is_relative_to(root) for root in (work_root, environment_root, output_root)))
     _need(contract_arguments.get('work_root') == work_root
         and contract_arguments.get('ephemeral_dirs', ()) == ())
+    _need(private_lock is None or phase == 'install' and type(private_lock) is bytes
+          and 0 < len(private_lock) <= 256 * 1024)
     support = runpy.run_path(str(Path(__file__).with_name('project_contract_mounts.py')))
     with ExitStack() as stack:
         pins: list[_Pinned] = []
@@ -192,8 +202,15 @@ def build_python_phase_mounts(
                 environment_fd=environment_fd, output_fd=output_fd, phase_fd=script_fd, import_module=import_module)
             boundary = phase_args.index('--')
             inherited = (*source.pass_fds, runtime_fd, wheel_fd, environment_fd, output_fd, script_fd)
-            argv = (*source.argv[:split], *phase_args[:boundary],
-                *_closed_execution(phase_args[boundary + 1:], inherited, support['_CLOSE_FDS_AND_EXEC']))
+            auxiliary = phase_args[:boundary]
+            command = phase_args[boundary + 1:]
+            if private_lock is not None:
+                lock_fd = _seal_data(private_lock, 'python-project-private-lock', stack)
+                auxiliary += ('--perms', '0444', '--ro-bind-data', str(lock_fd), '/trusted/requirements.lock')
+                inherited += (lock_fd,)
+                command += ('--private-lock-sha256', hashlib.sha256(private_lock).hexdigest())
+            argv = (*source.argv[:split], *auxiliary,
+                *_closed_execution(command, inherited, support['_CLOSE_FDS_AND_EXEC']))
             yield PythonPhaseMountPlan(argv, inherited)
             for pin in pins:
                 pin.check()

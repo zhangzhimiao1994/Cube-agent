@@ -210,6 +210,29 @@ class HarnessToolGateway:
             payload = {'approval_id': result.approval_id}
         return self._failure(request, result.reason or _capability_failure_reason(result.status), payload=payload)
 
+    async def authorize_original_python_resolution(
+        self, action: CapabilityRequest, *, tenant_id: UUID, run_id: UUID, user_id: UUID, role: Role,
+    ) -> CapabilityResult:
+        """Authorize a trusted pre-model, exact registry action, never a model tool."""
+        from agent_hub.capabilities.approvals import exact_capability_approval
+        from agent_hub.capabilities.python_resolution_authorization import (
+            validate_resolution_authorization,
+        )
+
+        denied = CapabilityResult(CapabilityStatus.DENIED, run_id, reason='capability denied')
+        if self._policy_gateway is None or type(role) is not Role:
+            return denied
+        try:
+            checked = validate_resolution_authorization(action)
+            if (checked.tenant_id, checked.run_id, checked.user_id, checked.agent_id) != (
+                tenant_id, run_id, user_id, 'main_agent',
+            ) or 'protected_original' not in checked.arguments:
+                return denied
+            with exact_capability_approval(checked):
+                return await self._policy_gateway.invoke(checked, role=role)
+        except Exception:  # noqa: BLE001 - no registry dispatch or private reason on invalid authority.
+            return denied
+
     async def authorize_project_toolchain(
         self, tenant_id: UUID, request: HarnessToolCallRequest, *, user_id: UUID,
         role: Role, plan: ToolchainSupplyPlan, original_reference: ProjectBaselineReference,

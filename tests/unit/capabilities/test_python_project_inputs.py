@@ -58,6 +58,8 @@ def test_recipe_is_scoped_but_environment_inputs_are_not_issuance_identity(input
     assert first.sha256 != second.sha256
     assert first.environment_input_sha256 == second.environment_input_sha256
     assert first.environment_input_sha256 != first.sha256
+    assert first.sha256 == '07f91c56c68076b838cc3b847586c77532d29d39553d1ab217b49c969a3b0933'
+    assert first.environment_input_sha256 == '22e8bf5ffd1bf520ae08a16392fee6cc871fa0ea033f2fba50c3ce8cad3a6706'
     assert first.to_payload()['kind'] == 'python_offline_wheel_v1'
     assert inputs.PythonProjectInputs.from_payload(first.to_payload()) == first
 
@@ -117,3 +119,90 @@ def test_install_approval_is_recipe_specific_and_never_old_generic_scope(inputs:
     assert not first.matches_approval_request(next_request)
     altered = request.model_copy(update={'arguments': request.arguments | {'project_id': 'sibling'}})
     assert not first.matches_approval_request(altered)
+
+
+def _private_original_args(inputs: Any, *, protect_manifest: bool = True) -> dict[str, Any]:
+    from agent_hub.capabilities.python_original_metadata import standard_python_intent
+    from agent_hub.capabilities.python_original_private_recipe import (
+        derive_private_original_recipe, original_dependency_needs,
+    )
+    from tests.unit.capabilities.test_standard_python_original_intent import (
+        FILES, MANIFEST as STANDARD_MANIFEST, PROTECTED,
+    )
+    from tests.unit.capabilities.test_standard_python_private_recipe import ENVIRONMENT, _descriptor
+
+    source_files = {path: hashlib.sha256(b'f\0pass').hexdigest() for path in FILES}
+    source_files['pyproject.toml'] = hashlib.sha256(b'f\0' + STANDARD_MANIFEST).hexdigest()
+    source_sha = hashlib.sha256(json.dumps(source_files, sort_keys=True,
+        separators=(',', ':')).encode()).hexdigest()
+    intent = standard_python_intent(STANDARD_MANIFEST, paths=FILES, protected=PROTECTED)
+    assert intent is not None
+    descriptor = _descriptor()
+    scope = replace(descriptor.scope, source_sha256=source_sha)
+    descriptor = replace(descriptor, scope=scope, needs=original_dependency_needs(intent, ENVIRONMENT))
+    recipe = derive_private_original_recipe(
+        intent, descriptor, expected_scope=scope, verified_descriptor_sha256=descriptor.sha256,
+    )
+    editable = ('src/expense_cli/cli.py',) if protect_manifest else ('pyproject.toml', 'src/expense_cli/cli.py')
+    contract = build_project_check_contract(scope.tenant_id, scope.run_id, scope.project_id,
+        scope.session_id, source_sha, editable, source_files)
+    return dict(contract=contract, original_reference=ProjectBaselineReference('3' * 64, source_sha, len(FILES)),
+        declaration=recipe.declaration, interpreter=runtime(inputs, version='3.12.8'), wheels=recipe.wheels)
+
+
+def test_private_original_canonical_lock_round_trips_without_source_lock(inputs: Any) -> None:
+    values = _private_original_args(inputs)
+    result = inputs.PythonProjectInputs(**values)
+    assert 'requirements.lock' not in result.contract.protected_files
+    assert inputs.PythonProjectInputs.from_payload(result.to_payload()) == result
+    assert set(result.to_payload()) == set(bind(inputs).to_payload())
+
+
+def test_private_original_requires_protected_manifest(inputs: Any) -> None:
+    with pytest.raises(ValueError):
+        inputs.PythonProjectInputs(**_private_original_args(inputs, protect_manifest=False))
+
+
+@pytest.mark.parametrize('change', ['lock', 'second_hash', 'selected_wheel'])
+def test_resigned_private_payload_still_checks_canonical_lock_and_exact_wheels(inputs: Any, change: str) -> None:
+    from agent_hub.capabilities.python_original_private_recipe import canonical_original_lock
+    from agent_hub.capabilities.python_project_recipe import PythonProjectDeclaration
+
+    result = inputs.PythonProjectInputs(**_private_original_args(inputs))
+    payload = result.to_payload()
+    declaration = payload['declaration']
+    if change == 'lock':
+        declaration['lock_sha256'] = 'd' * 64
+    elif change == 'second_hash':
+        declaration['requirements'][0]['hashes'].append('f' * 64)
+        parsed = PythonProjectDeclaration.from_payload(declaration)
+        declaration['lock_sha256'] = hashlib.sha256(canonical_original_lock(parsed.requirements)).hexdigest()
+    else:
+        payload['wheels'][0]['sha256'] = 'd' * 64
+    binding = {key: value for key, value in payload.items()
+               if key not in {'recipe_sha256', 'environment_input_sha256'}}
+    payload['recipe_sha256'] = inputs._digest(binding)
+    payload['environment_input_sha256'] = inputs._digest({
+        'schema_version': 1, 'kind': 'python_offline_wheel_v1', 'interpreter': payload['interpreter'],
+        'wheels': [{key: wheel[key] for key in ('name', 'version', 'sha256')} for wheel in payload['wheels']],
+    })
+    with pytest.raises(ValueError):
+        inputs.PythonProjectInputs.from_payload(payload)
+
+
+def test_resigned_consistent_private_recipe_cannot_reuse_exact_install_approval(inputs: Any) -> None:
+    from agent_hub.capabilities.python_original_private_recipe import canonical_original_lock
+
+    original = inputs.PythonProjectInputs(**_private_original_args(inputs))
+    wheel, *others = original.wheels
+    pin, *pins = original.declaration.requirements
+    replacement = replace(wheel, sha256='e' * 64)
+    requirements = (replace(pin, hashes=(replacement.sha256,)), *pins)
+    declaration = replace(original.declaration, requirements=requirements,
+        lock_sha256=hashlib.sha256(canonical_original_lock(requirements)).hexdigest())
+    changed = replace(original, declaration=declaration, wheels=(replacement, *others))
+    decoded = inputs.PythonProjectInputs.from_payload(changed.to_payload())
+    approved = original.approval_request(user_id=UUID(int=3), agent_id='main_agent', idempotency_key='install')
+    proposal = decoded.approval_request(user_id=UUID(int=3), agent_id='main_agent', idempotency_key='install')
+    assert not decoded.matches_approval_request(approved)
+    assert capability_approval_scope(proposal) != capability_approval_scope(approved)

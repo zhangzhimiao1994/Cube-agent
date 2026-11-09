@@ -39,6 +39,7 @@ _ENVIRONMENT = Path('/environment')
 _WHEELHOUSE = Path('/wheelhouse')
 _WORKSPACE = Path('/workspace')
 _OUTPUT = Path('/output')
+_PRIVATE_LOCK = Path('/trusted/requirements.lock')
 _PHASES = ('install', 'check_environment', 'build', 'test')
 _GENERATED = 'generated_test_execution'
 _MANIFEST_LIMIT = 128 * 1024
@@ -103,9 +104,11 @@ def _mounts() -> None:
 def _regular(path: Path, *, sealed_input: bool = False) -> os.stat_result:
     info = path.lstat()
     # bwrap's read-only data mounts are anonymous sealed files (nlink0), not
-    # shared hardlinks. Permit them only for the reconstructed source mount.
+    # shared hardlinks. Permit them only at the reconstructed source or fixed
+    # private lock mount.
     _need(stat.S_ISREG(info.st_mode) and (info.st_nlink == 1
-        or sealed_input and info.st_nlink == 0 and path.is_relative_to(_WORKSPACE)))
+        or sealed_input and info.st_nlink == 0
+        and (path.is_relative_to(_WORKSPACE) or path == _PRIVATE_LOCK)))
     return info
 
 
@@ -139,15 +142,24 @@ def _pip(*arguments: str) -> None:
               '--isolated', *arguments])
 
 
-def _install() -> dict[str, object]:
+def _install(private_lock_sha256: str | None = None) -> dict[str, object]:
     _directory(_ENVIRONMENT, owned=True, empty=True)
-    _regular(_WORKSPACE / 'requirements.lock', sealed_input=True)
+    lock = _WORKSPACE / 'requirements.lock'
+    if private_lock_sha256 is not None:
+        _need(type(private_lock_sha256) is str and re.fullmatch(r'[a-f0-9]{64}', private_lock_sha256))
+        lock = _PRIVATE_LOCK
+        maximum = 256 * 1024
+        with _read_regular(lock, sealed_input=True) as stream:
+            content = stream.read(maximum + 1)
+            _need(0 < len(content) <= maximum and hashlib.sha256(content).hexdigest() == private_lock_sha256)
+    else:
+        _regular(lock, sealed_input=True)
     _execute([str(_RUNTIME / 'bin/python3.12'), '-I', '-B', '-m', 'venv',
               '--copies', str(_ENVIRONMENT)])
     _pip('install', '--no-index', f'--find-links={_WHEELHOUSE}', '--require-hashes',
          '--only-binary=:all:', '--no-deps', '--no-cache-dir',
          '--disable-pip-version-check', '--no-compile',
-         '-r', str(_WORKSPACE / 'requirements.lock'))
+         '-r', str(lock))
     _pip('check')
     return {'requires_dist_check': 'completed'}
 
@@ -545,17 +557,19 @@ def _phase_output() -> Iterator[None]:
 
 
 def run_phase(phase: str, *, import_module: str,
-              generated_manifest_sha256: str | None = None) -> dict[str, object]:
+              generated_manifest_sha256: str | None = None,
+              private_lock_sha256: str | None = None) -> dict[str, object]:
     """Execute a fixed phase; callers must supply the real sandbox externally."""
     _isolation_guard()
     try:
         _selection(phase, import_module)
         _need(generated_manifest_sha256 is None or phase == 'test')
+        _need(private_lock_sha256 is None or phase == 'install')
         _mounts()
         sys.dont_write_bytecode = True
         with _phase_output():
             if phase == 'install':
-                metadata = _install()
+                metadata = _install(private_lock_sha256)
             elif phase == 'check_environment':
                 _environment_interpreter()
                 _pip('check')
@@ -582,10 +596,12 @@ def main(argv: list[str] | None = None) -> int:
         parser.add_argument('phase', choices=_PHASES)
         parser.add_argument('--import-module', required=True)
         parser.add_argument('--generated-manifest-sha256')
+        parser.add_argument('--private-lock-sha256')
         args = parser.parse_args(argv)
         _selection(args.phase, args.import_module)
         metadata = run_phase(args.phase, import_module=args.import_module,
-            generated_manifest_sha256=args.generated_manifest_sha256)
+            generated_manifest_sha256=args.generated_manifest_sha256,
+            private_lock_sha256=args.private_lock_sha256)
     except (Exception, SystemExit, KeyboardInterrupt):  # noqa: BLE001 - CLI fails closed.
         print(json.dumps({'status': 'failed', 'error': 'phase_failed'}))
         return 1
