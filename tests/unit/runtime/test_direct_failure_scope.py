@@ -100,7 +100,7 @@ async def test_direct_recovery_keeps_failed_call_scope_and_resets_next_run() -> 
 
 
 async def test_successful_workspace_continuation_keeps_scope_without_failure_label() -> None:
-    responses = [ModelResponse(text=json.dumps({"workspace_batch": {
+    responses: list[ModelResponse | Exception] = [ModelResponse(text=json.dumps({"workspace_batch": {
         "files": {path: "export {};\n"}, "complete": complete,
         "continuation": "" if complete else "remaining files",
     }}), usage=TokenUsage(10, 20, 30)) for path, complete in (

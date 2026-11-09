@@ -15759,7 +15759,7 @@ async def test_persistent_admin_conversation_keeps_chronological_messages(
 ) -> None:
     first_id = UUID("33333333-3333-4333-8333-333333333331")
     second_id = UUID("33333333-3333-4333-8333-333333333332")
-    routing = {"conversation_id": "conv-multi-turn"}
+    routing: dict[str, object] = {"conversation_id": "conv-multi-turn"}
     if install_state != "no_proposal":
         routing["capability_install_query"] = "读取 Office 文档并搜索"
     proposal = _capability_install_proposal(routing)
