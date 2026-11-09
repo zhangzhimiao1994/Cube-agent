@@ -1,4 +1,4 @@
-import { RotateCw, ShieldCheck, ShieldX } from "lucide-react";
+import { Clock, RotateCw, ShieldCheck, ShieldX } from "lucide-react";
 import { useRef } from "react";
 
 import { ApiError, type CapabilityApprovalEvent, type RunDetail } from "../api/client";
@@ -11,7 +11,7 @@ type ApprovalRecord = {
   id: string;
   sequence: number;
   source: number;
-  decision: "approved" | "rejected";
+  decision: "approved" | "rejected" | "expired";
   scope?: "conversation";
   createdAt: string;
   label?: string;
@@ -36,10 +36,12 @@ function approvalRecords(run: RunDetail, history: CapabilityApprovalEvent[]): Ap
           : capability === "command" && operation === "run" ? "执行命令" : undefined;
         requests.set(event.approval_id, safeIdentifier(event.tool_name) ?? capabilityLabel
           ?? (event.action === "capability_tool" ? "沙箱工具调用" : safeIdentifier(event.action)));
-      } else if (event.kind === "approval.resolved"
-        && (event.decision === "approved" || event.decision === "rejected")) {
+      } else if (event.kind === "approval.resolved") {
+        const decision = event.decision === "approved" || event.decision === "rejected" ? event.decision
+          : source === 1 && event.decision == null && event.payload.approval_expired === true ? "expired" : null;
+        if (decision === null) continue;
         records.set(event.approval_id, {
-          id: event.approval_id, sequence: event.sequence, source, decision: event.decision,
+          id: event.approval_id, sequence: event.sequence, source, decision,
           createdAt: event.created_at, label: requests.get(event.approval_id),
           scope: event.payload.decision_scope === "conversation" ? "conversation" : undefined,
         });
@@ -70,9 +72,10 @@ export function RunApprovalHistory({ run }: { run: RunDetail }) {
     <RunModelReviewHistory run={run} />
     {records.map((record) => (
       <article key={record.id} className="run-approval-result" aria-label="权限审批结果" data-decision={record.decision}>
-        {record.decision === "approved" ? <ShieldCheck size={16} aria-hidden="true" /> : <ShieldX size={16} aria-hidden="true" />}
+        {record.decision === "expired" ? <Clock size={16} aria-hidden="true" />
+          : record.decision === "approved" ? <ShieldCheck size={16} aria-hidden="true" /> : <ShieldX size={16} aria-hidden="true" />}
         <span className="approval-record-label">权限审批</span>
-        <strong>{record.decision === "rejected" ? "已拒绝本次操作"
+        <strong>{record.decision === "expired" ? "审批已过期" : record.decision === "rejected" ? "已拒绝本次操作"
           : record.scope === "conversation" ? "已批准本次会话内同范围操作" : "已批准本次操作"}</strong>
         {record.label ? <span>{record.label}</span> : null}
         <code>{record.id}</code>

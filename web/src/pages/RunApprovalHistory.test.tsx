@@ -73,6 +73,26 @@ describe("durable per-run approval history", () => {
     expect(record.textContent).toContain("权限审批");
   });
 
+  it("shows an expired ledger event without a decision as passive approval history", async () => {
+    const [requested] = events();
+    const expiredAt = "2026-10-24T00:10:00Z";
+    vi.spyOn(api, "modelReviews").mockResolvedValue({ items: [], next_cursor: null });
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      ready: false,
+      items: [requested, {
+        ...requested, kind: "approval.resolved", sequence: 5, created_at: expiredAt,
+        payload: { approval_expired: true },
+      }],
+    }), { status: 200 })));
+    mount([{ ...run(), status: "failed" }]);
+    const record = await screen.findByRole("article", { name: "权限审批结果" });
+    expect(record.getAttribute("data-decision")).toBe("expired");
+    expect(record.textContent).toContain("审批已过期");
+    expect(record.textContent).not.toMatch(/已拒绝|已批准/);
+    expect(record.querySelector("time")?.dateTime).toBe(expiredAt);
+    expect(record.querySelector("button")).toBeNull();
+  });
+
   it("reads every run independently, including terminal runs with no worker approval events", async () => {
     const read = vi.spyOn(api, "capabilityApprovals").mockImplementation(async (id) => ({
       items: events(id, `approval-${id}`), ready: false, conversation_approval_available: false,

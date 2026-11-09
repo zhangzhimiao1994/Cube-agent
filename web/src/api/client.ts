@@ -1039,6 +1039,7 @@ const CapabilityApprovalEventSchema = z.object({
     capability: z.string().optional(),
     operation: z.string().optional(),
     decision_scope: z.enum(["once", "conversation"]).optional(),
+    approval_expired: z.boolean().optional(),
   }).default({}),
 });
 const CapabilityApprovalsSchema = z.object({

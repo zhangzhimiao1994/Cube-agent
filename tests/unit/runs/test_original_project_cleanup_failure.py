@@ -27,8 +27,10 @@ from agent_hub.skills.sandbox import project
 from agent_hub.skills.sandbox.base import SkillResult
 from agent_hub.skills.sandbox.broker import BrokerResponse
 from agent_hub.subprocess_cleanup import ProcessCleanupIncomplete
-from tests.unit.runs.test_project_input_lifecycle import ObservingRuntime, route
-from tests.unit.runs.test_terminal_hooks import ExecutableFakeRepository
+from tests.unit.runs.test_project_input_lifecycle import (
+    ObservingRuntime,
+    original_project_repository,
+)
 
 CLEANUP_CODE = 'project_termination_cleanup_incomplete'
 
@@ -51,7 +53,7 @@ async def test_systemd_cleanup_response_preserves_typed_uncertainty(monkeypatch:
 async def test_original_cleanup_chain_only_retains_lease_for_typed_uncertainty(
     monkeypatch: pytest.MonkeyPatch, failure: str,
 ) -> None:
-    repository = ExecutableFakeRepository(routing_decision=route())
+    repository = original_project_repository()
     calls: list[str] = []
     errors: list[Exception] = []
     files = {path: 'a' * 64 for path in ('package.json', 'src/index.js', 'tests/original.js')}

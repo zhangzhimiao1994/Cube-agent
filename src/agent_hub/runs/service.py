@@ -3252,6 +3252,12 @@ class RunService:
                 continue
             recovered += 1
         recovered += await self.recover_terminal_worker_executions(limit=limit)
+        try:
+            recovered += await self._repository.expire_original_python_resolution_approvals(
+                limit=limit, now=datetime.now(UTC),
+            )
+        except Exception as error:
+            _LOGGER.exception("run_resolution_approval_expiry_failed error_type=%s", type(error).__name__)
         recovered += await self.recover_conversation_queue_releases(limit=limit)
         return recovered
 

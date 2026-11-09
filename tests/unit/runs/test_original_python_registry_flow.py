@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
@@ -13,10 +15,11 @@ import pytest
 
 from agent_hub.auth.models import Role
 from agent_hub.capabilities.approvals import fingerprint_capability_request
+from agent_hub.capabilities.defaults import _project_resolution_preparation_effect
 from agent_hub.capabilities.execution_authority import bind_execution_authority
 from agent_hub.capabilities.gateway import CapabilityResult, CapabilityStatus
 from agent_hub.capabilities.python_input_preparation import InspectOnlyError
-from agent_hub.capabilities.types import CapabilityRequest
+from agent_hub.capabilities.types import CapabilityRequest, PolicyEffect
 from agent_hub.domain.runs import TaskMode
 from agent_hub.harness.tool_gateway import HarnessToolGateway
 from agent_hub.runs import original_python_resolution
@@ -52,7 +55,13 @@ async def test_registry_requires_exact_approval_and_never_replays_unknown_public
     route = dict(record.routing_decision or {})
     route.update(project_id="project", workspace_session_id="session", project_input_preparation=captured,
                  project_input={"schema_version": 1, "kind": "managed_workspace",
-                                "editable_paths": ["src/expense_cli/cli.py"]})
+                                "editable_paths": ["src/expense_cli/cli.py"]},
+                 runtime_timeout_source="project_scale_soft_budget", runtime_timeout_seconds=30,
+                 runtime_timeout_absolute_seconds=180.25)
+    # Earlier queue time has exhausted the initial active budget in wall time,
+    # but does not consume the live worker's 25-second monotonic budget.
+    record = replace(record, created_at=datetime.now(UTC) - timedelta(seconds=45))
+    cutoff = record.created_at + timedelta(seconds=180)
     record = replace(record, routing_decision=route)
     grants: set[str] = set()
     submissions: list[CapabilityRequest] = []
@@ -67,6 +76,8 @@ async def test_registry_requires_exact_approval_and_never_replays_unknown_public
     async def authorize(action: CapabilityRequest, **identity: object) -> CapabilityResult:
         assert identity == {"tenant_id": record.tenant_id, "run_id": record.id,
                             "user_id": record.actor_id, "role": Role.OPERATOR}
+        assert await _project_resolution_preparation_effect(repository, action, role=Role.OPERATOR) is (
+            PolicyEffect.REQUIRE_APPROVAL)
         submissions.append(action)
         return CapabilityResult(CapabilityStatus.WAITING_APPROVAL, record.id, approval_id="approval_registry")
 
@@ -90,6 +101,8 @@ async def test_registry_requires_exact_approval_and_never_replays_unknown_public
 
     async def transport(call: ResolutionRequest) -> ResolutionStatus:
         nonlocal plan, original_request, descriptor, publication
+        assert call.claim.original_deadline == cutoff
+        assert 0 < call.claim.deadline - time.monotonic() <= 25
         actions.append(call.action)
         if call.action == "inspect_python_resolution":
             if call.expected_plan_sha256 is not None:
@@ -148,12 +161,16 @@ async def test_registry_requires_exact_approval_and_never_replays_unknown_public
         await run()
     assert actions == ["inspect_python_resolution"]
     assert len(submissions) == 1 and submissions[0].arguments["install_allowed"] is False
+    assert submissions[0].arguments["original_deadline"] == cutoff.isoformat()
     grants.add(fingerprint_capability_request(submissions[0]))
-    record = replace(record, worker_id="new-worker", worker_lease_token=UUID(int=43))
+    # A later worker must retain the sealed cutoff even if policy now allows longer.
+    route = {**route, "runtime_timeout_absolute_seconds": 240}
+    record = replace(record, worker_id="new-worker", worker_lease_token=UUID(int=43), routing_decision=route)
     with pytest.raises(OriginalProjectApprovalPending):
         await run()
     assert "publish_python_resolution" not in actions
     assert len(submissions) == 2 and submissions[1].resource != submissions[0].resource
+    assert submissions[1].arguments["original_deadline"] == cutoff.isoformat()
     grants.add(fingerprint_capability_request(submissions[1]))
     record = replace(record, worker_id="publication-worker", worker_lease_token=UUID(int=44))
     if publication_lost:

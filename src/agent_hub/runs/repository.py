@@ -685,6 +685,7 @@ class RunRepository:
 
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
         self._session_factory = session_factory
+        self._original_expiry_cursor: tuple[str, UUID] | None = None
 
     async def create_run(
         self,
@@ -1487,24 +1488,29 @@ class RunRepository:
     @staticmethod
     async def _require_resolution_manual_approval(
         session: AsyncSession, row: RunRow, *, approval_id: str, fingerprint: str, scope: str = 'once',
+        lock: bool = True,
     ) -> bool:
         approval_scope = (row.routing_decision or {}).get('approval_scope')
         if not isinstance(approval_scope, str) or 'resource=workspace/current/project-resolution/' not in approval_scope:
             return False
         from agent_hub.capabilities.python_resolution_authorization import (
+            resolution_approval_has_time,
             resolution_binding_matches,
         )
 
-        stored = await session.scalar(select(RunApprovalRow).where(
+        statement = select(RunApprovalRow).where(
             RunApprovalRow.tenant_id == row.tenant_id, RunApprovalRow.run_id == row.id,
             RunApprovalRow.approval_id == approval_id,
-        ).with_for_update())
+        )
+        stored = await session.scalar(statement.with_for_update() if lock else statement)
         if (scope != 'once' or stored is None or stored.status != 'pending'
                 or stored.payload.get('approval_fingerprint') != fingerprint
                 or stored.payload.get('approval_scope') != approval_scope
                 or not resolution_binding_matches(RunRepository._record(row),
                     stored.payload.get('python_resolution_binding'), approval_scope)):
             raise RunConflict('resolution approval scope changed')
+        if not resolution_approval_has_time(stored.payload.get('python_resolution_binding'), now=datetime.now(UTC)):
+            raise RunConflict('original Python dependency approval expired')
         return True
 
     @staticmethod
@@ -2870,6 +2876,7 @@ class RunRepository:
     @staticmethod
     def _resolution_approval_matches(run: RunRow, row: RunApprovalRow) -> bool:
         from agent_hub.capabilities.python_resolution_authorization import (
+            resolution_approval_has_time,
             resolution_binding_matches,
         )
 
@@ -2881,8 +2888,9 @@ class RunRepository:
         automatic = (row.action == 'capability_tool.auto_review' and 'decision_scope' not in row.payload
             and type(row.payload.get('reviewer')) is str and bool(row.payload['reviewer'])
             and row.approval_id == 'auto_review_' + hashlib.sha256(fingerprint.encode()).hexdigest()[:24])
-        return (manual or automatic) and resolution_binding_matches(RunRepository._record(run),
-            row.payload.get('python_resolution_binding'), row.payload.get('approval_scope'))
+        binding = row.payload.get('python_resolution_binding')
+        return ((manual or automatic) and resolution_approval_has_time(binding, now=datetime.now(UTC))
+            and resolution_binding_matches(RunRepository._record(run), binding, row.payload.get('approval_scope')))
 
     async def is_capability_approval_approved(
         self,
@@ -3445,9 +3453,125 @@ class RunRepository:
             return False
         try:
             await self._require_capability_approval_checkpoint(session, run, routing, approval_id=approval_id)
+            await self._require_resolution_manual_approval(
+                session, run, approval_id=approval_id, fingerprint=fingerprint, lock=False,
+            )
         except RunConflict:
             return False
         return True
+
+    async def expire_original_python_resolution_approvals(self, *, limit: int, now: datetime) -> int:
+        """Retire expired, idle pre-model requests without retrying a broker action."""
+        from agent_hub.capabilities.python_resolution_authorization import (
+            PREFIX,
+            original_resolution_approval_deadline,
+            resolution_binding_matches,
+        )
+
+        if limit <= 0 or now.utcoffset() is None:
+            return 0
+        route = RunRow.routing_decision
+        binding = RunApprovalRow.payload['python_resolution_binding']
+        deadline_text = binding['arguments']['original_deadline'].astext
+        # Candidate selection uses the UTC ISO spelling written by the original-project
+        # journal. Recheck the parsed deadline and full private binding under both locks.
+        candidate_query = (
+            select(RunRow, deadline_text)
+            .join(RunApprovalRow, (RunApprovalRow.tenant_id == RunRow.tenant_id)
+                  & (RunApprovalRow.run_id == RunRow.id)
+                  & (RunApprovalRow.approval_id == route['approval_id'].astext))
+            .where(RunRow.status == RunStatus.WAITING_APPROVAL.value,
+                   route['approval_kind'].astext == 'capability_tool',
+                   route['approval_checkpoint_required'].astext == 'false',
+                   route['approval_scope'].astext.contains(':resource=' + PREFIX, autoescape=True),
+                   RunRow.worker_id.is_(None), RunRow.worker_lease_token.is_(None),
+                   RunRow.worker_lease_expires_at.is_(None), RunRow.worker_heartbeat_at.is_(None),
+                   RunApprovalRow.action == 'capability_tool', RunApprovalRow.status == 'pending',
+                   RunApprovalRow.payload['approval_fingerprint'].astext == route['approval_fingerprint'].astext,
+                   RunApprovalRow.payload['approval_scope'].astext == route['approval_scope'].astext,
+                   binding['schema_version'].astext == '2',
+                   deadline_text.regexp_match(
+                       r'^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]{6})?\+00:00$'
+                   ),
+                   deadline_text <= now.astimezone(UTC).isoformat(timespec='microseconds'))
+            .order_by(deadline_text, RunRow.id)
+            .limit(limit)
+            .with_for_update(of=RunRow, skip_locked=True)
+        )
+        if self._original_expiry_cursor is not None:
+            after_deadline, after_id = self._original_expiry_cursor
+            candidate_query = candidate_query.where(or_(
+                deadline_text > after_deadline, and_(deadline_text == after_deadline, RunRow.id > after_id),
+            ))
+        expired = 0
+        next_cursor: tuple[str, UUID] | None = None
+        async with self._session_factory() as session, session.begin():
+            candidates = (await session.execute(candidate_query)).tuples().all()
+            if len(candidates) == limit:
+                last_row, last_deadline = candidates[-1]
+                next_cursor = (last_deadline, _database_uuid(last_row.id))
+            for row, _ in candidates:
+                routing = dict(row.routing_decision or {})
+                scope, fingerprint, approval_id = (routing.get(key) for key in
+                    ('approval_scope', 'approval_fingerprint', 'approval_id'))
+                if (row.status != RunStatus.WAITING_APPROVAL.value
+                        or routing.get('approval_kind') != 'capability_tool'
+                        or routing.get('approval_checkpoint_required') is not False
+                        or type(scope) is not str or ':resource=' + PREFIX not in scope
+                        or type(fingerprint) is not str or not fingerprint
+                        or type(approval_id) is not str or not approval_id
+                        or any(value is not None for value in (row.worker_id, row.worker_lease_token,
+                            row.worker_lease_expires_at, row.worker_heartbeat_at))):
+                    continue
+                approval = await session.scalar(select(RunApprovalRow).where(
+                    RunApprovalRow.tenant_id == row.tenant_id, RunApprovalRow.run_id == row.id,
+                    RunApprovalRow.approval_id == approval_id,
+                ).with_for_update())
+                if (approval is None or approval.status != 'pending' or approval.action != 'capability_tool'
+                        or approval.tenant_id != row.tenant_id or approval.run_id != row.id
+                        or approval.approval_id != approval_id
+                        or approval.payload.get('approval_scope') != scope
+                        or approval.payload.get('approval_fingerprint') != fingerprint):
+                    continue
+                stored_binding = approval.payload.get('python_resolution_binding')
+                deadline = original_resolution_approval_deadline(stored_binding)
+                if (deadline is None or not row.created_at < deadline <= now
+                        or not resolution_binding_matches(self._record(row), stored_binding, scope)):
+                    continue
+                # Only the pending decision expires. Leave the private proof, previous
+                # approvals, and staged artifacts intact for separate reconciliation.
+                resolution_version = row.version + 1
+                approval.status = 'expired'
+                approval.payload = {**approval.payload, 'status': 'expired', 'expired_at': now.isoformat(),
+                    'public_resolution': {'kind': 'approval.resolved', 'run_id': str(row.id),
+                        'approval_id': approval_id, 'sequence': resolution_version,
+                        'payload': {'approval_expired': True}}}
+                row.routing_decision = {key: value for key, value in routing.items()
+                    if key not in {'approval_kind', 'approval_id', 'approval_fingerprint', 'approval_scope',
+                                   'approval_checkpoint_required', 'approval_checkpoint_worker_token'}}
+                row.status = RunStatus.FAILED.value
+                row.version = resolution_version
+                await self.persist_event(
+                    session, tenant_id=row.tenant_id, run_id=row.id,
+                    event=RunEvent(kind=EventKind.RUNTIME_FAILED, run_id=row.id,
+                        sequence=await self.next_event_sequence(session, row.id),
+                        reason='Python 项目的依赖审批已过期。已保留项目与审批记录。',
+                        payload={
+                            'error_code': 'runtime.python_dependency_approval_expired',
+                            'error_stage': 'project_prerequisite',
+                            'error_category': 'approval_expired',
+                            'error_summary': 'Python 项目的依赖审批已过期。',
+                            'retryable': False,
+                            'suggested_action': '如需继续该项目，请重新提交任务，系统会重新检查依赖。',
+                        }),
+                )
+                expired += 1
+            if expired:
+                await session.flush()
+        # Advance past unproven rows as well as successful transitions. A permanently
+        # invalid older row cannot monopolize this periodic scan's bounded first page.
+        self._original_expiry_cursor = next_cursor
+        return expired
 
     async def raw_events(self, tenant_id: UUID, run_id: UUID) -> tuple[RunEvent, ...]:
         """Internal reconstruction only; public consumers must use events()."""
@@ -4316,7 +4440,7 @@ def _public_plugin_approval_events(
             or requested.get("run_id") != str(run.id)
             or requested.get("approval_id") != approval.approval_id
             or type(requested.get("sequence")) is not int or requested["sequence"] <= 0
-            or approval.status not in {"pending", "approved", "rejected"}
+            or approval.status not in {"pending", "approved", "rejected", "expired"}
         ):
             raise RunConflict("capability approval evidence is invalid")
         binding = requested.get("payload")
@@ -4423,14 +4547,48 @@ def _public_plugin_approval_events(
                         "resource": resource, "approval_scope": scope,
                     })
                     break
+        expired_at = None
+        expiry_resolution = None
+        if approval.status == 'expired':
+            from agent_hub.capabilities.python_resolution_authorization import (
+                original_resolution_approval_deadline,
+            )
+
+            deadline = original_resolution_approval_deadline(approval.payload.get('python_resolution_binding'))
+            expired_at_raw = approval.payload.get('expired_at')
+            try:
+                expired_at = datetime.fromisoformat(expired_at_raw) if type(expired_at_raw) is str else None
+            except ValueError:
+                expired_at = None
+            expiry_resolution = approval.payload.get('public_resolution')
+            if (run.status != RunStatus.FAILED.value or approval.payload.get('status') != 'expired'
+                    or deadline is None or expired_at is None or expired_at.utcoffset() is None
+                    or expired_at < deadline or not isinstance(expiry_resolution, dict)
+                    or expiry_resolution.get('kind') != 'approval.resolved'
+                    or expiry_resolution.get('run_id') != str(run.id)
+                    or expiry_resolution.get('approval_id') != approval.approval_id
+                    or type(expiry_resolution.get('sequence')) is not int
+                    or not requested['sequence'] < expiry_resolution['sequence'] <= run.version
+                    or expiry_resolution.get('payload') != {'approval_expired': True}
+                    or 'decision' in expiry_resolution):
+                raise RunConflict('capability approval expiration evidence is invalid')
         # Construct a whitelist view; even stored envelope extensions cannot leak arguments/source.
         public.append({
             "kind": "approval.requested", "sequence": requested["sequence"], "run_id": str(run.id),
             "approval_id": approval.approval_id, "actor": "capability_gateway",
-            "action": "capability_tool", "reason": "capability requires approval",
+            "action": "capability_tool",
+            "reason": "依赖审批已过期" if approval.status == 'expired' else "capability requires approval",
             "payload": public_binding, "created_at": approval.created_at,
         })
-        if approval.status != "pending":
+        if expired_at is not None and isinstance(expiry_resolution, dict):
+            # Do not introduce a fourth decision or break old clients' decision enum.
+            public.append({
+                'kind': 'approval.resolved', 'sequence': expiry_resolution['sequence'],
+                'run_id': str(run.id), 'approval_id': approval.approval_id,
+                'actor': 'runtime_worker', 'payload': {'approval_expired': True},
+                'created_at': expired_at,
+            })
+        if approval.status in {"approved", "rejected"}:
             resolved = approval.payload.get("public_resolution")
             if (
                 not isinstance(resolved, dict) or resolved.get("kind") != "approval.resolved"

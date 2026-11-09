@@ -6,6 +6,7 @@ from typing import cast
 
 import pytest
 
+from agent_hub.auth.models import Role
 from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.runs.repository import RunRepository
 from agent_hub.runs.service import RunService, TaskQueue
@@ -32,9 +33,15 @@ def route() -> dict[str, object]:
             'project_input': {'schema_version': 1, 'kind': 'managed_workspace', 'editable_paths': ['src']}}
 
 
+def original_project_repository() -> ExecutableFakeRepository:
+    repository = ExecutableFakeRepository(routing_decision=route())
+    repository.row.actor_role = Role.OPERATOR.value
+    return repository
+
+
 @pytest.mark.parametrize('mode', [TaskMode.DIRECT, TaskMode.DISPATCH, TaskMode.DISCUSS, TaskMode.HYBRID])
 async def test_shared_original_preparation_runs_before_any_mode_model(mode: TaskMode) -> None:
-    repository = ExecutableFakeRepository(routing_decision=route())
+    repository = original_project_repository()
     repository.row.mode = mode.value
     calls: list[str] = []
 
@@ -61,7 +68,7 @@ async def test_shared_original_preparation_runs_before_any_mode_model(mode: Task
 @pytest.mark.parametrize('change', ['missing', 'unobserved', 'tenant', 'permissions', 'tokens', 'cancelled',
     'scope_changed_in_db', 'state_not_persisted', 'lease_lost', 'actor', 'checkpoint', 'request', 'timeout'])
 async def test_missing_invalid_or_revoked_preparation_never_reaches_model(change: str) -> None:
-    repository = ExecutableFakeRepository(routing_decision=route())
+    repository = original_project_repository()
     calls: list[str] = []
 
     async def prepare(context: TaskContext) -> TaskContext:
@@ -113,7 +120,7 @@ async def test_missing_invalid_or_revoked_preparation_never_reaches_model(change
 
 
 async def test_user_cancellation_interrupts_original_preparation_before_any_model() -> None:
-    repository = ExecutableFakeRepository(routing_decision=route())
+    repository = original_project_repository()
     calls: list[str] = []
     started, stopped, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
 
@@ -145,7 +152,7 @@ async def test_user_cancellation_interrupts_original_preparation_before_any_mode
 
 @pytest.mark.parametrize('cleanup', ['error', 'blocked'])
 async def test_preparation_cancel_cleanup_failure_keeps_execution_nonquiescent(cleanup: str) -> None:
-    repository = ExecutableFakeRepository(routing_decision=route())
+    repository = original_project_repository()
     calls: list[str] = []
     started, cleanup_failed = asyncio.Event(), asyncio.Event()
 

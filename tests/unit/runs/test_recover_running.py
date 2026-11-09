@@ -245,10 +245,16 @@ def test_recover_paused_other_process_lease_without_releasing_successor() -> Non
 class RecoverableRunRepository:
     def __init__(self, candidates: tuple[UUID, ...]) -> None:
         self._candidates = candidates
+        self.expiry_limits: list[int] = []
 
     async def running_for_recovery(self, limit: int, *, now: datetime) -> tuple[UUID, ...]:
         del now
         return self._candidates[:limit]
+
+    async def expire_original_python_resolution_approvals(self, *, limit: int, now: datetime) -> int:
+        assert now.utcoffset() is not None
+        self.expiry_limits.append(limit)
+        return 0
 
     async def terminal_worker_executions_for_recovery(
         self,

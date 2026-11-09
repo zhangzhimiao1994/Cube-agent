@@ -643,11 +643,10 @@ async def _project_resolution_preparation_effect(
         if "protected_original" in checked.arguments:
             from agent_hub.capabilities.python_resolution_authorization import (
                 original_resolution_scope,
+                resolution_original_deadline,
                 validate_resolution_authorization,
             )
-            from agent_hub.runs.original_python_resolution import (
-                _timeout as _original_resolution_timeout,
-            )
+            from agent_hub.runs.original_python_resolution import _approval_window
             from agent_hub.skills.sandbox.python_resolution_protocol import (
                 ProtectedOriginalResolutionSource,
             )
@@ -655,11 +654,16 @@ async def _project_resolution_preparation_effect(
             args = validate_resolution_authorization(checked).arguments
             source = ProtectedOriginalResolutionSource.model_validate(args["protected_original"], strict=True)
             scope = original_resolution_scope(record, actor=checked.agent_id, source=source, live=True)
-            deadline = record.created_at + timedelta(seconds=_original_resolution_timeout(record))
+            ceiling = record.created_at + timedelta(seconds=_approval_window(record))
+            retained = resolution_original_deadline({**scope.model_dump(mode='json'),
+                'root_sha256': args['root_sha256'], 'catalog_sha256': args['catalog_sha256'],
+                'protected_original': source.model_dump(mode='json')})
+            deadline = ceiling if retained is None else retained
             if (authority.actor != scope.actor or record.worker_id != worker
                     or record.worker_lease_token != authority.execution_token
                     or args["permissions_sha256"] != scope.permissions_sha256
-                    or deadline <= datetime.now(UTC) or args["original_deadline"] != deadline.isoformat()):
+                    or not record.created_at < deadline <= ceiling or deadline <= datetime.now(UTC)
+                    or args["original_deadline"] != deadline.isoformat()):
                 return PolicyEffect.DENY
             return PolicyEffect.REQUIRE_APPROVAL
         scope = metadata_scope(record, actor=checked.agent_id, live=True)

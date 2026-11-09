@@ -307,6 +307,35 @@ def resolution_scope_resource(
     return None if match is None else match.group(1)
 
 
+def original_resolution_approval_deadline(binding: object) -> datetime | None:
+    """Only schema 2 binds an original project's execution cutoff."""
+    if (not isinstance(binding, Mapping) or type(binding.get('schema_version')) is not int
+            or binding['schema_version'] != 2):
+        return None
+    arguments = binding.get('arguments')
+    if not isinstance(arguments, Mapping):
+        return None
+    raw = arguments.get('original_deadline')
+    if type(raw) is not str or not 0 < len(raw) <= 64:
+        return None
+    try:
+        deadline = datetime.fromisoformat(raw)
+        return deadline if deadline.utcoffset() is not None else None
+    except (ValueError, OverflowError):
+        return None
+
+
+def resolution_approval_has_time(binding: object, *, now: datetime) -> bool:
+    """Check the live deadline without changing how historical receipts are displayed."""
+    if not isinstance(binding, Mapping) or type(binding.get('schema_version')) is not int:
+        return False
+    if binding['schema_version'] == 1:
+        # Generated-project grants did not persist a private original deadline here.
+        return True
+    deadline = original_resolution_approval_deadline(binding)
+    return deadline is not None and now.utcoffset() is not None and now < deadline
+
+
 def resolution_approval_binding(record: object, request: CapabilityRequest) -> dict[str, object]:
     """Bind the trusted row's identity, session, permissions and original request."""
     from agent_hub.capabilities.python_metadata_preparation import metadata_scope

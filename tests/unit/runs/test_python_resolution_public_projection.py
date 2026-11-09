@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock
 from uuid import UUID, uuid4
 
@@ -119,6 +119,30 @@ async def test_ordinary_dao_and_api_dto_keep_only_the_specific_public_scope(
     assert isinstance(items, list) and len(items) == 1
     assert object_map(items[0])['payload'] == expected_payload(case)
     assert response['ready'] is False and 'PRIVATE_' not in str(response)
+    assert case.approval.status == 'pending' and case.run.version == 4
+
+
+@pytest.mark.parametrize(
+    ('time_to_deadline', 'ready'),
+    [(timedelta(minutes=-1), False), (timedelta(minutes=1), True)],
+)
+async def test_standard_original_approval_readiness_respects_its_deadline(
+    monkeypatch: pytest.MonkeyPatch, time_to_deadline: timedelta, ready: bool,
+) -> None:
+    case = pending(native=False, mode=TaskMode.DISCUSS)
+    binding = object_map(case.approval.payload['python_resolution_binding'])
+    binding['schema_version'] = 2
+    binding['arguments'] = {'original_deadline': (datetime.now(UTC) + time_to_deadline).isoformat()}
+    # Isolate liveness from the separately tested cryptographic binding and checkpoint.
+    monkeypatch.setattr(
+        'agent_hub.capabilities.python_resolution_authorization.resolution_binding_matches',
+        lambda *_: True,
+    )
+    monkeypatch.setattr(RunRepository, '_require_capability_approval_checkpoint', AsyncMock())
+    monkeypatch.setattr(AsyncSession, 'scalar', AsyncMock(return_value=case.approval))
+    repository = RunRepository(async_sessionmaker(expire_on_commit=False))
+    async with AsyncSession() as session:
+        assert await repository._capability_approval_ready_from_record(session, case.run) is ready
     assert case.approval.status == 'pending' and case.run.version == 4
 
 

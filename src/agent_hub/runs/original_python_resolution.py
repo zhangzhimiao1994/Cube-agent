@@ -43,11 +43,22 @@ if TYPE_CHECKING:
     from agent_hub.runtime.contracts import JsonValue, TaskContext
 
 
-def _timeout(record: RunRecord) -> int:
-    value = (record.routing_decision or {}).get("runtime_timeout_seconds", 300)
+def _approval_window(record: RunRecord) -> int:
+    route = record.routing_decision or {}
+    value = route.get("runtime_timeout_seconds", 300)
     need(type(value) in {int, float} and math.isfinite(cast(float, value))
-         and cast(float, value) > 0, "resolution_deadline")
-    return min(3600, max(1, math.ceil(cast(float, value))))
+         and cast(float, value) >= 1, "resolution_deadline")
+    initial = min(3600, math.floor(cast(float, value)))
+    if route.get("runtime_timeout_source") != "project_scale_soft_budget":
+        return initial
+    absolute = route.get("runtime_timeout_absolute_seconds")
+    if absolute is None:
+        return initial
+    need(type(absolute) in {int, float} and cast(float, value) <= cast(float, absolute) <= 3600,
+         "resolution_deadline")
+    # Waiting for a person is bounded by the existing project envelope. Each
+    # admitted worker and broker call still uses its active monotonic budget.
+    return math.floor(cast(float, absolute))
 
 
 async def resolve_missing_original_python_inputs(
@@ -56,7 +67,11 @@ async def resolve_missing_original_python_inputs(
     artifacts: ArtifactRepository, deadline: float,
 ) -> None:
     """Reuse the Root resolver, its exact effect approvals, and inspect-only recovery."""
-    from agent_hub.capabilities.python_resolution_authorization import original_resolution_scope
+    from agent_hub.capabilities.python_resolution_authorization import (
+        bind_resolution_original_deadline,
+        original_resolution_scope,
+        resolution_policy_scope,
+    )
     from agent_hub.runs.project_inputs import OriginalProjectApprovalPending
 
     manifest = await asyncio.to_thread(
@@ -97,7 +112,7 @@ async def resolve_missing_original_python_inputs(
         **scope.model_dump(mode="json"), "root_sha256": base.profile.root_config_sha256,
         "catalog_sha256": base.profile.catalog_sha256, "protected_original": source.model_dump(mode="json"),
     }
-    cutoff = record.created_at + timedelta(seconds=_timeout(record))
+    cutoff = record.created_at + timedelta(seconds=_approval_window(record))
     journal = DynamicResolutionJournal(artifacts)
     rows = await journal.read_artifacts(context.tenant_id, context.run_id,
         artifact_type="python_resolution_checkpoint", producer="python_resolution")
@@ -142,7 +157,7 @@ async def resolve_missing_original_python_inputs(
         need(plan == planning and live.worker_lease_token == context.execution_token
              and original_resolution_scope(live, actor=scope.actor, source=source, live=True) == scope,
              "resolution_scope_changed")
-        return _timeout(live)
+        return _approval_window(live)
 
     async def save(key: str, pending: str | None) -> None:
         require_current(await current(), planning)
@@ -158,8 +173,10 @@ async def resolve_missing_original_python_inputs(
             return True
         await save(cast(str, action.arguments["key"]), cast(str | None, action.arguments.get("plan_sha256")))
         assert context.actor_id is not None and context.actor_role is not None
-        result = await authorizer.authorize_original_python_resolution(action, tenant_id=context.tenant_id,
-            run_id=context.run_id, user_id=context.actor_id, role=context.actor_role)
+        with resolution_policy_scope(action):
+            bind_resolution_original_deadline(stable_scope, cutoff)
+            result = await authorizer.authorize_original_python_resolution(action, tenant_id=context.tenant_id,
+                run_id=context.run_id, user_id=context.actor_id, role=context.actor_role)
         if (result.status is CapabilityStatus.WAITING_APPROVAL and result.approval_id is not None
                 and result.run_id == context.run_id):
             bound_scope = capability_approval_scope(action)
