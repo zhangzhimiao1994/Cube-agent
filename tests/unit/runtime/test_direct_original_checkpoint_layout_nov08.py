@@ -13,10 +13,12 @@ from uuid import uuid4
 
 import pytest
 
+from agent_hub.api.routers.admin import _admin_run_artifact
 from agent_hub.auth.models import Role
 from agent_hub.capabilities.gateway import CapabilityStatus
 from agent_hub.domain.runs import TaskMode
 from agent_hub.harness.tool_gateway import HarnessToolGateway
+from agent_hub.runs.repository import _public_artifact_payload
 from agent_hub.runs.service import _main_delivery_publication_batches
 from agent_hub.runtime import direct, hybrid_delivery_report
 from agent_hub.runtime.contracts import (
@@ -116,6 +118,33 @@ async def test_original_completion_publishes_and_recovers_without_replay(tmp_pat
     assert len(resumed) == 1 and resumed[0].kind is EventKind.RUNTIME_COMPLETED
     assert resumed[0].sequence == cp.state['next_sequence']
     assert not fresh_model.requests and tuple(configured.backend.calls) == calls_before
+
+
+async def test_original_workspace_report_projects_as_final_attachment(tmp_path: Path) -> None:
+    _, context, _, _, _, _, checkpoint, recovery = await completed(
+        tmp_path, corrected=True, report=True,
+    )
+    final = next(a for a in recovery.artifacts if str(a.id) == checkpoint.state['artifact_id'])
+    assert final.type == 'tool_result' and final.producer == 'main'
+    assert final.content[LAYOUT] == checkpoint.state[LAYOUT]
+    assert 'delivery_report_binding' in final.content
+    delivery = final.content['workspace_delivery']
+    assert isinstance(delivery, Mapping)
+    bundle_file = delivery['file']
+    assert isinstance(bundle_file, Mapping)
+
+    public = _public_artifact_payload(final.to_payload())
+    assert public['content_redacted'] is True
+    content = public['content']
+    assert isinstance(content, dict) and 'delivery_report_binding' not in content
+    response = _admin_run_artifact(public, run_id=context.run_id)
+
+    assert response.text == REPORT
+    assert response.filename == bundle_file['filename']
+    assert response.sha256 == bundle_file['sha256']
+    assert response.download_url == bundle_file['download_url']
+    assert 'delivery_report_binding' not in response.model_dump_json()
+    assert response.presentation == 'final_attachment'
 
 
 async def test_original_layout_tampering_never_authorizes_publication_or_recovery(tmp_path: Path) -> None:

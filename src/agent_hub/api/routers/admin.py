@@ -17737,7 +17737,9 @@ def _direct_delivery_summary(
     allowed = required | {'generated_event_layout'}
     if report:
         required = required | {'text'}
-        allowed = allowed | {'text', 'delivery_report_binding'}
+        # Original-workspace runs keep this layout for checkpoint recovery.
+        # Its presence does not replace validation of the bound report below.
+        allowed = allowed | {'text', 'delivery_report_binding', 'original_workspace_event_layout'}
     if not required <= content.keys() <= allowed:
         return None
     delivery = content['workspace_delivery']
