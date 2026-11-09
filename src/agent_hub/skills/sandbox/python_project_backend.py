@@ -928,6 +928,47 @@ def _fresh_copy_budget(
     return cast(int, selected)
 
 
+def _workspace_that_fits_disk(
+    config: RootConfig, roots: _Roots, maximum: int, *, minimum_environment_bytes: int,
+    allocation: Literal["persistent", "ephemeral", "reuse"] = "persistent",
+) -> int | None:
+    """Fit the enforced workspace to the measured disk after bounded staging."""
+    statvfs = getattr(os, "fstatvfs", None)
+    if not callable(statvfs) or roots.cache_fd is None:
+        return None
+    try:
+        stage = statvfs(roots.stage_fd)
+        cache = statvfs(roots.cache_fd)
+        same_device = os.fstat(roots.stage_fd).st_dev == os.fstat(roots.cache_fd).st_dev
+    except OSError:
+        return None
+    reserve = config.cache_policy.disk_reserve_bytes
+    stage_free = stage.f_bavail * stage.f_frsize
+    cache_free = cache.f_bavail * cache.f_frsize
+    if same_device:
+        stage_free = min(stage_free, cache_free)
+    # The free-space sample already accounts for the actual staged source and
+    # wheels, and for any verified existing environment on disk.
+    stage_room = stage_free - reserve - _STAGE_CONTROL_ALLOWANCE - _CONTROL_ALLOWANCE
+    cache_room = cache_free - reserve - 2 * _CONTROL_ALLOWANCE
+    if min(stage_room, cache_room) <= 0:
+        return None
+    lower, upper = 0, min(maximum, stage_room)
+    while lower < upper:
+        candidate = (lower + upper + 1) // 2
+        environment = 0 if allocation == "reuse" else min(config.max_environment_bytes, candidate)
+        cache_copy = environment if allocation == "persistent" else 0
+        stage_cost = candidate + environment + (cache_copy if same_device else 0)
+        if stage_cost <= stage_room and cache_copy <= cache_room:
+            lower = candidate
+        else:
+            upper = candidate - 1
+    bounded_environment = lower if allocation == "reuse" else min(config.max_environment_bytes, lower)
+    if lower <= 0 or bounded_environment < minimum_environment_bytes:
+        return None
+    return lower
+
+
 def _write_plan(plan: PythonProjectRunnerPlan, parent: int, stage: Path) -> Path:
     if sys.platform != "linux":
         raise PythonProjectBackendError("python_project_unsupported")
@@ -1438,7 +1479,6 @@ def _run(
     snapshot = (
         prepared.original.snapshot if invocation.source_kind == "original" else stage / "snapshot"
     )
-    budget = min(config.max_environment_bytes, invocation.workspace_limit_bytes)
     wheel_limits = ScanLimits(config.wheel_max_bytes)
     wheels = stage_python_project_wheels(
         config.wheel_root,
@@ -1448,16 +1488,40 @@ def _run(
         deadline=deadline,
         disk_reserve_bytes=config.cache_policy.disk_reserve_bytes,
     )
-    cache = PythonProjectEnvironmentCache(config.environment_root, config.cache_policy)
     minimum = _minimum_environment_bytes(config, deadline)
+    budget = min(config.max_environment_bytes, invocation.workspace_limit_bytes)
+    cache = PythonProjectEnvironmentCache(config.environment_root, config.cache_policy)
+
     def fresh_budget(proposed: int) -> int:
+        nonlocal invocation, budget
         try:
-            return _fresh_copy_budget(config, roots, budget, proposed,
-                                      product_bytes=invocation.workspace_limit_bytes)
+            selected = _fresh_copy_budget(config, roots, budget, proposed,
+                                          product_bytes=invocation.workspace_limit_bytes)
+        except PythonProjectBackendError as error:
+            if error.code != "python_project_environment_quota":
+                raise
+        else:
+            if selected >= minimum:
+                return selected
+        # This callback runs only for a fresh install, while both locks are
+        # held and before reservation. Leave an already verified reuse alone.
+        fitted = _workspace_that_fits_disk(config, roots, invocation.workspace_limit_bytes,
+                                          minimum_environment_bytes=minimum)
+        if fitted is None or fitted >= invocation.workspace_limit_bytes:
+            raise PythonProjectCacheError("cache_quota")
+        adjusted = min(config.max_environment_bytes, fitted)
+        try:
+            selected = _fresh_copy_budget(config, roots, adjusted, min(proposed, adjusted),
+                                          product_bytes=fitted)
         except PythonProjectBackendError as error:
             if error.code == "python_project_environment_quota":
                 raise PythonProjectCacheError("cache_quota") from None
             raise
+        if selected < minimum:
+            raise PythonProjectCacheError("cache_quota")
+        invocation = invocation.model_copy(update={"workspace_limit_bytes": fitted})
+        budget = adjusted
+        return selected
 
     with ExitStack() as resources:
         lease: PythonProjectCacheLease | None
@@ -1473,9 +1537,24 @@ def _run(
             lease = None
             storage = 'ephemeral_current_execution'
         reused = lease.current(deadline=deadline) if lease is not None else None
-        _disk_budget(config, roots, budget, reused is None,
-                     product_bytes=invocation.workspace_limit_bytes,
-                      cache_copy_bytes=lease.limits.max_bytes if lease is not None else 0)
+        cache_copy = lease.limits.max_bytes if lease is not None else 0
+        try:
+            _disk_budget(config, roots, budget, reused is None,
+                         product_bytes=invocation.workspace_limit_bytes, cache_copy_bytes=cache_copy)
+        except PythonProjectBackendError as error:
+            if error.code != "python_project_environment_quota" or (reused is None and lease is not None):
+                raise
+            # Reuse has no new environment cost; keep enough room for the
+            # runner to scan the full verified lease. Ephemeral creates an
+            # environment but has no persistent cache copy.
+            fitted = _workspace_that_fits_disk(config, roots, invocation.workspace_limit_bytes,
+                minimum_environment_bytes=max(minimum, lease.limits.max_bytes) if lease is not None else minimum,
+                allocation="reuse" if reused is not None else "ephemeral")
+            _need(fitted is not None, "python_project_environment_quota")
+            assert fitted is not None
+            invocation = invocation.model_copy(update={"workspace_limit_bytes": fitted})
+            budget = min(config.max_environment_bytes, fitted)
+            _disk_budget(config, roots, budget, reused is None, product_bytes=fitted, cache_copy_bytes=cache_copy)
         plan = PythonProjectRunnerPlan(
             invocation=invocation,
             inputs=prepared.inputs.to_payload(),
@@ -1681,14 +1760,16 @@ def execute_python_project_request(
             )
             # Initial admission covers staging/product. Environment allocation is
             # checked after the locked cache lease determines fresh versus reuse.
-            _disk_budget(
-                configuration,
-                roots,
-                0,
-                False,
-                source_bytes=request.invocation.source_limit_bytes * source_copies,
-                product_bytes=request.invocation.workspace_limit_bytes if copying else 0,
-            )
+            source_bytes = request.invocation.source_limit_bytes * source_copies
+            try:
+                _disk_budget(configuration, roots, 0, False, source_bytes=source_bytes,
+                             product_bytes=request.invocation.workspace_limit_bytes if copying else 0)
+            except PythonProjectBackendError as error:
+                if error.code != "python_project_environment_quota" or not isinstance(request, PythonProjectBrokerRequest):
+                    raise
+                # Admit only the bounded copies first. Their actual on-disk
+                # footprint is measured before any environment or process starts.
+                _disk_budget(configuration, roots, 0, False, source_bytes=source_bytes)
             if isinstance(request, PythonProjectProbeRequest):
                 response = _probe(request, policy, configuration, stage, deadline)
             elif isinstance(request, PythonProjectInspectEnvironmentRequest):

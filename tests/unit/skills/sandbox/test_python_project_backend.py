@@ -606,7 +606,8 @@ def test_disk_admission_rejects_before_staging_or_any_cache_write(
         stage=stage,
     )
     assert response.error == "python_project_environment_quota"
-    assert events == ["disk_lock", "preflight", "disk_unlock"]
+    assert events == ["disk_lock", *["preflight"] * (2 if action in {"original", "candidate"} else 1),
+                      "disk_unlock"]
     assert list(stage.iterdir()) == []
 
 
@@ -662,6 +663,85 @@ def test_disk_lock_spans_preflight_through_handler_and_uses_source_copy_budget(
     )
     assert response.error == "python_project_recipe_unavailable"
     assert events == ["disk_lock", "preflight", "handler_finished", "disk_unlock"]
+
+
+@pytest.mark.parametrize("same_device,shortfall,initial_free,reuse", [
+    (True, None, 1_511_653_376, False), (False, None, 1_511_653_376, False),
+    (True, None, 1_840_000_000, False), (True, None, 1_950_000_000, False),
+    (True, None, 1_511_653_376, True),
+    (True, "before_staging", 2**30, False), (True, "after_staging", 1_511_653_376, False),
+])
+def test_python_execution_uses_a_smaller_enforced_workspace_when_default_exceeds_free_disk(
+    api: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, same_device: bool,
+    shortfall: str | None, initial_free: int, reuse: bool,
+) -> None:
+    real_disk_budget = api._disk_budget
+    _, invocation, _, stage, _ = stubbed_context(api, monkeypatch, tmp_path)
+    invocation = invocation.model_copy(update={"install_allowed": True})
+    request = PythonProjectBrokerRequest(invocation=invocation)
+    payload = configuration_payload()
+    payload["max_environment_bytes"] = 192 * 2**20
+    payload["cache_policy"]["disk_reserve_bytes"] = 2**30
+    config = api.RootConfig.from_payload(payload)
+    free = initial_free
+    monkeypatch.setattr(api, "os", SimpleNamespace(
+        fstat=lambda fd: SimpleNamespace(st_dev=1 if same_device or fd == 10 else 2),
+        fstatvfs=lambda fd: SimpleNamespace(f_bavail=free, f_frsize=1),
+    ))
+    monkeypatch.setattr(api, "_disk_budget", real_disk_budget)
+    staged: list[str] = []
+    fitted: list[int] = []
+    minimum = 92_684_832
+
+    def snapshot(*args: Any) -> str:
+        staged.append("source")
+        return str(invocation.original_reference.input_source_sha256)
+
+    def wheels(*args: Any, **kwargs: Any) -> Path:
+        nonlocal free
+        staged.append("wheels")
+        if shortfall == "after_staging":
+            free -= 100 * 2**20
+        return Path(stage) / "selected-wheels"
+
+    class Cache:
+        @contextmanager
+        def reserve(self, scoped: Any, **kwargs: Any) -> Any:
+            assert staged == ["source", "wheels"]
+            # Cache chooses freshness and verifies READY before the execution
+            # limit changes, so an existing environment keeps its full bound.
+            assert scoped == invocation
+            assert kwargs["minimum_bytes"] == minimum
+            env = min(config.max_environment_bytes, scoped.workspace_limit_bytes)
+            assert kwargs["next_bytes"] == env
+            selected = env if reuse else kwargs["fresh_budget"](env)
+            assert minimum <= selected <= env
+            reference = expected_reference(scoped) if reuse else None
+            yield SimpleNamespace(current=lambda **opts: reference, limits=SimpleNamespace(max_bytes=selected))
+
+    def plan(payload: Any, *_args: Any) -> Any:
+        # The actual runner plan must use the smaller workspace and preserve
+        # the rest of the admitted request, including the exact recipe.
+        scoped = payload.invocation
+        assert scoped.model_dump(exclude={"workspace_limit_bytes"}) == (
+            invocation.model_dump(exclude={"workspace_limit_bytes"}))
+        floor = config.max_environment_bytes if reuse else minimum
+        assert floor <= scoped.workspace_limit_bytes < invocation.workspace_limit_bytes
+        assert (payload.reused_environment is not None) is reuse
+        fitted.append(scoped.workspace_limit_bytes)
+        raise api.PythonProjectBackendError("python_project_recipe_unavailable")
+
+    monkeypatch.setattr(api, "_minimum_environment_bytes", lambda *args: minimum)
+    monkeypatch.setattr(api, "_source_snapshot", snapshot)
+    monkeypatch.setattr(api, "stage_python_project_wheels", wheels)
+    monkeypatch.setattr(api, "PythonProjectEnvironmentCache", lambda *args: Cache())
+    monkeypatch.setattr(api, "_write_plan", plan)
+    result = api.execute_python_project_request(request, policy=BrokerPolicy(), configuration=config, stage=stage)
+    if shortfall is not None:
+        assert result.error == "python_project_environment_quota" and fitted == []
+        assert staged == (["source", "wheels"] if shortfall == "after_staging" else [])
+    else:
+        assert result.error == "python_project_recipe_unavailable" and len(fitted) == 1
 
 
 @pytest.mark.parametrize("same_device,has_cache", [(True, True), (False, True), (False, False)])
