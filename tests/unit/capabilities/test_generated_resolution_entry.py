@@ -27,6 +27,7 @@ from agent_hub.skills.sandbox.python_resolution_protocol import (
 from tests.unit.capabilities.dynamic_resolution_typed_fixture import present
 from tests.unit.capabilities.test_dynamic_python_resolution_flow import generated_dynamic_case
 from tests.unit.capabilities.test_python_catalog_gateway import configured_profile
+from tests.unit.capabilities.test_python_resolution_preparation import generated_planning
 from tests.unit.capabilities.test_scoped_read import project_path
 
 
@@ -106,7 +107,7 @@ async def test_main_agent_invalid_lock_three_unavailable_needs_reaches_specific_
     assert len(checkpoints) == 1
     assert checkpoints[0].content["resolution_key"] == inspected[0].key
     assert checkpoints[0].content["pending_plan_sha256"] is None
-    assert inspected[0].claim.planning.draft.lock_sha256 == hashlib.sha256(lock).hexdigest()
+    assert generated_planning(inspected[0].claim).draft.lock_sha256 == hashlib.sha256(lock).hexdigest()
     assert await journal.read_artifacts(
         context.tenant_id, context.run_id,
         artifact_type="python_resolution_data", producer="python_resolution",

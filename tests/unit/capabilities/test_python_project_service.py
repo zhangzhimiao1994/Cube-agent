@@ -24,7 +24,9 @@ from agent_hub.capabilities.project_verification import (
     ProjectVerificationService,
     validated_original_observation,
 )
-from agent_hub.capabilities.python_project_input_store import _capture
+from agent_hub.capabilities.python_project_input_store import PythonProjectInputStore, _capture
+from agent_hub.capabilities.python_project_inputs import PythonProjectInputs
+from agent_hub.capabilities.python_project_recipe import parse_python_project_declaration
 from agent_hub.capabilities.types import CapabilityRequest
 from agent_hub.skills.sandbox.base import SkillResult
 from agent_hub.skills.sandbox.project import ProjectInvocation, project_source_fingerprint
@@ -32,6 +34,8 @@ from agent_hub.skills.sandbox.python_project_protocol import (
     PythonEnvironmentReference,
     PythonProjectBrokerResponse,
     PythonProjectInputsObservation,
+    PythonProjectProbeInvocation,
+    _scope_payload,
     base_python_invocation,
 )
 from tests.unit.capabilities.test_project_baselines import source_tree
@@ -648,7 +652,7 @@ where = ["src"]
 
 def _verifier_with_sealed_original(
     monkeypatch: pytest.MonkeyPatch, files: Mapping[str, bytes],
-) -> tuple[ProjectVerificationService, ProjectInvocation, ProjectBaselineReference]:
+) -> tuple[ProjectVerificationService, ProjectInvocation, ProjectBaselineReference, dict[str, object]]:
     invocation = ProjectInvocation(
         execution_id="original_1", tenant_id=UUID(int=1), run_id=UUID(int=2),
         project_id="project-a", session_id="session-a", sandbox_profile="workspace_write",
@@ -667,6 +671,8 @@ def _verifier_with_sealed_original(
         },
     )
     record = ServiceRecord(record.tenant_id, record.id, record.routing_decision, record.actor_id)
+    routing = record.routing_decision
+    assert isinstance(routing, dict)
     monkeypatch.setattr(ProjectBaselineStore, "load", lambda *_: SimpleNamespace(
         source_files=files, snapshot=root, generated_metadata=None,
         contract=SimpleNamespace(editable_paths=selection.editable_paths, protected_files=files),
@@ -675,7 +681,7 @@ def _verifier_with_sealed_original(
                         lambda _root, parts, **_kwargs: files["/".join(parts)])
     verifier = ProjectVerificationService(root=root, repository=FakeRunRepository(record), executor=None)
     monkeypatch.setattr(verifier, "_require_supported_source", AsyncMock())
-    return verifier, invocation, reference
+    return verifier, invocation, reference, routing
 
 
 _PLAIN_PYTHON_FILES = {
@@ -691,7 +697,7 @@ _PLAIN_PYTHON_FILES = {
 async def test_unprepared_standard_python_never_falls_back_to_node(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    verifier, invocation, reference = _verifier_with_sealed_original(monkeypatch, _PLAIN_PYTHON_FILES)
+    verifier, invocation, reference, _ = _verifier_with_sealed_original(monkeypatch, _PLAIN_PYTHON_FILES)
     with pytest.raises(ProjectVerificationError, match="^python_original_metadata_preparation_required$"):
         await verifier.observe_original(
             tenant_id=invocation.tenant_id, run_id=invocation.run_id, actor="main_agent",
@@ -705,11 +711,12 @@ async def test_standard_python_probes_then_selects_persisted_recipe(
 ) -> None:
     from agent_hub.capabilities.python_original_metadata import standard_python_intent
     from agent_hub.capabilities.python_original_private_recipe import (
-        derive_private_original_recipe, original_dependency_needs,
+        derive_private_original_recipe,
+        original_dependency_needs,
     )
     from tests.unit.capabilities.test_standard_python_private_recipe import ENVIRONMENT, _descriptor
 
-    verifier, invocation, reference = _verifier_with_sealed_original(monkeypatch, _PLAIN_PYTHON_FILES)
+    verifier, invocation, reference, routing = _verifier_with_sealed_original(monkeypatch, _PLAIN_PYTHON_FILES)
     intent = standard_python_intent(
         _PLAIN_PYTHON_MANIFEST, paths=_PLAIN_PYTHON_FILES, protected=_PLAIN_PYTHON_FILES,
     )
@@ -722,8 +729,8 @@ async def test_standard_python_probes_then_selects_persisted_recipe(
     )
     identity = replace(interpreter(), version="3.12.8")
 
-    async def reply(probe: Any) -> PythonProjectInputsObservation:
-        scope_payload = python_project_service._scope_payload(probe)
+    async def reply(probe: PythonProjectProbeInvocation) -> PythonProjectInputsObservation:
+        scope_payload = _scope_payload(probe)
         if scope_drift:
             scope_payload["project_id"] = "other-project"
         return PythonProjectInputsObservation.model_validate({
@@ -734,9 +741,9 @@ async def test_standard_python_probes_then_selects_persisted_recipe(
 
     probe = AsyncMock(side_effect=reply)
     monkeypatch.setattr(verifier._python.executor, "probe", probe)
-    saved = SimpleNamespace(sha256="c" * 64, environment_input_sha256="d" * 64)
+    saved: PythonProjectInputs = Mock(spec=PythonProjectInputs, sha256="c" * 64, environment_input_sha256="d" * 64)
     capture = Mock(return_value=saved)
-    monkeypatch.setattr(python_project_service.PythonProjectInputStore, "capture_or_load_matching", capture)
+    monkeypatch.setattr(PythonProjectInputStore, "capture_or_load_matching", capture)
     if scope_drift:
         with pytest.raises(ProjectVerificationError, match="^python_project_service_unavailable$"):
             await verifier.prepare_python_original(invocation=invocation, reference=reference)
@@ -747,16 +754,17 @@ async def test_standard_python_probes_then_selects_persisted_recipe(
     assert args == (invocation, reference)
     assert kwargs["private_declaration"] == measured.declaration
     assert kwargs["wheels"] == measured.wheels and kwargs["interpreter"] == identity
-    sent = probe.await_args.args[0]
+    probe_args = probe.await_args
+    assert probe_args is not None
+    sent = probe_args.args[0]
     assert not sent.install_allowed and sent.original_reference.model_dump() == reference.to_payload()
 
-    record = verifier.repository.records[(invocation.tenant_id, invocation.run_id)]
-    record.routing_decision["project_input_preparation"] = {
+    routing["project_input_preparation"] = {
         "schema_version": 2, "phase": "captured", "reference": reference.to_payload(),
         "python_recipe": python_project_service.python_recipe_marker(saved),
     }
     load = Mock(return_value=saved)
-    monkeypatch.setattr(python_project_service.PythonProjectInputStore, "load", load)
+    monkeypatch.setattr(PythonProjectInputStore, "load", load)
     context = await verifier._python.select(
         invocation.tenant_id, invocation.run_id, "main_agent", phases=("captured",),
     )
@@ -768,7 +776,7 @@ async def test_standard_python_probes_then_selects_persisted_recipe(
 async def test_node_original_with_python_tool_config_still_uses_node_selection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    verifier, invocation, reference = _verifier_with_sealed_original(monkeypatch, {
+    verifier, invocation, reference, _ = _verifier_with_sealed_original(monkeypatch, {
         "package.json": b'{"scripts":{"test":"node tests/original.js"}}',
         "src/index.js": b"module.exports = () => 0;\n",
         "tests/original.js": b"// immutable original user check\n",
@@ -782,30 +790,30 @@ async def test_node_original_with_python_tool_config_still_uses_node_selection(
 async def test_declared_python_original_still_probes_exact_recipe(
     monkeypatch: pytest.MonkeyPatch, declaration_drift: bool,
 ) -> None:
-    verifier, invocation, reference = _verifier_with_sealed_original(monkeypatch, {
+    verifier, invocation, reference, _ = _verifier_with_sealed_original(monkeypatch, {
         "pyproject.toml": MANIFEST,
         "requirements.lock": LOCK,
         "src/billing/__init__.py": b"",
     })
-    declaration = python_project_service.parse_python_project_declaration(
+    declaration = parse_python_project_declaration(
         MANIFEST, LOCK, max_control_bytes=256 * 1024, max_requirements=128,
     )
     payload = declaration.to_payload()
     if declaration_drift:
         payload["project_name"] = "other-project"
 
-    async def reply(probe: Any) -> PythonProjectInputsObservation:
+    async def reply(probe: PythonProjectProbeInvocation) -> PythonProjectInputsObservation:
         return PythonProjectInputsObservation.model_validate({
-            "scope": python_project_service._scope_payload(probe),
+            "scope": _scope_payload(probe),
             "declaration": payload, "interpreter": interpreter().to_payload(),
             "wheels": tuple(wheel.to_payload() for wheel in selected()),
         }, strict=True)
 
     probe = AsyncMock(side_effect=reply)
     monkeypatch.setattr(verifier._python.executor, "probe", probe)
-    saved = object()
+    saved: PythonProjectInputs = Mock(spec=PythonProjectInputs)
     capture = Mock(return_value=saved)
-    monkeypatch.setattr(python_project_service.PythonProjectInputStore, "capture_or_load_matching", capture)
+    monkeypatch.setattr(PythonProjectInputStore, "capture_or_load_matching", capture)
     if declaration_drift:
         with pytest.raises(ProjectVerificationError, match="^python_project_service_unavailable$"):
             await verifier.prepare_python_original(invocation=invocation, reference=reference)
@@ -814,7 +822,9 @@ async def test_declared_python_original_still_probes_exact_recipe(
         assert await verifier.prepare_python_original(invocation=invocation, reference=reference) is saved
         assert capture.call_args.kwargs["private_declaration"] is None
     probe.assert_awaited_once()
-    assert probe.await_args.args[0].install_allowed is False
+    probe_args = probe.await_args
+    assert probe_args is not None
+    assert probe_args.args[0].install_allowed is False
 
 
 @pytest.mark.parametrize("change", ["user", "resource", "arguments"])

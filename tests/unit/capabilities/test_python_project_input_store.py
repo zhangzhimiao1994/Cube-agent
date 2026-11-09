@@ -13,7 +13,10 @@ import pytest
 
 from agent_hub.capabilities.project_baselines import ProjectBaselineStore
 from agent_hub.capabilities.project_contracts import ManagedProjectInput
-from agent_hub.capabilities.python_project_inputs import PythonInterpreterIdentity, PythonProjectInputs
+from agent_hub.capabilities.python_project_inputs import (
+    PythonInterpreterIdentity,
+    PythonProjectInputs,
+)
 from agent_hub.capabilities.python_project_recipe import PythonProjectRecipeError
 from agent_hub.capabilities.python_project_wheels import PythonWheelBinding
 from tests.unit.capabilities.test_project_baselines import source_tree
@@ -206,15 +209,23 @@ def private_capture(module: Any, monkeypatch: pytest.MonkeyPatch, request: pytes
     from contextlib import nullcontext
     from types import SimpleNamespace
 
-    from agent_hub.capabilities.project_baselines import ProjectBaselineReference, StoredProjectBaseline
+    from agent_hub.capabilities.project_baselines import (
+        ProjectBaselineReference,
+        StoredProjectBaseline,
+    )
     from agent_hub.capabilities.project_contracts import build_project_check_contract
     from agent_hub.capabilities.python_original_metadata import standard_python_intent
     from agent_hub.capabilities.python_original_private_recipe import (
-        derive_private_original_recipe, original_dependency_needs,
+        derive_private_original_recipe,
+        original_dependency_needs,
     )
     from agent_hub.skills.sandbox.project import ProjectInvocation
     from tests.unit.capabilities.test_standard_python_original_intent import (
-        FILES, MANIFEST as STANDARD_MANIFEST, PROTECTED,
+        FILES,
+        PROTECTED,
+    )
+    from tests.unit.capabilities.test_standard_python_original_intent import (
+        MANIFEST as STANDARD_MANIFEST,
     )
     from tests.unit.capabilities.test_standard_python_private_recipe import ENVIRONMENT, _descriptor
 
@@ -243,8 +254,9 @@ def private_capture(module: Any, monkeypatch: pytest.MonkeyPatch, request: pytes
     )
     snapshot = Path('original-snapshot')
     stored = StoredProjectBaseline(reference, contract, snapshot, source_files)
-    kwargs: dict[str, object] = dict(interpreter=interpreter(), wheels=selected(),
-        max_control_bytes=256 * 1024, max_requirements=128)
+    kwargs: dict[str, object] = {
+        "interpreter": interpreter(), "wheels": selected(), "max_control_bytes": 256 * 1024, "max_requirements": 128,
+    }
     measured = None
     if not legacy:
         intent = standard_python_intent(STANDARD_MANIFEST, paths=FILES, protected=PROTECTED)

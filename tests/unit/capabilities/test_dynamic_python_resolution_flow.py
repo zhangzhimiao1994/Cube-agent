@@ -53,7 +53,7 @@ from tests.unit.capabilities.dynamic_resolution_typed_fixture import (
     text,
 )
 from tests.unit.capabilities.test_python_dependency_resolution import resolve
-from tests.unit.capabilities.test_python_resolution_preparation import Live
+from tests.unit.capabilities.test_python_resolution_preparation import Live, generated_planning
 from tests.unit.skills import test_python_registry_read as registry
 
 offline_network = registry.offline_network
@@ -120,7 +120,7 @@ async def test_unknown_resolution_never_resolves_freezes_publishes_or_installs()
     flow = prep.DynamicPythonResolutionFlow(Client())
     with pytest.raises(ValueError, match="inspect_only"):
         await flow.prepare(needs=prep.dynamic_python_needs(manifest()),
-                           environment=registry.environment(), planning=claim().planning)
+                           environment=registry.environment(), planning=generated_planning(claim()))
     assert calls == ["inspect"]
 
 
@@ -258,6 +258,7 @@ async def test_publication_resume_distinguishes_unstarted_from_unknown(publicati
     descriptor = replace(descriptor, scope=original.resolution_scope())
     needs = descriptor.needs
     env = dict(descriptor.environment)
+    planning = generated_planning(original)
     plan = freeze_plan(descriptor, original=original, current=original, overlay_sha256="e" * 64)
     calls, publication_calls = [], 0
     class Client:
@@ -283,14 +284,14 @@ async def test_publication_resume_distinguishes_unstarted_from_unknown(publicati
             return ResolutionStatus(state="published", key=plan.resolution_key, plan=plan)
     flow = prep.DynamicPythonResolutionFlow(Client())
     with pytest.raises(TimeoutError if publication_unknown else ResolutionApprovalRequired):
-        await flow.prepare(needs=needs, environment=env, planning=original.planning)
+        await flow.prepare(needs=needs, environment=env, planning=planning)
     before = list(calls)
     if publication_unknown:
         with pytest.raises(ValueError, match="inspect_only"):
-            await flow.prepare(needs=needs, environment=env, planning=original.planning)
+            await flow.prepare(needs=needs, environment=env, planning=planning)
         assert publication_calls == 1
     else:
-        result = await flow.prepare(needs=needs, environment=env, planning=original.planning)
+        result = await flow.prepare(needs=needs, environment=env, planning=planning)
         assert result.state == "published" and publication_calls == 2
     assert calls == before + ["inspect_plan"]
 
@@ -302,6 +303,7 @@ async def test_resolved_data_is_available_before_freeze_and_legal_exact_edit_reu
     descriptor, _ = await data()
     original = claim()
     descriptor = replace(descriptor, scope=original.resolution_scope())
+    planning = generated_planning(original)
     calls = []
     class Client:
         async def inspect(self, **kwargs: Unpack[InspectArgs]) -> ResolutionStatus:
@@ -314,15 +316,15 @@ async def test_resolved_data_is_available_before_freeze_and_legal_exact_edit_reu
         async def publish(self, *args: object, **kwargs: Unpack[PublishArgs]) -> ResolutionStatus:
             raise AssertionError("data discovery must not publish/install")
     flow = prep.DynamicPythonResolutionFlow(Client())
-    await flow.resolve_data(needs=descriptor.needs, environment=dict(descriptor.environment), planning=original.planning)
+    await flow.resolve_data(needs=descriptor.needs, environment=dict(descriptor.environment), planning=planning)
     exact = (registry.api()[0].DependencyNeed("demo==1.0", "b" * 64),)
-    await flow.resolve_data(needs=exact, environment=dict(descriptor.environment), planning=original.planning)
+    await flow.resolve_data(needs=exact, environment=dict(descriptor.environment), planning=planning)
     assert calls == [descriptor.needs, descriptor.needs]
     public = flow.public_data()
     assert public["descriptor_sha256"] == descriptor.sha256 and text(public["data_ref"]).endswith("a" * 64)
     with pytest.raises(ValueError, match="declaration_changed"):
         await flow.resolve_data(needs=(registry.api()[0].DependencyNeed("demo==99", "c" * 64),),
-                                environment=dict(descriptor.environment), planning=original.planning)
+                                environment=dict(descriptor.environment), planning=planning)
     assert len(calls) == 2
 
 
@@ -618,7 +620,7 @@ async def test_fresh_flow_recovers_immutable_scoped_artifact_and_unknown_is_insp
     fresh.restore(loaded)
     with pytest.raises(ValueError, match="inspect_only"):
         await fresh.resolve_data(needs=(registry.api()[0].DependencyNeed("external-tool==1.0", "c" * 64),),
-                                 environment=registry.environment(), planning=original.planning)
+                                 environment=registry.environment(), planning=generated_planning(original))
     assert len(calls) == 1 and calls[0]["needs"] == needs
     assert calls[0]["expected_plan_sha256"] == "b" * 64
     assert recovered_context.execution_token == UUID("7b3faf79-a37d-4c27-b365-34d9c5991859")
@@ -874,7 +876,9 @@ async def test_recovered_resolution_rejects_a_different_root_data_key() -> None:
     flow.restore({'needs': [{'requirement': n.requirement, 'evidence_sha256': n.evidence_sha256} for n in descriptor.needs],
                   'environment': dict(descriptor.environment), 'resolution_key': 'a' * 64, 'pending_plan_sha256': None})
     with pytest.raises(ValueError, match='resolution_data_changed'):
-        await flow.resolve_data(needs=descriptor.needs, environment=dict(descriptor.environment), planning=claim().planning)
+        await flow.resolve_data(
+            needs=descriptor.needs, environment=dict(descriptor.environment), planning=generated_planning(claim()),
+        )
 
 
 async def test_actual_cold_approval_wait_can_resolve_only_after_root_absent_and_current_grant(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dynamic_case: tuple[GeneratedProjectService, FlowRepository, TaskContext, str]) -> None:

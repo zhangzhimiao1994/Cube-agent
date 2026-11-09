@@ -39,6 +39,12 @@ def api() -> PreparationAPI:
     return python_resolution_preparation
 
 
+def generated_planning(original: ResolutionClaim) -> PythonMetadataPlanningRequest:
+    planning = original.planning
+    assert isinstance(planning, PythonMetadataPlanningRequest)
+    return planning
+
+
 def test_resolution_action_is_specific_and_not_install_or_generic_command() -> None:
     p = api()
     original = claim()
@@ -131,7 +137,7 @@ def live() -> Live:
         routing_decision=_freeze_object(route, name="routing decision"),
         timeout_seconds=30,
     )
-    planning = original.planning.model_copy(
+    planning = generated_planning(original).model_copy(
         update={"scope": metadata_scope(row, actor="implementer", live=True)}
     )
     return Live(row=row, context=context, planning=planning, events=[], revoked=False)

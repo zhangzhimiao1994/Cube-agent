@@ -124,10 +124,15 @@ def test_install_approval_is_recipe_specific_and_never_old_generic_scope(inputs:
 def _private_original_args(inputs: Any, *, protect_manifest: bool = True) -> dict[str, Any]:
     from agent_hub.capabilities.python_original_metadata import standard_python_intent
     from agent_hub.capabilities.python_original_private_recipe import (
-        derive_private_original_recipe, original_dependency_needs,
+        derive_private_original_recipe,
+        original_dependency_needs,
     )
     from tests.unit.capabilities.test_standard_python_original_intent import (
-        FILES, MANIFEST as STANDARD_MANIFEST, PROTECTED,
+        FILES,
+        PROTECTED,
+    )
+    from tests.unit.capabilities.test_standard_python_original_intent import (
+        MANIFEST as STANDARD_MANIFEST,
     )
     from tests.unit.capabilities.test_standard_python_private_recipe import ENVIRONMENT, _descriptor
 
@@ -146,8 +151,10 @@ def _private_original_args(inputs: Any, *, protect_manifest: bool = True) -> dic
     editable = ('src/expense_cli/cli.py',) if protect_manifest else ('pyproject.toml', 'src/expense_cli/cli.py')
     contract = build_project_check_contract(scope.tenant_id, scope.run_id, scope.project_id,
         scope.session_id, source_sha, editable, source_files)
-    return dict(contract=contract, original_reference=ProjectBaselineReference('3' * 64, source_sha, len(FILES)),
-        declaration=recipe.declaration, interpreter=runtime(inputs, version='3.12.8'), wheels=recipe.wheels)
+    return {
+        "contract": contract, "original_reference": ProjectBaselineReference('3' * 64, source_sha, len(FILES)),
+        "declaration": recipe.declaration, "interpreter": runtime(inputs, version='3.12.8'), "wheels": recipe.wheels,
+    }
 
 
 def test_private_original_canonical_lock_round_trips_without_source_lock(inputs: Any) -> None:
