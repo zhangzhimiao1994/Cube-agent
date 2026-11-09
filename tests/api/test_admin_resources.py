@@ -2585,6 +2585,121 @@ def test_admin_run_event_exposes_safe_process_details_without_secrets() -> None:
     assert "result" not in serialized
 
 
+def test_admin_role_contribution_uses_public_event_identity_and_ignores_model_metadata() -> None:
+    run = str(uuid4())
+    raw = json.dumps({
+        "position": "reject",
+        "claims": ["需要先确认输入边界。"],
+        "evidence": ["角色引用了 CSV 用例。"],
+        "objections": ["暂不接受这个方案。"],
+        "verification_needed": ["重跑异常输入测试。"],
+        "actor": "spoofed_actor",
+        "source_sequence": 999,
+        "status": "verified",
+        "conclusion": "spoofed_conclusion",
+    })
+    event = {
+        "kind": "message.created", "sequence": 41, "actor": "critic",
+        "run_id": run, "session_id": run, "message": raw,
+        "payload": {"autogen_role_message_version": 1, "logical_model": "shared", "role_message": raw},
+    }
+
+    response = _admin_run_event(event)
+    public = response.model_dump(mode="json")
+    assert public["payload"]["role_contribution"] == {
+        "type": "role_contribution", "schema_version": 1, "status": "proposed",
+        "actor": "critic", "source_sequence": 41, "position": "reject",
+        "claims": ["需要先确认输入边界。"], "evidence": ["角色引用了 CSV 用例。"],
+        "objections": ["暂不接受这个方案。"], "verification_needed": ["重跑异常输入测试。"],
+    }
+    assert "spoofed_" not in json.dumps(public)
+    assert "autogen_role_message_version" not in public["payload"]
+    assert public["message"] == "需要先确认输入边界。"
+
+
+@pytest.mark.parametrize(
+    ("change", "text"),
+    [
+        ({"payload": {}}, None),
+        ({"payload": {"autogen_role_message_version": True}}, None),
+        ({"kind": "step.completed"}, None),
+        ({"session_id": "different_run"}, None),
+        ({"sequence": True}, None),
+        ({"actor": "user"}, None),
+        ({}, '{"tool_calls":[{"function":{"arguments":"execute"}}]}'),
+        ({}, "Role prose <think>INTERNAL_TRACE</think>"),
+        ({}, ('{"position":"approve","position":"reject","claims":["proposal"],'
+             '"evidence":[],"objections":[],"verification_needed":[]}')),
+        ({}, ('{"position":"approve","claims":[{"text":"nested"}],'
+             '"evidence":[],"objections":[],"verification_needed":[]}')),
+        ({}, ('{"position":"approved","claims":["proposal"],'
+             '"evidence":[],"objections":[],"verification_needed":[]}')),
+        ({}, '{"position":"approve","claims":[],"evidence":[],"objections":[],"verification_needed":[]}'),
+        ({}, ('{"position":"approve","claims":["<think>INTERNAL_TRACE</think>"],'
+             '"evidence":[],"objections":[],"verification_needed":[]}')),
+        ({}, ('{"position":"approve","claims":["Cookie: INTERNAL_TRACE"],'
+             '"evidence":[],"objections":[],"verification_needed":[]}')),
+    ],
+)
+def test_admin_role_contribution_refuses_legacy_forged_or_unsafe_messages(
+    change: dict[str, object], text: str | None,
+) -> None:
+    run = str(uuid4())
+    raw = text or '{"position":"approve","claims":["proposal"],"evidence":[],"objections":[],"verification_needed":[]}'
+    event: dict[str, object] = {
+        "kind": "message.created", "sequence": 4, "actor": "analyst",
+        "run_id": run, "session_id": run, "message": raw,
+        "payload": {"autogen_role_message_version": 1, "role_message": raw},
+    }
+    event.update(change)
+    response = _admin_run_event(event)
+    assert "role_contribution" not in response.payload
+    assert "autogen_role_message_version" not in response.payload
+    assert "INTERNAL_TRACE" not in response.model_dump_json()
+
+
+def test_admin_role_contribution_never_forwards_a_forged_public_payload() -> None:
+    response = _admin_run_event({
+        "kind": "message.created", "actor": "analyst", "sequence": 2,
+        "message": "A normal public excerpt.", "payload": {"role_contribution": {"actor": "forged"}},
+    })
+    assert "role_contribution" not in response.payload
+    assert response.message == "A normal public excerpt."
+
+
+def test_public_autogen_role_records_and_artifacts_keep_private_transcript_out() -> None:
+    from agent_hub.runs.repository import _public_artifact_payload, _public_event_payload
+    from agent_hub.runtime.contracts import Artifact
+
+    run_id = uuid4()
+    raw = json.dumps({
+        "position": "needs_user", "claims": ["Check the input."], "evidence": [],
+        "objections": [], "verification_needed": ["Confirm the data source."],
+        "identity": "PRIVATE_MODEL_FIELD",
+    })
+    marker = {"autogen_role_message_version": 1}
+    event = RunEvent(
+        kind=EventKind.MESSAGE_CREATED, sequence=7, run_id=run_id, session_id=str(run_id),
+        actor="analyst", message=raw, payload={"role_message": raw, **marker},
+    )
+    artifact = Artifact(id=uuid4(), type="text", producer="analyst", content={"text": raw, **marker})
+    public_event = _public_event_payload(event.model_dump(mode="json"))
+    public_artifact = _public_artifact_payload(artifact.model_dump(mode="json"))
+    assert public_event["run_id"] == public_event["session_id"] == str(run_id)
+    response = _admin_run_event(public_event, source_is_public=True)
+    assert response.payload["role_contribution"] == {
+        "type": "role_contribution", "schema_version": 1, "status": "proposed",
+        "actor": "analyst", "source_sequence": 7, "position": "needs_user",
+        "claims": ("Check the input.",), "evidence": (), "objections": (),
+        "verification_needed": ("Confirm the data source.",),
+    }
+    assert public_artifact["content_redacted"] is True
+    assert public_artifact["public_content_sha256"] != artifact.content_sha256
+    assert "PRIVATE_MODEL_FIELD" not in json.dumps([public_event, public_artifact])
+    assert "PRIVATE_MODEL_FIELD" not in _admin_run_artifact(artifact.to_payload()).model_dump_json()
+    assert event.message == artifact.content["text"] == raw
+
+
 def test_admin_run_event_preserves_tool_payload_approval_id_without_raw_details() -> None:
     response = _admin_run_event(
         {

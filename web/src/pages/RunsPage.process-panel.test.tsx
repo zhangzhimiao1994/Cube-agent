@@ -72,6 +72,50 @@ async function mount(mode?: string, empty = false, overrides: Partial<RunDetail>
 }
 
 describe("one process panel with summary and genuine records", () => {
+  it("shows attributable meeting minutes and opens the cited public record", async () => {
+    const detail = fixture("discuss");
+    const speech = detail.events[2];
+    const events = [
+      ...detail.events.slice(0, 2),
+      { ...speech, message: "原始架构发言", actor: "architect", payload: {
+        logical_model: "architect-model",
+        role_contribution: { type: "role_contribution", schema_version: 1, status: "proposed",
+          actor: "architect", source_sequence: 3, position: "approve",
+          claims: ["先跑原测试定位排序问题"], evidence: [], objections: [], verification_needed: ["重跑原测试"] },
+      } },
+      { ...speech, sequence: 4, actor: "skeptic", message: "原始审查发言提到 architect", payload: {
+        logical_model: "review-model",
+        role_contribution: { type: "role_contribution", schema_version: 1, status: "proposed",
+          actor: "skeptic", source_sequence: 4, position: "reject",
+          claims: [], evidence: ["排序输入用例"], objections: ["尚未证明安装后的入口可用"], verification_needed: ["隔离运行命令行"] },
+      } },
+      { ...speech, sequence: 5, actor: "pretender", kind: "model.reasoning_delta", message: "PRIVATE_REASONING",
+        payload: { role_contribution: { type: "role_contribution", schema_version: 1, status: "proposed",
+          actor: "pretender", source_sequence: 5, position: "approve", recommended_option: "伪造结论",
+          claims: ["伪造观点"], evidence: [], objections: [], verification_needed: [] } } },
+      { ...speech, sequence: 6, actor: "pretender", message: "角色和来源不匹配", payload: {
+        role_contribution: { type: "role_contribution", schema_version: 1, status: "proposed",
+          actor: "architect", source_sequence: 3, position: "approve", claims: ["伪造引用"] },
+      } },
+    ];
+    const { user, panel } = await mount("discuss", false, { events });
+    const minutes = within(panel).getByRole("region", { name: "会议纪要" });
+    expect(minutes.textContent).toContain("先跑原测试定位排序问题");
+    expect(minutes.textContent).toContain("尚未证明安装后的入口可用");
+    expect(minutes.textContent).toContain("隔离运行命令行");
+    expect(minutes.textContent).not.toContain("伪造");
+    await user.click(within(minutes).getByRole("button", { name: "查看原记录 #4" }));
+    const records = within(panel).getByRole("tabpanel", { name: "真实调度记录" });
+    expect(within(records).getByRole("region", { name: "纪要来源记录" }).textContent).toContain("原始审查发言");
+    await user.click(within(panel).getByRole("tab", { name: "摘要" }));
+    await user.click(within(panel).getByRole("button", { name: /打开.*规划工作调度/ }));
+    await user.click(within(panel).getByRole("tab", { name: "真实调度记录" }));
+    expect(within(panel).queryByRole("region", { name: "纪要来源记录" })).toBeNull();
+    const actorRecords = within(panel).getByRole("region", { name: "过程轨迹" });
+    expect(actorRecords.textContent).toContain("原始架构发言");
+    expect(actorRecords.textContent).not.toContain("原始审查发言");
+  });
+
   it("summarizes a server-truncated draft receipt instead of leaking partial JSON", async () => {
     const detail = fixture("discuss");
     const text = '{"generated_draft_rejection":{"execution_started":false,"issues":["scaffold_incomplete"],"project_id":"';

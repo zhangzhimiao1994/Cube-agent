@@ -1,9 +1,10 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { MemoryRouter, useNavigate } from "react-router-dom";
 import { afterEach, expect, it, vi } from "vitest";
 
-import { api, type Conversation } from "../api/client";
+import { ApiError, api, type Conversation, type RunDetail } from "../api/client";
 import { AuthProvider } from "../auth/AuthProvider";
 import { RunsPage } from "./RunsPage";
 
@@ -114,4 +115,67 @@ it("enables a newly created conversation immediately from its complete cached me
     navigate("new-conversation");
   });
   await waitFor(() => expect(files).toHaveBeenCalledWith("new-project", "new-session"));
+});
+
+it("removes cached conversation history and open minutes when access is revoked", async () => {
+  const user = userEvent.setup();
+  const { client, detail } = await mount("revoked");
+  const createdAt = "2026-11-09T00:00:00Z";
+  const request = "Previously visible conversation request";
+  const run: RunDetail = {
+    id: "revoked-run", conversation_id: "revoked", status: "completed", mode: "discuss",
+    request, created_at: createdAt, version: 1, queue_wait_ms: 0, capacity_wait_ms: 0, cost_usd: "0",
+    explicit_details: {}, artifacts: [], failure_diagnostics: [], tool_lifecycle: [],
+    model_outcome_summary: {
+      completion_count: 0, fallback_used: false, fallback_attempt_count: 0,
+      requested_logical_models: [], actual_logical_models: [], attempted_logical_models: [], provider_ids: [],
+    },
+    orchestration_protocol_summary: null,
+    events: ["engineer", "reviewer"].map((actor, index) => ({
+      kind: "message.created", actor, sequence: index + 1, created_at: createdAt,
+      message: "Previously visible role statement", participants: [],
+      payload: { role_contribution: {
+        type: "role_contribution", schema_version: 1, status: "proposed", actor,
+        source_sequence: index + 1, position: "approve", claims: ["Previously visible role statement"],
+      } },
+    })),
+  };
+  const original = { ...conversation("revoked"), runs: [run] };
+  await act(async () => detail.resolve(original));
+  await user.click(await screen.findByRole("button", { name: /Agent 工作席/ }));
+  expect(screen.getByRole("dialog", { name: "Agent 工作席详情" })).toBeTruthy();
+  expect(screen.getByRole("region", { name: "会议纪要" })).toBeTruthy();
+  expect(screen.getByText(request)).toBeTruthy();
+
+  const refresh = async (status: number, message: string) => {
+    vi.mocked(api.conversation).mockRejectedValueOnce(new ApiError(message, status));
+    await act(async () => { await client.refetchQueries({ queryKey: ["conversation", "revoked"], exact: true }); });
+    await screen.findByText(message, { exact: false });
+  };
+  await refresh(503, "Temporary read failure");
+  expect(screen.getByRole("region", { name: "会议纪要" })).toBeTruthy();
+
+  await refresh(403, "Conversation access revoked");
+  expect(screen.queryByRole("dialog", { name: "Agent 工作席详情" })).toBeNull();
+  expect(screen.queryByText(request)).toBeNull();
+  expect(screen.queryByText("Previously visible role statement")).toBeNull();
+
+  await act(async () => { client.setQueryData(["conversation", "revoked"], original); });
+  await refresh(503, "Still waiting for an authorized read");
+  expect(screen.queryByText(request)).toBeNull();
+
+  await act(async () => { await client.refetchQueries({ queryKey: ["conversation", "revoked"], exact: true }); });
+  expect(await screen.findByText(request)).toBeTruthy();
+  expect(screen.queryByRole("dialog", { name: "Agent 工作席详情" })).toBeNull();
+
+  // An explicit run denial must also win over the cached copy in a readable conversation.
+  await user.click(screen.getByRole("button", { name: /Agent 工作席/ }));
+  vi.spyOn(api, "run").mockRejectedValueOnce(new ApiError("Run no longer visible", 404));
+  await act(async () => {
+    await expect(client.fetchQuery({
+      queryKey: ["run", run.id], queryFn: () => api.run(run.id),
+    })).rejects.toMatchObject({ status: 404 });
+  });
+  await waitFor(() => expect(screen.queryByText(request)).toBeNull());
+  expect(screen.queryByRole("dialog", { name: "Agent 工作席详情" })).toBeNull();
 });

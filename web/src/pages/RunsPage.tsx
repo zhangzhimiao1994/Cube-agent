@@ -27,6 +27,7 @@ import { useAuth } from "../auth/AuthProvider";
 import { PermissionSelector, type PermissionMode } from "../components/PermissionSelector";
 import { ComposerModeMenu, ComposerMoreMenu } from "../components/ComposerMenus";
 import { ProcessPanelTabs } from "../components/ProcessPanelTabs";
+import { DiscussionMinutes, DiscussionSourceRecord, discussionSourceEvent } from "../components/DiscussionMinutes";
 import { approvalReviewPresentation, resolvePermissionSelection, sandboxPermissions, type SupportedPermissionMode } from "./permissionSelection";
 
 const RUN_MODES = [
@@ -1577,7 +1578,8 @@ function agentWorkbenchMeta({
 }
 
 function agentActivityItems(card: AgentDispatchCard, items: ProcessDetailTarget[]) {
-  return items.filter((item) => item.sourceActor === card.id || item.rows.some((row) => row.value.includes(card.name) || row.value.includes(card.id)));
+  return items.filter((item) => item.sourceActor ? item.sourceActor === card.id
+    : item.rows.some((row) => row.value.includes(card.name) || row.value.includes(card.id)));
 }
 
 function agentRoleActionSummary(card: AgentDispatchCard) {
@@ -5273,8 +5275,10 @@ function progressFeedbackSummary(text: string, ...sourceTexts: (string | null | 
   return text.trim() || "未提供公开正文";
 }
 
-function RunProgressSummary({ detail, agentId, items }: {
+function RunProgressSummary({ detail, agentId, items, onOpenMinuteSource, actorName }: {
   detail?: RunDetail; agentId?: string | null; items: ProcessDetailTarget[];
+  onOpenMinuteSource?: (event: RunEvent) => void;
+  actorName?: (actor: string) => string;
 }) {
   const actual = actualWorkbenchItems(items);
   const excerpts = detail ? orderedRunEvents(detail.events).filter((event) =>
@@ -5300,6 +5304,10 @@ function RunProgressSummary({ detail, agentId, items }: {
       <div><dt>最近记录</dt><dd>{progressFeedbackSummary(latestText, latestEvent?.message, latestEvent?.summary)}</dd></div>
       {blocker ? <div><dt>阻塞</dt><dd>{progressFeedbackSummary(blocker)}</dd></div> : null}
     </dl>
+    {detail && onOpenMinuteSource ? <DiscussionMinutes mode={detail.mode} events={detail.events}
+      selectedActor={agentId} actorName={actorName} onOpenSource={onOpenMinuteSource}
+      fallback={<p className="process-minutes-unavailable">未生成会议纪要</p>} />
+      : <p className="process-minutes-unavailable">未生成会议纪要</p>}
     <section className="process-public-excerpts" aria-label="公开发言摘录">
       <h4>公开记录摘录</h4>
       {visibleExcerpts.length ? visibleExcerpts.map((event) => <article key={event.sequence}>
@@ -5310,7 +5318,6 @@ function RunProgressSummary({ detail, agentId, items }: {
       </article>) : <p>暂无公开发言记录</p>}
       {excerpts.length > visibleExcerpts.length ? <p>另有 {excerpts.length - visibleExcerpts.length} 条公开消息保留在真实调度记录中。</p> : null}
     </section>
-    <p className="process-minutes-unavailable">未生成会议纪要</p>
   </section>;
 }
 
@@ -5334,6 +5341,24 @@ function AgentWorkbenchDrawer({
   const [selectedFileId, setSelectedFileId] = useState<string | null>(null);
   const [selectedSource, setSelectedSource] = useState<ProcessDetailTarget | null>(null);
   const [showAllRecords, setShowAllRecords] = useState(false);
+  const [activeTab, setActiveTab] = useState(0);
+  const [minuteSequence, setMinuteSequence] = useState<number | null>(null);
+  const minuteSourceRef = useRef<HTMLElement | null>(null);
+  const minuteSource = discussionSourceEvent(detail.events, minuteSequence);
+  function openMinuteSource(event: RunEvent) {
+    setMinuteSequence(event.sequence);
+    setActiveTab(1);
+  }
+  function selectAgent(agentId: string | null) {
+    setSelectedAgentId(agentId);
+    setMinuteSequence(null);
+    setSelectedFileId(null);
+    setSelectedSource(null);
+    setShowAllRecords(false);
+  }
+  useEffect(() => {
+    if (activeTab === 1 && minuteSequence !== null) minuteSourceRef.current?.focus();
+  }, [activeTab, minuteSequence]);
   const selectedAgent = dispatchCards.find((card) => card.id === selectedAgentId) ?? null;
   const eventItems = detail.events.flatMap((event, index) => {
     if (!["message.created", "runtime.started", "runtime.completed", "runtime.cancelled", "queued", "run.queued"].includes(event.kind)
@@ -5355,12 +5380,14 @@ function AgentWorkbenchDrawer({
   });
   useEffect(() => {
     setSelectedAgentId(initialAgentId ?? null);
+    setMinuteSequence(null);
+    setSelectedFileId(null);
     setSelectedSource(null);
     setShowAllRecords(false);
   }, [initialAgentId]);
   const agentHeading = selectedAgent ? <div className="agent-workbench-actions-header">
     <strong>{agentDisplayTitle(selectedAgent)}工作调度</strong>
-    <button type="button" className="secondary-action" onClick={() => setSelectedAgentId(null)}>返回调度总览</button>
+    <button type="button" className="secondary-action" onClick={() => selectAgent(null)}>返回调度总览</button>
   </div> : null;
   return createPortal(
     <div className="process-drawer-backdrop" role="presentation" onClick={onClose}>
@@ -5372,13 +5399,15 @@ function AgentWorkbenchDrawer({
           <button type="button" className="secondary-action" onClick={onClose}>关闭</button>
         </div>
         <div className="agent-workbench-detail">
-          <ProcessPanelTabs summary={<>
+          <ProcessPanelTabs active={activeTab} onSelect={setActiveTab} summary={<>
             {agentHeading}
-            <RunProgressSummary detail={detail} agentId={selectedAgentId} items={visibleItems} />
+            <RunProgressSummary detail={detail} agentId={selectedAgentId} items={visibleItems}
+              actorName={(actor) => dispatchCards.find((card) => card.id === actor)?.name ?? actor}
+              onOpenMinuteSource={openMinuteSource} />
             {!selectedAgent ? <div className="agent-workbench-list" aria-label="计划参与角色">
               {dispatchCards.map((card) => <button key={card.id} type="button"
                 className={`agent-workbench-agent-card status-${card.status}`}
-                aria-label={`打开${agentDisplayTitle(card)}工作调度`} onClick={() => setSelectedAgentId(card.id)}>
+                aria-label={`打开${agentDisplayTitle(card)}工作调度`} onClick={() => selectAgent(card.id)}>
                 <div className="agent-workbench-agent-header">
                   <div className="agent-workbench-avatar" aria-hidden="true">{card.name.slice(0, 1)}</div>
                   <div><strong>{agentDisplayTitle(card)}</strong><span>{card.status}</span></div>
@@ -5410,6 +5439,7 @@ function AgentWorkbenchDrawer({
             ) : null}
           </>} records={<>
             {agentHeading}
+            {minuteSource ? <DiscussionSourceRecord event={minuteSource} sourceRef={minuteSourceRef} /> : null}
             <section className="process-actual-records" role="region" aria-label="过程轨迹">
               {!showAllRecords && records.length > displayedRecords.length ? <div>
                 <span>已折叠 {records.length - displayedRecords.length} 个较早动作</span>
@@ -5600,6 +5630,7 @@ function RunProcessSummary({
           </button>
           {isWorkbenchOpen ? (
             <AgentWorkbenchDrawer
+              key={detail.id}
               detail={detail}
               dispatchCards={dispatchCards}
               executionIntents={executionIntents}
@@ -6406,6 +6437,10 @@ function RenameConversationDialog({
 export function MessageBody({ text, title }: { text: string; title: string }) {
   return <OutputContent text={text} title={title} />;
 }
+function isConversationReadDenied(error: unknown) {
+  return error instanceof ApiError && [401, 403, 404].includes(error.status);
+}
+
 export function RunsPage() {
   const auth = useAuth();
   if (auth.loading) return <p>正在确认身份...</p>;
@@ -6582,6 +6617,49 @@ function RunsPageForActor() {
   const [attachmentDraft, setAttachmentDraft] = useState<ChatAttachmentDraft | null>(null);
   const [archiveInstallFile, setArchiveInstallFile] = useState<File | null>(null);
   const [conversationRunCache, setConversationRunCache] = useState<Record<string, RunDetail[]>>({});
+  const [deniedReads, setDeniedReads] = useState(() => ({ conversation: new Set<string>(), run: new Set<string>() }));
+  useEffect(() => {
+    return queryClient.getQueryCache().subscribe((event) => {
+      if (event.type !== "updated") return;
+      const [scope, id]: readonly unknown[] = event.query.queryKey;
+      if ((scope !== "conversation" && scope !== "run") || typeof id !== "string" || !id) return;
+      const { action } = event;
+      const denied = action.type === "error" && isConversationReadDenied(action.error);
+      // A cache write or a transient error does not restore revoked access.
+      if (!denied) {
+        if (action.type !== "success" || action.manual) return;
+        const readId = scope === "conversation"
+          ? (action.data as Conversation | undefined)?.conversation_id
+          : (action.data as RunDetail | undefined)?.id;
+        if (readId !== id) return;
+      }
+      setDeniedReads((current) => {
+        if (current[scope].has(id) === denied) return current;
+        const ids = new Set(current[scope]);
+        if (denied) ids.add(id);
+        else ids.delete(id);
+        return { ...current, [scope]: ids };
+      });
+      if (!denied) return;
+      setConversationRunCache((current) => {
+        if (scope === "conversation") {
+          if (!(id in current)) return current;
+          const next = { ...current };
+          delete next[id];
+          return next;
+        }
+        const next = { ...current };
+        let changed = false;
+        for (const [conversationId, runs] of Object.entries(current)) {
+          const remaining = runs.filter((run) => run.id !== id);
+          if (remaining.length === runs.length) continue;
+          next[conversationId] = remaining;
+          changed = true;
+        }
+        return changed ? next : current;
+      });
+    });
+  }, [queryClient]);
   const [temporaryApproval, setTemporaryApproval] = useState<{
     runId: string;
     decisionToken: string;
@@ -6717,6 +6795,13 @@ function RunsPageForActor() {
     },
     refetchIntervalInBackground: true,
   });
+  const activeConversationDenied =
+    deniedReads.conversation.has(activeConversationId) || isConversationReadDenied(activeConversation.error);
+  const selectedRunDenied = Boolean(selectedRunId &&
+    (deniedReads.run.has(selectedRunId) || isConversationReadDenied(selectedRun.error)));
+  const readableSelectedRun = activeConversationDenied || selectedRunDenied ||
+    (selectedRunConversationId && deniedReads.conversation.has(selectedRunConversationId))
+    ? undefined : selectedRun.data;
   const conversationQueue = useQuery({
     queryKey: ["conversation-queue", activeConversationId],
     queryFn: () => api.conversationQueue(activeConversationId),
@@ -6726,15 +6811,15 @@ function RunsPageForActor() {
   });
   // A conversation deep-link has no explicit run selection. Inspect only its latest
   // actionable run, never search backwards for an older pending approval.
-  const approvalConversationRuns = activeConversation.data?.conversation_id === activeConversationId
-    ? activeConversation.data.runs.filter((run) => runConversationId(run) === activeConversationId)
+  const approvalConversationRuns = !activeConversationDenied && activeConversation.data?.conversation_id === activeConversationId
+    ? activeConversation.data.runs.filter((run) => runConversationId(run) === activeConversationId && !deniedReads.run.has(run.id))
     : [];
   const blockedApprovalRunIds = new Set((conversationQueue.data ?? [])
     .filter((item) => item.conversation_id === activeConversationId && (item.status === "queued" || item.status === "redirecting"))
     .map((item) => item.successor_run_id));
   const capabilityApprovalRun = selectedRunId
-    ? selectedRun.data?.id === selectedRunId && runConversationId(selectedRun.data) === activeConversationId
-      ? selectedRun.data
+    ? readableSelectedRun?.id === selectedRunId && runConversationId(readableSelectedRun) === activeConversationId
+      ? readableSelectedRun
       : undefined
     : orderedConversationRuns(approvalConversationRuns).reverse().find((run) => !blockedApprovalRunIds.has(run.id));
   const proposedCapabilityApproval = capabilityApprovalFromRunDetail(capabilityApprovalRun);
@@ -6750,7 +6835,7 @@ function RunsPageForActor() {
   const capabilityHistory = useRunCapabilityApprovals(capabilityApproval ? capabilityApprovalRun : undefined);
   // A URL identifies a conversation, not its workspace. Never query a fallback
   // project/session while its metadata is loading, or combine partial scopes.
-  const activeWorkspaceMetadata = [activeConversation.data, listedConversationMetadata].find((item) =>
+  const activeWorkspaceMetadata = activeConversationDenied ? undefined : [activeConversation.data, listedConversationMetadata].find((item) =>
     item?.conversation_id === activeConversationId && item.project_id?.trim() && item.workspace_path?.trim());
   const activeWorkspaceProjectId = activeWorkspaceMetadata?.project_id?.trim() || projectId.trim() || "default";
   const activeWorkspaceSessionId = activeWorkspaceMetadata?.workspace_path?.trim() || activeConversationId;
@@ -6973,9 +7058,24 @@ function RunsPageForActor() {
     setConversationPreviewFile(null);
   }, [selectedRunId]);
 
+  const processDetailDenied = Boolean(processDetailTarget && (
+    activeConversationDenied ||
+    (processDetailTarget.conversationId && deniedReads.conversation.has(processDetailTarget.conversationId)) ||
+    deniedReads.run.has(processDetailTarget.runId) ||
+    (selectedRunDenied && processDetailTarget.runId === selectedRunId)
+  ));
+  const previewRunId = conversationPreviewFile?.source?.runId;
+  const conversationPreviewDenied = activeConversationDenied || Boolean(previewRunId && (
+    deniedReads.run.has(previewRunId) || (selectedRunDenied && previewRunId === selectedRunId)
+  ));
+  useEffect(() => {
+    if (processDetailDenied) setProcessDetailTarget(null);
+    if (conversationPreviewDenied) setConversationPreviewFile(null);
+  }, [conversationPreviewDenied, processDetailDenied]);
+
   const pageOverlayOpen =
-    Boolean(processDetailTarget) ||
-    Boolean(conversationPreviewFile) ||
+    Boolean(processDetailTarget && !processDetailDenied) ||
+    Boolean(conversationPreviewFile && !conversationPreviewDenied) ||
     historyOpen ||
     configOpen ||
     newProjectOpen ||
@@ -7082,32 +7182,25 @@ function RunsPageForActor() {
   }, [activeConversation, activeConversationId, processDetailTarget, queryClient, selectedRun, selectedRunId]);
 
   useEffect(() => {
-    if (!activeConversation.data) return;
+    const data = activeConversation.data;
+    if (!data || activeConversationDenied || data.conversation_id !== activeConversationId) return;
+    const readableRuns = data.runs.filter((run) => !deniedReads.run.has(run.id));
     setConversationRunCache((current) => {
-      const conversationRuns = mergeConversationRuns(
-        current[activeConversation.data.conversation_id],
-        activeConversation.data.runs,
-      );
-      if (conversationRuns === current[activeConversation.data.conversation_id]) return current;
-      return {
-        ...current,
-        [activeConversation.data.conversation_id]: conversationRuns,
-      };
+      const conversationRuns = mergeConversationRuns(current[activeConversationId], readableRuns);
+      if (conversationRuns === current[activeConversationId]) return current;
+      return { ...current, [activeConversationId]: conversationRuns };
     });
-  }, [activeConversation.data]);
+  }, [activeConversation.data, activeConversationDenied, activeConversationId, deniedReads.run]);
 
   useEffect(() => {
-    const selectedConversationId = runConversationId(selectedRun.data);
-    if (!selectedRun.data || !selectedConversationId) return;
+    const selectedConversationId = runConversationId(readableSelectedRun);
+    if (!readableSelectedRun || !selectedConversationId || deniedReads.conversation.has(selectedConversationId)) return;
     setConversationRunCache((current) => {
-      const conversationRuns = mergeConversationRuns(current[selectedConversationId], [selectedRun.data]);
+      const conversationRuns = mergeConversationRuns(current[selectedConversationId], [readableSelectedRun]);
       if (conversationRuns === current[selectedConversationId]) return current;
-      return {
-        ...current,
-        [selectedConversationId]: conversationRuns,
-      };
+      return { ...current, [selectedConversationId]: conversationRuns };
     });
-  }, [selectedRun.data]);
+  }, [deniedReads.conversation, readableSelectedRun]);
 
   const createRun = useMutation({
     mutationFn: async (override?: RunSubmissionOverride) => {
@@ -8378,24 +8471,19 @@ function RunsPageForActor() {
   const conversationVisibleRuns = activeConversationRuns
     ? mergeConversationRuns(cachedConversationRuns, activeConversationRuns)
     : cachedConversationRuns;
-  const selectedRunAlreadyVisible =
-    selectedRun.data && runConversationId(selectedRun.data) === activeConversationId
-      ? conversationVisibleRuns?.find((run) => run.id === selectedRun.data?.id)
-      : undefined;
-  const shouldMergeSelectedRun =
-    selectedRun.data &&
-    runConversationId(selectedRun.data) === activeConversationId &&
-    (!selectedRunAlreadyVisible || runHasNewerProgress(selectedRun.data, selectedRunAlreadyVisible));
-  const visibleRuns =
-    shouldMergeSelectedRun
-      ? mergeConversationRuns(conversationVisibleRuns, [selectedRun.data])
-      : conversationVisibleRuns ?? activeConversationRuns ?? (selectedRun.data ? [selectedRun.data] : []);
+  const selectedRunAlreadyVisible = conversationVisibleRuns?.find((run) => run.id === readableSelectedRun?.id);
+  const visibleRuns = activeConversationDenied ? [] : (
+    readableSelectedRun && runConversationId(readableSelectedRun) === activeConversationId &&
+      (!selectedRunAlreadyVisible || runHasNewerProgress(readableSelectedRun, selectedRunAlreadyVisible))
+      ? mergeConversationRuns(conversationVisibleRuns, [readableSelectedRun])
+      : conversationVisibleRuns ?? activeConversationRuns ?? (readableSelectedRun ? [readableSelectedRun] : [])
+  ).filter((run) => !deniedReads.run.has(run.id) && !(selectedRunDenied && run.id === selectedRunId));
   const usageSummary = conversationUsageSummary(visibleRuns);
   const messages = conversationMessages(visibleRuns);
   const checkpoints = conversationCheckpoints(messages);
   const workspaceFiles = mergeWorkspaceFileList(
     conversationWorkspaceFiles(visibleRuns),
-    activeWorkspaceFiles.data,
+    activeConversationDenied ? undefined : activeWorkspaceFiles.data,
   );
   const inlineWorkspaceFilesMessageId = inlineFileMessageId(messages);
   const temporaryApprovalVisibleInMessages =
@@ -8419,19 +8507,19 @@ function RunsPageForActor() {
     [...visibleRuns]
       .reverse()
       .find((run) => !blockedQueueSuccessorIds.has(run.id)) ??
-    (selectedRun.data && !blockedQueueSuccessorIds.has(selectedRun.data.id)
-      ? selectedRun.data
+    (readableSelectedRun && !blockedQueueSuccessorIds.has(readableSelectedRun.id)
+      ? readableSelectedRun
       : undefined);
   const canStopLatestRun = Boolean(latestVisibleRun && !TERMINAL_STATUSES.has(latestVisibleRun.status));
   const mainAgentModelName = mainAgent.data?.model
     ? `${mainAgent.data.model.provider}/${mainAgent.data.model.upstream_model}`
     : "未配置";
-  const refreshedRunForProcessDetail = processDetailTarget
+  const refreshedRunForProcessDetail = processDetailTarget && !processDetailDenied
     ? visibleRuns.find((run) => run.id === processDetailTarget.runId) ??
-      (selectedRun.data?.id === processDetailTarget.runId ? selectedRun.data : null)
+      (readableSelectedRun?.id === processDetailTarget.runId ? readableSelectedRun : null)
     : null;
   const refreshedProcessDetailTarget =
-    processDetailTarget && refreshedRunForProcessDetail
+    !processDetailTarget || processDetailDenied ? null : refreshedRunForProcessDetail
       ? refreshedProcessTarget(
           processDetailTarget,
           runProcessItems(refreshedRunForProcessDetail, agentNameMap, mainAgentModelName),
@@ -8445,13 +8533,13 @@ function RunsPageForActor() {
     deletableConversationIds.length > 0 &&
     deletableConversationIds.every((id) => selectedConversationIds.includes(id));
   const currentConversationListItem = items.find((item) => item.conversation_id === activeConversationId);
-  const currentConversationTitle =
+  const currentConversationTitle = activeConversationDenied ? "会话不可用" :
     activeConversation.data?.title?.trim() ||
     listedConversationMetadata?.title?.trim() ||
     currentConversationListItem?.conversation_title?.trim() ||
     (activeConversationKnown ? "未命名会话" : "新会话");
-  const currentConversationArchived = Boolean(activeConversation.data?.archived_at);
-  const currentConversationPersisted = Boolean(
+  const currentConversationArchived = !activeConversationDenied && Boolean(activeConversation.data?.archived_at);
+  const currentConversationPersisted = !activeConversationDenied && Boolean(
     activeConversation.data?.created_at || listedConversationMetadata?.created_at,
   );
 
@@ -9137,7 +9225,7 @@ function RunsPageForActor() {
               </div>
             </div>
             <ConversationCheckpointNav checkpoints={checkpoints} conversationId={activeConversationId} />
-            {modeSelection ? (
+            {!activeConversationDenied && modeSelection && !deniedReads.run.has(modeSelection.runId) ? (
               <article className="chat-message assistant" aria-label="运行模式确认">
                 <span className="eyebrow">{APP_BRAND_NAME}</span>
                 <h3>主 Agent 需要你确认运行方式</h3>
@@ -9160,35 +9248,35 @@ function RunsPageForActor() {
                 </div>
               </article>
             ) : null}
-            {temporaryApproval && !temporaryApprovalVisibleInMessages ? (
+            {!activeConversationDenied && temporaryApproval && !deniedReads.run.has(temporaryApproval.runId) && !temporaryApprovalVisibleInMessages ? (
               <article className="chat-message assistant" aria-label="临时 Agent 文字确认">
                 <span className="eyebrow">{APP_BRAND_NAME}</span>
                 <h3>{temporaryApproval.proposal.name}</h3>
                 <TemporaryAgentApprovalMessage proposal={temporaryApproval.proposal} />
               </article>
             ) : null}
-            {scheduleApproval && !scheduleApprovalVisibleInMessages ? (
+            {!activeConversationDenied && scheduleApproval && !deniedReads.run.has(scheduleApproval.runId) && !scheduleApprovalVisibleInMessages ? (
               <article className="chat-message assistant" aria-label="计划任务文字确认">
                 <span className="eyebrow">{APP_BRAND_NAME}</span>
                 <h3>计划任务确认</h3>
                 <p>{scheduleProposalBody(scheduleApproval.proposal)}</p>
               </article>
             ) : null}
-            {openClawApproval && !openClawApprovalVisibleInMessages ? (
+            {!activeConversationDenied && openClawApproval && !deniedReads.run.has(openClawApproval.runId) && !openClawApprovalVisibleInMessages ? (
               <article className="chat-message assistant" aria-label="OpenClaw 文字确认">
                 <span className="eyebrow">{APP_BRAND_NAME}</span>
                 <h3>OpenClaw 操作确认</h3>
                 <p>{openClawProposalBody(openClawApproval.proposal)}</p>
               </article>
             ) : null}
-            {projectPreflightApproval && !projectPreflightApprovalVisibleInMessages ? (
+            {!activeConversationDenied && projectPreflightApproval && !deniedReads.run.has(projectPreflightApproval.runId) && !projectPreflightApprovalVisibleInMessages ? (
               <article className="chat-message assistant" aria-label="项目架构预检确认">
                 <span className="eyebrow">{APP_BRAND_NAME}</span>
                 <h3>{projectPreflightApproval.proposal.title}</h3>
                 <p>{projectPreflightProposalBody(projectPreflightApproval.proposal)}</p>
               </article>
             ) : null}
-            {repairApproval && !repairApprovalVisibleInMessages ? (
+            {!activeConversationDenied && repairApproval && !deniedReads.run.has(repairApproval.runId) && !repairApprovalVisibleInMessages ? (
               <article className="chat-message assistant" aria-label="自修复文字确认">
                 <span className="eyebrow">{APP_BRAND_NAME}</span>
                 <h3>{repairApproval.proposal.title}</h3>
@@ -9271,7 +9359,7 @@ function RunsPageForActor() {
                 onReject={() => capabilityDecisions.reject(capabilityApproval)} />
             ) : null}
           </div>
-          {conversationPreviewFile ? (
+          {conversationPreviewFile && !conversationPreviewDenied ? (
             <ConversationFilePreviewDrawer
               file={conversationPreviewFile}
               webPreviewScope={

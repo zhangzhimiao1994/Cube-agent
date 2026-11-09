@@ -302,6 +302,27 @@ describe("RunDetailPage", () => {
     window.sessionStorage.clear();
   });
 
+  it("opens the cited public meeting record from the run detail workbench", async () => {
+    const speech = (sequence: number, actor: string, message: string, position: string, claim: string) => ({
+      sequence, actor, message, kind: "message.created", participants: [], created_at: runDetail.events[0].created_at,
+      payload: { role_contribution: { type: "role_contribution", schema_version: 1, status: "proposed",
+        actor, source_sequence: sequence, position, claims: [claim], evidence: [], objections: [],
+        verification_needed: [] } },
+    });
+    vi.spyOn(api, "run").mockResolvedValue({ ...runDetail, mode: "hybrid", events: [
+      speech(1, "architect", "原始方案发言", "approve", "先对照保护测试"),
+      speech(2, "reviewer", "原始风险发言", "reject", "缺少隔离环境验证"),
+    ] });
+    const user = userEvent.setup();
+    render(<TestApp initialPath={`/runs/${runId}`} />);
+    await user.click(await screen.findByRole("button", { name: /Agent 工作席/ }));
+    const drawer = screen.getByRole("dialog", { name: "Agent 工作席详情" });
+    const minutes = within(drawer).getByRole("region", { name: "会议纪要" });
+    expect(minutes.textContent).toContain("缺少隔离环境验证");
+    await user.click(within(minutes).getByRole("button", { name: "查看原记录 #2" }));
+    expect(within(drawer).getByRole("region", { name: "纪要来源记录" }).textContent).toContain("原始风险发言");
+  });
+
   it.each([
     { details: { project_id: "project-a", workspace_session_id: "session-a" }, available: true },
     { details: { project_id: "Project.A:1", workspace_session_id: "Session_2" }, available: true },

@@ -52,6 +52,7 @@ from agent_hub.runs.self_repair import (
     repair_context_from_proposal,
 )
 from agent_hub.runtime.contracts import (
+    AUTOGEN_ROLE_MESSAGE_VERSION_KEY,
     Artifact,
     EventKind,
     JsonValue,
@@ -59,6 +60,7 @@ from agent_hub.runtime.contracts import (
     RuntimeCheckpoint,
     TaskContext,
     _mutable_json,
+    is_structured_role_message,
 )
 from agent_hub.runtime.failure_reason import (
     RECOVERY_BLOCKED_FAILURE_REASON,
@@ -4454,6 +4456,141 @@ def _public_plugin_approval_events(
     return tuple(public)
 
 
+_ROLE_CONTRIBUTION_LISTS = ("claims", "evidence", "objections", "verification_needed")
+_ROLE_CONTRIBUTION_IGNORED = frozenset({
+    "recommended_option", "confidence", "risks", "questions_for_user",
+    "actor", "role", "identity", "run_id", "source", "source_run_id", "source_sequence",
+    "conclusion", "status", "verified",
+})
+_PRIVATE_ROLE_TEXT = re.compile(
+    r"</?(?:think|thinking|analysis|reasoning)\b|\b(?:chain[-_ ]of[-_ ]thought|"
+    r"(?:private|hidden)[-_ ](?:reasoning|output)|reasoning_content)\b|(?:cookie|token|credential)\s*[:=]"
+    r"|私有思维|内部推理|\x60{3}|~~~",
+    re.IGNORECASE,
+)
+
+
+def _is_autogen_role_message(
+    kind: str, event: Mapping[str, object], payload: object, actor: str | None, sequence: object,
+) -> bool:
+    run_id = event.get("run_id")
+    return (
+        kind == "message.created"
+        and type(actor) is str
+        and re.fullmatch(r"[a-z0-9][a-z0-9_.-]{0,127}", actor) is not None
+        and actor not in {"user", "delivery_main_agent"}
+        and type(sequence) is int and sequence > 0
+        and type(run_id) is str and bool(run_id) and event.get("session_id") == run_id
+        and isinstance(payload, Mapping)
+        and type(version := payload.get(AUTOGEN_ROLE_MESSAGE_VERSION_KEY)) is int and version == 1
+    )
+
+
+def _role_contribution(value: object) -> dict[str, JsonValue] | None:
+    if type(value) is not str or len(value) > 8192:
+        return None
+    text = value.strip()
+    fenced = re.fullmatch(r"\x60{3}json[ \t]*\r?\n(.*?)\r?\n\x60{3}", text, re.IGNORECASE | re.DOTALL)
+    if fenced is not None:
+        text = fenced[1].strip()
+    if not text.startswith("{"):
+        return None
+
+    def unique_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        document = dict(pairs)
+        if len(document) != len(pairs):
+            raise ValueError("duplicate role contribution field")
+        return document
+
+    try:
+        document = json.loads(text, object_pairs_hook=unique_pairs)
+    except (ValueError, RecursionError):
+        return None
+    fields = {"position", *_ROLE_CONTRIBUTION_LISTS}
+    if type(document) is not dict or not fields <= document.keys() <= fields | _ROLE_CONTRIBUTION_IGNORED:
+        return None
+    position = document["position"]
+    if type(position) is not str or position not in {"approve", "reject", "needs_user"}:
+        return None
+    result: dict[str, JsonValue] = {"position": position}
+    for field_name in _ROLE_CONTRIBUTION_LISTS:
+        entries = document[field_name]
+        if type(entries) is not list or len(entries) > 12:
+            return None
+        safe_entries: list[str] = []
+        for item in entries:
+            if type(item) is not str:
+                return None
+            cleaned = item.strip()
+            if (
+                not cleaned or len(cleaned) > 300 or _SENSITIVE_PUBLIC_TEXT.search(cleaned)
+                or _PRIVATE_ROLE_TEXT.search(cleaned) or is_structured_role_message(cleaned)
+                or any(
+                    ord(char) < 32 or 127 <= ord(char) <= 159 or 0xD800 <= ord(char) <= 0xDFFF
+                    for char in cleaned
+                )
+                or cleaned.casefold() in {"redacted", "[redacted]", "[truncated]"}
+            ):
+                return None
+            safe_entries.append(cleaned)
+        result[field_name] = tuple(safe_entries)
+    return result if any(result[field] for field in _ROLE_CONTRIBUTION_LISTS) else None
+
+
+def project_autogen_role_event(event: dict[str, object]) -> dict[str, object]:
+    """Expose role structure only from the framework-owned source event."""
+    raw_payload = event.get("payload")
+    if not isinstance(raw_payload, Mapping) or not {
+        AUTOGEN_ROLE_MESSAGE_VERSION_KEY, "role_contribution",
+    }.intersection(raw_payload):
+        return event
+    payload = {
+        key: value for key, value in raw_payload.items()
+        if key not in {AUTOGEN_ROLE_MESSAGE_VERSION_KEY, "role_contribution"}
+    }
+    public = {**event, "payload": payload}
+    kind, actor, sequence = (event.get(key) for key in ("kind", "actor", "sequence"))
+    if type(kind) is not str or type(actor) is not str or not _is_autogen_role_message(
+        kind, event, raw_payload, actor, sequence,
+    ):
+        return public
+
+    message = event.get("message")
+    contribution = _role_contribution(message)
+    if contribution is not None:
+        payload["role_contribution"] = {
+            "type": "role_contribution",
+            "schema_version": 1,
+            "status": "proposed",
+            "actor": actor,
+            "source_sequence": sequence,
+            **contribution,
+        }
+        excerpt = next(
+            items[0] for name in _ROLE_CONTRIBUTION_LISTS
+            if (items := contribution[name]) and isinstance(items, tuple)
+        )
+        payload["role_message"] = excerpt
+        public["message"] = excerpt
+        public.pop("summary", None)
+    elif is_structured_role_message(message) or is_structured_role_message(payload.get("role_message")):
+        payload.pop("role_message", None)
+        public["message"] = "message.created"
+        public.pop("summary", None)
+    return public
+
+
+def public_autogen_role_artifact_content(content: object) -> object:
+    """Keep the private transcript out of public text artifact views."""
+    if (
+        isinstance(content, Mapping)
+        and type(version := content.get(AUTOGEN_ROLE_MESSAGE_VERSION_KEY)) is int
+        and version == 1
+    ):
+        return {"text": "结构化角色发言，请查看真实调度记录。", "presentation": "step_detail"}
+    return content
+
+
 def _public_event_payload(payload: dict[str, object]) -> dict[str, object]:
     kind = payload.get("kind")
     if type(kind) is str and kind in CONTEXT_EVENT_KINDS:
@@ -4472,7 +4609,7 @@ def _public_event_payload(payload: dict[str, object]) -> dict[str, object]:
         public["checkpoint_summary"] = _public_checkpoint_summary(
             payload.get("checkpoint_summary") if checkpoint is None else checkpoint
         )
-    return public
+    return project_autogen_role_event(public)
 
 
 def _public_checkpoint_summary(value: object) -> dict[str, str]:
@@ -4520,6 +4657,8 @@ def _public_artifact_payload(payload: dict[str, object]) -> dict[str, object]:
         for key, value in payload.items()
         if _is_public_key(key) and key not in {"public_content_sha256", "content_redacted"}
     }
+    if payload.get("type") == "text":
+        public["content"] = public_autogen_role_artifact_content(public.get("content"))
     if original is None or payload.get("content_sha256") != original.content_sha256:
         return public
     try:

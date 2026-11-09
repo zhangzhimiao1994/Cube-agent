@@ -39,6 +39,18 @@ from agent_hub.runtime.instruction_context import InstructionContext
 type JsonScalar = None | bool | int | float | str
 type JsonValue = JsonScalar | tuple["JsonValue", ...] | Mapping[str, "JsonValue"]
 
+AUTOGEN_ROLE_MESSAGE_VERSION_KEY = "autogen_role_message_version"
+
+
+def is_structured_role_message(value: object) -> bool:
+    if type(value) is not str:
+        return False
+    return re.match(
+        r"^\s*(?:\{|\[\s*(?:[{}\[\]\"0-9-]|null|true|false)|(?:\x60{3}|~~~)\s*(?:json\b|\{))",
+        value, re.IGNORECASE,
+    ) is not None or re.search(r"</?(?:think|thinking|analysis|reasoning)\b", value, re.IGNORECASE) is not None
+
+
 _SAFE_ID = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,127}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _VERSION = re.compile(r"^[0-9]+(?:\.[0-9]+){0,2}$")

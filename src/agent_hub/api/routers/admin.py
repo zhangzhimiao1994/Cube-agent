@@ -159,6 +159,8 @@ from agent_hub.runs.repository import (
     RunNotFound,
     RunRecord,
     RunRepository,
+    project_autogen_role_event,
+    public_autogen_role_artifact_content,
 )
 from agent_hub.runs.self_repair import repair_proposal_projection
 from agent_hub.runtime import direct_delivery_report
@@ -9697,7 +9699,7 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             install_visibility = await self._capability_install_visibility((record,))
         return RunDetailResponse(
             **list_item.model_dump(),
-            events=[_admin_run_event(event) for event in events],
+            events=[_admin_run_event(event, source_is_public=True) for event in events],
             artifacts=_admin_run_artifacts(artifacts, run_id=record.id),
             explicit_details={
                 "source": "database",
@@ -17157,7 +17159,12 @@ def _channel_error_logs_from_environment() -> tuple[LogEntryResponse, ...]:
     return _channel_error_logs_from_configuration({})
 
 
-def _admin_run_event(event: dict[str, object]) -> RunEventResponse:
+def _admin_run_event(
+    event: dict[str, object], *, source_is_public: bool = False,
+) -> RunEventResponse:
+    # Repository readers have already authenticated the structured projection.
+    if not source_is_public:
+        event = project_autogen_role_event(event)
     kind = event.get("kind")
     if type(kind) is str and kind in CONTEXT_EVENT_KINDS:
         event = context_event_projection(event)
@@ -17176,6 +17183,10 @@ def _admin_run_event(event: dict[str, object]) -> RunEventResponse:
         safe_payload = _runtime_recovered_event_payload(payload)
     else:
         safe_payload = _event_payload(payload)
+    if kind_text == "message.created" and isinstance(payload, Mapping):
+        contribution = payload.get("role_contribution")
+        if isinstance(contribution, Mapping):
+            safe_payload["role_contribution"] = _safe_event_detail(contribution)
     safe_artifact = _admin_run_artifact(artifact) if isinstance(artifact, dict) else None
     summary = _event_source_summary(event.get("summary")) or _event_summary(
         kind_text,
@@ -17326,6 +17337,8 @@ def _event_payload(value: object) -> dict[str, JsonValue]:
     payload: dict[str, JsonValue] = {}
     for key, item in value.items():
         key_text = str(key)
+        if key_text == "role_contribution":
+            continue
         if key_text == "model_execution_plan":
             payload[key_text] = _model_execution_plan_event_payload(item)
             continue
@@ -17768,7 +17781,7 @@ def _admin_run_artifact(
     artifact_id = artifact.get("id")
     artifact_type = artifact.get("type")
     producer = artifact.get("producer")
-    content = artifact.get("content")
+    content = public_autogen_role_artifact_content(artifact.get("content"))
     title = producer if type(producer) is str and producer else artifact_id
     text = _artifact_text(content) or _direct_delivery_summary(artifact, run_id=run_id)
     file_metadata = _artifact_file_metadata(artifact, run_id=run_id)

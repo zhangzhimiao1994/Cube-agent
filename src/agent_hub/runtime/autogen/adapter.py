@@ -141,12 +141,14 @@ from agent_hub.runtime.autogen.termination import CompositeDiscussionTermination
 from agent_hub.runtime.contracts import (
     _CAPACITY_DIAGNOSTIC_ENUMS,
     _GATEWAY_SCOPE_DIAGNOSTIC_KEYS,
+    AUTOGEN_ROLE_MESSAGE_VERSION_KEY,
     Artifact,
     EventKind,
     JsonValue,
     RunEvent,
     RuntimeCheckpoint,
     TaskContext,
+    is_structured_role_message,
 )
 from agent_hub.runtime.engineering_actions import required_engineering_action
 from agent_hub.runtime.execution_failure import (
@@ -307,7 +309,7 @@ def _artifact_prompt_content(artifact: Artifact) -> object:
 
 def _artifact_text_preview(artifact: Artifact, *, max_bytes: int = 2_000) -> str | None:
     text = artifact.content.get("text")
-    if type(text) is not str:
+    if type(text) is not str or artifact.content.get(AUTOGEN_ROLE_MESSAGE_VERSION_KEY) == 1:
         return None
     stripped = text.strip()
     if not stripped:
@@ -3599,7 +3601,13 @@ class AutoGenDiscussionRuntime:
                         system_message=(
                             f"Role: {participant.role}. Goal: {participant.goal}. "
                             "Return only explicit conclusions and citations. Never reveal hidden reasoning. "
-                            "Use [CONSENSUS] to vote, or [COMPLETE] only for a finished answer."
+                            "Use [CONSENSUS] to vote, or [COMPLETE] only for a finished answer. "
+                            "For an ordinary non-vote update, you may reply with one public JSON object "
+                            "with position (approve, reject, or needs_user), and string arrays "
+                            "claims, evidence, objections, and verification_needed. State only "
+                            "public observations and describe evidence as proposed until verified. "
+                            "Keep the original [CONSENSUS] vote and [COMPLETE] delivery conventions; "
+                            "do not put those markers inside the JSON object."
                             + (' ' + generated_project_guidance(context) if engineering else '')
                             + (" A generated_project_draft_rejection with phase before_capture means "
                                "capture and execution have not started and the draft is not frozen. "
@@ -3859,6 +3867,11 @@ class AutoGenDiscussionRuntime:
                         raise RuntimeExecutionError("capability execution failed") from None
                     if isinstance(item, BaseChatMessage) and item.source != "user":
                         text = item.to_text()
+                        is_role_message = (
+                            type(item) is TextMessage
+                            and item.source in participant_models
+                            and item.source != FINAL_REPORT_ACTOR
+                        )
                         report_metadata: Mapping[str, JsonValue] | None = None
                         if reports and item.source == FINAL_REPORT_ACTOR:
                             observe_report((item,))
@@ -3871,7 +3884,9 @@ class AutoGenDiscussionRuntime:
                             producer=item.source,
                             content={"text": text, **({"presentation": "final_answer",
                                 "engineering_report": report_metadata}
-                                if report_metadata is not None else {})},
+                                if report_metadata is not None else {}),
+                                **({AUTOGEN_ROLE_MESSAGE_VERSION_KEY: 1}
+                                    if is_role_message and is_structured_role_message(text) else {})},
                             source_ids=(cast(str, report_metadata["model_artifact_id"]),
                                         cast(str, report_metadata["bundle_artifact_id"]))
                             if report_metadata is not None else source_ids,
@@ -3898,6 +3913,12 @@ class AutoGenDiscussionRuntime:
                             raise
                         self._last_checkpoint = checkpoint
                         self._pending_artifact_writes.pop(write_id, None)
+                        message_payload: dict[str, JsonValue] = {
+                            "logical_model": participant_models.get(item.source, ""),
+                            "role_message": _truncate_prompt_text(text, max_bytes=2_000),
+                        }
+                        if is_role_message:
+                            message_payload[AUTOGEN_ROLE_MESSAGE_VERSION_KEY] = 1
                         yield RunEvent(
                             kind=EventKind.MESSAGE_CREATED,
                             sequence=sequence,
@@ -3906,10 +3927,7 @@ class AutoGenDiscussionRuntime:
                             session_id=str(context.run_id),
                             message=text,
                             inputs=context.artifacts,
-                            payload={
-                                "logical_model": participant_models.get(item.source, ""),
-                                "role_message": _truncate_prompt_text(text, max_bytes=2_000),
-                            },
+                            payload=message_payload,
                         )
                         sequence += 1
                         yield RunEvent(

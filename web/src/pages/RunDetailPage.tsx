@@ -9,6 +9,7 @@ import { useAuth } from "../auth/AuthProvider";
 import { useRunCapabilityApprovals } from "./useRunCapabilityApprovals";
 import { CapabilityApprovalCard } from "../components/CapabilityApprovalCard";
 import { PluginHandoverPanel } from "../components/PluginHandoverPanel";
+import { DiscussionMinutes, DiscussionSourceRecord, discussionSourceEvent } from "../components/DiscussionMinutes";
 import { BoundedTextBlock, OutputContent, hasStructuredOutput, isMarkdownOutputFile, outputFileLanguage } from "../components/OutputContent";
 import {
   ArtifactFileCard,
@@ -3107,6 +3108,7 @@ function DetailWorkbenchFilePreview({
 }
 
 function DetailProcessDrawer({
+  detail,
   cards,
   selectedCard,
   dialogId,
@@ -3114,6 +3116,7 @@ function DetailProcessDrawer({
   onSelectCard,
   webPreviewScope,
 }: {
+  detail: RunDetail;
   cards: DetailProcessCard[];
   selectedCard: DetailProcessCard | null;
   dialogId: string;
@@ -3124,6 +3127,12 @@ function DetailProcessDrawer({
   const [showAllActions, setShowAllActions] = useState(false);
   const [activeView, setActiveView] = useState<DetailWorkbenchView>("overview");
   const [selectedFileId, setSelectedFileId] = useState<string | null>(null);
+  const [minuteSequence, setMinuteSequence] = useState<number | null>(null);
+  const minuteSourceRef = useRef<HTMLElement | null>(null);
+  const minuteSource = discussionSourceEvent(detail.events, minuteSequence);
+  useEffect(() => {
+    if (activeView === "actions" && minuteSequence !== null) minuteSourceRef.current?.focus();
+  }, [activeView, minuteSequence]);
   const previewPaneRef = useRef<HTMLElement | null>(null);
   const overviewCards = detailWorkbenchOverviewCards(cards);
   const coordinationCards = cards.filter(isDetailCoordinationCard);
@@ -3228,6 +3237,8 @@ function DetailProcessDrawer({
                   <small>{actionBreakdown.join(" · ") || "暂无动作"}</small>
                 </button>
               </div>
+              {activeView === "actions" && minuteSource ? <DiscussionSourceRecord event={minuteSource}
+                sourceRef={minuteSourceRef} /> : null}
               {activeView === "overview" ? (
                 <section className="agent-workbench-action-list-pane" aria-label="助手总览工作区">
                   <div className="agent-workbench-actions-header">
@@ -3237,6 +3248,10 @@ function DetailProcessDrawer({
                       {coordinationCards.length > 0 ? ` · ${coordinationCards.length} 条调度证据` : ""}
                     </small>
                   </div>
+                  <DiscussionMinutes mode={detail.mode} events={detail.events}
+                    onOpenSource={(event) => { setMinuteSequence(event.sequence); setActiveView("actions"); }}
+                    fallback={detail.mode === "discuss" || detail.mode === "hybrid"
+                      ? <p className="process-minutes-unavailable">未生成会议纪要</p> : null} />
                   {coordinationCards.length > 0 ? <DetailCoordinationEvidence sections={coordinationSections} onOpen={onSelectCard} /> : null}
                   <div className="agent-cluster-actions" role="region" aria-label={visibleAria}>
                     {visiblePreview.visible.map((card) => (
@@ -3333,7 +3348,9 @@ function DetailProcessDrawer({
   );
 }
 
-function DetailProcessSummary({ cards, webPreviewScope }: { cards: DetailProcessCard[]; webPreviewScope?: WebPreviewScope | null }) {
+function DetailProcessSummary({ detail, cards, webPreviewScope }: {
+  detail: RunDetail; cards: DetailProcessCard[]; webPreviewScope?: WebPreviewScope | null;
+}) {
   const [selectedCard, setSelectedCard] = useState<DetailProcessCard | null>(null);
   const [drawerOpen, setDrawerOpen] = useState(false);
   const previouslyFocused = useRef<HTMLElement | null>(null);
@@ -3387,6 +3404,7 @@ function DetailProcessSummary({ cards, webPreviewScope }: { cards: DetailProcess
       </div>
       {drawerOpen ? (
         <DetailProcessDrawer
+          detail={detail}
           cards={cards}
           selectedCard={selected}
           dialogId={workbenchId}
@@ -3898,7 +3916,7 @@ function RunDetailPageForActor() {
         </article>
       ) : null}
 
-      <DetailProcessSummary cards={processCards} webPreviewScope={webPreviewScope} />
+      <DetailProcessSummary key={`process:${run.data.id}`} detail={run.data} cards={processCards} webPreviewScope={webPreviewScope} />
       <PluginHandoverPanel key={runId} runId={runId} artifacts={run.data.artifacts}
         workspaceScope={run.data.id === runId && run.data.explicit_details.project_id && run.data.explicit_details.workspace_session_id
           ? { projectId: run.data.explicit_details.project_id, sessionId: run.data.explicit_details.workspace_session_id }

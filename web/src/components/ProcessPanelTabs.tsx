@@ -1,7 +1,14 @@
 import { type ReactNode, useId, useRef, useState } from "react";
 
-export function ProcessPanelTabs({ summary, records }: { summary: ReactNode; records: ReactNode }) {
-  const [selected, setSelected] = useState(0);
+export function ProcessPanelTabs({ summary, records, active, onSelect }: {
+  summary: ReactNode; records: ReactNode; active?: number; onSelect?: (index: number) => void;
+}) {
+  const [internal, setInternal] = useState(0);
+  const selected = active ?? internal;
+  function setSelected(index: number) {
+    if (active === undefined) setInternal(index);
+    onSelect?.(index);
+  }
   const id = useId();
   const buttons = useRef<Array<HTMLButtonElement | null>>([]);
   const labels = ["摘要", "真实调度记录"];

@@ -139,6 +139,68 @@ def test_discussion_plan_rejects_invalid_participants_and_limits() -> None:
         plan(max_turns=0)
 
 
+async def test_discussion_role_contributions_keep_real_speakers_and_hybrid_parent_sequence() -> None:
+    from agent_hub.api.routers.admin import _admin_run_artifact, _admin_run_event
+    from agent_hub.runs.repository import _public_artifact_payload, _public_event_payload
+    from agent_hub.runtime.autogen.adapter import _artifact_text_preview
+    from agent_hub.runtime.hybrid import _renumber_child_event
+
+    def opinion(position: str, claim: str) -> str:
+        return json.dumps({
+            "position": position, "claims": [claim], "evidence": ["A role observation."],
+            "objections": ["Inputs remain unverified."] if position == "reject" else [],
+            "verification_needed": ["Verify the edge case."], "actor": "untrusted",
+            "conclusion": "MODEL_PRIVATE_FIELD",
+        })
+
+    gateway = ScriptedGateway([
+        ("analyst", 1, None), (opinion("approve", "Use the current structure."), 2, None),
+        ("critic", 1, None), (opinion("reject", "Change input validation."), 2, None),
+        ("analyst", 1, None), ("[COMPLETE] Finish.", 2, None),
+    ])
+    child = context()
+    events = await collect(AutoGenDiscussionRuntime(gateway, plan()), child)
+    messages = [event for event in events if event.kind is EventKind.MESSAGE_CREATED]
+    assert [event.actor for event in messages] == ["analyst", "critic", "analyst"]
+
+    parent = uuid4()
+    public_records = [
+        _public_event_payload(
+            _renumber_child_event(event, 50 + index, parent, inputs=()).model_dump(mode="json")
+        )
+        for index, event in enumerate(messages)
+    ]
+    assert all(record["run_id"] == record["session_id"] == str(parent) for record in public_records)
+    public = [
+        _admin_run_event(record, source_is_public=True).model_dump(mode="json")
+        for record in public_records
+    ]
+    contributions = [event["payload"].get("role_contribution") for event in public]
+    assert [(row["actor"], row["source_sequence"], row["position"], row["status"]) for row in contributions[:2]] == [
+        ("analyst", 50, "approve", "proposed"),
+        ("critic", 51, "reject", "proposed"),
+    ]
+    assert contributions[1]["objections"] == ["Inputs remain unverified."]
+    assert contributions[2] is None
+    assert all("MODEL_PRIVATE_FIELD" not in json.dumps(record) for record in public_records)
+    redacted_artifact_count = 0
+    for event in events:
+        if event.kind is EventKind.ARTIFACT_CREATED and event.artifact is not None:
+            artifact = event.artifact.to_payload()
+            if "MODEL_PRIVATE_FIELD" in json.dumps(artifact):
+                assert "MODEL_PRIVATE_FIELD" not in json.dumps(_public_artifact_payload(artifact))
+                assert "MODEL_PRIVATE_FIELD" not in _admin_run_artifact(artifact).model_dump_json()
+                assert _artifact_text_preview(event.artifact) is None
+                redacted_artifact_count += 1
+        if event.kind == "discussion.completed":
+            assert "MODEL_PRIVATE_FIELD" not in json.dumps(event.to_payload())
+    assert redacted_artifact_count == 2
+    assert events[-1].kind is EventKind.RUNTIME_COMPLETED
+    assert events[-1].reason == "explicit_completion"
+    assert "[COMPLETE] Finish." in messages[-1].message
+    assert len(gateway.requests) == 6
+
+
 async def test_real_selector_group_chat_uses_gateway_for_shared_roles() -> None:
     gateway = ScriptedGateway(
         [

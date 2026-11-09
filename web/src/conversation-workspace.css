@@ -276,6 +276,12 @@ body:has(.conversation-workspace) .mode-choice-grid small { color: #646b78; }
 .process-public-artifacts { border-top: 1px solid var(--border, #dfe3e8); margin-top: 16px; padding-top: 16px; }
 .process-public-artifacts article { margin-bottom: 16px; min-width: 0; }
 .process-public-excerpts time, .process-record-origin { color: var(--muted, #646b78); font-size: 12px; }
+.process-meeting-minutes { margin-bottom: 18px; overflow-wrap: anywhere; }
+.process-meeting-minutes article { border: 1px solid var(--border, #dfe3e8); border-radius: 10px; padding: 12px; }
+.process-meeting-minutes h5 { margin: 0; font-size: 14px; }
+.process-meeting-minutes ul { margin: 4px 0 10px; padding-inline-start: 20px; }
+.process-meeting-minutes article > button { margin-top: 8px; }
+.process-meeting-source > p { white-space: pre-wrap; overflow-wrap: anywhere; }
 .process-minutes-unavailable { color: var(--muted, #646b78); font-size: 13px; margin: 16px 0; }
 .process-record { border-bottom: 1px solid var(--border, #dfe3e8); padding: 12px 0; }
 .process-record-origin { align-items: baseline; display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 6px; }
