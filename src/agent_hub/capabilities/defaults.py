@@ -186,6 +186,26 @@ class DefaultRuntimeCapabilityPolicyGateway:
             reason=None if allowed else "capability denied",
         )
 
+    def _original_python_offline_action_allowed(
+        self, request: CapabilityRequest, *, role: Role, permission_mode: object,
+    ) -> bool:
+        """Pure action policy. The caller independently fences its locked run and settings."""
+        if (permission_mode != "auto_review" or self._approval_reviewer is not None or request.tool_origin != "builtin"
+                or request.agent_id != "main_agent"
+                or (request.capability, request.operation) != ("command", "run")
+                or not request.resource.startswith("workspace/current/project-verification/python/")):
+            return False
+        try:
+            _python_recipe_authorization(request, expected=request)
+            source = self._plugin_policy_rules
+            rules = () if source is None else source.capability_policy_rules(request.tenant_id)
+            if not isinstance(rules, tuple) or not all(isinstance(rule, CapabilityRule) for rule in rules):
+                return False
+            return (default_capability_policy(request.tenant_id).evaluate(request, role).effect is PolicyEffect.ALLOW
+                    and _explicit_policy_effect(rules, request, role) not in {PolicyEffect.DENY, PolicyEffect.REQUIRE_APPROVAL})
+        except Exception:  # noqa: BLE001 - unavailable policy leaves the existing approval path in force.
+            return False
+
     async def authorize_project_toolchain(
         self, request: CapabilityRequest, *, role: Role,
         authority: ToolchainSupplyAuthority | None = None,

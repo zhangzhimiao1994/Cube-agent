@@ -354,9 +354,7 @@ def build_worker_service(
         require_approval_for_tools=lambda tenant_id: _require_tool_approval_from_settings(
             _admin_settings_getter_for_tenant(admin_service, tenant_id)
         ),
-        tool_approval_mode=lambda tenant_id: _tool_approval_mode_from_settings(
-            _admin_settings_getter_for_tenant(admin_service, tenant_id)
-        ),
+        tool_approval_mode=admin.PersistentToolApprovalMode(admin_service),
         tool_registry=CompositeCapabilityManifestSource(
             (
                 runtime_mcp_service.capability_manifest_source(),

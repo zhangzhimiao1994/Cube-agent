@@ -84,6 +84,7 @@ from agent_hub.subprocess_cleanup import ProcessCleanupIncomplete
 
 if TYPE_CHECKING:
     from agent_hub.capabilities.project_verification import ProjectVerificationService
+    from agent_hub.runs.original_python_offline_review import OriginalPythonOfflineReview
 
 _ERROR = "python_project_service_unavailable"
 _METADATA_REQUIRED = "python_original_metadata_preparation_required"
@@ -717,6 +718,7 @@ class PythonProjectService:
         original: bool,
         execution_id: str | None = None,
         timeout_seconds: float | None = None,
+        offline_review: OriginalPythonOfflineReview | None = None,
     ) -> tuple[PythonProjectReport | PythonEphemeralProjectReport | PythonProjectFailure, PythonProjectInvocation, str,
                Mapping[str, JsonValue] | None]:
         base = context.invocation
@@ -743,6 +745,11 @@ class PythonProjectService:
         invocation = invocation.model_copy(
             update={"source_kind": "original" if original else "candidate"}
         )
+        if offline_review is not None:
+            from agent_hub.runs.original_python_offline_review import OriginalPythonOfflineReview
+
+            _need(original and type(offline_review) is OriginalPythonOfflineReview,
+                  "python_project_install_approval_required")
         if not original:
             await self.owner._begin_verification(tenant_id=invocation.tenant_id, run_id=invocation.run_id,
                 actor=actor, execution_id=invocation.execution_id, source_sha256=before)
@@ -751,6 +758,13 @@ class PythonProjectService:
             discard_product,
             persist_product,
         )
+
+        async def verify_offline(*, consume: bool = False) -> None:
+            if offline_review is not None:
+                await offline_review.verify(self.owner.repository, context.inputs, actor=actor,
+                                            execution_id=invocation.execution_id, consume=consume)
+
+        await verify_offline(consume=True)
         response = await self.executor.run(invocation)
         product = None
         try:
@@ -768,7 +782,7 @@ class PythonProjectService:
                     base.run_id,
                     actor,
                     phases=("executing",) if original else ("observed",),
-                    approve=True,
+                    approve=offline_review is None,
                 )
                 _need(
                     current is not None
@@ -777,6 +791,7 @@ class PythonProjectService:
                     and current.authority == context.authority,
                     "python_project_scope_changed",
                 )
+                await verify_offline()
                 assert response.result is not None
                 report = decode_python_project_report(
                     invocation=invocation,
@@ -799,7 +814,7 @@ class PythonProjectService:
                     base.run_id,
                     actor,
                     phases=("executing",) if original else ("observed",),
-                    approve=True,
+                    approve=offline_review is None,
                 )
                 _need(
                     final is not None
@@ -808,6 +823,7 @@ class PythonProjectService:
                     and final.authority == context.authority,
                     "python_project_scope_changed",
                 )
+                await verify_offline()
                 product = None
                 if not original and isinstance(report, (PythonProjectReport, PythonEphemeralProjectReport)):
                     product = await persist_product(self.owner.generated_file_store, response, stream,
@@ -980,6 +996,7 @@ class PythonProjectService:
         reference: ProjectBaselineReference,
         execution_id: str,
         timeout_seconds: float,
+        offline_review: OriginalPythonOfflineReview | None = None,
     ) -> Mapping[str, JsonValue]:
         try:
             _need(
@@ -992,6 +1009,7 @@ class PythonProjectService:
                 original=True,
                 execution_id=execution_id,
                 timeout_seconds=timeout_seconds,
+                offline_review=offline_review,
             )
             binding: dict[str, JsonValue] = {
                 "schema_version": 1,

@@ -43,6 +43,7 @@ if TYPE_CHECKING:
         PythonProjectExecutor,
     )
     from agent_hub.files.generated import GeneratedFileStore
+    from agent_hub.runs.original_python_offline_review import OriginalPythonOfflineReview
     from agent_hub.runs.project_verification_receipts import ProjectVerificationReceiptRepository
     from agent_hub.runtime.artifacts import ArtifactRepository
     from agent_hub.skills.sandbox.project import ProjectInvocation
@@ -535,13 +536,17 @@ class ProjectVerificationService:
     async def observe_original(
         self, *, tenant_id: UUID, run_id: UUID, actor: str, reference: ProjectBaselineReference,
         execution_id: str, timeout_seconds: float,
+        offline_review: OriginalPythonOfflineReview | None = None,
     ) -> Mapping[str, JsonValue]:
         await self._require_supported_source(tenant_id, run_id)
         python = await self._python.select(tenant_id, run_id, actor, phases=('executing',))
         if python is not None:
-            await self._python._approval(python, actor)
+            if offline_review is None:
+                await self._python._approval(python, actor)
             return await self._python.observe_original(python, actor=actor, reference=reference,
-                execution_id=execution_id, timeout_seconds=timeout_seconds)
+                execution_id=execution_id, timeout_seconds=timeout_seconds, offline_review=offline_review)
+        if offline_review is not None:
+            raise ProjectVerificationError('python_project_install_approval_required')
         invocation = await self._invocation(tenant_id, run_id, actor)
         invocation = invocation.model_copy(update={
             'execution_id': execution_id,

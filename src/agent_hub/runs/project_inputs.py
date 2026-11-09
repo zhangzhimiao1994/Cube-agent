@@ -52,6 +52,7 @@ from agent_hub.skills.sandbox.project import ProjectInvocation
 
 if TYPE_CHECKING:
     from agent_hub.capabilities.python_input_preparation import InputSupplyClient
+    from agent_hub.runs.original_python_offline_review import OriginalPythonOfflineReview
 
 _FAILURE = 'original project preparation is unavailable or changed'
 _SCOPE_KEYS = ('project_id', 'workspace_session_id', 'sandbox_profile', 'requested_permissions',
@@ -264,6 +265,7 @@ class OriginalProjectPreparer:
         replace: Mapping[str, JsonValue] | None = None,
         supply: bool = False, preparation: Mapping[str, JsonValue] | None = None,
         supply_binding: Mapping[str, JsonValue] | None = None,
+        offline_review: OriginalPythonOfflineReview | None = None,
     ) -> Mapping[str, JsonValue] | None:
         async with await self.repository.run_transaction() as session, session.begin():
             row = await self.repository.get_for_update(session, context.run_id)
@@ -309,6 +311,12 @@ class OriginalProjectPreparer:
                     from agent_hub.capabilities.python_input_preparation import supply_state_plan
 
                     supply_state_plan(replacement)
+                if offline_review is not None:
+                    if supply or state is None or replacement != {
+                        **state, 'phase': 'executing', 'execution_id': offline_review.execution_id,
+                    }:
+                        raise RunConflict(_FAILURE)
+                    await offline_review.reserve(session, row)
                 row.routing_decision = {
                     **(record.routing_decision or {}),
                     key: json.loads(_encoded(replacement)),
@@ -503,6 +511,7 @@ class OriginalProjectPreparer:
                 expected_python_inputs=python_inputs, expected_python_invocation=expected_invocation)
 
         if state['phase'] == 'captured':
+            offline_review = None
             request = HarnessToolCallRequest(
                 run_id=context.run_id, actor='main_agent', tool_name='project.verify', arguments={},
                 approval_required=False, sandbox='workspace_write',
@@ -517,18 +526,35 @@ class OriginalProjectPreparer:
                     raise RuntimeError('original project preparation authorization required or denied')
                 install_request = python_inputs.approval_request(user_id=context.actor_id,
                     agent_id=request.actor, idempotency_key=request.idempotency_key)
-                decision = await policy.invoke(install_request, role=context.actor_role)
-                if type(decision) is not CapabilityResult or decision.run_id != context.run_id:
-                    raise RuntimeError('original project preparation authorization required or denied')
-                if (decision.status is CapabilityStatus.WAITING_APPROVAL
-                        and isinstance(decision.approval_id, str)):
-                    raise OriginalProjectApprovalPending(decision.approval_id, state)
-                install_scope = capability_approval_scope(install_request)
-                if (decision.status is not CapabilityStatus.ALLOWED
-                        or not isinstance(install_scope, str)
-                        or await self.repository.is_capability_approval_scope_approved(
-                            context.tenant_id, context.run_id, install_scope) is not True):
-                    raise RuntimeError('original project preparation authorization required or denied')
+                if route.get('permission_mode') == 'auto_review':
+                    from agent_hub.capabilities.defaults import (
+                        DefaultRuntimeCapabilityPolicyGateway,
+                    )
+                    from agent_hub.runs.original_python_offline_review import (
+                        ORIGINAL_PYTHON_OFFLINE_MODES,
+                        OriginalPythonOfflineReview,
+                    )
+
+                    if (context.mode in ORIGINAL_PYTHON_OFFLINE_MODES
+                            and type(policy) is DefaultRuntimeCapabilityPolicyGateway):
+                        review = OriginalPythonOfflineReview(
+                            self.repository, policy, install_request, context.actor_role, python_inputs,
+                        )
+                        if await review.eligible():
+                            offline_review = review
+                if offline_review is None:
+                    decision = await policy.invoke(install_request, role=context.actor_role)
+                    if type(decision) is not CapabilityResult or decision.run_id != context.run_id:
+                        raise RuntimeError('original project preparation authorization required or denied')
+                    if (decision.status is CapabilityStatus.WAITING_APPROVAL
+                            and isinstance(decision.approval_id, str)):
+                        raise OriginalProjectApprovalPending(decision.approval_id, state)
+                    install_scope = capability_approval_scope(install_request)
+                    if (decision.status is not CapabilityStatus.ALLOWED
+                            or not isinstance(install_scope, str)
+                            or await self.repository.is_capability_approval_scope_approved(
+                                context.tenant_id, context.run_id, install_scope) is not True):
+                        raise RuntimeError('original project preparation authorization required or denied')
             allowed = await self.authorizer.authorize(
                 context.tenant_id, request, user_id=context.actor_id, role=context.actor_role,
             )
@@ -558,11 +584,12 @@ class OriginalProjectPreparer:
                     )
             state = await self._state(context, expected=state, replace={
                 **state, 'phase': 'executing', 'execution_id': invocation.execution_id,
-            }, supply_binding=supply_state)
+            }, supply_binding=supply_state, offline_review=offline_review)
             observation = await self.verifier.observe_original(
                 tenant_id=context.tenant_id, run_id=context.run_id, actor='main_agent', reference=reference,
                 execution_id=invocation.execution_id,
                 timeout_seconds=context.timeout_seconds - (asyncio.get_running_loop().time() - started),
+                offline_review=offline_review,
             )
             observation = validate_observation(observation)
             state = await self._state(context, expected=state, replace={

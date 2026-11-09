@@ -1615,10 +1615,11 @@ def create_app(
                                 )
                             )
                         ),
-                        tool_approval_mode=lambda tenant_id: _tool_approval_mode_from_settings(
-                            _admin_settings_getter_for_tenant(
-                                admin_service_for_capabilities,
-                                tenant_id,
+                        tool_approval_mode=(
+                            admin.PersistentToolApprovalMode(admin_service_for_capabilities)
+                            if type(admin_service_for_capabilities) is admin.PersistentAdminResourceService
+                            else lambda tenant_id: _tool_approval_mode_from_settings(
+                                _admin_settings_getter_for_tenant(admin_service_for_capabilities, tenant_id)
                             )
                         ),
                         tool_registry=CompositeCapabilityManifestSource(

@@ -2371,6 +2371,43 @@ def _migrate_system_settings_payload(payload: Mapping[str, object]) -> dict[str,
     return migrated
 
 
+@dataclass(frozen=True, slots=True)
+class PersistentToolApprovalMode:
+    """The system setting reader and its proof of a same-store PostgreSQL lock."""
+
+    service: PersistentAdminResourceService
+
+    async def __call__(self, tenant_id: UUID) -> str:
+        scoped = self.service.for_principal(tenant_id, tenant_id)
+        return (await scoped.get_settings()).tool_approval_mode
+
+    def uses_session_factory(self, factory: async_sessionmaker[AsyncSession]) -> bool:
+        return (type(self.service) is PersistentAdminResourceService
+                and self.service._session_factory is factory)
+
+    async def locked_auto_review(
+        self, session: AsyncSession, *, factory: async_sessionmaker[AsyncSession], tenant_id: UUID,
+    ) -> bool:
+        bind = session.bind
+        if (not self.uses_session_factory(factory) or not session.in_transaction() or bind is None
+                or bind is not factory.kw.get("bind") or bind.dialect.name != "postgresql"):
+            return False
+        # Settings updates upsert this exact unique row. FOR SHARE also conflicts
+        # with a payload-only UPDATE, unlike FOR KEY SHARE.
+        row = await session.scalar(select(AdminResourceRow).where(
+            AdminResourceRow.tenant_id == tenant_id, AdminResourceRow.kind == "setting",
+            AdminResourceRow.resource_id == "system",
+        ).with_for_update(read=True).execution_options(populate_existing=True))
+        if row is None or not isinstance(row.payload, dict):
+            return False
+        try:
+            return SystemSettingsResponse.model_validate(
+                _migrate_system_settings_payload(row.payload),
+            ).tool_approval_mode == "auto_review"
+        except (TypeError, ValueError):
+            return False
+
+
 def _settings_with_runtime_status(
     settings: SystemSettingsResponse,
     request: Request,
