@@ -1544,13 +1544,29 @@ async def test_unused_untrusted_catalog_deployment_does_not_block_trusted_subset
     assert not f.state.calls
 
 
-async def test_actual_stack_broker_reviewer_repository_and_backend_execute_once(tmp_path: Path) -> None:
+@pytest.mark.parametrize("untrusted_default", [False, True])
+async def test_actual_stack_broker_reviewer_repository_and_backend_execute_once(
+    tmp_path: Path, untrusted_default: bool,
+) -> None:
     from agent_hub.capabilities.defaults import build_runtime_capability_stack
     from agent_hub.db.models import RunReviewEventRow
     from agent_hub.files.workspace import ProjectWorkspaceStore
 
     a = review_assembly
     f = await fixture(tmp_path)
+    if untrusted_default:
+        document = f.state.platform.model_dump(mode="json")
+        document["models"]["aaa_untrusted_default"] = document["models"]["primary"]
+        f.state.platform = PlatformConfig.model_validate(document)
+        fingerprint = a.catalog_fingerprint(f.state.platform)
+        f.broker._contracts = tuple(
+            replace(contract, catalog_sha256=fingerprint) for contract in f.broker._contracts
+        )
+        profile = await f.broker.submission_profile(f.s.task.tenant_id, timeout_seconds=60)
+        route = {**f.s.task.routing_decision, **profile}
+        f.s.task = f.s.task.model_copy(update={"routing_decision": route})
+        f.s.runs.record = replace(f.s.runs.record, routing_decision=route)
+        f.db.run.routing_decision = route
     f.state.review = True
     stack = a.assemble_review_capability_stack(
         f.broker,

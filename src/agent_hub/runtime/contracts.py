@@ -34,6 +34,7 @@ from agent_hub.models.capacity import (
 )
 from agent_hub.models.failure_receipt import MAX_GATEWAY_FAILURE_ATTEMPTS
 from agent_hub.models.gateway import ScopeIncompletePhase, ScopeIncompleteReason
+from agent_hub.models.types import ModelCapability
 from agent_hub.runtime.instruction_context import InstructionContext
 
 type JsonScalar = None | bool | int | float | str
@@ -125,6 +126,14 @@ _CAPACITY_DIAGNOSTIC_ENUMS = {
     'capacity_exception_category': CapacityExceptionCategory,
     'capacity_timeout_origin': CapacityTimeoutOrigin, 'capacity_commit_state': CapacityCommitState,
 }
+_MODEL_PREFLIGHT_DIAGNOSTIC_ENUMS = {
+    "model_preflight_error_type": "NoCapableDeployment",
+    "model_preflight_error_code": "model.no_capable_deployment",
+    "model_preflight_phase": "candidate_selection",
+}
+_MODEL_PREFLIGHT_DIAGNOSTIC_KEYS = frozenset(_MODEL_PREFLIGHT_DIAGNOSTIC_ENUMS) | {
+    "model_preflight_logical_model", "model_preflight_required_capabilities",
+}
 _OPTIONAL_FAILURE_DIAGNOSTIC_KEYS = frozenset(
     {
         "status_code", "hybrid_child_mode", "orchestration_recovery_hint", "step_id", "actor",
@@ -132,7 +141,7 @@ _OPTIONAL_FAILURE_DIAGNOSTIC_KEYS = frozenset(
         "runtime_timeout_kind", "remaining_soft_timeout_seconds", "remaining_absolute_timeout_seconds",
         "engineering_work_progress_units",
     }
-) | frozenset(_CAPACITY_DIAGNOSTIC_ENUMS)
+) | frozenset(_CAPACITY_DIAGNOSTIC_ENUMS) | _MODEL_PREFLIGHT_DIAGNOSTIC_KEYS
 _FAILURE_DIAGNOSTIC_KEYS = _REQUIRED_FAILURE_DIAGNOSTIC_KEYS | _OPTIONAL_FAILURE_DIAGNOSTIC_KEYS
 _GATEWAY_SCOPE_DIAGNOSTIC_KEYS = frozenset({
     "gateway_scope_phase", "gateway_scope_reason",
@@ -274,6 +283,27 @@ def _validate_failure_diagnostic(payload: Mapping[str, JsonValue]) -> None:
         _safe_free_text(value, name="runtime failure diagnostic text", max_bytes=limit * 4)
     if type(payload["retryable"]) is not bool:
         raise ValueError("runtime failure diagnostic retryable must be boolean")
+    if payload.keys() & _MODEL_PREFLIGHT_DIAGNOSTIC_KEYS:
+        if any(payload.get(name) != expected for name, expected in _MODEL_PREFLIGHT_DIAGNOSTIC_ENUMS.items()):
+            raise ValueError("model preflight diagnostic type fields are invalid")
+        if "model_preflight_logical_model" in payload:
+            from agent_hub.runtime.failure_reason import SENSITIVE_FAILURE_REASON
+
+            model = payload["model_preflight_logical_model"]
+            if (type(model) is not str
+                    or re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,127}", model) is None
+                    or SENSITIVE_FAILURE_REASON.search(model) is not None):
+                raise ValueError("model preflight diagnostic model is invalid")
+        if "model_preflight_required_capabilities" in payload:
+            capabilities = payload["model_preflight_required_capabilities"]
+            if type(capabilities) is not str or len(capabilities) > 256:
+                raise ValueError("model preflight diagnostic capabilities are invalid")
+            if capabilities != "none":
+                parts = capabilities.split(", ")
+                if (len(parts) > len(ModelCapability)
+                        or parts != sorted(set(parts))
+                        or not set(parts) <= {item.value for item in ModelCapability}):
+                    raise ValueError("model preflight diagnostic capabilities are invalid")
     if "compression_trigger" in payload and (
         type(payload["compression_trigger"]) is not str
         or payload["compression_trigger"] != "incomplete_response"

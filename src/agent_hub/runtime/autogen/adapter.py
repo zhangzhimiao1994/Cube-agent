@@ -4287,7 +4287,7 @@ class AutoGenDiscussionRuntime:
                 if durability.request_hash(candidate, tool_names=tool_names) == digest:
                     return candidate
         query = getattr(self._gateway, "context_window_tokens", None)
-        window = query(request) if callable(query) else None
+        from agent_hub.models.registry import NoCapableDeployment
         from agent_hub.runtime.request_admission import (
             admission_token_limit,
             fit_output,
@@ -4295,7 +4295,25 @@ class AutoGenDiscussionRuntime:
             input_tokens,
         )
 
-        admission_limit = admission_token_limit(self._gateway, request)
+        try:
+            window = query(request) if callable(query) else None
+            admission_limit = admission_token_limit(self._gateway, request)
+        except NoCapableDeployment as error:
+            # Preserve the typed preflight failure before AutoGen wraps it.
+            # No candidate/config change, fallback grant, new call or replay.
+            if durability is not None:
+                reason = "model gateway failed: no capable deployment"
+                durability.fail_model(reason, source=error)
+                from agent_hub.runtime.failure_reason import model_candidate_failure_payload
+
+                durability.failure_payload = {
+                    **durability.failure_payload,
+                    **model_candidate_failure_payload(
+                        error, logical_model=request.logical_model,
+                        required_capabilities=request.required_capabilities,
+                    ),
+                }
+            raise
         if window is None and admission_limit is None:
             return request
         if window is not None and (type(window) is not int or window <= 0):

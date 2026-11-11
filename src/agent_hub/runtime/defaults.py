@@ -1241,6 +1241,7 @@ class ConfigBackedDispatchRuntime:
                 )
             ).roles
         role_sources = (*planned_roles, *_temporary_role_assignments(context, logical_model))
+        role_sources = _dispatch_roles_for_plan(role_sources, context)
         role_tools_by_id = _role_tools_by_id(
             role_sources,
             context,
@@ -1289,6 +1290,7 @@ class ConfigBackedDispatchRuntime:
             ),
             capability_gateway=self._capability_gateway,
             role_fallbacks_by_id=role_fallbacks_by_id,
+            role_tools_by_id=role_tools_by_id if self._capability_gateway is not None else None,
             config=config,
             deployment_constraint=deployment_constraint,
         )
@@ -1463,6 +1465,7 @@ class ConfigBackedDiscussionRuntime:
                 )
             ).roles
         planned_roles = _discussion_engineering_roles(planned_roles, context, logical_model)
+        planned_roles = _discussion_roles_for_plan(planned_roles, logical_model)
         role_tools_by_id = _role_tools_by_id(
             planned_roles,
             context,
@@ -1495,6 +1498,7 @@ class ConfigBackedDiscussionRuntime:
             logical_model,
             _runtime_plan_context(context),
             capability_gateway=self._capability_gateway,
+            role_tools_by_id=role_tools_by_id if self._capability_gateway is not None else None,
         )
         role_payload = _discussion_role_payload(plan)
         from agent_hub.runtime.autogen.adapter import AutoGenDiscussionRuntime
@@ -1697,7 +1701,8 @@ class ConfigBackedHybridRuntime:
             *dispatch_roles,
             *_temporary_role_assignments(context, logical_model),
         )
-        discussion_role_sources = discussion_roles
+        dispatch_role_sources = _dispatch_roles_for_plan(dispatch_role_sources, context)
+        discussion_role_sources = _discussion_roles_for_plan(discussion_roles, logical_model)
         dispatch_role_tools_by_id = _role_tools_by_id(
             dispatch_role_sources,
             context,
@@ -1773,6 +1778,7 @@ class ConfigBackedHybridRuntime:
             ),
             capability_gateway=self._capability_gateway,
             role_fallbacks_by_id=dispatch_fallbacks_by_id,
+            role_tools_by_id=dispatch_role_tools_by_id if self._capability_gateway is not None else None,
             config=config,
             deployment_constraint=deployment_constraint,
         )
@@ -1781,6 +1787,7 @@ class ConfigBackedHybridRuntime:
             logical_model,
             plan_context,
             capability_gateway=self._capability_gateway,
+            role_tools_by_id=discussion_role_tools_by_id if self._capability_gateway is not None else None,
         )
         role_payload = _hybrid_role_payload(dispatch_plan, discussion_plan)
         from agent_hub.runtime.autogen.adapter import AutoGenDiscussionRuntime
@@ -1937,10 +1944,7 @@ async def _gateway_for_config(
     transport: ModelTransport,
     routing_decision: object | None = None,
 ) -> tuple[ModelGateway, str, FallbackExecutionPolicy]:
-    from agent_hub.runtime.review_assembly import review_deployments
-
     logical_model = _direct_logical_model(config, routing_decision)
-    deployments = review_deployments(_deployments(config))
     try:
         fallback_policy = fallback_execution_policy_from_decision(routing_decision)
         selection_policy = model_selection_policy_from_decision(routing_decision)
@@ -1949,10 +1953,9 @@ async def _gateway_for_config(
     except ModelSelectionPolicyError as error:
         raise HarnessModelSelectionError(str(error)) from error
     deployment_constraint = _deployment_routing_constraint(config, routing_decision)
-    deployments = _constrained_deployments_for_harness_decision(
-        deployments,
-        deployment_constraint,
-    )
+    deployments = _authorized_runtime_deployments(config, deployment_constraint)
+    if not any(item.logical_model == logical_model for item in deployments):
+        raise HarnessModelSelectionError("selected model unavailable in authorized catalog")
     deployments = rank_deployments_for_selection(deployments, selection_policy)
     gateway = ModelGateway(
         ModelRegistry(deployments, preserve_order=True),
@@ -1962,11 +1965,45 @@ async def _gateway_for_config(
         fallbacks=(
             {}
             if deployment_constraint is not None or fallback_policy == "disabled"
-            else _fallbacks(config)
+            else _fallbacks(config, allowed_models=frozenset(item.logical_model for item in deployments))
         ),
         capacity_wait_timeout=60,
     )
     return gateway, logical_model, fallback_policy
+
+
+def _authorized_runtime_deployments(
+    config: PlatformConfig,
+    constraint: DeploymentRoutingConstraint | None,
+) -> tuple[Deployment, ...]:
+    from agent_hub.runtime.review_assembly import review_deployments
+
+    return _constrained_deployments_for_harness_decision(
+        review_deployments(_deployments(config)), constraint,
+    )
+
+
+def _role_routing_config(
+    config: PlatformConfig,
+    constraint: DeploymentRoutingConstraint | None,
+) -> PlatformConfig:
+    # The review snapshot retains the full catalog; only its contracted
+    # deployments enter the execution registry. Rank roles against that same
+    # set, using the original deployment IDs before filtering any definitions.
+    allowed = {deployment.id for deployment in _authorized_runtime_deployments(config, constraint)}
+    models = {}
+    for logical_model, definition in config.models.items():
+        deployments = [
+            deployment for index, deployment in enumerate(definition.deployments, start=1)
+            if f"{logical_model}_{index}" in allowed
+        ]
+        if deployments:
+            models[logical_model] = definition.model_copy(update={"deployments": deployments})
+    if not models:
+        raise HarnessModelSelectionError("model capability unavailable")
+    # This view is only for scoring. Never rebuild the execution registry from
+    # it: removing a deployment must not renumber IDs bound by review contracts.
+    return config.model_copy(update={"models": models})
 
 
 def _constrained_deployments_for_harness_decision(
@@ -2136,17 +2173,10 @@ def _project_preflight_tools(
     return (_PROJECT_PREFLIGHT_CAPABILITY,)
 
 
-def _dispatch_plan(
+def _dispatch_roles_for_plan(
     roles: tuple[RoleAssignment, ...],
     context: TaskContext,
-    *,
-    max_parallelism: int = 1,
-    capability_gateway: RuntimeCapabilityGatewayProtocol | None = None,
-    role_fallbacks_by_id: Mapping[str, tuple[str, ...]] | None = None,
-    config: PlatformConfig | None = None,
-    deployment_constraint: DeploymentRoutingConstraint | None = None,
-) -> DispatchPlan:
-    workspace_maintenance_contract_version(context.routing_decision)
+) -> tuple[RoleAssignment, ...]:
     selected_roles = tuple(roles)
     if not selected_roles:
         selected_roles = (
@@ -2169,6 +2199,23 @@ def _dispatch_plan(
         selected_roles = tuple(
             roles_by_id[role_id] for role_id in ("architect", "implementer", "tester")
         )
+    return selected_roles
+
+
+def _dispatch_plan(
+    roles: tuple[RoleAssignment, ...],
+    context: TaskContext,
+    *,
+    max_parallelism: int = 1,
+    capability_gateway: RuntimeCapabilityGatewayProtocol | None = None,
+    role_fallbacks_by_id: Mapping[str, tuple[str, ...]] | None = None,
+    role_tools_by_id: Mapping[str, tuple[str, ...]] | None = None,
+    config: PlatformConfig | None = None,
+    deployment_constraint: DeploymentRoutingConstraint | None = None,
+) -> DispatchPlan:
+    workspace_maintenance_contract_version(context.routing_decision)
+    selected_roles = _dispatch_roles_for_plan(roles, context)
+    multi_agent_chain = _is_default_multi_agent_chain_request(context, selected_roles)
     plan_allowed_tools = _plan_allowed_tools(
         selected_roles,
         context,
@@ -2181,16 +2228,15 @@ def _dispatch_plan(
         else ()
     )
     plan_allowed_tools = tuple(dict.fromkeys((*plan_allowed_tools, *preflight_tools)))
-    request_owner = _inventory_request_owner_id(selected_roles)
-    role_tools_by_id = {
-        role.id: _role_allowed_tools(
-            role,
-            context,
-            capability_gateway=capability_gateway,
-            include_request=role.id == request_owner,
-        )
-        for role in selected_roles
-    }
+    if role_tools_by_id is None:
+        request_owner = _inventory_request_owner_id(selected_roles)
+        role_tools_by_id = {
+            role.id: _role_allowed_tools(
+                role, context, capability_gateway=capability_gateway,
+                include_request=role.id == request_owner,
+            )
+            for role in selected_roles
+        }
     # Verification consumes source. Mixed software/ops plans must not schedule
     # an installation-only executor before the writer it needs.
     workspace_consumers = {
@@ -3329,6 +3375,7 @@ def _model_scope_limits(
     *,
     deployment_constraint: DeploymentRoutingConstraint | None = None,
 ) -> dict[str, dict[str, int]]:
+    config = _role_routing_config(config, deployment_constraint)
     limits: dict[str, int] = {}
     model_scopes: dict[str, set[str]] = {}
     # Match CapacityPool's most restrictive policy across the gateway catalog.
@@ -4492,7 +4539,7 @@ def _role_model_routing_matrix_payload(
                     default_model=default_model,
                     required_capabilities=required_capabilities,
                 ),
-                config,
+                _role_routing_config(config, deployment_constraint),
             )
             if _logical_model_satisfies_deployment_constraint(
                 config,
@@ -4591,7 +4638,7 @@ def _role_model_fallbacks_by_id(
                     default_model=default_model,
                     required_capabilities=required_capabilities,
                 ),
-                config,
+                _role_routing_config(config, deployment_constraint),
             )
             if candidate.eligible
             and candidate.logical_model != selected
@@ -4846,7 +4893,7 @@ def _rank_logical_models_for_role(
             default_model=default_model,
             required_capabilities=required_capabilities,
         ),
-        config,
+        _role_routing_config(config, deployment_constraint),
     )
     eligible = [
         candidate
@@ -5003,15 +5050,10 @@ def _discussion_engineering_roles(
     return (owner, *(role for role in roles if role.id != owner.id))
 
 
-def _discussion_plan(
+def _discussion_roles_for_plan(
     roles: tuple[RoleAssignment, ...],
     default_model: str,
-    context: TaskContext | None = None,
-    *,
-    capability_gateway: RuntimeCapabilityGatewayProtocol | None = None,
-) -> DiscussionPlan:
-    from agent_hub.runtime.autogen.adapter import DiscussionParticipant, DiscussionPlan
-
+) -> tuple[RoleAssignment, ...]:
     selected_roles = tuple(roles[:8])
     if len(selected_roles) < 2:
         selected_roles = (
@@ -5040,6 +5082,20 @@ def _discussion_plan(
                 model=default_model,
             ),
         )
+    return selected_roles
+
+
+def _discussion_plan(
+    roles: tuple[RoleAssignment, ...],
+    default_model: str,
+    context: TaskContext | None = None,
+    *,
+    capability_gateway: RuntimeCapabilityGatewayProtocol | None = None,
+    role_tools_by_id: Mapping[str, tuple[str, ...]] | None = None,
+) -> DiscussionPlan:
+    from agent_hub.runtime.autogen.adapter import DiscussionParticipant, DiscussionPlan
+
+    selected_roles = _discussion_roles_for_plan(roles, default_model)
     request_owner = _inventory_request_owner_id(selected_roles)
     participant_ids = _autogen_participant_ids(selected_roles)
     soft_turns = max(4, len(selected_roles) * 2)
@@ -5047,7 +5103,7 @@ def _discussion_plan(
     token_budget = context.token_budget if context is not None else 65_536
     participants: list[DiscussionParticipant] = []
     for role, participant_id in zip(selected_roles, participant_ids, strict=True):
-        tools = _role_allowed_tools(
+        tools = role_tools_by_id[role.id] if role_tools_by_id is not None else _role_allowed_tools(
             role, context, capability_gateway=capability_gateway,
             include_request=role.id == request_owner,
         )
@@ -5239,11 +5295,15 @@ def _deployments(config: PlatformConfig) -> tuple[Deployment, ...]:
     return tuple(deployments)
 
 
-def _fallbacks(config: PlatformConfig) -> dict[str, str]:
+def _fallbacks(
+    config: PlatformConfig, *, allowed_models: frozenset[str] | None = None,
+) -> dict[str, str]:
     return {
         logical_model: definition.fallback_model
         for logical_model, definition in config.models.items()
         if definition.fallback_model is not None
+        and (allowed_models is None or logical_model in allowed_models
+             and definition.fallback_model in allowed_models)
     }
 
 
@@ -5259,7 +5319,9 @@ def _direct_available_model_attempts(
         or _deployment_routing_constraint(config, routing_decision) is not None
     ):
         return 1
-    fallbacks = _fallbacks(config)
+    fallbacks = _fallbacks(config, allowed_models=frozenset(
+        deployment.logical_model for deployment in _authorized_runtime_deployments(config, None)
+    ))
     seen = {logical_model}
     current = logical_model
     while current in fallbacks:

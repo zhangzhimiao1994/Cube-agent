@@ -32,7 +32,7 @@ from agent_hub.models.litellm_client import (
     ModelTransportError,
 )
 from agent_hub.models.registry import NoCapableDeployment
-from agent_hub.models.types import RejectedOutputEvidence
+from agent_hub.models.types import ModelCapability, RejectedOutputEvidence
 
 MAX_FAILURE_REASON_LENGTH = 240
 RuntimeFailureDiagnostic = dict[str, str | int | bool]
@@ -265,6 +265,33 @@ def safe_model_gateway_failure_reason(error: Exception) -> str | None:
     return None
 
 
+def model_candidate_failure_payload(
+    error: object,
+    *,
+    logical_model: object = None,
+    required_capabilities: object = None,
+) -> RuntimeFailureDiagnostic:
+    """Finite typed metadata only; never inspect exception text or nested traces."""
+    if not isinstance(error, NoCapableDeployment):
+        return {}
+    payload: RuntimeFailureDiagnostic = {
+        "model_preflight_error_type": "NoCapableDeployment",
+        "model_preflight_error_code": "model.no_capable_deployment",
+        "model_preflight_phase": "candidate_selection",
+    }
+    if (type(logical_model) is str
+            and re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,127}", logical_model) is not None
+            and SENSITIVE_FAILURE_REASON.search(logical_model) is None):
+        payload["model_preflight_logical_model"] = logical_model
+    if (type(required_capabilities) is frozenset
+            and len(required_capabilities) <= len(ModelCapability)
+            and all(type(item) is ModelCapability for item in required_capabilities)):
+        payload["model_preflight_required_capabilities"] = (
+            ", ".join(sorted(item.value for item in required_capabilities)) or "none"
+        )
+    return payload
+
+
 def _prerequisite_failure_parts(reason: str) -> tuple[str, str, str | None] | None:
     match = _PREREQUISITE_FAILURE.fullmatch(reason)
     if match is None:
@@ -397,7 +424,8 @@ def safe_runtime_failure_diagnostic(
             diagnostic["error_summary"] = (
                 reason + match[0][len(_REJECTED_OUTPUT_BASE):]
             )[:MAX_FAILURE_REASON_LENGTH]
-    return {**diagnostic, **gateway_scope_failure_payload(error)}
+    return {**diagnostic, **gateway_scope_failure_payload(error),
+            **model_candidate_failure_payload(error)}
 
 
 def gateway_scope_failure_payload(

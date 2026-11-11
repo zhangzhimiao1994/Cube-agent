@@ -1163,6 +1163,7 @@ class ReviewAssemblyBroker:
                 secret_service=self._secrets,
                 capacity_factory=self._capacity,
                 transport=self._transport,
+                routing_decision={"direct_model": execution.snapshot.config.reviewer_logical_model},
             )
             return await ModelApprovalReviewService(gateway, self.review_repository).review(
                 snapshot, live_context,
