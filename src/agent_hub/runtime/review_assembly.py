@@ -74,6 +74,46 @@ from agent_hub.security.secrets import SecretService
 
 _MODES = frozenset({TaskMode.DIRECT, TaskMode.DISPATCH, TaskMode.DISCUSS, TaskMode.HYBRID})
 _PROFILE = "approval_review_profile"
+
+
+def _physical_scope_timeout_seconds(
+    context: TaskContext, persisted: Mapping[str, object], profile: Mapping[str, object],
+) -> float:
+    """Keep soft scheduling outside the already admitted physical hard envelope."""
+    policy: dict[str, object] = {
+        "runtime_timeout_source": "project_scale_soft_budget",
+        "runtime_progress_policy": "semantic_workspace_v1",
+        "engineering_delivery_contract_version": 1,
+        "engineering_action_version": 1,
+    }
+    if context.mode is TaskMode.DISCUSS:
+        policy.update(engineering_soft_admission_version=1, engineering_checkpoint_ack_version=1,
+                      engineering_progress_budget_version=1)
+    if any(type(persisted.get(key)) is not type(value) or persisted.get(key) != value
+           for key, value in policy.items()):
+        return context.timeout_seconds
+    # prepare already verified the profile against the persisted JSON by value;
+    # the worker's frozen MappingProxy profile need not have JSON's dict type.
+    keys = (*policy, "runtime_timeout_seconds", "runtime_timeout_soft_seconds",
+            "runtime_timeout_absolute_seconds")
+    route = context.routing_decision
+    if any(type(route.get(key)) is not type(persisted.get(key)) or route.get(key) != persisted.get(key)
+           for key in keys):
+        return context.timeout_seconds
+    hard = profile.get("timeout_seconds")
+    initial = persisted.get("runtime_timeout_seconds")
+    soft = persisted.get("runtime_timeout_soft_seconds")
+    envelope = persisted.get("runtime_timeout_absolute_seconds")
+    if (type(hard) not in (int, float) or not math.isfinite(hard) or hard <= 0
+            or type(initial) not in (int, float) or not math.isfinite(initial) or not 0 < initial <= hard
+            or type(soft) not in (int, float) or not math.isfinite(soft) or not 0 < soft <= hard
+            or type(envelope) not in (int, float) or envelope != hard):
+        return context.timeout_seconds
+    # The constructor still min-clamps this duration to the original persisted
+    # pool deadline. Reentry cannot restart that clock or refill charged usage.
+    return float(hard)
+
+
 REQUIRED_VERIFICATION_CHECKS = frozenset(
     {
         "original_pool",
@@ -1117,7 +1157,7 @@ class ReviewAssemblyBroker:
             evidence=evidence,
             lease=lease,
             config=snapshot.config,
-            deadline=captured + context.timeout_seconds,
+            deadline=captured + _physical_scope_timeout_seconds(context, record.routing_decision, profile),
             trusted_contexts=snapshot.contracts,
         )
         return ReviewExecution(budget, snapshot, activation_binding, admitted_at)

@@ -11,7 +11,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta, tzinfo
 from pathlib import Path
-from types import MethodType, ModuleType
+from types import MappingProxyType, MethodType, ModuleType
 from typing import TypedDict, Unpack
 from uuid import UUID, uuid4
 
@@ -331,6 +331,164 @@ async def test_same_run_reentry_and_unknown_never_refill_or_extend(tmp_path: Pat
     assert present(second).budget._pool.tokens_remaining == 22000
     assert present(second).budget._pool.original_deadline == deadline
     assert present(second).budget.deadline <= time.monotonic() + 60
+
+
+async def scale_soft_scope_fixture(tmp_path: Path, mode: TaskMode) -> AssemblyFixture:
+    f = await fixture(tmp_path, mode=mode)
+    route = {
+        **f.s.task.routing_decision,
+        "runtime_timeout_source": "project_scale_soft_budget",
+        "runtime_timeout_seconds": 1.0,
+        "runtime_timeout_soft_seconds": 1.0,
+        "runtime_progress_policy": "semantic_workspace_v1",
+        "engineering_delivery_contract_version": 1,
+        "engineering_action_version": 1,
+        "delivery_followup_version": 2,
+    }
+    # These are Discuss-specific claims, not a gate for the other three modes.
+    for key in ("engineering_soft_admission_version", "engineering_checkpoint_ack_version",
+                "engineering_progress_budget_version"):
+        route.pop(key, None)
+    if mode is TaskMode.DISCUSS:
+        route.update(engineering_soft_admission_version=1, engineering_checkpoint_ack_version=1,
+                     engineering_progress_budget_version=1)
+    f.s.task = f.s.task.model_copy(
+        update={"routing_decision": route, "timeout_seconds": 1.0},
+    ).validated_internal_clone()
+    f.s.runs.record = replace(f.s.runs.record, routing_decision=route)
+    f.db.run.routing_decision = route
+    return f
+
+
+@pytest.mark.parametrize("mode", [TaskMode.DIRECT, TaskMode.DISPATCH, TaskMode.DISCUSS, TaskMode.HYBRID])
+async def test_scale_soft_physical_scope_deadline_preserves_original_hard_envelope(
+    tmp_path: Path, mode: TaskMode,
+) -> None:
+    from agent_hub.models.physical_budget import (
+        _bind_run_budget,
+        _budget_deadline,
+        _capture_budget_call,
+        _resume_budget_call,
+    )
+
+    f = await scale_soft_scope_fixture(tmp_path, mode)
+    execution = present(await f.broker.prepare(f.s.task, worker_id=f.s.budget.lease.worker_id))
+    pool = execution.budget._pool
+    assert pool.original_deadline == f.s.runs.record.created_at + timedelta(seconds=60)
+    with _bind_run_budget(execution.budget):
+        now = time.monotonic()
+        call = present(_capture_budget_call(
+            replace(logical_request(), timeout_seconds=45.0), f.broker._transport,
+        ))
+        # Exercise the real broker -> physical call -> gateway deadline clamp.
+        # The one-second soft scheduling budget must not truncate this admitted call.
+        assert call.deadline > now + 30
+        assert call.deadline <= now + 45.1
+        with _resume_budget_call(call):
+            assert _budget_deadline(now + 40) > now + 30
+    assert pool.tokens_remaining == 40000
+    assert not f.state.calls
+
+
+@pytest.mark.parametrize("mode", [TaskMode.DIRECT, TaskMode.DISPATCH, TaskMode.DISCUSS, TaskMode.HYBRID])
+async def test_scale_soft_physical_scope_deadline_after_real_worker_route_freeze(
+    tmp_path: Path, mode: TaskMode,
+) -> None:
+    from agent_hub.models.physical_budget import _capture_budget_call
+
+    f = await scale_soft_scope_fixture(tmp_path, mode)
+    values = {name: getattr(f.s.task, name) for name in TaskContext.model_fields}
+    # The production worker removes private locators and freezes the remaining
+    # route before broker.prepare; persisted JSON still has a plain dict profile.
+    values["routing_decision"] = {**f.s.task.routing_decision, "approval_checkpoint_worker_token": "internal"}
+    context = TaskContext.model_validate(values, strict=True)
+
+    class Runtime(StreamRuntimeStub):
+        async def run(self, actual: TaskContext) -> AsyncIterator[RunEvent]:
+            assert isinstance(actual.routing_decision["approval_review_profile"], MappingProxyType)
+            assert type(present(f.s.runs.record.routing_decision)["approval_review_profile"]) is dict
+            call = present(_capture_budget_call(
+                replace(logical_request(), timeout_seconds=45.0), f.broker._transport,
+            ))
+            assert call.deadline > time.monotonic() + 30
+            yield RunEvent(kind="runtime.started", sequence=1, run_id=actual.run_id,
+                           payload={"phase": "started"})
+
+    async with worker_runtime_events(
+        Runtime(), context, worker_id=f.s.budget.lease.worker_id, review_broker=f.broker,
+    ) as events:
+        await anext(events)
+    assert not f.state.calls
+
+
+@pytest.mark.parametrize("change", [
+    "operator", "legacy", "boolean_action", "missing_delivery", "wrong_progress",
+    "context_policy", "context_timeout", "record_policy", "missing_soft_duration", "boolean_soft_duration",
+    "discuss_missing_soft",
+    "discuss_boolean_ack",
+])
+async def test_physical_scope_deadline_keeps_short_limit_without_matching_claims(
+    tmp_path: Path, change: str,
+) -> None:
+    mode = TaskMode.DISCUSS if change.startswith("discuss_") else TaskMode.DIRECT
+    f = await scale_soft_scope_fixture(tmp_path, mode)
+    persisted = dict(f.s.task.routing_decision)
+    route = dict(persisted)
+    if change == "operator":
+        route["runtime_timeout_source"] = persisted["runtime_timeout_source"] = "operator"
+    elif change == "legacy":
+        for key in ("engineering_action_version", "engineering_delivery_contract_version", "runtime_progress_policy"):
+            route.pop(key)
+            persisted.pop(key)
+    elif change == "boolean_action":
+        route["engineering_action_version"] = persisted["engineering_action_version"] = True
+    elif change == "missing_delivery":
+        route.pop("engineering_delivery_contract_version")
+        persisted.pop("engineering_delivery_contract_version")
+    elif change == "wrong_progress":
+        route["runtime_progress_policy"] = persisted["runtime_progress_policy"] = "legacy"
+    elif change == "context_policy":
+        route["engineering_action_version"] = True
+    elif change == "context_timeout":
+        route["runtime_timeout_seconds"] = 2.0
+    elif change == "record_policy":
+        persisted.pop("engineering_delivery_contract_version")
+    elif change == "missing_soft_duration":
+        route.pop("runtime_timeout_soft_seconds")
+        persisted.pop("runtime_timeout_soft_seconds")
+    elif change == "boolean_soft_duration":
+        route["runtime_timeout_soft_seconds"] = persisted["runtime_timeout_soft_seconds"] = True
+    elif change == "discuss_missing_soft":
+        route.pop("engineering_soft_admission_version")
+        persisted.pop("engineering_soft_admission_version")
+    else:
+        route["engineering_checkpoint_ack_version"] = persisted["engineering_checkpoint_ack_version"] = True
+    f.s.task = f.s.task.model_copy(update={"routing_decision": route}).validated_internal_clone()
+    f.s.runs.record = replace(f.s.runs.record, routing_decision=persisted)
+    f.db.run.routing_decision = persisted
+    started = time.monotonic()
+    execution = present(await f.broker.prepare(f.s.task, worker_id=f.s.budget.lease.worker_id))
+    assert execution.budget.deadline <= started + 1.1
+    execution.budget.revoke()
+    assert not f.state.calls
+
+
+async def test_scale_soft_physical_scope_deadline_reentry_keeps_charges_and_original_clock(
+    tmp_path: Path,
+) -> None:
+    f = await scale_soft_scope_fixture(tmp_path, TaskMode.DISCUSS)
+    first = present(await f.broker.prepare(f.s.task, worker_id=f.s.budget.lease.worker_id))
+    pool_row = next(row for row in f.db.rows if isinstance(row, RunAdmissionPoolRow))
+    pool_row.token_charged = 18000  # Preserve an existing charge; this does not simulate UNKNOWN settlement.
+    deadline = first.budget._pool.original_deadline
+    first.budget.revoke()
+    second = present(await f.broker.prepare(f.s.task, worker_id=f.s.budget.lease.worker_id))
+    assert second.budget._pool.original_deadline == deadline
+    assert second.budget._pool.tokens_remaining == 22000
+    assert second.budget.deadline <= first.budget.deadline + 0.1
+    assert second.budget.deadline > time.monotonic() + 30
+    second.budget.revoke()
+    assert not f.state.calls
 
 
 async def test_old_profile_is_never_upgraded_even_when_configuration_ready(tmp_path: Path) -> None:
