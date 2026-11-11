@@ -469,6 +469,50 @@ def gateway_scope_failure_payload(
     }
 
 
+_DISCUSSION_FAILURE_KINDS = {
+    "model_response_validation": frozenset({
+        "tool_call_limit", "invalid_response", "unavailable_capability",
+        "required_tool_missing", "acceptance_write_missing",
+    }),
+    "model_client": frozenset({
+        "type_error", "value_error", "runtime_error", "validation_error", "serialization_error", "unknown_error",
+    }),
+    "tool_arguments_serialization": frozenset({
+        "type_error", "value_error", "runtime_error", "validation_error", "serialization_error", "unknown_error",
+    }),
+    "framework": frozenset({"wrapped_failure"}),
+}
+
+
+def discussion_exception_kind(error: Exception) -> str:
+    """Classify the original exception type only; never read text or nested errors."""
+    from pydantic import ValidationError
+    from pydantic_core import PydanticSerializationError
+
+    for error_type, kind in (
+        (ValidationError, "validation_error"), (PydanticSerializationError, "serialization_error"),
+        (TypeError, "type_error"), (ValueError, "value_error"), (RuntimeError, "runtime_error"),
+    ):
+        if isinstance(error, error_type):
+            return kind
+    return "unknown_error"
+
+
+def discussion_failure_diagnostic(*, phase: str, kind: str) -> RuntimeFailureDiagnostic:
+    """Canonical bounded facts emitted by an observed local discussion boundary."""
+    if (type(phase) is not str or type(kind) is not str
+            or kind not in _DISCUSSION_FAILURE_KINDS.get(phase, ())):
+        raise ValueError("discussion failure diagnostic is invalid")
+    return {
+        **_base_diagnostic(
+            f"discussion failed: {phase}/{kind}", error_stage="discussion_runtime",
+            error_category="discussion_failed", error_code=f"runtime.discussion_failed.{phase}.{kind}",
+            retryable=True, suggested_action="检查此阶段的有限诊断与已保存检查点；保留已有产物，不重放结果未知的请求。",
+        ),
+        "discussion_failure_phase": phase, "discussion_failure_kind": kind,
+    }
+
+
 def runtime_failure_diagnostic_from_reason(
     reason: str | None,
     *,
@@ -1308,6 +1352,8 @@ __all__ = [
     "ORCHESTRATION_CHECKPOINT_FAILURE_REASON",
     "RECOVERY_BLOCKED_FAILURE_REASON",
     "SENSITIVE_FAILURE_REASON",
+    "discussion_exception_kind",
+    "discussion_failure_diagnostic",
     "gateway_scope_failure_payload",
     "is_legacy_generic_failure_reason",
     "is_public_project_prerequisite_text",

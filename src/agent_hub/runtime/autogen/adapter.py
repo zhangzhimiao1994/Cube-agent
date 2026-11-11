@@ -155,6 +155,8 @@ from agent_hub.runtime.execution_failure import (
     execution_failure_result as _execution_failure_result,
 )
 from agent_hub.runtime.failure_reason import (
+    discussion_exception_kind,
+    discussion_failure_diagnostic,
     gateway_scope_failure_payload,
     model_provider_failure_payload,
     runtime_failure_diagnostic_from_reason,
@@ -804,6 +806,14 @@ class _DiscussionDurability:
             }
         if self._model_lock.locked():
             self._model_lock.release()
+
+    def fail_discussion(self, *, phase: str, kind: str) -> None:
+        # Keep the first observed failure and its gateway-issued evidence.
+        # Later framework wrappers cannot replace it with their exception text.
+        if self.failure_reason is None:
+            previous = self.failure_payload
+            self.fail_model("discussion_failed")
+            self.failure_payload = {**previous, **discussion_failure_diagnostic(phase=phase, kind=kind)}
 
     async def reject_model(
         self, request: ModelRequest, rejected: GatewayRejectedOutput, *,
@@ -2382,6 +2392,30 @@ class GatewayChatCompletionClient(ChatCompletionClient):
         extra_create_args: Mapping[str, Any] = {},
         cancellation_token: CancellationToken | None = None,
     ) -> CreateResult:
+        try:
+            return await self._create_result(
+                messages, tools=tools, tool_choice=tool_choice, json_output=json_output,
+                extra_create_args=extra_create_args, cancellation_token=cancellation_token,
+            )
+        except Exception as error:
+            if self._durability is not None:
+                known = safe_model_gateway_failure_reason(error)
+                if known is not None:
+                    self._durability.fail_model(known, source=error)
+                else:
+                    self._durability.fail_discussion(phase="model_client", kind=discussion_exception_kind(error))
+            raise
+
+    async def _create_result(
+        self,
+        messages: Sequence[LLMMessage],
+        *,
+        tools: Sequence[Tool | ToolSchema] = (),
+        tool_choice: Tool | Literal["auto", "required", "none"] = "auto",
+        json_output: bool | type[Any] | None = None,
+        extra_create_args: Mapping[str, Any] = {},
+        cancellation_token: CancellationToken | None = None,
+    ) -> CreateResult:
         del extra_create_args
         if not isinstance(tool_choice, str) or tool_choice not in {"auto", "none"}:
             raise RuntimeExecutionError("unsupported AutoGen tool choice")
@@ -2472,9 +2506,16 @@ class GatewayChatCompletionClient(ChatCompletionClient):
         content: str | list[FunctionCall]
         finish_reason: Literal["stop", "function_calls"]
         if response.tool_calls:
-            content = [FunctionCall(id=call.id, name=tool_names[call.name], arguments=json.dumps(
-                dict(call.arguments), ensure_ascii=False, allow_nan=False, sort_keys=True, separators=(",", ":"),
-            )) for call in response.tool_calls]
+            try:
+                content = [FunctionCall(id=call.id, name=tool_names[call.name], arguments=json.dumps(
+                    _mutable_json(call.arguments), ensure_ascii=False, allow_nan=False, sort_keys=True, separators=(",", ":"),
+                )) for call in response.tool_calls]
+            except Exception as error:
+                if self._durability is not None:
+                    self._durability.fail_discussion(
+                        phase="tool_arguments_serialization", kind=discussion_exception_kind(error),
+                    )
+                raise
             finish_reason = "function_calls"
         elif response.text is not None:
             content, finish_reason = response.text, "stop"
@@ -2713,11 +2754,11 @@ class GatewayChatCompletionClient(ChatCompletionClient):
         cost_usd = completion.cost_usd if completion.cost_usd is not None else Decimal(0)
         if len(response.tool_calls) > _MAX_TOOL_CALLS_PER_RESPONSE:
             if not replayed and self._durability is not None:
-                self._durability.fail_model("discussion_failed")
+                self._durability.fail_discussion(phase="model_response_validation", kind="tool_call_limit")
             raise RuntimeExecutionError("model tool call limit exceeded")
         if response.text is None and not response.tool_calls:
             if not replayed and self._durability is not None:
-                self._durability.fail_model("discussion_failed")
+                self._durability.fail_discussion(phase="model_response_validation", kind="invalid_response")
             raise RuntimeExecutionError("model response is invalid")
         usage = RequestUsage(
             prompt_tokens=response.usage.prompt_tokens,
@@ -2733,12 +2774,14 @@ class GatewayChatCompletionClient(ChatCompletionClient):
             self._usage.cost_usd += cost_usd
         if any(call.name not in tool_names for call in response.tool_calls):
             if not replayed and self._durability is not None:
-                self._durability.fail_model("discussion_failed")
+                self._durability.fail_discussion(phase="model_response_validation", kind="unavailable_capability")
             raise RuntimeExecutionError("model requested an unavailable capability")
         if not replayed and self._durability is not None:
             await self._durability.succeed_model(request, completion, tool_names=tool_names, actor=self._actor)
         if request.required_tool is not None and (len(response.tool_calls) != 1
             or response.tool_calls[0].name != request.required_tool):
+            if self._durability is not None:
+                self._durability.fail_discussion(phase="model_response_validation", kind="required_tool_missing")
             raise RuntimeExecutionError("required engineering tool was not returned")
         if (self._acceptance_first and request.required_tool is not None
             and tool_names.get(request.required_tool) == "workspace.write_text"
@@ -2746,6 +2789,8 @@ class GatewayChatCompletionClient(ChatCompletionClient):
                  or type(response.tool_calls[0].arguments.get("content")) is not str
                  or not str(response.tool_calls[0].arguments["content"]).strip()
                  or set(response.tool_calls[0].arguments) != {"path", "content"})):
+            if self._durability is not None:
+                self._durability.fail_discussion(phase="model_response_validation", kind="acceptance_write_missing")
             raise RuntimeExecutionError("required acceptance draft write was not returned")
         return completion, usage
 
@@ -4176,6 +4221,8 @@ class AutoGenDiscussionRuntime:
                 if durability is not None and durability.failure_reason is not None
                 else safe_runtime_failure_reason(error, fallback="discussion_failed")
             )
+            if failure_reason == "discussion_failed" and durability is not None:
+                durability.fail_discussion(phase="framework", kind="wrapped_failure")
             error.__traceback__ = None
             error.__context__ = None
             error.__cause__ = None

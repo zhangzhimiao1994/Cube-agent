@@ -138,6 +138,7 @@ _PROVIDER_FAILURE_DIAGNOSTIC_KEYS = frozenset({
     "provider_rejection_class", "provider_parameter_family", "provider_protocol",
     "provider_classification_source", "provider_body_state",
 })
+_DISCUSSION_FAILURE_DIAGNOSTIC_KEYS = frozenset({"discussion_failure_phase", "discussion_failure_kind"})
 _OPTIONAL_FAILURE_DIAGNOSTIC_KEYS = frozenset(
     {
         "status_code", "hybrid_child_mode", "orchestration_recovery_hint", "step_id", "actor",
@@ -146,7 +147,7 @@ _OPTIONAL_FAILURE_DIAGNOSTIC_KEYS = frozenset(
         "engineering_work_progress_units",
         "provider_request_shape",
     }
-) | frozenset(_CAPACITY_DIAGNOSTIC_ENUMS) | _MODEL_PREFLIGHT_DIAGNOSTIC_KEYS | _PROVIDER_FAILURE_DIAGNOSTIC_KEYS
+) | frozenset(_CAPACITY_DIAGNOSTIC_ENUMS) | _MODEL_PREFLIGHT_DIAGNOSTIC_KEYS | _PROVIDER_FAILURE_DIAGNOSTIC_KEYS | _DISCUSSION_FAILURE_DIAGNOSTIC_KEYS
 _FAILURE_DIAGNOSTIC_KEYS = _REQUIRED_FAILURE_DIAGNOSTIC_KEYS | _OPTIONAL_FAILURE_DIAGNOSTIC_KEYS
 _GATEWAY_SCOPE_DIAGNOSTIC_KEYS = frozenset({
     "gateway_scope_phase", "gateway_scope_reason",
@@ -288,6 +289,16 @@ def _validate_failure_diagnostic(payload: Mapping[str, JsonValue]) -> None:
         _safe_free_text(value, name="runtime failure diagnostic text", max_bytes=limit * 4)
     if type(payload["retryable"]) is not bool:
         raise ValueError("runtime failure diagnostic retryable must be boolean")
+    if payload.keys() & _DISCUSSION_FAILURE_DIAGNOSTIC_KEYS:
+        from agent_hub.runtime.failure_reason import discussion_failure_diagnostic
+
+        if not _DISCUSSION_FAILURE_DIAGNOSTIC_KEYS <= payload.keys():
+            raise ValueError("discussion failure diagnostic fields are incomplete")
+        expected = discussion_failure_diagnostic(
+            phase=cast(str, payload["discussion_failure_phase"]), kind=cast(str, payload["discussion_failure_kind"]),
+        )
+        if any(type(payload.get(key)) is not type(value) or payload[key] != value for key, value in expected.items()):
+            raise ValueError("discussion failure diagnostic fields are inconsistent")
     if payload.keys() & (_PROVIDER_FAILURE_DIAGNOSTIC_KEYS | {"provider_request_shape"}):
         from agent_hub.models.provider_diagnostics import ProviderRejection, RequestShape
 

@@ -160,5 +160,8 @@ async def test_client_does_not_leak_or_misclassify_preflight_exception_text(type
         assert durable.failure_payload["model_preflight_error_type"] == "NoCapableDeployment"
         assert durable.failure_payload["model_preflight_logical_model"] == "qwen"
     else:
-        assert durable.failure_reason is None and durable.failure_payload == {}
+        assert durable.failure_reason == "discussion_failed"
+        assert durable.failure_payload["discussion_failure_phase"] == "model_client"
+        assert durable.failure_payload["discussion_failure_kind"] == "value_error"
+        assert "model_preflight_error_type" not in durable.failure_payload
     assert durable.model_entries == []
