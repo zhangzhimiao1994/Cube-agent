@@ -536,10 +536,12 @@ def _pending_approval_call(
     for index, call in enumerate(calls):
         if (not isinstance(call, Mapping) or set(call) != {'id', 'name', 'arguments'}
                 or not isinstance(call['arguments'], Mapping) or not isinstance(call['id'], str)
-                or not isinstance(call['name'], str) or call['id'] in identifiers):
+                or not isinstance(call['name'], str)):
             raise RuntimeExecutionError('durable capability approval model binding is invalid')
-        _safe_id(call['id'], 'tool call id')
-        identifiers.add(call['id'])
+        internal_id = _provider_call_id(call['id'])
+        if internal_id in identifiers:
+            raise RuntimeExecutionError('durable capability approval call ids are ambiguous')
+        identifiers.add(internal_id)
         call_intent = content.get(ROUND_INTENT)
         if durability.repair_phase is not None and isinstance(call_intent, Mapping):
             names = cast(Mapping[str, JsonValue], call_intent['tool_names'])
@@ -937,8 +939,10 @@ class _DiscussionDurability:
                 calls = None if artifact is None else artifact.content.get('tool_calls')
                 if (model.get('status') != 'succeeded' or artifact is None or not isinstance(calls, tuple)):
                     raise RuntimeExecutionError('durable capability approval model binding is invalid')
-                indexes = [index for index, item in enumerate(calls)
-                           if isinstance(item, Mapping) and item.get('id') == call_id]
+                internal_ids = _provider_call_ids(tuple(
+                    item.get('id') if isinstance(item, Mapping) else None for item in calls))
+                indexes = [index for index, internal_id in enumerate(internal_ids)
+                           if internal_id == call_id]
                 if len(indexes) != 1 or indexes[0] > self._tool_cursor:
                     raise RuntimeExecutionError('durable capability approval model binding is invalid')
                 self.approval_batch = {'model_artifact_id': str(artifact.id),
@@ -1392,6 +1396,29 @@ def _safe_id(value: str, name: str) -> str:
     if type(value) is not str or _ID.fullmatch(value) is None:
         raise ValueError(f"{name} must be a safe identifier")
     return value
+
+
+def _provider_call_id(value: object) -> str:
+    """Keep legacy safe IDs; map opaque provider IDs without changing their case."""
+    if (type(value) is not str or not value or value != value.strip() or len(value) > 512
+            or any(ord(character) < 32 or ord(character) == 127 for character in value)):
+        raise RuntimeExecutionError('provider tool call id is invalid')
+    if _ID.fullmatch(value) is not None:
+        return value
+    try:
+        encoded = value.encode('utf-8')
+    except UnicodeEncodeError:
+        raise RuntimeExecutionError('provider tool call id is invalid') from None
+    digest = hashlib.sha256(b'agent-hub/autogen/provider-call-id/v1\0' + encoded).hexdigest()
+    return f'call-v1-{digest}'
+
+
+def _provider_call_ids(values: Sequence[object]) -> tuple[str, ...]:
+    identifiers = tuple(_provider_call_id(value) for value in values)
+    # Legacy passthrough and mapped IDs share a namespace: reject ambiguity before execution.
+    if len(set(identifiers)) != len(identifiers):
+        raise RuntimeExecutionError('provider tool call ids are ambiguous')
+    return identifiers
 
 
 def _safe_text(value: str, name: str, maximum: int = 16_384) -> str:
@@ -2507,9 +2534,10 @@ class GatewayChatCompletionClient(ChatCompletionClient):
         finish_reason: Literal["stop", "function_calls"]
         if response.tool_calls:
             try:
-                content = [FunctionCall(id=call.id, name=tool_names[call.name], arguments=json.dumps(
+                internal_ids = _provider_call_ids(tuple(call.id for call in response.tool_calls))
+                content = [FunctionCall(id=internal_id, name=tool_names[call.name], arguments=json.dumps(
                     _mutable_json(call.arguments), ensure_ascii=False, allow_nan=False, sort_keys=True, separators=(",", ":"),
-                )) for call in response.tool_calls]
+                )) for call, internal_id in zip(response.tool_calls, internal_ids, strict=True)]
             except Exception as error:
                 if self._durability is not None:
                     self._durability.fail_discussion(
@@ -3795,7 +3823,7 @@ class AutoGenDiscussionRuntime:
                         try:
                             await matched[index].run_json(
                                 cast(dict[str, JsonValue], _mutable_json(calls[index]['arguments'])),
-                                self._cancel_token, call_id=cast(str, calls[index]['id']))
+                                self._cancel_token, call_id=_provider_call_id(calls[index]['id']))
                         except _ExecutionObservationError:
                             # A diagnosed check failure ends the batch, not the repair loop.
                             break
