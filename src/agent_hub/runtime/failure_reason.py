@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from functools import cache
-from typing import get_args
+from typing import cast, get_args
 
 from agent_hub.capabilities.project_prerequisites import (
     project_prerequisite_reason_category,
@@ -19,6 +19,7 @@ from agent_hub.models.capacity import (
     CapacityWaitTimeout,
     capacity_backend_diagnostic_payload,
 )
+from agent_hub.models.failure_receipt import get_gateway_failure_receipt
 from agent_hub.models.gateway import (
     GatewayNegotiatedRejectedOutput,
     GatewayRejectedOutput,
@@ -32,10 +33,10 @@ from agent_hub.models.litellm_client import (
     ModelTransportError,
 )
 from agent_hub.models.registry import NoCapableDeployment
-from agent_hub.models.types import ModelCapability, RejectedOutputEvidence
+from agent_hub.models.types import JsonValue, ModelCapability, RejectedOutputEvidence
 
 MAX_FAILURE_REASON_LENGTH = 240
-RuntimeFailureDiagnostic = dict[str, str | int | bool]
+RuntimeFailureDiagnostic = dict[str, JsonValue]
 SENSITIVE_FAILURE_REASON = re.compile(
     r"(api[_-]?key|authorization|bearer|credential|password|secret|(?:access|refresh|session)[_-]?token|sk-[A-Za-z0-9])",
     re.IGNORECASE,
@@ -424,8 +425,32 @@ def safe_runtime_failure_diagnostic(
             diagnostic["error_summary"] = (
                 reason + match[0][len(_REJECTED_OUTPUT_BASE):]
             )[:MAX_FAILURE_REASON_LENGTH]
-    return {**diagnostic, **gateway_scope_failure_payload(error),
+    return {**diagnostic, **gateway_scope_failure_payload(error), **model_provider_failure_payload(error),
             **model_candidate_failure_payload(error)}
+
+
+def model_provider_failure_payload(error: object) -> RuntimeFailureDiagnostic:
+    """Project only the final gateway-issued HTTP400 rejection, never exception text."""
+    receipt = get_gateway_failure_receipt(error)
+    if receipt is None or not receipt.history_complete:
+        return {}
+    attempt = receipt.attempts[-1]
+    diagnostic = attempt.provider_diagnostic
+    if attempt.status_code != 400 or diagnostic is None:
+        return {}
+    rejection = diagnostic.rejections[-1]
+    shape = rejection.request_shape
+    payload: RuntimeFailureDiagnostic = {
+        "provider_rejection_class": rejection.rejection_class,
+        "provider_parameter_family": rejection.parameter_family,
+        "provider_protocol": "unknown" if shape is None else shape.protocol,
+        "provider_classification_source": rejection.classification_source,
+        "provider_body_state": rejection.body_state,
+    }
+    if shape is not None:
+        # The issued DTO retains only bounded counts/booleans/enums, not wire content.
+        payload["provider_request_shape"] = cast(JsonValue, shape.to_payload())
+    return payload
 
 
 def gateway_scope_failure_payload(
@@ -1287,6 +1312,7 @@ __all__ = [
     "is_legacy_generic_failure_reason",
     "is_public_project_prerequisite_text",
     "is_safe_failure_reason",
+    "model_provider_failure_payload",
     "normalize_failure_reason",
     "runtime_failure_diagnostic_from_reason",
     "safe_model_gateway_failure_reason",

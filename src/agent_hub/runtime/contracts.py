@@ -134,14 +134,19 @@ _MODEL_PREFLIGHT_DIAGNOSTIC_ENUMS = {
 _MODEL_PREFLIGHT_DIAGNOSTIC_KEYS = frozenset(_MODEL_PREFLIGHT_DIAGNOSTIC_ENUMS) | {
     "model_preflight_logical_model", "model_preflight_required_capabilities",
 }
+_PROVIDER_FAILURE_DIAGNOSTIC_KEYS = frozenset({
+    "provider_rejection_class", "provider_parameter_family", "provider_protocol",
+    "provider_classification_source", "provider_body_state",
+})
 _OPTIONAL_FAILURE_DIAGNOSTIC_KEYS = frozenset(
     {
         "status_code", "hybrid_child_mode", "orchestration_recovery_hint", "step_id", "actor",
         "compression_trigger", "termination_reason",
         "runtime_timeout_kind", "remaining_soft_timeout_seconds", "remaining_absolute_timeout_seconds",
         "engineering_work_progress_units",
+        "provider_request_shape",
     }
-) | frozenset(_CAPACITY_DIAGNOSTIC_ENUMS) | _MODEL_PREFLIGHT_DIAGNOSTIC_KEYS
+) | frozenset(_CAPACITY_DIAGNOSTIC_ENUMS) | _MODEL_PREFLIGHT_DIAGNOSTIC_KEYS | _PROVIDER_FAILURE_DIAGNOSTIC_KEYS
 _FAILURE_DIAGNOSTIC_KEYS = _REQUIRED_FAILURE_DIAGNOSTIC_KEYS | _OPTIONAL_FAILURE_DIAGNOSTIC_KEYS
 _GATEWAY_SCOPE_DIAGNOSTIC_KEYS = frozenset({
     "gateway_scope_phase", "gateway_scope_reason",
@@ -283,6 +288,27 @@ def _validate_failure_diagnostic(payload: Mapping[str, JsonValue]) -> None:
         _safe_free_text(value, name="runtime failure diagnostic text", max_bytes=limit * 4)
     if type(payload["retryable"]) is not bool:
         raise ValueError("runtime failure diagnostic retryable must be boolean")
+    if payload.keys() & (_PROVIDER_FAILURE_DIAGNOSTIC_KEYS | {"provider_request_shape"}):
+        from agent_hub.models.provider_diagnostics import ProviderRejection, RequestShape
+
+        if (not _PROVIDER_FAILURE_DIAGNOSTIC_KEYS <= payload.keys()
+                or type(payload.get("status_code")) is not int or payload["status_code"] != 400
+                or payload["retryable"] is not False
+                or type(payload["provider_protocol"]) is not str
+                or payload["provider_protocol"] not in {"unknown", "chat_completions", "responses", "messages"}):
+            raise ValueError("provider failure diagnostic fields are invalid")
+        # Reuse the finite DTO's exact enum and source/body joint invariants.
+        ProviderRejection.from_payload({
+            "status_code": 400, "exception_family": "sdk_bad_request",
+            "rejection_class": payload["provider_rejection_class"],
+            "parameter_family": payload["provider_parameter_family"],
+            "classification_source": payload["provider_classification_source"],
+            "body_state": payload["provider_body_state"], "request_shape": None,
+        })
+        if "provider_request_shape" in payload:
+            shape = RequestShape.from_payload(_mutable_json(payload["provider_request_shape"]))
+            if shape.protocol != payload["provider_protocol"]:
+                raise ValueError("provider request shape protocol is inconsistent")
     if payload.keys() & _MODEL_PREFLIGHT_DIAGNOSTIC_KEYS:
         if any(payload.get(name) != expected for name, expected in _MODEL_PREFLIGHT_DIAGNOSTIC_ENUMS.items()):
             raise ValueError("model preflight diagnostic type fields are invalid")

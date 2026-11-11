@@ -156,6 +156,7 @@ from agent_hub.runtime.execution_failure import (
 )
 from agent_hub.runtime.failure_reason import (
     gateway_scope_failure_payload,
+    model_provider_failure_payload,
     runtime_failure_diagnostic_from_reason,
     safe_model_gateway_failure_reason,
     safe_runtime_failure_reason,
@@ -792,11 +793,15 @@ class _DiscussionDurability:
     def fail_model(self, reason: str | None = None, *, source: object = None) -> None:
         if reason and self.failure_reason is None:
             self.failure_reason = reason
-            self.failure_payload = gateway_scope_failure_payload(source, include_noncapacity=True)
+            self.failure_payload = {
+                **gateway_scope_failure_payload(source, include_noncapacity=True),
+                **model_provider_failure_payload(source),
+            }
         elif self.failure_reason is None and not self.failure_payload:
-            self.failure_payload = gateway_scope_failure_payload(
-                source, include_noncapacity=True,
-            )
+            self.failure_payload = {
+                **gateway_scope_failure_payload(source, include_noncapacity=True),
+                **model_provider_failure_payload(source),
+            }
         if self._model_lock.locked():
             self._model_lock.release()
 

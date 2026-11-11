@@ -415,6 +415,28 @@ def _validate_transport_request(
     return None
 
 
+def _official_deepseek_auto_tool_choice(api_base: str, wire_model: object) -> bool:
+    # Official Flash defaults to thinking, where named/required choices are
+    # unsupported. Match the actual destination/model, never a provider label.
+    # https://api-docs.deepseek.com/api/create-chat-completion/
+    if type(wire_model) is not str or wire_model not in {"deepseek-flash", "deepseek-v4-flash"}:
+        return False
+    try:
+        base = urlsplit(api_base)
+        return (
+            base.scheme == "https"
+            and base.hostname == "api.deepseek.com"
+            and base.port in (None, 443)
+            and base.username is None
+            and base.password is None
+            and not base.query
+            and not base.fragment
+            and base.path in {"", "/", "/v1", "/v1/"}
+        )
+    except ValueError:
+        return False
+
+
 def _chat_completion_create_kwargs(
     deployment: Deployment,
     request: ModelRequest,
@@ -1204,6 +1226,12 @@ class LiteLLMClient:
                 request,
                 stream=False,
             )
+            if request.required_tool is not None and _official_deepseek_auto_tool_choice(
+                deployment.api_base, create_kwargs["model"],
+            ):
+                # Only the wire dialect changes. _complete still rejects missing
+                # or wrong required tools and retains the response usage evidence.
+                create_kwargs["tool_choice"] = "auto"
             shape = _request_shape(create_kwargs, "chat_completions", 1, request)
             response = await client.chat.completions.create(**create_kwargs)
             parsed = _parse_response(response, deployment.id, sensitive_values,

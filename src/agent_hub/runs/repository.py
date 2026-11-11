@@ -38,6 +38,7 @@ from agent_hub.db.models import (
     UserRow,
 )
 from agent_hub.domain.runs import RunStatus, TaskMode
+from agent_hub.models.provider_diagnostics import RequestShape
 from agent_hub.runs.approval_checkpoint import checkpoint_waits_for_approval
 from agent_hub.runs.authorization import (
     _AuthenticatedInput,
@@ -4749,6 +4750,20 @@ def public_autogen_role_artifact_content(content: object) -> object:
     return content
 
 
+def _canonical_public_provider_request_shape(payload: dict[str, object]) -> tuple[dict[str, object], str] | None:
+    if payload.get("kind") != EventKind.RUNTIME_FAILED.value:
+        return None
+    try:
+        # created_at is repository row metadata, not a RunEvent contract field.
+        event = RunEvent.from_payload({key: value for key, value in payload.items() if key != "created_at"})
+        # Full event validation binds the exact five-core group, HTTP400,
+        # retryable=false and matching protocol before any redaction exception.
+        shape = RequestShape.from_payload(_mutable_json(event.payload["provider_request_shape"]))
+        return shape.to_payload(), cast(str, event.payload["provider_parameter_family"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
 def _public_event_payload(payload: dict[str, object]) -> dict[str, object]:
     kind = payload.get("kind")
     if type(kind) is str and kind in CONTEXT_EVENT_KINDS:
@@ -4760,6 +4775,14 @@ def _public_event_payload(payload: dict[str, object]) -> dict[str, object]:
         for key, value in payload.items()
         if _is_public_key(key) and key not in {"checkpoint", "checkpoint_summary"}
     }
+    diagnostic = public.get("payload")
+    if isinstance(diagnostic, Mapping) and "provider_request_shape" in diagnostic:
+        # Never return an unvalidated shape, even its otherwise harmless text.
+        diagnostic = {key: value for key, value in diagnostic.items() if key != "provider_request_shape"}
+        canonical = _canonical_public_provider_request_shape(payload)
+        if canonical is not None:
+            diagnostic["provider_request_shape"], diagnostic["provider_parameter_family"] = canonical
+        public["payload"] = diagnostic
     if "checkpoint" in payload or kind == EventKind.CHECKPOINT_SAVED.value:
         public["checkpoint"] = None
     if kind == EventKind.CHECKPOINT_SAVED.value:
