@@ -1,4 +1,4 @@
-"""Real submit/claim -> broker/frozen context -> factory/Gateway/PG settlement.
+"""Real submit/claim -> worker/context -> broker/factory/Gateway/PG settlement.
 
 Dedicated test PG and the existing owned Unix Redis are mandatory. Only provider
 HTTP is MockTransport. No deadline helper, pool, factory, adapter or admission
@@ -34,6 +34,7 @@ from agent_hub.runs.service import RunService
 from agent_hub.runtime.contracts import RunEvent, TaskContext
 from agent_hub.runtime.defaults import ConfigBackedDiscussionRuntime, _deployments
 from agent_hub.runtime.registry import RuntimeRegistry
+from agent_hub.runtime.review_assembly import ReviewExecution
 from tests.integration.capabilities.test_review_repository import (
     database_url as database_url,  # noqa: PLC0414
 )
@@ -82,8 +83,11 @@ def remaining_context(context: TaskContext, *, forged: bool) -> TaskContext:
     values["instruction_context"] = context.instruction_context
     rebuilt = TaskContext.model_validate(values, strict=True)
     assert rebuilt.timeout_seconds <= context.timeout_seconds
-    assert isinstance(rebuilt.routing_decision, MappingProxyType)
-    assert isinstance(rebuilt.routing_decision["approval_review_profile"], MappingProxyType)
+    # DTO validation uses built-in JSON containers. Original worker processing
+    # freezes routing only when it strips an actual private locator below.
+    assert isinstance(rebuilt.routing_decision, Mapping)
+    assert isinstance(rebuilt.routing_decision["approval_review_profile"], Mapping)
+    assert rebuilt.routing_decision["approval_review_profile"] == context.routing_decision["approval_review_profile"]
     assert rebuilt.execution_token == context.execution_token
     return rebuilt
 
@@ -173,6 +177,27 @@ async def test_claimed_factory_capacity_crosses_only_trusted_soft_boundary(
         return result
 
     real_worker = service_module.worker_runtime_events
+    real_prepare = case.broker.prepare
+
+    async def observe_prepare(context: TaskContext, *, worker_id: str) -> ReviewExecution | None:
+        # This observation is reached through original worker_runtime_events,
+        # after its conditional private-locator removal and before real prepare.
+        rebuilt = observed["rebuilt_context"]
+        private = {"project_verification_receipt", "approval_checkpoint_worker_token"}
+        expected_route = {key: value for key, value in rebuilt.routing_decision.items() if key not in private}
+        assert context.run_id == submitted.id and context.execution_token == rebuilt.execution_token
+        assert isinstance(context.routing_decision, Mapping)
+        assert isinstance(context.routing_decision["approval_review_profile"], Mapping)
+        assert dict(context.routing_decision) == expected_route
+        assert context.routing_decision["approval_review_profile"] == rebuilt.routing_decision["approval_review_profile"]
+        assert not private.intersection(context.routing_decision)
+        if private.intersection(rebuilt.routing_decision):
+            # Keep the real worker's deep-freeze assertions at its actual
+            # boundary. Fresh claims need not carry either private locator.
+            assert isinstance(context.routing_decision, MappingProxyType)
+            assert isinstance(context.routing_decision["approval_review_profile"], MappingProxyType)
+        observed["prepared_context"] = context
+        return await real_prepare(context, worker_id=worker_id)
 
     @asynccontextmanager
     async def observe_worker(
@@ -183,7 +208,7 @@ async def test_claimed_factory_capacity_crosses_only_trusted_soft_boundary(
         claimed = current.routing_decision
         assert isinstance(claimed, Mapping)
         assert context.routing_decision["runtime_timeout_source"] == claimed["runtime_timeout_source"] == expected_source
-        assert isinstance(context.routing_decision["approval_review_profile"], MappingProxyType)
+        assert isinstance(context.routing_decision["approval_review_profile"], Mapping)
         assert isinstance(claimed["approval_review_profile"], dict)
         assert dict(context.routing_decision["approval_review_profile"]) == claimed["approval_review_profile"]
         if boundary in {"trusted_soft", "past_hard"}:
@@ -216,6 +241,7 @@ async def test_claimed_factory_capacity_crosses_only_trusted_soft_boundary(
 
     monkeypatch.setattr(CapacityPool, "_try_acquire", observe_busy)
     monkeypatch.setattr(service_module, "worker_runtime_events", observe_worker)
+    monkeypatch.setattr(case.broker, "prepare", observe_prepare)
     release_task: asyncio.Task[None] | None = None
     execution: asyncio.Task[object] | None = None
 
@@ -235,6 +261,7 @@ async def test_claimed_factory_capacity_crosses_only_trusted_soft_boundary(
         # This bounds the local fixture, not any production/request deadline.
         await asyncio.wait_for(execution, timeout=25)
         assert entered_worker.is_set(), "original submit/claim never reached the original worker entry"
+        assert "prepared_context" in observed, "original worker never called the real broker prepare boundary"
         if boundary == "trusted_soft":
             assert queued.is_set(), "request did not exercise native Redis pretransport contention"
             await asyncio.wait_for(release_task, timeout=2)
