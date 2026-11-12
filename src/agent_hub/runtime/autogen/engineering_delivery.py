@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import cast
 from uuid import UUID
 
+from agent_hub.capabilities.project_inspection import is_python_catalog_query_feedback
 from agent_hub.domain.runs import TaskMode
 from agent_hub.runtime.autogen.model_tool_correction import (
     TOOL_CORRECTION_POLICY,
@@ -309,6 +310,8 @@ def engineering_progress(
             seen, current, failed_current = True, False, True
             continue
         if name == "project.inspect":
+            if is_python_catalog_query_feedback(result):
+                continue
             scope = result.get("scope")
             if (type(result.get("schema_version")) is not int or result.get("schema_version") != 1
                 or not isinstance(scope, Mapping)

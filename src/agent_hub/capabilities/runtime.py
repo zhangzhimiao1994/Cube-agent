@@ -467,9 +467,24 @@ class RuntimeCapabilityGateway:
             if self._project_workspace_dir is None:
                 raise RuntimeCapabilityError("project inspection scope unavailable")
             try:
-                from agent_hub.capabilities.project_inspection import parse_python_catalog_query
+                from agent_hub.capabilities.project_inspection import (
+                    PythonCatalogQueryFeedback,
+                    PythonCatalogQueryInvalid,
+                    parse_python_catalog_query,
+                    project_inspection_scope,
+                )
 
-                catalog_query = parse_python_catalog_query(arguments)
+                try:
+                    catalog_query = parse_python_catalog_query(arguments)
+                except PythonCatalogQueryInvalid as error:
+                    # Only this exact pure parser outcome is correctable. Scope
+                    # overrides and unrelated errors remain on the fatal path.
+                    if type(error) is not PythonCatalogQueryInvalid or set(arguments) != {'python_catalog'}:
+                        raise
+                    await project_inspection_scope(
+                        repository=self._run_repository, tenant_id=tenant_id, run_id=run_id,
+                    )
+                    return PythonCatalogQueryFeedback().to_payload()
                 observation = dict(await inspect_project(
                     repository=self._run_repository, tenant_id=tenant_id, run_id=run_id,
                     project_root=self._project_workspace_dir,

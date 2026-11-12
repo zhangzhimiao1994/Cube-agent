@@ -216,7 +216,15 @@ async def test_catalog_query_rejects_malformed_or_stale_selection_without_catalo
 ) -> None:
     case = catalog_case(tmp_path, monkeypatch)
     result = await case.inspect({'python_catalog': {'catalog_sha256': case.profile.catalog_sha256, **defect}})
-    assert result.status == 'failed' and result.truncated is False
+    assert result.truncated is False
+    if defect == {'catalog_sha256': '0' * 64}:
+        assert result.status == 'failed'  # Stale catalog CAS is not a pure parser rejection.
+    else:
+        assert result.status == 'succeeded'  # Only the rejection observation was delivered.
+        assert result.payload['status'] == 'rejected'
+        assert result.payload['reason_code'] == 'python_catalog_query_invalid'
+        assert result.payload['inspection_performed'] is False
+        assert case.broker_calls == []
     assert 'python_build_profile' not in result.payload and 'catalog' not in result.payload
     assert case.profile.catalog[0].filename not in repr(result.payload)
     assert case.backend._project_delivery_receipts == {} and case.db.approvals == {}
@@ -233,7 +241,14 @@ async def test_missing_digest_and_extra_top_level_fields_are_not_query_authority
     if 'project_id' in arguments:
         arguments = {**arguments, 'python_catalog': {'catalog_sha256': case.profile.catalog_sha256}}
     result = await case.inspect(arguments)
-    assert result.status == 'failed' and 'python_build_profile' not in result.payload
+    assert 'python_build_profile' not in result.payload
+    if 'project_id' in arguments:
+        assert result.status == 'failed'
+    else:
+        assert result.status == 'succeeded'
+        assert result.payload['status'] == 'rejected'
+        assert result.payload['inspection_performed'] is False
+    assert case.broker_calls == []
 
 
 @pytest.mark.parametrize('foreign', ['tenant', 'run'])

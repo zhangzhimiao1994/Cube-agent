@@ -8,6 +8,7 @@ import re
 from collections.abc import Mapping
 from typing import cast
 
+from agent_hub.capabilities.project_inspection import is_python_catalog_query_feedback
 from agent_hub.runtime.contracts import Artifact, JsonValue, TaskContext
 from agent_hub.runtime.crew.workspace_maintenance_delivery import (
     _file_metadata,
@@ -76,6 +77,8 @@ def engineering_action_progress(
         if status == 'rejected':
             continue
         if name == 'project.inspect' and status == 'succeeded':
+            if is_python_catalog_query_feedback(result):
+                continue
             scope = result.get('scope')
             if (not isinstance(scope, Mapping) or scope.get('run_id') != str(context.run_id)
                     or scope.get('tenant_id') != str(context.tenant_id)):

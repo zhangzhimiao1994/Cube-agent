@@ -23,7 +23,7 @@ from collections.abc import (
 )
 from dataclasses import dataclass, field, replace
 from decimal import Decimal
-from typing import Any, Literal, Protocol, cast
+from typing import Any, Literal, NoReturn, Protocol, cast
 from uuid import UUID, uuid4
 
 import autogen_agentchat
@@ -406,6 +406,18 @@ class RuntimeExecutionError(RuntimeError):
     """Stable discussion runtime failure."""
 
 
+@dataclass
+class _PreparationRejection:
+    actor: str
+    name: str
+    call_id: str | None
+    kind: str
+    recoverable: bool
+    admitted: bool = False
+    request_hash: str | None = None
+    model_position: int | None = None
+
+
 class _StoppedModelResponse(RuntimeExecutionError):
     def __init__(self, record: RejectedModelRecord) -> None:
         super().__init__(record.failure_reason())
@@ -611,6 +623,10 @@ class _DiscussionDurability:
         self._tool_lock = asyncio.Lock()
         self.failure_reason: str | None = None
         self.failure_payload: Mapping[str, JsonValue] = {}
+        # This is not a model failure or a tool outcome. It must not unlock a
+        # model, be erased by model success, or publish an executed-tool receipt.
+        self.preparation_rejection: _PreparationRejection | None = None
+        self.preparation_replanning = False
         self.approval_pending = False
         self.approval_batch = dict(approval_batch) if approval_batch is not None else None
         self.repair_phase = dict(repair_phase) if repair_phase is not None else None
@@ -659,6 +675,43 @@ class _DiscussionDurability:
             json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest()
 
+    def reject_preparation(self, *, actor: str, name: str, call_id: str | None,
+                           kind: str) -> NoReturn:
+        if self.preparation_rejection is None:
+            self.preparation_rejection = _PreparationRejection(
+                actor, name, call_id if isinstance(call_id, str) and _ID.fullmatch(call_id) else None,
+                kind, self.preparation_replanning and kind in {"payload_limit", "invalid_arguments"},
+            )
+        else:
+            self.preparation_rejection.recoverable = False
+        if not self.preparation_rejection.recoverable:
+            self.stop_preparation()
+        raise RuntimeExecutionError(
+            "Capability proposal was not submitted: " + kind + ". "
+            "Correct its arguments within the same approved tool scope and 65536 UTF-8 bytes. "
+            "This rejection is not an executed action, tool grant or completed work."
+        ) from None
+
+    def stop_preparation(self) -> None:
+        rejected = self.preparation_rejection
+        if rejected is not None and self.failure_reason is None:
+            self.failure_reason = "discussion_failed"
+            self.failure_payload = discussion_failure_diagnostic(
+                phase="tool_preparation", kind=rejected.kind,
+            )
+
+    def check_preparation_model(self, actor: str | None, request_hash: str) -> None:
+        rejected = self.preparation_rejection
+        if rejected is None:
+            return
+        if (not rejected.recoverable or not rejected.admitted or actor != rejected.actor
+                or rejected.request_hash is not None and rejected.request_hash != request_hash
+                or rejected.model_position is not None and rejected.model_position != self._model_cursor):
+            self.stop_preparation()
+            raise RuntimeExecutionError("capability preparation rejected")
+        rejected.request_hash = request_hash
+        rejected.model_position = self._model_cursor
+
     async def before_model(
         self,
         request: ModelRequest,
@@ -667,14 +720,17 @@ class _DiscussionDurability:
         bounded_no_tool: bool = False,
         report_binding: Mapping[str, JsonValue] | None = None,
         correction_for: int | None = None,
+        actor: str | None = None,
     ) -> GatewayCompletion | RejectedModelRecord | None:
         if self.approval_pending:
             raise RuntimeExecutionError('capability requires approval')
         if self.failure_reason == _GENERATED_DRAFT_NO_PROGRESS:
             raise RuntimeExecutionError(_GENERATED_DRAFT_NO_PROGRESS)
-        await self._model_lock.acquire()
         request_hash = self.request_hash(request, tool_names=tool_names)
+        self.check_preparation_model(actor, request_hash)
+        await self._model_lock.acquire()
         try:
+            self.check_preparation_model(actor, request_hash)
             if self._model_cursor < len(self.model_entries):
                 entry = self.model_entries[self._model_cursor]
                 if (entry.get("correction_for") != correction_for
@@ -1949,7 +2005,12 @@ class GatewayCapabilityTool(BaseTool[_DynamicToolArguments, _DynamicToolResult])
         cancellation_token: CancellationToken,
         call_id: str | None = None,
     ) -> Any:
-        validated = _DynamicToolArguments.model_validate(args)
+        try:
+            validated = _DynamicToolArguments.model_validate(args)
+        except (TypeError, ValueError):
+            self._durability.reject_preparation(
+                actor=self._actor, name=self.name, call_id=call_id, kind="invalid_arguments",
+            )
         return await self._execute(validated, cancellation_token, call_id=call_id)
 
     async def _execute(
@@ -1988,27 +2049,30 @@ class GatewayCapabilityTool(BaseTool[_DynamicToolArguments, _DynamicToolResult])
             call_id
             or hashlib.sha256(f"{self._run_id}:{self._actor}:{self.name}".encode()).hexdigest()
         )
-        _safe_id(safe_call_id, "tool call id")
-        arguments = dict(args.model_extra or {})
-        if self.name == "project.preflight_architecture":
-            context = self._server_context
-            if context is None:
-                raise RuntimeExecutionError("project preflight workspace scope is not configured")
-            project_id = context.routing_decision.get("project_id")
-            workspace_session_id = context.routing_decision.get("workspace_session_id")
-            if not isinstance(project_id, str) or not project_id.strip():
-                raise RuntimeExecutionError("project preflight workspace scope is not configured")
-            if not isinstance(workspace_session_id, str) or not workspace_session_id.strip():
-                raise RuntimeExecutionError("project preflight workspace scope is not configured")
-            arguments = dict(
-                scoped_project_preflight_arguments(
-                    request=context.request,
-                    project_id=project_id,
-                    workspace_session_id=workspace_session_id,
-                    model_arguments=cast(Mapping[str, JsonValue], arguments),
-                )
-            )
+        kind = "invalid_identifier"
         try:
+            _safe_id(safe_call_id, "tool call id")
+            arguments = dict(args.model_extra or {})
+            kind = "invalid_scope"
+            if self.name == "project.preflight_architecture":
+                context = self._server_context
+                if context is None:
+                    raise RuntimeExecutionError("project preflight workspace scope is not configured")
+                project_id = context.routing_decision.get("project_id")
+                workspace_session_id = context.routing_decision.get("workspace_session_id")
+                if not isinstance(project_id, str) or not project_id.strip():
+                    raise RuntimeExecutionError("project preflight workspace scope is not configured")
+                if not isinstance(workspace_session_id, str) or not workspace_session_id.strip():
+                    raise RuntimeExecutionError("project preflight workspace scope is not configured")
+                arguments = dict(
+                    scoped_project_preflight_arguments(
+                        request=context.request,
+                        project_id=project_id,
+                        workspace_session_id=workspace_session_id,
+                        model_arguments=cast(Mapping[str, JsonValue], arguments),
+                    )
+                )
+            kind = "invalid_arguments"
             encoded = json.dumps(
                 arguments,
                 ensure_ascii=False,
@@ -2016,21 +2080,33 @@ class GatewayCapabilityTool(BaseTool[_DynamicToolArguments, _DynamicToolResult])
                 sort_keys=True,
                 separators=(",", ":"),
             ).encode()
-        except (TypeError, ValueError):
-            raise RuntimeExecutionError("capability arguments are invalid") from None
-        if len(encoded) > _MAX_TOOL_PAYLOAD_BYTES:
-            raise RuntimeExecutionError("capability arguments exceed limit")
+            if len(encoded) > _MAX_TOOL_PAYLOAD_BYTES:
+                kind = "payload_limit"
+                raise RuntimeExecutionError("capability arguments exceed limit")
+            # Only pure preparation is observed here. before_tool/checkpoint and
+            # invoke stay OUTSIDE this catch and retain their UNKNOWN semantics.
+            kind = "invalid_replay_policy"
+            replay_safe = self._gateway.is_replay_safe(self.name)
+            if type(replay_safe) is not bool:
+                raise RuntimeExecutionError("capability replay policy is invalid")
+            kind = "invalid_arguments"
+            tool_sandbox = _tool_sandbox(
+                self.name,
+                sandbox_profile=self._sandbox_profile,
+                arguments=cast(Mapping[str, JsonValue], arguments),
+                routing_decision=None if self._server_context is None else self._server_context.routing_decision,
+            )
+        except Exception:  # noqa: BLE001 - finite pure preparation, never checkpoint/invoke
+            self._durability.reject_preparation(
+                actor=self._actor, name=self.name, call_id=safe_call_id, kind=kind,
+            )
         arguments_hash = hashlib.sha256(encoded).hexdigest()
-        # Resolve replay policy before publishing a started boundary or causing I/O.
-        replay_safe = self._gateway.is_replay_safe(self.name)
-        if type(replay_safe) is not bool:
-            raise RuntimeExecutionError("capability replay policy is invalid")
-        tool_sandbox = _tool_sandbox(
-            self.name,
-            sandbox_profile=self._sandbox_profile,
-            arguments=cast(Mapping[str, JsonValue], arguments),
-            routing_decision=None if self._server_context is None else self._server_context.routing_decision,
-        )
+        rejected = self._durability.preparation_rejection
+        if rejected is not None and (not rejected.admitted or not rejected.recoverable
+                or rejected.actor != self._actor or rejected.name != self.name
+                or rejected.request_hash is None):
+            self._durability.stop_preparation()
+            raise RuntimeExecutionError("capability preparation rejected")
         replayed, idempotency_key = await self._durability.before_tool(
             actor=self._actor,
             name=self.name,
@@ -2038,6 +2114,7 @@ class GatewayCapabilityTool(BaseTool[_DynamicToolArguments, _DynamicToolResult])
             replay_safe=replay_safe,
             server_context=self._server_context,
         )
+        self._durability.preparation_rejection = None
         self._records.append(
             _ToolRecord(
                 EventKind.TOOL_STARTED,
@@ -2532,6 +2609,16 @@ class GatewayChatCompletionClient(ChatCompletionClient):
                 response, tool_names = completion.response, names
         content: str | list[FunctionCall]
         finish_reason: Literal["stop", "function_calls"]
+        rejected = self._durability.preparation_rejection if self._durability is not None else None
+        if rejected is not None and rejected.admitted and (
+            len(response.tool_calls) != 1
+            or tool_names.get(response.tool_calls[0].name) != rejected.name
+        ):
+            # Validate the WHOLE corrective proposal before any facade runs.
+            # Clearing its latch after the first valid tool cannot grant a suffix.
+            assert self._durability is not None
+            self._durability.stop_preparation()
+            raise RuntimeExecutionError("capability preparation rejected")
         if response.tool_calls:
             try:
                 internal_ids = _provider_call_ids(tuple(call.id for call in response.tool_calls))
@@ -2734,7 +2821,7 @@ class GatewayChatCompletionClient(ChatCompletionClient):
             await self._durability.before_model(request, tool_names=tool_names,
                 bounded_no_tool=self._bounded_no_tool,
                 report_binding=self._report_binding() if self._report_binding is not None else None,
-                correction_for=correction_for)
+                correction_for=correction_for, actor=self._actor)
             if self._durability is not None
             else None
         )
@@ -2756,6 +2843,13 @@ class GatewayChatCompletionClient(ChatCompletionClient):
                         min(request.timeout_seconds, float(seconds))
                         if request.required_tool is not None else float(seconds)
                     ))
+                if self._durability is not None:
+                    # A checkpoint publication can yield after before_model's
+                    # lock check. Fence again immediately before physical I/O.
+                    row = self._durability.model_entries[self._durability._model_cursor]
+                    self._durability.check_preparation_model(
+                        self._actor, cast(str, row["request_hash"]),
+                    )
                 task = asyncio.create_task(self._gateway.complete_with_context(request))
                 if cancellation_token is not None:
                     cancellation_token.link_future(task)
@@ -3013,6 +3107,10 @@ class AutoGenDiscussionRuntime:
         continuation = (engineering and engineering_continuation_selected(context)
                         and sum("workspace.write_text" in tools for tools in allowed_tools.values()) == 1)
         round_published = asyncio.Event()
+        pretool_replanning = (
+            type(context.routing_decision.get("engineering_auto_repair_version")) is int
+            and context.routing_decision.get("engineering_auto_repair_version") == 1
+        )
         checkpoint_ack = engineering and _checkpoint_ack_selected(context)
         soft_admission = engineering and _soft_admission_selected(context)
         publications = CheckpointPublications() if checkpoint_ack else None
@@ -3152,6 +3250,12 @@ class AutoGenDiscussionRuntime:
                     self._cancel_token.link_future(published)
                 await published
                 round_published.clear()
+            if durability is not None and durability.preparation_rejection is not None:
+                rejected = durability.preparation_rejection
+                if not rejected.recoverable or not rejected.admitted:
+                    durability.stop_preparation()
+                    raise RuntimeExecutionError("capability preparation rejected")
+                return rejected.actor
             if reports and tools_ready():
                 return FINAL_REPORT_ACTOR
             if (not continuation or not messages or not isinstance(messages[-1], ToolCallSummaryMessage)
@@ -3405,6 +3509,7 @@ class AutoGenDiscussionRuntime:
                 if restored is not None else None,
             )
             self._repair_phase = durability.repair_phase
+            durability.preparation_replanning = pretool_replanning
             if durability.repair_phase is not None:
                 if any(row.get('status') == 'running' for row in durability.model_entries):
                     raise ModelOutcomeUncertain('model outcome is uncertain')
@@ -3724,7 +3829,7 @@ class AutoGenDiscussionRuntime:
                     "and current workspace.bundle. Prefer the engineering writer until these are delivered; "
                     "do not treat [COMPLETE] or consensus text as delivery. Return only one speaker name."
                 )
-            if continuation or checkpoint_ack or reports:
+            if continuation or checkpoint_ack or reports or pretool_replanning:
                 team_options["selector_func"] = continue_writer
             if reports:
                 team_options["candidate_func"] = lambda _messages: list(self.participant_ids)
@@ -3943,6 +4048,44 @@ class AutoGenDiscussionRuntime:
                         for event in drained_tool_events
                     ):
                         raise RuntimeExecutionError("capability execution failed") from None
+                    rejected = durability.preparation_rejection
+                    if rejected is not None:
+                        if not rejected.recoverable:
+                            durability.stop_preparation()
+                            raise RuntimeExecutionError("capability preparation rejected")
+                        if isinstance(item, BaseChatMessage) and item.source != "user":
+                            # A typed, single-call error summary can open ONE
+                            # same-actor replan. No tool outcome or progress is
+                            # invented; known model responses remain in ledger.
+                            if (not isinstance(item, ToolCallSummaryMessage)
+                                    or item.source != rejected.actor
+                                    or len(item.results) != 1 or len(item.tool_calls) != 1
+                                    or not item.results[0].is_error
+                                    or item.results[0].call_id != rejected.call_id
+                                    or item.results[0].name not in {rejected.name, rejected.name.replace('.', '_')}):
+                                durability.stop_preparation()
+                                raise RuntimeExecutionError("capability preparation rejected")
+                            rejected.admitted = True
+                            yield RunEvent(kind="tool.preparation_rejected", sequence=sequence,
+                                run_id=context.run_id,
+                                payload={**discussion_failure_diagnostic(
+                                    phase="tool_preparation", kind=rejected.kind),
+                                    "actor": rejected.actor, "tool_name": rejected.name,
+                                    "tool_call_id": rejected.call_id,
+                                    "tool_submitted": False, "replanning_available": True})
+                            sequence += 1
+                            checkpoint = self._checkpoint(context, next_sequence=sequence + 1,
+                                terminal=False, reason=None,
+                                artifacts=tuple(message_artifacts) + durability.artifacts, usage=usage,
+                                model_ledger=tuple(durability.model_entries),
+                                tool_ledger=tuple(durability.tool_entries),
+                                engineering_tool_prefix=durability.engineering_tool_prefix)
+                            self._last_checkpoint = checkpoint
+                            yield RunEvent(kind=EventKind.CHECKPOINT_SAVED, sequence=sequence,
+                                run_id=context.run_id, checkpoint=checkpoint)
+                            sequence += 1
+                            round_published.set()
+                            continue
                     if isinstance(item, BaseChatMessage) and item.source != "user":
                         text = item.to_text()
                         is_role_message = (
@@ -4022,7 +4165,7 @@ class AutoGenDiscussionRuntime:
                             checkpoint=checkpoint,
                         )
                         sequence += 1
-                        if continuation or checkpoint_ack or reports:
+                        if continuation or checkpoint_ack or reports or pretool_replanning:
                             round_published.set()
                     elif isinstance(item, TaskResult):
                         reason = termination.reason or self._normalize_stop_reason(item.stop_reason)
@@ -4035,7 +4178,7 @@ class AutoGenDiscussionRuntime:
                 if publication_task is not None:
                     publication_task.cancel()
                     await asyncio.gather(publication_task, return_exceptions=True)
-                if continuation or checkpoint_ack or reports:
+                if continuation or checkpoint_ack or reports or pretool_replanning:
                     if (framework_failed or framework_timed_out) and self._cancel_token is not None:
                         self._cancel_token.cancel()
                     round_published.set()
@@ -4074,6 +4217,11 @@ class AutoGenDiscussionRuntime:
                     message_artifacts=message_artifacts,
                 ):
                     raise RuntimeExecutionError("AutoGen runtime cleanup failed") from None
+            if durability.preparation_rejection is not None:
+                # Termination/TaskResult can arrive without admitting another
+                # actor turn. An unresolved proposal is never completed work.
+                durability.stop_preparation()
+                raise RuntimeExecutionError("capability preparation rejected")
             if cleanup_failed and not framework_failed and not framework_timed_out:
                 yield RunEvent(
                     kind="runtime.cleanup_degraded",

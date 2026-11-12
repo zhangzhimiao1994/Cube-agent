@@ -470,6 +470,10 @@ def gateway_scope_failure_payload(
 
 
 _DISCUSSION_FAILURE_KINDS = {
+    "tool_preparation": frozenset({
+        "invalid_identifier", "invalid_scope", "invalid_arguments", "payload_limit",
+        "invalid_replay_policy",
+    }),
     "model_response_validation": frozenset({
         "tool_call_limit", "invalid_response", "unavailable_capability",
         "required_tool_missing", "acceptance_write_missing",

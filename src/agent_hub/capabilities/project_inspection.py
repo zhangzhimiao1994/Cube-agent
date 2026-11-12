@@ -44,6 +44,38 @@ class ProjectInspectionError(RuntimeError):
     """Project observations could not be authorized."""
 
 
+class PythonCatalogQueryInvalid(ProjectInspectionError):
+    """A pure catalog query failed validation before any inspection was attempted."""
+
+
+@dataclass(frozen=True, slots=True)
+class PythonCatalogQueryFeedback:
+    """A delivered rejection observation; never an inspection or execution receipt."""
+
+    def to_payload(self) -> Mapping[str, JsonValue]:
+        return {
+            'schema_version': 1,
+            'kind': 'project_inspection_query_feedback',
+            'status': 'rejected',
+            'reason_code': 'python_catalog_query_invalid',
+            'inspection_performed': False,
+            'correction': (
+                'Correct the python_catalog query, or call project.inspect with {} to inspect '
+                'the current catalog. Use its observed lowercase 64-hex catalog_sha256; '
+                'offset must be an integer from 0 to 1000; supplied names must contain '
+                '1 to 16 sorted unique canonical lowercase hyphenated names.'
+            ),
+        }
+
+
+def is_python_catalog_query_feedback(value: Mapping[str, JsonValue]) -> bool:
+    """Recognize only the complete fixed rejection; it grants no inspection evidence."""
+    expected = PythonCatalogQueryFeedback().to_payload()
+    return (set(value) == set(expected)
+            and all(type(value[key]) is type(item) and value[key] == item
+                    for key, item in expected.items()))
+
+
 @dataclass(frozen=True, slots=True)
 class PythonCatalogQuery:
     catalog_sha256: str
@@ -57,7 +89,7 @@ class PythonCatalogQuery:
                 or any(type(name) is not str or not 1 <= len(name) <= 128
                        or _CATALOG_NAME.fullmatch(name) is None for name in self.names)
                 or self.names != tuple(sorted(set(self.names)))):
-            raise ProjectInspectionError('python_catalog_query_invalid')
+            raise PythonCatalogQueryInvalid('python_catalog_query_invalid')
 
     def to_payload(self) -> Mapping[str, JsonValue]:
         query: dict[str, JsonValue] = {'catalog_sha256': self.catalog_sha256, 'offset': self.offset}
@@ -68,26 +100,26 @@ class PythonCatalogQuery:
 
 def parse_python_catalog_query(arguments: Mapping[str, JsonValue]) -> PythonCatalogQuery | None:
     if not isinstance(arguments, Mapping):
-        raise ProjectInspectionError('python_catalog_query_invalid')
+        raise PythonCatalogQueryInvalid('python_catalog_query_invalid')
     if not arguments:
         return None
     if set(arguments) != {'python_catalog'}:
-        raise ProjectInspectionError('python_catalog_query_invalid')
+        raise PythonCatalogQueryInvalid('python_catalog_query_invalid')
     query = arguments['python_catalog']
     if (not isinstance(query, Mapping) or 'catalog_sha256' not in query
             or set(query) - {'catalog_sha256', 'offset', 'names'}):
-        raise ProjectInspectionError('python_catalog_query_invalid')
+        raise PythonCatalogQueryInvalid('python_catalog_query_invalid')
     digest, offset = query['catalog_sha256'], query.get('offset', 0)
     if type(digest) is not str or type(offset) is not int:
-        raise ProjectInspectionError('python_catalog_query_invalid')
+        raise PythonCatalogQueryInvalid('python_catalog_query_invalid')
     names: list[str] = []
     if 'names' in query:
         raw_names = query['names']
         if not isinstance(raw_names, (list, tuple)) or not 1 <= len(raw_names) <= 16:
-            raise ProjectInspectionError('python_catalog_query_invalid')
+            raise PythonCatalogQueryInvalid('python_catalog_query_invalid')
         for name in raw_names:
             if type(name) is not str:
-                raise ProjectInspectionError('python_catalog_query_invalid')
+                raise PythonCatalogQueryInvalid('python_catalog_query_invalid')
             names.append(name)
     return PythonCatalogQuery(digest, offset, tuple(names))
 
@@ -141,9 +173,10 @@ class _RunRepository(Protocol):
     async def get(self, tenant_id: UUID, run_id: UUID) -> object: ...
 
 
-async def inspect_project(
-    *, repository: object, tenant_id: UUID, run_id: UUID, project_root: Path,
-) -> Mapping[str, JsonValue]:
+async def project_inspection_scope(
+    *, repository: object, tenant_id: UUID, run_id: UUID,
+) -> tuple[str, str, str]:
+    """Validate the original authoritative scope without reading workspace files."""
     try:
         record = await cast(_RunRepository, repository).get(tenant_id, run_id)
         project, session = authorized_workspace_scope(record, tenant_id=tenant_id, run_id=run_id)
@@ -155,6 +188,15 @@ async def inspect_project(
             raise ProjectInspectionError
     except Exception:  # noqa: BLE001 - do not expose repository or other-scope details.
         raise ProjectInspectionError("project inspection scope unavailable") from None
+    return project, session, backend
+
+
+async def inspect_project(
+    *, repository: object, tenant_id: UUID, run_id: UUID, project_root: Path,
+) -> Mapping[str, JsonValue]:
+    project, session, backend = await project_inspection_scope(
+        repository=repository, tenant_id=tenant_id, run_id=run_id,
+    )
 
     observations: list[JsonValue] = []
     dependencies: list[JsonValue] = []
