@@ -85,6 +85,7 @@ from agent_hub.subprocess_cleanup import ProcessCleanupIncomplete
 if TYPE_CHECKING:
     from agent_hub.capabilities.project_verification import ProjectVerificationService
     from agent_hub.runs.original_python_offline_review import OriginalPythonOfflineReview
+    from agent_hub.runs.python_recipe_review import PythonRecipeReview
 
 _ERROR = "python_project_service_unavailable"
 _METADATA_REQUIRED = "python_original_metadata_preparation_required"
@@ -443,6 +444,7 @@ class PythonProjectService:
         self.executor = executor or PythonProjectSystemdSandbox()
         self.receipts: dict[tuple[UUID, UUID], _Receipt] = {}
         self.environments: dict[tuple[UUID, UUID], PythonEnvironmentReference] = {}
+        self.recipe_review: PythonRecipeReview | None = None
 
     async def _record(self, tenant_id: UUID, run_id: UUID) -> object:
         getter = getattr(self.owner.repository, "get", None)
@@ -670,6 +672,12 @@ class PythonProjectService:
             agent_id=actor,
             idempotency_key="python-project-verification-scope",
         )
+        if self.recipe_review is not None:
+            from agent_hub.runs.python_recipe_review import PythonRecipeReview
+
+            if (type(self.recipe_review) is PythonRecipeReview
+                    and await self.recipe_review.review(request, context.authority[1])):
+                return
         checker = getattr(self.owner.repository, "is_capability_approval_scope_approved", None)
         if not callable(checker):
             raise ProjectVerificationError("python_project_install_approval_required")

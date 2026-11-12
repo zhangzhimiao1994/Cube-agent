@@ -381,6 +381,7 @@ def build_worker_service(
         review_broker=review_broker,
         conversation_artifact_repository=artifact_repository,
         project_input_preparer=runtime_capability_stack.project_input_preparer,
+        pending_python_recipe_reviewer=runtime_capability_stack.policy_gateway.python_recipe_review.reevaluate_pending,
         instruction_context_loader=InstructionContextLoader(
             repository=run_repository, project_root=settings.project_workspace_dir,
         ),

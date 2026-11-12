@@ -49,6 +49,7 @@ from agent_hub.runtime.artifacts import ArtifactRepository
 from agent_hub.runtime.contracts import TaskContext
 
 if TYPE_CHECKING:
+    from agent_hub.capabilities.project_verification import ProjectVerificationService
     from agent_hub.capabilities.review_context import ConcreteModelReviewGate, _ConcreteReviewCall
     from agent_hub.runs.project_verification_receipts import ProjectVerificationReceiptRepository
     from agent_hub.runs.toolchain_supply import ToolchainSupplyAuthority
@@ -90,6 +91,10 @@ class DefaultRuntimeCapabilityPolicyGateway:
         self._approval_reviewer = approval_reviewer
         self._plugin_policy_rules = plugin_policy_rules
         self._exact_human_approval_getter = exact_human_approval_getter
+        from agent_hub.runs.python_recipe_review import PythonRecipeReview
+
+        self._python_recipe_verifier: Callable[[], ProjectVerificationService | None] | None = None
+        self.python_recipe_review = PythonRecipeReview(self)
 
     async def invoke(
         self,
@@ -124,6 +129,7 @@ class DefaultRuntimeCapabilityPolicyGateway:
             if self._exact_human_approval_getter is None
             else lambda: self._read_exact_human(request)
         )
+        await self.python_recipe_review.review(request, role, create=True)
         try:
             policy, inbound = await current_policy()
         except Exception:  # noqa: BLE001 - unavailable current scope never grants execution.
@@ -161,10 +167,14 @@ class DefaultRuntimeCapabilityPolicyGateway:
             effect = await _project_input_supply_effect(self._run_repository, request, role=role)
         if effect is None:
             effect = await _project_verification_effect(self._run_repository, request, role=role)
+        recipe_allowed = (effect is PolicyEffect.REQUIRE_APPROVAL
+            and await self.python_recipe_review.review(request, role))
+        if recipe_allowed:
+            effect = PolicyEffect.ALLOW
         if effect in {PolicyEffect.DENY, PolicyEffect.REQUIRE_APPROVAL}:
             rules = (*rules, CapabilityRule(request.tenant_id, role, request.agent_id,
                 request.capability, request.operation, request.resource, effect))
-        inbound = (effect in {None, PolicyEffect.ALLOW}
+        inbound = recipe_allowed or (effect in {None, PolicyEffect.ALLOW}
             and await submission_capability_allowed(self._run_repository, request, role=role))
         # Suppress only the default blanket ASK for an actually authorized inbound
         # action. Explicit current ASK/DENY rules still aggregate above ALLOW.
@@ -297,6 +307,12 @@ class DefaultRuntimeCapabilityPolicyGateway:
                 request.run_id,
                 reason="capability denied",
             )
+        # Separate the internally added recipe ASK from current explicit plugin policy.
+        # Explicit ASK/DENY must still prevent this narrow automatic review.
+        recipe_plugin_effect = _explicit_policy_effect(self._extra_policy_rules(request), request, role)
+        if (project_effect is PolicyEffect.REQUIRE_APPROVAL and recipe_plugin_effect is None
+                and await self.python_recipe_review.review(request, role, create=True)):
+            return CapabilityResult(CapabilityStatus.ALLOWED, request.run_id)
         if explicit_plugin_effect is PolicyEffect.ALLOW and project_effect is None:
             return CapabilityResult(CapabilityStatus.ALLOWED, request.run_id)
         if (permission_mode in {"default", "auto_review"}
@@ -470,6 +486,7 @@ async def _has_exact_human_approval(repository: object, request: CapabilityReque
         ))).all()
         fingerprint = fingerprint_capability_request(request)
         return any(row.payload.get("approval_fingerprint") == fingerprint
+            and 'automatic_review_id' not in row.payload
             and row.payload.get("decision_scope") != "conversation"
             and row.payload.get("approval_origin", request.tool_origin) == request.tool_origin
             for row in rows)
@@ -957,6 +974,9 @@ def build_runtime_capability_stack(
         plugin_policy_rules=_plugin_policy_rule_source(plugin_backend),
         exact_human_approval_getter=exact_human_approval_getter,
     )
+    policy_gateway._python_recipe_verifier = lambda: runtime_gateway._project_verification
+    if runtime_gateway._project_verification is not None:
+        runtime_gateway._project_verification._python.recipe_review = policy_gateway.python_recipe_review
     harness_tool_gateway = HarnessToolGateway(
         runtime_gateway,
         policy_gateway=policy_gateway,

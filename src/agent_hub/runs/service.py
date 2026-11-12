@@ -561,6 +561,7 @@ class RunService:
         conversation_preview_stopper: Callable[[UUID, str], Awaitable[None]] | None = None,
         project_input_preparer: Callable[[TaskContext], Awaitable[TaskContext]] | None = None,
         review_broker: ReviewAssemblyBroker | None = None,
+        pending_python_recipe_reviewer: Callable[[int], Awaitable[int]] | None = None,
     ) -> None:
         self._repository = repository
         self._instruction_context_loader = instruction_context_loader
@@ -570,6 +571,7 @@ class RunService:
         self._conversation_preview_stopper = conversation_preview_stopper
         self._project_input_preparer = project_input_preparer
         self._review_broker = review_broker
+        self._pending_python_recipe_reviewer = pending_python_recipe_reviewer
         self._runtime_registry = runtime_registry
         self._router = router
         self._queue = task_queue
@@ -3259,6 +3261,11 @@ class RunService:
         except Exception as error:
             _LOGGER.exception("run_resolution_approval_expiry_failed error_type=%s", type(error).__name__)
         recovered += await self.recover_conversation_queue_releases(limit=limit)
+        if self._pending_python_recipe_reviewer is not None:
+            try:
+                recovered += await self._pending_python_recipe_reviewer(limit)
+            except Exception as error:  # noqa: BLE001 - failed reviews leave pending intact.
+                _LOGGER.warning('python_recipe_pending_review_failed error_type=%s', type(error).__name__)
         return recovered
 
     async def recover_conversation_queue_releases(self, limit: int = 100) -> int:

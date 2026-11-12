@@ -2913,6 +2913,8 @@ class RunRepository:
             for row in rows:
                 if row.payload.get('approval_fingerprint') != approval_fingerprint:
                     continue
+                if 'python_recipe_review' in row.payload or 'automatic_review_id' in row.payload:
+                    continue  # These require the live task/tenant/source recheck, never a cached grant.
                 if row.payload.get("decision_scope") == "conversation":
                     # These grants require current conversation and permission checks.
                     continue
@@ -2963,6 +2965,8 @@ class RunRepository:
             ).all()
             for row in rows:
                 if row.payload.get('approval_scope') != approval_scope:
+                    continue
+                if 'python_recipe_review' in row.payload or 'automatic_review_id' in row.payload:
                     continue
                 if ('python_resolution_binding' in row.payload
                         or 'resource=workspace/current/project-resolution/' in approval_scope):
