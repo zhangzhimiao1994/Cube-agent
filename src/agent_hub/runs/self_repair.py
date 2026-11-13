@@ -963,6 +963,11 @@ def _requires_manual_repair_approval(failure_category: str) -> bool:
 def _failure_diagnostic_metadata(failure: RunEvent | None) -> tuple[str | None, str | None]:
     if failure is None:
         return None, None
+    if "resolution_failure" in failure.payload:
+        from agent_hub.runtime.failure_reason import resolution_failure_payload
+
+        diagnostic = resolution_failure_payload(failure.payload["resolution_failure"])
+        return str(diagnostic["error_code"]), str(diagnostic["suggested_action"])
     report = runtime_failure_diagnostic_from_reason(failure.reason)
     if report.get("error_stage") in {"delivery_report", "project_verification"}:
         return (_safe_diagnostic_code(report.get("error_code")),

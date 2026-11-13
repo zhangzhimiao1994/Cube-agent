@@ -143,7 +143,17 @@ class ProjectVerificationError(RuntimeError):
     def __init__(self, message: str, diagnostic: ExecutionDiagnostic | None = None, *,
                  project_failure: ProjectVerificationFailure | None = None,
                  project_prerequisite: ProjectPrerequisiteObservation | None = None,
-                 python_project_failure: PythonProjectFailure | None = None) -> None:
+                 python_project_failure: PythonProjectFailure | None = None,
+                 resolution_failure: object = None) -> None:
+        if resolution_failure is not None:
+            from agent_hub.skills.sandbox.python_resolution_protocol import (
+                ResolutionFailureDiagnostic,
+            )
+
+            if any(value is not None for value in (diagnostic, project_failure,
+                                                  project_prerequisite, python_project_failure)):
+                raise TypeError('resolution failure must remain a separate typed observation')
+            resolution_failure = ResolutionFailureDiagnostic.model_validate(resolution_failure, strict=True)
         if python_project_failure is not None:
             from agent_hub.capabilities.python_project_reports import PythonProjectFailure
             if (type(python_project_failure) is not PythonProjectFailure
@@ -160,6 +170,7 @@ class ProjectVerificationError(RuntimeError):
         self.project_failure = project_failure
         self.project_prerequisite = project_prerequisite
         self.python_project_failure = python_project_failure
+        self.resolution_failure = resolution_failure
 
 
 def _validate_original_diagnostic(value: object, *, retain_tail: bool = False) -> None:

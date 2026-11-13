@@ -193,6 +193,30 @@ async def _run_fetch_unit(
     finally:
         await _uninterrupted(stop())
     if result.exit_code != 0 or result.timed_out:
+        if registry:
+            from agent_hub.skills.sandbox.python_resolution_protocol import (
+                ResolutionFailureDiagnostic,
+                ResolutionFailureError,
+                decode,
+            )
+
+            diagnostic = ResolutionFailureDiagnostic(phase="registry_metadata",
+                code="resolution_deadline" if result.timed_out else "registry_worker_unavailable",
+                exit_code=result.exit_code, timed_out=result.timed_out)
+            if result.exit_code == 2 and not result.timed_out:
+                try:
+                    if type(result.stdout) is not str or not 0 < len(result.stdout.encode("utf-8")) <= 4096:
+                        raise ValueError
+                    observed = ResolutionFailureDiagnostic.model_validate(
+                        decode(result.stdout.encode("utf-8")), strict=True)
+                    if observed.phase != "registry_metadata":
+                        raise ValueError
+                except (ValueError, TypeError, AttributeError):
+                    pass
+                else:
+                    diagnostic = ResolutionFailureDiagnostic(phase=observed.phase, code=observed.code,
+                        exit_code=result.exit_code, timed_out=result.timed_out)
+            raise ResolutionFailureError(diagnostic)
         raise InputSupplyError("input_supply_unavailable")
     return result
 

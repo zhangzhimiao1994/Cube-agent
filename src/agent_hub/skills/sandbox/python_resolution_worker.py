@@ -534,6 +534,7 @@ def main() -> int:
     from agent_hub.skills.sandbox.python_metadata_preparation_worker import _native, _stage_identity
     from agent_hub.skills.sandbox.python_resolution_protocol import encoded
 
+    request: ResolutionRequest | None = None
     try:
         _native()
         need(
@@ -562,8 +563,26 @@ def main() -> int:
         print(status.model_dump_json(), flush=True)
         return 0
     except ProcessCleanupIncomplete:
+        if request is not None:
+            from agent_hub.skills.sandbox.python_resolution_protocol import (
+                ResolutionFailureDiagnostic,
+            )
+
+            print(ResolutionStatus(state="unknown", key=request.key,
+                diagnostic=ResolutionFailureDiagnostic(phase="cleanup",
+                    code="metadata_prepare_cleanup_incomplete", exit_code=3, timed_out=None)
+                ).model_dump_json(), flush=True)
         return 3
-    except Exception:  # noqa: BLE001 - no private scope, metadata or source reflected.
+    except Exception as error:  # noqa: BLE001 - no private scope, metadata or source reflected.
+        if request is not None:
+            from agent_hub.skills.sandbox.python_resolution_protocol import (
+                resolution_failure_diagnostic,
+            )
+
+            phase = {"freeze_python_resolution": "freeze", "publish_python_resolution": "publication"}.get(
+                request.action, "resolution")
+            diagnostic = resolution_failure_diagnostic(error, phase=phase, exit_code=2)
+            print(ResolutionStatus(state="unknown", key=request.key, diagnostic=diagnostic).model_dump_json(), flush=True)
         print("resolution_unavailable", file=sys.stderr, flush=True)
         return 2
 

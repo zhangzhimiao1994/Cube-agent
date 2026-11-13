@@ -8,6 +8,7 @@ import ipaddress
 import json
 import re
 import time
+import zlib
 from urllib.parse import SplitResult
 
 from packaging.specifiers import SpecifierSet
@@ -34,6 +35,46 @@ from agent_hub.skills.sandbox.python_registry_protocol import (
 
 
 class _RegistryTransport(_WheelTransport):
+    def _response_headers(self, headers: dict[str, str]) -> dict[str, str]:
+        encoding = headers.get("content-encoding", "identity").lower()
+        need(encoding in {"identity", "gzip"}, "registry_encoding")
+        # The shared framer still bounds wire bytes and rejects conflicting framing.
+        checked = _headers(
+            {key: value for key, value in headers.items() if key != "content-encoding"},
+            self._max_response_bytes,
+        )
+        return {**checked, "content-encoding": encoding}
+
+    async def _read_response(self, reader: asyncio.StreamReader) -> HttpResponse:
+        response = await super()._read_response(reader)
+        body = response.body
+        if response.headers.get("content-encoding") == "gzip":
+            decoder = zlib.decompressobj(16 + zlib.MAX_WBITS)
+            decoded = bytearray()
+            try:
+                for offset in range(0, len(body), 16384):
+                    # Bounded synchronous work between cancellation/deadline checks.
+                    await asyncio.sleep(0)
+                    need(time.monotonic() < self.deadline, "resolution_deadline")
+                    decoded.extend(decoder.decompress(
+                        body[offset : offset + 16384],
+                        self._max_response_bytes + 1 - len(decoded),
+                    ))
+                    need(len(decoded) <= self._max_response_bytes, "registry_response_limit")
+                    need(not decoder.unused_data and not decoder.unconsumed_tail,
+                         "registry_gzip_invalid")
+                # zlib validates the gzip CRC/ISIZE; require exactly one complete member.
+                need(decoder.eof, "registry_gzip_invalid")
+            except zlib.error:
+                raise ResolutionError("registry_gzip_invalid") from None
+            body = bytes(decoded)
+        need(time.monotonic() < self.deadline, "resolution_deadline")
+        headers = {
+            key: value for key, value in response.headers.items()
+            if key not in {"content-encoding", "transfer-encoding", "content-length"}
+        }
+        return HttpResponse(response.status_code, {**headers, "content-length": str(len(body))}, body)
+
     async def _request_address(
         self,
         *,
@@ -54,7 +95,7 @@ class _RegistryTransport(_WheelTransport):
                 (
                     f"GET {parsed.path} HTTP/1.1\r\nHost: pypi.org\r\n"
                     "Accept: application/vnd.pypi.simple.v1+json, application/json\r\n"
-                    "Accept-Encoding: identity\r\nConnection: close\r\n"
+                    "Accept-Encoding: gzip\r\nConnection: close\r\n"
                     "User-Agent: AgentHub-Registry/1\r\n\r\n"
                 ).encode("ascii")
             )

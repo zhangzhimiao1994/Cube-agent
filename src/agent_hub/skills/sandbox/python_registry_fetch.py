@@ -190,7 +190,13 @@ def main() -> int:
         response = asyncio.run(read_metadata_snapshot(request))
         print(encoded(response).decode("ascii"), flush=True)
         return 0
-    except (Exception, KeyboardInterrupt):  # noqa: BLE001 - finite code only, no reflected metadata.
+    except (Exception, KeyboardInterrupt) as error:  # noqa: BLE001 - finite code only, no reflected metadata.
+        from agent_hub.skills.sandbox.python_resolution_protocol import (
+            resolution_failure_diagnostic,
+        )
+
+        diagnostic = resolution_failure_diagnostic(error, phase="registry_metadata", exit_code=2)
+        print(diagnostic.model_dump_json(), flush=True)
         print("registry_worker_unavailable", file=sys.stderr, flush=True)
         return 2
 

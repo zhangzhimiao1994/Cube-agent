@@ -185,7 +185,13 @@ async def _handle_preparation(
                    "exit_code": exit_code, "timed_out": timed_out},
         )
         if isinstance(request, ResolutionRequest):
-            return ResolutionStatus(state="unknown", key=request.key)
+            from agent_hub.skills.sandbox.python_resolution_protocol import (
+                ResolutionFailureDiagnostic,
+            )
+
+            return ResolutionStatus(state="unknown", key=request.key,
+                diagnostic=ResolutionFailureDiagnostic(phase=phase, code=code,
+                    exit_code=exit_code, timed_out=timed_out))
         return PythonMetadataPreparationResponse(action=request.action,
             scope=PythonProjectProfileScope.for_invocation(request.invocation), ok=False, error=code)
 
@@ -328,6 +334,21 @@ async def _handle_preparation(
                     native_uncertain = True
                     raise ProcessCleanupIncomplete("metadata_prepare_cleanup_incomplete")
                 if result.exit_code != 0 or result.timed_out:
+                    if resolution and result.exit_code == 2 and not result.timed_out:
+                        # Only a bounded, exact-key UNKNOWN from the reviewed Root worker.
+                        # Invalid/private stdout is never reflected, even on failure.
+                        try:
+                            if type(result.stdout) is not str or not 0 < len(result.stdout.encode("utf-8")) <= 4096:
+                                raise ValueError
+                            raw = json.loads(result.stdout, object_pairs_hook=_object)
+                            observed = ResolutionStatus.model_validate_json(_encoded(raw), strict=True)
+                            if observed.key != request.key or observed.state != "unknown" or observed.diagnostic is None:
+                                raise ValueError
+                        except (ValueError, TypeError, AttributeError):
+                            pass
+                        else:
+                            failure("metadata_prepare_unavailable")
+                            return observed
                     return failure("metadata_prepare_unavailable")
                 phase = "response"
                 payload = json.loads(result.stdout, object_pairs_hook=_object)

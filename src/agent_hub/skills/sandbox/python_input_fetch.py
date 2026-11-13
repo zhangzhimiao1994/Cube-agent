@@ -137,6 +137,9 @@ class _WheelTransport(PinnedHttpTransport):
         self.deadline = deadline
         self.context = _tls_context()
 
+    def _response_headers(self, headers: dict[str, str]) -> dict[str, str]:
+        return _headers(headers, self._max_response_bytes)
+
     async def _request_address(self, *, parsed: SplitResult, host: str,
                                address: str, port: int) -> HttpResponse:
         _need(host == _HOST and port == 443 and parsed.scheme == "https", "fetch_url_invalid")
@@ -183,7 +186,7 @@ class _WheelTransport(PinnedHttpTransport):
             name = key.decode("ascii").lower()
             _need(name not in headers, "fetch_headers")
             headers[name] = value.strip(b" \t").decode("ascii")
-        headers = _headers(headers, self._max_response_bytes)
+        headers = self._response_headers(headers)
         if "transfer-encoding" in headers:
             data = bytearray()
             for _ in range(131072):

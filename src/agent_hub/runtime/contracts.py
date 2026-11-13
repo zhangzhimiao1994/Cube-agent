@@ -145,7 +145,7 @@ _OPTIONAL_FAILURE_DIAGNOSTIC_KEYS = frozenset(
         "compression_trigger", "termination_reason",
         "runtime_timeout_kind", "remaining_soft_timeout_seconds", "remaining_absolute_timeout_seconds",
         "engineering_work_progress_units",
-        "provider_request_shape",
+        "provider_request_shape", "resolution_failure",
     }
 ) | frozenset(_CAPACITY_DIAGNOSTIC_ENUMS) | _MODEL_PREFLIGHT_DIAGNOSTIC_KEYS | _PROVIDER_FAILURE_DIAGNOSTIC_KEYS | _DISCUSSION_FAILURE_DIAGNOSTIC_KEYS
 _FAILURE_DIAGNOSTIC_KEYS = _REQUIRED_FAILURE_DIAGNOSTIC_KEYS | _OPTIONAL_FAILURE_DIAGNOSTIC_KEYS
@@ -276,6 +276,12 @@ def _validate_failure_diagnostic(payload: Mapping[str, JsonValue]) -> None:
         set(payload) - _FAILURE_DIAGNOSTIC_KEYS - _GATEWAY_SCOPE_DIAGNOSTIC_KEYS
     ):
         raise ValueError("runtime failure diagnostic fields are invalid")
+    if "resolution_failure" in payload:
+        from agent_hub.runtime.failure_reason import resolution_failure_payload
+
+        expected = resolution_failure_payload(payload["resolution_failure"])
+        if any(payload.get(key) != value for key, value in expected.items()):
+            raise ValueError("resolution failure diagnostic fields are inconsistent")
     for name in ("error_code", "error_stage", "error_category", "step_id", "actor"):
         if name in payload:
             value = payload[name]

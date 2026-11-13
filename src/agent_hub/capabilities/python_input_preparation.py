@@ -504,7 +504,11 @@ class DynamicResolutionJournal:
 class InspectOnlyError(ValueError):
     """A checked resolution response permits inspection only, never replay."""
 
-    def __init__(self) -> None:
+    def __init__(self, diagnostic: object = None) -> None:
+        from agent_hub.skills.sandbox.python_resolution_protocol import ResolutionFailureDiagnostic
+
+        self.diagnostic = (None if diagnostic is None else
+            ResolutionFailureDiagnostic.model_validate(diagnostic, strict=True))
         super().__init__('resolution_inspect_only')
 
 
@@ -521,7 +525,7 @@ def _inspect_only(status: ResolutionStatus) -> NoReturn:
     if type(status) is not ResolutionStatus:
         raise ValueError('resolution_response_invalid')
     ResolutionStatus.model_validate_json(status.model_dump_json(warnings='error'), strict=True)
-    raise InspectOnlyError()
+    raise InspectOnlyError(status.diagnostic)
 
 
 class DynamicPythonResolutionFlow:

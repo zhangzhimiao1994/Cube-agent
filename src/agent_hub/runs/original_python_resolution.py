@@ -195,12 +195,12 @@ async def resolve_missing_original_python_inputs(
         if status.state == "published":
             return
         if status.state != "frozen":
-            raise InspectOnlyError()
+            raise InspectOnlyError(status.diagnostic)
         status = await client.inspect(needs=needs, environment=environment, planning=planning)
     elif status.state == "absent":
         status = await client.resolve(needs=needs, environment=environment, planning=planning)
     if status.state != "resolved" or status.descriptor is None:
-        raise InspectOnlyError()
+        raise InspectOnlyError(status.diagnostic)
     descriptor = decode_descriptor(status.descriptor)
     need(descriptor.scope.source_sha256 == source.source_sha256
          and descriptor.scope.catalog_sha256 == base.profile.catalog_sha256
@@ -208,7 +208,7 @@ async def resolve_missing_original_python_inputs(
          and descriptor.scope.run_id == scope.run_id, "resolution_scope_changed")
     frozen = await client.freeze(needs=needs, environment=environment, planning=planning)
     if frozen.state != "frozen" or frozen.plan is None:
-        raise InspectOnlyError()
+        raise InspectOnlyError(frozen.diagnostic)
     plan = frozen.plan
     need(previous_plan is None or plan.sha256 == previous_plan, "resolution_plan_changed")
     derive_private_original_recipe(intent, descriptor, expected_scope=plan.claim.resolution_scope(),
@@ -217,4 +217,4 @@ async def resolve_missing_original_python_inputs(
     await save(frozen.key, plan.sha256)
     result = await client.publish(plan, needs=needs, environment=environment, planning=planning)
     if result.state != "published" or result.plan != plan:
-        raise InspectOnlyError()
+        raise InspectOnlyError(result.diagnostic)

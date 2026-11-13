@@ -3272,7 +3272,11 @@ class RunRepository:
         reason: str,
         worker_id: str | None = None,
         worker_lease_token: UUID | None = None,
+        resolution_failure: object = None,
     ) -> RunRecord:
+        from agent_hub.runtime.failure_reason import resolution_failure_payload
+
+        failure_payload = {} if resolution_failure is None else resolution_failure_payload(resolution_failure)
         async with self._session_factory() as session, session.begin():
             row = await self.get_for_update(session, run_id)
             if (
@@ -3304,6 +3308,7 @@ class RunRepository:
                     sequence=sequence,
                     run_id=run_id,
                     reason=reason,
+                    payload=failure_payload,
                 ),
             )
             row.status = RunStatus.FAILED.value

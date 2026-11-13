@@ -7,7 +7,7 @@ import math
 import time
 from dataclasses import asdict
 from datetime import UTC, datetime
-from typing import Literal, Self, cast
+from typing import Literal, Self, cast, get_args
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -26,6 +26,7 @@ from agent_hub.skills.sandbox.python_registry_protocol import (
     RegistryCandidate,
     RegistryProvenance,
     ResolutionDescriptor,
+    ResolutionError,
     ResolutionLimits,
     ResolutionScope,
     ResolvedWheel,
@@ -314,11 +315,83 @@ class ResolutionPlan(_Strict):
         return digest({**self.model_dump(mode="json"), "claim": self.claim.approval_payload()})
 
 
+type ResolutionFailurePhase = Literal[
+    "request", "configuration", "admission", "stage", "execution", "response", "cleanup",
+    "registry_metadata", "resolution", "freeze", "publication",
+]
+type ResolutionFailureCode = Literal[
+    "internal_failure", "resolution_deadline", "resolution_unavailable",
+    "resolution_request_invalid", "resolution_response_invalid", "resolution_stage_invalid",
+    "metadata_prepare_request_invalid", "metadata_prepare_unavailable",
+    "metadata_prepare_plan_changed", "metadata_prepare_scope_changed",
+    "metadata_prepare_catalog_changed", "metadata_prepare_draft_changed",
+    "metadata_prepare_artifact_integrity", "metadata_prepare_quota", "metadata_prepare_timeout",
+    "metadata_prepare_consumed", "metadata_prepare_unknown", "metadata_prepare_cleanup_incomplete",
+    "metadata_prepare_metadata_untrusted", "registry_unavailable", "registry_worker_invalid",
+    "registry_worker_unavailable", "registry_encoding", "registry_gzip_invalid",
+    "registry_response_limit", "registry_duplicate_key", "registry_shape", "registry_dns",
+    "registry_http", "registry_content_type", "registry_length", "registry_nonfinite",
+    "registry_identity", "registry_api_version", "registry_versions_limit", "registry_files_limit",
+    "registry_size", "registry_ambiguous_wheel", "registry_no_candidate",
+    "input_supply_unavailable", "input_supply_timeout", "input_supply_quota",
+]
+
+
+class ResolutionFailureDiagnostic(_Strict):
+    """Finite observed failure facts; never authority to retry an unknown operation."""
+    phase: ResolutionFailurePhase
+    code: ResolutionFailureCode
+    exit_code: int | None = Field(ge=-255, le=255)
+    timed_out: bool | None
+
+    @model_validator(mode="before")
+    @classmethod
+    def closed_fields(cls, value: object) -> object:
+        if isinstance(value, BaseModel):
+            if type(value) is not cls:
+                raise ValueError("resolution_response_invalid")
+            return dict(vars(value)) | (value.model_extra or {})
+        return value
+
+
+class ResolutionFailureError(ResolutionError):
+    def __init__(self, diagnostic: ResolutionFailureDiagnostic) -> None:
+        self.diagnostic = ResolutionFailureDiagnostic.model_validate(diagnostic, strict=True)
+        super().__init__(self.diagnostic.code)
+
+
+def resolution_failure_diagnostic(
+    error: BaseException, *, phase: ResolutionFailurePhase,
+    exit_code: int | None = None, timed_out: bool | None = None,
+) -> ResolutionFailureDiagnostic:
+    """Only exact trusted exception types and closed codes; no reflected exception text."""
+    from agent_hub.skills.sandbox.python_input_supply_catalog import InputSupplyError
+
+    if type(error) is ResolutionFailureError:
+        return ResolutionFailureDiagnostic.model_validate(error.diagnostic, strict=True)
+    code = "internal_failure"
+    if type(error) in {ResolutionError, InputSupplyError} and len(error.args) == 1:
+        candidate = error.args[0]
+        if type(candidate) is str and candidate in get_args(ResolutionFailureCode.__value__):
+            code = candidate
+    elif type(error) is TimeoutError:
+        code, timed_out = "resolution_deadline", True
+    return ResolutionFailureDiagnostic(phase=phase, code=code, exit_code=exit_code, timed_out=timed_out)
+
+
 class ResolutionStatus(_Strict):
     state: Literal["absent", "unknown", "resolved", "frozen", "published", "lease_renewed"]
     key: str = Field(pattern="^[a-f0-9]{64}$")
     descriptor: dict[str, object] | None = None
     plan: ResolutionPlan | None = None
+    diagnostic: ResolutionFailureDiagnostic | None = None
+
+    @model_validator(mode="after")
+    def failure_only(self) -> Self:
+        if self.diagnostic is not None:
+            need(self.state == "unknown" and self.descriptor is None and self.plan is None,
+                 "resolution_response_invalid")
+        return self
 
 
 class ResolutionRequest(_Strict):

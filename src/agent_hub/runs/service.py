@@ -87,6 +87,7 @@ from agent_hub.runtime.contracts import (
     _freeze_object,
 )
 from agent_hub.runtime.failure_reason import (
+    project_resolution_failure_payload,
     runtime_failure_diagnostic_from_reason,
     safe_runtime_failure_reason,
 )
@@ -2739,12 +2740,15 @@ class RunService:
             if approval_failure is not None:
                 failed = approval_failure
             else:
+                resolution_payload = project_resolution_failure_payload(error)
                 try:
                     failed = await self._repository.fail_run(
                         run_id,
                         reason=_runtime_failure_reason(error),
                         worker_id=self._worker_id,
                         worker_lease_token=worker_lease_token,
+                        **({"resolution_failure": resolution_payload["resolution_failure"]}
+                           if resolution_payload else {}),
                     )
                 except RunConflict:
                     return await self._submitted_by_run_id(tenant_id, run_id)
@@ -2794,6 +2798,7 @@ class RunService:
                 sequence=1,
                 run_id=run_id,
                 reason=_runtime_failure_reason(error),
+                payload=project_resolution_failure_payload(error),
             )
             repair_decision = classify_terminal_run(
                 status=failed.status,

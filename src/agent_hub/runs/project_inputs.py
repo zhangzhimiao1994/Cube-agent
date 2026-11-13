@@ -409,9 +409,10 @@ class OriginalProjectPreparer:
                                 repository=self.repository, authorizer=self.authorizer,
                                 artifacts=self.artifact_repository, deadline=started + context.timeout_seconds,
                             )
-                        except InspectOnlyError:
+                        except InspectOnlyError as resolution_error:
                             raise ProjectVerificationError(
                                 'project verification failed: resolution inspect only',
+                                resolution_failure=resolution_error.diagnostic,
                             ) from None
                         except ResolutionApprovalRequired:
                             raise ProjectVerificationError('project verification failed: capability denied') from None

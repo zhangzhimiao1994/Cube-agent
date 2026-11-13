@@ -425,8 +425,36 @@ def safe_runtime_failure_diagnostic(
             diagnostic["error_summary"] = (
                 reason + match[0][len(_REJECTED_OUTPUT_BASE):]
             )[:MAX_FAILURE_REASON_LENGTH]
-    return {**diagnostic, **gateway_scope_failure_payload(error), **model_provider_failure_payload(error),
+    return {**diagnostic, **project_resolution_failure_payload(error),
+            **gateway_scope_failure_payload(error), **model_provider_failure_payload(error),
             **model_candidate_failure_payload(error)}
+
+
+def resolution_failure_payload(value: object) -> RuntimeFailureDiagnostic:
+    """Canonical closed diagnostic only; contains no retry or execution authority."""
+    from collections.abc import Mapping
+
+    from agent_hub.skills.sandbox.python_resolution_protocol import ResolutionFailureDiagnostic
+
+    if isinstance(value, Mapping):
+        value = dict(value)
+    diagnostic = ResolutionFailureDiagnostic.model_validate(value, strict=True)
+    return {
+        "error_code": "project_verification.resolution." + diagnostic.code,
+        "error_stage": "project_verification", "error_category": "backend_unavailable",
+        "error_summary": "project verification failed: resolution " + diagnostic.code,
+        "retryable": False,
+        "suggested_action": "检查有限输入解析诊断；保留原意图与期限，结果未知时仅检查，禁止重放。",
+        "resolution_failure": cast(JsonValue, diagnostic.model_dump(mode="json")),
+    }
+
+
+def project_resolution_failure_payload(error: object) -> RuntimeFailureDiagnostic:
+    from agent_hub.capabilities.project_verification import ProjectVerificationError
+
+    if type(error) is not ProjectVerificationError or error.resolution_failure is None:
+        return {}
+    return resolution_failure_payload(error.resolution_failure)
 
 
 def model_provider_failure_payload(error: object) -> RuntimeFailureDiagnostic:

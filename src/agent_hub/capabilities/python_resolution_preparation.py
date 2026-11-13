@@ -279,6 +279,7 @@ class PythonResolutionPreparation:
                 type(response) is ResolutionStatus and response.key == request.key,
                 "resolution_response_invalid",
             )
+            response = ResolutionStatus.model_validate(response, strict=True)
             final = await self._claim(planning)
             final.require_continuity(current)
             if action in {"resolve_python_inputs", "publish_python_resolution"}:
