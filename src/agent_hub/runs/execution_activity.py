@@ -27,11 +27,20 @@ class ExecutionActivity(BaseModel):
 
 
 class ActivitySubject(Protocol):
-    id: UUID
-    tenant_id: UUID
-    actor_id: UUID | None
-    actor_role: Role | str | None
-    status: RunStatus | str
+    @property
+    def id(self) -> UUID: ...
+
+    @property
+    def tenant_id(self) -> UUID: ...
+
+    @property
+    def actor_id(self) -> UUID | None: ...
+
+    @property
+    def actor_role(self) -> Role | str | None: ...
+
+    @property
+    def status(self) -> RunStatus | str: ...
 
 
 def execution_is_active(record: ActivitySubject) -> bool:
@@ -66,6 +75,7 @@ async def read_execution_activities(
         held = any(getattr(record, key, None) is not None for key in (
             'worker_id', 'worker_lease_token', 'worker_lease_expires_at', 'worker_heartbeat_at',
         ))
+        reason: Literal['active', 'terminal', 'deadline_elapsed', 'worker_not_released']
         if record.status in _TERMINAL:
             active, reason = False, 'terminal'
         elif held:

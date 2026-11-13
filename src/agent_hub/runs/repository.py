@@ -3816,6 +3816,7 @@ class RunRepository:
         run_id: UUID,
         event: RunEvent,
         routing_decision: Mapping[str, JsonValue] | None = None,
+        diagnostic_context: TaskContext | None = None,
     ) -> None:
         event = _event_with_failure_diagnostic(event)
         if event.kind in {EventKind.RUNTIME_FAILED, EventKind.STEP_FAILED, EventKind.TOOL_FAILED}:
@@ -3828,6 +3829,7 @@ class RunRepository:
         ) and await self._guard_diagnostic_checkpoint(
             session, tenant_id=tenant_id, run_id=run_id, event=event,
             routing_decision=routing_decision,
+            diagnostic_context=diagnostic_context,
         ):
             return
         payload = event.to_payload()
@@ -3860,6 +3862,7 @@ class RunRepository:
     async def _guard_diagnostic_checkpoint(
         self, session: AsyncSession, *, tenant_id: UUID, run_id: UUID, event: RunEvent,
         routing_decision: Mapping[str, JsonValue] | None,
+        diagnostic_context: TaskContext | None = None,
     ) -> bool:
         """Validate against the locked DB predecessor; True is an identical replay."""
         from agent_hub.runs.artifacts import PostgresArtifactRepository
@@ -3953,7 +3956,14 @@ class RunRepository:
                 mode=TaskMode.DISCUSS, request=row.request,
                 routing_decision=cast(Mapping[str, JsonValue], actual_route),
             )
-            validate_diagnostic_transition(context, previous, checkpoint, artifacts)
+            from agent_hub.runs.diagnostic_context import python_diagnostic_progress_context
+
+            progress_context = python_diagnostic_progress_context(context, diagnostic_context, row)
+            if progress_context is None:
+                validate_diagnostic_transition(context, previous, checkpoint, artifacts)
+            else:
+                validate_diagnostic_transition(context, previous, checkpoint, artifacts,
+                                               progress_context=progress_context)
         except (ArithmeticError, KeyError, TypeError, ValueError, ArtifactRepositoryError):
             raise RunConflict(failure) from None
         return False

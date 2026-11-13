@@ -161,7 +161,9 @@ def validate(
     value: object, *, context: TaskContext,
     models: Sequence[Mapping[str, JsonValue]], tools: Sequence[Mapping[str, JsonValue]],
     tool_prefix: int, state: Mapping[str, JsonValue], artifacts: Sequence[Artifact] | None = None,
+    progress_context: TaskContext | None = None,
 ) -> dict[str, JsonValue]:
+    progress_context = _diagnostic_progress_view(context, progress_context)
     proposal = _proposal(context)
     _need(isinstance(value, Mapping) and set(value) == _FIELDS)
     assert isinstance(value, Mapping)
@@ -189,7 +191,8 @@ def validate(
         state={**metadata, 'model_ledger': tuple(models[:model_count]), 'tool_ledger': tuple(tools[:tool_count])})
     _need(source.state_sha256 == value['source_checkpoint_sha256'])
     _budget_not_replenished(metadata, state,
-        soft_progress=_soft_progress(context, state, metadata, tools, tool_count, artifacts))
+        soft_progress=_soft_progress(context, state, metadata, tools, tool_count, artifacts,
+                                     progress_context=progress_context))
     progress = context.routing_decision.get('self_repair_episode_progress')
     if progress is not None:
         _need(isinstance(progress, Mapping) and set(progress) == _PROGRESS_FIELDS)
@@ -211,7 +214,7 @@ def validate(
             and progress['remaining_absolute_timeout_seconds'] == metadata.get('remaining_absolute_timeout_seconds'))
         _budget_not_replenished(progress, state,
             soft_progress=_soft_progress(context, state, progress, tools,
-                cast(int, progress.get('tool_count')), artifacts))
+                cast(int, progress.get('tool_count')), artifacts, progress_context=progress_context))
     failure = value['failure_tool_position']
     if failure is None:
         _need(value['failure_artifact_id'] is None and value['failure_artifact_sha256'] is None
@@ -226,7 +229,8 @@ def validate(
 
 def _soft_progress(context: TaskContext, state: Mapping[str, JsonValue], baseline: Mapping[str, JsonValue],
                    tools: Sequence[Mapping[str, JsonValue]], lower: int,
-                   artifacts: Sequence[Artifact] | None) -> bool:
+                   artifacts: Sequence[Artifact] | None, *,
+                   progress_context: TaskContext | None = None) -> bool:
     route = context.routing_decision
     if (type(lower) is not int or not 0 <= lower < len(tools)
             or route.get('runtime_timeout_source') != 'project_scale_soft_budget'
@@ -254,16 +258,17 @@ def _soft_progress(context: TaskContext, state: Mapping[str, JsonValue], baselin
         actor, name = row.get('actor'), row.get('name')
         if isinstance(actor, str) and isinstance(name, str):
             allowed[actor] = (*allowed.get(actor, ()), name)
-    before = engineering_work_progress(context, tool_entries=tools[:lower], artifacts=artifacts,
+    view = context if progress_context is None else progress_context
+    before = engineering_work_progress(view, tool_entries=tools[:lower], artifacts=artifacts,
         allowed_tools=allowed, include_draft_diagnoses=True)
-    after = engineering_work_progress(context, tool_entries=tools, artifacts=artifacts,
+    after = engineering_work_progress(view, tool_entries=tools, artifacts=artifacts,
         allowed_tools=allowed, include_draft_diagnoses=True)
     if after - before:
         return True
     if diagnostic_candidate:
         phase, models = state.get(PHASE_KEY), state.get('model_ledger')
         if isinstance(phase, Mapping) and isinstance(models, tuple):
-            keys = diagnostic_progress(context, phase=phase,
+            keys = diagnostic_progress(view, phase=phase,
                 models=cast(Sequence[Mapping[str, JsonValue]], models), tools=tools, artifacts=artifacts)
             return any(boundary > lower for boundary in keys.values())
     return False
@@ -520,12 +525,28 @@ def diagnostic_progress(
     return credits
 
 
+def _diagnostic_progress_view(context: TaskContext, view: TaskContext | None) -> TaskContext:
+    if view is None:
+        return context
+    from agent_hub.runtime.python_project_history import HISTORY_KEY
+
+    _need(type(view) is TaskContext and view.run_id == context.run_id
+          and view.tenant_id == context.tenant_id and view.actor_id == context.actor_id
+          and view.actor_role is context.actor_role and view.mode is context.mode
+          and view.request == context.request)
+    _need({k: v for k, v in view.routing_decision.items() if k != HISTORY_KEY}
+          == {k: v for k, v in context.routing_decision.items() if k != HISTORY_KEY})
+    return view
+
+
 def validate_diagnostic_transition(
     context: TaskContext, previous: RuntimeCheckpoint | None, checkpoint: RuntimeCheckpoint,
     artifacts: Sequence[Artifact],
+    *, progress_context: TaskContext | None = None,
 ) -> None:
     """Validate against the committed predecessor, not just the episode's older source."""
     route, state = context.routing_decision, checkpoint.state
+    view = _diagnostic_progress_view(context, progress_context)
     _need(type(route.get(DIAGNOSTIC_POLICY)) is int and route.get(DIAGNOSTIC_POLICY) == 1)
     absolute_limit, initial = route.get('runtime_timeout_absolute_seconds'), route.get('runtime_timeout_seconds')
     token_limit, plan_tokens = route.get('runtime_token_absolute_tokens'), route.get('runtime_plan_token_budget')
@@ -558,8 +579,9 @@ def validate_diagnostic_transition(
         tools = cast(tuple[Mapping[str, JsonValue], ...], tools)
         if phase is not None:
             validate(phase, context=context, models=models, tools=tools,
-                tool_prefix=cast(int, value.get('engineering_tool_prefix', 0)), state=value, artifacts=artifacts)
-        diagnostic = diagnostic_progress(context, phase=cast(Mapping[str, JsonValue] | None, phase),
+                tool_prefix=cast(int, value.get('engineering_tool_prefix', 0)), state=value, artifacts=artifacts,
+                progress_context=view)
+        diagnostic = diagnostic_progress(view, phase=cast(Mapping[str, JsonValue] | None, phase),
             models=models, tools=tools, artifacts=artifacts)
         watermark = max(diagnostic.values(), default=0)
         _need(type(value.get(DIAGNOSTIC_WATERMARK)) is int and value.get(DIAGNOSTIC_WATERMARK) == watermark)
@@ -568,7 +590,7 @@ def validate_diagnostic_transition(
             actor, name = row.get('actor'), row.get('name')
             if isinstance(actor, str) and isinstance(name, str):
                 allowed[actor] = (*allowed.get(actor, ()), name)
-        work = engineering_work_progress(context, tool_entries=tools, artifacts=artifacts,
+        work = engineering_work_progress(view, tool_entries=tools, artifacts=artifacts,
             allowed_tools=allowed, include_draft_diagnoses=True, include_bootstrap_observations=True)
         return set(work) | set(diagnostic), watermark
     keys, watermark = progress(checkpoint)

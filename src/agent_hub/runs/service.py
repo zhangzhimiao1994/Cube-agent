@@ -12,7 +12,7 @@ from contextlib import aclosing
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from typing import TYPE_CHECKING, Literal, Protocol, cast
+from typing import TYPE_CHECKING, Literal, Protocol, TypedDict, cast
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from agent_hub.auth.models import Role
@@ -146,6 +146,11 @@ def _required_approval_checkpoint_id(record: RunRecord) -> str | None:
     ):
         return approval_id
     return None
+
+
+class _DiagnosticCheckpointOptions(TypedDict, total=False):
+    routing_decision: Mapping[str, JsonValue]
+    diagnostic_context: TaskContext
 
 
 @dataclass(slots=True)
@@ -2551,6 +2556,13 @@ class RunService:
                         return _submitted(current)
                     project_preparation_task = None
                     runtime_routing_decision = dict(context.routing_decision)
+                from agent_hub.runtime.python_project_history import python_history_selected
+
+                diagnostic_options: _DiagnosticCheckpointOptions = {}
+                if 'engineering_diagnostic_allowance_version' in routing_decision:
+                    diagnostic_options['routing_decision'] = cast(Mapping[str, JsonValue], routing_decision)
+                    if python_history_selected(context):
+                        diagnostic_options['diagnostic_context'] = context
                 runtime_events = _adaptive_runtime_events(
                     runtime,
                     context,
@@ -2644,8 +2656,7 @@ class RunService:
                                     event = _event_at_sequence(candidate, run_id=run_id, sequence=sequence)
                                     await self._repository.persist_event(
                                         session, tenant_id=tenant_id, run_id=run_id, event=event,
-                                        **({'routing_decision': cast(Mapping[str, JsonValue], routing_decision)}
-                                           if 'engineering_diagnostic_allowance_version' in routing_decision else {}),
+                                        **diagnostic_options,
                                     )
                                     committed_events.append(event)
                                 if event.kind is EventKind.RUNTIME_COMPLETED:
