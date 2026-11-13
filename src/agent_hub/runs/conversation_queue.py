@@ -23,6 +23,7 @@ from agent_hub.runs.authorization import (
     _persist_authenticated_input,
     _validate_authenticated_input,
 )
+from agent_hub.runs.execution_activity import read_execution_activities
 
 
 def _has_worker_execution(row: RunRow) -> bool:
@@ -141,11 +142,8 @@ class ConversationQueueRepository:
                 )
                 successor.blocked_by_run_id = effective_predecessor.id
                 successor.version += 1
-            if RunStatus(effective_predecessor.status) in {
-                RunStatus.COMPLETED,
-                RunStatus.FAILED,
-                RunStatus.CANCELLED,
-            }:
+            (activity,) = await read_execution_activities(session, (effective_predecessor,))
+            if not activity.is_active:
                 raise ConversationQueueConflict("conversation has no active run")
             next_position = (
                 await session.scalar(

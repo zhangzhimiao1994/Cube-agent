@@ -616,6 +616,13 @@ const ConfigRevisionSchema = z.object({
 
 export type ConfigRevision = z.infer<typeof ConfigRevisionSchema>;
 
+const ExecutionActivitySchema = z.object({
+  is_active: z.boolean(),
+  deadline_at: z.string().datetime({ offset: true }).nullable(),
+  evaluated_at: z.string().datetime({ offset: true }),
+  reason: z.enum(["active", "terminal", "deadline_elapsed", "worker_not_released"]),
+}).strict();
+
 const RunListItemSchema = z.object({
   id: z.string(),
   status: z.string(),
@@ -629,6 +636,7 @@ const RunListItemSchema = z.object({
   queue_wait_ms: z.number(),
   capacity_wait_ms: z.number(),
   cost_usd: z.string(),
+  execution_activity: ExecutionActivitySchema.nullable().optional(),
 });
 
 export type RunListItem = z.infer<typeof RunListItemSchema>;

@@ -2260,9 +2260,24 @@ function runHasNewerProgress(candidate: RunDetail, current: RunDetail): boolean 
 }
 
 function preferredRunSnapshot(current: RunDetail, candidate: RunDetail): RunDetail {
-  if (runHasNewerProgress(candidate, current)) return candidate;
-  if (runHasNewerProgress(current, candidate)) return current;
-  return candidate;
+  // Read-only activity can change while durable status/version/event history stay fixed.
+  const base = runHasNewerProgress(current, candidate) ? current : candidate;
+  // Activity belongs to this persisted version; a later old-version read cannot
+  // release the worker fence of a newer version (nor fill its unknown deadline).
+  if (runDetailVersion(current) !== runDetailVersion(candidate)) return base;
+  const older = current.execution_activity;
+  const incoming = candidate.execution_activity;
+  const activity = !incoming ? older : !older ? incoming
+    : Date.parse(incoming.evaluated_at) >= Date.parse(older.evaluated_at) ? incoming : older;
+  return activity && activity !== base.execution_activity ? { ...base, execution_activity: activity } : base;
+}
+
+export function runExecutionIsActive(run: Pick<RunDetail, "status" | "execution_activity"> | undefined) {
+  return Boolean(run && !TERMINAL_STATUSES.has(run.status) && run.execution_activity?.is_active !== false);
+}
+
+export function runExecutionDeadlineElapsed(run: RunDetail | undefined) {
+  return run?.execution_activity?.is_active === false && run.execution_activity.reason === "deadline_elapsed";
 }
 
 function explainActualMode(run: { status: string; mode: string | null }) {
@@ -2284,7 +2299,7 @@ function modeSelectionFromSubmittedRun(run: SubmittedRun): ModeSelection | null 
 }
 
 function modeSelectionFromRunDetail(run: RunDetail | undefined): ModeSelection | null {
-  if (!run || run.status !== "waiting_user_mode" || !run.decision_token) return null;
+  if (!run || runExecutionDeadlineElapsed(run) || run.status !== "waiting_user_mode" || !run.decision_token) return null;
   return {
     runId: run.id,
     decisionToken: run.decision_token,
@@ -2294,7 +2309,7 @@ function modeSelectionFromRunDetail(run: RunDetail | undefined): ModeSelection |
 }
 
 function temporaryApprovalFromRunDetail(run: RunDetail | undefined) {
-  if (!run || run.status !== "waiting_approval" || !run.decision_token || !run.temporary_agent_proposal) {
+  if (!run || runExecutionDeadlineElapsed(run) || run.status !== "waiting_approval" || !run.decision_token || !run.temporary_agent_proposal) {
     return null;
   }
   return {
@@ -2307,7 +2322,7 @@ function temporaryApprovalFromRunDetail(run: RunDetail | undefined) {
 }
 
 function scheduleApprovalFromRunDetail(run: RunDetail | undefined) {
-  if (!run || run.status !== "waiting_approval" || !run.schedule_proposal) return null;
+  if (!run || runExecutionDeadlineElapsed(run) || run.status !== "waiting_approval" || !run.schedule_proposal) return null;
   return {
     runId: run.id,
     proposal: run.schedule_proposal,
@@ -2317,7 +2332,7 @@ function scheduleApprovalFromRunDetail(run: RunDetail | undefined) {
 }
 
 function evolutionApprovalFromRunDetail(run: RunDetail | undefined) {
-  if (!run || run.status !== "waiting_approval" || !run.evolution_proposal) return null;
+  if (!run || runExecutionDeadlineElapsed(run) || run.status !== "waiting_approval" || !run.evolution_proposal) return null;
   return {
     runId: run.id,
     proposal: run.evolution_proposal,
@@ -2326,7 +2341,7 @@ function evolutionApprovalFromRunDetail(run: RunDetail | undefined) {
 }
 
 function openClawApprovalFromRunDetail(run: RunDetail | undefined) {
-  if (!run || run.status !== "waiting_approval" || !run.openclaw_proposal) return null;
+  if (!run || runExecutionDeadlineElapsed(run) || run.status !== "waiting_approval" || !run.openclaw_proposal) return null;
   return {
     runId: run.id,
     proposal: run.openclaw_proposal,
@@ -2335,7 +2350,7 @@ function openClawApprovalFromRunDetail(run: RunDetail | undefined) {
 }
 
 function projectPreflightApprovalFromRunDetail(run: RunDetail | undefined) {
-  if (!run || run.status !== "waiting_approval" || !run.decision_token || !run.project_preflight_proposal) {
+  if (!run || runExecutionDeadlineElapsed(run) || run.status !== "waiting_approval" || !run.decision_token || !run.project_preflight_proposal) {
     return null;
   }
   return {
@@ -2358,7 +2373,7 @@ function repairApprovalFromSubmittedRun(run: SubmittedRun) {
 
 function repairApprovalFromRunDetail(run: RunDetail | undefined) {
   if (
-    !run ||
+    !run || runExecutionDeadlineElapsed(run) ||
     !["failed", "waiting_approval"].includes(run.status) ||
     !run.decision_token ||
     !run.repair_proposal
@@ -2372,7 +2387,7 @@ function repairApprovalFromRunDetail(run: RunDetail | undefined) {
 }
 
 function capabilityApprovalFromRunDetail(run: RunDetail | undefined): CapabilityApproval | null {
-  if (!run || run.status !== "waiting_approval") return null;
+  if (!run || runExecutionDeadlineElapsed(run) || run.status !== "waiting_approval") return null;
   if (run.explicit_details.approval_kind !== "capability_tool") return null;
   const approvalId = run.explicit_details.approval_id?.trim();
   if (!approvalId) return null;
@@ -4187,6 +4202,11 @@ function runSnapshotSignature(run: RunDetail) {
   return JSON.stringify({
     id: run.id,
     status: run.status,
+    execution_activity: run.execution_activity ? {
+      is_active: run.execution_activity.is_active,
+      deadline_at: run.execution_activity.deadline_at,
+      reason: run.execution_activity.reason,
+    } : null,
     mode: run.mode,
     request: run.request,
     decision_token: run.decision_token,
@@ -6459,7 +6479,7 @@ function RunsPageForActor() {
     queryKey: ["runs"],
     queryFn: () => api.runs(),
     refetchInterval: (query) =>
-      query.state.data?.some((run) => !TERMINAL_STATUSES.has(run.status)) ? 1000 : 5000,
+      query.state.data?.some(runExecutionIsActive) ? 1000 : 5000,
     refetchIntervalInBackground: true,
   });
   const runListItems = runs.data ?? [];
@@ -6612,7 +6632,7 @@ function RunsPageForActor() {
   });
   const [processDetailTarget, setProcessDetailTarget] = useState<ProcessDetailTarget | null>(null);
   const [conversationPreviewFile, setConversationPreviewFile] = useState<WorkbenchFileItem | null>(null);
-  const [modeSelection, setModeSelection] = useState<ModeSelection | null>(null);
+  const [modeSelectionCandidate, setModeSelection] = useState<ModeSelection | null>(null);
   const [skillInstallCandidate, setSkillInstallCandidate] = useState<SkillInstallCandidate | null>(null);
   const [attachmentDraft, setAttachmentDraft] = useState<ChatAttachmentDraft | null>(null);
   const [archiveInstallFile, setArchiveInstallFile] = useState<File | null>(null);
@@ -6660,7 +6680,7 @@ function RunsPageForActor() {
       });
     });
   }, [queryClient]);
-  const [temporaryApproval, setTemporaryApproval] = useState<{
+  const [temporaryApprovalCandidate, setTemporaryApproval] = useState<{
     runId: string;
     decisionToken: string;
     version: number;
@@ -6668,7 +6688,7 @@ function RunsPageForActor() {
     approved: boolean;
   } | null>(null);
   const [temporaryFeedback, setTemporaryFeedback] = useState("");
-  const [scheduleApproval, setScheduleApproval] = useState<{
+  const [scheduleApprovalCandidate, setScheduleApproval] = useState<{
     runId: string;
     proposal: ScheduleProposal;
     createdScheduleId: string | null;
@@ -6679,23 +6699,23 @@ function RunsPageForActor() {
   const [dismissedOpenClawApprovalRunIds, setDismissedOpenClawApprovalRunIds] = useState<string[]>([]);
   const [dismissedProjectPreflightApprovalRunIds, setDismissedProjectPreflightApprovalRunIds] = useState<string[]>([]);
   const [dismissedRepairApprovalRunIds, setDismissedRepairApprovalRunIds] = useState<string[]>([]);
-  const [evolutionApproval, setEvolutionApproval] = useState<{
+  const [evolutionApprovalCandidate, setEvolutionApproval] = useState<{
     runId: string;
     proposal: EvolutionProposal;
     createdEvolutionId: string | null;
   } | null>(null);
-  const [openClawApproval, setOpenClawApproval] = useState<{
+  const [openClawApprovalCandidate, setOpenClawApproval] = useState<{
     runId: string;
     proposal: OpenClawProposal;
     createdOperationId: string | null;
   } | null>(null);
-  const [projectPreflightApproval, setProjectPreflightApproval] = useState<{
+  const [projectPreflightApprovalCandidate, setProjectPreflightApproval] = useState<{
     runId: string;
     decisionToken: string;
     version: number;
     proposal: ProjectPreflightProposal;
   } | null>(null);
-  const [repairApproval, setRepairApproval] = useState<{
+  const [repairApprovalCandidate, setRepairApproval] = useState<{
     runId: string;
     decisionToken: string;
     version: number;
@@ -6720,12 +6740,7 @@ function RunsPageForActor() {
     queryKey: ["run", selectedRunId],
     queryFn: () => api.run(selectedRunId ?? ""),
     enabled: Boolean(selectedRunId),
-    refetchInterval: (query) => {
-      const data = query.state.data;
-      if (!data) return false;
-      if (processDetailTarget?.runId === data.id) return 1000;
-      return !TERMINAL_STATUSES.has(data.status) ? 1000 : false;
-    },
+    refetchInterval: (query) => runExecutionIsActive(query.state.data) ? 1000 : false,
     refetchIntervalInBackground: true,
   });
 
@@ -6787,26 +6802,21 @@ function RunsPageForActor() {
     queryKey: ["conversation", activeConversationId],
     queryFn: () => api.conversation(activeConversationId),
     enabled: Boolean(activeConversationId && activeConversationKnown),
-    refetchInterval: (query) => {
-      const data = query.state.data;
-      if (data && processDetailTarget?.conversationId === data.conversation_id) return 1000;
-      if (data && activeConversationId === data.conversation_id) return 1000;
-      return data?.runs.some((run) => !TERMINAL_STATUSES.has(run.status)) ? 1000 : false;
-    },
+    refetchInterval: (query) => query.state.data?.runs.some(runExecutionIsActive) ? 1000 : false,
     refetchIntervalInBackground: true,
   });
   const activeConversationDenied =
     deniedReads.conversation.has(activeConversationId) || isConversationReadDenied(activeConversation.error);
   const selectedRunDenied = Boolean(selectedRunId &&
     (deniedReads.run.has(selectedRunId) || isConversationReadDenied(selectedRun.error)));
-  const readableSelectedRun = activeConversationDenied || selectedRunDenied ||
+  const rawReadableSelectedRun = activeConversationDenied || selectedRunDenied ||
     (selectedRunConversationId && deniedReads.conversation.has(selectedRunConversationId))
     ? undefined : selectedRun.data;
   const conversationQueue = useQuery({
     queryKey: ["conversation-queue", activeConversationId],
     queryFn: () => api.conversationQueue(activeConversationId),
     enabled: Boolean(activeConversationId && activeConversationKnown),
-    refetchInterval: 1000,
+    refetchInterval: activeConversation.data?.runs.some(runExecutionIsActive) ? 1000 : false,
     refetchIntervalInBackground: true,
   });
   // A conversation deep-link has no explicit run selection. Inspect only its latest
@@ -6814,6 +6824,24 @@ function RunsPageForActor() {
   const approvalConversationRuns = !activeConversationDenied && activeConversation.data?.conversation_id === activeConversationId
     ? activeConversation.data.runs.filter((run) => runConversationId(run) === activeConversationId && !deniedReads.run.has(run.id))
     : [];
+  const conversationSelectedRun = rawReadableSelectedRun
+    ? approvalConversationRuns.find((run) => run.id === rawReadableSelectedRun.id) : undefined;
+  const readableSelectedRun = rawReadableSelectedRun && conversationSelectedRun
+    ? preferredRunSnapshot(conversationSelectedRun, rawReadableSelectedRun) : rawReadableSelectedRun;
+  function currentComposerCandidate<T extends { runId: string }>(candidate: T | null): T | null {
+    if (!candidate) return null;
+    const record = readableSelectedRun?.id === candidate.runId ? readableSelectedRun
+      : approvalConversationRuns.find((run) => run.id === candidate.runId);
+    return runExecutionDeadlineElapsed(record) ? null : candidate;
+  }
+  // Derived immediately, before effects/events: an expired proposal is history only.
+  const modeSelection = currentComposerCandidate(modeSelectionCandidate);
+  const temporaryApproval = currentComposerCandidate(temporaryApprovalCandidate);
+  const scheduleApproval = currentComposerCandidate(scheduleApprovalCandidate);
+  const evolutionApproval = currentComposerCandidate(evolutionApprovalCandidate);
+  const openClawApproval = currentComposerCandidate(openClawApprovalCandidate);
+  const projectPreflightApproval = currentComposerCandidate(projectPreflightApprovalCandidate);
+  const repairApproval = currentComposerCandidate(repairApprovalCandidate);
   const blockedApprovalRunIds = new Set((conversationQueue.data ?? [])
     .filter((item) => item.conversation_id === activeConversationId && (item.status === "queued" || item.status === "redirecting"))
     .map((item) => item.successor_run_id));
@@ -6914,7 +6942,14 @@ function RunsPageForActor() {
   }, [activeConversationId]);
 
   useEffect(() => {
-    const selection = modeSelectionFromRunDetail(selectedRun.data);
+    if (modeSelectionCandidate && !modeSelection) setModeSelection(null);
+    if (temporaryApprovalCandidate && !temporaryApproval) setTemporaryApproval(null);
+    if (scheduleApprovalCandidate && !scheduleApproval) setScheduleApproval(null);
+    if (evolutionApprovalCandidate && !evolutionApproval) setEvolutionApproval(null);
+    if (openClawApprovalCandidate && !openClawApproval) setOpenClawApproval(null);
+    if (projectPreflightApprovalCandidate && !projectPreflightApproval) setProjectPreflightApproval(null);
+    if (repairApprovalCandidate && !repairApproval) setRepairApproval(null);
+    const selection = modeSelectionFromRunDetail(readableSelectedRun);
     if (selection) {
       if (
         !modeSelection ||
@@ -6936,7 +6971,7 @@ function RunsPageForActor() {
     if (selectedConversationId) {
       setConversationId(selectedConversationId);
     }
-    const approval = temporaryApprovalFromRunDetail(selectedRun.data);
+    const approval = temporaryApprovalFromRunDetail(readableSelectedRun);
     if (approval) {
       setModeSelection(null);
       setScheduleApproval(null);
@@ -6954,7 +6989,7 @@ function RunsPageForActor() {
           : approval,
       );
     }
-    const proposedSchedule = scheduleApprovalFromRunDetail(selectedRun.data);
+    const proposedSchedule = scheduleApprovalFromRunDetail(readableSelectedRun);
     if (proposedSchedule && !dismissedScheduleApprovalRunIds.includes(proposedSchedule.runId)) {
       setModeSelection(null);
       setTemporaryApproval(null);
@@ -6967,7 +7002,7 @@ function RunsPageForActor() {
         current && current.runId === proposedSchedule.runId ? current : proposedSchedule,
       );
     }
-    const proposedEvolution = evolutionApprovalFromRunDetail(selectedRun.data);
+    const proposedEvolution = evolutionApprovalFromRunDetail(readableSelectedRun);
     if (proposedEvolution && !dismissedEvolutionApprovalRunIds.includes(proposedEvolution.runId)) {
       setModeSelection(null);
       setTemporaryApproval(null);
@@ -6980,7 +7015,7 @@ function RunsPageForActor() {
         current && current.runId === proposedEvolution.runId ? current : proposedEvolution,
       );
     }
-    const proposedOpenClaw = openClawApprovalFromRunDetail(selectedRun.data);
+    const proposedOpenClaw = openClawApprovalFromRunDetail(readableSelectedRun);
     if (proposedOpenClaw && !dismissedOpenClawApprovalRunIds.includes(proposedOpenClaw.runId)) {
       setModeSelection(null);
       setTemporaryApproval(null);
@@ -6993,7 +7028,7 @@ function RunsPageForActor() {
         current && current.runId === proposedOpenClaw.runId ? current : proposedOpenClaw,
       );
     }
-    const proposedRepair = repairApprovalFromRunDetail(selectedRun.data);
+    const proposedRepair = repairApprovalFromRunDetail(readableSelectedRun);
     if (proposedRepair && !dismissedRepairApprovalRunIds.includes(proposedRepair.runId)) {
       setModeSelection(null);
       setTemporaryApproval(null);
@@ -7011,7 +7046,7 @@ function RunsPageForActor() {
           : proposedRepair,
       );
     }
-    const proposedProjectPreflight = projectPreflightApprovalFromRunDetail(selectedRun.data);
+    const proposedProjectPreflight = projectPreflightApprovalFromRunDetail(readableSelectedRun);
     if (proposedProjectPreflight && !dismissedProjectPreflightApprovalRunIds.includes(proposedProjectPreflight.runId)) {
       setModeSelection(null);
       setTemporaryApproval(null);
@@ -7051,7 +7086,7 @@ function RunsPageForActor() {
     } else if (capabilityApprovalCandidate) {
       setCapabilityApproval(null);
     }
-  }, [capabilityApprovalCandidate, capabilityApprovalRun, dismissedEvolutionApprovalRunIds, dismissedOpenClawApprovalRunIds, dismissedProjectPreflightApprovalRunIds, dismissedRepairApprovalRunIds, dismissedScheduleApprovalRunIds, modeSelection, projectPreflightApproval, selectedRun.data, temporaryApproval]);
+  }, [capabilityApprovalCandidate, capabilityApprovalRun, dismissedEvolutionApprovalRunIds, dismissedOpenClawApprovalRunIds, dismissedProjectPreflightApprovalRunIds, dismissedRepairApprovalRunIds, dismissedScheduleApprovalRunIds, modeSelection, projectPreflightApproval, selectedRun.data, temporaryApproval, modeSelectionCandidate, temporaryApprovalCandidate, scheduleApprovalCandidate, evolutionApprovalCandidate, openClawApprovalCandidate, projectPreflightApprovalCandidate, repairApprovalCandidate, scheduleApproval, evolutionApproval, openClawApproval, repairApproval, readableSelectedRun]);
 
   useEffect(() => {
     setProcessDetailTarget(null);
@@ -8510,7 +8545,7 @@ function RunsPageForActor() {
     (readableSelectedRun && !blockedQueueSuccessorIds.has(readableSelectedRun.id)
       ? readableSelectedRun
       : undefined);
-  const canStopLatestRun = Boolean(latestVisibleRun && !TERMINAL_STATUSES.has(latestVisibleRun.status));
+  const canStopLatestRun = runExecutionIsActive(latestVisibleRun);
   const mainAgentModelName = mainAgent.data?.model
     ? `${mainAgent.data.model.provider}/${mainAgent.data.model.upstream_model}`
     : "未配置";

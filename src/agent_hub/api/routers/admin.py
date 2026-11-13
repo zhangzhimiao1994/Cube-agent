@@ -147,6 +147,7 @@ from agent_hub.runs.conversations import (
     normalize_conversation_title,
     normalize_conversation_workspace,
 )
+from agent_hub.runs.execution_activity import ExecutionActivity
 from agent_hub.runs.projects import (
     ProjectWorkspaceConflict,
     ProjectWorkspaceNotFound,
@@ -430,6 +431,7 @@ class RunListItem(BaseModel):
     queue_wait_ms: int = Field(ge=0)
     capacity_wait_ms: int = Field(ge=0)
     cost_usd: str
+    execution_activity: ExecutionActivity | None = None
 
 
 class ConversationQuestionSearchItemResponse(BaseModel):
@@ -9702,6 +9704,7 @@ class PersistentAdminResourceService(InMemoryAdminResourceService):
             queue_wait_ms=0,
             capacity_wait_ms=0,
             cost_usd=str(await self._run_repository.usage_cost(self._tenant_id, record.id)),
+            execution_activity=record.execution_activity,
         )
 
     async def _capability_install_visibility(

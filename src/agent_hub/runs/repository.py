@@ -8,7 +8,7 @@ import hashlib
 import json
 import re
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING, TypedDict, cast
@@ -47,6 +47,7 @@ from agent_hub.runs.authorization import (
     _validated_persisted_input,
 )
 from agent_hub.runs.context_evidence import CONTEXT_EVENT_KINDS, context_event_projection
+from agent_hub.runs.execution_activity import ExecutionActivity, read_execution_activities
 from agent_hub.runs.self_repair import (
     project_repair_checkpoint_is_safe,
     project_repair_scope_sha256,
@@ -487,6 +488,7 @@ class RunRecord:
     worker_lease_token: UUID | None = None
     worker_lease_expires_at: datetime | None = None
     worker_heartbeat_at: datetime | None = None
+    execution_activity: ExecutionActivity | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -786,7 +788,7 @@ class RunRepository:
                 raise RunNotFound("run was not found")
             if actor_id is not None and row.actor_id != actor_id:
                 raise RunNotFound("run was not found")
-            return self._record(row)
+            return (await self._read_records(session, (row,)))[0]
 
     async def load_same_run_repair_continuity(
         self,
@@ -1066,7 +1068,7 @@ class RunRepository:
                     .limit(limit)
                 )
             ).all()
-            return tuple(self._record(row) for row in rows)
+            return await self._read_records(session, rows)
 
     async def search_conversation_questions(
         self,
@@ -1172,7 +1174,7 @@ class RunRepository:
                     .order_by(RunRow.created_at.asc(), RunRow.id.asc())
                 )
             ).all()
-            return tuple(self._record(row) for row in rows)
+            return await self._read_records(session, rows)
 
     async def delete_run(self, tenant_id: UUID, run_id: UUID) -> None:
         async with self._session_factory() as session, session.begin():
@@ -4037,6 +4039,12 @@ class RunRepository:
                 row.worker_heartbeat_at,
             )
         )
+
+    async def _read_records(self, session: AsyncSession, rows: Sequence[RunRow]) -> tuple[RunRecord, ...]:
+        records = tuple(self._record(row) for row in rows)
+        activities = await read_execution_activities(session, records)
+        return tuple(replace(record, execution_activity=activity)
+                     for record, activity in zip(records, activities, strict=True))
 
     @staticmethod
     def _record(row: RunRow) -> RunRecord:

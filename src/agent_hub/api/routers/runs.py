@@ -43,6 +43,7 @@ from agent_hub.runs.conversation_queue import (
     ConversationQueueNotFound,
 )
 from agent_hub.runs.conversations import ConversationArchived
+from agent_hub.runs.execution_activity import ExecutionActivity
 from agent_hub.runs.repository import CapabilityApprovalSnapshot, RunConflict, RunNotFound
 from agent_hub.runs.self_repair import repair_proposal_projection
 from agent_hub.runs.service import RunSummary, SubmittedRun, VibeCodingUnavailable
@@ -611,6 +612,7 @@ class RunSummaryResponse(BaseModel):
     execution_lease_expires_at: datetime | None = None
     approval_kind: str | None = None
     repair_proposal: dict[str, object] | None = None
+    execution_activity: ExecutionActivity | None = None
 
     @classmethod
     def from_summary(cls, run: RunSummary) -> RunSummaryResponse:
@@ -634,6 +636,7 @@ class RunSummaryResponse(BaseModel):
             mode_source=run.mode_source,
             execution_quiescent=run.execution_quiescent,
             execution_lease_expires_at=run.execution_lease_expires_at,
+            execution_activity=run.execution_activity,
             approval_kind=run.approval_kind,
             repair_proposal=_repair_proposal_response(run.repair_proposal),
         )

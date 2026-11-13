@@ -51,6 +51,7 @@ from agent_hub.runs.conversation_queue import (
     EnqueueConversationMessage,
 )
 from agent_hub.runs.conversations import ConversationArchived, ConversationRecord
+from agent_hub.runs.execution_activity import ExecutionActivity, execution_is_active
 from agent_hub.runs.observer import ObserverDecision, ObserverPolicy, RunMonitor
 from agent_hub.runs.repository import (
     CapabilityApprovalSnapshot,
@@ -245,6 +246,7 @@ class RunSummary:
     execution_lease_expires_at: datetime | None = None
     approval_kind: str | None = None
     repair_proposal: dict[str, object] | None = None
+    execution_activity: ExecutionActivity | None = None
 
 
 class VibeCodingUnavailable(RuntimeError):
@@ -1817,7 +1819,7 @@ class RunService:
         active_runs = [
             run
             for run in await self._repository.list_conversation(tenant_id, conversation_id)
-            if run.status not in {RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED}
+            if execution_is_active(run)
         ]
         if not active_runs:
             raise ConversationQueueConflict("conversation has no active run")
@@ -3504,6 +3506,7 @@ class RunService:
             mode_source=_string_or_none(routing_decision.get("mode_source")),
             execution_quiescent=execution_quiescent,
             execution_lease_expires_at=lease_expires_at,
+            execution_activity=record.execution_activity,
             approval_kind=(
                 approval_kind
                 if waiting_for_decision
