@@ -100,10 +100,10 @@ def _physical_scope_timeout_seconds(
     if any(type(route.get(key)) is not type(persisted.get(key)) or route.get(key) != persisted.get(key)
            for key in keys):
         return context.timeout_seconds
-    hard = profile.get("timeout_seconds")
-    initial = persisted.get("runtime_timeout_seconds")
-    soft = persisted.get("runtime_timeout_soft_seconds")
-    envelope = persisted.get("runtime_timeout_absolute_seconds")
+    hard = cast(int | float, profile.get("timeout_seconds"))
+    initial = cast(int | float, persisted.get("runtime_timeout_seconds"))
+    soft = cast(int | float, persisted.get("runtime_timeout_soft_seconds"))
+    envelope = cast(int | float, persisted.get("runtime_timeout_absolute_seconds"))
     if (type(hard) not in (int, float) or not math.isfinite(hard) or hard <= 0
             or type(initial) not in (int, float) or not math.isfinite(initial) or not 0 < initial <= hard
             or type(soft) not in (int, float) or not math.isfinite(soft) or not 0 < soft <= hard

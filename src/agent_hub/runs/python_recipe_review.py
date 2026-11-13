@@ -4,9 +4,9 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 from uuid import UUID
 
 from sqlalchemy import select
@@ -32,6 +32,7 @@ from agent_hub.runs.repository import (
     _database_uuid,
     _python_project_approval_binding,
 )
+from agent_hub.runtime.contracts import JsonValue, RuntimeCheckpoint
 from agent_hub.skills.sandbox.project import project_source_fingerprint, project_source_manifest
 
 if TYPE_CHECKING:
@@ -61,7 +62,7 @@ class PythonRecipeReview:
         state = route.get('project_input_preparation')
         scope = capability_approval_scope(request)
         binding = _python_project_approval_binding(row, scope)
-        permissions = route.get('requested_permissions', ())
+        permissions = cast(Iterable[object], route.get('requested_permissions', ()))
         rules = self.policy._extra_policy_rules(request)
         if (self.policy._approval_reviewer is not None or request.tool_origin != 'builtin'
                 or (_database_uuid(row.tenant_id), _database_uuid(row.id), row.actor_id, row.actor_role)
@@ -213,24 +214,26 @@ class PythonRecipeReview:
             from agent_hub.runs.approval_checkpoint import checkpoint_waits_for_approval
 
             if (not isinstance(approval_id, str) or not checkpoint_waits_for_approval(checkpoint, approval_id)
-                    or checkpoint.runtime_type != 'autogen'):
+                    or cast(RuntimeCheckpoint, checkpoint).runtime_type != 'autogen'):
                 return False
-            receipt = checkpoint.state['tool_ledger'][-1]
+            assert checkpoint is not None
+            tools = cast(tuple[Mapping[str, JsonValue], ...], checkpoint.state['tool_ledger'])
+            receipt = tools[-1]
             models = checkpoint.state.get('model_ledger')
             if (not isinstance(models, tuple)
                     or any(not isinstance(m, Mapping) or m.get('status') not in {'succeeded', 'failed'} for m in models)
-                    or any(t.get('status') != 'succeeded' for t in checkpoint.state['tool_ledger'][:-1])
+                    or any(t.get('status') != 'succeeded' for t in tools[:-1])
                     or receipt['name'] != 'project.verify' or receipt['arguments_hash'] != _digest({})):
                 return False
             binding = _python_project_approval_binding(row, route.get('approval_scope'))
             if binding is None:
                 return False
-            request = CapabilityRequest(tenant_id=tenant, run_id=run, user_id=_database_uuid(row.actor_id),
-                agent_id=receipt['actor'], capability='command', operation='run',
-                resource='workspace/current/project-verification/python/' + binding['recipe_sha256'],
-                arguments=binding, idempotency_key=receipt['idempotency_key'])
+            request = CapabilityRequest(tenant_id=tenant, run_id=run, user_id=_database_uuid(cast(UUID, row.actor_id)),
+                agent_id=cast(str, receipt['actor']), capability='command', operation='run',
+                resource='workspace/current/project-verification/python/' + cast(str, binding['recipe_sha256']),
+                arguments=binding, idempotency_key=cast(str, receipt['idempotency_key']))
             expected = (route.get('approval_scope'), route.get('approval_fingerprint'), checkpoint.state_sha256)
-            role = Role(row.actor_role)
+            role = Role(cast(str, row.actor_role))
         source = await self._source(request)
         async with repo._session_factory() as session, session.begin():
             row = await session.scalar(repo._run_select(tenant, run).with_for_update())

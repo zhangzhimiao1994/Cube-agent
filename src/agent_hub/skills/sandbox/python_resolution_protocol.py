@@ -369,11 +369,11 @@ def resolution_failure_diagnostic(
 
     if type(error) is ResolutionFailureError:
         return ResolutionFailureDiagnostic.model_validate(error.diagnostic, strict=True)
-    code = "internal_failure"
+    code: ResolutionFailureCode = "internal_failure"
     if type(error) in {ResolutionError, InputSupplyError} and len(error.args) == 1:
         candidate = error.args[0]
         if type(candidate) is str and candidate in get_args(ResolutionFailureCode.__value__):
-            code = candidate
+            code = cast(ResolutionFailureCode, candidate)
     elif type(error) is TimeoutError:
         code, timed_out = "resolution_deadline", True
     return ResolutionFailureDiagnostic(phase=phase, code=code, exit_code=exit_code, timed_out=timed_out)

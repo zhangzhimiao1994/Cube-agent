@@ -10,7 +10,7 @@ import sys
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from agent_hub.skills.sandbox.base import run_subprocess_with_limits
 from agent_hub.skills.sandbox.project import (
@@ -38,6 +38,7 @@ from agent_hub.skills.sandbox.python_project_broker import PythonRootExecution, 
 from agent_hub.skills.sandbox.python_project_profile import PythonProjectProfileScope
 from agent_hub.skills.sandbox.python_resolution_protocol import (
     ResolutionClaim,
+    ResolutionFailurePhase,
     ResolutionRequest,
     ResolutionStatus,
 )
@@ -171,7 +172,7 @@ async def _handle_preparation(
     broker: ProjectExecutionBroker, request: PythonMetadataPreparationRequest | ResolutionRequest, *, peer_uid: int,
 ) -> PythonMetadataPreparationResponse | ResolutionStatus:
     resolution = type(request) is ResolutionRequest
-    phase = "request"
+    phase: ResolutionFailurePhase = "request"
     action: str | None = None
     correlation_key: str | None = None
     exit_code: int | None = None
@@ -342,7 +343,7 @@ async def _handle_preparation(
                                 raise ValueError
                             raw = json.loads(result.stdout, object_pairs_hook=_object)
                             observed = ResolutionStatus.model_validate_json(_encoded(raw), strict=True)
-                            if observed.key != request.key or observed.state != "unknown" or observed.diagnostic is None:
+                            if observed.key != cast(ResolutionRequest, request).key or observed.state != "unknown" or observed.diagnostic is None:
                                 raise ValueError
                         except (ValueError, TypeError, AttributeError):
                             pass

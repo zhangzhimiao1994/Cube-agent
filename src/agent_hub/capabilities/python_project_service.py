@@ -422,7 +422,7 @@ class _Context:
     inputs: PythonProjectInputs
     state: Mapping[str, JsonValue]
     user_id: UUID
-    authority: tuple[object, ...]
+    authority: tuple[UUID, Role, tuple[object, ...]]
     observation_sha256: str | None
 
 
@@ -459,7 +459,7 @@ class PythonProjectService:
         run_id: UUID,
         *,
         readonly: bool = False,
-    ) -> tuple[ProjectInvocation, tuple[object, ...], UUID]:
+    ) -> tuple[ProjectInvocation, tuple[UUID, Role, tuple[object, ...]], UUID]:
         project, session = authorized_workspace_scope(record, tenant_id=tenant_id, run_id=run_id)
         route = getattr(record, "routing_decision", None)
         _need(isinstance(route, Mapping))
@@ -472,6 +472,7 @@ class PythonProjectService:
             and (readonly or role is not Role.VIEWER)
         )
         assert isinstance(user_id, UUID)
+        assert isinstance(role, Role)
         required = (
             {"workspace.read"} if readonly else {"workspace.read", "workspace.write", "command.run"}
         )

@@ -10,7 +10,7 @@ from collections.abc import Awaitable, Callable
 from contextlib import ExitStack
 from dataclasses import replace
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from agent_hub.capabilities.project_baselines import ProjectBaselineReference, StoredProjectBaseline
 from agent_hub.capabilities.python_dependency_resolution import resolve_dependencies
@@ -53,6 +53,7 @@ from agent_hub.skills.sandbox.python_resolution_protocol import (
     MAX_CONTROL,
     ProtectedOriginalResolutionPlanning,
     ResolutionClaim,
+    ResolutionFailurePhase,
     ResolutionRequest,
     ResolutionStatus,
     decode,
@@ -579,8 +580,9 @@ def main() -> int:
                 resolution_failure_diagnostic,
             )
 
-            phase = {"freeze_python_resolution": "freeze", "publish_python_resolution": "publication"}.get(
-                request.action, "resolution")
+            phase = cast(ResolutionFailurePhase,
+                {"freeze_python_resolution": "freeze", "publish_python_resolution": "publication"}.get(
+                    request.action, "resolution"))
             diagnostic = resolution_failure_diagnostic(error, phase=phase, exit_code=2)
             print(ResolutionStatus(state="unknown", key=request.key, diagnostic=diagnostic).model_dump_json(), flush=True)
         print("resolution_unavailable", file=sys.stderr, flush=True)
