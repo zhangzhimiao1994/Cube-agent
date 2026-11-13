@@ -1,31 +1,48 @@
 """Offline native-boundary fakes; real broker/client/original-project failure flow."""
+from __future__ import annotations
+
+import os
+import sys
+from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime
+from pathlib import Path
 from types import SimpleNamespace
+from typing import Literal, Never, cast
 
 import pytest
 
 from agent_hub.capabilities.execution_authority import bind_execution_authority
-from agent_hub.capabilities.project_verification import ProjectVerificationError
+from agent_hub.capabilities.project_baselines import ProjectBaselineStore
+from agent_hub.capabilities.project_verification import (
+    ProjectVerificationError,
+    ProjectVerificationService,
+)
 from agent_hub.domain.runs import TaskMode
+from agent_hub.harness.tool_gateway import HarnessToolGateway
 from agent_hub.runs import original_python_resolution
-from agent_hub.runs.project_inputs import OriginalProjectPreparer, ProjectBaselineStore
+from agent_hub.runs.project_inputs import OriginalProjectPreparer
+from agent_hub.runs.repository import RunRecord, RunRepository
+from agent_hub.runs.self_repair import SelfRepairDecision
 from agent_hub.runtime.artifacts import InMemoryArtifactRepository
-from agent_hub.runtime.contracts import EventKind, RunEvent, TaskContext
+from agent_hub.runtime.contracts import EventKind, JsonValue, RunEvent, TaskContext, _freeze_object
 from agent_hub.runtime.failure_reason import safe_runtime_failure_diagnostic
 from agent_hub.skills.sandbox import python_metadata_preparation_broker as broker_api
 from agent_hub.skills.sandbox import python_resolution_protocol as protocol
 from agent_hub.skills.sandbox import python_resolution_worker
 from agent_hub.skills.sandbox.base import SkillResult
+from agent_hub.skills.sandbox.python_registry_protocol import DependencyNeed
+from agent_hub.skills.sandbox.python_registry_read import RegistryReader
 from tests.unit.capabilities.test_protected_original_resolution_authorization import (
     original as running_record,
 )
 from tests.unit.capabilities.test_standard_python_private_recipe import ENVIRONMENT
 from tests.unit.skills.sandbox import test_resolution_broker_diagnostics as native
 from tests.unit.skills.sandbox.test_protected_original_resolution import _original
+from tests.unit.skills.sandbox.test_resolution_lease_witness import request as resolution_request
 
 
-def diagnostic(**changes):
+def diagnostic(**changes: object) -> protocol.ResolutionFailureDiagnostic:
     return protocol.ResolutionFailureDiagnostic.model_validate({
         'phase': 'registry_metadata', 'code': 'registry_unavailable',
         'exit_code': 2, 'timed_out': False, **changes}, strict=True)
@@ -35,12 +52,12 @@ def diagnostic(**changes):
     {'exit_code': True}, {'timed_out': 0}, {'phase': 'PRIVATE'},
     {'code': 'PRIVATE'}, {'secret': 'PRIVATE'}, {'exit_code': 2**64},
 ])
-def test_closed_diagnostic(changes):
+def test_closed_diagnostic(changes: dict[str, object]) -> None:
     with pytest.raises(ValueError):
         diagnostic(**changes)
 
 
-def test_unknown_only_and_exception_privacy():
+def test_unknown_only_and_exception_privacy() -> None:
     value = diagnostic()
     assert protocol.ResolutionStatus(state='unknown', key='a'*64, diagnostic=value).diagnostic == value
     assert protocol.ResolutionStatus(state='unknown', key='a'*64).diagnostic is None
@@ -53,7 +70,7 @@ def test_unknown_only_and_exception_privacy():
 
 
 @pytest.mark.parametrize('boundary', ['registry', 'wheel'])
-async def test_real_resolver_preserves_closed_leaf_diagnostic(boundary):
+async def test_real_resolver_preserves_closed_leaf_diagnostic(boundary: str) -> None:
     from agent_hub.capabilities.python_dependency_resolution import resolve_dependencies
     from tests.unit.skills.test_python_registry_read import (
         Wire,
@@ -70,19 +87,19 @@ async def test_real_resolver_preserves_closed_leaf_diagnostic(boundary):
     failure = protocol.ResolutionFailureError(leaf)
 
     class FailingRegistry:
-        async def candidates(self, *args, **kwargs):
+        async def candidates(self, *args: object, **kwargs: object) -> Never:
             raise failure
 
-    async def fail_wheel(*args):
+    async def fail_wheel(*args: object) -> Never:
         raise failure
 
     allowance = budget()
     deadline = allowance.deadline
     with pytest.raises(protocol.ResolutionFailureError) as caught:
         await resolve_dependencies(
-            (protocol.DependencyNeed('demo', 'a'*64),), scope=scope(),
+            (DependencyNeed('demo', 'a'*64),), scope=scope(),
             environment=environment(),
-            reader=FailingRegistry() if boundary == 'registry' else actual_reader,
+            reader=cast(RegistryReader, FailingRegistry()) if boundary == 'registry' else actual_reader,
             wheel_reader=fail_wheel, budget=allowance,
         )
     assert caught.value is failure
@@ -93,7 +110,7 @@ async def test_real_resolver_preserves_closed_leaf_diagnostic(boundary):
     assert len(wire.requests) == (0 if boundary == 'registry' else 2)
 
 
-async def test_actual_broker_client_original_project_failure(tmp_path, monkeypatch):
+async def test_actual_broker_client_original_project_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     baseline, _invocation_request = _original(tmp_path)
     captured = {'schema_version': 1, 'phase': 'captured', 'reference': baseline.reference.to_payload()}
     record = running_record()
@@ -106,39 +123,39 @@ async def test_actual_broker_client_original_project_failure(tmp_path, monkeypat
                  runtime_timeout_absolute_seconds=180)
     record = replace(record, created_at=datetime.now(UTC), routing_decision=route)
 
-    async def current(*args): return record
-    async def approved(*args, **kwargs): return True
+    async def current(*args: object) -> RunRecord: return record
+    async def approved(*args: object, **kwargs: object) -> bool: return True
     repository = SimpleNamespace(get=current, is_capability_approval_approved=approved)
 
     class Profiles:
-        async def inspect(self, invocation, *, expected_source_sha256=None):
+        async def inspect(self, invocation: object, *, expected_source_sha256: str | None=None) -> SimpleNamespace:
             return SimpleNamespace(ok=True, profile=SimpleNamespace(root_config_sha256='4'*64,
                 catalog_sha256='5'*64, target_environment=ENVIRONMENT if expected_source_sha256 else None))
 
     class Verifier:
-        async def prepare_python_original(self, **kwargs):
+        async def prepare_python_original(self, **kwargs: object) -> Never:
             raise ProjectVerificationError('python_original_catalog_incomplete')
 
     class Preparer(OriginalProjectPreparer):
-        async def _state(self, context, **kwargs):
-            return None if kwargs.get('supply') else captured
+        async def _state(self, context: TaskContext, **kwargs: object) -> Mapping[str, JsonValue] | None:
+            return None if kwargs.get('supply') else cast(Mapping[str, JsonValue], captured)
 
     monkeypatch.setattr(ProjectBaselineStore, 'load', lambda *args: baseline)
     monkeypatch.setattr(original_python_resolution, 'PythonProjectProfileSandbox', Profiles)
-    active = native.request()
+    active = resolution_request()
     monkeypatch.setattr(native, 'request', lambda: active)
     (tmp_path / 'broker').mkdir()
     case = native.portable_broker(tmp_path / 'broker', monkeypatch, 'execution', 2, False)
-    actions = []
+    actions: list[str] = []
 
-    async def child(*args, **kwargs):
-        state = 'absent' if active.action == 'inspect_python_resolution' else 'unknown'
+    async def child(*args: object, **kwargs: object) -> SkillResult:
+        state: Literal['absent', 'unknown'] = 'absent' if active.action == 'inspect_python_resolution' else 'unknown'
         response = protocol.ResolutionStatus(state=state, key=active.key,
             diagnostic=diagnostic() if state == 'unknown' else None)
         return SkillResult(exit_code=2 if state == 'unknown' else 0, timed_out=False,
                            stdout=response.model_dump_json(), stderr='token=PRIVATE')
 
-    async def transport(call):
+    async def transport(call: protocol.ResolutionRequest) -> protocol.ResolutionStatus:
         nonlocal active
         active = call
         actions.append(call.action)
@@ -149,10 +166,10 @@ async def test_actual_broker_client_original_project_failure(tmp_path, monkeypat
     monkeypatch.setattr(python_resolution_worker, 'request_resolution', transport)
     context = TaskContext(run_id=record.id, tenant_id=record.tenant_id, request=record.request,
         mode=TaskMode.DISCUSS, actor_id=record.actor_id, actor_role=record.actor_role,
-        execution_token=record.worker_lease_token, routing_decision=route, timeout_seconds=25.)
-    preparer = Preparer(root=tmp_path, repository=repository, authorizer=SimpleNamespace(),
-        verifier=Verifier(), artifact_repository=InMemoryArtifactRepository())
-    with (bind_execution_authority(context, worker_id=record.worker_id),
+        execution_token=record.worker_lease_token, routing_decision=_freeze_object(route, name='test routing'), timeout_seconds=25.)
+    preparer = Preparer(root=tmp_path, repository=cast(RunRepository, repository), authorizer=cast(HarnessToolGateway, SimpleNamespace()),
+        verifier=cast(ProjectVerificationService, Verifier()), artifact_repository=InMemoryArtifactRepository())
+    with (bind_execution_authority(context, worker_id=cast(str, record.worker_id)),
           pytest.raises(ProjectVerificationError) as caught):
         await preparer(context)
     error = caught.value
@@ -168,6 +185,7 @@ async def test_actual_broker_client_original_project_failure(tmp_path, monkeypat
     from agent_hub.runs.self_repair import SelfRepairPolicy, classify_terminal_run
     decision = classify_terminal_run(status=RunStatus.FAILED, mode=TaskMode.DISCUSS,
         routing_decision=route, events=(event,), policy=SelfRepairPolicy(enabled=True))
+    decision = cast(SelfRepairDecision, decision)
     assert decision.skip_reason == 'project_verification_no_safe_recovery'
     assert decision.error_code == payload['error_code']
     assert decision.automatic_execution is False and decision.recovery_strategy is None
@@ -176,38 +194,38 @@ async def test_actual_broker_client_original_project_failure(tmp_path, monkeypat
     before = len(actions)
     again = await broker_api.handle_resolution_preparation(case.broker, active,
         peer_uid=case.broker.policy.allowed_uid)
-    assert again.state == 'unknown' and again.diagnostic.code == 'metadata_prepare_consumed'
+    assert again.state == 'unknown' and cast(protocol.ResolutionFailureDiagnostic, again.diagnostic).code == 'metadata_prepare_consumed'
     assert len(actions) == before
 
 
 @pytest.mark.parametrize('bad', ['wrong_key', 'success', 'private', 'extra', 'bool', 'oversize'])
-async def test_broker_rejects_untrusted_failure_output(tmp_path, monkeypatch, bad):
+async def test_broker_rejects_untrusted_failure_output(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, bad: str) -> None:
     case = native.portable_broker(tmp_path, monkeypatch, 'execution', 2, False)
-    request = native.request()
+    request = resolution_request()
     payload = {'state': 'unknown', 'key': request.key, 'diagnostic': diagnostic().model_dump()}
     if bad == 'wrong_key': payload['key'] = 'a'*64
     elif bad == 'success': payload['state'] = 'published'
-    elif bad == 'extra': payload['diagnostic']['secret'] = 'PRIVATE'
-    elif bad == 'bool': payload['diagnostic']['exit_code'] = True
+    elif bad == 'extra': cast(dict[str, object], payload['diagnostic'])['secret'] = 'PRIVATE'
+    elif bad == 'bool': cast(dict[str, object], payload['diagnostic'])['exit_code'] = True
     import json
     stdout = 'PRIVATE' if bad == 'private' else json.dumps(payload)
     if bad == 'oversize': stdout += ' ' * 4096
-    async def child(*args, **kwargs):
+    async def child(*args: object, **kwargs: object) -> SkillResult:
         return SkillResult(exit_code=2, timed_out=False, stdout=stdout, stderr='PRIVATE')
     monkeypatch.setattr(broker_api, 'run_subprocess_with_limits', child)
     result = await broker_api.handle_resolution_preparation(case.broker, request,
         peer_uid=case.broker.policy.allowed_uid)
-    assert result.state == 'unknown' and result.diagnostic.code == 'metadata_prepare_unavailable'
+    assert result.state == 'unknown' and cast(protocol.ResolutionFailureDiagnostic, result.diagnostic).code == 'metadata_prepare_unavailable'
     assert 'PRIVATE' not in result.model_dump_json()
 
 
 @pytest.mark.parametrize('defect', ['extra', 'bool', 'code', 'retryable'])
-def test_event_rejects_corrupted_resolution_diagnostic(defect):
+def test_event_rejects_corrupted_resolution_diagnostic(defect: str) -> None:
     from agent_hub.runtime.failure_reason import resolution_failure_payload
     payload = resolution_failure_payload(diagnostic())
-    if defect == 'extra': payload['resolution_failure']['secret'] = 'PRIVATE'
-    elif defect == 'bool': payload['resolution_failure']['exit_code'] = True
-    elif defect == 'code': payload['resolution_failure']['code'] = 'PRIVATE'
+    if defect == 'extra': cast(dict[str, object], payload['resolution_failure'])['secret'] = 'PRIVATE'
+    elif defect == 'bool': cast(dict[str, object], payload['resolution_failure'])['exit_code'] = True
+    elif defect == 'code': cast(dict[str, object], payload['resolution_failure'])['code'] = 'PRIVATE'
     else: payload['retryable'] = True
     with pytest.raises(ValueError):
         RunEvent(kind=EventKind.RUNTIME_FAILED, sequence=1, run_id=running_record().id,
@@ -215,7 +233,7 @@ def test_event_rejects_corrupted_resolution_diagnostic(defect):
 
 
 @pytest.mark.parametrize('known', [True, False])
-def test_registry_worker_main_only_emits_closed_failure(monkeypatch, capsys, known):
+def test_registry_worker_main_only_emits_closed_failure(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], known: bool) -> None:
     import io
     import time
 
@@ -223,15 +241,15 @@ def test_registry_worker_main_only_emits_closed_failure(monkeypatch, capsys, kno
     from agent_hub.skills.sandbox.python_registry_protocol import ResolutionError
 
     query = worker.MetadataReadRequest(name='setuptools', maximum=1024, deadline=time.monotonic()+20)
-    flags = {name: getattr(worker.sys.flags, name) for name in dir(worker.sys.flags) if not name.startswith('_')}
+    flags = {name: getattr(sys.flags, name) for name in dir(sys.flags) if not name.startswith('_')}
     flags.update(isolated=True, optimize=0)
-    monkeypatch.setattr(worker.sys, 'flags', SimpleNamespace(**flags))
-    monkeypatch.setattr(worker.sys, 'dont_write_bytecode', True)
-    monkeypatch.setattr(worker.sys, 'platform', 'linux')
-    monkeypatch.setattr(worker.os, 'geteuid', lambda: 10001, raising=False)
-    monkeypatch.setattr(worker.sys, 'argv', ['worker', '--metadata-worker'])
-    monkeypatch.setattr(worker.sys, 'stdin', SimpleNamespace(buffer=io.BytesIO(query.model_dump_json().encode())))
-    async def fail(request):
+    monkeypatch.setattr(sys, 'flags', SimpleNamespace(**flags))
+    monkeypatch.setattr(sys, 'dont_write_bytecode', True)
+    monkeypatch.setattr(sys, 'platform', 'linux')
+    monkeypatch.setattr(os, 'geteuid', lambda: 10001, raising=False)
+    monkeypatch.setattr(sys, 'argv', ['worker', '--metadata-worker'])
+    monkeypatch.setattr(sys, 'stdin', SimpleNamespace(buffer=io.BytesIO(query.model_dump_json().encode())))
+    async def fail(request: object) -> Never:
         if known: raise ResolutionError('registry_unavailable')
         raise ValueError('token=PRIVATE /private/source')
     monkeypatch.setattr(worker, 'read_metadata_snapshot', fail)
@@ -247,7 +265,7 @@ def test_registry_worker_main_only_emits_closed_failure(monkeypatch, capsys, kno
     ('valid', False, 'registry_unavailable'), ('invalid', False, 'registry_worker_unavailable'),
     ('valid', True, 'resolution_deadline'),
 ])
-async def test_fetch_unit_retains_leaf_only_after_confirmed_cleanup(monkeypatch, child_output, timed_out, want):
+async def test_fetch_unit_retains_leaf_only_after_confirmed_cleanup(monkeypatch: pytest.MonkeyPatch, child_output: str, timed_out: bool, want: str) -> None:
     import time
 
     from agent_hub.skills.sandbox import python_input_supply_worker as worker
@@ -257,9 +275,9 @@ async def test_fetch_unit_retains_leaf_only_after_confirmed_cleanup(monkeypatch,
         supply_configuration,
     )
 
-    request = native.request()
-    calls = []
-    async def run(command, *args, **kwargs):
+    request = resolution_request()
+    calls: list[Sequence[str]] = []
+    async def run(command: Sequence[str], *args: object, **kwargs: object) -> SkillResult:
         calls.append(command)
         if command[0].endswith('systemd-run'):
             return SkillResult(exit_code=None if timed_out else 2, timed_out=timed_out,
@@ -276,11 +294,11 @@ async def test_fetch_unit_retains_leaf_only_after_confirmed_cleanup(monkeypatch,
     assert 'PRIVATE' not in caught.value.diagnostic.model_dump_json()
 
 
-def test_resolution_worker_main_retains_leaf_without_root_io(tmp_path, monkeypatch, capsys):
+def test_resolution_worker_main_retains_leaf_without_root_io(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
     from agent_hub.skills.sandbox import broker, project_contract_broker
     from agent_hub.skills.sandbox import python_metadata_preparation_worker as native_worker
     worker = python_resolution_worker
-    request = native.request()
+    request = resolution_request()
     stage = tmp_path / 'stage'
     monkeypatch.setattr(native_worker, '_native', lambda: None)
     monkeypatch.setattr(native_worker, '_stage_identity', lambda *args: None)
@@ -295,7 +313,7 @@ def test_resolution_worker_main_retains_leaf_without_root_io(tmp_path, monkeypat
     monkeypatch.setattr(sys, 'flags', SimpleNamespace(**flags))
     monkeypatch.setattr(sys, 'dont_write_bytecode', True)
     monkeypatch.setattr(sys, 'argv', ['worker', '--stage', str(stage)])
-    async def fail(*args, **kwargs): raise protocol.ResolutionFailureError(diagnostic())
+    async def fail(*args: object, **kwargs: object) -> Never: raise protocol.ResolutionFailureError(diagnostic())
     monkeypatch.setattr(worker, 'execute_resolution', fail)
     assert worker.main() == 2
     streams = capsys.readouterr()
@@ -304,7 +322,7 @@ def test_resolution_worker_main_retains_leaf_without_root_io(tmp_path, monkeypat
     assert streams.err == 'resolution_unavailable\n'
 
 
-async def test_real_registry_reader_and_resolver_preserve_finite_leaf(monkeypatch):
+async def test_real_registry_reader_and_resolver_preserve_finite_leaf(monkeypatch: pytest.MonkeyPatch) -> None:
     import time
 
     from agent_hub.capabilities.python_dependency_resolution import resolve_dependencies
@@ -317,16 +335,16 @@ async def test_real_registry_reader_and_resolver_preserve_finite_leaf(monkeypatc
         supply_configuration,
     )
 
-    request = native.request()
+    request = resolution_request()
     leaf = diagnostic(code='registry_gzip_invalid')
-    calls = []
-    async def run(command, *args, **kwargs):
+    calls: list[Sequence[str]] = []
+    async def run(command: Sequence[str], *args: object, **kwargs: object) -> SkillResult:
         calls.append(command)
         if command[0].endswith('systemd-run'):
             return SkillResult(exit_code=2, timed_out=False, stdout=leaf.model_dump_json(), stderr='PRIVATE')
         return SkillResult(exit_code=0, timed_out=False, stdout=(
             'LoadState=not-found\nActiveState=inactive\nSubState=dead\nMainPID=0\nControlPID=0\nControlGroup=\nTasksCurrent=0\n'), stderr='')
-    async def no_wheel(*args): pytest.fail('failed metadata must not fetch wheels')
+    async def no_wheel(*args: object) -> Never: pytest.fail('failed metadata must not fetch wheels')
     monkeypatch.setattr(worker, 'run_subprocess_with_limits', run)
     reader = BrokerRegistryReader(request, BrokerPolicy(), configuration(), supply_configuration())
     with pytest.raises(protocol.ResolutionFailureError) as caught:
@@ -339,7 +357,7 @@ async def test_real_registry_reader_and_resolver_preserve_finite_leaf(monkeypatc
     assert calls[-1][1] == 'show'
 
 
-async def test_fail_run_real_sql_roundtrip_and_worker_ownership():
+async def test_fail_run_real_sql_roundtrip_and_worker_ownership() -> None:
     from uuid import uuid4
 
     from sqlalchemy import select, update
@@ -351,7 +369,7 @@ async def test_fail_run_real_sql_roundtrip_and_worker_ownership():
 
     record = running_record()
     context = TaskContext(run_id=record.id, tenant_id=record.tenant_id, request=record.request,
-        mode=record.mode, actor_id=record.actor_id, actor_role=record.actor_role, timeout_seconds=25.)
+        mode=cast(TaskMode, record.mode), actor_id=record.actor_id, actor_role=record.actor_role, timeout_seconds=25.)
     async with sql_repository(context) as (repository, factory, _engine):
         async with factory.begin() as session:
             await session.execute(update(RunRow).where(RunRow.id == record.id).values(

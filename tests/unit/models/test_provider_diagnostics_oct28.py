@@ -62,6 +62,9 @@ def test_final_shape_counts_do_not_retain_request_contents() -> None:
         "tool_count": 1, "tool_choice": "named", "schema_present": True,
         "native_continuation": True, "native_reasoning_present": True, "native_tool_call_count": 1,
         "output_token_parameter": "max_completion_tokens", "output_tokens": 321,
+        "last_role": "tool", "last_content_kind": "text", "last_content_empty": False, "last_assistant_prefix": False,
+        "empty_content_role_counts": {"system": 0, "developer": 0, "user": 0, "assistant": 0, "tool": 0},
+        "native_reasoning_field_count": 1, "empty_native_reasoning_field_count": 0,
     }
     original["max_completion_tokens"] = 999
     assert shape.output_tokens == 321

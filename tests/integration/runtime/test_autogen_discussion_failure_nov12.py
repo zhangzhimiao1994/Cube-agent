@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from decimal import Decimal
-from uuid import uuid4
+from typing import NoReturn
+from uuid import UUID, uuid4
 
 import pytest
 from autogen_core.models import UserMessage
+from autogen_core.tools import ToolSchema
 
 from agent_hub.models.gateway import GatewayCompletion
-from agent_hub.models.types import ModelResponse, TokenUsage, ToolCall
+from agent_hub.models.types import ModelRequest, ModelResponse, TokenUsage, ToolCall
 from agent_hub.runs.repository import _public_event_payload
 from agent_hub.runtime.autogen.adapter import (
     AutoGenDiscussionRuntime,
@@ -18,7 +21,7 @@ from agent_hub.runtime.autogen.adapter import (
     _DiscussionDurability,
 )
 from agent_hub.runtime.autogen.termination import DiscussionUsage
-from agent_hub.runtime.contracts import EventKind, RunEvent
+from agent_hub.runtime.contracts import Artifact, EventKind, JsonValue, RunEvent
 from tests.integration.runtime.test_autogen_adapter import ScriptedGateway, context, plan
 
 
@@ -28,9 +31,9 @@ from tests.integration.runtime.test_autogen_adapter import ScriptedGateway, cont
     ('unavailable_capability', 'model_response_validation'),
     ('type_error', 'model_client'),
 ])
-async def test_actual_framework_preserves_local_failure_without_another_attempt(kind, phase) -> None:
+async def test_actual_framework_preserves_local_failure_without_another_attempt(kind: str, phase: str) -> None:
     class Gateway(ScriptedGateway):
-        async def complete_with_context(self, request):
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
             self.requests.append(request)
             if len(self.requests) == 1:
                 response = ModelResponse(text='analyst', usage=TokenUsage(1, 1, 2))
@@ -49,10 +52,10 @@ async def test_actual_framework_preserves_local_failure_without_another_attempt(
     class Capabilities:
         calls = 0
 
-        def is_replay_safe(self, name):
+        def is_replay_safe(self, name: str) -> bool:
             return True
 
-        async def execute(self, **kwargs):
+        async def execute(self, **kwargs: object) -> Mapping[str, JsonValue]:
             self.calls += 1
             raise AssertionError('invalid/serialization result must not execute a tool')
 
@@ -78,19 +81,19 @@ async def test_actual_framework_preserves_local_failure_without_another_attempt(
 
 
 @pytest.mark.parametrize('kind', ['required_tool_missing', 'acceptance_write_missing'])
-async def test_required_tool_postcheck_preserves_known_succeeded_ledger_and_specific_kind(kind) -> None:
-    snapshots = []
-    artifacts = []
+async def test_required_tool_postcheck_preserves_known_succeeded_ledger_and_specific_kind(kind: str) -> None:
+    snapshots: list[tuple[JsonValue, ...]] = []
+    artifacts: list[Artifact] = []
 
-    async def publish(saved_artifacts, models, tools):
+    async def publish(saved_artifacts: tuple[Artifact, ...], models: tuple[Mapping[str, JsonValue], ...], tools: tuple[Mapping[str, JsonValue], ...]) -> None:
         snapshots.append(tuple(row['status'] for row in models))
         assert not tools
 
-    async def store(artifact):
+    async def store(artifact: Artifact) -> UUID:
         artifacts.append(artifact)
         return uuid4()
 
-    async def abort(write_id):
+    async def abort(write_id: UUID) -> NoReturn:
         raise AssertionError('known completed publication must not be aborted')
 
     durability = _DiscussionDurability(publish, store, abort, lambda _: None,
@@ -99,7 +102,7 @@ async def test_required_tool_postcheck_preserves_known_succeeded_ledger_and_spec
     class Gateway:
         calls = 0
 
-        async def complete_with_context(self, request):
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
             self.calls += 1
             assert request.required_tool == 'workspace_write_text'
             response = ModelResponse(text='safe text', usage=TokenUsage(1, 1, 2), tool_calls=(
@@ -114,7 +117,7 @@ async def test_required_tool_postcheck_preserves_known_succeeded_ledger_and_spec
     client = GatewayChatCompletionClient(gateway, 'shared', usage, supports_tool_calls=True,
         durability=durability, engineering_action=lambda _: 'workspace.write_text',
         engineering_budget=lambda: (100, 5.0), acceptance_first=kind == 'acceptance_write_missing')
-    schema = {'name': 'workspace.write_text', 'description': 'local probe',
+    schema: ToolSchema = {'name': 'workspace.write_text', 'description': 'local probe',
               'parameters': {'type': 'object', 'properties': {}, 'additionalProperties': True}, 'strict': False}
     with pytest.raises(RuntimeExecutionError):
         await client.create([UserMessage(content='safe', source='user')], tools=[schema])

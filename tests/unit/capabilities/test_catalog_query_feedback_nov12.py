@@ -3,10 +3,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import AsyncGenerator, Mapping
 from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
+from typing import NoReturn, cast
 from uuid import UUID
 
 import pytest
@@ -21,14 +23,15 @@ from agent_hub.domain.runs import TaskMode
 from agent_hub.harness.tool_gateway import HarnessToolGateway
 from agent_hub.harness.types import HarnessToolCallRequest
 from agent_hub.models.gateway import GatewayCompletion
-from agent_hub.models.types import ModelResponse, TokenUsage, ToolCall
+from agent_hub.models.types import ModelRequest, ModelResponse, TokenUsage, ToolCall
+from agent_hub.runs.repository import RunRecord
 from agent_hub.runtime.artifacts import ArtifactReference, InMemoryArtifactRepository
 from agent_hub.runtime.autogen.adapter import AutoGenDiscussionRuntime, DiscussionParticipant
 from agent_hub.runtime.autogen.engineering_delivery import (
     engineering_progress,
     engineering_work_progress,
 )
-from agent_hub.runtime.contracts import EventKind, RuntimeCheckpoint
+from agent_hub.runtime.contracts import Artifact, EventKind, JsonValue, RunEvent, RuntimeCheckpoint
 from agent_hub.runtime.engineering_actions import EngineeringProgress, required_engineering_action
 from tests.integration.runtime.test_autogen_adapter import ScriptedGateway, context, plan
 from tests.unit.capabilities.test_project_inspection import backend
@@ -43,13 +46,13 @@ from tests.unit.capabilities.test_scoped_read import (
 from tests.unit.harness.test_tool_gateway import FakePolicyGateway
 
 
-def request(arguments, *, key='catalog-query'):
+def request(arguments: Mapping[str, object], *, key: str='catalog-query') -> HarnessToolCallRequest:
     return HarnessToolCallRequest(run_id=RUN, actor='analyst', tool_name='project.inspect',
-                                  arguments=arguments, sandbox='read_only', approval_required=False,
+                                  arguments=cast(Mapping[str, JsonValue], arguments), sandbox='read_only', approval_required=False,
                                   idempotency_key=key)
 
 
-async def test_actual_harness_returns_bounded_rejection_and_accepts_explicit_fresh_inspection(tmp_path: Path):
+async def test_actual_harness_returns_bounded_rejection_and_accepts_explicit_fresh_inspection(tmp_path: Path) -> None:
     write_file(tmp_path / 'projects', f'{project_path()}/package.json', '{"dependencies":{}}')
     runtime = backend(tmp_path)
     harness = HarnessToolGateway(runtime)
@@ -67,7 +70,7 @@ async def test_actual_harness_returns_bounded_rejection_and_accepts_explicit_fre
 
     corrected = await harness.invoke(TENANT, request({}, key='fresh-catalog'))
     assert corrected.status == 'succeeded'
-    assert corrected.payload['scope']['run_id'] == str(RUN)
+    assert cast(Mapping[str, JsonValue], corrected.payload['scope'])['run_id'] == str(RUN)
     assert 'manifests' in corrected.payload
     assert 'kind' not in corrected.payload
 
@@ -76,9 +79,9 @@ async def test_actual_harness_returns_bounded_rejection_and_accepts_explicit_fre
     stored_run(tenant=OTHER), replace(stored_run(), id=OTHER),
     stored_run(project_id='../escape'), stored_run(requested_permissions=[]),
 ])
-async def test_invalid_query_never_masks_an_unauthorized_workspace(tmp_path: Path, record):
+async def test_invalid_query_never_masks_an_unauthorized_workspace(tmp_path: Path, record: RunRecord) -> None:
     class Repository:
-        async def get(self, tenant_id, run_id):
+        async def get(self, tenant_id: UUID, run_id: UUID) -> RunRecord:
             return record
 
     result = await HarnessToolGateway(backend(tmp_path, Repository())).invoke(
@@ -88,10 +91,10 @@ async def test_invalid_query_never_masks_an_unauthorized_workspace(tmp_path: Pat
     assert result.failure_reason == 'project inspection scope unavailable'
 
 
-async def test_unrelated_inspection_error_with_identical_text_still_fails_closed(tmp_path: Path, monkeypatch):
+async def test_unrelated_inspection_error_with_identical_text_still_fails_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     runtime = backend(tmp_path)
 
-    async def broken_profile(*args, **kwargs):
+    async def broken_profile(*args: object, **kwargs: object) -> NoReturn:
         raise ProjectInspectionError('python_catalog_query_invalid')
 
     monkeypatch.setattr(runtime, '_python_build_profile', broken_profile)
@@ -102,14 +105,14 @@ async def test_unrelated_inspection_error_with_identical_text_still_fails_closed
 
 
 @pytest.mark.parametrize('mode', tuple(TaskMode))
-async def test_all_run_modes_receive_the_same_central_rejection_observation(tmp_path: Path, mode):
+async def test_all_run_modes_receive_the_same_central_rejection_observation(tmp_path: Path, mode: TaskMode) -> None:
     row = stored_run()
     authoritative = SimpleNamespace(tenant_id=row.tenant_id, id=row.id,
         routing_decision=row.routing_decision, actor_id=row.actor_id, mode=mode)
 
     class Repository:
-        async def get(self, tenant_id, run_id):
-            return authoritative
+        async def get(self, tenant_id: UUID, run_id: UUID) -> RunRecord:
+            return cast(RunRecord, authoritative)
 
     runtime = backend(tmp_path, Repository())
     result = await HarnessToolGateway(runtime).invoke(TENANT, request({
@@ -120,7 +123,7 @@ async def test_all_run_modes_receive_the_same_central_rejection_observation(tmp_
     assert not (tmp_path / 'projects').exists(), 'Invalid query must not inspect or create a workspace'
 
 
-async def test_denied_permission_is_not_converted_to_query_feedback(tmp_path: Path):
+async def test_denied_permission_is_not_converted_to_query_feedback(tmp_path: Path) -> None:
     harness = HarnessToolGateway(backend(tmp_path),
         policy_gateway=FakePolicyGateway(CapabilityStatus.DENIED))
     result = await harness.invoke(TENANT, request({'python_catalog': {'catalog_sha256': 'invalid'}}),
@@ -130,10 +133,10 @@ async def test_denied_permission_is_not_converted_to_query_feedback(tmp_path: Pa
     assert not (tmp_path / 'projects').exists()
 
 
-async def test_uncertain_profile_exception_cannot_become_correctable_feedback(tmp_path: Path, monkeypatch):
+async def test_uncertain_profile_exception_cannot_become_correctable_feedback(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     runtime = backend(tmp_path)
 
-    async def unknown_profile(*args, **kwargs):
+    async def unknown_profile(*args: object, **kwargs: object) -> NoReturn:
         raise TimeoutError('synthetic SDK source token=DO-NOT-EXPORT')
 
     monkeypatch.setattr(runtime, '_python_build_profile', unknown_profile)
@@ -143,12 +146,12 @@ async def test_uncertain_profile_exception_cannot_become_correctable_feedback(tm
     assert 'DO-NOT-EXPORT' not in repr(result)
 
 
-async def test_query_feedback_never_reads_workspace_or_catalog_and_cannot_override_scope(tmp_path, monkeypatch):
+async def test_query_feedback_never_reads_workspace_or_catalog_and_cannot_override_scope(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from agent_hub.capabilities import project_inspection
 
     runtime = backend(tmp_path)
 
-    def forbidden_read(*args, **kwargs):
+    def forbidden_read(*args: object, **kwargs: object) -> NoReturn:
         pytest.fail('Rejected query must not observe workspace or catalog')
 
     monkeypatch.setattr(project_inspection, '_read_no_links', forbidden_read)
@@ -165,18 +168,18 @@ async def test_query_feedback_never_reads_workspace_or_catalog_and_cannot_overri
 @pytest.mark.parametrize('engineering', [False, True], ids=['complete-discussion', 'engineering-checkpoint'])
 async def test_real_autogen_can_correct_rejected_query_without_new_run_or_automatic_tool_retry(
     tmp_path: Path, engineering: bool,
-):
+) -> None:
     write_file(tmp_path / 'projects', f'{project_path()}/package.json', '{"dependencies":{}}')
     runtime = backend(tmp_path)
     harness = HarnessToolGateway(runtime, policy_gateway=FakePolicyGateway(CapabilityStatus.ALLOWED))
 
     class Gateway(ScriptedGateway):
-        def __init__(self):
+        def __init__(self) -> None:
             super().__init__([])
             self.actor_turn = 0
             self.correction_context = ''
 
-        async def complete_with_context(self, model_request):
+        async def complete_with_context(self, model_request: ModelRequest) -> GatewayCompletion:
             self.requests.append(model_request)
             if model_request.logical_model == 'selector':
                 response = ModelResponse(text='analyst', usage=TokenUsage(1, 1, 2))
@@ -209,7 +212,7 @@ async def test_real_autogen_can_correct_rejected_query_without_new_run_or_automa
              max_turns=4, wall_time_seconds=10), capability_gateway=runtime,
         harness_tool_gateway=harness, artifact_repository=repository)
     ctx = context(run_id=RUN, tenant_id=TENANT, actor_id=OTHER, actor_role=Role.OPERATOR,
-        routing_decision=({**stored_run().routing_decision,
+        routing_decision=({**cast(Mapping[str, object], stored_run().routing_decision),
                           'engineering_delivery_contract_version': 1, 'engineering_action_version': 1,
                           'engineering_progress_budget_version': 1,
                           'engineering_checkpoint_ack_version': 1, 'engineering_soft_admission_version': 1}
@@ -229,7 +232,7 @@ async def test_real_autogen_can_correct_rejected_query_without_new_run_or_automa
                     if engineering:
                         break  # Inspect continuation only; no fake write/verify/bundle delivery.
         finally:
-            await stream.aclose()
+            await cast(AsyncGenerator[RunEvent, None], stream).aclose()
     if not engineering:
         assert events[-1].kind is EventKind.RUNTIME_COMPLETED, [(e.kind, e.reason) for e in events[-5:]]
     assert not any(e.kind is EventKind.RUNTIME_FAILED for e in events), [(e.kind, e.reason) for e in events[-5:]]
@@ -238,17 +241,17 @@ async def test_real_autogen_can_correct_rejected_query_without_new_run_or_automa
     assert [e.tool_call_id for e in outcomes] == ['query-bad', 'query-corrected']
     assert corrected_checkpoint is not None
     checkpoint = RuntimeCheckpoint.from_payload(json.loads(json.dumps(corrected_checkpoint.to_payload())))
-    ledger = checkpoint.state['tool_ledger']
+    ledger = cast(tuple[Mapping[str, JsonValue], ...], checkpoint.state['tool_ledger'])
     assert len(ledger) == (2 if engineering else 1)
     assert all(row['status'] == 'succeeded' for row in ledger)
     assert len(observed_checkpoints) == 2
     assert all(e.run_id == RUN for e in events)
     assert gateway.actor_turn >= 2
-    assert len([row for row in checkpoint.state['model_ledger']
+    assert len([row for row in cast(tuple[Mapping[str, JsonValue], ...], checkpoint.state['model_ledger'])
                 if row.get('status') == 'succeeded']) <= ctx.token_budget // 2
     if engineering:
         artifacts = await repository.get_many(TENANT, RUN, tuple(
-            ArtifactReference(UUID(row['artifact_id']), row['artifact_sha256']) for row in ledger))
+            ArtifactReference(UUID(cast(str, row['artifact_id'])), cast(str, row['artifact_sha256'])) for row in ledger))
         tools = {'analyst': actor.allowed_tools}
         rejected_progress = engineering_progress(ctx, tool_entries=ledger[:1], artifacts=artifacts,
                                                  allowed_tools=tools)
@@ -270,7 +273,7 @@ async def test_real_autogen_can_correct_rejected_query_without_new_run_or_automa
 
 @pytest.mark.parametrize('engine', ['autogen', 'crew'])
 @pytest.mark.parametrize('defect', [None, 'extra', 'bool_version', 'performed', 'reason', 'hash', 'unknown'])
-def test_trusted_rejection_is_neutral_engineering_evidence(engine, defect):
+def test_trusted_rejection_is_neutral_engineering_evidence(engine: str, defect: str | None) -> None:
     from agent_hub.runtime.crew.engineering_delivery import engineering_action_progress
     from tests.unit.runtime.autogen.test_engineering_actions import action_context
     from tests.unit.runtime.autogen.test_engineering_delivery import append_result
@@ -285,7 +288,8 @@ def test_trusted_rejection_is_neutral_engineering_evidence(engine, defect):
         value['inspection_performed'] = True
     elif defect == 'reason':
         value['reason_code'] = 'other'
-    rows, artifacts = [], []
+    rows: list[dict[str, JsonValue]] = []
+    artifacts: list[Artifact] = []
     append_result(rows, artifacts, 'project.inspect', value)
     if defect == 'hash':
         rows[0]['artifact_sha256'] = '0' * 64
@@ -303,7 +307,7 @@ def test_trusted_rejection_is_neutral_engineering_evidence(engine, defect):
         artifact = Artifact(id=original.id, type=original.type, producer=original.producer,
             source_ids=(str(ctx.run_id),), content={**original.content, 'agent_id': 'engineer'})
         key = 'native-tool'
-        state = {'step_id': 'step', 'attempt': 0, 'round': 0, 'tool_index': 0,
+        state: dict[str, JsonValue] = {'step_id': 'step', 'attempt': 0, 'round': 0, 'tool_index': 0,
             'name': 'project.inspect', 'status': rows[0]['status'],
             'arguments_sha256': rows[0]['arguments_hash'], 'artifact_id': str(artifact.id),
             'sha256': '0' * 64 if defect == 'hash' else artifact.content_sha256}

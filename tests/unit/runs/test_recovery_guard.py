@@ -22,7 +22,13 @@ from agent_hub.runs.repository import (
     _is_self_repair_recovery_baseline_event_kind,
 )
 from agent_hub.runs.service import _execution_quiescence
-from agent_hub.runtime.contracts import EventKind, JsonValue, RunEvent, RuntimeCheckpoint
+from agent_hub.runtime.contracts import (
+    EventKind,
+    JsonValue,
+    RunEvent,
+    RuntimeCheckpoint,
+    TaskContext,
+)
 
 
 @dataclass(slots=True)
@@ -255,6 +261,7 @@ class _RecoveryBlockingRepository(RunRepository):
         run_id: UUID,
         event: RunEvent,
         routing_decision: Mapping[str, JsonValue] | None = None,
+        diagnostic_context: TaskContext | None = None,
     ) -> None:
         del session
         assert routing_decision is None, 'blocking recovery fixture must not persist a new route'

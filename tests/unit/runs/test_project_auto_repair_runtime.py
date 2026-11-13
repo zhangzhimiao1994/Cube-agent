@@ -270,7 +270,8 @@ class ContinuationRepository(RepairRepository):
         self._checkpoint = value
 
     async def persist_event(self, session: AsyncSession, *, tenant_id: UUID, run_id: UUID,
-                            event: RunEvent, routing_decision: Mapping[str, JsonValue] | None = None) -> None:
+                            event: RunEvent, routing_decision: Mapping[str, JsonValue] | None = None,
+                            diagnostic_context: TaskContext | None = None) -> None:
         await super().persist_event(session, tenant_id=tenant_id, run_id=run_id, event=event,
                                     routing_decision=routing_decision)
         if event.checkpoint is not None:

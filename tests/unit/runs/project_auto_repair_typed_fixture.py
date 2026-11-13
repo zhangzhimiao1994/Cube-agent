@@ -30,6 +30,7 @@ from agent_hub.runtime.contracts import (
     JsonValue,
     RunEvent,
     RuntimeCheckpoint,
+    TaskContext,
     _freeze_object,
 )
 from tests.unit.runs.test_terminal_hooks import ACTOR_ID, TENANT_ID
@@ -269,6 +270,7 @@ class RepairRepository(RunRepository):
         run_id: UUID,
         event: RunEvent,
         routing_decision: Mapping[str, JsonValue] | None = None,
+        diagnostic_context: TaskContext | None = None,
     ) -> None:
         del session, routing_decision
         assert tenant_id == TENANT_ID
@@ -304,6 +306,7 @@ class RepairRepository(RunRepository):
         reason: str,
         worker_id: str | None = None,
         worker_lease_token: UUID | None = None,
+        resolution_failure: object = None,
     ) -> RunRecord:
         del worker_id, worker_lease_token
         assert run_id == self.run_id

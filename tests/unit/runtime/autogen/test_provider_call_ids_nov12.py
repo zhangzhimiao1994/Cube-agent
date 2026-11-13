@@ -1,31 +1,42 @@
+from __future__ import annotations
+
 import asyncio
 import hashlib
 import json
-from collections.abc import Mapping
+from collections.abc import AsyncGenerator, Mapping
 from dataclasses import replace
 from decimal import Decimal
+from typing import TypedDict, Unpack, cast
+from uuid import UUID
 
 import pytest
 
-from agent_hub.harness.types import HarnessToolCallResult
+from agent_hub.auth.models import Role
+from agent_hub.harness.types import HarnessToolCallRequest, HarnessToolCallResult
 from agent_hub.models.gateway import GatewayCompletion
-from agent_hub.models.types import ModelResponse, TokenUsage, ToolCall
+from agent_hub.models.types import ModelRequest, ModelResponse, TokenUsage, ToolCall
 from agent_hub.runs.approval_checkpoint import checkpoint_waits_for_approval
 from agent_hub.runtime.autogen.adapter import (
     AutoGenDiscussionRuntime,
+    CapabilityGateway,
     DiscussionParticipant,
     RuntimeExecutionError,
     _pending_approval_call,
     _provider_call_id,
     _provider_call_ids,
 )
-from agent_hub.runtime.contracts import EventKind, RuntimeCheckpoint
+from agent_hub.runtime.contracts import EventKind, JsonValue, RunEvent, RuntimeCheckpoint
 from tests.integration.runtime.test_autogen_adapter import ScriptedGateway, context, plan
 from tests.unit.runtime.autogen.test_capability_approval_resume import (
     APPROVAL,
     RealDiscussionApproval,
 )
 from tests.unit.runtime.autogen.test_model_tool_bridge import _durability
+
+
+class _InvokeOptions(TypedDict, total=False):
+    user_id: UUID | None
+    role: Role | None
 
 
 def internal_id(identifier: str) -> str:
@@ -39,9 +50,9 @@ def internal_id(identifier: str) -> str:
     ('call_lower',), ('call_UpperAa09',), ('A' * 128,), ('call_Case', 'call_case'),
     ('Call_X', internal_id('Call_X')), ('call_lower', 'call_lower'),
 ])
-async def test_real_autogen_maps_provider_ids_through_harness(identifiers) -> None:
+async def test_real_autogen_maps_provider_ids_through_harness(identifiers: tuple[str, ...]) -> None:
     class Gateway(ScriptedGateway):
-        async def complete_with_context(self, request):
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
             self.requests.append(request)
             count = len(self.requests)
             response = ModelResponse(text='analyst' if request.logical_model == 'selector' else '[COMPLETE] verified',
@@ -55,13 +66,13 @@ async def test_real_autogen_maps_provider_ids_through_harness(identifiers) -> No
                 cost_usd=Decimal(0))
 
     class Harness:
-        def __init__(self):
-            self.calls = []
+        def __init__(self) -> None:
+            self.calls: list[HarnessToolCallRequest] = []
 
-        def is_replay_safe(self, name):
+        def is_replay_safe(self, name: str) -> bool:
             return True
 
-        async def invoke(self, tenant_id, request, **kwargs):
+        async def invoke(self, tenant_id: UUID, request: HarnessToolCallRequest, **kwargs: Unpack[_InvokeOptions]) -> HarnessToolCallResult:
             self.calls.append(request)
             return HarnessToolCallResult(call_id=request.call_id, tool_name=request.tool_name,
                                          status='succeeded', payload={'safe': True})
@@ -70,7 +81,7 @@ async def test_real_autogen_maps_provider_ids_through_harness(identifiers) -> No
     participant = DiscussionParticipant(id='analyst', role='Analyst', goal='Search',
                                        logical_model='shared', allowed_tools=('web.search',))
     runtime = AutoGenDiscussionRuntime(gateway, plan(selector_model='selector', participants=(participant, plan().participants[1])),
-                                      capability_gateway=harness, harness_tool_gateway=harness)
+                                      capability_gateway=cast(CapabilityGateway, harness), harness_tool_gateway=harness)
     async with asyncio.timeout(10):
         events = [event async for event in runtime.run(context())]
     if len(identifiers) == 2 and (identifiers[0] == identifiers[1]
@@ -90,16 +101,16 @@ async def test_real_autogen_maps_provider_ids_through_harness(identifiers) -> No
 
 async def test_real_approval_cold_resume_preserves_uppercase_call_id_without_new_model() -> None:
     class UppercaseApproval(RealDiscussionApproval):
-        requests_at_approved_verify = None
+        requests_at_approved_verify: int | None = None
 
-        async def complete_with_context(self, request):
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
             completion = await super().complete_with_context(request)
             if completion.response.tool_calls:
                 return replace(completion, response=replace(completion.response, tool_calls=tuple(
                     replace(call, id='Call_' + call.id) for call in completion.response.tool_calls)))
             return completion
 
-        async def invoke(self, tenant_id, request, **kwargs):
+        async def invoke(self, tenant_id: UUID, request: HarnessToolCallRequest, **kwargs: Unpack[_InvokeOptions]) -> HarnessToolCallResult:
             if self.approved and request.tool_name == 'project.verify':
                 self.requests_at_approved_verify = len(self.requests)
             return await super().invoke(tenant_id, request, **kwargs)
@@ -111,13 +122,13 @@ async def test_real_approval_cold_resume_preserves_uppercase_call_id_without_new
     assert checkpoint_waits_for_approval(saved, APPROVAL), [(e.kind, e.reason) for e in first[-3:]]
     artifacts = await case.runner._hydrate_checkpoint(saved, case.context)
     raw_ids = [call['id'] for artifact in artifacts if artifact.type == 'model_result'
-               for call in artifact.content.get('tool_calls', ())]
+               for call in cast(tuple[Mapping[str, JsonValue], ...], artifact.content.get('tool_calls', ()))]
     assert 'Call_actual-verify' in raw_ids
     assert internal_id('Call_actual-verify') not in raw_ids
     saved = RuntimeCheckpoint.from_payload(json.loads(json.dumps(saved.to_payload())))
     count = len(case.requests)
     case.approved = True
-    restored = AutoGenDiscussionRuntime(case, case.runner._plan, capability_gateway=case,
+    restored = AutoGenDiscussionRuntime(case, case.runner._plan, capability_gateway=cast(CapabilityGateway, case),
         harness_tool_gateway=case, artifact_repository=case.runner._repository)
     await restored.restore_checkpoint(saved)
     stream = restored.run(case.context.model_copy(update={'checkpoint': saved}))
@@ -132,7 +143,7 @@ async def test_real_approval_cold_resume_preserves_uppercase_call_id_without_new
                     succeeded = True
                     break
     finally:
-        await stream.aclose()
+        await cast(AsyncGenerator[RunEvent, None], stream).aclose()
     assert succeeded and case.executions == 1
     assert case.requests_at_approved_verify == count
     assert case.calls[-1].call_id == internal_id('Call_actual-verify')
@@ -140,7 +151,7 @@ async def test_real_approval_cold_resume_preserves_uppercase_call_id_without_new
 
 
 @pytest.mark.parametrize('identifier', [None, 1, '', ' padded', 'padded ', 'bad\nID', 'bad\x00ID', 'bad\x7fID', '\ud800', 'a' * 513])
-def test_invalid_provider_identifier_is_rejected(identifier) -> None:
+def test_invalid_provider_identifier_is_rejected(identifier: object) -> None:
     with pytest.raises(RuntimeExecutionError, match='provider tool call id is invalid'):
         _provider_call_id(identifier)
 
@@ -154,7 +165,7 @@ def test_mixed_passthrough_hash_collision_and_duplicate_ids_reject() -> None:
 
 
 @pytest.mark.parametrize('identifiers', [('Call_X', internal_id('Call_X')), ('call_lower', 'call_lower')])
-def test_pending_approval_rejects_complete_batch_canonical_collision(identifiers) -> None:
+def test_pending_approval_rejects_complete_batch_canonical_collision(identifiers: tuple[str, ...]) -> None:
     durable = _durability()
     completion = GatewayCompletion(response=ModelResponse(text=None, tool_calls=tuple(
         ToolCall(id=identifier, name='web_search', arguments={}) for identifier in identifiers),

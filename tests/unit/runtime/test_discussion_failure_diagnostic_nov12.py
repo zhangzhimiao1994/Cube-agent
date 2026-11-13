@@ -1,15 +1,16 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from types import MappingProxyType
 from uuid import uuid4
 
 import pytest
 
 from agent_hub.runs.repository import _public_event_payload
-from agent_hub.runtime.contracts import EventKind, RunEvent
+from agent_hub.runtime.contracts import EventKind, JsonValue, RunEvent
 
 
-def diagnostic(phase: str = 'model_response_validation', kind: str = 'tool_call_limit'):
+def diagnostic(phase: str = 'model_response_validation', kind: str = 'tool_call_limit') -> dict[str, JsonValue]:
     from agent_hub.runtime.failure_reason import discussion_failure_diagnostic
 
     return discussion_failure_diagnostic(phase=phase, kind=kind)
@@ -36,7 +37,7 @@ def test_discussion_diagnostic_frozen_event_json_and_public_roundtrip() -> None:
     {'discussion_failure_phase': True},
     {'api_key': 'PRIVATE_BODY'},
 ])
-def test_discussion_diagnostic_rejects_unknown_or_misbound_fields(change) -> None:
+def test_discussion_diagnostic_rejects_unknown_or_misbound_fields(change: Mapping[str, JsonValue]) -> None:
     payload = {**diagnostic(), **change}
     with pytest.raises(ValueError):
         RunEvent(kind=EventKind.RUNTIME_FAILED, sequence=1, run_id=uuid4(),

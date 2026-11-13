@@ -1,5 +1,7 @@
 """Real metadata HTTP framing/decompression over in-memory streams, never network."""
 
+from __future__ import annotations
+
 import asyncio
 import base64
 import gzip
@@ -46,6 +48,10 @@ class Writer:
         self.closed = True
 
 
+type TLSContext = ssl.SSLContext
+type Connection = tuple[asyncio.StreamReader, Writer, list[tuple[str, int, TLSContext, str]], TLSContext]
+
+
 def frame(raw: bytes, encoding: str, framing: str = "length") -> bytes:
     headers = (
         b"HTTP/1.1 200 OK\r\nContent-Type: application/vnd.pypi.simple.v1+json\r\n"
@@ -63,14 +69,14 @@ def frame(raw: bytes, encoding: str, framing: str = "length") -> bytes:
 
 
 @pytest.fixture
-async def connection(monkeypatch: pytest.MonkeyPatch, offline_network: None):
+async def connection(monkeypatch: pytest.MonkeyPatch, offline_network: None) -> Connection:
     stream = asyncio.StreamReader()
     writer = Writer()
-    calls = []
+    calls: list[tuple[str, int, TLSContext, str]] = []
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     monkeypatch.setattr(python_input_fetch, "_tls_context", lambda: context)
 
-    async def connect(address, port, *, ssl, server_hostname):
+    async def connect(address: str, port: int, *, ssl: TLSContext, server_hostname: str) -> tuple[asyncio.StreamReader, Writer]:
         calls.append((address, port, ssl, server_hostname))
         return stream, writer
 
@@ -81,7 +87,7 @@ async def connection(monkeypatch: pytest.MonkeyPatch, offline_network: None):
 @pytest.mark.parametrize("encoding", ["gzip", "identity"])
 @pytest.mark.parametrize("framing", ["length", "chunked", "eof"])
 async def test_metadata_returns_decoded_json_hash_with_normalized_headers(
-    connection, encoding: str, framing: str
+    connection: Connection, encoding: str, framing: str
 ) -> None:
     stream, writer, calls, context = connection
     raw = gzip.compress(DOCUMENT, mtime=0) if encoding == "gzip" else DOCUMENT
@@ -103,7 +109,7 @@ async def test_metadata_returns_decoded_json_hash_with_normalized_headers(
     assert writer.closed
 
 
-async def test_gzip_worker_snapshot_preserves_decoded_bytes_for_root_json_and_sha(connection) -> None:
+async def test_gzip_worker_snapshot_preserves_decoded_bytes_for_root_json_and_sha(connection: Connection) -> None:
     from agent_hub.skills.sandbox.python_registry_fetch import (
         MetadataReadRequest,
         read_metadata_snapshot,
@@ -125,7 +131,7 @@ async def test_gzip_worker_snapshot_preserves_decoded_bytes_for_root_json_and_sh
 
 @pytest.mark.parametrize("large_wire", [False, True])
 async def test_decoded_limit_and_multiblock_gzip_preserve_original_provenance_and_usage(
-    connection, large_wire: bool
+    connection: Connection, large_wire: bool
 ) -> None:
     if large_wire:
         document = json.dumps({"value": random.Random(0).randbytes(40_000).hex()}).encode()
@@ -148,7 +154,7 @@ async def test_decoded_limit_and_multiblock_gzip_preserve_original_provenance_an
 
 
 @pytest.mark.parametrize("fault", ["truncated", "crc", "trailing", "concatenated"])
-async def test_invalid_gzip_is_rejected_before_metadata_provenance(connection, fault: str) -> None:
+async def test_invalid_gzip_is_rejected_before_metadata_provenance(connection: Connection, fault: str) -> None:
     raw = gzip.compress(DOCUMENT, mtime=0)
     raw = {
         "truncated": raw[:-8],
@@ -166,7 +172,7 @@ async def test_invalid_gzip_is_rejected_before_metadata_provenance(connection, f
 
 
 @pytest.mark.parametrize("framing", ["length", "chunked", "eof"])
-async def test_compressed_bomb_never_escapes_decoded_limit(connection, framing: str) -> None:
+async def test_compressed_bomb_never_escapes_decoded_limit(connection: Connection, framing: str) -> None:
     stream, _, _, _ = connection
     stream.feed_data(frame(gzip.compress(b"x" * 100_000, mtime=0), "gzip", framing))
     stream.feed_eof()
@@ -178,7 +184,7 @@ async def test_compressed_bomb_never_escapes_decoded_limit(connection, framing: 
 
 
 @pytest.mark.parametrize("framing", ["length", "chunked", "eof"])
-async def test_wire_limit_is_enforced_independently_of_decoded_limit(connection, framing: str) -> None:
+async def test_wire_limit_is_enforced_independently_of_decoded_limit(connection: Connection, framing: str) -> None:
     stream, _, _, _ = connection
     # Incompressible wire is larger than the 1024-byte decoded payload.
     raw = gzip.compress(random.Random(0).randbytes(1024), mtime=0)
@@ -193,7 +199,7 @@ async def test_wire_limit_is_enforced_independently_of_decoded_limit(connection,
 
 
 @pytest.mark.parametrize("encoding", ["br", "deflate", "gzip, identity"])
-async def test_unnegotiated_metadata_encoding_is_rejected(connection, encoding: str) -> None:
+async def test_unnegotiated_metadata_encoding_is_rejected(connection: Connection, encoding: str) -> None:
     stream, _, _, _ = connection
     stream.feed_data(frame(DOCUMENT, encoding))
     stream.feed_eof()
@@ -205,7 +211,7 @@ async def test_unnegotiated_metadata_encoding_is_rejected(connection, encoding: 
 
 @pytest.mark.parametrize("cancel", [False, True])
 async def test_original_deadline_or_cancellation_closes_partial_body_without_retry(
-    connection, cancel: bool
+    connection: Connection, cancel: bool
 ) -> None:
     stream, writer, calls, _ = connection
     raw = gzip.compress(DOCUMENT, mtime=0)
@@ -221,7 +227,7 @@ async def test_original_deadline_or_cancellation_closes_partial_body_without_ret
     assert dict(budget.usage) == {"requests": 1}
 
 
-async def test_wheel_transport_still_rejects_gzip_and_keeps_identity_request(connection) -> None:
+async def test_wheel_transport_still_rejects_gzip_and_keeps_identity_request(connection: Connection) -> None:
     stream, writer, _, _ = connection
     stream.feed_data(frame(gzip.compress(DOCUMENT, mtime=0), "gzip"))
     stream.feed_eof()

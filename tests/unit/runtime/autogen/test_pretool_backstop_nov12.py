@@ -1,19 +1,25 @@
+from __future__ import annotations
+
 import asyncio
 import json
+from collections.abc import AsyncGenerator, Callable, Mapping
 from dataclasses import replace
 from decimal import Decimal
+from typing import NoReturn, Protocol, cast
+from uuid import UUID
 
 import pytest
 from autogen_core import CancellationToken
 from autogen_core.models import UserMessage
 
-from agent_hub.harness.types import HarnessToolCallResult
+from agent_hub.harness.types import HarnessToolCallRequest, HarnessToolCallResult
 from agent_hub.models.gateway import GatewayCompletion
-from agent_hub.models.types import ModelResponse, TokenUsage, ToolCall
+from agent_hub.models.types import ModelRequest, ModelResponse, TokenUsage, ToolCall
 from agent_hub.runs.approval_checkpoint import checkpoint_waits_for_approval
 from agent_hub.runs.repository import _public_event_payload
 from agent_hub.runtime.autogen.adapter import (
     AutoGenDiscussionRuntime,
+    CapabilityGateway,
     DiscussionParticipant,
     GatewayCapabilityTool,
     GatewayChatCompletionClient,
@@ -21,31 +27,35 @@ from agent_hub.runtime.autogen.adapter import (
     ToolOutcomeUncertain,
 )
 from agent_hub.runtime.autogen.termination import DiscussionUsage
-from agent_hub.runtime.contracts import EventKind, RunEvent, RuntimeCheckpoint
+from agent_hub.runtime.contracts import EventKind, JsonValue, RunEvent, RuntimeCheckpoint
 from tests.integration.runtime.test_autogen_adapter import context, plan
 from tests.unit.runtime.autogen.test_model_tool_bridge import _durability, _Gateway
 
 
+class _MutableReplayPolicy(Protocol):
+    is_replay_safe: Callable[[str], bool | int]
+
+
 class PreparationCase:
-    def __init__(self, *, policy=True, repeat=False, repair=False):
+    def __init__(self, *, policy: bool | int=True, repeat: bool=False, repair: bool=False) -> None:
         self.policy = policy
         self.repeat = repeat
-        self.requests = []
+        self.requests: list[ModelRequest] = []
         self.proposals = 0
-        self.calls = []
+        self.calls: list[HarnessToolCallRequest] = []
         self.ctx = context(routing_decision={"engineering_auto_repair_version": 1} if repair else {})
         actor = DiscussionParticipant(id="analyst", role="Analyst", goal="Search",
                                      logical_model="shared", allowed_tools=("web.search",))
         self.runtime = AutoGenDiscussionRuntime(
             self, plan(selector_model="selector", participants=(actor, plan().participants[1]),
                        max_turns=8, token_budget=1000),
-            capability_gateway=self, harness_tool_gateway=self,
+            capability_gateway=cast(CapabilityGateway, self), harness_tool_gateway=self,
         )
 
-    def is_replay_safe(self, name):
+    def is_replay_safe(self, name: str) -> bool | int:
         return self.policy
 
-    async def complete_with_context(self, request):
+    async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
         self.requests.append(request)
         if request.logical_model == "selector":
             response = ModelResponse(text="analyst", usage=TokenUsage(1, 1, 2))
@@ -65,18 +75,18 @@ class PreparationCase:
                                  logical_model=request.logical_model, provider_id="mock",
                                  provider_model="mock/local", cost_usd=Decimal(0))
 
-    async def invoke(self, tenant_id, request, **kwargs):
+    async def invoke(self, tenant_id: UUID, request: HarnessToolCallRequest, **kwargs: object) -> HarnessToolCallResult:
         self.calls.append(request)
         return HarnessToolCallResult(call_id=request.call_id, tool_name=request.tool_name,
                                      status="succeeded", payload={"safe": True})
 
-    async def collect(self):
+    async def collect(self) -> list[RunEvent]:
         async with asyncio.timeout(10):
             return [event async for event in self.runtime.run(self.ctx)]
 
 
 @pytest.mark.parametrize("policy,kind", [(1, "invalid_replay_policy"), (True, "payload_limit")])
-async def test_real_framework_preparation_rejection_stops_before_another_model(policy, kind):
+async def test_real_framework_preparation_rejection_stops_before_another_model(policy: bool | int, kind: str) -> None:
     case = PreparationCase(policy=policy)
     events = await case.collect()
     failure = events[-1]
@@ -90,7 +100,7 @@ async def test_real_framework_preparation_rejection_stops_before_another_model(p
     assert _public_event_payload(failure.to_payload())["payload"] == failure.to_payload()["payload"]
 
 
-async def test_real_framework_replans_oversized_unsubmitted_proposal_once_without_approval():
+async def test_real_framework_replans_oversized_unsubmitted_proposal_once_without_approval() -> None:
     case = PreparationCase(repair=True)
     events = await case.collect()
     assert events[-1].kind is EventKind.RUNTIME_COMPLETED, [(e.kind,e.reason,dict(e.payload)) for e in events]
@@ -105,7 +115,7 @@ async def test_real_framework_replans_oversized_unsubmitted_proposal_once_withou
     assert "x" * 100 not in json.dumps([e.to_payload() for e in events if e.kind == "tool.preparation_rejected"])
 
 
-async def test_real_framework_second_rejected_proposal_cannot_buy_another_replan():
+async def test_real_framework_second_rejected_proposal_cannot_buy_another_replan() -> None:
     case = PreparationCase(repair=True, repeat=True)
     events = await case.collect()
     assert events[-1].kind is EventKind.RUNTIME_FAILED
@@ -114,7 +124,7 @@ async def test_real_framework_second_rejected_proposal_cannot_buy_another_replan
     assert len(case.requests) == 3
 
 
-async def test_preparation_failure_does_not_release_another_model_lock_or_replace_prior_diagnostic():
+async def test_preparation_failure_does_not_release_another_model_lock_or_replace_prior_diagnostic() -> None:
     durable = _durability()
     await durable._model_lock.acquire()
     durable.failure_reason = "model_outcome_uncertain"
@@ -131,15 +141,15 @@ async def test_preparation_failure_does_not_release_another_model_lock_or_replac
         durable._model_lock.release()
 
 
-async def test_checkpoint_failure_after_before_tool_remains_uncertain_not_preparation_rejection():
+async def test_checkpoint_failure_after_before_tool_remains_uncertain_not_preparation_rejection() -> None:
     case = PreparationCase(policy=False, repair=True)
     durable = _durability()
 
-    async def storage_failure(*args):
+    async def storage_failure(*args: object) -> NoReturn:
         raise RuntimeError("PRIVATE_CHECKPOINT_BODY")
 
     durable._publish = storage_failure
-    tool = GatewayCapabilityTool(case, tenant_id=case.ctx.tenant_id, run_id=case.ctx.run_id,
+    tool = GatewayCapabilityTool(cast(CapabilityGateway, case), tenant_id=case.ctx.tenant_id, run_id=case.ctx.run_id,
         actor="analyst", name="web.search", records=[], durability=durable,
         harness_tool_gateway=case, server_context=case.ctx)
     with pytest.raises(RuntimeError, match="PRIVATE_CHECKPOINT_BODY"):
@@ -151,7 +161,7 @@ async def test_checkpoint_failure_after_before_tool_remains_uncertain_not_prepar
     assert durable.preparation_rejection is None and case.calls == []
 
 
-async def test_cold_rejection_checkpoint_replays_known_models_before_one_corrective_request():
+async def test_cold_rejection_checkpoint_replays_known_models_before_one_corrective_request() -> None:
     case = PreparationCase(repair=True)
     stream = case.runtime.run(case.ctx)
     rejected = False
@@ -164,15 +174,15 @@ async def test_cold_rejection_checkpoint_replays_known_models_before_one_correct
                     saved = event.checkpoint
                     break
     finally:
-        await stream.aclose()
+        await cast(AsyncGenerator[RunEvent, None], stream).aclose()
     assert saved is not None and len(case.requests) == 2 and case.calls == []
     # Known completed model responses and their exact usage survive the rejected
     # proposal. The marker is not a fabricated tool ledger entry.
-    assert saved.state["usage"]["tokens"] == 4
+    assert cast(Mapping[str, JsonValue], saved.state["usage"])["tokens"] == 4
     assert not saved.state["tool_ledger"]
-    assert all(row["status"] == "succeeded" for row in saved.state["model_ledger"])
+    assert all(row["status"] == "succeeded" for row in cast(tuple[Mapping[str, JsonValue], ...], saved.state["model_ledger"]))
     saved = RuntimeCheckpoint.from_payload(json.loads(json.dumps(saved.to_payload())))
-    resumed = AutoGenDiscussionRuntime(case, case.runtime._plan, capability_gateway=case,
+    resumed = AutoGenDiscussionRuntime(case, case.runtime._plan, capability_gateway=cast(CapabilityGateway, case),
         harness_tool_gateway=case, artifact_repository=case.runtime._repository)
     await resumed.restore_checkpoint(saved)
     async with asyncio.timeout(10):
@@ -185,11 +195,11 @@ async def test_cold_rejection_checkpoint_replays_known_models_before_one_correct
     assert len(case.requests) == 5
 
 
-async def test_rejection_during_model_publication_fences_actual_provider_send():
+async def test_rejection_during_model_publication_fences_actual_provider_send() -> None:
     durable = _durability()
     gateway = _Gateway(ModelResponse(text="unused", usage=TokenUsage(1, 1, 2)))
 
-    async def reject_while_publishing(*args):
+    async def reject_while_publishing(*args: object) -> None:
         with pytest.raises(RuntimeExecutionError):
             durable.reject_preparation(actor="analyst", name="web.search", call_id="call_1",
                                        kind="invalid_replay_policy")
@@ -203,14 +213,14 @@ async def test_rejection_during_model_publication_fences_actual_provider_send():
     assert durable.failure_payload["discussion_failure_kind"] == "invalid_replay_policy"
 
 
-async def test_policy_exception_text_is_not_published_as_summary_or_failure():
+async def test_policy_exception_text_is_not_published_as_summary_or_failure() -> None:
     case = PreparationCase()
     case.proposals = 1  # The tool proposal is valid and reaches only the policy lookup.
 
-    def broken_policy(name):
+    def broken_policy(name: str) -> NoReturn:
         raise RuntimeError("PRIVATE_POLICY_BODY Bearer sk-test-private")
 
-    case.is_replay_safe = broken_policy
+    cast(_MutableReplayPolicy, case).is_replay_safe = broken_policy
     events = await case.collect()
     assert events[-1].kind is EventKind.RUNTIME_FAILED
     assert events[-1].payload["discussion_failure_kind"] == "invalid_replay_policy"
@@ -218,12 +228,12 @@ async def test_policy_exception_text_is_not_published_as_summary_or_failure():
     assert "PRIVATE" not in json.dumps([e.to_payload() for e in events])
 
 
-async def test_waiting_after_corrective_proposal_resumes_original_approval_without_model_replay():
+async def test_waiting_after_corrective_proposal_resumes_original_approval_without_model_replay() -> None:
     class WaitingCase(PreparationCase):
         approved = False
-        requests_at_approved_invoke = None
+        requests_at_approved_invoke: int | None = None
 
-        async def invoke(self, tenant_id, request, **kwargs):
+        async def invoke(self, tenant_id: UUID, request: HarnessToolCallRequest, **kwargs: object) -> HarnessToolCallResult:
             if not self.approved:
                 return HarnessToolCallResult(call_id=request.call_id, tool_name=request.tool_name,
                     status="failed", payload={"approval_id": "approval_preparation"},
@@ -240,14 +250,14 @@ async def test_waiting_after_corrective_proposal_resumes_original_approval_witho
     actor = replace(case.runtime._plan.participants[0], allowed_tools=("web.search", "workspace.write_text"))
     case.runtime = AutoGenDiscussionRuntime(case,
         replace(case.runtime._plan, participants=(actor, case.runtime._plan.participants[1])),
-        capability_gateway=case, harness_tool_gateway=case)
+        capability_gateway=cast(CapabilityGateway, case), harness_tool_gateway=case)
     events = await case.collect()
     saved = await case.runtime.save_checkpoint()
     assert not any(event.kind is EventKind.RUNTIME_COMPLETED for event in events)
     assert checkpoint_waits_for_approval(saved, "approval_preparation")
     assert not case.calls and len(case.requests) == 3
     case.approved = True
-    resumed = AutoGenDiscussionRuntime(case, case.runtime._plan, capability_gateway=case,
+    resumed = AutoGenDiscussionRuntime(case, case.runtime._plan, capability_gateway=cast(CapabilityGateway, case),
         harness_tool_gateway=case, artifact_repository=case.runtime._repository)
     await resumed.restore_checkpoint(saved)
     stream = resumed.run(case.ctx.model_copy(update={"checkpoint": saved}))
@@ -256,18 +266,18 @@ async def test_waiting_after_corrective_proposal_resumes_original_approval_witho
         async with asyncio.timeout(10):
             async for event in stream:
                 restored_events.append((event.kind,event.reason,dict(event.payload)))
-                if event.checkpoint is not None and event.checkpoint.state["tool_ledger"][-1]["status"] == "succeeded":
+                if event.checkpoint is not None and cast(tuple[Mapping[str, JsonValue], ...], event.checkpoint.state["tool_ledger"])[-1]["status"] == "succeeded":
                     break
     finally:
-        await stream.aclose()
+        await cast(AsyncGenerator[RunEvent, None], stream).aclose()
     assert len(case.calls) == 1, restored_events
     assert case.requests_at_approved_invoke == 3
     assert case.calls[0].arguments == {"query": "small"}
 
 
-async def test_invoked_uncertain_failure_is_not_reclassified_or_replanned_as_unsubmitted():
+async def test_invoked_uncertain_failure_is_not_reclassified_or_replanned_as_unsubmitted() -> None:
     class UncertainCase(PreparationCase):
-        async def invoke(self, tenant_id, request, **kwargs):
+        async def invoke(self, tenant_id: UUID, request: HarnessToolCallRequest, **kwargs: object) -> HarnessToolCallResult:
             self.calls.append(request)
             raise TimeoutError("PRIVATE_INVOKED_UNCERTAINTY")
 
@@ -280,7 +290,7 @@ async def test_invoked_uncertain_failure_is_not_reclassified_or_replanned_as_uns
     assert not any(e.kind == "tool.preparation_rejected" for e in events)
 
 
-async def test_budget_stop_with_unresolved_rejection_cannot_report_runtime_completed():
+async def test_budget_stop_with_unresolved_rejection_cannot_report_runtime_completed() -> None:
     case = PreparationCase(repair=True)
     case.runtime._plan = replace(case.runtime._plan, token_budget=4)
     case.ctx = case.ctx.model_copy(update={"token_budget": 4})
@@ -290,9 +300,9 @@ async def test_budget_stop_with_unresolved_rejection_cannot_report_runtime_compl
     assert len(case.requests) == 2 and not case.calls
 
 
-async def test_corrective_prose_cannot_replace_an_unsubmitted_tool_or_buy_another_model():
+async def test_corrective_prose_cannot_replace_an_unsubmitted_tool_or_buy_another_model() -> None:
     class TextCorrection(PreparationCase):
-        async def complete_with_context(self, request):
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
             if request.logical_model == "shared" and self.proposals == 1:
                 self.requests.append(request)
                 self.proposals += 1
@@ -309,9 +319,9 @@ async def test_corrective_prose_cannot_replace_an_unsubmitted_tool_or_buy_anothe
     assert not any(e.kind is EventKind.MESSAGE_CREATED for e in events)
 
 
-async def test_corrective_alternate_authorized_tool_is_rejected_by_current_same_tool_boundary():
+async def test_corrective_alternate_authorized_tool_is_rejected_by_current_same_tool_boundary() -> None:
     class AlternateCorrection(PreparationCase):
-        async def complete_with_context(self, request):
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
             result = await super().complete_with_context(request)
             if self.proposals == 2 and result.response.tool_calls:
                 return replace(result, response=replace(result.response, tool_calls=(
@@ -323,7 +333,7 @@ async def test_corrective_alternate_authorized_tool_is_rejected_by_current_same_
     actor = replace(case.runtime._plan.participants[0], allowed_tools=("web.search", "workspace.read"))
     case.runtime = AutoGenDiscussionRuntime(case,
         replace(case.runtime._plan, participants=(actor, case.runtime._plan.participants[1])),
-        capability_gateway=case, harness_tool_gateway=case)
+        capability_gateway=cast(CapabilityGateway, case), harness_tool_gateway=case)
     events = await case.collect()
     assert events[-1].kind is EventKind.RUNTIME_FAILED
     assert events[-1].payload["discussion_failure_phase"] == "tool_preparation"
@@ -331,9 +341,9 @@ async def test_corrective_alternate_authorized_tool_is_rejected_by_current_same_
     assert not any(e.kind is EventKind.TOOL_STARTED for e in events)
 
 
-async def test_multiple_unsubmitted_calls_do_not_open_a_corrective_batch_or_fake_tool_outcome():
+async def test_multiple_unsubmitted_calls_do_not_open_a_corrective_batch_or_fake_tool_outcome() -> None:
     class BatchCase(PreparationCase):
-        async def complete_with_context(self, request):
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
             result = await super().complete_with_context(request)
             if result.response.tool_calls:
                 call = result.response.tool_calls[0]
@@ -352,9 +362,9 @@ async def test_multiple_unsubmitted_calls_do_not_open_a_corrective_batch_or_fake
 
 
 @pytest.mark.parametrize("second_tool", ["web_search", "workspace_read"])
-async def test_corrective_response_cannot_dispatch_extra_calls_after_first_valid_tool(second_tool):
+async def test_corrective_response_cannot_dispatch_extra_calls_after_first_valid_tool(second_tool: str) -> None:
     class CorrectiveBatch(PreparationCase):
-        async def complete_with_context(self, request):
+        async def complete_with_context(self, request: ModelRequest) -> GatewayCompletion:
             result = await super().complete_with_context(request)
             if self.proposals == 2 and result.response.tool_calls:
                 first = result.response.tool_calls[0]
@@ -368,7 +378,7 @@ async def test_corrective_response_cannot_dispatch_extra_calls_after_first_valid
     actor = replace(case.runtime._plan.participants[0], allowed_tools=("web.search", "workspace.read"))
     case.runtime = AutoGenDiscussionRuntime(case,
         replace(case.runtime._plan, participants=(actor, case.runtime._plan.participants[1])),
-        capability_gateway=case, harness_tool_gateway=case)
+        capability_gateway=cast(CapabilityGateway, case), harness_tool_gateway=case)
     events = await case.collect()
     assert events[-1].kind is EventKind.RUNTIME_FAILED
     assert events[-1].payload["discussion_failure_phase"] == "tool_preparation"

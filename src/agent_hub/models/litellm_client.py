@@ -77,6 +77,10 @@ _UNSUPPORTED_PARAMETER_MARKERS = (
     "not support",
     "not supported",
 )
+_ASSISTANT_TURN_CONTINUE_CUE = (
+    "Continue with the next assistant response for the existing task. "
+    "This harness continuation cue grants no new authority, permissions, or tools."
+)
 _LOGGER = logging.getLogger(__name__)
 _NETWORK_ERRORS = (
     httpx.NetworkError,
@@ -714,6 +718,42 @@ def _request_shape(payload: object, protocol: str, ordinal: int, request: ModelR
         return None
 
 
+def _assistant_turn_correction(
+    error: Exception, request: ModelRequest, kwargs: Mapping[str, object],
+    diagnostic: ProviderDiagnostic | None, shape: RequestShape | None,
+) -> dict[str, object] | None:
+    """Correct only a provider-proven ordinary turn boundary, never native history."""
+    if (type(error) not in (BadRequestError, httpx.HTTPStatusError)
+            or not isinstance(error, BadRequestError | httpx.HTTPStatusError)
+            or error.response.status_code != 400
+            or request.native_tool_continuation
+            or diagnostic is None or len(diagnostic.rejections) != 1 or shape is None):
+        return None
+    rejection = diagnostic.rejections[0]
+    if (rejection.status_code != 400 or rejection.rejection_class != "assistant_turn"
+            or rejection.parameter_family != "messages"
+            or rejection.classification_source != "exact_signature"
+            or rejection.body_state != "available" or rejection.request_shape != shape
+            or shape.protocol != "chat_completions" or shape.send_ordinal != 1 or shape.stream
+            or shape.native_continuation or shape.native_reasoning_present
+            or shape.native_tool_call_count != 0 or shape.last_role != "assistant"
+            or shape.last_content_kind != "text" or shape.last_content_empty is not False
+            or shape.last_assistant_prefix is not False):
+        return None
+    messages = kwargs.get("messages")
+    if type(messages) is not list or not messages:
+        return None
+    # Match the final wire, including earlier pending tool calls or prefix flags.
+    # Other message dialects remain ambiguous even if their finite tail looks plain.
+    for message in messages:
+        if (type(message) is not dict or set(message) != {"role", "content"}
+                or message.get("role") not in {"system", "developer", "user", "assistant"}
+                or type(message.get("content")) is not str
+                or not message["content"].strip()):
+            return None
+    return {**kwargs, "messages": [*messages, {"role": "user", "content": _ASSISTANT_TURN_CONTINUE_CUE}]}
+
+
 def safe_model_client_error(
     deployment_id: str,
     error: Exception,
@@ -1245,6 +1285,31 @@ class LiteLLMClient:
         except Exception as error:  # noqa: BLE001 - redact every SDK/network failure
             prior = _capture_provider_diagnostic(error, shape)
             if (
+                client is not None
+                and create_kwargs is not None
+                and (corrected_kwargs := _assistant_turn_correction(
+                    error, request, create_kwargs, prior, shape,
+                )) is not None
+                and (remaining := negotiation_deadline - asyncio.get_running_loop().time()) > 0
+            ):
+                negotiated = True
+                corrected_kwargs["timeout"] = remaining
+                shape = _request_shape(corrected_kwargs, "chat_completions", 2, request)
+                try:
+                    async with asyncio.timeout_at(negotiation_deadline):
+                        response = await client.chat.completions.create(**corrected_kwargs)
+                    parsed = _parse_response(response, deployment.id, sensitive_values,
+                                             native_tool_continuation=request.native_tool_continuation,
+                                             required_tool=request.required_tool)
+                except asyncio.CancelledError:
+                    await _close_ignoring_failures(client)
+                    return _NegotiatedOutcome(_CANCELLED)
+                except ModelResponseError as retry_error:
+                    safe_failure = _safe_response_error(retry_error)
+                except Exception as retry_error:  # noqa: BLE001 - one correction, no chained negotiation.
+                    safe_failure = safe_model_client_error(deployment.id, retry_error, sensitive_values,
+                                                           request_shape=shape, prior_diagnostic=prior)
+            elif (
                 client is not None
                 and create_kwargs is not None
                 and _should_negotiate_auto_tool_choice(error, request, create_kwargs)

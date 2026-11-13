@@ -9,11 +9,11 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import AsyncIterator, Mapping
-from contextlib import asynccontextmanager
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any
+from typing import Any, Protocol, cast
 from uuid import UUID
 
 import pytest
@@ -30,11 +30,12 @@ from agent_hub.models.run_admission_repository import RunAdmissionRepository
 from agent_hub.models.types import Deployment
 from agent_hub.runs import service as service_module
 from agent_hub.runs.authorization import _capture_authenticated_input
+from agent_hub.runs.repository import RunRepository
 from agent_hub.runs.service import RunService
-from agent_hub.runtime.contracts import RunEvent, TaskContext
+from agent_hub.runtime.contracts import ExecutionRuntime, RunEvent, TaskContext
 from agent_hub.runtime.defaults import ConfigBackedDiscussionRuntime, _deployments
 from agent_hub.runtime.registry import RuntimeRegistry
-from agent_hub.runtime.review_assembly import ReviewExecution
+from agent_hub.runtime.review_assembly import ReviewAssemblyBroker, ReviewExecution
 from tests.integration.capabilities.test_review_repository import (
     database_url as database_url,  # noqa: PLC0414
 )
@@ -59,6 +60,13 @@ SOFT = 3.0
 RELEASE_AFTER_SOFT = 4.0
 
 
+class _WorkerEvents(Protocol):
+    def __call__(self, runtime: ExecutionRuntime, context: TaskContext, *,
+                 worker_id: str | None = None, review_broker: ReviewAssemblyBroker | None = None,
+                 run_repository: RunRepository | None = None,
+                 ) -> AbstractAsyncContextManager[AsyncIterator[RunEvent]]: ...
+
+
 class LocalQueue:
     """RunService's queue seam; no Celery/broker or second execution is launched."""
 
@@ -73,7 +81,7 @@ def remaining_context(context: TaskContext, *, forged: bool) -> TaskContext:
     if forged:
         # Persisted claim is operator/explicit. A context-only promotion must
         # not turn that into an authenticated scale-soft policy.
-        route = dict(payload["routing_decision"])
+        route = dict(cast(Mapping[str, object], payload["routing_decision"]))
         route["runtime_timeout_source"] = "project_scale_soft_budget"
         route["engineering_soft_admission_version"] = 1
         payload["routing_decision"] = route
@@ -136,7 +144,7 @@ async def test_claimed_factory_capacity_crosses_only_trusted_soft_boundary(
         sandbox_profile=body.sandbox_profile,
         requested_permissions=body.requested_permissions,
         permission_mode=body.permission_mode,
-        execution_backend=body.execution_backend,
+        execution_backend=cast(str, body.execution_backend),
         runtime_timeout_seconds=body.runtime_timeout_seconds,
         authenticated_input=evidence,
     )
@@ -176,7 +184,7 @@ async def test_claimed_factory_capacity_crosses_only_trusted_soft_boundary(
             queued.set()
         return result
 
-    real_worker = service_module.worker_runtime_events
+    real_worker = cast(_WorkerEvents, vars(service_module)["worker_runtime_events"])
     real_prepare = case.broker.prepare
 
     async def observe_prepare(context: TaskContext, *, worker_id: str) -> ReviewExecution | None:

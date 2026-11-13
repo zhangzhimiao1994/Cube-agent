@@ -1,4 +1,5 @@
 """Finite model-selection diagnostics never derive authority from framework text."""
+from collections.abc import Mapping
 from uuid import uuid4
 
 import pytest
@@ -57,7 +58,7 @@ def test_untrusted_metadata_cannot_mint_model_or_capability_claims(logical_model
     assert helper(ValueError("no capable deployment for logical model qwen: text, tool_calling")) == {}
 
 
-def _event(payload: dict[str, object]) -> RunEvent:
+def _event(payload: Mapping[str, object]) -> RunEvent:
     return RunEvent.model_validate({
         "kind": EventKind.RUNTIME_FAILED, "sequence": 1, "run_id": uuid4(),
         "reason": "model gateway failed: no capable deployment", "payload": payload,

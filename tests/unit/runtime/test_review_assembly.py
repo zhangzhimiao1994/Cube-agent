@@ -335,7 +335,7 @@ async def test_same_run_reentry_and_unknown_never_refill_or_extend(tmp_path: Pat
 
 async def scale_soft_scope_fixture(tmp_path: Path, mode: TaskMode) -> AssemblyFixture:
     f = await fixture(tmp_path, mode=mode)
-    route = {
+    route: dict[str, object] = {
         **f.s.task.routing_decision,
         "runtime_timeout_source": "project_scale_soft_budget",
         "runtime_timeout_seconds": 1.0,
@@ -432,7 +432,7 @@ async def test_physical_scope_deadline_keeps_short_limit_without_matching_claims
 ) -> None:
     mode = TaskMode.DISCUSS if change.startswith("discuss_") else TaskMode.DIRECT
     f = await scale_soft_scope_fixture(tmp_path, mode)
-    persisted = dict(f.s.task.routing_decision)
+    persisted: dict[str, object] = dict(f.s.task.routing_decision)
     route = dict(persisted)
     if change == "operator":
         route["runtime_timeout_source"] = persisted["runtime_timeout_source"] = "operator"
