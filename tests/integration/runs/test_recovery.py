@@ -1567,7 +1567,12 @@ async def test_persistent_hermes_runtime_outcome_is_scheduler_observation(
     assert payload["category"] == "scheduler"
     assert payload["conversation_id"] == "conv-scheduler-observe"
     assert payload["run_id"] == str(run_id)
-    conversation_payload = next(payload for payload in payloads if payload["category"] == "conversation")
+    conversation_payload = next(
+        payload
+        for payload in payloads
+        if payload["id"] == f"hermes_conversation_{run_id.hex}"
+    )
+    assert conversation_payload["category"] == "conversation"
     assert conversation_payload["outcome"] == "failure"
     assert conversation_payload["target"] == "learning_ledger"
 
@@ -1605,7 +1610,12 @@ async def test_persistent_hermes_completed_run_also_records_conversation_memory(
     payloads = [dict(row.payload) for row in rows]
     categories = {payload["category"] for payload in payloads}
     assert categories == {"scheduler", "conversation"}
-    conversation_payload = next(payload for payload in payloads if payload["category"] == "conversation")
+    conversation_payload = next(
+        payload
+        for payload in payloads
+        if payload["id"] == f"hermes_conversation_{run_id.hex}"
+    )
+    assert conversation_payload["category"] == "conversation"
     assert conversation_payload["id"] == f"hermes_conversation_{run_id.hex}"
     assert conversation_payload["conversation_id"] == "conv-learns-after-clear"
     assert conversation_payload["run_id"] == str(run_id)
@@ -1650,6 +1660,7 @@ async def test_persistent_hermes_records_scheduler_notice_details(
                 select(AdminResourceRow)
                 .where(AdminResourceRow.tenant_id == tenant_id)
                 .where(AdminResourceRow.kind == "hermes")
+                .order_by(AdminResourceRow.resource_id)
             )
         ).scalars().all()
 
@@ -1663,9 +1674,36 @@ async def test_persistent_hermes_records_scheduler_notice_details(
     assert isinstance(tags, list)
     assert "reschedule_or_reassign_model" in tags
     assert "planner" in tags
-    conversation_payload = next(payload for payload in payloads if payload["category"] == "conversation")
+    conversation_payload = next(
+        payload
+        for payload in payloads
+        if payload["id"] == f"hermes_conversation_{run_id.hex}"
+    )
+    assert conversation_payload["category"] == "conversation"
     assert conversation_payload["outcome"] == "failure"
     assert conversation_payload["target"] == "learning_ledger"
+    assert conversation_payload["memory_type"] == "conversation_outcome_summary"
+    assert conversation_payload["run_id"] == str(run_id)
+    assert conversation_payload["conversation_id"] == "conv-scheduler-notice"
+    assert conversation_payload["confirmed_at"] is None
+    candidate_payload = next(
+        payload
+        for payload in payloads
+        if payload["id"] == f"hermes_candidate_recovery_{run_id.hex}"
+    )
+    assert candidate_payload["id"] != conversation_payload["id"]
+    assert candidate_payload["category"] == "conversation"
+    assert candidate_payload["outcome"] == "failure"
+    assert candidate_payload["target"] == "main_agent"
+    assert candidate_payload["memory_type"] == "error_handling"
+    assert candidate_payload["candidate_source"] == "scheduler_review"
+    assert candidate_payload["run_id"] == str(run_id)
+    assert candidate_payload["conversation_id"] == "conv-scheduler-notice"
+    assert candidate_payload["owner_actor_id"] == str(actor_id)
+    assert candidate_payload["requires_approval"] is True
+    assert candidate_payload["activation_status"] == "pending_approval"
+    assert candidate_payload["auto_activate"] is False
+    assert candidate_payload["confirmed_at"] is None
 
 
 async def test_persistent_hermes_runtime_advice_uses_only_confirmed_lessons(
