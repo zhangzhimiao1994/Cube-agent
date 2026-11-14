@@ -54,15 +54,46 @@ class PhaseError(RuntimeError):
     """Phase rejection with no raw paths or project exception messages."""
 
 
+class _TestResultFailed(PhaseError):
+    """The real unittest runner returned an unsuccessful result."""
+
+
 class _WheelMetadata(TypedDict):
     filename: str
     sha256: str
     size: int
 
 
-def _need(condition: object) -> None:
+def _need(condition: object, *, error: type[PhaseError] = PhaseError) -> None:
     if not condition:
-        raise PhaseError('phase_failed')
+        raise error('phase_failed')
+
+
+def _write_phase_failure(phase: str, error: Exception) -> None:
+    """Finite cause only; the parent still bounds and sanitizes native stderr."""
+    causes = {
+        ModuleNotFoundError: ('test_import', 'import_error', 'ModuleNotFoundError'),
+        ImportError: ('test_import', 'import_error', 'ImportError'),
+        SyntaxError: ('phase_execution', 'syntax_error', 'SyntaxError'),
+        AssertionError: ('phase_execution', 'assertion_error', 'AssertionError'),
+        _TestResultFailed: ('test_execution', 'test_result_failed', 'PhaseError'),
+        PhaseError: ('phase_guard', 'phase_guard', 'PhaseError'),
+        TypeError: ('phase_execution', 'type_error', 'TypeError'),
+        ValueError: ('phase_execution', 'value_error', 'ValueError'),
+        RuntimeError: ('phase_execution', 'runtime_error', 'RuntimeError'),
+        FileNotFoundError: ('phase_execution', 'os_error', 'FileNotFoundError'),
+        PermissionError: ('phase_execution', 'os_error', 'PermissionError'),
+        OSError: ('phase_execution', 'os_error', 'OSError'),
+    }
+    try:
+        stage, cause, kind = causes.get(type(error), ('phase_execution', 'unknown', 'Other'))
+        if phase != 'test' and stage in {'test_import', 'test_execution'}:
+            stage = 'phase_execution'
+        record = {'phase': phase if phase in _PHASES else 'unknown',
+                  'stage': stage, 'cause': cause, 'exception_type': kind}
+        sys.stderr.write('PYTHON_PHASE_FAILURE ' + json.dumps(record, sort_keys=True) + '\n')
+    except Exception:  # noqa: BLE001 - optional diagnostics never replace the primary failure.
+        return
 
 
 def _isolation_guard() -> None:
@@ -522,7 +553,8 @@ def _test(module_name: str, *, generated_manifest_sha256: str | None = None) -> 
             count = suite.countTestCases()
             _need(count > 0)
             result = unittest.TextTestRunner(stream=sys.stderr, verbosity=1).run(suite)
-            _need(result.testsRun == count and result.wasSuccessful())
+            _need(result.testsRun == count)
+            _need(result.wasSuccessful(), error=_TestResultFailed)
             count = result.testsRun
     finally:
         sys.path[:] = previous
@@ -579,7 +611,8 @@ def run_phase(phase: str, *, import_module: str,
             else:
                 metadata = _test(import_module, generated_manifest_sha256=generated_manifest_sha256)
         return {'phase': phase, 'evidence': 'native_process_only', **metadata}
-    except Exception:  # noqa: BLE001 - never expose backend/process exception text.
+    except Exception as error:  # noqa: BLE001 - never expose backend/process exception text.
+        _write_phase_failure(phase, error)
         raise PhaseError('phase_failed') from None
 
 

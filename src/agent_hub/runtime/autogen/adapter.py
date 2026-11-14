@@ -2280,7 +2280,7 @@ class GatewayCapabilityTool(BaseTool[_DynamicToolArguments, _DynamicToolResult])
                     name=self.name, status="failed", result=draft_feedback,
                     artifact_id=str(artifact.id), replay_safe=replay_safe,
                     failure_kind="capability_failed",
-                ), reason=REJECTION_REASON,
+                ), artifact=artifact, reason=REJECTION_REASON,
             ))
             assert self._server_context is not None
             if _draft_observation_repeated(artifact, self._durability.artifacts, context=self._server_context):
@@ -2312,6 +2312,7 @@ class GatewayCapabilityTool(BaseTool[_DynamicToolArguments, _DynamicToolResult])
                         failure_kind="capability_failed",
                     ),
                     reason=tool_result.failure_reason or "process execution failed",
+                    artifact=artifact,
                 ))
                 raise _ExecutionObservationError(execution_failure)
             reusable_result = reusable_generated_file_result(
@@ -2459,6 +2460,7 @@ class GatewayChatCompletionClient(ChatCompletionClient):
         tool_correction_enabled: bool = False,
         admitted_tool_correction: bool = False,
         engineering_context_compaction: bool = False,
+        engineering_role_turn: bool = False,
         input_projection: Callable[[ModelRequest, Mapping[str, str], tuple[int, ...], str | None], ModelRequest] | None = None,
         actor: str | None = None,
     ) -> None:
@@ -2481,6 +2483,7 @@ class GatewayChatCompletionClient(ChatCompletionClient):
         self._tool_correction_enabled = tool_correction_enabled
         self._admitted_tool_correction = admitted_tool_correction is True
         self._engineering_context_compaction = engineering_context_compaction is True
+        self._engineering_role_turn = engineering_role_turn is True
         self._input_projection = input_projection
         self._input_task_positions: tuple[int, ...] = ()
         self._actual = RequestUsage(prompt_tokens=0, completion_tokens=0)
@@ -2526,6 +2529,14 @@ class GatewayChatCompletionClient(ChatCompletionClient):
         model_tools, tool_names = _model_tool_definitions(tools if tool_choice == "auto" else ())
         if json_output not in {None, False}:
             raise RuntimeExecutionError("unsupported AutoGen model request")
+        turn_messages = self._engineering_turn_messages(messages)
+        saved_turn_messages = None
+        if (self._durability is not None
+                and self._durability._model_cursor < len(self._durability.model_entries)):
+            if turn_messages is not messages:
+                saved_turn_messages = turn_messages
+        else:
+            messages = turn_messages
         if self._report_evidence is not None:
             messages = (*messages, UserMessage(content=self._report_evidence(), source="agent_hub"))
         if len(messages) > self._compaction_window.absolute_safety_limit:
@@ -2563,6 +2574,17 @@ class GatewayChatCompletionClient(ChatCompletionClient):
             max_output_tokens=self._max_output_tokens,
             tools=model_tools,
         )
+        saved_turn_request = None
+        if (saved_turn_messages is not None
+                and len(saved_turn_messages) <= self._compaction_window.absolute_safety_limit):
+            saved_compacted = _compact_llm_messages(saved_turn_messages,
+                window=self._compaction_window, preserve_tool_pairs=self._engineering_context_compaction)
+            if len(saved_compacted) <= self._compaction_window.allowed_messages:
+                saved_turn_request = (
+                    replace(request, messages=tuple(self._message(m) for m in saved_compacted)),
+                    tuple(i for i, m in enumerate(saved_compacted)
+                          if isinstance(m, UserMessage) and m.source == "user"),
+                )
         if self._bounded_no_tool:
             if model_tools or self._engineering_action is not None:
                 raise RuntimeExecutionError("final report cannot invoke tools")
@@ -2584,6 +2606,10 @@ class GatewayChatCompletionClient(ChatCompletionClient):
         action = self._engineering_action(False) if self._engineering_action is not None else None
         if action is not None:
             request, tool_names = self._required_request(request, tool_names, action)
+            if saved_turn_request is not None:
+                candidate, positions = saved_turn_request
+                candidate, _ = self._required_request(candidate, tool_names, action)
+                saved_turn_request = candidate, positions
         if legacy_messages is not None and self._durability is not None:
             legacy = replace(request, messages=tuple(self._message(message) for message in legacy_messages))
             if action is not None:
@@ -2591,7 +2617,8 @@ class GatewayChatCompletionClient(ChatCompletionClient):
             saved = self._durability.model_entries[self._durability._model_cursor]
             if saved.get("request_hash") == self._durability.request_hash(legacy, tool_names=tool_names):
                 request = legacy
-        completion, usage = await self._complete_model_request(request, tool_names, cancellation_token)
+        completion, usage = await self._complete_model_request(request, tool_names, cancellation_token,
+                                                              saved_turn_request=saved_turn_request)
         response = completion.response
         if not response.tool_calls and self._engineering_action is not None:
             action = self._engineering_action(True)
@@ -2638,6 +2665,48 @@ class GatewayChatCompletionClient(ChatCompletionClient):
             raise RuntimeExecutionError("model response is invalid")
         return CreateResult(finish_reason=finish_reason, content=content, usage=usage, cached=False,
                             thought=(response.text or None) if response.tool_calls else None)
+
+    def _engineering_turn_messages(
+        self, messages: Sequence[LLMMessage],
+    ) -> Sequence[LLMMessage]:
+        """Start an ordinary role turn explicitly, before fitting/admission/hash.
+
+        This is orchestration, not another user task or permission grant. Saved
+        requests (including UNKNOWN) are selected only by their original hash;
+        native history and pending calls retain their original identities.
+        """
+        if (not self._engineering_role_turn or self._bounded_no_tool
+                or self._actor is None or not messages):
+            return messages
+        tail = messages[-1]
+        if (type(tail) is not AssistantMessage or tail.source != self._actor
+                or type(tail.content) is not str or not tail.content):
+            return messages
+        pending: set[str] = set()
+        for message in messages:
+            if type(message) is AssistantMessage:
+                # Our bridge stores ordinary accompanying tool text as thought.
+                # A plain assistant thought is ambiguous and remains untouched.
+                if type(message.content) is str and message.thought is not None:
+                    return messages
+                if type(message.content) is list:
+                    for call in message.content:
+                        if not call.id or call.id in pending:
+                            return messages
+                        pending.add(call.id)
+            elif type(message) is FunctionExecutionResultMessage:
+                for result in message.content:
+                    if result.call_id not in pending:
+                        return messages
+                    pending.remove(result.call_id)
+            elif type(message) not in (SystemMessage, UserMessage):
+                return messages
+        if pending:
+            return messages
+        return (*messages, UserMessage(
+            source="agent_hub", content="Harness orchestration: continue this engineering role turn "
+            "from the existing user task and recorded evidence. This cue grants no new "
+            "authorization, permissions, tools, or budget."))
 
     def _required_request(
         self, request: ModelRequest, tool_names: Mapping[str, str], action: str,
@@ -2686,10 +2755,22 @@ class GatewayChatCompletionClient(ChatCompletionClient):
     async def _complete_model_request(
         self, request: ModelRequest, tool_names: Mapping[str, str],
         cancellation_token: CancellationToken | None,
+        *, saved_turn_request: tuple[ModelRequest, tuple[int, ...]] | None = None,
     ) -> tuple[GatewayCompletion, RequestUsage]:
         if self._input_projection is not None:
             request = self._input_projection(request, tool_names, self._input_task_positions, self._actor)
         request = self._fit_context_request(request, tool_names)
+        durable = self._durability
+        if (saved_turn_request is not None and durable is not None
+                and durable._model_cursor < len(durable.model_entries)):
+            saved_hash = durable.model_entries[durable._model_cursor].get("request_hash")
+            if durable.request_hash(request, tool_names=tool_names) != saved_hash:
+                candidate, positions = saved_turn_request
+                if self._input_projection is not None:
+                    candidate = self._input_projection(candidate, tool_names, positions, self._actor)
+                candidate = self._fit_context_request(candidate, tool_names)
+                if durable.request_hash(candidate, tool_names=tool_names) == saved_hash:
+                    request = candidate
         try:
             return await self._complete_model_attempt(request, tool_names, cancellation_token)
         except _StoppedModelResponse as stopped:
@@ -3622,6 +3703,7 @@ class AutoGenDiscussionRuntime:
                     tool_correction_enabled=corrections and participant.id == owner,
                     admitted_tool_correction=soft_admission and participant.id == owner,
                     engineering_context_compaction=soft_admission or self._handoff_context_version == 1,
+                    engineering_role_turn=engineering,
                     input_projection=project_handoff if self._handoff_context_version == 1 else None,
                 )
                 for participant in self._plan.participants
@@ -3721,11 +3803,20 @@ class AutoGenDiscussionRuntime:
                             tool_call_id=record.call_id,
                             tool_name=record.name,
                             payload=record.payload,
-                            artifact=record.artifact,
+                            artifact=None if record.kind is EventKind.TOOL_FAILED else record.artifact,
                             reason=record.reason,
                         )
                     )
                     sequence += 1
+                    if record.kind is EventKind.TOOL_FAILED and record.artifact is not None:
+                        events.append(RunEvent(
+                            kind=EventKind.ARTIFACT_CREATED,
+                            sequence=sequence,
+                            run_id=context.run_id,
+                            actor=record.actor,
+                            artifact=record.artifact,
+                        ))
+                        sequence += 1
                 return tuple(events)
 
             def participant_tools(
