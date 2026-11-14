@@ -97,3 +97,66 @@ def test_phase_cause_never_reflects_error_text_paths_or_custom_class_names(
     assert set(record) == {'phase', 'stage', 'cause', 'exception_type'}
     assert len(captured.err.encode()) <= 512
     assert 'SECRET_PATH' not in captured.err and 'SupplierSecretFailure' not in captured.err
+
+
+def test_cause_dispatch_never_hashes_or_compares_unknown_exception_class(
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    from agent_hub.skills.sandbox.python_project_phase import _write_phase_failure
+
+    calls: list[str] = []
+
+    class SupplierMeta(type):
+        def __hash__(cls) -> int:
+            calls.append('hash')
+            return hash(RuntimeError)
+
+        def __eq__(cls, other: object) -> bool:
+            calls.append('eq')
+            return cls is other
+
+    class SupplierError(Exception, metaclass=SupplierMeta):
+        def __str__(self) -> str:
+            calls.append('str')
+            return 'password=DO_NOT_REFLECT'
+
+    error = SupplierError()
+    calls.clear()
+    _write_phase_failure('test', error)
+    captured = capfd.readouterr()
+    assert calls == []
+    assert cause_record(captured.err)['cause'] == 'unknown'
+    assert 'SupplierError' not in captured.err and 'DO_NOT_REFLECT' not in captured.err
+
+
+def test_phase_subclass_is_rejected_without_hash_equality_or_string_hooks(
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    from agent_hub.skills.sandbox.python_project_phase import _write_phase_failure
+
+    calls: list[str] = []
+
+    class SupplierPhase(str):
+        def __hash__(self) -> int:
+            calls.append('hash')
+            return str.__hash__(self)
+
+        def __eq__(self, other: object) -> bool:
+            calls.append('eq')
+            return str.__eq__(self, other)
+
+        def __ne__(self, other: object) -> bool:
+            calls.append('ne')
+            return str.__ne__(self, other)
+
+        def __str__(self) -> str:
+            calls.append('str')
+            return 'password=DO_NOT_REFLECT'
+
+    phase = SupplierPhase('test')
+    calls.clear()
+    _write_phase_failure(phase, RuntimeError())
+    captured = capfd.readouterr()
+    assert calls == []
+    assert cause_record(captured.err)['phase'] == 'unknown'
+    assert 'DO_NOT_REFLECT' not in captured.err

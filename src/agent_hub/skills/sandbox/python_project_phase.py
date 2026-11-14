@@ -71,25 +71,30 @@ def _need(condition: object, *, error: type[PhaseError] = PhaseError) -> None:
 
 def _write_phase_failure(phase: str, error: Exception) -> None:
     """Finite cause only; the parent still bounds and sanitizes native stderr."""
-    causes = {
-        ModuleNotFoundError: ('test_import', 'import_error', 'ModuleNotFoundError'),
-        ImportError: ('test_import', 'import_error', 'ImportError'),
-        SyntaxError: ('phase_execution', 'syntax_error', 'SyntaxError'),
-        AssertionError: ('phase_execution', 'assertion_error', 'AssertionError'),
-        _TestResultFailed: ('test_execution', 'test_result_failed', 'PhaseError'),
-        PhaseError: ('phase_guard', 'phase_guard', 'PhaseError'),
-        TypeError: ('phase_execution', 'type_error', 'TypeError'),
-        ValueError: ('phase_execution', 'value_error', 'ValueError'),
-        RuntimeError: ('phase_execution', 'runtime_error', 'RuntimeError'),
-        FileNotFoundError: ('phase_execution', 'os_error', 'FileNotFoundError'),
-        PermissionError: ('phase_execution', 'os_error', 'PermissionError'),
-        OSError: ('phase_execution', 'os_error', 'OSError'),
-    }
+    causes = (
+        (ModuleNotFoundError, ('test_import', 'import_error', 'ModuleNotFoundError')),
+        (ImportError, ('test_import', 'import_error', 'ImportError')),
+        (SyntaxError, ('phase_execution', 'syntax_error', 'SyntaxError')),
+        (AssertionError, ('phase_execution', 'assertion_error', 'AssertionError')),
+        (_TestResultFailed, ('test_execution', 'test_result_failed', 'PhaseError')),
+        (PhaseError, ('phase_guard', 'phase_guard', 'PhaseError')),
+        (TypeError, ('phase_execution', 'type_error', 'TypeError')),
+        (ValueError, ('phase_execution', 'value_error', 'ValueError')),
+        (RuntimeError, ('phase_execution', 'runtime_error', 'RuntimeError')),
+        (FileNotFoundError, ('phase_execution', 'os_error', 'FileNotFoundError')),
+        (PermissionError, ('phase_execution', 'os_error', 'PermissionError')),
+        (OSError, ('phase_execution', 'os_error', 'OSError')),
+    )
     try:
-        stage, cause, kind = causes.get(type(error), ('phase_execution', 'unknown', 'Other'))
-        if phase != 'test' and stage in {'test_import', 'test_execution'}:
+        stage, cause, kind = 'phase_execution', 'unknown', 'Other'
+        for known, evidence in causes:
+            if type(error) is known:
+                stage, cause, kind = evidence
+                break
+        safe_phase = phase if type(phase) is str and phase in _PHASES else 'unknown'
+        if safe_phase != 'test' and stage in {'test_import', 'test_execution'}:
             stage = 'phase_execution'
-        record = {'phase': phase if phase in _PHASES else 'unknown',
+        record = {'phase': safe_phase,
                   'stage': stage, 'cause': cause, 'exception_type': kind}
         sys.stderr.write('PYTHON_PHASE_FAILURE ' + json.dumps(record, sort_keys=True) + '\n')
     except Exception:  # noqa: BLE001 - optional diagnostics never replace the primary failure.
