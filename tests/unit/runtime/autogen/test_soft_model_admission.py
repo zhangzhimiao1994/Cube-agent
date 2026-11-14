@@ -39,13 +39,14 @@ TOOLS = ("project.inspect", "workspace.list", "workspace.write_text", "project.v
 
 class Journey:
     def __init__(self, *, policy: JsonValue = 1, source: str = "project_scale_soft_budget",
-                 blocked: bool = False, slow_selector: bool = False, slow_inspect: bool = False) -> None:
+                 blocked: bool = False, slow_selector: bool = False, slow_inspect: bool = False,
+                 soft_seconds: float = 0.3, absolute_seconds: float = 2.0) -> None:
         original = action_context()
-        self.context = original.model_copy(update={"timeout_seconds": 0.3, "routing_decision": {
+        self.context = original.model_copy(update={"timeout_seconds": soft_seconds, "routing_decision": {
             **original.routing_decision, POLICY: policy,
             "engineering_progress_budget_version": 1, "engineering_checkpoint_ack_version": 1,
             "engineering_writer_continuation_version": 1, "runtime_timeout_source": source,
-            "runtime_timeout_soft_seconds": 0.3, "runtime_timeout_absolute_seconds": 2.0,
+            "runtime_timeout_soft_seconds": soft_seconds, "runtime_timeout_absolute_seconds": absolute_seconds,
         }})
         self.blocked, self.slow_selector = blocked, slow_selector
         self.slow_inspect = slow_inspect
@@ -56,7 +57,7 @@ class Journey:
             DiscussionParticipant(id="implementer", role="Engineer", goal="Build", logical_model="writer",
                                   allowed_tools=TOOLS),
             DiscussionParticipant(id="reviewer", role="Reviewer", goal="Review", logical_model="reviewer"),
-        ), selector_model="selector", max_turns=8, token_budget=500, wall_time_seconds=0.3),
+        ), selector_model="selector", max_turns=8, token_budget=500, wall_time_seconds=soft_seconds),
             capability_gateway=cast(CapabilityGateway, self), harness_tool_gateway=self)
 
     def is_available(self, tenant_id: UUID, name: str) -> bool:
@@ -259,27 +260,54 @@ async def test_user_can_cancel_an_admitted_operation_after_soft_expiry() -> None
 async def test_inflight_unknown_checkpoint_never_reenters_provider_on_restore(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    case = Journey(blocked=True)
+    # This case tests durable identity, not subsecond admission timing.
+    case = Journey(blocked=True, soft_seconds=4.0, absolute_seconds=8.0)
     events: list[RunEvent] = []
     stream = cast(AsyncGenerator[RunEvent, None], case.runner.run(case.context))
-    saved = None
-    try:
-        async with asyncio.timeout(5):
+    saved: RuntimeCheckpoint | None = None
+    running_checkpoints: list[RuntimeCheckpoint] = []
+
+    async def consume() -> None:
+        try:
             async for event in stream:
                 events.append(event)
-                if case.entered.is_set():
-                    saved = next(e.checkpoint for e in reversed(events) if e.checkpoint is not None)
-                    break
-                # The running checkpoint suspends before provider entry.
                 if event.checkpoint is not None:
                     rows = event.checkpoint.state["model_ledger"]
                     if (isinstance(rows, tuple) and rows and isinstance(rows[-1], Mapping)
-                        and rows[-1].get("required_tool") == "workspace_write_text"):
-                        saved = event.checkpoint
-                        break
+                        and rows[-1].get("required_tool") == "workspace_write_text"
+                        and rows[-1].get("status") == "running"):
+                        running_checkpoints.append(event.checkpoint)
+                # Keep consuming: the next iteration acknowledges the intent
+                # checkpoint, allowing the provider to enter its blocked request.
+        except asyncio.CancelledError:
+            pass
+        finally:
+            await stream.aclose()
+
+    pending = asyncio.create_task(consume())
+    entered = asyncio.create_task(case.entered.wait())
+    try:
+        async with asyncio.timeout(5):
+            await asyncio.wait((pending, entered), return_when=asyncio.FIRST_COMPLETED)
+            if pending.done():
+                await pending
+            diagnostic = {"events": [(e.kind, e.reason) for e in events],
+                          "calls": [c.tool_name for c in case.calls],
+                          "requests": [r.required_tool for r in case.requests]}
+            assert case.entered.is_set(), diagnostic
+            # Freeze the pre-cancel intent; cleanup can publish a terminal checkpoint.
+            saved = running_checkpoints[-1] if running_checkpoints else None
+            assert saved is not None, diagnostic
+            assert saved.state["terminal"] is False
     finally:
-        await stream.aclose()
-    assert saved is not None
+        entered.cancel()
+        await asyncio.gather(entered, return_exceptions=True)
+        await case.runner.cancel()
+        await asyncio.wait_for(pending, timeout=3)
+    assert saved is not None, {"events": [(e.kind, e.reason) for e in events],
+                               "calls": [c.tool_name for c in case.calls]}
+    assert case.requests[-1].required_tool == "workspace_write_text"
+    assert [c.tool_name for c in case.calls] == ["project.inspect", "workspace.list"]
     before = len(case.requests)
     saved_rows = saved.state["model_ledger"]
     assert isinstance(saved_rows, tuple) and len(saved_rows) == 1
