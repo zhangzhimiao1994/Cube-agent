@@ -307,8 +307,9 @@ class RepairRepository(RunRepository):
         worker_id: str | None = None,
         worker_lease_token: UUID | None = None,
         resolution_failure: object = None,
+        resolution_timeout: BaseException | None = None,
     ) -> RunRecord:
-        del worker_id, worker_lease_token
+        del worker_id, worker_lease_token, resolution_timeout
         assert run_id == self.run_id
         if self.row.status in {
             RunStatus.WAITING_APPROVAL.value,
