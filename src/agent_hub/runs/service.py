@@ -2759,7 +2759,8 @@ class RunService:
                         worker_id=self._worker_id,
                         worker_lease_token=worker_lease_token,
                         **({"resolution_failure": resolution_payload["resolution_failure"]}
-                           if resolution_payload else {}),
+                           if "resolution_failure" in resolution_payload else
+                           {"resolution_timeout": error} if resolution_payload else {}),
                     )
                 except RunConflict:
                     return await self._submitted_by_run_id(tenant_id, run_id)

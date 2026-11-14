@@ -57,6 +57,18 @@ class PhaseError(RuntimeError):
 class _TestResultFailed(PhaseError):
     """The real unittest runner returned an unsuccessful result."""
 
+    def __init__(self, message: str = 'phase_failed', *, counts: dict[str, int] | None = None) -> None:
+        super().__init__(message)
+        self.counts = counts
+
+
+class _PhaseExecutionFailed(PhaseError):
+    """Carry finite failure observations to the existing stdout envelope only."""
+
+    def __init__(self, hint: dict[str, object] | None) -> None:
+        super().__init__('phase_failed')
+        self.hint = hint
+
 
 class _WheelMetadata(TypedDict):
     filename: str
@@ -69,7 +81,7 @@ def _need(condition: object, *, error: type[PhaseError] = PhaseError) -> None:
         raise error('phase_failed')
 
 
-def _write_phase_failure(phase: str, error: Exception) -> None:
+def _write_phase_failure(phase: str, error: Exception) -> dict[str, object] | None:
     """Finite cause only; the parent still bounds and sanitizes native stderr."""
     causes = (
         (ModuleNotFoundError, ('test_import', 'import_error', 'ModuleNotFoundError')),
@@ -97,8 +109,18 @@ def _write_phase_failure(phase: str, error: Exception) -> None:
         record = {'phase': safe_phase,
                   'stage': stage, 'cause': cause, 'exception_type': kind}
         sys.stderr.write('PYTHON_PHASE_FAILURE ' + json.dumps(record, sort_keys=True) + '\n')
+        if safe_phase == 'unknown' or cause == 'unknown':
+            return None
+        hint: dict[str, object] = dict(record)
+        if type(error) is _TestResultFailed and type(error.counts) is dict:
+            counts = error.counts
+            if (set(counts) == {'tests', 'failures', 'errors', 'skipped'}
+                    and all(type(value) is int and 0 <= value <= 2**31 - 1 for value in counts.values())
+                    and counts['tests'] > 0 and counts['failures'] + counts['errors'] > 0):
+                hint['counts'] = dict(counts)
+        return hint
     except Exception:  # noqa: BLE001 - optional diagnostics never replace the primary failure.
-        return
+        return None
 
 
 def _isolation_guard() -> None:
@@ -559,7 +581,11 @@ def _test(module_name: str, *, generated_manifest_sha256: str | None = None) -> 
             _need(count > 0)
             result = unittest.TextTestRunner(stream=sys.stderr, verbosity=1).run(suite)
             _need(result.testsRun == count)
-            _need(result.wasSuccessful(), error=_TestResultFailed)
+            if not result.wasSuccessful():
+                raise _TestResultFailed(counts={
+                    'tests': result.testsRun, 'failures': len(result.failures),
+                    'errors': len(result.errors), 'skipped': len(result.skipped),
+                })
             count = result.testsRun
     finally:
         sys.path[:] = previous
@@ -617,8 +643,8 @@ def run_phase(phase: str, *, import_module: str,
                 metadata = _test(import_module, generated_manifest_sha256=generated_manifest_sha256)
         return {'phase': phase, 'evidence': 'native_process_only', **metadata}
     except Exception as error:  # noqa: BLE001 - never expose backend/process exception text.
-        _write_phase_failure(phase, error)
-        raise PhaseError('phase_failed') from None
+        hint = _write_phase_failure(phase, error)
+        raise _PhaseExecutionFailed(hint) from None
 
 
 class _Parser(argparse.ArgumentParser):
@@ -640,6 +666,12 @@ def main(argv: list[str] | None = None) -> int:
         metadata = run_phase(args.phase, import_module=args.import_module,
             generated_manifest_sha256=args.generated_manifest_sha256,
             private_lock_sha256=args.private_lock_sha256)
+    except _PhaseExecutionFailed as error:
+        failure: dict[str, object] = {'status': 'failed', 'error': 'phase_failed'}
+        if error.hint is not None:
+            failure['failure_hint'] = error.hint
+        print(json.dumps(failure, sort_keys=True))
+        return 1
     except (Exception, SystemExit, KeyboardInterrupt):  # noqa: BLE001 - CLI fails closed.
         print(json.dumps({'status': 'failed', 'error': 'phase_failed'}))
         return 1

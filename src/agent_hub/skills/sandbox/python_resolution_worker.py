@@ -581,9 +581,11 @@ def main() -> int:
             )
 
             phase = cast(ResolutionFailurePhase,
-                {"freeze_python_resolution": "freeze", "publish_python_resolution": "publication"}.get(
+                {"freeze_python_resolution": "freeze", "publish_python_resolution": "publication",
+                 "inspect_python_resolution": "inspection"}.get(
                     request.action, "resolution"))
-            diagnostic = resolution_failure_diagnostic(error, phase=phase, exit_code=2)
+            diagnostic = resolution_failure_diagnostic(error, phase=phase, exit_code=2,
+                original_deadline=request.claim.original_deadline)
             print(ResolutionStatus(state="unknown", key=request.key, diagnostic=diagnostic).model_dump_json(), flush=True)
         print("resolution_unavailable", file=sys.stderr, flush=True)
         return 2

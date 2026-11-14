@@ -201,7 +201,7 @@ async def _run_fetch_unit(
             )
 
             diagnostic = ResolutionFailureDiagnostic(phase="registry_metadata",
-                code="resolution_deadline" if result.timed_out else "registry_worker_unavailable",
+                code="resolution_timeout" if result.timed_out else "registry_worker_unavailable",
                 exit_code=result.exit_code, timed_out=result.timed_out)
             if result.exit_code == 2 and not result.timed_out:
                 try:

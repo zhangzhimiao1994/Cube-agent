@@ -452,9 +452,13 @@ def resolution_failure_payload(value: object) -> RuntimeFailureDiagnostic:
 def project_resolution_failure_payload(error: object) -> RuntimeFailureDiagnostic:
     from agent_hub.capabilities.project_verification import ProjectVerificationError
 
-    if type(error) is not ProjectVerificationError or error.resolution_failure is None:
-        return {}
-    return resolution_failure_payload(error.resolution_failure)
+    if type(error) is ProjectVerificationError and error.resolution_failure is not None:
+        return resolution_failure_payload(error.resolution_failure)
+    if isinstance(error, BaseException):
+        from agent_hub.capabilities.python_resolution_diagnostics import resolution_timeout_payload
+
+        return cast(RuntimeFailureDiagnostic, resolution_timeout_payload(error))
+    return {}
 
 
 def model_provider_failure_payload(error: object) -> RuntimeFailureDiagnostic:

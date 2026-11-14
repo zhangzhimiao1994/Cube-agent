@@ -139,6 +139,9 @@ _PROVIDER_FAILURE_DIAGNOSTIC_KEYS = frozenset({
     "provider_classification_source", "provider_body_state",
 })
 _DISCUSSION_FAILURE_DIAGNOSTIC_KEYS = frozenset({"discussion_failure_phase", "discussion_failure_kind"})
+_RESOLUTION_TIMEOUT_DIAGNOSTIC_KEYS = frozenset({
+    "resolution_phase", "resolution_progress", "resolution_progress_evidence", "original_deadline_expired",
+})
 _OPTIONAL_FAILURE_DIAGNOSTIC_KEYS = frozenset(
     {
         "status_code", "hybrid_child_mode", "orchestration_recovery_hint", "step_id", "actor",
@@ -147,7 +150,7 @@ _OPTIONAL_FAILURE_DIAGNOSTIC_KEYS = frozenset(
         "engineering_work_progress_units",
         "provider_request_shape", "resolution_failure",
     }
-) | frozenset(_CAPACITY_DIAGNOSTIC_ENUMS) | _MODEL_PREFLIGHT_DIAGNOSTIC_KEYS | _PROVIDER_FAILURE_DIAGNOSTIC_KEYS | _DISCUSSION_FAILURE_DIAGNOSTIC_KEYS
+) | _RESOLUTION_TIMEOUT_DIAGNOSTIC_KEYS | frozenset(_CAPACITY_DIAGNOSTIC_ENUMS) | _MODEL_PREFLIGHT_DIAGNOSTIC_KEYS | _PROVIDER_FAILURE_DIAGNOSTIC_KEYS | _DISCUSSION_FAILURE_DIAGNOSTIC_KEYS
 _FAILURE_DIAGNOSTIC_KEYS = _REQUIRED_FAILURE_DIAGNOSTIC_KEYS | _OPTIONAL_FAILURE_DIAGNOSTIC_KEYS
 _GATEWAY_SCOPE_DIAGNOSTIC_KEYS = frozenset({
     "gateway_scope_phase", "gateway_scope_reason",
@@ -276,6 +279,12 @@ def _validate_failure_diagnostic(payload: Mapping[str, JsonValue]) -> None:
         set(payload) - _FAILURE_DIAGNOSTIC_KEYS - _GATEWAY_SCOPE_DIAGNOSTIC_KEYS
     ):
         raise ValueError("runtime failure diagnostic fields are invalid")
+    if payload.keys() & _RESOLUTION_TIMEOUT_DIAGNOSTIC_KEYS:
+        from agent_hub.capabilities.python_resolution_diagnostics import (
+            validate_resolution_timeout_payload,
+        )
+
+        validate_resolution_timeout_payload(payload)
     if "resolution_failure" in payload:
         from agent_hub.runtime.failure_reason import resolution_failure_payload
 

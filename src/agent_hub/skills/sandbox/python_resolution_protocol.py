@@ -317,10 +317,10 @@ class ResolutionPlan(_Strict):
 
 type ResolutionFailurePhase = Literal[
     "request", "configuration", "admission", "stage", "execution", "response", "cleanup",
-    "registry_metadata", "resolution", "freeze", "publication",
+    "registry_metadata", "resolution", "freeze", "publication", "inspection",
 ]
 type ResolutionFailureCode = Literal[
-    "internal_failure", "resolution_deadline", "resolution_unavailable",
+    "internal_failure", "resolution_deadline", "resolution_timeout", "resolution_unavailable",
     "resolution_request_invalid", "resolution_response_invalid", "resolution_stage_invalid",
     "metadata_prepare_request_invalid", "metadata_prepare_unavailable",
     "metadata_prepare_plan_changed", "metadata_prepare_scope_changed",
@@ -363,6 +363,7 @@ class ResolutionFailureError(ResolutionError):
 def resolution_failure_diagnostic(
     error: BaseException, *, phase: ResolutionFailurePhase,
     exit_code: int | None = None, timed_out: bool | None = None,
+    original_deadline: datetime | None = None,
 ) -> ResolutionFailureDiagnostic:
     """Only exact trusted exception types and closed codes; no reflected exception text."""
     from agent_hub.skills.sandbox.python_input_supply_catalog import InputSupplyError
@@ -375,7 +376,10 @@ def resolution_failure_diagnostic(
         if type(candidate) is str and candidate in get_args(ResolutionFailureCode.__value__):
             code = cast(ResolutionFailureCode, candidate)
     elif type(error) is TimeoutError:
-        code, timed_out = "resolution_deadline", True
+        # A transport/operation timeout alone cannot prove the durable task expired.
+        expired = (type(original_deadline) is datetime and original_deadline.utcoffset() is not None
+                   and datetime.now(UTC) >= original_deadline)
+        code, timed_out = ("resolution_deadline" if expired else "resolution_timeout"), True
     return ResolutionFailureDiagnostic(phase=phase, code=code, exit_code=exit_code, timed_out=timed_out)
 
 

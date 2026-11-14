@@ -38,8 +38,12 @@ def test_real_test_phase_distinguishes_import_from_test_result_failure(
     try:
         assert isolated.main(['test', '--import-module', name]) == 1
         captured = capfd.readouterr()
-        assert json.loads(captured.out) == {'status': 'failed', 'error': 'phase_failed'}
         record = cause_record(captured.err)
+        expected_hint: dict[str, object] = dict(record)
+        if failure == 'assertion':
+            expected_hint['counts'] = {'tests': 1, 'failures': 1, 'errors': 0, 'skipped': 0}
+        assert json.loads(captured.out) == {
+            'status': 'failed', 'error': 'phase_failed', 'failure_hint': expected_hint}
         assert record['phase'] == 'test'
         assert record['stage'] == ('test_import' if failure == 'import' else 'test_execution')
         assert record['cause'] == ('import_error' if failure == 'import' else 'test_result_failed')
@@ -91,8 +95,11 @@ def test_phase_cause_never_reflects_error_text_paths_or_custom_class_names(
     monkeypatch.setattr(isolated, '_test', fail)
     assert isolated.main(['test', '--import-module', 'sample']) == 1
     captured = capfd.readouterr()
-    assert json.loads(captured.out) == {'status': 'failed', 'error': 'phase_failed'}
     record = cause_record(captured.err)
+    expected_output: dict[str, object] = {'status': 'failed', 'error': 'phase_failed'}
+    if kind != 'unknown':
+        expected_output['failure_hint'] = record
+    assert json.loads(captured.out) == expected_output
     assert record['cause'] == expected
     assert set(record) == {'phase', 'stage', 'cause', 'exception_type'}
     assert len(captured.err.encode()) <= 512

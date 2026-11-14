@@ -3273,10 +3273,20 @@ class RunRepository:
         worker_id: str | None = None,
         worker_lease_token: UUID | None = None,
         resolution_failure: object = None,
+        resolution_timeout: BaseException | None = None,
     ) -> RunRecord:
-        from agent_hub.runtime.failure_reason import resolution_failure_payload
+        from agent_hub.runtime.failure_reason import (
+            project_resolution_failure_payload,
+            resolution_failure_payload,
+        )
 
         failure_payload = {} if resolution_failure is None else resolution_failure_payload(resolution_failure)
+        if resolution_timeout is not None:
+            if resolution_failure is not None:
+                raise ValueError("resolution_failure_diagnostic_ambiguous")
+            failure_payload = project_resolution_failure_payload(resolution_timeout)
+            if not failure_payload or "resolution_failure" in failure_payload:
+                raise ValueError("resolution_timeout_diagnostic_invalid")
         async with self._session_factory() as session, session.begin():
             row = await self.get_for_update(session, run_id)
             if (

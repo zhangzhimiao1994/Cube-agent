@@ -264,7 +264,7 @@ def test_registry_worker_main_only_emits_closed_failure(monkeypatch: pytest.Monk
 
 @pytest.mark.parametrize('child_output,timed_out,want', [
     ('valid', False, 'registry_unavailable'), ('invalid', False, 'registry_worker_unavailable'),
-    ('valid', True, 'resolution_deadline'),
+    ('valid', True, 'resolution_timeout'),
 ])
 async def test_fetch_unit_retains_leaf_only_after_confirmed_cleanup(monkeypatch: pytest.MonkeyPatch, child_output: str, timed_out: bool, want: str) -> None:
     import time

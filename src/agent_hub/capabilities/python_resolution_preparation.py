@@ -14,10 +14,20 @@ from agent_hub.capabilities.execution_authority import (
     get_verification_authority,
 )
 from agent_hub.capabilities.generated_project_service import generated_authority
+from agent_hub.capabilities.python_resolution_diagnostics import (
+    ResolutionPhase,
+    ResolutionProgress,
+    observe_resolution_timeout,
+)
 from agent_hub.capabilities.types import CapabilityRequest
 from agent_hub.models.physical_budget import _budget_deadline, _run_budget
 from agent_hub.runs.repository import RunRecord
-from agent_hub.skills.sandbox.python_registry_protocol import DependencyNeed, digest, need
+from agent_hub.skills.sandbox.python_registry_protocol import (
+    DependencyNeed,
+    ResolutionError,
+    digest,
+    need,
+)
 from agent_hub.skills.sandbox.python_resolution_protocol import (
     ProtectedOriginalResolutionPlanning,
     ResolutionClaim,
@@ -97,6 +107,8 @@ class PythonResolutionPreparation:
         self._original: ResolutionClaim | None = None
         self._original_deadline = original_deadline
         self._protected_original = protected_original
+        self._diagnostic_progress = ResolutionProgress.UNOBSERVED
+        self._diagnostic_progress_key: str | None = None
 
     async def _claim(self, planning: ResolutionPlanning) -> ResolutionClaim:
         budget = _run_budget.get()
@@ -198,6 +210,70 @@ class PythonResolutionPreparation:
         return result
 
     async def _send(
+        self,
+        action: Literal[
+            "resolve_python_inputs",
+            "freeze_python_resolution",
+            "publish_python_resolution",
+            "inspect_python_resolution",
+        ],
+        *,
+        needs: tuple[DependencyNeed, ...],
+        environment: dict[str, str],
+        planning: ResolutionPlanning,
+        plan: ResolutionPlan | None = None,
+        expected_plan_sha256: str | None = None,
+    ) -> ResolutionStatus:
+        phase = {
+            "resolve_python_inputs": ResolutionPhase.RESOLUTION,
+            "freeze_python_resolution": ResolutionPhase.FREEZE,
+            "publish_python_resolution": ResolutionPhase.PUBLICATION,
+            "inspect_python_resolution": ResolutionPhase.INSPECTION,
+        }[action]
+        request_key = None
+        if self._original is not None and self._original.planning == planning:
+            try:
+                request_key = resolution_key(self._original, needs, environment)
+            except ResolutionError:
+                # Diagnostics cannot add a rejection before the original guarded call.
+                pass
+        progress = (self._diagnostic_progress
+                    if request_key is not None and request_key == self._diagnostic_progress_key
+                    else ResolutionProgress.UNOBSERVED)
+        if action == "freeze_python_resolution" and progress is ResolutionProgress.RESOLUTION_COMPLETED:
+            progress = ResolutionProgress.FREEZE_PENDING
+        elif action == "publish_python_resolution" and progress is ResolutionProgress.FREEZE_COMPLETED:
+            progress = ResolutionProgress.PUBLICATION_PENDING
+        try:
+            response = await self._send_guarded(
+                action, needs=needs, environment=environment, planning=planning,
+                plan=plan, expected_plan_sha256=expected_plan_sha256,
+            )
+        except (TimeoutError, asyncio.CancelledError) as error:
+            cutoff = (self._original.original_deadline if self._original is not None
+                      else self._original_deadline)
+            observe_resolution_timeout(error, phase=phase, progress=progress, original_deadline=cutoff)
+            raise
+        except ResolutionError as error:
+            if error.args == ("resolution_deadline",):
+                cutoff = (self._original.original_deadline if self._original is not None
+                          else self._original_deadline)
+                observe_resolution_timeout(error, phase=phase, progress=progress, original_deadline=cutoff)
+            raise
+        # Only the original guarded call's validated Root response can establish progress.
+        self._diagnostic_progress = ResolutionProgress.UNOBSERVED
+        self._diagnostic_progress_key = None
+        if response.state == "resolved" and response.descriptor is not None:
+            self._diagnostic_progress = ResolutionProgress.RESOLUTION_COMPLETED
+        elif response.state == "frozen" and response.plan is not None:
+            self._diagnostic_progress = ResolutionProgress.FREEZE_COMPLETED
+        elif response.state == "published" and response.plan is not None:
+            self._diagnostic_progress = ResolutionProgress.PUBLICATION_COMPLETED
+        if self._diagnostic_progress is not ResolutionProgress.UNOBSERVED:
+            self._diagnostic_progress_key = response.key
+        return response
+
+    async def _send_guarded(
         self,
         action: Literal[
             "resolve_python_inputs",
