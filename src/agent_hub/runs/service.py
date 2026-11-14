@@ -52,6 +52,19 @@ from agent_hub.runs.conversation_queue import (
 )
 from agent_hub.runs.conversations import ConversationArchived, ConversationRecord
 from agent_hub.runs.execution_activity import ExecutionActivity, execution_is_active
+from agent_hub.runs.execution_clock import (
+    activate as activate_execution_clock,
+)
+from agent_hub.runs.execution_clock import (
+    bind_submission as bind_clock_submission,
+)
+from agent_hub.runs.execution_clock import (
+    execution_boundary,
+    submission_boundary,
+)
+from agent_hub.runs.execution_clock import (
+    live_remaining as execution_clock_remaining,
+)
 from agent_hub.runs.observer import ObserverDecision, ObserverPolicy, RunMonitor
 from agent_hub.runs.repository import (
     CapabilityApprovalSnapshot,
@@ -554,6 +567,7 @@ class RunService:
         runtime_memory_recall: RuntimeMemoryRecall | None = None,
         temporary_agent_policy: TemporaryAgentPolicyProtocol | None = None,
         runtime_timeout_seconds: float = 300.0,
+        runtime_authorization_timeout_seconds: float | None = None,
         runtime_token_budget: int = 1_000_000,
         main_agent_context_window_getter: Callable[[], Awaitable[int | None]] | None = None,
         terminal_run_hooks: tuple[TerminalRunHook, ...] = (),
@@ -579,6 +593,11 @@ class RunService:
         self._conversation_preview_stopper = conversation_preview_stopper
         self._project_input_preparer = project_input_preparer
         self._review_broker = review_broker
+        from agent_hub.runs.execution_clock import authorization_seconds
+
+        self._runtime_authorization_timeout_seconds = (
+            None if runtime_authorization_timeout_seconds is None
+            else authorization_seconds(runtime_authorization_timeout_seconds))
         self._pending_python_recipe_reviewer = pending_python_recipe_reviewer
         self._runtime_registry = runtime_registry
         self._router = router
@@ -600,6 +619,7 @@ class RunService:
         self._worker_id = _safe_worker_id(worker_id)
         self._run_worker_lease_seconds = _run_worker_lease_seconds(run_worker_lease_seconds)
 
+    @submission_boundary
     async def submit(
         self,
         *,
@@ -629,6 +649,8 @@ class RunService:
         execution_backend: str = "systemd",
         requested_permissions: tuple[str, ...] = (),
         runtime_timeout_seconds: float | None = None,
+        execution_clock_version: Literal[2] | None = None,
+        runtime_authorization_seconds: float | None = None,
         permission_mode: PermissionMode | None = None,
         channel_context: dict[str, str] | None = None,
         idempotency_key: str | None = None,
@@ -797,23 +819,84 @@ class RunService:
             operator_selection["capability"] = "vibe_coding"
         if skip_evolution_proposal:
             operator_selection["skip_evolution_proposal"] = True
+        # The normal authenticated UI/API path needs no implementation-version fields.
+        if (execution_clock_version is None and authenticated_input is not None
+                and self._runtime_authorization_timeout_seconds is not None):
+            execution_clock_version = 2
+        clock_active = _explicit_runtime_timeout_seconds(runtime_timeout_seconds)
+        from agent_hub.runs.execution_clock import authorization_seconds
+
+        clock_authorization = (None if runtime_authorization_seconds is None
+                               else authorization_seconds(runtime_authorization_seconds))
+        if execution_clock_version == 2:
+            if clock_authorization is None:
+                clock_authorization = self._runtime_authorization_timeout_seconds
+            if clock_active is None:
+                assessment_active = (project_delivery or {}).get("runtime_timeout_seconds")
+                clock_active = _explicit_runtime_timeout_seconds(assessment_active) or self._runtime_timeout_seconds
+        if execution_clock_version is not None:
+            if (type(execution_clock_version) is not int or execution_clock_version != 2
+                    or authenticated_input is None or self._review_broker is None
+                    or self._runtime_authorization_timeout_seconds is None
+                    or clock_active is None or clock_authorization is None
+                    or (runtime_timeout_seconds is not None and runtime_timeout_seconds != clock_active)
+                    or (runtime_authorization_seconds is not None and runtime_authorization_seconds != clock_authorization)
+                    or not clock_active <= clock_authorization <= self._runtime_authorization_timeout_seconds
+                    or not clock_authorization.is_integer()):
+                raise ValueError("split clock requires independent server-approved execution and authorization amounts")
+        elif runtime_authorization_seconds is not None:
+            raise ValueError("authorization amount requires new-task split clock")
         cleaned_runtime_timeout = _explicit_runtime_timeout_seconds(runtime_timeout_seconds)
         if cleaned_runtime_timeout is not None:
             operator_selection["runtime_timeout_seconds"] = cleaned_runtime_timeout
             operator_selection["runtime_timeout_absolute_seconds"] = cleaned_runtime_timeout
             operator_selection["runtime_timeout_source"] = "operator"
+        if execution_clock_version == 2:
+            operator_selection["runtime_timeout_absolute_seconds"] = clock_authorization
         if self._review_broker is not None and authenticated_input is not None:
-            operator_selection.update(await self._review_broker.submission_profile(
-                tenant_id, timeout_seconds=(
-                    _explicit_runtime_timeout_seconds(operator_selection.get("runtime_timeout_absolute_seconds"))
-                    or _routing_runtime_timeout_seconds(operator_selection, progress_units=0)
-                    or self._runtime_timeout_seconds
-                ),
-            ))
+            if execution_clock_version == 2:
+                assert clock_authorization is not None
+                approved_profile = await self._review_broker.clock_submission_profile(
+                    tenant_id, timeout_seconds=clock_authorization)
+            else:
+                approved_profile = await self._review_broker.submission_profile(
+                    tenant_id, timeout_seconds=(
+                        _explicit_runtime_timeout_seconds(operator_selection.get("runtime_timeout_absolute_seconds"))
+                        or _routing_runtime_timeout_seconds(operator_selection, progress_units=0)
+                        or self._runtime_timeout_seconds))
+            operator_selection.update(approved_profile)
             if "approval_review_profile" in operator_selection:
                 operator_selection = _with_runtime_token_budget_policy(
                     operator_selection, configured_tokens=self._runtime_token_budget, mode=mode,
                 )
+        if execution_clock_version == 2:
+            profile = operator_selection.get("approval_review_profile")
+            if not isinstance(profile, Mapping) or profile.get("timeout_seconds") != clock_authorization:
+                raise ValueError("split clock requires a live server-approved authorization profile")
+            assert clock_active is not None and clock_authorization is not None and self._review_broker is not None
+            assessment = project_delivery or {}
+            soft = _explicit_runtime_timeout_seconds(assessment.get("runtime_timeout_soft_seconds")) or min(
+                self._runtime_timeout_seconds, clock_active)
+            initial = min(clock_active, soft, self._runtime_timeout_seconds)
+            complexity = assessment.get("critical_path_complexity_units", 1)
+            if type(complexity) is not int or complexity <= 0:
+                complexity = 1
+
+            async def recheck_clock_policy() -> bool:
+                assert self._review_broker is not None and clock_authorization is not None
+                fresh = await self._review_broker.clock_submission_profile(tenant_id, timeout_seconds=clock_authorization)
+                current = fresh.get("approval_review_profile")
+                return (isinstance(current, Mapping)
+                    and {k: v for k, v in current.items() if k != "prepared_at"}
+                    == {k: v for k, v in profile.items() if k != "prepared_at"})
+
+            bind_clock_submission(tenant_id=tenant_id, actor_id=actor_id, request=message,
+                profile=profile, active_seconds=clock_active, initial_soft_seconds=initial,
+                extension_per_unit=min(soft, clock_active)/complexity, recheck=recheck_clock_policy)
+            operator_selection.update(execution_clock_version=2,
+                runtime_timeout_seconds=initial, runtime_timeout_soft_seconds=min(soft, clock_active),
+                runtime_timeout_absolute_seconds=clock_active, runtime_plan_timeout_seconds=clock_active,
+                runtime_timeout_source="project_scale_soft_budget", critical_path_complexity_units=complexity)
         if channel_context:
             operator_selection.update(_safe_channel_context(channel_context))
         evolution_proposal = None
@@ -2089,6 +2172,7 @@ class RunService:
             raise TimeoutError(failure)
         return prepared.model_copy(update={"timeout_seconds": remaining}).validated_internal_clone()
 
+    @execution_boundary
     async def execute(
         self,
         run_id: UUID,
@@ -2377,6 +2461,12 @@ class RunService:
                         except RunConflict:
                             pre_runtime_exit = await self._repository.get(tenant_id, run_id)
                     return _submitted(pre_runtime_exit)
+            if type(runtime_routing_decision.get("execution_clock_version")) is int and runtime_routing_decision["execution_clock_version"] == 2:
+                clock_snapshot, clock_observed = await self._repository.execution_clock_snapshot(
+                    tenant_id, run_id, worker_id=self._worker_id, worker_lease_token=worker_lease_token,
+                    checkpoint=checkpoint, progress_units=checkpoint_progress_units)
+                activate_execution_clock(clock_snapshot, clock_observed,
+                    run_id=run_id, worker_token=worker_lease_token)
             context_timeout_seconds = _runtime_timeout_seconds(
                 mode,
                 configured_seconds=self._runtime_timeout_seconds,
@@ -2385,6 +2475,11 @@ class RunService:
                     progress_units=checkpoint_progress_units,
                 ),
             )
+            clock_remaining = execution_clock_remaining(progress_units=checkpoint_progress_units)
+            if clock_remaining is not None:
+                context_timeout_seconds = min(context_timeout_seconds, clock_remaining.effective_seconds)
+                if context_timeout_seconds <= 0:
+                    raise TimeoutError("run execution or authorization budget exhausted")
             if "conversation_input_snapshot_version" in runtime_routing_decision and checkpoint is not None:
                 from agent_hub.runtime.action_checkpoint import action_checkpoint_valid
 
@@ -2512,6 +2607,14 @@ class RunService:
                         if not pending.matches(current, context):
                             raise RuntimeError('original project approval binding changed') from None
                         project_preparation_task = None
+                        if type(context.routing_decision.get("execution_clock_version")) is int and context.routing_decision["execution_clock_version"] == 2:
+                            heartbeat_stop.set()
+                            await self._await_worker_lease_heartbeat(heartbeat_task)
+                            if runtime_cancel_failed:
+                                raise RuntimeError("approval execution cleanup is not confirmed")
+                            await self._repository.park_execution_clock(
+                                tenant_id, run_id, worker_id=self._worker_id,
+                                worker_lease_token=worker_lease_token, quiescent=True)
                         return _submitted(current)
                     except asyncio.CancelledError:
                         current = await self._repository.get(tenant_id, run_id)
@@ -2539,6 +2642,10 @@ class RunService:
                                     )
                             except RunConflict:
                                 current = await self._repository.get(tenant_id, run_id)
+                        if (not runtime_cancel_failed and current.execution_clock_sha256 is not None
+                                and not _record_has_worker_execution(current)):
+                            await self._repository.close_execution_clock(tenant_id, run_id,
+                                worker_id=self._worker_id, worker_lease_token=worker_lease_token, quiescent=True)
                         return _submitted(current)
                     except RunConflict:
                         current = await self._repository.get(tenant_id, run_id)
@@ -2674,6 +2781,26 @@ class RunService:
                                 if draining_approval and terminal is not RunStatus.WAITING_APPROVAL:
                                     stop_runtime_loop = True
                         for committed_event in committed_events:
+                            if committed_event.artifact is not None:
+                                progress_id = str(committed_event.artifact.id)
+                                progress_key = _runtime_artifact_progress_key(committed_event.artifact,
+                                    meaningful_progress=meaningful_progress)
+                                checkpoint_progress_keys[progress_id] = progress_key
+                                if progress_key is None:
+                                    non_progress_artifact_ids = non_progress_artifact_ids | {progress_id}
+                            if (committed_event.checkpoint is not None
+                                    and type(context.routing_decision.get("execution_clock_version")) is int
+                                    and context.routing_decision["execution_clock_version"] == 2
+                                    and terminal is RunStatus.RUNNING):
+                                current_progress = _checkpoint_progress_units(committed_event.checkpoint,
+                                    non_progress_artifact_ids=non_progress_artifact_ids,
+                                    artifact_progress_keys=checkpoint_progress_keys)
+                                clock_snapshot, clock_observed = await self._repository.execution_clock_snapshot(
+                                    tenant_id, run_id, worker_id=self._worker_id,
+                                    worker_lease_token=worker_lease_token, checkpoint=committed_event.checkpoint,
+                                    progress_units=current_progress)
+                                activate_execution_clock(clock_snapshot, clock_observed,
+                                    run_id=run_id, worker_token=worker_lease_token)
                             observed_events.append(committed_event)
                             observer_decision = monitor.observe(committed_event)
                             if observer_decision is not None:
@@ -2720,6 +2847,17 @@ class RunService:
                 )
             except RunConflict:
                 released_record = await self._repository.get(tenant_id, run_id)
+                # The approval transaction may already have cleared the worker.
+                # We reach here only after generator aclose and heartbeat cleanup.
+                if (type(context.routing_decision.get("execution_clock_version")) is int
+                        and context.routing_decision["execution_clock_version"] == 2
+                        and terminal is released_record.status is RunStatus.WAITING_APPROVAL
+                        and approval_drain.complete and approval_drain.approval_id is not None
+                        and approval_drain.owns(released_record)
+                        and not runtime_cancel_failed and not _record_has_worker_execution(released_record)):
+                    await self._repository.park_execution_clock(tenant_id, run_id,
+                        worker_id=self._worker_id, worker_lease_token=worker_lease_token, quiescent=True)
+                    return _submitted(released_record)
                 if not (
                     approval_drain.complete
                     and approval_drain.approval_id is not None
@@ -2730,6 +2868,16 @@ class RunService:
                 ):
                     return _submitted(released_record)
             terminal = released_record.status
+            if (terminal in {RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED, RunStatus.PAUSED}
+                    and not runtime_cancel_failed and released_record.execution_clock_sha256 is not None):
+                await self._repository.close_execution_clock(tenant_id, run_id,
+                    worker_id=self._worker_id, worker_lease_token=worker_lease_token, quiescent=True)
+            if (terminal is RunStatus.WAITING_APPROVAL and approval_drain.complete
+                    and not runtime_cancel_failed and type(context.routing_decision.get("execution_clock_version")) is int
+                    and context.routing_decision["execution_clock_version"] == 2):
+                await self._repository.park_execution_clock(tenant_id, run_id,
+                    worker_id=self._worker_id, worker_lease_token=worker_lease_token, quiescent=True)
+                return _submitted(released_record)
         except Exception as error:
             if isinstance(error, ProcessCleanupIncomplete):
                 runtime_cancel_failed = True
@@ -2747,6 +2895,8 @@ class RunService:
                     try:
                         await asyncio.wait_for(runtime_cancel(), timeout=5.0)
                     except Exception:
+                        if type(context.routing_decision.get("execution_clock_version")) is int and context.routing_decision["execution_clock_version"] == 2:
+                            runtime_cancel_failed = True
                         _LOGGER.exception("approval_checkpoint_cancel_failed run_id=%s", run_id)
             if approval_failure is not None:
                 failed = approval_failure
@@ -2785,6 +2935,11 @@ class RunService:
                         )
                     except RunConflict:
                         return await self._submitted_by_run_id(tenant_id, run_id)
+            if (not runtime_cancel_failed and failed.execution_clock_sha256 is not None
+                    and not _record_has_worker_execution(failed)):
+                await self._repository.close_execution_clock(failed.tenant_id, run_id,
+                    worker_id=self._worker_id, worker_lease_token=worker_lease_token,
+                    quiescent=True, uncertain=bool(project_resolution_failure_payload(error)))
             if failed.status is RunStatus.WAITING_APPROVAL:
                 return _submitted(failed)
             if failed.status in {

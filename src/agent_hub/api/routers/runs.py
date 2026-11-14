@@ -93,6 +93,18 @@ ARCHIVE_EXTENSIONS = (
 ARCHIVE_MANIFEST_MAX_FILES = 512
 
 
+class _ExecutionClockSubmitOptions(TypedDict, total=False):
+    execution_clock_version: Literal[2] | None
+    runtime_authorization_seconds: float | None
+
+
+def _execution_clock_options(body: CreateRunRequest) -> _ExecutionClockSubmitOptions:
+    if body.execution_clock_version is None and body.runtime_authorization_seconds is None:
+        return {}
+    return {"execution_clock_version": body.execution_clock_version,
+            "runtime_authorization_seconds": body.runtime_authorization_seconds}
+
+
 class RunServiceProtocol(Protocol):
     async def submit(
         self,
@@ -123,6 +135,8 @@ class RunServiceProtocol(Protocol):
         execution_backend: str = "systemd",
         requested_permissions: tuple[str, ...] = (),
         runtime_timeout_seconds: float | None = None,
+        execution_clock_version: Literal[2] | None = None,
+        runtime_authorization_seconds: float | None = None,
         permission_mode: PermissionMode | None = None,
         idempotency_key: str | None = None,
         authenticated_input: _AuthenticatedInput | None = None,
@@ -363,6 +377,8 @@ class CreateRunRequest(BaseModel):
     )
     requested_permissions: tuple[str, ...] = Field(default_factory=tuple, max_length=16)
     runtime_timeout_seconds: float | None = Field(default=None, gt=0, le=3600)
+    execution_clock_version: Literal[2] | None = None
+    runtime_authorization_seconds: float | None = Field(default=None, gt=0, allow_inf_nan=False)
 
     @field_validator("attachment_ids", mode="before")
     @classmethod
@@ -1411,6 +1427,7 @@ async def create_run(
             execution_backend=execution_backend,
             requested_permissions=body.requested_permissions,
             runtime_timeout_seconds=body.runtime_timeout_seconds,
+            **_execution_clock_options(body),
             idempotency_key=idempotency_key,
             **_project_input_options(body),
             **_permission_mode_options(body),

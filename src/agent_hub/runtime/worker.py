@@ -342,6 +342,7 @@ def build_worker_service(
         config_service=config_service, config_getter=review_config,
         run_repository=run_repository, session_factory=database.session_factory,
         secret_service=secret_service, redis_client=redis_client,
+        runtime_authorization_timeout_seconds=settings.runtime_authorization_timeout_seconds,
     )
     capability_stack_builder = partial(
         assemble_review_capability_stack, review_broker, build_runtime_capability_stack,
@@ -401,6 +402,7 @@ def build_worker_service(
         hermes_advisor=PersistentHermesRunAdvisor(database.session_factory),
         runtime_memory_recall=PersistentRuntimeMemoryRecall(database.session_factory),
         runtime_timeout_seconds=settings.runtime_timeout_seconds,
+        runtime_authorization_timeout_seconds=settings.runtime_authorization_timeout_seconds,
         runtime_token_budget=settings.runtime_token_budget,
         terminal_run_hooks=(*_evolution_terminal_hooks(
             config_service=config_service,

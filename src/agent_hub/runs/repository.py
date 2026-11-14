@@ -46,8 +46,15 @@ from agent_hub.runs.authorization import (
     _validate_authenticated_input,
     _validated_persisted_input,
 )
-from agent_hub.runs.context_evidence import CONTEXT_EVENT_KINDS, context_event_projection
-from agent_hub.runs.execution_activity import ExecutionActivity, read_execution_activities
+from agent_hub.runs.context_evidence import (
+    CONTEXT_EVENT_KINDS,
+    context_event_projection,
+)
+from agent_hub.runs.execution_activity import (
+    ExecutionActivity,
+    read_execution_activities,
+)
+from agent_hub.runs.execution_clock import ClockSnapshot
 from agent_hub.runs.self_repair import (
     project_repair_checkpoint_is_safe,
     project_repair_scope_sha256,
@@ -189,7 +196,9 @@ def _metadata_approval_binding(
     row: RunRow, scope: object, *, planned: bool = False, live: bool = False,
 ) -> dict[str, object] | None:
     from agent_hub.capabilities.approvals import capability_approval_scope
-    from agent_hub.capabilities.python_metadata_preparation import metadata_preparation_binding
+    from agent_hub.capabilities.python_metadata_preparation import (
+        metadata_preparation_binding,
+    )
 
     try:
         request = metadata_preparation_binding(row, planned=planned, live=live)
@@ -226,7 +235,11 @@ def _is_go_recipe_scope(scope: object) -> bool:
 
 def _go_approval_binding(row: RunRow, scope: object) -> dict[str, object]:
     from agent_hub.capabilities.approvals import capability_approval_scope
-    from agent_hub.runs.go_project_admission import EXECUTION_KEY, RECIPE_KEY, go_recipe_binding
+    from agent_hub.runs.go_project_admission import (
+        EXECUTION_KEY,
+        RECIPE_KEY,
+        go_recipe_binding,
+    )
 
     try:
         request = go_recipe_binding(row)
@@ -314,7 +327,10 @@ def _python_recipe_marker(value: object) -> dict[str, object] | None:
 def _python_project_approval_binding(run: RunRow, approval_scope: object) -> dict[str, object] | None:
     from agent_hub.capabilities.project_baselines import ProjectBaselineReference
     from agent_hub.capabilities.project_contracts import ManagedProjectInput
-    from agent_hub.capabilities.scoped_read import ScopedReadError, authorized_workspace_scope
+    from agent_hub.capabilities.scoped_read import (
+        ScopedReadError,
+        authorized_workspace_scope,
+    )
 
     route = run.routing_decision or {}
     if 'generated_project_contract_version' in route or 'generated_project_preparation' in route:
@@ -399,7 +415,9 @@ def _toolchain_supply_approval_binding(
         return None
     try:
         from agent_hub.capabilities.approvals import capability_approval_scope
-        from agent_hub.capabilities.toolchain_preparation import toolchain_supply_binding
+        from agent_hub.capabilities.toolchain_preparation import (
+            toolchain_supply_binding,
+        )
 
         request = toolchain_supply_binding(run, planned=planned)
         return request.arguments if approval_scope == capability_approval_scope(request) else None
@@ -424,7 +442,9 @@ def _toolchain_approval_matches(run: RunRow, approval: RunApprovalRow) -> bool:
 
 def _generated_python_approval_binding(run: RunRow, scope: object, *, supply: bool) -> dict[str, object] | None:
     from agent_hub.capabilities.approvals import capability_approval_scope
-    from agent_hub.capabilities.python_generated_service import generated_python_approval_request
+    from agent_hub.capabilities.python_generated_service import (
+        generated_python_approval_request,
+    )
 
     try:
         state = (run.routing_decision or {}).get('generated_project_preparation')
@@ -489,6 +509,7 @@ class RunRecord:
     worker_lease_expires_at: datetime | None = None
     worker_heartbeat_at: datetime | None = None
     execution_activity: ExecutionActivity | None = None
+    execution_clock_sha256: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -714,6 +735,12 @@ class RunRepository:
                     blocked_by_run_id = UUID(raw_blocked_by_run_id)
                 except ValueError:
                     raise ValueError("blocked_by_run_id must be a UUID") from None
+        if type((routing_decision or {}).get("execution_clock_version")) is int and (routing_decision or {})["execution_clock_version"] == 2:
+            if authenticated_input is None:
+                raise ValueError("execution clock requires authenticated original input")
+            from agent_hub.runs.execution_clock import submission_binding
+
+            submission_binding(tenant_id, actor_id, request, routing_decision or {})
         run_id = uuid4()
         outbox_id = uuid4()
         outbox_key = f"{tenant_id}:{idempotency_key or run_id}"
@@ -749,6 +776,9 @@ class RunRepository:
             await session.flush()
             if authenticated_input is not None:
                 await _persist_authenticated_input(session, row, authenticated_input)
+                from agent_hub.runs import execution_clock_store as clocks
+
+                await clocks.create(session, row, authorization_turn_id=authenticated_input.turn_id)
             if enqueue and blocked_by_run_id is None:
                 session.add(
                     RunOutboxRow(
@@ -2247,7 +2277,87 @@ class RunRepository:
             worker_lease_token=worker_lease_token,
             worker_lease_expires_at=worker_lease_expires_at,
         )
+        from agent_hub.runs import execution_clock_store as clocks
+
+        try:
+            await clocks.start(session, row, checkpoint)
+        except clocks.ExecutionClockExpired:
+            sequence = await self.next_event_sequence(session, row.id)
+            await self.persist_event(session, tenant_id=row.tenant_id, run_id=row.id,
+                event=RunEvent(kind=EventKind.RUNTIME_FAILED, sequence=sequence, run_id=row.id,
+                               reason="run execution or authorization budget exhausted"))
+            row.status = RunStatus.FAILED.value
+            self.clear_worker_lease(row)
+            row.version += 1
+            await session.flush()
+            return self._record(row)
         return row, checkpoint
+
+    async def execution_clock_snapshot(
+        self, tenant_id: UUID, run_id: UUID, *, worker_id: str,
+        worker_lease_token: UUID, checkpoint: RuntimeCheckpoint | None, progress_units: int,
+    ) -> tuple[ClockSnapshot, datetime]:
+        from agent_hub.runs import execution_clock_store as clocks
+
+        async with self._session_factory() as session, session.begin():
+            row = await session.scalar(self._run_select(tenant_id, run_id).with_for_update())
+            if (row is None or row.status != RunStatus.RUNNING.value
+                    or (row.worker_id, row.worker_lease_token) != (worker_id, worker_lease_token)):
+                raise RunConflict("execution clock worker changed")
+            clock = await clocks.locked(session, row)
+            if clock is None:
+                raise RunConflict("execution clock is not bound")
+            expected = (None, None) if checkpoint is None else (checkpoint.id, checkpoint.state_sha256)
+            if (clock.checkpoint_id, clock.checkpoint_sha256) != expected:
+                raise RunConflict("execution clock checkpoint changed")
+            if type(progress_units) is not int or progress_units < 0:
+                raise RunConflict("execution clock progress is invalid")
+            clock.progress_units = max(clock.progress_units, progress_units)
+            clock.version += 1
+            now = await clocks.database_now(session)
+            await session.flush()
+            return clocks.snapshot(clock), now
+
+    async def park_execution_clock(
+        self, tenant_id: UUID, run_id: UUID, *, worker_id: str,
+        worker_lease_token: UUID, quiescent: bool,
+    ) -> None:
+        from agent_hub.runs import execution_clock_store as clocks
+
+        if quiescent is not True:
+            raise RunConflict("execution clock cleanup is not confirmed")
+        async with self._session_factory() as session, session.begin():
+            row = await session.scalar(self._run_select(tenant_id, run_id).with_for_update())
+            if row is None:
+                raise RunNotFound("run was not found")
+            route = dict(row.routing_decision or {})
+            approval_id = route.get("approval_id")
+            if type(approval_id) is not str:
+                raise RunConflict("execution clock approval binding is missing")
+            # Reuse the real durable recovery guard, including UNKNOWN/effect checks.
+            await self._require_capability_approval_checkpoint(session, row, route, approval_id=approval_id)
+            latest = await self.latest_checkpoint(session, tenant_id=tenant_id, run_id=run_id)
+            if latest is not None and clocks.checkpoint_has_unsettled_effects(latest):
+                raise RunConflict("execution clock has unresolved external work")
+            await clocks.park(session, row, worker_id=worker_id, token=worker_lease_token)
+
+    async def close_execution_clock(
+        self, tenant_id: UUID, run_id: UUID, *, worker_id: str,
+        worker_lease_token: UUID, quiescent: bool, uncertain: bool = False,
+    ) -> bool:
+        from agent_hub.runs import execution_clock_store as clocks
+
+        if quiescent is not True:
+            return False
+        async with self._session_factory() as session, session.begin():
+            row = await session.scalar(self._run_select(tenant_id, run_id).with_for_update())
+            if row is None:
+                raise RunNotFound("run was not found")
+            latest = await self.latest_checkpoint(session, tenant_id=tenant_id, run_id=run_id)
+            if latest is not None and clocks.checkpoint_has_unsettled_effects(latest):
+                return False
+            return await clocks.close_segment(session, row, worker_id=worker_id,
+                token=worker_lease_token, uncertain=uncertain)
 
     async def running_for_recovery(self, limit: int, *, now: datetime) -> tuple[UUID, ...]:
         if limit <= 0:
@@ -2557,7 +2667,9 @@ class RunRepository:
             approval_worker_token = row.worker_lease_token
             conversation_binding = None
             if approval_request is not None:
-                from agent_hub.capabilities.approvals import fingerprint_capability_request
+                from agent_hub.capabilities.approvals import (
+                    fingerprint_capability_request,
+                )
                 from agent_hub.capabilities.conversation_approvals import (
                     conversation_approval_binding,
                 )
@@ -2580,7 +2692,9 @@ class RunRepository:
                     raise RunConflict('resolution approval request binding is invalid')
                 resolution_binding = resolution_approval_binding(self._record(row), approval_request)
             if _is_metadata_preparation_scope(approval_scope):
-                from agent_hub.capabilities.approvals import fingerprint_capability_request
+                from agent_hub.capabilities.approvals import (
+                    fingerprint_capability_request,
+                )
                 from agent_hub.capabilities.python_metadata_preparation import (
                     metadata_preparation_binding,
                 )
@@ -3442,7 +3556,9 @@ class RunRepository:
     async def _conversation_scope_valid(
         session: AsyncSession, run: RunRow, binding: object, *, lock: bool = False,
     ) -> bool:
-        from agent_hub.capabilities.conversation_approvals import conversation_binding_valid
+        from agent_hub.capabilities.conversation_approvals import (
+            conversation_binding_valid,
+        )
         if not conversation_binding_valid(run, binding):
             return False
         route = run.routing_decision or {}
@@ -3863,6 +3979,10 @@ class RunRepository:
         if event.artifact is not None:
             await self._persist_artifact(session, tenant_id, run_id, event.artifact)
         if event.checkpoint is not None:
+            from agent_hub.runs import execution_clock_store as clocks
+
+            clock_parent = await self.get_for_update(session, run_id)
+            await clocks.checkpoint(session, clock_parent, event.checkpoint)
             await self._persist_checkpoint(session, tenant_id, run_id, event)
         if event.kind in {EventKind.APPROVAL_REQUESTED, EventKind.APPROVAL_RESOLVED}:
             await self._persist_approval(session, tenant_id, run_id, event)
@@ -3877,7 +3997,9 @@ class RunRepository:
         """Validate against the locked DB predecessor; True is an identical replay."""
         from agent_hub.runs.artifacts import PostgresArtifactRepository
         from agent_hub.runtime.artifacts import ArtifactRepositoryError
-        from agent_hub.runtime.autogen.project_repair_phase import validate_diagnostic_transition
+        from agent_hub.runtime.autogen.project_repair_phase import (
+            validate_diagnostic_transition,
+        )
 
         checkpoint = event.checkpoint
         assert checkpoint is not None
@@ -3966,7 +4088,9 @@ class RunRepository:
                 mode=TaskMode.DISCUSS, request=row.request,
                 routing_decision=cast(Mapping[str, JsonValue], actual_route),
             )
-            from agent_hub.runs.diagnostic_context import python_diagnostic_progress_context
+            from agent_hub.runs.diagnostic_context import (
+                python_diagnostic_progress_context,
+            )
 
             progress_context = python_diagnostic_progress_context(context, diagnostic_context, row)
             if progress_context is None:
@@ -4089,6 +4213,7 @@ class RunRepository:
             worker_lease_token=_optional_database_uuid(getattr(row, 'worker_lease_token', None)),
             worker_lease_expires_at=getattr(row, "worker_lease_expires_at", None),
             worker_heartbeat_at=getattr(row, "worker_heartbeat_at", None),
+            execution_clock_sha256=getattr(row, "execution_clock_sha256", None),
         )
 
     @staticmethod
@@ -4515,7 +4640,11 @@ def _public_plugin_approval_events(
             public_binding.update(_metadata_history_projection(run, approval))
         elif 'public_binding' not in approval.payload and 'go_recipe_binding' in approval.payload:
             from agent_hub.capabilities.approvals import capability_approval_scope
-            from agent_hub.runs.go_project_admission import RECIPE_KEY, encoded, go_recipe_binding
+            from agent_hub.runs.go_project_admission import (
+                RECIPE_KEY,
+                encoded,
+                go_recipe_binding,
+            )
 
             try:
                 request = go_recipe_binding(run)

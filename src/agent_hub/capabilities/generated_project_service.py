@@ -582,6 +582,7 @@ class GeneratedProjectService:
         from agent_hub.capabilities.python_resolution_preparation import (
             PythonResolutionPreparation,
             ResolutionApprovalRequired,
+            existing_resolution_publication_approved,
         )
         from agent_hub.skills.sandbox.python_metadata_plan_protocol import (
             PythonMetadataDraft,
@@ -632,7 +633,12 @@ class GeneratedProjectService:
             user_id=authority.user_id, role=authority.role, current_record=latest)
         # The live context carries remaining time. Charge elapsed time once;
         # the resolution client separately enforces that remaining-time cap.
-        original_deadline = latest.created_at + timedelta(seconds=authority.timeout_seconds)
+        authorization_seconds = authority.timeout_seconds
+        if latest.execution_clock_sha256 is not None:
+            from agent_hub.runs.execution_clock import authorization_window
+
+            authorization_seconds = int(authorization_window(latest))
+        original_deadline = latest.created_at + timedelta(seconds=authorization_seconds)
         journal_scope = {**scope.model_dump(mode='json'), 'root_sha256': root_config_sha256,
             'catalog_sha256': base.profile.catalog_sha256}
         journal = self._resolution_journal
@@ -651,7 +657,7 @@ class GeneratedProjectService:
                 original_deadline = datetime.fromisoformat(raw_deadline)
                 _need(original_deadline.tzinfo is not None and original_deadline.isoformat() == raw_deadline
                       and latest.created_at < original_deadline
-                      <= latest.created_at + timedelta(seconds=authority.timeout_seconds),
+                      <= latest.created_at + timedelta(seconds=authorization_seconds),
                       'resolution_checkpoint_scope_changed')
         # A checkpoint is data, not a grant. Keep its first exact deadline, then
         # validate the COMPLETE immutable history, including every scope field.
@@ -701,8 +707,15 @@ class GeneratedProjectService:
             assert callable(checker)
             return await checker(authority.tenant_id, authority.run_id, capability_approval_scope(request)) is True
 
+        async def existing_approved(request: CapabilityRequest) -> bool:
+            await guard()
+            allowed = await existing_resolution_publication_approved(self.repository, request)
+            await guard()
+            return allowed is True
+
         # Retain immutable data, but never retain a previous call's source/actor fences.
         client = PythonResolutionPreparation(current=current, approved=approved,
+            existing_approved=existing_approved,
             original_deadline=original_deadline)
         if flow is None:
             flow = DynamicPythonResolutionFlow(client, checkpoint=persist)

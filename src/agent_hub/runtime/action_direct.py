@@ -198,6 +198,19 @@ def _check_guidance(context: TaskContext) -> None:
     raise RuntimeExecutionError('action recovery guidance is unsupported or unsafe to persist') from None
 
 
+def _restore_execution_window(context: TaskContext, *, current_seconds: float,
+                              saved_seconds: float, elapsed_seconds: float,
+                              read_elapsed_seconds: float = 0.) -> float:
+    if type(context.routing_decision.get("execution_clock_version")) is int and context.routing_decision["execution_clock_version"] == 2:
+        from agent_hub.runs.execution_clock import bound_clock
+
+        clock = bound_clock(context.run_id, context.execution_token)
+        return min(current_seconds-read_elapsed_seconds,
+                   saved_seconds-elapsed_seconds-read_elapsed_seconds,
+                   clock.remaining().effective_seconds)
+    return min(current_seconds, saved_seconds)-elapsed_seconds-read_elapsed_seconds
+
+
 def _tighten_budgets(snapshot: TaskContext, current: TaskContext) -> TaskContext:
     route = {key: value for key, value in snapshot.routing_decision.items()
              if key not in _APPROVAL_ROUTE_KEYS}
@@ -581,6 +594,7 @@ class ActionApprovedDirectRuntime(DirectRuntime):
     async def _run_actions(self, context: TaskContext, token: object, done: asyncio.Event) -> AsyncGenerator[RunEvent, None]:
         _check_guidance(context)
         original = _tighten_budgets(context, context)
+        historical_total = original.timeout_seconds
         checkpoint = self._action_restored
         self._action_restored = None
         self._actions, self._pending, self._inspection = [], None, None
@@ -595,8 +609,9 @@ class ActionApprovedDirectRuntime(DirectRuntime):
                     or context.checkpoint is None or context.checkpoint.id != checkpoint.id):
                 raise RuntimeExecutionError('action checkpoint context changed')
             elapsed = cast(float, checkpoint.state['elapsed_seconds'])
-            deadline = started + min(original.timeout_seconds,
-                cast(float, checkpoint.state['timeout_seconds'])) - elapsed
+            deadline = started + _restore_execution_window(context,
+                current_seconds=original.timeout_seconds,
+                saved_seconds=cast(float, checkpoint.state['timeout_seconds']), elapsed_seconds=elapsed)
             if deadline <= started:
                 raise RuntimeExecutionError('action continuation execution budget is exhausted')
 
@@ -629,11 +644,15 @@ class ActionApprovedDirectRuntime(DirectRuntime):
             if (type(recorded) not in (int, float) or not math.isfinite(cast(float, recorded))
                     or not 0 <= cast(float, recorded) <= elapsed):
                 raise RuntimeExecutionError('action continuation budget is unavailable')
+            historical_total = min(snapshot.timeout_seconds, cast(float, checkpoint.state['timeout_seconds']))
             original = _tighten_budgets(snapshot, context)
             if original.timeout_seconds > cast(float, checkpoint.state['timeout_seconds']):
                 raise RuntimeExecutionError('action continuation budget is unavailable')
-            remaining = (original.timeout_seconds - elapsed
-                         - (asyncio.get_running_loop().time() - started))
+            remaining = _restore_execution_window(context,
+                current_seconds=original.timeout_seconds,
+                saved_seconds=min(snapshot.timeout_seconds, cast(float, checkpoint.state['timeout_seconds'])),
+                elapsed_seconds=elapsed,
+                read_elapsed_seconds=asyncio.get_running_loop().time()-started)
             if remaining <= 0:
                 raise RuntimeExecutionError('action continuation execution budget is exhausted')
             context = original.model_copy(update={'execution_token': context.execution_token,
@@ -662,8 +681,13 @@ class ActionApprovedDirectRuntime(DirectRuntime):
             preparation = (await self._preparation_snapshot(context, deadline=deadline)
                            if captured is None else captured)
             binding = _binding(_prepared_context(original, preparation), self._logical_model)
+            saved_original = original
+            if type(context.routing_decision.get("execution_clock_version")) is int and context.routing_decision["execution_clock_version"] == 2:
+                # This is immutable historical data, not the current execution grant.
+                # Pair the original total with cumulative elapsed across every wait.
+                saved_original = original.model_copy(update={'timeout_seconds': historical_total})
             reference = await self._data_io(save_continuation(self._repository, tenant_id=context.tenant_id, run_id=context.run_id,
-                value=cast(JsonValue, {'context': original.model_copy(update={'checkpoint': None, 'execution_token': None}).to_payload(),
+                value=cast(JsonValue, {'context': saved_original.model_copy(update={'checkpoint': None, 'execution_token': None}).to_payload(),
                     'models': self._journal.references, 'actions': self._actions,
                     'pending': self._pending, 'emitted': emitted,
                     'preparation': preparation,
@@ -674,6 +698,6 @@ class ActionApprovedDirectRuntime(DirectRuntime):
                 state={'phase': 'concrete_action', 'completed': False, 'approval_id': pending.approval,
                     'tool_name': pending.request.tool_name, 'context_sha256': binding, 'reference': reference,
                     'elapsed_seconds': elapsed + asyncio.get_running_loop().time() - started,
-                    'timeout_seconds': original.timeout_seconds})
+                    'timeout_seconds': saved_original.timeout_seconds})
             yield RunEvent(kind=EventKind.CHECKPOINT_SAVED, sequence=emitted+1,
                            run_id=context.run_id, checkpoint=self._last_checkpoint)

@@ -23,7 +23,10 @@ from agent_hub.capabilities.python_original_private_recipe import (
     derive_private_original_recipe,
     original_dependency_needs,
 )
-from agent_hub.capabilities.python_resolution_preparation import PythonResolutionPreparation
+from agent_hub.capabilities.python_resolution_preparation import (
+    PythonResolutionPreparation,
+    existing_resolution_publication_approved,
+)
 from agent_hub.capabilities.scoped_read import _read_no_links
 from agent_hub.skills.sandbox.project import ProjectInvocation
 from agent_hub.skills.sandbox.python_project_profile import PythonProjectProfileSandbox
@@ -44,6 +47,10 @@ if TYPE_CHECKING:
 
 
 def _approval_window(record: RunRecord) -> int:
+    if getattr(record, "execution_clock_sha256", None) is not None:
+        from agent_hub.runs.execution_clock import authorization_window
+
+        return int(authorization_window(record))
     route = record.routing_decision or {}
     value = route.get("runtime_timeout_seconds", 300)
     need(type(value) in {int, float} and math.isfinite(cast(float, value))
@@ -184,7 +191,14 @@ async def resolve_missing_original_python_inputs(
             raise OriginalProjectApprovalPending(result.approval_id, preparation, resolution_scope=bound_scope)
         return result.status is CapabilityStatus.ALLOWED and result.run_id == context.run_id
 
-    client = PythonResolutionPreparation(current=current, approved=approved, original_deadline=cutoff,
+    async def existing_approved(action: CapabilityRequest) -> bool:
+        require_current(await current(), planning)
+        allowed = await existing_resolution_publication_approved(repository, action)
+        require_current(await current(), planning)
+        return allowed is True
+
+    client = PythonResolutionPreparation(current=current, approved=approved, existing_approved=existing_approved,
+                                         original_deadline=cutoff,
                                          protected_original=require_current)
     previous_plan = None if checkpoint is None else cast(str | None, checkpoint["pending_plan_sha256"])
     previous_key = None if checkpoint is None else checkpoint["resolution_key"]

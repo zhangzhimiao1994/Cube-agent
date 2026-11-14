@@ -446,8 +446,12 @@ class RunAdmissionRepository:
             .where(RunInputAuthorizationRow.run_id == run.id)
             .execution_options(populate_existing=True))).one_or_none()
         evidence = None if rows is None else _validated_persisted_input(run, *rows)
+        from agent_hub.runs import execution_clock_store as execution_clocks
+
+        execution_clock = await execution_clocks.locked(session, run)
         # Must be after ALL admission locks and current-link reads, including lock waits.
-        now = (await session.execute(select(func.clock_timestamp()))).scalar_one()
+        now = (await execution_clocks.database_now(session) if execution_clock is not None
+               else (await session.execute(select(func.clock_timestamp()))).scalar_one())
         if (evidence is None or evidence.turn_id != turn_id
                 or run.status not in _EXECUTABLE_RUN_STATUSES
                 or run.mode not in ('direct', 'dispatch', 'discuss', 'hybrid')
@@ -469,6 +473,13 @@ class RunAdmissionRepository:
             if not math.isfinite(timeout_number) or timeout_number <= 0:
                 raise ValueError
             timeout_seconds = min(float(timeout_number), 3600.0)
+            if execution_clock is not None:
+                clock_snapshot = execution_clocks.snapshot(execution_clock)
+                if clock_snapshot.remaining(now).absolute_seconds <= 0:
+                    raise ValueError
+                if pool is not None and pool.original_deadline != execution_clock.hard_deadline:
+                    raise ValueError
+                timeout_seconds = clock_snapshot.policy.authorization_seconds
         except (ValueError, TypeError, OverflowError):
             raise AdmissionConflict(_CONFLICT) from None
         if pool is not None and (
@@ -552,6 +563,11 @@ class RunAdmissionRepository:
         run, pool = await self._locked(session, a['tenant_id'], a['run_id'])
         evidence, now, ceiling, timeout = await self._fence(session, run, pool,
             a['authorization_turn_id'], a['lease'], a['config_sha256'])
+        from agent_hub.runs import execution_clock_store as execution_clocks
+
+        execution_clock = await execution_clocks.locked(session, run)
+        if execution_clock is not None and deadline != execution_clock.hard_deadline:
+            raise AdmissionConflict(_CONFLICT)
         if grant > ceiling or not now < deadline <= now + timedelta(seconds=timeout):
             raise AdmissionConflict(_CONFLICT)
         route = run.routing_decision or {}

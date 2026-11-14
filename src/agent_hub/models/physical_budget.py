@@ -164,7 +164,9 @@ class _RunBudgetContext:
         self._evidence = replace(evidence)
         self._lease = _WorkerLease(lease.worker_id, lease.token)
         self._config = config_copy
-        self._deadline = min(float(deadline), captured_monotonic + remaining)
+        from agent_hub.runs.execution_clock import clamp_deadline
+
+        self._deadline = clamp_deadline(min(float(deadline), captured_monotonic + remaining))
         self._trusted_contexts = contracts
         self._acting_model = (
             None
@@ -501,7 +503,9 @@ def _selected_budget_request(
 
 def _budget_deadline(deadline: float) -> float:
     call = _budget_call.get()
-    return deadline if call is None else min(deadline, call.deadline)
+    from agent_hub.runs.execution_clock import clamp_deadline
+
+    return clamp_deadline(deadline if call is None else min(deadline, call.deadline))
 
 
 async def _selection_stream[T](

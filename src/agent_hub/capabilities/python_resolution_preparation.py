@@ -21,7 +21,7 @@ from agent_hub.capabilities.python_resolution_diagnostics import (
 )
 from agent_hub.capabilities.types import CapabilityRequest
 from agent_hub.models.physical_budget import _budget_deadline, _run_budget
-from agent_hub.runs.repository import RunRecord
+from agent_hub.runs.repository import RunRecord, RunRepository
 from agent_hub.skills.sandbox.python_registry_protocol import (
     DependencyNeed,
     ResolutionError,
@@ -39,6 +39,30 @@ from agent_hub.skills.sandbox.python_resolution_protocol import (
 )
 
 PREFIX = "workspace/current/project-resolution/python/"
+
+
+async def existing_resolution_publication_approved(repository: object, request: CapabilityRequest) -> bool:
+    """Read the original exact resolution ledger; never create or widen a grant.
+
+    The existing reader revalidates manual-once and resolution auto-review rows.
+    Recipe/conversation grants have different resources and remain excluded.
+    Caller-owned live claim/source/budget fences still run before and after IO.
+    """
+    from agent_hub.capabilities.approvals import fingerprint_capability_request
+    from agent_hub.capabilities.python_resolution_authorization import (
+        validate_resolution_authorization,
+    )
+
+    if not isinstance(repository, RunRepository):
+        return False
+    try:
+        checked = validate_resolution_authorization(request)
+    except ValueError:
+        return False
+    if checked.arguments["purpose"] != "python_dependency_publication":
+        return False
+    return await repository.is_capability_approval_approved(
+        checked.tenant_id, checked.run_id, fingerprint_capability_request(checked), tool_origin="builtin")
 
 
 def resolution_action(
@@ -97,12 +121,14 @@ class PythonResolutionPreparation:
         *,
         current: Callable[[], Awaitable[RunRecord | None]],
         approved: Callable[[CapabilityRequest], Awaitable[bool]] | None,
+        existing_approved: Callable[[CapabilityRequest], Awaitable[bool]] | None = None,
         transport: Callable[[ResolutionRequest], Awaitable[ResolutionStatus]] | None = None,
         original_deadline: datetime | None = None,
         protected_original: Callable[[RunRecord, ProtectedOriginalResolutionPlanning], int] | None = None,
     ) -> None:
         self.current = current
         self.approved = approved
+        self.existing_approved = existing_approved
         self.transport = transport
         self._original: ResolutionClaim | None = None
         self._original_deadline = original_deadline
@@ -154,7 +180,14 @@ class PythonResolutionPreparation:
             need(self._protected_original is not None, "resolution_authority_unavailable")
             assert self._protected_original is not None
             allowed_timeout = self._protected_original(record, planning)
-            need(type(allowed_timeout) is int and 0 < allowed_timeout <= 3600, "resolution_deadline")
+            if record.execution_clock_sha256 is not None:
+                from agent_hub.runs.execution_clock import authorization_window
+
+                verified_window = int(authorization_window(record))
+                need(type(allowed_timeout) is int and allowed_timeout == verified_window,
+                     "resolution_deadline")
+            else:
+                need(type(allowed_timeout) is int and 0 < allowed_timeout <= 3600, "resolution_deadline")
         else:
             live = generated_authority(record, scope.tenant_id, scope.run_id)
             need(
@@ -165,6 +198,10 @@ class PythonResolutionPreparation:
 
             need(metadata_scope(record, actor=scope.actor, live=True) == scope, "resolution_scope_changed")
             allowed_timeout = live.timeout_seconds
+        if record.execution_clock_sha256 is not None:
+            from agent_hub.runs.execution_clock import authorization_window
+
+            allowed_timeout = int(authorization_window(record))
         need(hashlib.sha256(record.request.encode()).hexdigest() == scope.request_sha256)
         if self._original is None:
             # The route retains the original total; context timeout is remaining
@@ -358,6 +395,10 @@ class PythonResolutionPreparation:
             response = ResolutionStatus.model_validate(response, strict=True)
             final = await self._claim(planning)
             final.require_continuity(current)
+            if self._quiet_publication_timeout(response):
+                # A failed operation cannot call an approval/authorizer fallback.
+                # The reconciliation below uses only a pure existing-grant reader.
+                return response
             if action in {"resolve_python_inputs", "publish_python_resolution"}:
                 assert self.approved is not None
                 if await self.approved(action_request) is not True:
@@ -404,7 +445,7 @@ class PythonResolutionPreparation:
             ConnectionResetError, BrokenPipeError, EOFError, asyncio.IncompleteReadError,
         )
         try:
-            return await self._send(
+            response = await self._send(
                 "publish_python_resolution",
                 needs=needs,
                 environment=environment,
@@ -458,6 +499,49 @@ class PythonResolutionPreparation:
                 # Opaque Root inspections intentionally omit plan bytes; only
                 # the exact validated, requested plan can fill that field.
                 return ResolutionStatus(state="published", key=plan.resolution_key, plan=plan)
+
+        if not self._quiet_publication_timeout(response) or self.existing_approved is None:
+            return response
+        # The broker proved only a local timeout and completed cleanup, never
+        # completion or permission. Reuse the exact immutable plan and all live
+        # fences; do not reset an expired claim or invoke another effect.
+        async with asyncio.timeout_at(plan.claim.task_deadline) as timeout:
+            current = await self._claim(current_planning)
+            if isinstance(current_planning, ProtectedOriginalResolutionPlanning):
+                current.require_data_origin(plan.claim)
+                need(current.approval_payload() == plan.claim.approval_payload(), "resolution_scope_changed")
+            else:
+                current.require_continuity(plan.claim)
+            timeout.reschedule(current.task_deadline)
+            action = resolution_action(current, needs, environment, plan=plan)
+            if await self.existing_approved(action) is not True:
+                return response
+            fresh = await self._claim(current_planning)
+            fresh.require_continuity(current)
+            timeout.reschedule(fresh.task_deadline)
+            status = await self.inspect(needs=needs, environment=environment, planning=current_planning,
+                                        plan=plan, expected_plan_sha256=plan.sha256)
+            status = ResolutionStatus.model_validate(status, strict=True)
+            need(status.key == plan.resolution_key, "resolution_response_invalid")
+            if status.state != "published":
+                return response
+            need(status.plan is None or status.plan.sha256 == plan.sha256, "resolution_response_invalid")
+            inspected = await self._claim(current_planning)
+            inspected.require_continuity(fresh)
+            timeout.reschedule(inspected.task_deadline)
+            if await self.existing_approved(action) is not True:
+                return response
+            final = await self._claim(current_planning)
+            final.require_continuity(inspected)
+            return ResolutionStatus(state="published", key=plan.resolution_key, plan=plan)
+
+    @staticmethod
+    def _quiet_publication_timeout(status: ResolutionStatus) -> bool:
+        diagnostic = status.diagnostic
+        return (status.state == "unknown" and diagnostic is not None
+                and diagnostic.phase == "publication"
+                and diagnostic.code == "resolution_publication_timeout_quiet"
+                and diagnostic.timed_out is True)
 
     async def inspect(
         self,

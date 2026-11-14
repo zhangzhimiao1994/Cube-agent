@@ -320,6 +320,7 @@ type ResolutionFailurePhase = Literal[
     "registry_metadata", "resolution", "freeze", "publication", "inspection",
 ]
 type ResolutionFailureCode = Literal[
+    "resolution_publication_timeout_quiet",
     "internal_failure", "resolution_deadline", "resolution_timeout", "resolution_unavailable",
     "resolution_request_invalid", "resolution_response_invalid", "resolution_stage_invalid",
     "metadata_prepare_request_invalid", "metadata_prepare_unavailable",

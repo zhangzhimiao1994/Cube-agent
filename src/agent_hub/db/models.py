@@ -7,6 +7,7 @@ from sqlalchemy import (
     Boolean,
     CheckConstraint,
     DateTime,
+    Float,
     ForeignKey,
     ForeignKeyConstraint,
     Index,
@@ -198,6 +199,7 @@ class ConversationRow(Base):
 class RunRow(Base):
     __tablename__ = "agent_hub_runs"
     __table_args__ = (
+        UniqueConstraint("id", "execution_clock_sha256", name="uq_run_execution_clock_binding"),
         UniqueConstraint(
             "tenant_id",
             "idempotency_key",
@@ -229,6 +231,7 @@ class RunRow(Base):
     )
 
     id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), primary_key=True, default=uuid4)
+    execution_clock_sha256: Mapped[str | None] = mapped_column(String(64))
     tenant_id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), nullable=False)
     actor_id: Mapped[UUID | None] = mapped_column(PostgreSQLUUID(as_uuid=True), nullable=True)
     actor_role: Mapped[str | None] = mapped_column(String(32), nullable=True)
@@ -849,3 +852,39 @@ class RunReviewEventRow(Base):
     kind: Mapped[str] = mapped_column(String(16))
     evidence: Mapped[dict[str, object]] = mapped_column(JSONB)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class RunExecutionClockRow(Base):
+    """New-task immutable authorization plus one owned execution interval."""
+
+    __tablename__ = "agent_hub_run_execution_clocks"
+    __table_args__ = (
+        ForeignKeyConstraint(["run_id", "binding_sha256"],
+            ["agent_hub_runs.id", "agent_hub_runs.execution_clock_sha256"],
+            name="fk_execution_clock_witness"),
+        ForeignKeyConstraint(["authorization_turn_id", "tenant_id", "run_id"],
+            ["agent_hub_authenticated_inputs.turn_id", "agent_hub_authenticated_inputs.tenant_id",
+             "agent_hub_authenticated_inputs.run_id"], name="fk_execution_clock_original"),
+        CheckConstraint("spent_seconds >= 0 AND progress_units >= 0 AND version > 0",
+                        name="ck_execution_clock_accounting"),
+        CheckConstraint("(active_since IS NULL AND worker_id IS NULL AND worker_token IS NULL) OR "
+                        "(active_since IS NOT NULL AND worker_id IS NOT NULL AND worker_token IS NOT NULL)",
+                        name="ck_execution_clock_owned_interval"),
+    )
+
+    run_id: Mapped[UUID] = mapped_column(ForeignKey("agent_hub_runs.id", ondelete="CASCADE"), primary_key=True)
+    tenant_id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), nullable=False)
+    authorization_turn_id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), nullable=False)
+    actor_id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), nullable=False)
+    request_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    binding_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    policy: Mapped[dict[str, object]] = mapped_column(JSONB, nullable=False)
+    hard_deadline: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    spent_seconds: Mapped[float] = mapped_column(Float, nullable=False)
+    active_since: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    worker_id: Mapped[str | None] = mapped_column(String(128))
+    worker_token: Mapped[UUID | None] = mapped_column(PostgreSQLUUID(as_uuid=True))
+    progress_units: Mapped[int] = mapped_column(Integer, nullable=False)
+    checkpoint_id: Mapped[UUID | None] = mapped_column(PostgreSQLUUID(as_uuid=True))
+    checkpoint_sha256: Mapped[str | None] = mapped_column(String(64))
+    version: Mapped[int] = mapped_column(Integer, nullable=False)

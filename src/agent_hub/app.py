@@ -1597,6 +1597,7 @@ def create_app(
                         config_service=ConfigService(active_sessions), config_getter=review_config,
                         run_repository=capability_run_repository, session_factory=active_sessions,
                         secret_service=active_secret_service, redis_client=active_redis,
+                        runtime_authorization_timeout_seconds=configured.runtime_authorization_timeout_seconds,
                     )
                     application.state.review_assembly_broker = review_broker
                     capability_stack_builder = partial(
@@ -1724,6 +1725,7 @@ def create_app(
                     runtime_memory_recall=PersistentRuntimeMemoryRecall(active_sessions),
                     temporary_agent_policy=AdminResourceTemporaryAgentPolicy(active_sessions),
                     runtime_timeout_seconds=configured.runtime_timeout_seconds,
+                    runtime_authorization_timeout_seconds=configured.runtime_authorization_timeout_seconds,
                     runtime_token_budget=configured.runtime_token_budget,
                     main_agent_context_window_getter=_MainAgentContextWindowGetter(
                         cast(

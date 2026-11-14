@@ -69,6 +69,7 @@ class _ResolutionPreparationExecution(_Execution):
     lease_closed: bool = False
     lease_timeout: asyncio.Timeout | None = None
     task_bound: float | None = None
+    operation_timed_out: bool = False
 
     def __post_init__(self) -> None:
         if self.original_request is not None:
@@ -281,11 +282,13 @@ async def _handle_preparation(
                 helper.process = None
                 job.finished.set()
 
+        operation_timeout: asyncio.Timeout | None = None
         try:
             deadline = asyncio.get_running_loop().time() + invocation.timeout_seconds
             if isinstance(request, ResolutionRequest):
                 deadline = min(deadline, request.claim.task_deadline)
-            async with asyncio.timeout_at(deadline), asyncio.timeout(None) as lease_timeout:
+            operation_timeout = asyncio.timeout_at(deadline)
+            async with operation_timeout, asyncio.timeout(None) as lease_timeout:
                 if isinstance(job, _ResolutionPreparationExecution):
                     async with job.lease_lock:
                         assert job.current_claim is not None
@@ -331,6 +334,8 @@ async def _handle_preparation(
                     on_forced_terminate=stop_units)
                 if result.exit_code != 0 or result.timed_out:
                     exit_code, timed_out = result.exit_code, result.timed_out
+                if isinstance(job, _ResolutionPreparationExecution) and result.timed_out is True:
+                    job.operation_timed_out = True
                 if result.exit_code == 3:
                     native_uncertain = True
                     raise ProcessCleanupIncomplete("metadata_prepare_cleanup_incomplete")
@@ -361,6 +366,11 @@ async def _handle_preparation(
                 response = PythonMetadataPreparationResponse.model_validate_json(_encoded(payload), strict=True)
                 response.require_for(request)
                 return _inspection_state(broker, request, response)
+        except TimeoutError:
+            if (isinstance(job, _ResolutionPreparationExecution)
+                    and operation_timeout is not None and operation_timeout.expired()):
+                job.operation_timed_out = True
+            raise
         finally:
             previous_phase, phase = phase, "cleanup"
             await _uninterrupted(finish())
@@ -386,4 +396,43 @@ async def handle_resolution_preparation(
     result = await _handle_preparation(broker, request, peer_uid=peer_uid)
     if type(result) is not ResolutionStatus:
         raise ValueError("resolution_response_invalid")
+    if (result.diagnostic is not None
+            and result.diagnostic.code == "resolution_publication_timeout_quiet"):
+        # This attestation belongs to the broker, never to worker stdout (even
+        # when the worker serialises an otherwise valid finite diagnostic).
+        from agent_hub.skills.sandbox.python_resolution_protocol import (
+            ResolutionFailureDiagnostic,
+        )
+
+        return ResolutionStatus(state="unknown", key=request.key,
+            diagnostic=ResolutionFailureDiagnostic(phase="response",
+                code="resolution_response_invalid", exit_code=result.diagnostic.exit_code, timed_out=None))
+    # Only this broker's completed two-unit drain can attest a local operation
+    # timeout. A worker's UNKNOWN/diagnostic alone never establishes quiescence.
+    job = broker.executions.get(request.invocation.execution_id)
+    if (request.action == "publish_python_resolution" and result.state == "unknown"
+            and result.diagnostic is not None and result.diagnostic.phase == "execution"
+            and result.diagnostic.code in {"metadata_prepare_timeout", "metadata_prepare_unavailable"}
+            and type(job) is _ResolutionPreparationExecution and job.operation_timed_out
+            and job.original_request == request and job.quiet and job.finished.is_set()
+            and job.task is None and not job.slot_acquired and job.lease_closed
+            and job.stage is not None and not job.stage.exists()):
+        current = job.current_claim
+        if current is not None and job.task_bound is not None:
+            try:
+                current.require_continuity(request.claim)
+                # Lease/task expiry is never reclassified as a short operation timeout.
+                _ = current.deadline
+                local_only = job.task_bound < current.task_deadline
+            except ValueError:
+                local_only = False
+            if local_only:
+                from agent_hub.skills.sandbox.python_resolution_protocol import (
+                    ResolutionFailureDiagnostic,
+                )
+
+                return ResolutionStatus(state="unknown", key=request.key,
+                    diagnostic=ResolutionFailureDiagnostic(phase="publication",
+                        code="resolution_publication_timeout_quiet",
+                        exit_code=result.diagnostic.exit_code, timed_out=True))
     return result

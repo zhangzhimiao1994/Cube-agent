@@ -57,6 +57,8 @@ class Settings(BaseSettings):
     trusted_proxy_ips: frozenset[str] = Field(default=frozenset(), max_length=32)
     log_level: str = Field(default="WARNING", pattern=r"^(DEBUG|INFO|WARNING|ERROR|CRITICAL)$")
     runtime_timeout_seconds: float = Field(default=300.0, gt=0, le=3600)
+    # Explicit server authorization for NEW split-clock submissions; absent disables v2.
+    runtime_authorization_timeout_seconds: float | None = Field(default=None, gt=0, allow_inf_nan=False)
     runtime_token_budget: int = Field(default=1_000_000, ge=1, le=10_000_000)
     scheduler_enabled: bool = True
     scheduler_tick_interval_seconds: float = Field(default=5.0, ge=0.1, le=300.0)

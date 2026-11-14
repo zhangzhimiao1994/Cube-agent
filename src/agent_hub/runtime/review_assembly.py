@@ -80,6 +80,11 @@ def _physical_scope_timeout_seconds(
     context: TaskContext, persisted: Mapping[str, object], profile: Mapping[str, object],
 ) -> float:
     """Keep soft scheduling outside the already admitted physical hard envelope."""
+    if type(persisted.get("execution_clock_version")) is int and persisted["execution_clock_version"] == 2:
+        from agent_hub.runs.execution_clock import bound_clock, positive
+
+        clock = bound_clock(context.run_id, context.execution_token)
+        return min(clock.remaining().absolute_seconds, positive(persisted["runtime_timeout_absolute_seconds"]))
     policy: dict[str, object] = {
         "runtime_timeout_source": "project_scale_soft_budget",
         "runtime_progress_policy": "semantic_workspace_v1",
@@ -154,6 +159,12 @@ def runtime_source_fingerprint() -> str:
         "runtime/repair_projection.py",
         "runtime/hybrid.py",
         "runs/service.py",
+        "runs/execution_clock.py",
+        "runs/execution_clock_store.py",
+        "runs/execution_clock_schema.py",
+        "db/models.py",
+        "settings.py",
+        "runtime/adaptive_budget.py",
         "runs/authorization.py",
         "runs/repository.py",
         "capabilities/defaults.py",
@@ -629,7 +640,13 @@ class ReviewAssemblyBroker:
         ]
         | None = None,
         evidence_source: ServerReviewEvidenceSource | None = None,
+        runtime_authorization_timeout_seconds: float | None = None,
     ) -> None:
+        from agent_hub.runs.execution_clock import authorization_seconds
+
+        self._runtime_authorization_timeout_seconds = (
+            None if runtime_authorization_timeout_seconds is None
+            else authorization_seconds(runtime_authorization_timeout_seconds))
         self._configs, self._get_config = config_service, config_getter
         self._runs, self._sessions = run_repository, session_factory
         self._secrets, self._capacity = secret_service, capacity_factory
@@ -868,15 +885,28 @@ class ReviewAssemblyBroker:
     async def submission_profile(
         self, tenant_id: UUID, *, timeout_seconds: float
     ) -> dict[str, object]:
+        if (type(timeout_seconds) not in (int, float) or not math.isfinite(timeout_seconds)
+                or not 0 < timeout_seconds <= 3600):
+            raise ValueError("invalid original review timeout")
+        return await self._submission_profile(tenant_id, timeout_seconds=timeout_seconds)
+
+    async def clock_submission_profile(
+        self, tenant_id: UUID, *, timeout_seconds: float,
+    ) -> dict[str, object]:
+        from agent_hub.runs.execution_clock import authorization_seconds
+
+        horizon = authorization_seconds(timeout_seconds)
+        if (self._runtime_authorization_timeout_seconds is None
+                or horizon > self._runtime_authorization_timeout_seconds):
+            raise ValueError("split clock requires a server-approved authorization horizon")
+        return await self._submission_profile(tenant_id, timeout_seconds=horizon)
+
+    async def _submission_profile(
+        self, tenant_id: UUID, *, timeout_seconds: float,
+    ) -> dict[str, object]:
         snapshot, _ = await self._compile(tenant_id)
         if snapshot is None:
             return {}
-        if (
-            type(timeout_seconds) not in (int, float)
-            or not math.isfinite(timeout_seconds)
-            or not 0 < timeout_seconds <= 3600
-        ):
-            raise ValueError("invalid original review timeout")
         profile: dict[str, object] = {
                 "version": 1,
                 "config_sha256": review_config_sha256(snapshot.config),
@@ -973,6 +1003,22 @@ class ReviewAssemblyBroker:
             or record.routing_decision.get(_PROFILE) != dict(profile)
         ):
             raise ReviewAssemblyUnavailable("original_authenticated_context_missing")
+        verified_clock = None
+        if record.execution_clock_sha256 is not None:
+            from agent_hub.runs.execution_clock import bound_clock, digest
+
+            verified_clock = bound_clock(context.run_id, context.execution_token)
+            policy = verified_clock.snapshot.policy
+            if (type(route.get("execution_clock_version")) is not int
+                    or route["execution_clock_version"] != 2
+                    or digest(profile) != policy.policy_sha256
+                    or profile.get("timeout_seconds") != policy.authorization_seconds
+                    or not 0 < policy.active_seconds <= 3600
+                    or verified_clock.snapshot.hard_deadline != record.created_at + timedelta(
+                        seconds=policy.authorization_seconds)):
+                raise ReviewAssemblyUnavailable("original_hard_envelope_missing")
+        elif route.get("execution_clock_version") == 2:
+            raise ReviewAssemblyUnavailable("original_hard_envelope_missing")
         admission_repository = RunAdmissionRepository(self._sessions)
         pool = await admission_repository.get_pool(context.tenant_id, context.run_id)
         activation_binding: Mapping[str, JsonValue] | None = None
@@ -1114,11 +1160,21 @@ class ReviewAssemblyBroker:
                 or not 0 < min(absolute, plan) <= 10_000_000
                 or type(timeout) not in (int, float)
                 or type(envelope) not in (int, float)
-                or timeout != envelope
+                or (timeout != envelope and not (
+                    type(route.get("execution_clock_version")) is int and route["execution_clock_version"] == 2
+                    and record.execution_clock_sha256 is not None))
             ):
                 raise ReviewAssemblyUnavailable("original_hard_envelope_missing")
+            if type(route.get("execution_clock_version")) is int and route["execution_clock_version"] == 2:
+                from agent_hub.runs.execution_clock import bound_clock, positive
+
+                clock = bound_clock(context.run_id, context.execution_token)
+                if (not positive(envelope) <= clock.snapshot.policy.active_seconds
+                        or clock.snapshot.policy.authorization_seconds != timeout):
+                    raise ReviewAssemblyUnavailable("original_hard_envelope_missing")
             original_timeout = cast(int | float, timeout)
-            if not math.isfinite(original_timeout) or not 0 < original_timeout <= 3600:
+            if (not math.isfinite(original_timeout) or original_timeout <= 0
+                    or (original_timeout > 3600 and verified_clock is None)):
                 raise ReviewAssemblyUnavailable("original_hard_envelope_missing")
             # Anchored to persisted creation, not this (possibly late) factory call.
             deadline = record.created_at + timedelta(seconds=float(original_timeout))
@@ -1157,7 +1213,9 @@ class ReviewAssemblyBroker:
             evidence=evidence,
             lease=lease,
             config=snapshot.config,
-            deadline=captured + _physical_scope_timeout_seconds(context, record.routing_decision, profile),
+            deadline=(time.monotonic() if type(route.get("execution_clock_version")) is int
+                      and route["execution_clock_version"] == 2 else captured)
+                + _physical_scope_timeout_seconds(context, record.routing_decision, profile),
             trusted_contexts=snapshot.contracts,
         )
         return ReviewExecution(budget, snapshot, activation_binding, admitted_at)
@@ -1220,6 +1278,7 @@ def build_review_broker(
     session_factory: async_sessionmaker[AsyncSession],
     secret_service: SecretService,
     redis_client: object,
+    runtime_authorization_timeout_seconds: float | None = None,
 ) -> ReviewAssemblyBroker:
     # Deployment environment is a server control plane. Neither field exists
     # in settings, model catalog payloads, action arguments or app.state maps.
@@ -1246,6 +1305,7 @@ def build_review_broker(
         session_factory=session_factory,
         secret_service=secret_service,
         capacity_factory=capacity,
+        runtime_authorization_timeout_seconds=runtime_authorization_timeout_seconds,
         evidence_loader=evidence if not path or not digest else None,
         evidence_source=ServerReviewEvidenceSource(Path(path), digest) if path and digest else None,
     )

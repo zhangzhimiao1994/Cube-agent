@@ -229,7 +229,7 @@ async def pg_seal_case() -> AsyncIterator[PgSealCase]:
         async with database.session_factory() as session, session.begin():
             identity = (await session.execute(select(func.current_database(), func.current_user()))).one()
             assert tuple(identity) == ('agent_hub_test','agent_hub_test')
-            assert (await session.execute(text('SELECT version_num FROM alembic_version'))).scalar_one() == '0036_review_ledger'
+            assert (await session.execute(text('SELECT version_num FROM alembic_version'))).scalar_one() == '0037_execution_clock'
             now: object = await session.scalar(select(func.clock_timestamp()))
             assert isinstance(now, datetime)
             expiry = now+timedelta(seconds=30)

@@ -56,11 +56,21 @@ class AdaptiveDeadline:
             raise ValueError("complexity_units must be a positive integer")
         if type(progress_units) is not int or progress_units < 0:
             raise ValueError("progress_units must be a non-negative integer")
+        from agent_hub.runs.execution_clock import live_clock, live_remaining
+
+        clock = live_clock()
+        clock_remaining = live_remaining(progress_units=progress_units)
+        if clock_remaining is not None:
+            absolute = min(absolute, clock_remaining.absolute_seconds)
+            initial = min(initial, clock_remaining.soft_seconds)
+            if absolute <= 0:
+                raise TimeoutError("run execution or authorization budget exhausted")
         absolute_deadline = current + absolute
         return cls(
             deadline=min(current + initial, absolute_deadline),
             absolute_deadline=absolute_deadline,
-            extension_per_unit=soft / complexity_units,
+            extension_per_unit=(soft / complexity_units if clock is None
+                                else clock.snapshot.policy.extension_per_unit),
             progress_units=progress_units,
         )
 
@@ -74,10 +84,12 @@ class AdaptiveDeadline:
             return False
         delta = progress_units - self.progress_units
         self.progress_units = progress_units
-        self.deadline = min(
+        from agent_hub.runs.execution_clock import clamp_soft_deadline
+
+        self.deadline = clamp_soft_deadline(min(
             self.absolute_deadline,
             self.deadline + self.extension_per_unit * delta,
-        )
+        ), progress_units=progress_units)
         return True
 
     def remaining(self, *, now: float) -> float:
@@ -100,7 +112,10 @@ class AdaptiveDeadline:
         if current >= self.absolute_deadline or (current >= self.deadline and not admitted_completion):
             return False
         previous = self.deadline
-        self.deadline = min(self.absolute_deadline, max(previous, current + runway))
+        from agent_hub.runs.execution_clock import clamp_soft_deadline
+
+        self.deadline = clamp_soft_deadline(
+            min(self.absolute_deadline, max(previous, current + runway)), progress_units=progress_units)
         return self.deadline > previous
 
     def absolute_remaining(self, *, now: float) -> float:
