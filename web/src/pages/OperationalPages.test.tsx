@@ -997,6 +997,12 @@ describe("operational management pages", () => {
         if (path === "/api/v1/admin/conversations/conv-previous") {
           return jsonResponse({ ...visibleConversationMetadata, runs: visibleConversationRuns });
         }
+        const createdConversation = createdConversationMetadataList.find((item) =>
+          path === `/api/v1/admin/conversations/${encodeURIComponent(item.conversation_id)}`,
+        );
+        if (createdConversation && method === "GET") {
+          return jsonResponse({ ...createdConversation, runs: [] });
+        }
         if (path === "/api/v1/workspaces/projects/default/sessions/conv-previous/files") {
           return jsonResponse(visibleWorkspaceFiles);
         }
@@ -5052,7 +5058,8 @@ describe("operational management pages", () => {
     const workbenchDrawer = await screen.findByRole("dialog", { name: "Agent 工作席详情" });
     expect(within(workbenchDrawer).queryByRole("region", { name: "重点摘要" })).toBeNull();
     const writerCard = within(workbenchDrawer).getByRole("button", { name: /打开顾准 · 文案工作调度/ });
-    expect(within(writerCard).getByText(/17 条，点击查看/)).not.toBeNull();
+    // The main agent's plan is not an execution record from the writer.
+    expect(within(writerCard).getByText(/16 条，点击查看/)).not.toBeNull();
     expect(within(writerCard).queryByText(/阶段 01 完成/)).toBeNull();
 
     await user.click(writerCard);

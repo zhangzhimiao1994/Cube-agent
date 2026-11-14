@@ -9,7 +9,7 @@ from typing import Self, TypedDict
 from uuid import UUID, uuid4
 
 from openai import AsyncOpenAI
-from sqlalchemy import event
+from sqlalchemy import Select, event
 from sqlalchemy.engine import Result
 from sqlalchemy.engine.result import IteratorResult, SimpleResultMetaData
 from sqlalchemy.ext.asyncio import AsyncSession, AsyncSessionTransaction, async_sessionmaker
@@ -17,7 +17,7 @@ from sqlalchemy.orm import ORMExecuteState
 
 from agent_hub.config.repository import ConfigRevision
 from agent_hub.config.service import ConfigService
-from agent_hub.db.models import RunApprovalRow, RunEventRow
+from agent_hub.db.models import RunAdmissionPoolRow, RunApprovalRow, RunEventRow
 from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.harness.types import HarnessToolCallRequest, HarnessToolCallResult
 from agent_hub.models.litellm_client import _Chat, _Completions
@@ -246,6 +246,14 @@ class ProjectionSession(AsyncSession):
         await self.original.flush()
 
     def dispatch_projection(self, state: ORMExecuteState) -> Result[tuple[object, ...]]:
+        if (isinstance(state.statement, Select)
+            and state.statement.column_descriptions[0].get("expr") is RunAdmissionPoolRow):
+            params = state.statement.compile().params
+            assert params == {
+                "tenant_id_1": [self.original.run.tenant_id],
+                "run_id_1": [self.original.run.id],
+            }
+            return rows([])  # This SQL fixture has no durable admission pool.
         if state.is_select:
             if any(
                 name in str(state.statement)

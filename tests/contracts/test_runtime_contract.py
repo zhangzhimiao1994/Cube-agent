@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import asyncio
 import json
 import math
@@ -212,7 +213,24 @@ async def test_direct_runtime_retries_once_after_empty_model_text() -> None:
 def test_contract_module_is_framework_neutral() -> None:
     source = Path("src/agent_hub/runtime/contracts.py").read_text(encoding="utf-8")
     forbidden = ("fastapi", "sqlalchemy", "crewai", "autogen", "celery")
-    assert all(name not in source.casefold() for name in forbidden)
+    # Protocol keys may name adapters (e.g. autogen_role_message_version).
+    # Framework neutrality forbids dependencies, not wire-format vocabulary.
+    imports: list[str] = []
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Import):
+            imports.extend(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            imports.append(node.module or "")
+            imports.extend(alias.name for alias in node.names)
+    dependencies = {
+        module for module in imports
+        if any(
+            part == name or part.startswith(f"{name}_")
+            for part in module.casefold().split(".")
+            for name in forbidden
+        )
+    }
+    assert not dependencies, f"runtime contracts import framework dependencies: {sorted(dependencies)}"
 
 
 def test_contract_validation_strings_and_safe_factory_hide_hostile_input() -> None:

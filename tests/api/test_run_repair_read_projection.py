@@ -8,6 +8,7 @@ from uuid import UUID
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy.engine import ScalarResult
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from agent_hub.app import create_app
@@ -53,6 +54,11 @@ def repair_client(
     session = AsyncMock(spec=AsyncSession)
     session.__aenter__.return_value = session
     session.scalar.return_value = row
+    # No admission pool was seeded; scalars() returns a synchronous ScalarResult,
+    # whose all() is an empty collection, not another awaitable.
+    pools = MagicMock(spec=ScalarResult)
+    pools.all.return_value = []
+    session.scalars.return_value = pools
     repository = RunRepository(cast(async_sessionmaker[AsyncSession], MagicMock(return_value=session)))
     monkeypatch.setattr(repository, "completed_step_ids", AsyncMock(return_value=("architect_step",)))
     monkeypatch.setattr(repository, "artifact_ids", AsyncMock(return_value=()))
@@ -74,11 +80,18 @@ def test_owned_pending_repair_survives_ordinary_reconnect(
     monkeypatch: pytest.MonkeyPatch, suffix: str, status: RunStatus,
 ) -> None:
     client = repair_client(monkeypatch, status=status)
+    read_started_at = datetime.now(UTC)
     response = client.get(f"/api/v1/runs/{RUN}{suffix}", headers=bearer())
+    read_finished_at = datetime.now(UTC)
     assert response.status_code == 200
     body = response.json()
     assert body["status"] == status.value
     assert body["version"] == 6
+    activity = body["execution_activity"]
+    assert activity["is_active"] is (status is RunStatus.WAITING_APPROVAL)
+    assert activity["reason"] == ("active" if status is RunStatus.WAITING_APPROVAL else "terminal")
+    assert activity["deadline_at"] is None
+    assert read_started_at <= datetime.fromisoformat(activity["evaluated_at"]) <= read_finished_at
     assert body["decision_token"] == TOKEN
     assert body["approval_kind"] == "self_repair"
     assert body["repair_proposal"]["kind"] == "self_repair"

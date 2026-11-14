@@ -20,8 +20,13 @@ from agent_hub.runtime.autogen.adapter import (
     CapabilityGateway,
     DiscussionParticipant,
     DiscussionPlan,
+    GatewayChatCompletionClient,
+    ModelOutcomeUncertain,
     RuntimeExecutionError,
+    _DiscussionDurability,
 )
+from agent_hub.runtime.autogen.model_rejection import RejectedModelRecord
+from agent_hub.runtime.autogen.termination import DiscussionUsage
 from agent_hub.runtime.contracts import EventKind, JsonValue, RunEvent, RuntimeCheckpoint
 from tests.unit.runtime.autogen.test_draft_action_progress import (
     action_context,
@@ -135,7 +140,10 @@ async def test_admitted_model_tool_and_ack_cross_soft_without_raising_absolute_b
                                "calls": [c.tool_name for c in case.calls]}
     assert [call.tool_name for call in case.calls] == ["project.inspect", "workspace.list", "workspace.write_text"]
     assert case.requests[-1].timeout_seconds > case.context.timeout_seconds
-    assert 0 < cast(float, saved.state["remaining_timeout_seconds"]) <= 0.3
+    # Subtracting large monotonic timestamps can round just above the window.
+    remaining_soft = cast(float, saved.state["remaining_timeout_seconds"])
+    assert remaining_soft > 0
+    assert remaining_soft <= 0.3 or remaining_soft == pytest.approx(0.3, rel=0, abs=1e-9)
     assert 0 < cast(float, saved.state["remaining_absolute_timeout_seconds"]) < 1.8
     assert saved.state[POLICY] == 1
     case.runner._validate_checkpoint(saved, case.context)
@@ -248,7 +256,9 @@ async def test_user_can_cancel_an_admitted_operation_after_soft_expiry() -> None
     assert not any(c.tool_name == "workspace.write_text" for c in case.calls)
 
 
-async def test_inflight_unknown_checkpoint_never_reenters_provider_on_restore() -> None:
+async def test_inflight_unknown_checkpoint_never_reenters_provider_on_restore(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     case = Journey(blocked=True)
     events: list[RunEvent] = []
     stream = cast(AsyncGenerator[RunEvent, None], case.runner.run(case.context))
@@ -271,15 +281,47 @@ async def test_inflight_unknown_checkpoint_never_reenters_provider_on_restore() 
         await stream.aclose()
     assert saved is not None
     before = len(case.requests)
+    saved_rows = saved.state["model_ledger"]
+    assert isinstance(saved_rows, tuple) and len(saved_rows) == 1
+    row = saved_rows[0]
+    assert isinstance(row, Mapping) and row["status"] == "running"
+    saved_hash = row["request_hash"]
+    mismatches: list[str] = []
+    before_model = _DiscussionDurability.before_model
+
+    async def check_identity(
+        self: _DiscussionDurability, request: ModelRequest, *,
+        tool_names: Mapping[str, str] | None = None, bounded_no_tool: bool = False,
+        report_binding: Mapping[str, JsonValue] | None = None, correction_for: int | None = None,
+        actor: str | None = None,
+    ) -> GatewayCompletion | RejectedModelRecord | None:
+        assert self.model_entries[0]["request_hash"] == saved_hash
+        assert self.request_hash(request, tool_names=tool_names) != saved_hash
+        try:
+            return await before_model(self, request, tool_names=tool_names,
+                bounded_no_tool=bounded_no_tool, report_binding=report_binding,
+                correction_for=correction_for, actor=actor)
+        except RuntimeExecutionError as error:
+            mismatches.append(str(error))
+            raise
+
+    monkeypatch.setattr(_DiscussionDurability, "before_model", check_identity)
     restored = AutoGenDiscussionRuntime(case, case.runner._plan,
         capability_gateway=cast(CapabilityGateway, case), harness_tool_gateway=case,
         artifact_repository=case.runner._repository)
     await restored.restore_checkpoint(RuntimeCheckpoint.from_payload(saved.to_payload()))
     result = [e async for e in restored.run(case.context.model_copy(update={"checkpoint": saved}))]
     assert result[-1].kind is EventKind.RUNTIME_FAILED
-    # Compacted transcript cannot match the pending request; fail closed before replay.
-    assert result[-1].reason == "durable model request mismatch"
+    # Compacted transcript cannot reconstruct the pending request. Keep its identity
+    # and fail closed; the public event uses the safe, structured discussion diagnostic.
+    assert mismatches == ["durable model request mismatch"]
+    assert result[-1].reason == "discussion_failed"
+    assert result[-1].payload["discussion_failure_phase"] == "model_client"
+    assert result[-1].payload["discussion_failure_kind"] == "runtime_error"
+    assert result[-1].payload["error_code"] == "runtime.discussion_failed.model_client.runtime_error"
+    assert row["request_hash"] == saved_hash and row["status"] == "running"
     assert len(case.requests) == before
+    RunEvent.from_payload(result[-1].to_payload())
 
 
 @pytest.mark.parametrize("count", [1, 20])
@@ -334,3 +376,55 @@ async def test_zero_soft_cold_restore_never_gets_a_new_one_millisecond_window(
     finally:
         await stream.aclose()
     assert len(case.requests) == before
+
+
+@pytest.mark.parametrize("cued", [False, True], ids=["legacy-identity", "cued-identity"])
+@pytest.mark.parametrize("status", ["succeeded", "running"])
+@pytest.mark.parametrize("changed", [None, "messages", "schema", "model", "tokens"])
+async def test_saved_engineering_identity_is_exact_and_unknown_never_dispatches(
+    cued: bool, status: str, changed: str | None,
+) -> None:
+    from autogen_core.models import UserMessage
+
+    from tests.unit.runtime.autogen.test_engineering_role_turn_contract import (
+        RecordingGateway,
+        durable_history,
+        role_history,
+        tools,
+    )
+
+    gateway, original = RecordingGateway(), durable_history()
+    history, schemas = role_history(), tools()
+    client = GatewayChatCompletionClient(gateway, "shared", DiscussionUsage(), durability=original,
+        actor="project_engineer", engineering_context_compaction=True, engineering_role_turn=cued,
+        max_output_tokens=512)
+    expected = await client.create(history, tools=schemas)
+    entry = {**original.model_entries[0], "status": status}
+    saved_hash = entry["request_hash"]
+    restored = durable_history(entries=(entry,), artifacts=original.artifacts)
+    model, tokens = "shared", 512
+    # A current role cue may match its saved identity; it cannot disguise any
+    # change to messages, schemas, model or token budget as that old request.
+    if changed == "messages":
+        history.insert(1, UserMessage(content="Different task evidence", source="user"))
+    elif changed == "schema":
+        schemas[0]["parameters"] = {"type": "object", "properties": {}, "additionalProperties": True}
+    elif changed == "model":
+        model = "other"
+    elif changed == "tokens":
+        tokens = 511
+    current = GatewayChatCompletionClient(gateway, model, DiscussionUsage(), durability=restored,
+        actor="project_engineer", engineering_context_compaction=True, engineering_role_turn=True,
+        max_output_tokens=tokens)
+    if changed is not None:
+        with pytest.raises(RuntimeExecutionError, match="durable model request mismatch"):
+            await current.create(history, tools=schemas)
+    elif status == "running":
+        with pytest.raises(ModelOutcomeUncertain, match="model outcome is uncertain"):
+            await current.create(history, tools=schemas)
+    else:
+        assert await current.create(history, tools=schemas) == expected
+    assert len(gateway.requests) == 1
+    assert len(restored.model_entries) == 1
+    assert restored.model_entries[0]["request_hash"] == saved_hash
+    assert restored.model_entries[0]["status"] == status

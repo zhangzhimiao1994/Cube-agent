@@ -34,7 +34,7 @@ from agent_hub.capabilities.generated_project_service import GeneratedProjectSer
 from agent_hub.capabilities.python_input_preparation import dynamic_python_pins
 from agent_hub.capabilities.runtime import RuntimeCapabilityGateway
 from agent_hub.capabilities.types import CapabilityRequest
-from agent_hub.db.models import RunApprovalRow, RunCheckpointRow
+from agent_hub.db.models import RunAdmissionPoolRow, RunApprovalRow, RunCheckpointRow
 from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.harness.tool_gateway import HarnessToolGateway
 from agent_hub.harness.types import HarnessToolCallRequest, HarnessToolCallResult
@@ -125,8 +125,12 @@ async def configured(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dao: Any,
             return await self.session.scalar(statement)
 
         async def scalars(self, statement: Any) -> Any:
-            assert {table.name for table in statement.get_final_froms()} == {'agent_hub_run_approvals'}
+            expr = statement.column_descriptions[0].get('expr')
+            if expr is RunAdmissionPoolRow:
+                return await self.session.scalars(statement)
+            assert expr is RunApprovalRow
             params = statement.compile().params
+            assert {'tenant_id_1', 'run_id_1'} <= params.keys()
             rows = [approval for approval in dao.approvals
                     if all(getattr(approval, key.rsplit('_', 1)[0]) == value for key, value in params.items())]
             return SimpleNamespace(all=lambda: rows)

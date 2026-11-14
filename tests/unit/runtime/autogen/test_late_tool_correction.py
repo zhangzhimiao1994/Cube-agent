@@ -155,9 +155,11 @@ async def test_soft_expiry_after_rejection_emits_budget_diagnostic_without_valid
         self: _DiscussionDurability, request: ModelRequest, *,
         tool_names: Mapping[str, str] | None = None, bounded_no_tool: bool = False,
         report_binding: Mapping[str, JsonValue] | None = None, correction_for: int | None = None,
+        actor: str | None = None,
     ) -> GatewayCompletion | RejectedModelRecord | None:
         result = await before_model(self, request, tool_names=tool_names,
-            bounded_no_tool=bounded_no_tool, report_binding=report_binding, correction_for=correction_for)
+            bounded_no_tool=bounded_no_tool, report_binding=report_binding,
+            correction_for=correction_for, actor=actor)
         if correction_for is not None:
             self.failure_reason = prior_reason
             self.failure_payload = validated_prior.payload

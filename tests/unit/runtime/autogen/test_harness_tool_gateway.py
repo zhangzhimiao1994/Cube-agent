@@ -270,9 +270,10 @@ async def test_project_preflight_tool_injects_server_owned_context() -> None:
     )
     with pytest.raises(
         RuntimeExecutionError,
-        match="project preflight workspace scope is not configured",
+        match="Capability proposal was not submitted: invalid_scope",
     ):
         await missing_scope_tool.run_json({}, CancellationToken(), call_id="missing-scope")
+    assert len(harness.calls) == 1  # Invalid scope never reaches the Harness backend.
 
 
 async def test_gateway_capability_tool_routes_through_harness_with_actor_identity() -> None:

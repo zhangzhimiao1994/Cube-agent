@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from collections.abc import Awaitable, Mapping
 from decimal import Decimal
 from typing import Any, cast
@@ -1186,7 +1187,9 @@ async def test_repository_put_failure_aborts_reserved_artifact_write() -> None:
     assert runtime._pending_artifact_writes == {}
 
 
-async def test_post_write_pre_return_cancel_aborts_artifact_and_clears_pending() -> None:
+async def test_post_write_pre_return_cancel_aborts_artifact_and_clears_pending(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     class BlockingRepository(InMemoryArtifactRepository):
         def __init__(self) -> None:
             super().__init__()
@@ -1211,8 +1214,11 @@ async def test_post_write_pre_return_cancel_aborts_artifact_and_clears_pending()
             await self.release.wait()
 
     repository = BlockingRepository()
+    # The framework may prepare the next turn while the role artifact is blocked.
+    gateway = ScriptedGateway([("analyst", 1, Decimal(0)), ("message", 1, Decimal(0)),
+                               ("critic", 1, Decimal(0)), ("review", 1, Decimal(0))])
     runtime = AutoGenDiscussionRuntime(
-        ScriptedGateway([("analyst", 1, Decimal(0)), ("message", 1, Decimal(0))]),
+        gateway,
         plan(max_turns=2),
         artifact_repository=repository,
     )
@@ -1235,9 +1241,19 @@ async def test_post_write_pre_return_cancel_aborts_artifact_and_clears_pending()
     with pytest.raises(ArtifactRepositoryError):
         await repository.get_many(ctx.tenant_id, ctx.run_id, (reference,))
     assert runtime._pending_artifact_writes == {}
+    assert len(gateway.requests) <= 4, "scripted gateway exhausted during cancellation"
+    assert not cancelled.payload
+    # AutoGen logs expected cancellation as ERROR; other gateway/framework failures
+    # (including an exhausted response script) must not be hidden by cancellation.
+    assert not [record for record in caplog.records
+                if record.name.startswith("autogen") and record.levelno >= logging.ERROR
+                and not (record.exc_info
+                         and isinstance(record.exc_info[1], asyncio.CancelledError))]
 
 
-async def test_late_put_that_swallows_cancel_remains_fenced_and_cleanup_finishes() -> None:
+async def test_late_put_that_swallows_cancel_remains_fenced_and_cleanup_finishes(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     class LateRepository(InMemoryArtifactRepository):
         def __init__(self) -> None:
             super().__init__()
@@ -1267,8 +1283,11 @@ async def test_late_put_that_swallows_cancel_remains_fenced_and_cleanup_finishes
                 await self.release.wait()
 
     repository = LateRepository()
+    # The framework may prepare the next turn while the role artifact is blocked.
+    gateway = ScriptedGateway([("analyst", 1, Decimal(0)), ("message", 1, Decimal(0)),
+                               ("critic", 1, Decimal(0)), ("review", 1, Decimal(0))])
     runtime = AutoGenDiscussionRuntime(
-        ScriptedGateway([("analyst", 1, Decimal(0)), ("message", 1, Decimal(0))]),
+        gateway,
         plan(max_turns=2),
         artifact_repository=repository,
     )
@@ -1294,4 +1313,12 @@ async def test_late_put_that_swallows_cancel_remains_fenced_and_cleanup_finishes
     with pytest.raises(ArtifactRepositoryError):
         await repository.get_many(ctx.tenant_id, ctx.run_id, (reference,))
     assert runtime._pending_artifact_writes == {}
+    assert len(gateway.requests) <= 4, "scripted gateway exhausted during cancellation"
+    assert not cancelled.payload
+    # AutoGen logs expected cancellation as ERROR; other gateway/framework failures
+    # (including an exhausted response script) must not be hidden by cancellation.
+    assert not [record for record in caplog.records
+                if record.name.startswith("autogen") and record.levelno >= logging.ERROR
+                and not (record.exc_info
+                         and isinstance(record.exc_info[1], asyncio.CancelledError))]
     assert not runtime._cleanup_tasks

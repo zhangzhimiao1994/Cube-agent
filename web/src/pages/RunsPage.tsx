@@ -5561,6 +5561,7 @@ function RunProcessSummary({
   mainAgentModelName?: string;
   workspaceFiles: ConversationWorkspaceFileBuckets;
 }) {
+  const queryClient = useQueryClient();
   const [isWorkbenchOpen, setIsWorkbenchOpen] = useState(false);
   const [initialWorkbenchAgentId, setInitialWorkbenchAgentId] = useState<string | null>(null);
   const previouslyFocused = useRef<HTMLElement | null>(null);
@@ -5594,6 +5595,20 @@ function RunProcessSummary({
     items,
     taskChain,
   });
+  useEffect(() => {
+    if (!isWorkbenchOpen) return undefined;
+    // Inline records need the same fresh reads as the standalone process drawer,
+    // including terminal runs whose normal polling has already stopped.
+    const refresh = () => {
+      void queryClient.invalidateQueries({ queryKey: ["run", detail.id] });
+      if (conversationId) {
+        void queryClient.invalidateQueries({ queryKey: ["conversation", conversationId] });
+      }
+    };
+    refresh();
+    const interval = window.setInterval(refresh, 1000);
+    return () => window.clearInterval(interval);
+  }, [conversationId, detail.id, isWorkbenchOpen, queryClient]);
   useEffect(() => {
     if (!isWorkbenchOpen) return undefined;
     previouslyFocused.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;

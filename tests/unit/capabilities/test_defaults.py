@@ -613,7 +613,8 @@ async def test_default_policy_gateway_allows_custom_plugin_permission_from_polic
     )
 
     assert result.status is CapabilityStatus.ALLOWED
-    assert source.tenants == [TENANT_ID]
+    # Evaluate the current rules again before applying the narrow recipe exception.
+    assert source.tenants == [TENANT_ID, TENANT_ID]
 
 
 async def test_default_policy_gateway_requires_approval_for_plugin_policy_effect() -> None:

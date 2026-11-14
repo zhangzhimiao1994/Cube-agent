@@ -29,7 +29,7 @@ from agent_hub.capabilities.project_verification import ProjectVerificationError
 from agent_hub.capabilities.runtime import RuntimeCapabilityGateway
 from agent_hub.capabilities.tools.registry import CompositeCapabilityManifestSource
 from agent_hub.capabilities.types import CapabilityRequest
-from agent_hub.db.models import AdminResourceRow
+from agent_hub.db.models import AdminResourceRow, RunApprovalRow
 from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.harness.tool_gateway import HarnessToolGateway, _python_recipe_authorization
 from agent_hub.harness.types import HarnessToolCallRequest
@@ -109,7 +109,7 @@ class AdmissionSqlSession(ApprovalProjectionSession):
 
     async def scalars(self, statement: Any) -> Any:
         params = statement.compile().params
-        if {getattr(table, "name", None) for table in statement.get_final_froms()} == {"agent_hub_run_approvals"}:
+        if statement.column_descriptions[0].get("expr") is RunApprovalRow:
             assert self.run.tenant_id in params.values() and self.run.id in params.values()
             self.sql_phases.append("approval_read")
             rows = [row for row in self.approvals.values() if row.status in params.values()]

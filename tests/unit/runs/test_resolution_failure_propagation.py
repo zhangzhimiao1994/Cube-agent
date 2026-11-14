@@ -144,7 +144,8 @@ async def test_actual_broker_client_original_project_failure(tmp_path: Path, mon
     monkeypatch.setattr(original_python_resolution, 'PythonProjectProfileSandbox', Profiles)
     active = resolution_request()
     monkeypatch.setattr(native, 'request', lambda: active)
-    (tmp_path / 'broker').mkdir()
+    # The native fake retains real cleanup, which requires a private stage parent on Linux.
+    (tmp_path / 'broker').mkdir(mode=0o700)
     case = native.portable_broker(tmp_path / 'broker', monkeypatch, 'execution', 2, False)
     actions: list[str] = []
 

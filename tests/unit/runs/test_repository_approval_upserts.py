@@ -17,7 +17,7 @@ from agent_hub.capabilities.defaults import DefaultRuntimeCapabilityPolicyGatewa
 from agent_hub.capabilities.gateway import CapabilityGateway
 from agent_hub.capabilities.policy import CapabilityPolicy, CapabilityRule
 from agent_hub.capabilities.types import CapabilityRequest, PolicyEffect
-from agent_hub.db.models import RunApprovalRow, RunEventRow, RunRow
+from agent_hub.db.models import RunAdmissionPoolRow, RunApprovalRow, RunEventRow, RunRow
 from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.plugins.runtime import RuntimePluginService
 from agent_hub.runs.repository import RunConflict, RunNotFound, RunRepository
@@ -126,9 +126,17 @@ class ApprovalProjectionSession:
         from types import SimpleNamespace
 
         params = statement.compile().params
+        expr = statement.column_descriptions[0].get("expr")
+        if expr is RunAdmissionPoolRow:
+            assert params == {"tenant_id_1": [self.run.tenant_id], "run_id_1": [self.run.id]}
+            return SimpleNamespace(all=list)
         assert self.run.tenant_id in params.values() and self.run.id in params.values()
-        rows = (list(self.approvals.values()) if "agent_hub_run_approvals" in str(statement)
-                else self.events)
+        rows: list[RunApprovalRow] | list[RunEventRow]
+        if expr is RunApprovalRow:
+            rows = list(self.approvals.values())
+        else:
+            assert expr is RunEventRow, f"unexpected SQL scalars: {statement}"
+            rows = self.events
         return SimpleNamespace(all=lambda: rows)
 
     async def execute(self, statement: Any) -> Any:

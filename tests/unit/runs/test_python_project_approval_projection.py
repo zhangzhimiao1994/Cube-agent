@@ -11,7 +11,7 @@ import pytest
 from sqlalchemy import create_engine, text
 
 from agent_hub.capabilities.approvals import PluginApprovalIdentity
-from agent_hub.db.models import RunApprovalRow, RunRow
+from agent_hub.db.models import RunAdmissionPoolRow, RunApprovalRow, RunRow
 from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.runs.repository import (
     RunConflict,
@@ -88,8 +88,12 @@ def dao() -> Any:
             return run if tables == {'agent_hub_runs'} else connection.scalar(statement)
 
         async def scalars(self, statement: Any) -> Any:
-            assert {item.name for item in statement.get_final_froms()} == {'agent_hub_run_approvals'}
             params = statement.compile().params
+            expr = statement.column_descriptions[0].get('expr')
+            if expr is RunAdmissionPoolRow:
+                assert params == {'tenant_id_1': [run.tenant_id], 'run_id_1': [run.id]}
+                return SimpleNamespace(all=list)
+            assert expr is RunApprovalRow
             assert run.tenant_id in params.values() and run.id in params.values()
             return SimpleNamespace(all=lambda: approvals)
 

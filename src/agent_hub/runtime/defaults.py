@@ -3375,29 +3375,23 @@ def _model_scope_limits(
     *,
     deployment_constraint: DeploymentRoutingConstraint | None = None,
 ) -> dict[str, dict[str, int]]:
-    config = _role_routing_config(config, deployment_constraint)
+    deployments = _authorized_runtime_deployments(config, deployment_constraint)
+    if not deployments:
+        raise HarnessModelSelectionError("model capability unavailable")
     limits: dict[str, int] = {}
     model_scopes: dict[str, set[str]] = {}
-    # Match CapacityPool's most restrictive policy across the gateway catalog.
-    for logical_model, definition in config.models.items():
-        scopes = model_scopes[logical_model] = set()
-        for deployment in definition.deployments:
-            if (
-                deployment_constraint is not None
-                and deployment_constraint.logical_model == logical_model
-                and not _deployment_definition_matches_constraint(
-                    logical_model, deployment, deployment_constraint,
-                )
-            ):
-                continue
-            scope = deployment.quota_scope_id
-            limit = safe_operational_limit(
-                deployment.max_concurrency,
-                deployment.target_utilization,
-                deployment.reserved_slots,
-            )
-            limits[scope] = min(limits.get(scope, limit), limit)
-            scopes.add(scope)
+    # Use the execution catalog once, retaining review and harness constraints.
+    # Match CapacityPool's most restrictive policy across its shared scopes.
+    for deployment in deployments:
+        scopes = model_scopes.setdefault(deployment.logical_model, set())
+        scope = deployment.quota_scope_id
+        limit = safe_operational_limit(
+            deployment.max_concurrency,
+            deployment.target_utilization,
+            deployment.reserved_slots,
+        )
+        limits[scope] = min(limits.get(scope, limit), limit)
+        scopes.add(scope)
     return {
         logical_model: {scope: limits[scope] for scope in scopes}
         for logical_model, scopes in model_scopes.items()

@@ -1,4 +1,6 @@
 from collections.abc import AsyncIterator
+from dataclasses import fields
+from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
 import pytest
@@ -79,6 +81,29 @@ async def seed_blocked_run(
     return await repository.get(tenant, created.id), actor
 
 
+async def assert_failed_run_unchanged(repository: RunRepository, before: RunRecord) -> None:
+    read_started_at = datetime.now(UTC)
+    after = await repository.get(before.tenant_id, before.id)
+    read_finished_at = datetime.now(UTC)
+    # All durable fields must be unchanged; activity is evaluated anew on each read.
+    durable_fields = tuple(
+        field.name for field in fields(RunRecord) if field.name != "execution_activity"
+    )
+    assert {name: getattr(after, name) for name in durable_fields} == {
+        name: getattr(before, name) for name in durable_fields
+    }
+    for record in (before, after):
+        activity = record.execution_activity
+        assert activity is not None
+        assert activity.is_active is False
+        assert activity.reason == "terminal"
+        assert activity.deadline_at is None
+    assert before.execution_activity is not None
+    assert after.execution_activity is not None
+    assert read_started_at <= after.execution_activity.evaluated_at <= read_finished_at
+    assert before.execution_activity.evaluated_at <= after.execution_activity.evaluated_at
+
+
 async def test_retry_recovery_preserves_approved_prefix_and_executes_once(
     run_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
@@ -117,11 +142,13 @@ async def test_retry_recovery_never_ignores_uncheckpointed_execution(
 ) -> None:
     repository = RunRepository(run_session_factory)
     record, actor = await seed_blocked_run(repository, unsafe_kind=unsafe_kind)
+    before_events = await repository.events(record.tenant_id, record.id)
     with pytest.raises(RunConflict):
         await repository.retry_self_repair_recovery_and_enqueue(
             tenant_id=record.tenant_id, actor_id=actor, run_id=record.id, version=record.version,
         )
-    assert await repository.get(record.tenant_id, record.id) == record
+    await assert_failed_run_unchanged(repository, record)
+    assert await repository.events(record.tenant_id, record.id) == before_events
     assert await repository.pending_outbox() == ()
 
 
@@ -130,13 +157,18 @@ async def test_retry_recovery_checks_owner_and_version_inside_transaction(
 ) -> None:
     repository = RunRepository(run_session_factory)
     record, actor = await seed_blocked_run(repository)
+    before_events = await repository.events(record.tenant_id, record.id)
     with pytest.raises(RunNotFound):
         await repository.retry_self_repair_recovery_and_enqueue(
             tenant_id=record.tenant_id, actor_id=uuid4(), run_id=record.id, version=record.version,
         )
+    await assert_failed_run_unchanged(repository, record)
+    assert await repository.events(record.tenant_id, record.id) == before_events
+    assert await repository.pending_outbox() == ()
     with pytest.raises(RunConflict):
         await repository.retry_self_repair_recovery_and_enqueue(
             tenant_id=record.tenant_id, actor_id=actor, run_id=record.id, version=record.version - 1,
         )
-    assert await repository.get(record.tenant_id, record.id) == record
+    await assert_failed_run_unchanged(repository, record)
+    assert await repository.events(record.tenant_id, record.id) == before_events
     assert await repository.pending_outbox() == ()

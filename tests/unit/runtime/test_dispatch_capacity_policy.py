@@ -10,7 +10,9 @@ from agent_hub.models.routing_policy import (
     DeploymentRoutingConstraint,
     constrain_deployments_for_routing,
 )
+from agent_hub.models.types import Deployment
 from agent_hub.runtime.defaults import (
+    HarnessModelSelectionError,
     _assign_models_to_roles,
     _deployments,
     _dispatch_parallelism,
@@ -224,3 +226,30 @@ def test_capacity_matches_pool_policy_with_utilization_reserves_and_optional_rat
     assert _dispatch_parallelism(
         config, "main", (_role("main"), _role("review")), deployment_constraint=constraint,
     ) == shared_policy.base_limit + independent_policy.base_limit
+
+
+@pytest.mark.parametrize("capacity", [_logical_model_capacity, _dispatch_parallelism])
+def test_capacity_uses_only_review_authorized_deployments(
+    monkeypatch: pytest.MonkeyPatch, capacity: Callable[..., int],
+) -> None:
+    config = _config({
+        "main": [_deployment("shared", 10), _deployment("selected", 5)],
+        "review": [_deployment("selected", 1)],
+    })
+
+    def selected_only(deployments: tuple[Deployment, ...]) -> tuple[Deployment, ...]:
+        return tuple(item for item in deployments if item.id == "main_2")
+
+    monkeypatch.setattr("agent_hub.runtime.review_assembly.review_deployments", selected_only)
+    # Excluded main_1 must not add capacity; excluded review_1 must not throttle it.
+    assert capacity(config, "main") == 4
+
+
+@pytest.mark.parametrize("capacity", [_logical_model_capacity, _dispatch_parallelism])
+def test_capacity_rejects_empty_review_authorized_catalog(
+    monkeypatch: pytest.MonkeyPatch, capacity: Callable[..., int],
+) -> None:
+    config = _config({"main": [_deployment("shared", 10)]})
+    monkeypatch.setattr("agent_hub.runtime.review_assembly.review_deployments", lambda _: ())
+    with pytest.raises(HarnessModelSelectionError, match="model capability unavailable"):
+        capacity(config, "main")
