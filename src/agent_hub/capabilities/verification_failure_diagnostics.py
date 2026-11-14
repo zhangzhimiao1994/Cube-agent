@@ -13,6 +13,26 @@ from typing import cast
 from agent_hub.runtime.contracts import JsonValue, _freeze_object
 
 
+def _unittest_summary_stream(text: str) -> str | None:
+    """Recognize only the two exact native trailers following unittest.run.
+
+    These are observation framing, never execution proof. Other native causes,
+    arbitrary JSON, duplicate markers or unknown tails cannot supply a summary.
+    """
+    marker = 'PYTHON_PHASE_FAILURE '
+    if marker not in text:
+        return text
+    if text.count(marker) != 1:
+        return None
+    for trailer in (
+        'PYTHON_PHASE_FAILURE {"cause": "test_result_failed", "exception_type": "PhaseError", "phase": "test", "stage": "test_execution"}\n',
+        'PYTHON_PHASE_FAILURE {"cause": "phase_guard", "exception_type": "PhaseError", "phase": "test", "stage": "phase_guard"}\n',
+    ):
+        if text.endswith('\n' + trailer):
+            return text[:-len(trailer)]
+    return None
+
+
 def verification_failure_diagnosis(
     report: Mapping[str, JsonValue], preview: Mapping[str, JsonValue] | None,
 ) -> Mapping[str, JsonValue]:
@@ -46,7 +66,12 @@ def verification_failure_diagnosis(
                 for name in ('stdout_metadata', 'stderr_metadata'))):
             return _freeze_object(result, name='failure diagnosis')
         texts = tuple(cast(str, preview[name]) for name in ('stdout', 'stderr'))
-        summaries = [match for text in texts if (match := re.search(
+        # The native producer writes the finite trailer to stderr only. Do not
+        # alter bound metadata, disclosed diagnostics or legacy summary parsing.
+        summary_stderr = _unittest_summary_stream(texts[1])
+        summary_texts = (() if 'PYTHON_PHASE_FAILURE ' in texts[0] or summary_stderr is None
+                         else (texts[0], summary_stderr))
+        summaries = [match for text in summary_texts if (match := re.search(
             r'(?m)^Ran ([0-9]{1,10}) tests? in [0-9]+(?:\.[0-9]+)?s\n\n?FAILED \(([^()\n]{1,128})\)\s*\Z', text))]
         if len(summaries) == 1:
             summary = summaries[0]
