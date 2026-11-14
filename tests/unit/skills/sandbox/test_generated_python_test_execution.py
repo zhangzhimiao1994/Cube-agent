@@ -195,7 +195,13 @@ def test_strict_readonly_manifest_is_not_a_claimed_result(tmp_path: Path, defect
         payload['test_files'] = ['tests/test_missing.py']
     result = smoke(tmp_path, GOOD, payload=payload)
     assert result.returncode != 0
-    assert json.loads(result.stdout) == {'status': 'failed', 'error': 'phase_failed'}
+    hint = ({'cause': 'os_error', 'exception_type': 'FileNotFoundError',
+             'phase': 'test', 'stage': 'phase_execution'} if defect == 'missing_file' else
+            {'cause': 'phase_guard', 'exception_type': 'PhaseError',
+             'phase': 'test', 'stage': 'phase_guard'})
+    assert json.loads(result.stdout) == {
+        'status': 'failed', 'error': 'phase_failed', 'failure_hint': hint,
+    }
 
 
 @pytest.mark.parametrize('raw', [b'{"schema_version":1,"schema_version":1}', b'NaN', b'x' * (128 * 1024 + 1)],
