@@ -2350,7 +2350,17 @@ def test_run_events_and_details_never_expose_credentials_or_hidden_reasoning() -
 
     assert events.status_code == 200
     assert details.status_code == 200
-    serialized = events.text + details.text + client.get("/openapi.json").text
+    schema = client.get("/openapi.json").json()
+    # This public duration schema contains no header or credential. Keep the
+    # full denylist on response bodies and on every other OpenAPI field.
+    horizon = schema["components"]["schemas"]["CreateRunRequest"]["properties"].pop(
+        "runtime_authorization_seconds"
+    )
+    assert horizon == {
+        "anyOf": [{"type": "number", "exclusiveMinimum": 0.0}, {"type": "null"}],
+        "title": "Runtime Authorization Seconds",
+    }
+    serialized = events.text + details.text + json.dumps(schema)
     for forbidden in (
         "api_key",
         "secret_ref",

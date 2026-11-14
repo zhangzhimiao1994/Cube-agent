@@ -48,6 +48,7 @@ def test_worker_runtime_stack_uses_configured_artifacts_and_sql_approval_validat
         generated_artifact_dir = tmp_path / "generated"
         project_workspace_dir = tmp_path / "workspaces"
         runtime_timeout_seconds = 10
+        runtime_authorization_timeout_seconds: float | None = None
         runtime_token_budget = 1000
 
         def database_url_value(self) -> str:
@@ -131,6 +132,7 @@ def test_worker_runtime_stack_uses_configured_artifacts_and_sql_approval_validat
 
     resources = worker.build_worker_service(cast(Settings, FakeSettings()))
     assert cast(dict[str, object], captured['run_service'])['project_input_preparer'] is wired.last.project_input_preparer
+    assert cast(dict[str, object], captured['run_service'])['runtime_authorization_timeout_seconds'] is None
 
     runtime_stack = captured["runtime_stack"]
     mcp_service = captured["mcp_service"]
@@ -212,6 +214,7 @@ def test_worker_runtime_stack_reads_tool_approval_settings_for_target_tenant(
         generated_artifact_dir = tmp_path / "generated"
         project_workspace_dir = tmp_path / "workspaces"
         runtime_timeout_seconds = 10
+        runtime_authorization_timeout_seconds: float | None = None
         runtime_token_budget = 1000
 
         def database_url_value(self) -> str:
@@ -300,6 +303,7 @@ def test_worker_registers_enabled_plugin_package_subprocess_adapters(
         generated_artifact_dir = tmp_path / "generated"
         project_workspace_dir = tmp_path / "workspaces"
         runtime_timeout_seconds = 10
+        runtime_authorization_timeout_seconds: float | None = None
         runtime_token_budget = 1000
         plugin_package_subprocess_runner_enabled = True
         plugin_package_subprocess_adapter_ids = frozenset({"calendar_python"})

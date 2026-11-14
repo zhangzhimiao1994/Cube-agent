@@ -372,7 +372,7 @@ async def test_trusted_hint_cannot_override_locked_actor_or_scope(db: Checkpoint
     assert proof[0][0].routing_decision['project_id'] == 'project'
 
 
-async def test_legacy_checkpoint_keeps_insert_only_query_behavior(db: Checkpoints, proof: ProofCalls) -> None:
+async def test_legacy_checkpoint_reads_parent_without_diagnostic_or_clock_ledger_queries(db: Checkpoints, proof: ProofCalls) -> None:
     candidate = db.checkpoint()
     state = dict(candidate.state)
     state.pop(POLICY)
@@ -394,7 +394,12 @@ async def test_legacy_checkpoint_keeps_insert_only_query_behavior(db: Checkpoint
                                               event=db.event(checkpoint, 1))
     finally:
         event.remove(engine, 'before_cursor_execute', observe)
-    assert not any(sql.lstrip().upper().startswith('SELECT') for sql in statements)
+    # The persisted parent must be checked even when an incoming checkpoint
+    # omits clock tags; otherwise a sealed v2 run could masquerade as legacy.
+    selects = [sql for sql in statements if sql.lstrip().upper().startswith('SELECT')]
+    assert len(selects) == 1 and 'FROM agent_hub_runs' in selects[0]
+    assert 'agent_hub_run_execution_clocks' not in selects[0]
+    assert 'agent_hub_authenticated_inputs' not in selects[0]
     assert proof == [] and await db.counts() == (1, 1)
 
 

@@ -440,6 +440,9 @@ class RunAdmissionRepository:
         self, session: AsyncSession, run: RunRow, pool: RunAdmissionPoolRow | None,
         turn_id: UUID, lease: _WorkerLease, config: str,
     ) -> tuple[_AuthenticatedInput, datetime, int, float]:
+        route = run.routing_decision
+        if type(route) is not dict:
+            raise AdmissionConflict(_CONFLICT)
         rows = (await session.execute(select(RunInputAuthorizationRow, RunAuthenticatedInputRow)
             .join(RunAuthenticatedInputRow,
                   RunAuthenticatedInputRow.turn_id == RunInputAuthorizationRow.turn_id)
@@ -460,9 +463,6 @@ class RunAdmissionRepository:
                 or run.worker_lease_expires_at <= now):
             raise AdmissionConflict(_CONFLICT)
         try:
-            route = run.routing_decision or {}
-            if type(route) is not dict:
-                raise ValueError
             ceiling = min(_positive(route.get('runtime_token_absolute_tokens')),
                           _positive(route.get('runtime_plan_token_budget')), _MAX_TOKENS)
             timeout = route.get('runtime_timeout_absolute_seconds',
