@@ -1,3 +1,4 @@
+import { resolutionTimeoutMeta } from "../lib/resolutionTimeout";
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Fragment, FormEvent, type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
@@ -2099,6 +2100,7 @@ function runFailureDiagnosticFromApi(
     detail: detail || "已记录结构化故障摘要",
     recommendation: diagnosticRecommendation(diagnostic.category, diagnostic.recommendation),
     meta: [
+      ...resolutionTimeoutMeta(diagnostic),
       actor,
       diagnostic.error_stage ? `位置 ${diagnostic.error_stage}` : "",
       diagnostic.error_code ? `错误码 ${repairErrorCodeLabel(diagnostic.error_code)}` : "",

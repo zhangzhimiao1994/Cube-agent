@@ -12,6 +12,11 @@ from decimal import Decimal, InvalidOperation
 from typing import Literal, cast
 from uuid import UUID
 
+from agent_hub.capabilities.python_resolution_diagnostics import (
+    RESOLUTION_TIMEOUT_ERROR_CODES,
+    RESOLUTION_TIMEOUT_OBSERVATION_KEYS,
+    validated_resolution_timeout_observation,
+)
 from agent_hub.domain.runs import RunStatus, TaskMode
 from agent_hub.models.types import ModelCapability
 from agent_hub.recovery_metadata import (
@@ -307,6 +312,7 @@ class SelfRepairDecision:
     role_capability_requirements: tuple[Mapping[str, JsonValue], ...] = ()
     automatic_checkpoint_sha256: str | None = None
     automatic_scope_sha256: str | None = None
+    resolution_timeout_observation: Mapping[str, JsonValue] | None = None
 
     @property
     def pauses_run(self) -> bool:
@@ -341,6 +347,7 @@ class SelfRepairDecision:
             role_capability_requirements=self.role_capability_requirements,
             automatic_checkpoint_sha256=self.automatic_checkpoint_sha256,
             automatic_scope_sha256=self.automatic_scope_sha256,
+            resolution_timeout_observation=self.resolution_timeout_observation,
         )
 
     def to_event(self, *, run_id: UUID, sequence: int) -> RunEvent:
@@ -373,6 +380,9 @@ class SelfRepairDecision:
             payload["suggested_action"] = self.suggested_action
         if self.role_capability_requirements:
             payload["role_capability_requirements"] = self.role_capability_requirements
+        payload.update(validated_resolution_timeout_observation(
+            self.resolution_timeout_observation or {},
+        ))
         return RunEvent(kind=self.kind, sequence=sequence, run_id=run_id, payload=payload)
 
     def to_proposal(self, *, run_id: UUID) -> dict[str, object] | None:
@@ -417,6 +427,9 @@ class SelfRepairDecision:
             proposal["error_code"] = self.error_code
         if self.suggested_action is not None:
             proposal["suggested_action"] = self.suggested_action
+        proposal.update(validated_resolution_timeout_observation(
+            self.resolution_timeout_observation or {},
+        ))
         if self.blocked_contract_ids:
             proposal["blocked_contract_ids"] = self.blocked_contract_ids
         if self.role_capability_requirements:
@@ -607,6 +620,9 @@ def classify_terminal_run(
             requires_approval=False, attempt=1, max_attempts=policy.max_attempts,
             skip_reason="project_verification_no_safe_recovery", error_code=error_code,
             suggested_action=suggested_action,
+            resolution_timeout_observation=validated_resolution_timeout_observation(
+                failure.payload if failure is not None else {}, require_diagnostic=True,
+            ),
         )
     if _routing_source(routing_decision) == "self_repair":
         return _skipped_decision(
@@ -690,6 +706,7 @@ def _skipped_decision(
     suggested_action: str | None = None,
     blocked_contract_ids: tuple[str, ...] = (),
     role_capability_requirements: tuple[Mapping[str, JsonValue], ...] = (),
+    resolution_timeout_observation: Mapping[str, JsonValue] | None = None,
 ) -> SelfRepairDecision:
     return SelfRepairDecision(
         kind="repair.skipped",
@@ -713,6 +730,7 @@ def _skipped_decision(
         suggested_action=suggested_action,
         blocked_contract_ids=blocked_contract_ids,
         role_capability_requirements=role_capability_requirements,
+        resolution_timeout_observation=resolution_timeout_observation,
     )
 
 
@@ -789,6 +807,7 @@ def repair_context_from_proposal(proposal: Mapping[str, object]) -> dict[str, ob
     )
     if role_capability_requirements:
         context["role_capability_requirements"] = role_capability_requirements
+    context.update(validated_resolution_timeout_observation(proposal))
     return context
 
 
@@ -806,6 +825,7 @@ def repair_proposal_projection(proposal: Mapping[str, object] | None) -> dict[st
             safe[key] = converted
     if safe.get("automatic_execution") is True and safe.get("requires_approval") is not False:
         safe["automatic_execution"] = False
+    safe.update(validated_resolution_timeout_observation(proposal))
     return safe or None
 
 
@@ -960,14 +980,33 @@ def _requires_manual_repair_approval(failure_category: str) -> bool:
     return failure_category in _MANUAL_APPROVAL_FAILURE_CATEGORIES
 
 
+def _validated_resolution_leaf(payload: Mapping[str, JsonValue]) -> dict[str, JsonValue]:
+    from agent_hub.runtime.failure_reason import resolution_failure_payload
+
+    if payload.keys() & RESOLUTION_TIMEOUT_OBSERVATION_KEYS:
+        return {}
+    try:
+        diagnostic = resolution_failure_payload(payload["resolution_failure"])
+    except (KeyError, TypeError, ValueError):
+        return {}
+    if any(payload.get(key) != value or (key != "resolution_failure"
+            and type(payload.get(key)) is not type(value)) for key, value in diagnostic.items()):
+        return {}
+    return diagnostic
+
+
 def _failure_diagnostic_metadata(failure: RunEvent | None) -> tuple[str | None, str | None]:
     if failure is None:
         return None, None
     if "resolution_failure" in failure.payload:
-        from agent_hub.runtime.failure_reason import resolution_failure_payload
-
-        diagnostic = resolution_failure_payload(failure.payload["resolution_failure"])
-        return str(diagnostic["error_code"]), str(diagnostic["suggested_action"])
+        diagnostic = _validated_resolution_leaf(failure.payload)
+        return ((str(diagnostic["error_code"]), str(diagnostic["suggested_action"]))
+                if diagnostic else (None, None))
+    if (failure.payload.keys() & RESOLUTION_TIMEOUT_OBSERVATION_KEYS
+            or failure.payload.get("error_code") in RESOLUTION_TIMEOUT_ERROR_CODES):
+        if not validated_resolution_timeout_observation(failure.payload, require_diagnostic=True):
+            return None, None
+        return (str(failure.payload["error_code"]), str(failure.payload["suggested_action"]))
     report = runtime_failure_diagnostic_from_reason(failure.reason)
     if report.get("error_stage") in {"delivery_report", "project_verification"}:
         return (_safe_diagnostic_code(report.get("error_code")),
@@ -1236,6 +1275,14 @@ def _failure_category(event: RunEvent) -> str:
     text = _failure_text(event)
     if _contains_marker(text, _UNCERTAIN_MARKERS):
         return "outcome_uncertain"
+    if "resolution_failure" in event.payload:
+        return "project_verification" if _validated_resolution_leaf(event.payload) else "outcome_uncertain"
+    if (event.payload.keys() & RESOLUTION_TIMEOUT_OBSERVATION_KEYS
+            or event.payload.get("error_code") in RESOLUTION_TIMEOUT_ERROR_CODES):
+        # Incomplete legacy observations are UNKNOWN, never ordinary retryable failures.
+        return ("project_verification" if validated_resolution_timeout_observation(
+            event.payload, require_diagnostic=True,
+        ) else "outcome_uncertain")
     if runtime_failure_diagnostic_from_reason(event.reason).get("error_stage") == "delivery_report":
         return "delivery_report"
     if runtime_failure_diagnostic_from_reason(event.reason).get("error_stage") == "project_verification":

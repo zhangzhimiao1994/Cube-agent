@@ -9,6 +9,15 @@ from enum import StrEnum
 
 type JsonScalar = str | bool | None
 
+RESOLUTION_TIMEOUT_OBSERVATION_KEYS = frozenset({
+    "resolution_phase", "resolution_progress", "resolution_progress_evidence",
+    "original_deadline_expired",
+})
+RESOLUTION_TIMEOUT_ERROR_CODES = (
+    "project_verification.resolution.resolution_timeout",
+    "project_verification.resolution.resolution_deadline",
+)
+
 
 class ResolutionPhase(StrEnum):
     INSPECTION = "inspection"
@@ -123,3 +132,32 @@ def validate_resolution_timeout_payload(payload: Mapping[str, object]) -> None:
     if any(type(payload.get(key)) is not type(value) or payload[key] != value
            for key, value in expected.items()):
         raise ValueError("resolution timeout diagnostic fields are inconsistent")
+
+
+def validated_resolution_timeout_observation(
+    payload: Mapping[str, object], *, require_diagnostic: bool = False,
+) -> dict[str, JsonScalar]:
+    """Project four canonical observations, never text or execution authority.
+
+    Event consumers must validate the full diagnostic. Context consumers receive
+    only the already projected four fields and validate that finite tuple again.
+    An incomplete or inconsistent tuple is discarded as a whole.
+    """
+    phase, progress = payload.get("resolution_phase"), payload.get("resolution_progress")
+    expired = payload.get("original_deadline_expired")
+    if (not RESOLUTION_TIMEOUT_OBSERVATION_KEYS <= payload.keys()
+            or type(phase) is not str or type(progress) is not str
+            or (expired is not None and type(expired) is not bool)):
+        return {}
+    try:
+        expected = _observation_payload(_Observation(
+            ResolutionPhase(phase), ResolutionProgress(progress), expired,
+        ))
+        if require_diagnostic:
+            validate_resolution_timeout_payload(payload)
+        elif any(type(payload[key]) is not type(expected[key]) or payload[key] != expected[key]
+                 for key in RESOLUTION_TIMEOUT_OBSERVATION_KEYS):
+            return {}
+    except ValueError:
+        return {}
+    return {key: expected[key] for key in RESOLUTION_TIMEOUT_OBSERVATION_KEYS}

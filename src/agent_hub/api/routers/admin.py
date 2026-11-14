@@ -48,6 +48,7 @@ from pydantic import (
     Field,
     PrivateAttr,
     SecretStr,
+    StrictBool,
     ValidationError,
     ValidationInfo,
     computed_field,
@@ -62,6 +63,11 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from agent_hub.api.dependencies import current_principal
 from agent_hub.api.errors import BASE_ERROR_RESPONSES, PublicAPIError, error_responses
 from agent_hub.auth.models import AuthenticatedPrincipal, Authorizer, PermissionDenied, Role
+from agent_hub.capabilities.python_resolution_diagnostics import (
+    ResolutionPhase,
+    ResolutionProgress,
+    validated_resolution_timeout_observation,
+)
 from agent_hub.capabilities.review_contracts import ApprovalReviewConfig
 from agent_hub.capabilities.review_settings import ApprovalReviewReadiness, ApprovalReviewSettings
 from agent_hub.capabilities.tools.registry import PluginConfigCapabilityManifestSource
@@ -513,9 +519,26 @@ class FailureDiagnosticResponse(BaseModel):
     error_category: str | None = None
     error_code: str | None = None
     retryable: bool | None = None
+    resolution_phase: ResolutionPhase | None = None
+    resolution_progress: ResolutionProgress | None = None
+    resolution_progress_evidence: Literal["none", "validated_root_status"] | None = None
+    original_deadline_expired: StrictBool | None = None
     approval_id: str | None = None
     action: str | None = None
     wrapped_by: int | None = Field(default=None, ge=1)
+
+    @model_validator(mode="after")
+    def validate_timeout_observation(self) -> Self:
+        observation = {
+            "resolution_phase": self.resolution_phase.value if self.resolution_phase else None,
+            "resolution_progress": self.resolution_progress.value if self.resolution_progress else None,
+            "resolution_progress_evidence": self.resolution_progress_evidence,
+            "original_deadline_expired": self.original_deadline_expired,
+        }
+        if (any(value is not None for value in observation.values())
+                and not validated_resolution_timeout_observation(observation)):
+            raise ValueError("resolution timeout observation is invalid")
+        return self
 
 
 class ToolLifecycleResponse(BaseModel):
@@ -16135,7 +16158,7 @@ def _runtime_or_step_failure_diagnostic(event: RunEventResponse) -> FailureDiagn
     reason = _safe_model_check_detail(event.message)
     if reason == "redacted":
         reason = "runtime failure was redacted"
-    return FailureDiagnosticResponse(
+    diagnostic = FailureDiagnosticResponse(
         category=category,
         stage=event.kind,
         reason=reason,
@@ -16156,6 +16179,11 @@ def _runtime_or_step_failure_diagnostic(event: RunEventResponse) -> FailureDiagn
         error_code=error_code,
         retryable=retryable,
     )
+
+    observation = validated_resolution_timeout_observation(event.payload, require_diagnostic=True)
+    if observation:
+        return FailureDiagnosticResponse.model_validate({**diagnostic.model_dump(), **observation})
+    return diagnostic
 
 
 def _pending_approval_diagnostics(

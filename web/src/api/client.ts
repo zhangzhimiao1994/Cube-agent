@@ -885,9 +885,21 @@ const FailureDiagnosticSchema = z.object({
   error_category: z.string().nullable().optional(),
   error_code: z.string().nullable().optional(),
   retryable: z.boolean().nullable().optional(),
+  resolution_phase: z.enum(["inspection", "resolution", "freeze", "publication"]).nullable().optional(),
+  resolution_progress: z.enum(["unobserved", "resolution_completed", "freeze_pending", "freeze_completed", "publication_pending", "publication_completed"]).nullable().optional(),
+  resolution_progress_evidence: z.enum(["none", "validated_root_status"]).nullable().optional(),
+  original_deadline_expired: z.boolean().nullable().optional(),
   approval_id: z.string().nullable().optional(),
   action: z.string().nullable().optional(),
   wrapped_by: z.number().nullable().optional(),
+}).superRefine((diagnostic, context) => {
+  const { resolution_phase: phase, resolution_progress: progress,
+    resolution_progress_evidence: evidence, original_deadline_expired: expired } = diagnostic;
+  if (phase == null && progress == null && evidence == null && expired == null) return;
+  if (!phase || !progress || !evidence || expired === undefined
+      || evidence !== (progress === "unobserved" ? "none" : "validated_root_status")) {
+    context.addIssue({ code: "custom", message: "Invalid resolution timeout observation" });
+  }
 });
 
 const ToolLifecycleSchema = z.object({

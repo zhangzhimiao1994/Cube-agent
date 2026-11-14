@@ -1,3 +1,4 @@
+import { resolutionTimeoutMeta } from "../lib/resolutionTimeout";
 import { Fragment, useEffect, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { createPortal } from "react-dom";
@@ -2397,6 +2398,7 @@ function detailDiagnosticFromApi(
     detail: detail || "已记录结构化故障摘要",
     recommendation: diagnosticRecommendation(diagnostic.category, diagnostic.recommendation),
     meta: [
+      ...resolutionTimeoutMeta(diagnostic),
       actor,
       diagnostic.error_stage ? `位置 ${diagnostic.error_stage}` : "",
       diagnostic.error_code ? `错误码 ${repairErrorCodeLabel(diagnostic.error_code)}` : "",
